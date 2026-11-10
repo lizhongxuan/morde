@@ -1,6 +1,6 @@
 # B20 PC 并发任务与回传展示实施任务 TODO
 
-**会话：B｜阶段：P2｜状态：进行中（2026-11-10；B20-T1/T2 已完成，T3 等待前置任务）。**
+**会话：B｜阶段：P2｜状态：进行中（2026-11-10；B20-T1/T2 已完成，T3 正在正式 API 与本地 UI 验收）。**
 
 来源：[需求与架构](../../Morde个人Muse需求与架构设计方案.md)；共同规则：[执行总览](00-三会话执行总览.md)；接口：[共享合同](01-共享接口与联调合同.md)。
 
@@ -27,11 +27,11 @@ B 独占的 PC/Web 聊天、任务详情、审批/澄清、事件订阅及对应
   - 验收：停止 B 不误停 A；查询不产生任务，过期审批能提示；重复点击、跨端已经处理及撤权后答复均与合同一致。
   - 完成：Assistant 与项目任务停止/继续按真实 Task ID、状态和修订请求正式接口；Assistant 发请求前重取同一 Task，服务端在任务行锁事务内原子比较状态与成对修订号。Portal 类型、MSW mock、审批/澄清既有版本和幂等行为保持同步。`api`、K2 投影、Assistant、Projects 与 mock 定向测试 241 项通过；Portal typecheck、lint、Vite 生产构建通过；本地内置浏览器选择 Task A 并提交停止后显示“正在停止 / 等待服务端确认”，Task B/C/D 状态未变。`go test ./internal/api ./internal/app ./internal/store/postgres` 通过；Postgres 集成测试因未配置 `CH_TEST_DATABASE_URL` 按约定跳过。`make -C server lint` 通过（0 issues），`git diff --check` 通过。
 
-- [ ] B20-T3（未开始）联调并行任务与主助手回传
+- [ ] B20-T3（进行中）联调并行任务与主助手回传
   - 前置：B20-T2、A21-T3。
   - 修改：接 A21-T3 的正式 API，更新 B 生成类型和实际视图映射；在独立浏览器/Electron fixture 验证，不以样例页面代替。
-  - 验收：完成 A3–A6/A11 的 PC 路径：A 执行中发 B、修改 A、停止 B、主助手因子结果继续、重连后不重复最终回复。向 A21-T4 交付本地证据。
-  - 前置状态：G1 尚未发布；A20-T1 本地审查和定向检查已通过，仍待 G1/A10-T3 iOS 集成验收；A20-T2 有未验收接线，A20-T3/T4 与 A21-T1–T4 未开始；A21-T3 还依赖 A20-T4 与 A21-T2。正式 OpenAPI 尚无 K2 `dependencies`、`child_jobs`、`result_review` 字段；本地 K2 fixture 只验 UI，不能代替真实 API 联调。本项保持未开始，待 G1 与 A21-T3 完成后再接入验收。
+  - 验收：完成 A3–A6/A11 的 PC 路径：A 执行中发 B、修改 A、停止 B、主助手消费 A 的结果继续回复、重连后不重复最终回复。向 A21-T4 交付本地证据。
+  - 当前状态（2026-11-10）：正式 OpenAPI/TypeScript 已含 K2 `dependencies`、`child_jobs`、`result_review`；服务端迁移、投影、依赖执行和结果审阅队列已接入。Postgres 定向集成、worker 全包、DSH Runtime 94 项、Portal typecheck 与 lint 通过。本机 Portal 浏览器确认 A/B 同时运行、可单独选中并停止 B，服务端确认 B 已停止；“Reply exactly OK.” 的完成回复在重新加载后只显示一条。A 的本地 held-model 验收在修订前因模型服务超时而失败，故不据此宣称 A 修订及主助手因结果继续已通过。C10/G1 Simulator 登录/App-close 对账已通过；当前仍待 A 修订与主助手结果审阅的浏览器联验、全量 `make it` 复跑，本项保持进行中。
 
 ## 交付
 

@@ -187528,6 +187528,188 @@
           }
         }
       }
+    },
+    "%@ · required revision %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · erforderliche Revision %2$lld" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · required revision %2$lld" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · revisión requerida %2$lld" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · révision requise %2$lld" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · 必要なリビジョン %2$lld" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · 필수 리비전 %2$lld" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · требуемая ревизия %2$lld" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · 所需修订 %2$lld" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · 所需修訂版 %2$lld" } }
+      }
+    },
+    "Child jobs" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Unteraufgaben" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Child jobs" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tareas secundarias" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Tâches enfants" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "子ジョブ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "하위 작업" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Дочерние задачи" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "子任务" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "子任務" } }
+      }
+    },
+    "Dependencies" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Abhängigkeiten" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Dependencies" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Dependencias" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Dépendances" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "依存関係" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "종속 항목" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Зависимости" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "依赖项" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "相依項" } }
+      }
+    },
+    "Dependency satisfied" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Abhängigkeit erfüllt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Dependency satisfied" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Dependencia satisfecha" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Dépendance satisfaite" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "依存関係を満たしました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "종속 항목 충족" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Зависимость выполнена" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "依赖已满足" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "相依條件已滿足" } }
+      }
+    },
+    "Result published" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ergebnis veröffentlicht" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Result published" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Resultado publicado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Résultat publié" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "結果を公開しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "결과 게시됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Результат опубликован" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "结果已发布" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "結果已發布" } }
+      }
+    },
+    "Result review failed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ergebnisprüfung fehlgeschlagen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Result review failed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Falló la revisión del resultado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Échec de la vérification du résultat" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "結果の確認に失敗しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "결과 검토 실패" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось проверить результат" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "结果整理失败" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "結果整理失敗" } }
+      }
+    },
+    "Result review pending" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wartet auf Ergebnisprüfung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Waiting for result review" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando la revisión del resultado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En attente de l’examen du résultat" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "結果の確認待ち" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "결과 검토 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидает проверки результата" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待整理结果" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待整理結果" } }
+      }
+    },
+    "Result review processing" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ergebnis wird geprüft" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Processing result review" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Revisando el resultado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Vérification du résultat en cours" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "結果を確認しています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "결과 검토 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Проверка результата" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在整理结果" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在整理結果" } }
+      }
+    },
+    "Result review status unknown" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Status der Ergebnisprüfung unbekannt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Result review status unknown" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se desconoce el estado de revisión del resultado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "État de vérification du résultat inconnu" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "結果の確認状態は不明です" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "결과 검토 상태를 알 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Статус проверки результата неизвестен" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "结果整理状态未知" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "結果整理狀態未知" } }
+      }
+    },
+    "Source %@ · revision %lld · event %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Quelle %1$@ · Revision %2$lld · Ereignis %3$lld" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Source %1$@ · revision %2$lld · event %3$lld" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Origen %1$@ · revisión %2$lld · evento %3$lld" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Source %1$@ · révision %2$lld · événement %3$lld" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ソース %1$@ · リビジョン %2$lld · イベント %3$lld" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "출처 %1$@ · 리비전 %2$lld · 이벤트 %3$lld" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Источник %1$@ · ревизия %2$lld · событие %3$lld" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "来源 %1$@ · 修订 %2$lld · 事件 %3$lld" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "來源 %1$@ · 修訂版 %2$lld · 事件 %3$lld" } }
+      }
+    },
+    "Task relationships" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Aufgabenbeziehungen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Task relationships" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Relaciones entre tareas" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Relations entre tâches" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "タスクの関連情報" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 관계" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Связи задач" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务关联" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務關聯" } }
+      }
+    },
+    "Task result review" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Prüfung des Aufgabenergebnisses" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Task result review" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Revisión del resultado de la tarea" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Vérification du résultat de la tâche" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "タスク結果の確認" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 결과 검토" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Проверка результата задачи" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务结果整理" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務結果整理" } }
+      }
+    },
+    "Waiting for dependency" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wartet auf Abhängigkeit" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Waiting for dependency" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando una dependencia" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En attente d’une dépendance" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "依存タスク待ち" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "종속 작업 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидает зависимость" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待依赖任务" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待相依任務" } }
+      }
     }
   },
   "version" : "1.0"

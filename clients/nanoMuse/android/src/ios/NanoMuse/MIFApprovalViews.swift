@@ -117,7 +117,16 @@ struct MIFApprovalInboxRoom: View {
         }
         .background(approvalCanvasColor.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
-        .task(id: store.scopeKey) { await reload(scopeKey: store.scopeKey) }
+        .task(id: store.scopeKey) {
+            let scopeKey = store.scopeKey
+            await reload(scopeKey: scopeKey)
+            guard let scopeKey else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { return }
+                await reload(scopeKey: scopeKey, preservingSnapshot: true)
+            }
+        }
     }
 
     private var confirmedHeaderCountText: String? {
@@ -311,18 +320,20 @@ struct MIFApprovalInboxRoom: View {
     }
 
     @MainActor
-    private func reload(scopeKey: String?) async {
+    private func reload(scopeKey: String?, preservingSnapshot: Bool = false) async {
         loadGeneration += 1
         let generation = loadGeneration
         submissionLedger.use(scopeKey: scopeKey)
-        taskIDs = []
-        details = [:]
-        failedTaskIDs = []
-        pageReadFailed = false
-        hasLoaded = false
-        loadedScopeKey = nil
-        actionMessage = nil
-        onConfirmedCount?(nil)
+        if !preservingSnapshot {
+            taskIDs = []
+            details = [:]
+            failedTaskIDs = []
+            pageReadFailed = false
+            hasLoaded = false
+            loadedScopeKey = nil
+            actionMessage = nil
+            onConfirmedCount?(nil)
+        }
 
         guard let scopeKey else {
             isLoading = false
@@ -366,22 +377,25 @@ struct MIFApprovalInboxRoom: View {
             }
         }
 
-        taskIDs = collectedTaskIDs
-        pageReadFailed = listFailed
-
+        var refreshedDetails: [String: MordeTask] = [:]
+        var refreshedFailedTaskIDs = Set<String>()
         for taskID in collectedTaskIDs {
             guard isCurrent(scopeKey, generation: generation) else { return }
             do {
                 let detail = try await store.task(id: taskID)
                 guard isCurrent(scopeKey, generation: generation) else { return }
-                details[taskID] = detail
+                refreshedDetails[taskID] = detail
             } catch {
                 guard isCurrent(scopeKey, generation: generation) else { return }
-                failedTaskIDs.insert(taskID)
+                refreshedFailedTaskIDs.insert(taskID)
             }
         }
 
         guard isCurrent(scopeKey, generation: generation) else { return }
+        taskIDs = collectedTaskIDs
+        details = refreshedDetails
+        failedTaskIDs = refreshedFailedTaskIDs
+        pageReadFailed = listFailed
         loadedScopeKey = scopeKey
         hasLoaded = true
         publishConfirmedCount(for: scopeKey)

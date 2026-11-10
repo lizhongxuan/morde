@@ -18,6 +18,7 @@ type cloudDSHCheckpointHistory struct {
 	inputs            []app.ModelInput
 	calls             map[string]*cloudDSHToolCall
 	fileWrites        map[string]struct{}
+	systemNodes       map[int64]struct{}
 	result            string
 	resultTurn        int64
 	completedTurn     int64
@@ -51,7 +52,8 @@ type cloudDSHToolCall struct {
 }
 
 func newCloudDSHCheckpointHistory(sessionID string) *cloudDSHCheckpointHistory {
-	return &cloudDSHCheckpointHistory{sessionID: sessionID, calls: make(map[string]*cloudDSHToolCall), fileWrites: make(map[string]struct{})}
+	return &cloudDSHCheckpointHistory{sessionID: sessionID, calls: make(map[string]*cloudDSHToolCall),
+		fileWrites: make(map[string]struct{}), systemNodes: make(map[int64]struct{})}
 }
 
 func (h *cloudDSHCheckpointHistory) clone() *cloudDSHCheckpointHistory {
@@ -68,6 +70,10 @@ func (h *cloudDSHCheckpointHistory) clone() *cloudDSHCheckpointHistory {
 	clone.fileWrites = make(map[string]struct{}, len(h.fileWrites))
 	for id := range h.fileWrites {
 		clone.fileWrites[id] = struct{}{}
+	}
+	clone.systemNodes = make(map[int64]struct{}, len(h.systemNodes))
+	for sequence := range h.systemNodes {
+		clone.systemNodes[sequence] = struct{}{}
 	}
 	clone.assistantOutputs = append([]cloudDSHAssistantOutput(nil), h.assistantOutputs...)
 	return &clone
@@ -87,7 +93,7 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 			Sequence        int64           `json:"seq"`
 			Type            string          `json:"type"`
 			Data            json.RawMessage `json:"data"`
-			SurfaceOp       string          `json:"surfaceOp"`
+			SurfaceOp       json.RawMessage `json:"surfaceOp"`
 			SourceEventSeqs []int64         `json:"sourceEventSeqs"`
 		} `json:"events"`
 	}
@@ -100,7 +106,19 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 		if event.Sequence != from+int64(index) || event.Type == "" || len(event.Data) == 0 || !json.Valid(event.Data) {
 			return errors.New("dsh checkpoint event sequence is invalid")
 		}
+		var surfaceOp string
+		if len(event.SurfaceOp) != 0 && string(event.SurfaceOp) != "null" {
+			if err := json.Unmarshal(event.SurfaceOp, &surfaceOp); err != nil {
+				if event.Type != "system/message" || h.replaceSystemNode(event.Sequence, event.Data, event.SurfaceOp, event.SourceEventSeqs) != nil {
+					return errors.New("dsh checkpoint surface operation is invalid")
+				}
+			}
+		}
 		switch event.Type {
+		case "system/message":
+			if surfaceOp == "append" && cloudDSHSystemMessage(event.Data) {
+				h.systemNodes[event.Sequence] = struct{}{}
+			}
 		case "assistant/message":
 			if err := h.appendAssistantMessage(event.Sequence, event.Data); err != nil {
 				return err
@@ -110,7 +128,7 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 				return err
 			}
 		case "tool/result":
-			if err := h.appendToolResult(event.Sequence, event.Data, event.SurfaceOp, event.SourceEventSeqs); err != nil {
+			if err := h.appendToolResult(event.Sequence, event.Data, surfaceOp, event.SourceEventSeqs); err != nil {
 				return err
 			}
 		case "step/end":
@@ -157,6 +175,40 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 		}
 	}
 	h.nextSeq = through + 1
+	return nil
+}
+
+func cloudDSHSystemMessage(data json.RawMessage) bool {
+	var value struct {
+		Message struct {
+			Role string `json:"role"`
+		} `json:"message"`
+	}
+	return json.Unmarshal(data, &value) == nil && value.Message.Role == "system"
+}
+
+func (h *cloudDSHCheckpointHistory) replaceSystemNode(sequence int64, data, raw json.RawMessage, sources []int64) error {
+	var operation struct {
+		Op    string          `json:"op"`
+		Start json.RawMessage `json:"startSeq"`
+		End   json.RawMessage `json:"endSeq"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var start, end int64
+	if decoder.Decode(&operation) != nil || operation.Op != "replace" || len(operation.Start) == 0 || len(operation.End) == 0 ||
+		string(operation.Start) == "null" || string(operation.End) == "null" ||
+		string(operation.Start) == "-0" || string(operation.End) == "-0" ||
+		json.Unmarshal(operation.Start, &start) != nil || json.Unmarshal(operation.End, &end) != nil ||
+		start < 0 || start > 1<<53-1 || start != end || start >= sequence || len(sources) != 1 || sources[0] != start ||
+		!cloudDSHSystemMessage(data) {
+		return errors.New("dsh system replacement is invalid")
+	}
+	if _, exists := h.systemNodes[start]; !exists {
+		return errors.New("dsh system replacement target is unavailable")
+	}
+	delete(h.systemNodes, start)
+	h.systemNodes[sequence] = struct{}{}
 	return nil
 }
 

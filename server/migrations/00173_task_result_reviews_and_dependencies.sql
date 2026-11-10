@@ -24,10 +24,14 @@ ALTER TABLE conversation_result_batches
   DROP CONSTRAINT conversation_result_batches_state_check,
   ADD CONSTRAINT conversation_result_batches_state_check
     CHECK (state IN ('pending','processing','published','failed','superseded')),
+  ADD COLUMN authorization_version bigint NOT NULL DEFAULT 1 CHECK (authorization_version > 0),
   ADD COLUMN trigger_message_id text UNIQUE,
   ADD CONSTRAINT conversation_result_trigger_message_fkey
     FOREIGN KEY (trigger_message_id, owner_id, conversation_id, actor_id)
     REFERENCES conversation_messages(id, owner_id, conversation_id, actor_id) ON DELETE RESTRICT;
+UPDATE conversation_result_batches b SET authorization_version=t.auth_version
+FROM conversation_result_sources s JOIN tasks t ON t.id=s.task_id
+WHERE s.batch_message_id=b.message_id AND s.source_order=1;
 
 ALTER TABLE conversation_result_sources
   ADD COLUMN payload_sha256 bytea,
@@ -59,6 +63,7 @@ ALTER TABLE conversation_result_sources
 ALTER TABLE conversation_result_batches
   DROP CONSTRAINT conversation_result_trigger_message_fkey,
   DROP COLUMN trigger_message_id,
+  DROP COLUMN authorization_version,
   DROP CONSTRAINT conversation_result_batches_state_check,
   ADD CONSTRAINT conversation_result_batches_state_check CHECK (state IN ('pending','published','superseded'));
 DROP INDEX task_dependencies_target;

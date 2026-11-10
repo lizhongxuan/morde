@@ -2,6 +2,12 @@ import XCTest
 @testable import MordeTaskPolicies
 
 final class MordeTaskEventIsolationTests: XCTestCase {
+    func testEventsOlderThanConversationSnapshotAreNotPresented() {
+        XCTAssertFalse(MordeTaskEventCursor.shouldPresent(sequence: 7, initialSequence: 8))
+        XCTAssertTrue(MordeTaskEventCursor.shouldPresent(sequence: 8, initialSequence: 8))
+        XCTAssertTrue(MordeTaskEventCursor.shouldPresent(sequence: 9, initialSequence: 8))
+    }
+
     func testSameConversationTaskCursorsResumeIndependently() async {
         let first = MordeTaskEventCursor(taskID: "q1234567", afterSequence: 3)
         let second = MordeTaskEventCursor(taskID: "q2345678", afterSequence: 11)

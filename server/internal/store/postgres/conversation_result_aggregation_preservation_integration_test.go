@@ -71,20 +71,27 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, modifiedID, value.ID, f.ownerID, f.conv
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1 WHERE id=$1`, value.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied' WHERE id=$1`, modifiedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed' WHERE message_id=$1`, modifiedID); err != nil {
+		t.Fatal(err)
+	}
 	if !f.complete(t, &value, "new revision result") {
 		t.Fatal("new revision result was not published")
 	}
-	var newMessageID, content, snapshotID, snapshotText, snapshotStatus string
+	f.runNextReview(t)
+	var newMessageID, content, replyContent, snapshotID, snapshotText, snapshotStatus string
 	var revision, snapshotRevision int64
-	err = f.store.pool.QueryRow(ctx, `SELECT m.id,m.content,s.task_revision,snapshot.message_id,snapshot.content,snapshot.status,snapshot.task_revision
+	err = f.store.pool.QueryRow(ctx, `SELECT m.id,s.content,m.content,s.task_revision,snapshot.message_id,snapshot.content,snapshot.status,snapshot.task_revision
 FROM conversation_result_sources s JOIN conversation_messages m ON m.id=s.batch_message_id
 JOIN task_assistant_message_snapshots snapshot ON snapshot.task_id=s.task_id
 WHERE s.task_id=$1 AND s.state='published'`, value.ID).
-		Scan(&newMessageID, &content, &revision, &snapshotID, &snapshotText, &snapshotStatus, &snapshotRevision)
-	if err != nil || newMessageID == oldMessageID || content != "new revision result" || revision != 1 ||
+		Scan(&newMessageID, &content, &replyContent, &revision, &snapshotID, &snapshotText, &snapshotStatus, &snapshotRevision)
+	if err != nil || newMessageID == oldMessageID || content != "new revision result" || replyContent != resultReviewTestReply || revision != 1 ||
 		snapshotID != oldMessageID || snapshotText != "visible older fragment" || snapshotStatus != "interrupted" || snapshotRevision != 0 {
-		t.Fatalf("new result or previous snapshot was lost: new=%s revision=%d snapshot=%s snapshot_revision=%d status=%s err=%v",
-			newMessageID, revision, snapshotID, snapshotRevision, snapshotStatus, err)
+		t.Fatalf("new result or previous snapshot was lost: new=%s revision=%d reply=%q snapshot=%s snapshot_revision=%d status=%s err=%v",
+			newMessageID, revision, replyContent, snapshotID, snapshotRevision, snapshotStatus, err)
 	}
 	var oldContent, oldStatus string
 	var actualSequence int64
@@ -108,7 +115,6 @@ WHERE s.task_id=$1 AND s.state='published'`, value.ID).
 		t.Fatalf("new result source not independently recoverable: %+v err=%v", sources, err)
 	}
 }
-
 func TestConversationResultAggregationPreservesDifferentVisibleTurn(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	value := f.createTask(t, f.ownerID, "one task")
@@ -122,6 +128,7 @@ func TestConversationResultAggregationPreservesDifferentVisibleTurn(t *testing.T
 	if !f.complete(t, &value, "new independent result") {
 		t.Fatal("new result was not published")
 	}
+	f.runNextReview(t)
 	var snapshotID, content, status string
 	if err := f.store.pool.QueryRow(context.Background(), `SELECT message_id,content,status FROM task_assistant_message_snapshots WHERE task_id=$1`, value.ID).
 		Scan(&snapshotID, &content, &status); err != nil || snapshotID != oldMessageID || content != "visible previous turn" || status != "interrupted" {

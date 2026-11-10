@@ -1321,6 +1321,10 @@ struct MordeTaskEventCursor: Equatable, Sendable {
 
     var queryValue: String? { afterSequence > 0 ? String(afterSequence) : nil }
 
+    static func shouldPresent(sequence: Int64, initialSequence: Int64) -> Bool {
+        sequence >= initialSequence
+    }
+
     mutating func advance(eventID: String, for taskID: String) -> Bool {
         guard taskID == self.taskID, let sequence = Int64(eventID), sequence > 0 else { return false }
         afterSequence = max(afterSequence, sequence)

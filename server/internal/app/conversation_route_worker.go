@@ -15,13 +15,14 @@ const MaxConversationAgentInputBytes = maxAgentInputBytes
 // ConversationRouteSnapshot contains only information the sender may use to
 // determine the fate of one accepted message.
 type ConversationRouteSnapshot struct {
-	Context              ConversationRouteContext
-	PreviousMissing      bool
-	PreviousCycle        bool
-	PreviousRoutingState string
-	PreviousTaskID       string
-	PreviousMessageID    string
-	PreviousSequence     int64
+	Context                ConversationRouteContext
+	ResultReviewSuperseded bool
+	PreviousMissing        bool
+	PreviousCycle          bool
+	PreviousRoutingState   string
+	PreviousTaskID         string
+	PreviousMessageID      string
+	PreviousSequence       int64
 }
 
 // ConversationRouteClassifier uses the same metered model gateway as Tasks.

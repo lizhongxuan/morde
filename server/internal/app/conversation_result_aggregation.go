@@ -2,7 +2,7 @@ package app
 
 import "context"
 
-// ConversationResultPublisher publishes ready result batches atomically.
-type ConversationResultPublisher interface {
-	PublishReadyConversationResults(context.Context, int) (int, error)
+// ConversationResultReviewQueue durably wakes the conversation coordinator for ready Task results.
+type ConversationResultReviewQueue interface {
+	QueueReadyConversationResultReviews(context.Context, int) (int, error)
 }

@@ -159,6 +159,7 @@ type Task struct {
 	DesiredRevision             *int64
 	Objective                   string
 	ConversationContext         *ConversationContext
+	DependencyResults           []DependencyResult
 	FileDeliveryIntent          FileDeliveryIntent
 	Status                      Status
 	Authorization               Authorization
@@ -175,6 +176,13 @@ type Task struct {
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	FinishedAt         *time.Time
+}
+
+type DependencyResult struct {
+	TaskID           string `json:"task_id"`
+	RequiredRevision int64  `json:"required_revision"`
+	Objective        string `json:"objective"`
+	Result           string `json:"result"`
 }
 
 // ConversationContext is the authorized, bounded history snapshot loaded for

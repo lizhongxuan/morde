@@ -92,6 +92,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 	}
+	if snapshot.ResultReviewSuperseded {
+		return true, nil
+	}
 	if len(snapshot.Context.Content) > app.MaxConversationAgentInputBytes {
 		return true, w.failRoute(ctx, claim, "message_too_long", errors.New("message exceeds the model input budget"))
 	}
@@ -119,6 +122,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, snapshot.Context)
 		if err != nil {
+			if snapshot.Context.ResultReview != nil && routeCtx.Err() != nil && ctx.Err() == nil {
+				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 5*time.Second)
+			}
 			if domain.CodeOf(err) == domain.CodeResultTooLarge {
 				return true, w.failRoute(ctx, claim, "message_too_long", err)
 			}
@@ -137,10 +143,16 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 	}
 	decision = safeConversationRouteDecision(snapshot.Context, decision)
+	if snapshot.Context.ResultReview != nil && decision.Action != app.ConversationRouteReply {
+		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("task result review did not produce a reply"))
+	}
 	if snapshot.PreviousMissing && decision.Action != app.ConversationRouteNew {
 		decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 	}
 	if err := w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, decision); err != nil {
+		if claim.Input.ResultReviewID != "" && domain.CodeOf(err) == domain.CodeConflict {
+			return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
+		}
 		if domain.CodeOf(err) == domain.CodeConflict || routeCtx.Err() != nil {
 			return true, err
 		}
@@ -183,12 +195,13 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	}
 	switch decision.Action {
 	case app.ConversationRouteNew:
-		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" {
+		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" &&
+			app.ValidConversationRouteDependencyIDs(decision.DependencyTaskIDs, value.Candidates) {
 			return decision
 		}
 	case app.ConversationRouteReply:
 		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" &&
-			app.ValidConversationRouteReply(decision.Reply) {
+			len(decision.DependencyTaskIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
 			return decision
 		}
 	case app.ConversationRouteClarify:

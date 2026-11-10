@@ -166,7 +166,7 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
  SELECT 1 FROM conversation_result_sources source
  JOIN conversation_result_batches batch ON batch.message_id=source.batch_message_id
  JOIN service_identity instance ON instance.singleton=true AND instance.instance_id=batch.service_instance_id
- WHERE source.task_id=$1 AND source.task_revision=$2 AND source.state='pending' AND batch.state='pending'
+ WHERE source.task_id=$1 AND source.task_revision=$2 AND source.state='pending' AND batch.state IN ('pending','processing')
 ), EXISTS (
  SELECT 1 FROM conversation_result_sources source
  JOIN conversation_result_batches batch ON batch.message_id=source.batch_message_id
@@ -177,8 +177,13 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 `, row.ID, *projected[0].CurrentRevision).Scan(&resultMessagePending, &resultMessagePublished, &currentRevisionStarted); err != nil {
 			return fmt.Errorf("read pending Task result message: %w", err)
 		}
+		dependencies, childJobs, resultReview, err := loadTaskK2Projection(ctx, tx, row.ID, *projected[0].CurrentRevision)
+		if err != nil {
+			return err
+		}
 		result = app.TaskDetails{
 			Task: projected[0], AssistantMessage: assistantMessage, CurrentRevisionStarted: &currentRevisionStarted,
+			Dependencies: dependencies, ChildJobs: childJobs, ResultReview: resultReview,
 			ResultMessagePending: resultMessagePending, ResultMessagePublished: resultMessagePublished,
 			ScheduleObservation: scheduleObservation, Steps: mapRows(steps, taskStepDomain),
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
@@ -210,6 +215,7 @@ func (s *Store) ListTasks(ctx context.Context, ownerID string, filter app.TaskLi
 	var rows []sqlcgen.Task
 	visibleRows := make([]sqlcgen.Task, 0)
 	var items []task.Task
+	var k2Projections map[string]app.TaskK2Projection
 	err = s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		var err error
 		rows, err = sqlcgen.New(tx).ListTasks(ctx, sqlcgen.ListTasksParams{
@@ -228,12 +234,20 @@ func (s *Store) ListTasks(ctx context.Context, ownerID string, filter app.TaskLi
 		if err := populateTaskStepCounts(ctx, tx, items); err != nil {
 			return err
 		}
-		return populateTaskRevisionProjection(ctx, tx, items)
+		if err := populateTaskRevisionProjection(ctx, tx, items); err != nil {
+			return err
+		}
+		projectionItems := items
+		if int32(len(projectionItems)) > limit {
+			projectionItems = projectionItems[:limit]
+		}
+		k2Projections, err = loadTaskK2Projections(ctx, tx, projectionItems)
+		return err
 	})
 	if err != nil {
 		return app.TaskPage{}, err
 	}
-	page := app.TaskPage{Items: items}
+	page := app.TaskPage{Items: items, K2Projections: k2Projections}
 	page.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
 	if int32(len(items)) > limit {
 		page.Items = items[:limit]
@@ -647,6 +661,12 @@ WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_
           AND hb.last_seen_at > clock_timestamp() - $2::double precision * interval '1 second'))
   )))
   AND t.execution_location='server' AND t.current_revision=t.desired_revision
+	  AND NOT EXISTS (SELECT 1 FROM task_dependencies dependency JOIN tasks prerequisite
+	    ON prerequisite.id=dependency.dependency_task_id AND prerequisite.owner_id=dependency.owner_id
+	      AND prerequisite.conversation_id=dependency.conversation_id AND prerequisite.initiator_id=t.initiator_id
+	      AND prerequisite.project_id IS NOT DISTINCT FROM t.project_id
+	    WHERE dependency.task_id=t.id AND (prerequisite.status<>'completed'
+	      OR prerequisite.current_revision<>dependency.required_revision OR prerequisite.desired_revision<>dependency.required_revision OR prerequisite.result=''))
 	  AND ((t.project_id IS NULL AND t.initiator_id=t.owner_id) OR (t.project_id IS NOT NULL AND (t.checkpoint_through_seq>=0 OR EXISTS (
 	    SELECT 1 FROM project_members pm JOIN users pu ON pu.id=pm.user_id AND pu.status='approved'
 	    WHERE pm.project_id=t.project_id AND pm.user_id=t.initiator_id AND pm.role IN ('member','owner')
@@ -726,6 +746,12 @@ WHERE t.initiator_id=$1 AND t.execution_epoch=$2
             AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'))
     )))
   AND t.execution_location='server' AND t.current_revision=t.desired_revision
+	  AND NOT EXISTS (SELECT 1 FROM task_dependencies dependency JOIN tasks prerequisite
+	    ON prerequisite.id=dependency.dependency_task_id AND prerequisite.owner_id=dependency.owner_id
+	      AND prerequisite.conversation_id=dependency.conversation_id AND prerequisite.initiator_id=t.initiator_id
+	      AND prerequisite.project_id IS NOT DISTINCT FROM t.project_id
+	    WHERE dependency.task_id=t.id AND (prerequisite.status<>'completed'
+	      OR prerequisite.current_revision<>dependency.required_revision OR prerequisite.desired_revision<>dependency.required_revision OR prerequisite.result=''))
 	AND ((t.project_id IS NULL AND t.initiator_id=t.owner_id) OR (t.project_id IS NOT NULL AND (t.checkpoint_through_seq>=0 OR EXISTS (
 	  SELECT 1 FROM project_members pm JOIN users pu ON pu.id=pm.user_id AND pu.status='approved'
 	  WHERE pm.project_id=t.project_id AND pm.user_id=t.initiator_id AND pm.role IN ('member','owner')
@@ -854,6 +880,10 @@ WHERE task_id=$1 AND owner_id=$2 AND role='user' AND delivery_status='pending'`,
 				return err
 			}
 		}
+		dependencyResults, err := loadTaskDependencyResultsInTx(ctx, tx, id, taskOwnerID)
+		if err != nil {
+			return err
+		}
 		found = true
 		if oldVersion == int64(^uint64(0)>>1) {
 			return domain.NewError(domain.CodeInvalidState, "task lease version is exhausted")
@@ -926,6 +956,7 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 		}
 		claimed = rowTaskDomain(row)
 		claimed.ConversationContext = conversationContext
+		claimed.DependencyResults = dependencyResults
 		return nil
 	})
 	return claimed, found, err

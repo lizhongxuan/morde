@@ -855,8 +855,8 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 	if err != nil || backgroundAccepted.Task.ConversationID != createdConversation.ID {
 		t.Fatalf("routed background cloud Task = %#v, %v", backgroundAccepted.Task, err)
 	}
-	if routeClassifier.calls.Load() != 2 {
-		t.Fatalf("synthetic route classifier calls after second message = %d, want 2", routeClassifier.calls.Load())
+	if routeClassifier.calls.Load() != 3 {
+		t.Fatalf("synthetic route classifier calls after second message and result review = %d, want 3", routeClassifier.calls.Load())
 	}
 	childWaitCtx, cancelChildWait := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelChildWait()
@@ -936,11 +936,14 @@ func (*f01ConversationRouteClassifier) ResolveConversationRouteModel(context.Con
 }
 
 func (classifier *f01ConversationRouteClassifier) ClassifyConversationRoute(ctx context.Context, _ app.ConversationRouteClaim,
-	_ app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	if err := ctx.Err(); err != nil {
 		return app.ConversationRouteDecision{}, err
 	}
 	classifier.calls.Add(1)
+	if value.ResultReview != nil {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "Background Task result received."}, nil
+	}
 	return app.ConversationRouteDecision{Action: app.ConversationRouteNew}, nil
 }
 

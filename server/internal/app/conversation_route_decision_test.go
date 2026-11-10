@@ -46,6 +46,29 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 	}
 }
 
+func TestConversationRouteDecisionFencesDependenciesToActiveTasks(t *testing.T) {
+	candidates := []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 4}}
+	decision := ParseConversationRouteDecision(`{"action":"new","task_id":"","question":"","dependency_task_ids":["q1234567"]}`, candidates)
+	if decision.Action != ConversationRouteNew || len(decision.DependencyTaskIDs) != 1 || decision.DependencyTaskIDs[0] != "q1234567" {
+		t.Fatalf("authorized dependency was not retained: %+v", decision)
+	}
+	for _, output := range []string{
+		`{"action":"new","task_id":"","question":"","dependency_task_ids":["q7654321"]}`,
+		`{"action":"new","task_id":"","question":"","dependency_task_ids":["q1234567","q1234567"]}`,
+		`{"action":"reply","task_id":"","question":"","reply":"done","dependency_task_ids":["q1234567"]}`,
+		`{"action":"stop","task_id":"q1234567","question":"","dependency_task_ids":["q1234567"]}`,
+	} {
+		if decision := ParseConversationRouteDecision(output, candidates); decision.Action != ConversationRouteClarify || len(decision.DependencyTaskIDs) != 0 {
+			t.Errorf("invalid dependency selection was accepted: %q => %+v", output, decision)
+		}
+	}
+	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "等前置任务完成再整理",
+		Candidates: candidates})
+	if err != nil || !strings.Contains(request.Instructions, "dependency_task_ids") || !strings.Contains(request.Input[0].Text, "q1234567") {
+		t.Fatalf("dependency context was not presented to the router: request=%+v err=%v", request, err)
+	}
+}
+
 func TestConversationRouteDirectReplyRequiresValidTargetlessText(t *testing.T) {
 	for _, output := range []string{
 		`{"action":"reply","task_id":"q1234567","question":"","reply":"answer"}`,

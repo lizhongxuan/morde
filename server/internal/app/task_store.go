@@ -29,8 +29,9 @@ type MessagePage struct {
 }
 
 type TaskPage struct {
-	Items      []task.Task
-	NextCursor string
+	Items         []task.Task
+	NextCursor    string
+	K2Projections map[string]TaskK2Projection
 }
 
 type TaskListRequest struct {
@@ -60,6 +61,12 @@ type ResultReview struct {
 	SourceTaskRevision  int64
 	SourceEventSequence int64
 	ReplyMessageID      *string
+}
+
+type TaskK2Projection struct {
+	Dependencies []Dependency
+	ChildJobs    []ChildJob
+	ResultReview *ResultReview
 }
 
 type TaskDetails struct {

@@ -128,6 +128,7 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 				err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status,message.conversation_id FROM conversation_messages AS message JOIN tasks AS task
 ON task.id=message.task_id AND task.owner_id=message.owner_id AND task.conversation_id=message.conversation_id
 WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3 AND message.actor_id=task.initiator_id
+ AND message.source_kind<>'task_result_review'
 FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &content, &deliveryStatus, &conversationID)
 				if errors.Is(err, pgx.ErrNoRows) {
 					if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
@@ -275,7 +276,7 @@ FROM conversation_messages AS message
 LEFT JOIN task_revision_intents revision ON revision.message_id=message.id
  AND revision.task_id=message.task_id AND revision.owner_id=message.owner_id
 WHERE message.task_id=$1 AND message.owner_id=$2 AND message.conversation_id=(SELECT conversation_id FROM tasks WHERE id=$1 AND owner_id=$2)
-  AND message.role='user' AND message.delivery_status='pending'
+  AND message.role='user' AND message.source_kind<>'task_result_review' AND message.delivery_status='pending'
 ORDER BY (revision.message_id IS NOT NULL),revision.expected_revision,message.sequence LIMIT 128`, fence.TaskID, fence.OwnerID)
 		if err != nil {
 			return fmt.Errorf("list pending task messages: %w", err)

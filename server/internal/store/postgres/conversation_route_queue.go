@@ -25,10 +25,10 @@ func (s *Store) ClaimConversationRoute(ctx context.Context, workerID string, dur
 	var found bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var metadata, authorization []byte
-		var role, delivery string
+		var role, delivery, sourceKind string
 		err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,
 COALESCE(m.task_id,''),m.model_id,m.sequence,m.delivery_status,m.created_at,
-r.service_instance_id::text,r.client_message_id,r.request_metadata,r.authorization_snapshot
+m.source_kind,r.service_instance_id::text,r.client_message_id,r.request_metadata,r.authorization_snapshot
 FROM conversation_message_routes r
 JOIN service_identity i ON i.instance_id=r.service_instance_id AND i.singleton=true
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.conversation_id=r.conversation_id
@@ -55,7 +55,7 @@ WHERE (r.state='pending' OR (r.state='processing' AND r.lease_expires_at<=clock_
 ORDER BY r.created_at,r.message_id FOR UPDATE OF r SKIP LOCKED LIMIT 1`).Scan(
 			&claim.Message.ID, &claim.Message.ConversationID, &claim.Message.OwnerID, &claim.Message.ActorID, &role,
 			&claim.Message.Content, &claim.Message.TaskID, &claim.Message.ModelID, &claim.Message.Sequence,
-			&delivery, &claim.Message.CreatedAt, &claim.ServiceInstanceID, &claim.Message.ClientMessageID, &metadata, &authorization)
+			&delivery, &claim.Message.CreatedAt, &sourceKind, &claim.ServiceInstanceID, &claim.Message.ClientMessageID, &metadata, &authorization)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -78,6 +78,7 @@ WHERE message_id=$1 RETURNING lease_version,lease_expires_at`, claim.Message.ID,
 		}
 		claim.LeaseOwner = workerID
 		claim.Message.Role = conversation.Role(role)
+		claim.Message.SourceKind = sourceKind
 		claim.Message.DeliveryStatus = conversation.DeliveryStatus(delivery)
 		claim.Message.RoutingStatus = conversation.RoutingProcessing
 		found = true

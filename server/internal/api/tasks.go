@@ -648,7 +648,7 @@ func (h *api) listTasks(service TaskService) gin.HandlerFunc {
 		}
 		response := taskPageResponse{Items: make([]taskSummaryResponse, 0, len(result.Items)), NextCursor: cursorPointer(result.NextCursor)}
 		for _, item := range result.Items {
-			view, err := toTaskSummaryResponse(item)
+			view, err := toTaskSummaryResponseWithK2(item, result.K2Projections[item.ID])
 			if err != nil {
 				writeError(c, err)
 				return
@@ -684,7 +684,7 @@ func (h *api) getTask(service TaskService) gin.HandlerFunc {
 	}
 }
 
-func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
+func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projection) (taskSummaryResponse, error) {
 	initiatorID := value.InitiatorID
 	if initiatorID == "" {
 		initiatorID = value.OwnerID
@@ -707,7 +707,7 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 		value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
-	return taskSummaryResponse{
+	response := taskSummaryResponse{
 		ID: value.ID, OwnerID: value.OwnerID, InitiatorID: initiatorID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
 		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, CurrentRevision: value.CurrentRevision,
 		DesiredRevision: value.DesiredRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
@@ -718,13 +718,44 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,
 		}, Dependencies: make([]taskDependencyResponse, 0), ChildJobs: make([]taskChildJobResponse, 0),
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-	}, nil
+	}
+	for _, dependency := range projection.Dependencies {
+		if !domain.ValidTaskID(dependency.TaskID) || dependency.RequiredRevision < 0 || !validTaskStatusResponse(dependency.TaskStatus) {
+			return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.Dependencies = append(response.Dependencies, taskDependencyResponse{
+			TaskID: dependency.TaskID, RequiredRevision: dependency.RequiredRevision,
+			TaskStatus: dependency.TaskStatus, Satisfied: dependency.Satisfied,
+		})
+	}
+	for _, job := range projection.ChildJobs {
+		if !utf8.ValidString(job.JobID) || utf8.RuneCountInString(job.JobID) < 1 || utf8.RuneCountInString(job.JobID) > 128 ||
+			!domain.ValidStepID(job.TaskStepID) || !utf8.ValidString(job.Title) || job.TaskRevision < 0 || !validStepStatus(job.Status) {
+			return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.ChildJobs = append(response.ChildJobs, taskChildJobResponse{
+			JobID: job.JobID, TaskStepID: job.TaskStepID, Title: job.Title, TaskRevision: job.TaskRevision, Status: job.Status,
+		})
+	}
+	if review := projection.ResultReview; review != nil {
+		if !validTaskResultReviewState(review.State) || !domain.ValidTaskID(review.SourceTaskID) || review.SourceTaskRevision < 0 ||
+			review.SourceEventSequence < 1 || (review.ReplyMessageID != nil && !domain.ValidMessageID(*review.ReplyMessageID)) {
+			return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.ResultReview = &taskResultReviewResponse{
+			State: review.State, SourceTaskID: review.SourceTaskID, SourceTaskRevision: review.SourceTaskRevision,
+			SourceEventSequence: review.SourceEventSequence, ReplyMessageID: review.ReplyMessageID,
+		}
+	}
+	return response, nil
 }
 
 func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	taskSummary := value.Task
 	taskSummary.StepCount, taskSummary.CompletedStepCount = task.StepCounts(value.Steps)
-	summary, err := toTaskSummaryResponse(taskSummary)
+	summary, err := toTaskSummaryResponseWithK2(taskSummary, app.TaskK2Projection{
+		Dependencies: value.Dependencies, ChildJobs: value.ChildJobs, ResultReview: value.ResultReview,
+	})
 	if err != nil {
 		return taskResponse{}, err
 	}
@@ -737,36 +768,6 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
 		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt,
-	}
-	response.Dependencies = make([]taskDependencyResponse, 0, len(value.Dependencies))
-	for _, dependency := range value.Dependencies {
-		if !domain.ValidTaskID(dependency.TaskID) || dependency.RequiredRevision < 0 || !validTaskStatusResponse(dependency.TaskStatus) {
-			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-		}
-		response.Dependencies = append(response.Dependencies, taskDependencyResponse{
-			TaskID: dependency.TaskID, RequiredRevision: dependency.RequiredRevision,
-			TaskStatus: dependency.TaskStatus, Satisfied: dependency.Satisfied,
-		})
-	}
-	response.ChildJobs = make([]taskChildJobResponse, 0, len(value.ChildJobs))
-	for _, job := range value.ChildJobs {
-		if !utf8.ValidString(job.JobID) || utf8.RuneCountInString(job.JobID) < 1 || utf8.RuneCountInString(job.JobID) > 128 ||
-			!domain.ValidStepID(job.TaskStepID) || !utf8.ValidString(job.Title) || job.TaskRevision < 0 || !validStepStatus(job.Status) {
-			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-		}
-		response.ChildJobs = append(response.ChildJobs, taskChildJobResponse{
-			JobID: job.JobID, TaskStepID: job.TaskStepID, Title: job.Title, TaskRevision: job.TaskRevision, Status: job.Status,
-		})
-	}
-	if review := value.ResultReview; review != nil {
-		if !validTaskResultReviewState(review.State) || !domain.ValidTaskID(review.SourceTaskID) || review.SourceTaskRevision < 0 ||
-			review.SourceEventSequence < 1 || (review.ReplyMessageID != nil && !domain.ValidMessageID(*review.ReplyMessageID)) {
-			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-		}
-		response.ResultReview = &taskResultReviewResponse{
-			State: review.State, SourceTaskID: review.SourceTaskID, SourceTaskRevision: review.SourceTaskRevision,
-			SourceEventSequence: review.SourceEventSequence, ReplyMessageID: review.ReplyMessageID,
-		}
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
 		message := assistant.Message

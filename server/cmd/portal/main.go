@@ -645,7 +645,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize record worker: %w", err)
 	}
-	resultWorker, err := worker.NewConversationResultAggregationWorker(store, 100*time.Millisecond, logger)
+	resultWorker, err := worker.NewConversationResultReviewWorker(store, 100*time.Millisecond, logger)
 	if err != nil {
 		return fmt.Errorf("initialize conversation result worker: %w", err)
 	}
@@ -1349,7 +1349,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, resultWorker *worker.ConversationResultAggregationWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)

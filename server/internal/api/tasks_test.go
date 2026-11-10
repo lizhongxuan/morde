@@ -727,7 +727,14 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 	value := apiTestTask()
 	value.StepCount = 3
 	value.CompletedStepCount = 1
-	service := &taskServiceStub{listPage: app.TaskPage{Items: []task.Task{value}}}
+	service := &taskServiceStub{listPage: app.TaskPage{
+		Items: []task.Task{value},
+		K2Projections: map[string]app.TaskK2Projection{value.ID: {
+			Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusCompleted, Satisfied: true}},
+			ChildJobs:    []app.ChildJob{{JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning}},
+			ResultReview: &app.ResultReview{State: "pending", SourceTaskID: value.ID, SourceTaskRevision: 3, SourceEventSequence: 9},
+		}},
+	}}
 	engine := taskAPIRouter(service, nil)
 	response := httptest.NewRecorder()
 	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks?limit=20", nil))
@@ -736,20 +743,21 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 	}
 	var body struct {
 		Items []struct {
-			StepCount          int64             `json:"step_count"`
-			CompletedStepCount int64             `json:"completed_step_count"`
-			Dependencies       []json.RawMessage `json:"dependencies"`
-			ChildJobs          []json.RawMessage `json:"child_jobs"`
-			ResultReview       json.RawMessage   `json:"result_review"`
+			StepCount          int64                     `json:"step_count"`
+			CompletedStepCount int64                     `json:"completed_step_count"`
+			Dependencies       []taskDependencyResponse  `json:"dependencies"`
+			ChildJobs          []taskChildJobResponse    `json:"child_jobs"`
+			ResultReview       *taskResultReviewResponse `json:"result_review"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
 	if len(body.Items) != 1 || body.Items[0].StepCount != 3 || body.Items[0].CompletedStepCount != 1 ||
-		body.Items[0].Dependencies == nil || len(body.Items[0].Dependencies) != 0 ||
-		body.Items[0].ChildJobs == nil || len(body.Items[0].ChildJobs) != 0 || string(body.Items[0].ResultReview) != "null" {
-		t.Fatalf("task summary counts = %#v; want total 3, completed 1", body.Items)
+		len(body.Items[0].Dependencies) != 1 || body.Items[0].Dependencies[0].TaskID != "q7654321" || !body.Items[0].Dependencies[0].Satisfied ||
+		len(body.Items[0].ChildJobs) != 1 || body.Items[0].ChildJobs[0].JobID != "dsh-child-1" ||
+		body.Items[0].ResultReview == nil || body.Items[0].ResultReview.State != "pending" || body.Items[0].ResultReview.SourceTaskID != value.ID {
+		t.Fatalf("task summary counts and K2 projection = %#v", body.Items)
 	}
 }
 
@@ -1039,19 +1047,29 @@ func TestConversationTaskSubmissionRouteIsRemoved(t *testing.T) {
 func TestConversationActiveTasksIncludesCursor(t *testing.T) {
 	value := apiTestTask()
 	value.EventSequence = 7
-	service := &taskServiceStub{conversationTasks: app.TaskPage{Items: []task.Task{value}, NextCursor: "next"}}
+	service := &taskServiceStub{conversationTasks: app.TaskPage{
+		Items: []task.Task{value}, NextCursor: "next",
+		K2Projections: map[string]app.TaskK2Projection{value.ID: {
+			Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusRunning}},
+			ChildJobs:    []app.ChildJob{{JobID: "dsh-child-2", TaskStepID: "s1234568", Title: "Draft", TaskRevision: 1, Status: task.StepSucceeded}},
+			ResultReview: &app.ResultReview{State: "published", SourceTaskID: value.ID, SourceTaskRevision: 1, SourceEventSequence: 7},
+		}},
+	}}
 	response := httptest.NewRecorder()
 	taskAPIRouter(service, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/tasks?limit=1", nil))
 	var body struct {
 		Items []struct {
-			ID            string `json:"id"`
-			EventSequence int64  `json:"event_sequence"`
+			taskSummaryResponse
+			EventSequence int64 `json:"event_sequence"`
 		} `json:"items"`
 		NextCursor string `json:"next_cursor"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK ||
 		service.conversationTaskID != "c1234567" || len(body.Items) != 1 || body.Items[0].ID != value.ID ||
-		body.Items[0].EventSequence != 7 || body.NextCursor != "next" {
+		body.Items[0].EventSequence != 7 || body.NextCursor != "next" || len(body.Items[0].Dependencies) != 1 ||
+		body.Items[0].Dependencies[0].TaskStatus != task.StatusRunning || len(body.Items[0].ChildJobs) != 1 ||
+		body.Items[0].ChildJobs[0].TaskRevision != 1 || body.Items[0].ResultReview == nil ||
+		body.Items[0].ResultReview.State != "published" {
 		t.Fatalf("active tasks response=%d body=%s err=%v", response.Code, response.Body.String(), err)
 	}
 }

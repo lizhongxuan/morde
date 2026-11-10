@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -247,7 +248,7 @@ func TestRouteModelDirectReplySettlesReplaysAndAppliesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayed, err := restarted.ClassifyConversationRoute(ctx, claim, value)
-	if err != nil || replayed != decision || client.calls.Load() != 1 {
+	if err != nil || !reflect.DeepEqual(replayed, decision) || client.calls.Load() != 1 {
 		t.Fatalf("direct reply was not replayed from the settled route receipt: replay=%+v calls=%d err=%v", replayed, client.calls.Load(), err)
 	}
 
@@ -276,7 +277,7 @@ FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.messag
 			routeState, delivery, taskID, assistantCount, answer)
 	}
 	var stored app.ConversationRouteDecision
-	if err := store.pool.QueryRow(ctx, `SELECT decision FROM conversation_route_model_calls WHERE message_id=$1`, claim.Message.ID).Scan(&stored); err != nil || stored != decision {
+	if err := store.pool.QueryRow(ctx, `SELECT decision FROM conversation_route_model_calls WHERE message_id=$1`, claim.Message.ID).Scan(&stored); err != nil || !reflect.DeepEqual(stored, decision) {
 		t.Fatalf("durable direct reply/model output differed from replay: stored=%+v want=%+v err=%v", stored, decision, err)
 	}
 }

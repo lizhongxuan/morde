@@ -36,6 +36,28 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(message.routing_status, "pending")
     }
 
+    func testPublishedTaskResultIsShownOnceWithItsSource() {
+        let snapshot = MordeClientMessage(
+            id: "m0000001", conversation_id: "c1234567", task_id: "q1234567",
+            role: "assistant", content: "A result", output_status: "completed",
+            output_task_revision: 2, output_result_event_sequence: 7)
+        let published = MordeClientMessage(
+            id: "m0000002", conversation_id: "c1234567", task_id: "q1234567",
+            role: "assistant", content: "The main assistant reply", status: "completed",
+            sources: [MordeClientMessageSource(
+                user_message_id: "m1234567", task_id: "q1234567", task_revision: 2,
+                event_sequence: 7, content: "A result")])
+
+        let merged = MordeTaskSnapshotMessageMerge.merge(
+            [published], snapshot: snapshot, taskID: "q1234567", conversationID: "c1234567")
+
+        XCTAssertEqual(merged.map(\.id), ["m0000002"])
+        XCTAssertFalse(MordeTaskSnapshotMessageMerge.shouldShowTaskResult(
+            resultMessagePending: false, resultMessagePublished: true))
+        XCTAssertEqual(merged.first?.sources?.first?.task_revision, 2)
+        XCTAssertEqual(merged.first?.sources?.first?.event_sequence, 7)
+    }
+
     func testExpiredCredentialIsRejected() throws {
         let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-11-09T12:00:00Z"))
 

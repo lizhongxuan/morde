@@ -109,6 +109,37 @@ WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 AND conversation_id=$4 AND desir
 	if result.RowsAffected() != 1 {
 		return domain.NewError(domain.CodeConflict, "task revision changed before modification")
 	}
+	if _, err := tx.Exec(ctx, `UPDATE task_dependencies SET required_revision=$2
+WHERE dependency_task_id=$1 AND required_revision<$2`, candidate.TaskID, desired+1); err != nil {
+		return fmt.Errorf("advance dependent Task revisions: %w", err)
+	}
+	rows, err := tx.Query(ctx, `SELECT dependent.id,dependent.owner_id FROM task_dependencies dependency
+JOIN tasks dependent ON dependent.id=dependency.task_id AND dependent.owner_id=dependency.owner_id
+WHERE dependency.dependency_task_id=$1 AND dependent.status IN ('running','waiting_user','pausing','paused','cancelling')
+ORDER BY dependent.id FOR UPDATE OF dependent`, candidate.TaskID)
+	if err != nil {
+		return fmt.Errorf("lock active dependent Tasks after revision: %w", err)
+	}
+	type dependentTask struct{ id, ownerID string }
+	var activeDependents []dependentTask
+	for rows.Next() {
+		var dependent dependentTask
+		if err := rows.Scan(&dependent.id, &dependent.ownerID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read active dependent Task: %w", err)
+		}
+		activeDependents = append(activeDependents, dependent)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate active dependent Tasks: %w", err)
+	}
+	rows.Close()
+	for _, dependent := range activeDependents {
+		if err := requestTaskCancellationForAuthorization(ctx, tx, dependent.id, dependent.ownerID); err != nil {
+			return fmt.Errorf("stop dependent Task after prerequisite revision: %w", err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO task_revision_intents
 (message_id,task_id,owner_id,initiator_id,conversation_id,message_sequence,expected_revision,state,stop_request_id,
 interrupted_lease_owner,interrupted_lease_version,interrupted_agent_instance_id,interrupted_agent_generation)

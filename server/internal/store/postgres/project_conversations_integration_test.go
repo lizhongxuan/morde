@@ -82,8 +82,9 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 	aggregation := resultAggregationFixture{store: store, ownerID: owner.ID, conversation: created}
 	completed := resultAggregationTask{ID: ownerTask.Task.ID, ActorID: owner.ID, UserMessageID: ownerTask.Message.ID, TurnID: mustID(t, domain.NewStepID)}
 	if !aggregation.complete(t, &completed, "owner's confirmed answer") {
-		t.Fatal("owner's Task result was not published")
+		t.Fatal("owner's Task result was not queued for review")
 	}
+	aggregation.runNextReview(t)
 	memberTask := append(member.ID, "project-conversation-member-message", "from member")
 	for _, actorID := range []string{owner.ID, member.ID} {
 		page, err := service.ListTasks(ctx, principal(actorID), projectValue.ID, created.ID, app.PageRequest{Limit: 20})
@@ -98,7 +99,9 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 		page, err := service.ListMessages(ctx, principal(actorID), projectValue.ID, created.ID, app.PageRequest{Limit: 20})
 		if err != nil || len(page.Items) != 3 || page.Items[0].ActorID != owner.ID || page.Items[1].ActorID != owner.ID ||
 			page.Items[2].ActorID != member.ID || page.Items[0].Content != "from owner" ||
-			page.Items[1].Content != "owner's confirmed answer" || page.Items[2].Content != "from member" {
+			page.Items[1].Content != resultReviewTestReply || len(page.Items[1].Sources) != 1 ||
+			page.Items[1].Sources[0].TaskID != ownerTask.Task.ID || page.Items[1].Sources[0].Content != "owner's confirmed answer" ||
+			page.Items[2].Content != "from member" {
 			t.Fatalf("shared history for %s = %#v err=%v", actorID, page, err)
 		}
 	}
@@ -185,8 +188,8 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 	}
 	contextValue := claimed.ConversationContext
 	if contextValue == nil || contextValue.Scope != "project" || contextValue.ProjectID != projectValue.ID ||
-		contextValue.OwnerID != owner.ID || contextValue.InitiatorID != member.ID || contextValue.ThroughSequence != 2 || len(contextValue.Messages) != 2 ||
-		contextValue.Messages[0].Content != "from owner" || contextValue.Messages[1].Content != "owner's confirmed answer" {
+		contextValue.OwnerID != owner.ID || contextValue.InitiatorID != member.ID || contextValue.ThroughSequence != 3 || len(contextValue.Messages) != 2 ||
+		contextValue.Messages[0].Content != "from owner" || contextValue.Messages[1].Content != resultReviewTestReply {
 		t.Fatalf("member project Task context = %#v", contextValue)
 	}
 	paused, err := tasks.RequestAction(ctx, principal(member.ID), memberTask.Task.ID, task.ActionPause, task.StatusRunning, "project-task-pause")

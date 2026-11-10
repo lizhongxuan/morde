@@ -35,11 +35,11 @@ func lockConversationRouteClaim(ctx context.Context, tx pgx.Tx, claim app.Conver
 	if err := lockConversationReceiptScopeInTx(ctx, tx, receipt); err != nil {
 		return err
 	}
-	var content, role, clientID string
+	var content, role, sourceKind, clientID string
 	var sequence int64
 	var createdAt time.Time
 	var metadata, authorization []byte
-	err := tx.QueryRow(ctx, `SELECT m.content,m.role,m.sequence,m.created_at,r.client_message_id,r.request_metadata,r.authorization_snapshot
+	err := tx.QueryRow(ctx, `SELECT m.content,m.role,m.source_kind,m.sequence,m.created_at,r.client_message_id,r.request_metadata,r.authorization_snapshot
 FROM conversation_message_routes r
 JOIN service_identity i ON i.singleton=true AND i.instance_id=r.service_instance_id
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id
@@ -47,7 +47,7 @@ JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id
 WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.owner_id=$3 AND r.actor_id=$4 AND r.conversation_id=$5
  AND r.state='processing' AND r.lease_owner=$6 AND r.lease_version=$7 AND r.lease_expires_at>clock_timestamp()
 FOR UPDATE OF r`, claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID,
-		claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion).Scan(&content, &role, &sequence, &createdAt, &clientID, &metadata, &authorization)
+		claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion).Scan(&content, &role, &sourceKind, &sequence, &createdAt, &clientID, &metadata, &authorization)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeConflict, "conversation route lease is no longer current")
 	}
@@ -58,9 +58,16 @@ FOR UPDATE OF r`, claim.ServiceInstanceID, claim.Message.ID, claim.Message.Owner
 	var auth task.Authorization
 	if json.Unmarshal(metadata, &input) != nil || json.Unmarshal(authorization, &auth) != nil ||
 		!reflect.DeepEqual(input, claim.Input) || !reflect.DeepEqual(auth, claim.Authorization) ||
-		content != claim.Message.Content || role != string(conversation.RoleUser) || sequence != claim.Message.Sequence ||
+		content != claim.Message.Content || role != string(conversation.RoleUser) ||
+		(claim.Message.SourceKind != "" && sourceKind != claim.Message.SourceKind) || sequence != claim.Message.Sequence ||
 		clientID != claim.Message.ClientMessageID || !createdAt.Equal(claim.Message.CreatedAt) {
 		return domain.NewError(domain.CodeConflict, "conversation route receipt has changed")
+	}
+	if claim.Input.ResultReviewID != "" {
+		return lockTaskResultReviewRouteClaim(ctx, tx, claim, sourceKind)
+	}
+	if sourceKind == "task_result_review" {
+		return domain.NewError(domain.CodeConflict, "internal result review route is missing its review identity")
 	}
 	if auth.Kind != string(identity.KindSession) && auth.Kind != string(identity.KindClient) ||
 		!domain.ValidTokenID(auth.TokenID) || auth.ExpiresAt == nil || !auth.ExpiresAt.After(time.Now()) {
@@ -130,6 +137,9 @@ func (s *Store) LoadConversationRouteSnapshot(ctx context.Context, claim app.Con
 		}
 		var err error
 		snapshot, err = loadConversationRouteSnapshotInTx(ctx, tx, claim, false)
+		if err == nil && snapshot.ResultReviewSuperseded {
+			err = finishConversationRoute(ctx, tx, claim, "routed", "", "", true)
+		}
 		return err
 	})
 	return snapshot, err
@@ -211,6 +221,14 @@ func loadConversationRouteSnapshotInTx(ctx context.Context, tx pgx.Tx, claim app
 	value := app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{ActorID: claim.Message.ActorID,
 		Content: claim.Message.Content, ReferenceTaskID: claim.Input.ReferenceTaskID,
 		History: []app.ConversationRouteHistory{}, Candidates: []app.ConversationRouteCandidate{}}}
+	if claim.Input.ResultReviewID != "" {
+		resultReview, err := loadConversationTaskResultReviewInTx(ctx, tx, claim)
+		if err != nil {
+			return app.ConversationRouteSnapshot{}, err
+		}
+		value.Context.ResultReview = resultReview
+		value.ResultReviewSuperseded = resultReview == nil
+	}
 	if claim.Input.ProjectID != "" && claim.Input.ReferenceTaskID != "" {
 		query := `SELECT waiting_reason FROM tasks WHERE id=$1 AND owner_id=$2 AND conversation_id=$3
  AND project_id=$4 AND initiator_id=$5`
@@ -269,7 +287,8 @@ SELECT COALESCE(bool_or(cycle OR (depth=128 AND previous_id IS NOT NULL)),false)
 	}
 	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.role,m.content FROM conversation_messages m
 LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
-WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
+WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind<>'task_result_review'
+ AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
  AND (
    (m.actor_id=$4 AND (m.task_id IS NULL OR t.initiator_id=$4)
     AND (m.role='user' OR (m.role='assistant' AND (
@@ -377,6 +396,9 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if err != nil {
 			return err
 		}
+		if current.ResultReviewSuperseded {
+			return finishConversationRoute(ctx, tx, claim, "routed", "", "", true)
+		}
 		if !app.ValidConversationRouteModelOutput(decision.ModelOutput) {
 			return domain.InvalidArgument("route_decision", "conversation route model output is invalid")
 		}
@@ -426,6 +448,9 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		} else if current.PreviousMissing && decision.Action != app.ConversationRouteClarify {
 			return domain.NewError(domain.CodeConflict, "previous conversation message is unavailable")
 		}
+		if current.Context.ResultReview != nil && decision.Action != app.ConversationRouteReply {
+			return domain.NewError(domain.CodeInvalidState, "task result review must produce a reply")
+		}
 		var candidate *app.ConversationRouteCandidate
 		for index := range current.Context.Candidates {
 			item := &current.Context.Candidates[index]
@@ -445,8 +470,11 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		}
 		switch decision.Action {
 		case app.ConversationRouteNew:
-			return createConversationRouteTask(ctx, tx, claim, modelID)
+			return createConversationRouteTask(ctx, tx, claim, modelID, decision.DependencyTaskIDs, current.Context.Candidates)
 		case app.ConversationRouteReply:
+			if current.Context.ResultReview != nil {
+				return publishConversationResultReviewInTx(ctx, tx, claim, decision.Reply)
+			}
 			result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied'
 WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user' AND task_id IS NULL AND delivery_status='pending'`,
 				claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID)
@@ -529,9 +557,13 @@ WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, candidate.
 	})
 }
 
-func createConversationRouteTask(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, modelID string) error {
+func createConversationRouteTask(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, modelID string,
+	dependencyTaskIDs []string, candidates []app.ConversationRouteCandidate) error {
 	if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
 		return err
+	}
+	if !app.ValidConversationRouteDependencyIDs(dependencyTaskIDs, candidates) {
+		return domain.NewError(domain.CodeConflict, "task dependency selection is no longer current")
 	}
 	if !domain.ValidModelConnectionID(modelID) || claim.Input.Budget.Validate() != nil {
 		return domain.InvalidArgument("route_model", "conversation route model or budget is invalid")
@@ -611,6 +643,25 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	}
 	if err := insertTask(ctx, tx, value, 1, gate.epoch); err != nil {
 		return err
+	}
+	for _, dependencyTaskID := range dependencyTaskIDs {
+		var requiredRevision int64
+		err := tx.QueryRow(ctx, `SELECT desired_revision FROM tasks
+WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND initiator_id=$4
+ AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')
+ AND waiting_reason<>'project_recovery_unavailable' FOR UPDATE`, dependencyTaskID, value.OwnerID, value.ConversationID, value.InitiatorID).
+			Scan(&requiredRevision)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "task dependency changed before submission")
+		}
+		if err != nil {
+			return fmt.Errorf("lock task dependency for submission: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO task_dependencies
+(task_id,owner_id,conversation_id,dependency_task_id,required_revision) VALUES ($1,$2,$3,$4,$5)`,
+			value.ID, value.OwnerID, value.ConversationID, dependencyTaskID, requiredRevision); err != nil {
+			return fmt.Errorf("persist task dependency: %w", err)
+		}
 	}
 	if err := insertTaskEvent(ctx, tx, task.Event{TaskID: value.ID, Sequence: 1, Type: "task.status", Payload: payload}); err != nil {
 		return err
@@ -794,9 +845,13 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversat
 			}
 		}
 	}
-	return recordAccountObjectChanges(ctx, tx,
-		accountObjectChange{OwnerID: claim.Message.OwnerID, ObjectType: "conversation", ObjectID: claim.Message.ConversationID, Operation: "upsert", MutationID: claim.Message.ClientMessageID},
-		accountObjectChange{OwnerID: claim.Message.OwnerID, ObjectType: "message", ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID})
+	changes := []accountObjectChange{{OwnerID: claim.Message.OwnerID, ObjectType: "conversation",
+		ObjectID: claim.Message.ConversationID, Operation: "upsert", MutationID: claim.Message.ClientMessageID}}
+	if claim.Input.ResultReviewID == "" {
+		changes = append(changes, accountObjectChange{OwnerID: claim.Message.OwnerID, ObjectType: "message",
+			ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID})
+	}
+	return recordAccountObjectChanges(ctx, tx, changes...)
 }
 
 func (s *Store) FailConversationRoute(ctx context.Context, claim app.ConversationRouteClaim, reason string) error {
@@ -804,6 +859,40 @@ func (s *Store) FailConversationRoute(ctx context.Context, claim app.Conversatio
 		return domain.InvalidArgument("route_failure", "invalid conversation route failure")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		var taskIDs []string
+		if claim.Input.ResultReviewID != "" {
+			var reviewState string
+			err := tx.QueryRow(ctx, `SELECT state FROM conversation_result_batches
+WHERE message_id=$1 AND trigger_message_id=$2 FOR UPDATE`, claim.Input.ResultReviewID, claim.Message.ID).Scan(&reviewState)
+			if err != nil {
+				return domain.NewError(domain.CodeConflict, "task result review route is no longer current")
+			}
+			if reviewState != "processing" && reviewState != "superseded" {
+				return domain.NewError(domain.CodeConflict, "task result review route is no longer current")
+			}
+			taskIDs, err = conversationResultReviewTaskIDsInTx(ctx, tx, claim.Input.ResultReviewID)
+			if err != nil {
+				return err
+			}
+			if reviewState == "superseded" {
+				result, err := tx.Exec(ctx, `UPDATE conversation_message_routes r SET state='routed',failure_reason='',
+lease_owner='',lease_expires_at=NULL,updated_at=clock_timestamp()
+FROM service_identity i WHERE i.singleton=true AND i.instance_id=r.service_instance_id AND r.service_instance_id=$1::uuid
+ AND r.message_id=$2 AND r.state='processing' AND r.lease_owner=$3 AND r.lease_version=$4 AND r.lease_expires_at>clock_timestamp()
+ AND r.owner_id=$5 AND r.actor_id=$6 AND r.conversation_id=$7`, claim.ServiceInstanceID, claim.Message.ID, claim.LeaseOwner,
+					claim.LeaseVersion, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID)
+				if err != nil {
+					return fmt.Errorf("finish superseded task result review route: %w", err)
+				}
+				if result.RowsAffected() != 1 {
+					return domain.NewError(domain.CodeConflict, "conversation route lease is no longer current")
+				}
+				if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied' WHERE id=$1`, claim.Message.ID); err != nil {
+					return fmt.Errorf("finish superseded task result review trigger: %w", err)
+				}
+				return recordTaskResultReviewChanges(ctx, tx, claim, taskIDs)
+			}
+		}
 		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes r SET state='failed',failure_reason=$5,
 lease_owner='',lease_expires_at=NULL,updated_at=clock_timestamp()
 FROM service_identity i WHERE i.singleton=true AND i.instance_id=r.service_instance_id AND r.service_instance_id=$1::uuid
@@ -817,9 +906,33 @@ FROM service_identity i WHERE i.singleton=true AND i.instance_id=r.service_insta
 		if result.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "conversation route lease is no longer current")
 		}
+		if claim.Input.ResultReviewID != "" {
+			result, err := tx.Exec(ctx, `UPDATE conversation_result_batches SET state='failed',updated_at=clock_timestamp()
+WHERE message_id=$1 AND trigger_message_id=$2 AND state='processing'`, claim.Input.ResultReviewID, claim.Message.ID)
+			if err != nil {
+				return fmt.Errorf("fail task result review batch: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "task result review changed before failure was recorded")
+			}
+			if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied' WHERE id=$1`, claim.Message.ID); err != nil {
+				return fmt.Errorf("finish failed task result review trigger: %w", err)
+			}
+			return recordTaskResultReviewChanges(ctx, tx, claim, taskIDs)
+		}
 		return recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
 			ObjectType: "message", ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID})
 	})
+}
+
+func recordTaskResultReviewChanges(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, taskIDs []string) error {
+	changes := make([]accountObjectChange, 0, len(taskIDs)+1)
+	for _, taskID := range taskIDs {
+		changes = append(changes, accountObjectChange{OwnerID: claim.Message.OwnerID, ObjectType: "task", ObjectID: taskID, Operation: "upsert"})
+	}
+	changes = append(changes, accountObjectChange{OwnerID: claim.Message.OwnerID, ObjectType: "conversation",
+		ObjectID: claim.Message.ConversationID, Operation: "upsert"})
+	return recordAccountObjectChanges(ctx, tx, changes...)
 }
 
 // RetryConversationRoute reuses the accepted message and requires a fresh,

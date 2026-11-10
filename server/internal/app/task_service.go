@@ -434,7 +434,23 @@ func (s *TaskService) List(ctx context.Context, principal identity.Principal, fi
 		visible = append(visible, item)
 	}
 	page.Items = visible
+	retainTaskK2Projections(&page)
 	return page, nil
+}
+
+func retainTaskK2Projections(page *TaskPage) {
+	if page == nil || page.K2Projections == nil {
+		return
+	}
+	visible := make(map[string]struct{}, len(page.Items))
+	for _, item := range page.Items {
+		visible[item.ID] = struct{}{}
+	}
+	for taskID := range page.K2Projections {
+		if _, ok := visible[taskID]; !ok {
+			delete(page.K2Projections, taskID)
+		}
+	}
 }
 
 // ListConversationActiveTasks returns only tasks visible to this caller in the selected conversation.
@@ -485,6 +501,7 @@ func (s *TaskService) ListConversationActiveTasks(ctx context.Context, principal
 		visible = append(visible, item)
 	}
 	result.Items = visible
+	retainTaskK2Projections(&result)
 	return result, nil
 }
 

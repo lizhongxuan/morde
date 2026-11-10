@@ -569,7 +569,8 @@ CASE WHEN m.output_status='streaming' AND NOT EXISTS (
   AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
 ) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence
 FROM conversation_messages m LEFT JOIN conversation_message_routes r ON r.message_id=m.id
-WHERE m.owner_id=$1 AND m.conversation_id=$2 AND ($3::bigint=0 OR m.sequence<$3::bigint)
+WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.source_kind<>'task_result_review'
+  AND ($3::bigint=0 OR m.sequence<$3::bigint)
 ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	if err != nil {
 		return app.MessagePage{}, fmt.Errorf("list conversation messages: %w", err)
@@ -645,7 +646,8 @@ JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.p
 JOIN project_members pm ON pm.project_id=c.project_id AND pm.user_id=$2
 JOIN users u ON u.id=pm.user_id AND u.status='approved'
 LEFT JOIN conversation_message_routes r ON r.message_id=m.id
-WHERE m.conversation_id=$3 AND ($4::bigint=0 OR m.sequence<$4::bigint)
+WHERE m.conversation_id=$3 AND m.source_kind<>'task_result_review'
+  AND ($4::bigint=0 OR m.sequence<$4::bigint)
 ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, limit+1)
 	if err != nil {
 		return app.MessagePage{}, fmt.Errorf("list project conversation messages: %w", err)
@@ -741,6 +743,7 @@ func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projec
 	}
 	var rows []sqlcgen.Task
 	var items []task.Task
+	var k2Projections map[string]app.TaskK2Projection
 	err = s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		if projectID != "" {
 			if _, err := loadProjectConversationForActorInTx(ctx, tx, actorID, projectID, conversationID, false); err != nil {
@@ -767,12 +770,20 @@ func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projec
 		if err := populateTaskStepCounts(ctx, tx, items); err != nil {
 			return err
 		}
-		return populateTaskRevisionProjection(ctx, tx, items)
+		if err := populateTaskRevisionProjection(ctx, tx, items); err != nil {
+			return err
+		}
+		projectionItems := items
+		if int32(len(projectionItems)) > limit {
+			projectionItems = projectionItems[:limit]
+		}
+		k2Projections, err = loadTaskK2Projections(ctx, tx, projectionItems)
+		return err
 	})
 	if err != nil {
 		return app.TaskPage{}, fmt.Errorf("list active conversation tasks: %w", err)
 	}
-	result := app.TaskPage{Items: items}
+	result := app.TaskPage{Items: items, K2Projections: k2Projections}
 	result.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
 	if int32(len(items)) > limit {
 		result.Items = items[:limit]

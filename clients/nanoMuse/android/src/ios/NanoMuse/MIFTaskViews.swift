@@ -845,6 +845,7 @@ struct MIFTaskDetailView: View {
             }
             taskSummary(task)
             taskSteps(task)
+            taskRelationships(task)
             taskPendingRequest(task)
             taskClarification(task)
             taskActivity(task)
@@ -882,6 +883,104 @@ struct MIFTaskDetailView: View {
             .padding(.horizontal, 22)
             .padding(.top, 2)
             .accessibilityIdentifier("morde.task.status")
+    }
+
+    @ViewBuilder
+    private func taskRelationships(_ task: MordeTask) -> some View {
+        let dependencies = task.dependencies ?? []
+        let childJobs = task.child_jobs ?? []
+        if !dependencies.isEmpty || !childJobs.isEmpty || task.result_review != nil {
+            MIFTaskSection(title: AppLocalized("Task relationships")) {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !dependencies.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(AppLocalized("Dependencies"))
+                                .font(.subheadline.weight(.semibold))
+                            ForEach(dependencies, id: \.task_id) { dependency in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: dependency.satisfied ? "checkmark.circle.fill" : "clock")
+                                        .foregroundStyle(dependency.satisfied ? NanoMuseTones.action : .orange)
+                                        .accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(String(format: AppLocalized("%@ · required revision %lld"),
+                                                    dependency.task_id, dependency.required_revision))
+                                            .font(.subheadline.weight(.medium))
+                                        Text(NSLocalizedString(MordeTaskStatusPresentation.localizationKey(
+                                            status: dependency.task_status), comment: "Task dependency status"))
+                                            .font(.caption)
+                                            .foregroundStyle(taskSecondaryText)
+                                    }
+                                    Spacer(minLength: 4)
+                                    Text(AppLocalized(dependency.satisfied ? "Dependency satisfied" : "Waiting for dependency"))
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(dependency.satisfied ? NanoMuseTones.action : .orange)
+                                        .multilineTextAlignment(.trailing)
+                                }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityIdentifier("morde.task.dependency.\(dependency.task_id).\(dependency.required_revision)")
+                            }
+                        }
+                        .accessibilityIdentifier("morde.task.dependencies")
+                    }
+
+                    if !childJobs.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(AppLocalized("Child jobs"))
+                                .font(.subheadline.weight(.semibold))
+                            ForEach(childJobs, id: \.job_id) { job in
+                                HStack(alignment: .top, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(job.title)
+                                            .font(.subheadline.weight(.medium))
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        Text(String(format: AppLocalized("Revision %lld"), job.task_revision))
+                                            .font(.caption)
+                                            .foregroundStyle(taskSecondaryText)
+                                    }
+                                    Spacer(minLength: 4)
+                                    Text(MIFTaskPresentation.stepStatusLabel(job.status))
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(taskSecondaryText)
+                                        .multilineTextAlignment(.trailing)
+                                }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityIdentifier("morde.task.childJob.\(job.id)")
+                            }
+                        }
+                        .accessibilityIdentifier("morde.task.childJobs")
+                    }
+
+                    if let review = task.result_review {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(AppLocalized("Task result review"))
+                                .font(.subheadline.weight(.semibold))
+                            Text(resultReviewLabel(review.state))
+                                .font(.subheadline)
+                            Text(String(format: AppLocalized("Source %@ · revision %lld · event %lld"),
+                                        review.source_task_id, review.source_task_revision,
+                                        review.source_event_sequence))
+                                .font(.caption)
+                                .foregroundStyle(taskSecondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("morde.task.resultReview")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            }
+        }
+    }
+
+    private func resultReviewLabel(_ state: String) -> String {
+        switch state {
+        case "pending": return AppLocalized("Result review pending")
+        case "processing": return AppLocalized("Result review processing")
+        case "published": return AppLocalized("Result published")
+        case "failed": return AppLocalized("Result review failed")
+        default: return AppLocalized("Result review status unknown")
+        }
     }
 
     @ViewBuilder

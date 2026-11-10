@@ -877,7 +877,9 @@ func TestTaskServiceListHidesTasksWithoutHostReadAccess(t *testing.T) {
 		{ID: "qprivate1", OwnerID: "u1234567", ProjectID: "p1234567", InitiatorID: "u7654321", HostID: "hprivate1", Objective: "private summary"},
 		{ID: "qforbidden1", OwnerID: "u1234567", ProjectID: "p1234567", InitiatorID: "u7654321", HostID: "hforbid01", Objective: "forbidden summary"},
 		{ID: "qvisible1", OwnerID: "u1234567", ProjectID: "p1234567", InitiatorID: "u1234567", HostID: "hvisible1", Objective: "visible summary"},
-	}, NextCursor: "next-page"}}
+	}, NextCursor: "next-page", K2Projections: map[string]TaskK2Projection{
+		"qprivate1": {}, "qforbidden1": {}, "qvisible1": {},
+	}}}
 	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
 		"hprivate1": domain.NewError(domain.CodeNotFound, "host not found"),
 		"hforbid01": domain.NewError(domain.CodeForbidden, "host access denied"),
@@ -890,7 +892,9 @@ func TestTaskServiceListHidesTasksWithoutHostReadAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Items) != 1 || page.Items[0].ID != "qvisible1" || page.NextCursor != "next-page" || authorizer.calls != 3 {
+	_, visibleProjection := page.K2Projections["qvisible1"]
+	if len(page.Items) != 1 || page.Items[0].ID != "qvisible1" || page.NextCursor != "next-page" || authorizer.calls != 3 ||
+		len(page.K2Projections) != 1 || !visibleProjection {
 		t.Fatalf("task page exposed an unauthorized project task or lost its cursor: %#v (authorizer calls=%d)", page, authorizer.calls)
 	}
 }

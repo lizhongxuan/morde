@@ -92,6 +92,7 @@ VALUES ('p1234567',$1,'synthetic','http://127.0.0.1','test',decode(repeat('01',2
 	if !aggregation.complete(t, &first, "first shared answer") || !aggregation.complete(t, &second, "second shared answer") {
 		t.Fatal("completed results were not queued")
 	}
+	aggregation.runNextReview(t)
 	var batchID string
 	if err := f.store.pool.QueryRow(ctx, `SELECT message_id FROM conversation_result_batches
 WHERE conversation_id=$1 AND state='published'`, f.conversationID).Scan(&batchID); err != nil {
@@ -147,11 +148,11 @@ VALUES ($1,1,'task.result','{}'::jsonb,0,sha256(convert_to('shared streamed answ
 	if err := checkFence(); err != nil {
 		t.Fatalf("model rejected verified shared history: %v", err)
 	}
-	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_messages SET content='tampered batch' WHERE id=$1`, batchID); err != nil {
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_result_sources SET content='tampered source' WHERE batch_message_id=$1 AND task_id=$2`, batchID, first.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := checkFence(); err == nil {
-		t.Fatal("model accepted stale, tampered batch evidence")
+		t.Fatal("model accepted stale, tampered Task result evidence")
 	}
 	snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, claim)
 	if err != nil {
@@ -227,6 +228,7 @@ func TestProjectTaskHistoryFiltersUnappliedAndUnprovenMessages(t *testing.T) {
 	if !aggregation.complete(t, &completed, "shared completed answer") {
 		t.Fatal("completed result was not queued")
 	}
+	aggregation.runNextReview(t)
 	var batchID string
 	if err := f.store.pool.QueryRow(ctx, `SELECT message_id FROM conversation_result_batches
 WHERE conversation_id=$1 AND state='published'`, f.conversationID).Scan(&batchID); err != nil {
@@ -275,7 +277,7 @@ WHERE conversation_id=$1 AND state='published'`, f.conversationID).Scan(&batchID
 		}
 	}
 	assertFilter(filter(), []string{completed.UserMessageID, batchID}, []string{importID, ownPending, claim.Message.ID})
-	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_messages SET output_status='interrupted',output_task_revision=0 WHERE id=$1`, batchID); err != nil {
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_result_sources SET content='tampered source' WHERE batch_message_id=$1 AND task_id=$2`, batchID, completed.ID); err != nil {
 		t.Fatal(err)
 	}
 	assertFilter(filter(), nil, []string{completed.UserMessageID, batchID, importID, ownPending, claim.Message.ID})

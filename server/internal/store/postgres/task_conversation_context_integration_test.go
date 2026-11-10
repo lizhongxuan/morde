@@ -336,7 +336,7 @@ func TestPostgresScheduledPersonalContextRequiresExactOwnerRunAndTask(t *testing
 		objectID   string
 		body       string
 	}{
-		{personal.ObjectTypeProfile, personal.ProfileObjectID, `{"name":"Context owner","avatar":"spark"}`},
+		{personal.ObjectTypeProfile, personal.ProfileObjectID, `{"name":"Context owner","avatar":"dragon"}`},
 		{personal.ObjectTypeSoul, "default", `{"name":"Morde","content":"Protect private data."}`},
 		{personal.ObjectTypeMemory, "global", `{"content":"prefers short summaries"}`},
 		{personal.ObjectTypeGoal, "g_schedule1", `{"title":"Finish report","status":"active","steps":[]}`},

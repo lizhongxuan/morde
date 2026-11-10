@@ -15,7 +15,7 @@ type conversationResultWorkerStore struct {
 	cancel context.CancelFunc
 }
 
-func (s *conversationResultWorkerStore) PublishReadyConversationResults(context.Context, int) (int, error) {
+func (s *conversationResultWorkerStore) QueueReadyConversationResultReviews(context.Context, int) (int, error) {
 	if s.calls.Add(1) == 1 {
 		return 1, nil
 	}
@@ -27,7 +27,7 @@ func TestConversationResultWorkerDrainsAndStops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := &conversationResultWorkerStore{cancel: cancel}
-	worker, err := NewConversationResultAggregationWorker(store, 100*time.Millisecond, zap.NewNop())
+	worker, err := NewConversationResultReviewWorker(store, 100*time.Millisecond, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -10,6 +12,97 @@ import (
 
 const checkpointToolArguments = `{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}`
 const checkpointToolOutput = `{"path":"notes.txt","bytes_written":5}`
+
+func TestCloudDSHCheckpointHistorySystemReplacement(t *testing.T) {
+	system := cloudDSHCheckpointEvent{Sequence: 0, Type: "system/message", SurfaceOp: "append",
+		Data: map[string]any{"message": map[string]any{"role": "system"}}}
+	replacement := cloudDSHCheckpointEvent{Sequence: 1, Type: "system/message",
+		SurfaceOp: map[string]any{"op": "replace", "startSeq": 0, "endSeq": 0}, SourceEventSeqs: []int64{0},
+		Data: map[string]any{"message": map[string]any{"role": "system"}}}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0, system), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	payload := cloudDSHCheckpointPayload("session_1", 1, replacement)
+	_, err := saveCloudDSHCheckpoint(context.Background(), &cloudDSHTestCheckpoints{err: errors.New("save failed")}, history,
+		app.AgentCheckpointCommand{From: 1, Through: 1, Payload: payload})
+	if err == nil {
+		t.Fatal("checkpoint save failure was ignored")
+	}
+	if err := history.append(payload, 1, 1); err != nil {
+		t.Fatalf("failed save changed the original system nodes: %v", err)
+	}
+	stale := replacement
+	stale.Sequence = 2
+	if err := history.clone().append(cloudDSHCheckpointPayload("session_1", 2, stale), 2, 2); err == nil {
+		t.Fatal("replaced system node was accepted as an active target")
+	}
+	replacement.Sequence, replacement.SourceEventSeqs = 2, []int64{1}
+	replacement.SurfaceOp = map[string]any{"op": "replace", "startSeq": 1, "endSeq": 1}
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 2, replacement), 2, 2); err != nil {
+		t.Fatalf("replacement did not update the active system node: %v", err)
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsInvalidSystemReplacement(t *testing.T) {
+	valid := map[string]any{"op": "replace", "startSeq": 0, "endSeq": 0}
+	for _, test := range []struct {
+		name    string
+		kind    string
+		op      any
+		sources []int64
+		role    string
+	}{
+		{name: "missing end", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": 0}, sources: []int64{0}, role: "system"},
+		{name: "extra field", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": 0, "endSeq": 0, "extra": true}, sources: []int64{0}, role: "system"},
+		{name: "wrong operation", kind: "system/message", op: map[string]any{"op": "append", "startSeq": 0, "endSeq": 0}, sources: []int64{0}, role: "system"},
+		{name: "negative target", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": -1, "endSeq": -1}, sources: []int64{-1}, role: "system"},
+		{name: "negative zero", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": json.Number("-0"), "endSeq": 0}, sources: []int64{0}, role: "system"},
+		{name: "fractional target", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": 0.5, "endSeq": 0}, sources: []int64{0}, role: "system"},
+		{name: "null target", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": nil, "endSeq": 0}, sources: []int64{0}, role: "system"},
+		{name: "unsafe target", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": int64(1 << 53), "endSeq": int64(1 << 53)}, sources: []int64{1 << 53}, role: "system"},
+		{name: "future target", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": 2, "endSeq": 2}, sources: []int64{2}, role: "system"},
+		{name: "non-system target", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": 1, "endSeq": 1}, sources: []int64{1}, role: "system"},
+		{name: "multiple nodes", kind: "system/message", op: map[string]any{"op": "replace", "startSeq": 0, "endSeq": 1}, sources: []int64{0, 1}, role: "system"},
+		{name: "wrong source", kind: "system/message", op: valid, sources: []int64{1}, role: "system"},
+		{name: "missing source", kind: "system/message", op: valid, role: "system"},
+		{name: "wrong message role", kind: "system/message", op: valid, sources: []int64{0}, role: "user"},
+		{name: "tool result object", kind: "tool/result", op: valid, sources: []int64{0}},
+		{name: "other message object", kind: "user/message", op: valid, sources: []int64{0}},
+		{name: "array", kind: "system/message", op: []any{}, sources: []int64{0}, role: "system"},
+		{name: "boolean", kind: "system/message", op: true, sources: []int64{0}, role: "system"},
+		{name: "number", kind: "system/message", op: 1, sources: []int64{0}, role: "system"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			history := newCloudDSHCheckpointHistory("session_1")
+			err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+				cloudDSHCheckpointEvent{Sequence: 0, Type: "system/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "system"}}},
+				cloudDSHCheckpointEvent{Sequence: 1, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "user"}}},
+				cloudDSHCheckpointEvent{Sequence: 2, Type: test.kind, SurfaceOp: test.op, SourceEventSeqs: test.sources, Data: map[string]any{"message": map[string]any{"role": test.role}}},
+			), 0, 2)
+			if err == nil {
+				t.Fatal("invalid replacement was accepted")
+			}
+		})
+	}
+}
+
+func TestCloudDSHCheckpointHistoryKeepsToolResultAppendRequirement(t *testing.T) {
+	for _, op := range []any{json.RawMessage(`null`), "replace", map[string]any{"op": "replace", "startSeq": 0, "endSeq": 0}} {
+		history := newCloudDSHCheckpointHistory("session_1")
+		result := checkpointToolResult(2, "call_write_1", checkpointToolOutput, 1)
+		result.SurfaceOp = op
+		if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+			checkpointAssistantCall(0, "call_write_1"), checkpointToolCall(1, "call_write_1"), result), 0, 2); err == nil {
+			t.Fatalf("tool result with surfaceOp %v was accepted", op)
+		}
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		cloudDSHCheckpointEvent{Sequence: 0, Type: "user/message", SurfaceOp: json.RawMessage(`null`), Data: map[string]any{}}), 0, 0); err != nil {
+		t.Fatalf("existing non-tool null behavior changed: %v", err)
+	}
+}
 
 func TestCloudDSHCheckpointHistoryReconcilesPinnedToolResult(t *testing.T) {
 	history := newCloudDSHCheckpointHistory("session_1")
@@ -289,7 +382,7 @@ type cloudDSHCheckpointEvent struct {
 	Sequence        int64   `json:"seq"`
 	Type            string  `json:"type"`
 	Data            any     `json:"data"`
-	SurfaceOp       string  `json:"surfaceOp,omitempty"`
+	SurfaceOp       any     `json:"surfaceOp,omitempty"`
 	SourceEventSeqs []int64 `json:"sourceEventSeqs,omitempty"`
 }
 

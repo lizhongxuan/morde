@@ -746,11 +746,17 @@ func TestProjectTaskContextIncludesOnlyProvenSharedHistory(t *testing.T) {
 	first := fixture.createTask(t, owner.ID, "completed owner request one")
 	second := fixture.createTask(t, owner.ID, "completed owner request two")
 	if !fixture.complete(t, &first, "verified owner answer one") || !fixture.complete(t, &second, "verified owner answer two") {
-		t.Fatal("completed project results were not published")
+		t.Fatal("completed project results were not queued for review")
 	}
+	fixture.runNextReview(t)
 	var batchID string
 	if err := pool.QueryRow(ctx, `SELECT message_id FROM conversation_result_batches WHERE state='published'`).Scan(&batchID); err != nil {
 		t.Fatal(err)
+	}
+	sources, err := store.ListConversationResultSources(ctx, owner.ID, conversationID, []string{batchID})
+	if err != nil || len(sources[batchID]) != 2 || sources[batchID][0].Content != "verified owner answer one" ||
+		sources[batchID][1].Content != "verified owner answer two" {
+		t.Fatalf("published Task result sources = %#v err=%v", sources, err)
 	}
 	pending := fixture.createTask(t, owner.ID, "unfinished owner request")
 	importedID := mustID(t, domain.NewMessageID)
@@ -797,19 +803,19 @@ func TestProjectTaskContextIncludesOnlyProvenSharedHistory(t *testing.T) {
 	for _, message := range value.Messages {
 		joined += "\n" + message.Content
 	}
-	if !strings.Contains(joined, "completed owner request one") || !strings.Contains(joined, "verified owner answer two") ||
+	if !strings.Contains(joined, "completed owner request one") || !strings.Contains(joined, resultReviewTestReply) ||
 		strings.Contains(joined, "unfinished owner request") || strings.Contains(joined, "unverified imported history") ||
 		strings.Contains(joined, "private personal fact") {
 		t.Fatal("project task snapshot did not preserve the proven shared-history boundary")
 	}
-	if _, err := pool.Exec(ctx, `UPDATE conversation_messages SET content='tampered batch' WHERE id=$1`, batchID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE conversation_result_sources SET content='tampered source' WHERE batch_message_id=$1 AND task_id=$2`, batchID, first.ID); err != nil {
 		t.Fatal(err)
 	}
 	if readEvidence(first.UserMessageID) || readEvidence(batchID) {
-		t.Fatal("tampered batch proved shared history")
+		t.Fatal("tampered Task result source proved shared history")
 	}
-	if _, err := pool.Exec(ctx, `UPDATE conversation_messages SET content=$2 WHERE id=$1`, batchID,
-		"verified owner answer one\n\nverified owner answer two"); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE conversation_result_sources SET content=$3 WHERE batch_message_id=$1 AND task_id=$2`, batchID, first.ID,
+		"verified owner answer one"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET result='changed result' WHERE id=$1`, first.ID); err != nil {

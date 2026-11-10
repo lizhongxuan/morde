@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.uber.org/zap"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -17,6 +18,7 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/worker"
 )
 
 type resultAggregationFixture struct {
@@ -32,6 +34,29 @@ type resultAggregationTask struct {
 	TurnID        string
 	EventSequence int64
 	Content       string
+}
+
+const resultReviewTestReply = "主助手已整理结果，并保留了每项任务的完成情况。"
+const resultReviewTestModelOutput = `{"action":"reply","task_id":"","question":"","reply":"主助手已整理结果，并保留了每项任务的完成情况。"}`
+
+type resultReviewRouteModel struct {
+	calls   int
+	sources []app.ConversationTaskResultSource
+}
+
+func (*resultReviewRouteModel) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
+	return "p1234567", nil
+}
+
+func (model *resultReviewRouteModel) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim,
+	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	if value.ResultReview == nil {
+		return app.ConversationRouteDecision{}, fmt.Errorf("result review context is missing")
+	}
+	model.calls++
+	model.sources = append(model.sources, value.ResultReview.Sources...)
+	return app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: resultReviewTestReply,
+		ModelOutput: resultReviewTestModelOutput}, nil
 }
 
 func newResultAggregationFixture(t *testing.T) resultAggregationFixture {
@@ -112,7 +137,24 @@ func (f resultAggregationFixture) replay(t *testing.T, value resultAggregationTa
 	}
 }
 
-func TestConversationResultAggregationMergesExactSourcesAndReplays(t *testing.T) {
+func (f resultAggregationFixture) runNextReview(t *testing.T) *resultReviewRouteModel {
+	t.Helper()
+	model := &resultReviewRouteModel{}
+	routeWorker, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+		Queue: f.store, Actions: f.store, Models: model, WorkerID: "result-review-test-worker",
+		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := routeWorker.RunOnce(context.Background())
+	if err != nil || !found || model.calls != 1 {
+		t.Fatalf("route result review: found=%t calls=%d err=%v", found, model.calls, err)
+	}
+	return model
+}
+
+func TestConversationResultAggregationQueuesHiddenReviewAndReplaysOnce(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
 	first := f.createTask(t, f.ownerID, "first question")
@@ -146,38 +188,75 @@ FROM conversation_result_batches b WHERE b.message_id=$1`, batchID).Scan(&retain
 	if !f.complete(t, &second, "second answer") {
 		t.Fatal("second result was not queued")
 	}
-	var content, state string
-	var taskID *string
-	if err := f.store.pool.QueryRow(ctx, `SELECT m.content,m.task_id,b.state FROM conversation_result_batches b
-JOIN conversation_messages m ON m.id=b.published_message_id WHERE b.message_id=$1`, batchID).Scan(&content, &taskID, &state); err != nil ||
-		content != "first answer\n\nsecond answer" || taskID != nil || state != "published" {
-		t.Fatalf("combined conversation message = %q task=%v state=%q err=%v", content, taskID, state, err)
+	var state, triggerID, triggerKind, triggerContent string
+	if err := f.store.pool.QueryRow(ctx, `SELECT batch.state,batch.trigger_message_id,message.source_kind,message.content
+FROM conversation_result_batches batch JOIN conversation_messages message ON message.id=batch.trigger_message_id
+WHERE batch.message_id=$1`, batchID).Scan(&state, &triggerID, &triggerKind, &triggerContent); err != nil ||
+		state != "processing" || triggerKind != "task_result_review" || triggerContent != "Completed Task results are ready for review." || triggerID == batchID {
+		t.Fatalf("result review route = state %q trigger %q kind %q content %q err=%v", state, triggerID, triggerKind, triggerContent, err)
+	}
+	var assistantMessages int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant'`,
+		f.conversation.ID).Scan(&assistantMessages); err != nil || assistantMessages != 0 {
+		t.Fatalf("raw Task results were published before review: assistant messages=%d err=%v", assistantMessages, err)
+	}
+	visibleBeforeReview, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range visibleBeforeReview.Items {
+		if message.ID == triggerID || message.SourceKind == "task_result_review" {
+			t.Fatalf("internal result review route leaked into conversation messages: %+v", message)
+		}
+	}
+	model := f.runNextReview(t)
+	if len(model.sources) != 2 || model.sources[0].TaskID != first.ID || model.sources[0].TaskRevision != 0 ||
+		model.sources[0].EventSequence != first.EventSequence || model.sources[0].Content != "first answer" ||
+		model.sources[1].TaskID != second.ID || model.sources[1].TaskRevision != 0 ||
+		model.sources[1].EventSequence != second.EventSequence || model.sources[1].Content != "second answer" {
+		t.Fatalf("coordinator received incorrect result sources: %#v", model.sources)
+	}
+	var publishedMessageID, routeState string
+	if err := f.store.pool.QueryRow(ctx, `SELECT batch.published_message_id,route.state FROM conversation_result_batches batch
+JOIN conversation_message_routes route ON route.message_id=batch.trigger_message_id WHERE batch.message_id=$1 AND batch.state='published'`,
+		batchID).Scan(&publishedMessageID, &routeState); err != nil || publishedMessageID != batchID || routeState != "routed" {
+		t.Fatalf("review publication = message %q route %q err=%v", publishedMessageID, routeState, err)
 	}
 	provenance, err := f.store.ListConversationResultSources(ctx, f.ownerID, f.conversation.ID, []string{batchID})
 	if err != nil || len(provenance[batchID]) != 2 || provenance[batchID][0].TaskID != first.ID ||
 		provenance[batchID][0].UserMessageID != first.UserMessageID || provenance[batchID][0].EventSequence != first.EventSequence ||
 		provenance[batchID][1].TaskID != second.ID || provenance[batchID][1].UserMessageID != second.UserMessageID ||
 		provenance[batchID][1].EventSequence != second.EventSequence {
-		t.Fatalf("combined source evidence = %#v err=%v", provenance, err)
+		t.Fatalf("published source evidence = %#v err=%v", provenance, err)
 	}
-	var snapshots int
-	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_assistant_message_snapshots snapshot
-JOIN conversation_result_sources source ON source.task_id=snapshot.task_id AND source.batch_message_id=snapshot.message_id
- AND source.task_revision=snapshot.task_revision AND source.event_sequence=snapshot.result_event_sequence
-WHERE snapshot.message_id=$1 AND snapshot.status='completed' AND source.state='published'`, batchID).Scan(&snapshots); err != nil || snapshots != 2 {
-		t.Fatalf("source snapshots = %d err=%v", snapshots, err)
+	page, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replies []conversation.Message
+	for _, message := range page.Items {
+		if message.Role == conversation.RoleAssistant {
+			replies = append(replies, message)
+		}
+	}
+	if len(replies) != 1 || replies[0].ID != batchID || replies[0].Content != resultReviewTestReply || len(replies[0].Sources) != 2 {
+		t.Fatalf("reviewed reply = %#v", replies)
 	}
 	for _, value := range []resultAggregationTask{first, second} {
 		details, err := f.store.GetTask(ctx, value.ID, f.ownerID)
-		if err != nil || details.ResultMessagePending || !details.ResultMessagePublished || details.AssistantMessage == nil ||
-			details.AssistantMessage.Message.ID != batchID || details.AssistantMessage.TaskRevision == nil || *details.AssistantMessage.TaskRevision != 0 ||
-			details.AssistantMessage.ResultEventSequence == nil || *details.AssistantMessage.ResultEventSequence != value.EventSequence {
+		if err != nil || details.ResultReview == nil || details.ResultReview.State != "published" || details.ResultReview.SourceTaskID != value.ID ||
+			details.ResultReview.SourceTaskRevision != 0 || details.ResultReview.SourceEventSequence != value.EventSequence ||
+			details.ResultReview.ReplyMessageID == nil || *details.ResultReview.ReplyMessageID != batchID {
 			t.Fatalf("published task projection for %s = %#v err=%v", value.ID, details, err)
 		}
 	}
 	f.replay(t, first)
-	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_result_batches`).Scan(&sources); err != nil || sources != 1 {
-		t.Fatalf("published replay made another batch: %d err=%v", sources, err)
+	var reviewRoutes int
+	if err := f.store.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM conversation_result_batches),
+ (SELECT count(*) FROM conversation_message_routes WHERE request_metadata->>'result_review_id'=$1),
+ (SELECT count(*) FROM conversation_messages WHERE conversation_id=$2 AND role='assistant')`, batchID, f.conversation.ID).
+		Scan(&sources, &reviewRoutes, &assistantMessages); err != nil || sources != 1 || reviewRoutes != 1 || assistantMessages != 1 {
+		t.Fatalf("published replay duplicated review or reply: batches=%d routes=%d replies=%d err=%v", sources, reviewRoutes, assistantMessages, err)
 	}
 }
 
@@ -201,28 +280,32 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 		t.Fatal(err)
 	}
 	restarted := New(f.store.pool)
-	if count, err := restarted.PublishReadyConversationResults(ctx, 100); err != nil || count != 0 {
-		t.Fatalf("outdated result was published: count=%d err=%v", count, err)
+	if count, err := restarted.QueueReadyConversationResultReviews(ctx, 100); err != nil || count != 0 {
+		t.Fatalf("outdated result was queued: count=%d err=%v", count, err)
 	}
 	var batchState, sourceState string
+	var triggerID string
 	var messages int
-	if err := f.store.pool.QueryRow(ctx, `SELECT b.state,s.state,(SELECT count(*) FROM conversation_messages WHERE id=b.message_id)
+	if err := f.store.pool.QueryRow(ctx, `SELECT b.state,s.state,COALESCE(b.trigger_message_id,''),(SELECT count(*) FROM conversation_messages WHERE id=b.message_id)
 FROM conversation_result_batches b JOIN conversation_result_sources s ON s.batch_message_id=b.message_id WHERE b.message_id=$1`, batchID).
-		Scan(&batchState, &sourceState, &messages); err != nil || batchState != "superseded" || sourceState != "superseded" || messages != 0 {
-		t.Fatalf("old revision not suppressed: %s %s messages=%d err=%v", batchState, sourceState, messages, err)
+		Scan(&batchState, &sourceState, &triggerID, &messages); err != nil || batchState != "superseded" || sourceState != "superseded" || triggerID != "" || messages != 0 {
+		t.Fatalf("old revision not suppressed: %s %s trigger=%q messages=%d err=%v", batchState, sourceState, triggerID, messages, err)
 	}
 }
 
-func TestConversationResultAggregationPublishesSingleAndPreservesStream(t *testing.T) {
+func TestConversationResultAggregationQueuesSingleAndPreservesStream(t *testing.T) {
 	t.Run("no other active task", func(t *testing.T) {
 		f := newResultAggregationFixture(t)
 		value := f.createTask(t, f.ownerID, "single")
 		if !f.complete(t, &value, "single answer") {
 			t.Fatal("single result was not handled")
 		}
-		var state string
-		if err := f.store.pool.QueryRow(context.Background(), `SELECT state FROM conversation_result_batches`).Scan(&state); err != nil || state != "published" {
-			t.Fatalf("single result was delayed: %s err=%v", state, err)
+		var state, triggerID string
+		var assistants int
+		if err := f.store.pool.QueryRow(context.Background(), `SELECT state,trigger_message_id,
+ (SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant')
+FROM conversation_result_batches`, f.conversation.ID).Scan(&state, &triggerID, &assistants); err != nil || state != "processing" || triggerID == "" || assistants != 0 {
+			t.Fatalf("single result was not queued for review: state=%s trigger=%q assistants=%d err=%v", state, triggerID, assistants, err)
 		}
 	})
 	t.Run("already streaming", func(t *testing.T) {
@@ -230,8 +313,19 @@ func TestConversationResultAggregationPublishesSingleAndPreservesStream(t *testi
 		value := f.createTask(t, f.ownerID, "streaming")
 		f.createTask(t, f.ownerID, "other active")
 		messageID := mustID(t, domain.NewMessageID)
-		if _, err := f.store.pool.Exec(context.Background(), `INSERT INTO task_assistant_message_snapshots
-(task_id,message_id,turn_id,content,status,task_revision) VALUES ($1,$2,$3,'visible prefix','streaming',0)`, value.ID, messageID, value.TurnID); err != nil {
+		if err := f.store.WithTx(context.Background(), func(tx pgx.Tx) error {
+			message := conversation.Message{ID: messageID, ConversationID: f.conversation.ID, OwnerID: f.ownerID,
+				ActorID: f.ownerID, Role: conversation.RoleAssistant, Content: "visible prefix", TaskID: value.ID}
+			if err := insertMessage(context.Background(), tx, message); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(context.Background(), `UPDATE conversation_messages SET output_status='streaming',output_task_revision=0 WHERE id=$1`, messageID); err != nil {
+				return err
+			}
+			_, err := tx.Exec(context.Background(), `INSERT INTO task_assistant_message_snapshots
+(task_id,message_id,turn_id,content,status,task_revision) VALUES ($1,$2,$3,'visible prefix','streaming',0)`, value.ID, messageID, value.TurnID)
+			return err
+		}); err != nil {
 			t.Fatal(err)
 		}
 		if f.complete(t, &value, "visible prefix and final text") {
@@ -243,6 +337,19 @@ func TestConversationResultAggregationPublishesSingleAndPreservesStream(t *testi
 FROM task_assistant_message_snapshots WHERE task_id=$1`, value.ID).Scan(&count, &snapshotID, &text); err != nil ||
 			count != 0 || snapshotID != messageID || text != "visible prefix" {
 			t.Fatalf("visible stream was rewritten: batches=%d id=%q text=%q err=%v", count, snapshotID, text, err)
+		}
+	})
+	t.Run("orphaned streaming snapshot", func(t *testing.T) {
+		f := newResultAggregationFixture(t)
+		value := f.createTask(t, f.ownerID, "orphaned stream")
+		f.createTask(t, f.ownerID, "other active")
+		if _, err := f.store.pool.Exec(context.Background(), `INSERT INTO task_assistant_message_snapshots
+(task_id,message_id,turn_id,content,status,task_revision) VALUES ($1,$2,$3,'visible prefix','streaming',0)`,
+			value.ID, mustID(t, domain.NewMessageID), value.TurnID); err != nil {
+			t.Fatal(err)
+		}
+		if !f.complete(t, &value, "visible prefix and final text") {
+			t.Fatal("orphaned stream snapshot suppressed the result review")
 		}
 	})
 	t.Run("other turn with same prefix", func(t *testing.T) {
@@ -266,7 +373,7 @@ WHERE task_id=$1 AND state='pending'`, value.ID).Scan(&count); err != nil || cou
 	})
 }
 
-func TestConversationResultAggregationDeadlineAndConcurrentPublish(t *testing.T) {
+func TestConversationResultAggregationDeadlineAndConcurrentQueue(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
 	first := f.createTask(t, f.ownerID, "first task")
@@ -284,7 +391,7 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			count, err := New(f.store.pool).PublishReadyConversationResults(ctx, 100)
+			count, err := New(f.store.pool).QueueReadyConversationResultReviews(ctx, 100)
 			counts <- count
 			errs <- err
 		}()
@@ -302,9 +409,11 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 		}
 	}
 	if total != 1 {
-		t.Fatalf("concurrent workers published %d messages", total)
+		t.Fatalf("concurrent workers queued %d result reviews", total)
 	}
 	f.complete(t, &second, "later answer")
+	f.runNextReview(t)
+	f.runNextReview(t)
 	var batches, messages int
 	if err := f.store.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM conversation_result_batches WHERE state='published'),
  (SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant')`, f.conversation.ID).Scan(&batches, &messages); err != nil || batches != 2 || messages != 2 {
@@ -312,7 +421,7 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 	}
 }
 
-func TestConversationResultAggregationPublishesWhenRemainingTaskStops(t *testing.T) {
+func TestConversationResultAggregationQueuesWhenRemainingTaskStops(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
 	first := f.createTask(t, f.ownerID, "finished task")
@@ -321,8 +430,13 @@ func TestConversationResultAggregationPublishesWhenRemainingTaskStops(t *testing
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET status='failed' WHERE id=$1`, other.ID); err != nil {
 		t.Fatal(err)
 	}
-	if count, err := f.store.PublishReadyConversationResults(ctx, 100); err != nil || count != 1 {
-		t.Fatalf("result stayed queued after other task stopped: count=%d err=%v", count, err)
+	if count, err := f.store.QueueReadyConversationResultReviews(ctx, 100); err != nil || count != 1 {
+		t.Fatalf("result review was not queued after other task stopped: count=%d err=%v", count, err)
+	}
+	var state, triggerKind string
+	if err := f.store.pool.QueryRow(ctx, `SELECT batch.state,message.source_kind FROM conversation_result_batches batch
+JOIN conversation_messages message ON message.id=batch.trigger_message_id`).Scan(&state, &triggerKind); err != nil || state != "processing" || triggerKind != "task_result_review" {
+		t.Fatalf("stopped-task result route = state %q source %q err=%v", state, triggerKind, err)
 	}
 }
 
@@ -337,9 +451,9 @@ func TestConversationResultAggregationDoesNotWaitForPausedOrInteractiveTasks(t *
 				t.Fatal(err)
 			}
 			f.complete(t, &first, "finished answer")
-			var state string
-			if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_result_batches`).Scan(&state); err != nil || state != "published" {
-				t.Fatalf("result waited for %s task: state=%s err=%v", status, state, err)
+			var state, triggerID string
+			if err := f.store.pool.QueryRow(ctx, `SELECT state,trigger_message_id FROM conversation_result_batches`).Scan(&state, &triggerID); err != nil || state != "processing" || triggerID == "" {
+				t.Fatalf("result review waited for %s task: state=%s trigger=%q err=%v", status, state, triggerID, err)
 			}
 		})
 	}
@@ -356,8 +470,10 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 		t.Fatal(err)
 	}
 	// The second completion itself encounters the expired batch before any
-	// polling worker runs; it must publish separately rather than extend it.
+	// review-queue worker runs; it must close that batch rather than extend it.
 	f.complete(t, &second, "later answer")
+	f.runNextReview(t)
+	f.runNextReview(t)
 	var batches, messages int
 	if err := f.store.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM conversation_result_batches WHERE state='published'),
  (SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant')`, f.conversation.ID).Scan(&batches, &messages); err != nil || batches != 2 || messages != 2 {
@@ -393,12 +509,12 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		count, err := f.store.PublishReadyConversationResults(ctx, 100)
+		count, err := f.store.QueueReadyConversationResultReviews(ctx, 100)
 		done <- outcome{count, err}
 	}()
 	select {
 	case result := <-done:
-		t.Fatalf("result publisher bypassed revision transaction: %+v", result)
+		t.Fatalf("result reviewer bypassed revision transaction: %+v", result)
 	case <-time.After(100 * time.Millisecond):
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -407,10 +523,10 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 	select {
 	case result := <-done:
 		if result.err != nil || result.count != 0 {
-			t.Fatalf("obsolete result was published: %+v", result)
+			t.Fatalf("obsolete result was queued: %+v", result)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("result publisher did not resume after revision commit")
+		t.Fatal("result review queue did not resume after revision commit")
 	}
 	var state string
 	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_result_sources WHERE task_id=$1`, first.ID).Scan(&state); err != nil || state != "superseded" {
@@ -418,7 +534,7 @@ SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FRO
 	}
 }
 
-func TestConversationResultAggregationDoesNotTruncateLargeResults(t *testing.T) {
+func TestConversationResultAggregationPreservesLargeResultsAcrossReviews(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
 	first := f.createTask(t, f.ownerID, "first long result")
@@ -427,11 +543,21 @@ func TestConversationResultAggregationDoesNotTruncateLargeResults(t *testing.T) 
 	two := strings.Repeat("b", 20_000)
 	f.complete(t, &first, one)
 	f.complete(t, &second, two)
-	var messages, byteCount int
-	if err := f.store.pool.QueryRow(ctx, `SELECT count(*),COALESCE(sum(octet_length(content)),0)
-FROM conversation_messages WHERE conversation_id=$1 AND role='assistant'`, f.conversation.ID).Scan(&messages, &byteCount); err != nil ||
-		messages != 2 || byteCount != len(one)+len(two) {
-		t.Fatalf("large results were truncated or lost: messages=%d bytes=%d err=%v", messages, byteCount, err)
+	firstReview := f.runNextReview(t)
+	secondReview := f.runNextReview(t)
+	if len(firstReview.sources) != 1 || len(secondReview.sources) != 1 ||
+		(firstReview.sources[0].Content != one && firstReview.sources[0].Content != two) ||
+		(secondReview.sources[0].Content != one && secondReview.sources[0].Content != two) ||
+		firstReview.sources[0].Content == secondReview.sources[0].Content {
+		t.Fatalf("large result sources were truncated or combined incorrectly: first=%d second=%d",
+			len(firstReview.sources), len(secondReview.sources))
+	}
+	var messages, exactResults int
+	if err := f.store.pool.QueryRow(ctx, `SELECT
+ (SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND content=$2),
+ (SELECT count(*) FROM conversation_result_sources WHERE conversation_id=$3 AND octet_length(content)=20000)`,
+		f.conversation.ID, resultReviewTestReply, f.conversation.ID).Scan(&messages, &exactResults); err != nil || messages != 2 || exactResults != 2 {
+		t.Fatalf("large results were not kept separate from reviewed replies: replies=%d exact sources=%d err=%v", messages, exactResults, err)
 	}
 }
 
@@ -575,11 +701,18 @@ VALUES ('p1234567',NULL,'result model','http://127.0.0.1','test',decode(repeat('
 	}
 	f.complete(t, &a2, "owner second answer")
 	f.complete(t, &b2, "member second answer")
+	ownerReview := f.runNextReview(t)
+	memberReview := f.runNextReview(t)
+	if len(ownerReview.sources) != 2 || len(memberReview.sources) != 2 ||
+		ownerReview.sources[0].TaskID != a1.ID || ownerReview.sources[1].TaskID != a2.ID ||
+		memberReview.sources[0].TaskID != b1.ID || memberReview.sources[1].TaskID != b2.ID {
+		t.Fatalf("project actor result reviews crossed sources: owner=%#v member=%#v", ownerReview.sources, memberReview.sources)
+	}
 	var ownerMessage, memberMessage string
-	if err := store.pool.QueryRow(ctx, `SELECT message_id FROM conversation_result_batches WHERE actor_id=$1 AND state='published'`, owner.ID).Scan(&ownerMessage); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT published_message_id FROM conversation_result_batches WHERE actor_id=$1 AND state='published'`, owner.ID).Scan(&ownerMessage); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT message_id FROM conversation_result_batches WHERE actor_id=$1 AND state='published'`, member.ID).Scan(&memberMessage); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT published_message_id FROM conversation_result_batches WHERE actor_id=$1 AND state='published'`, member.ID).Scan(&memberMessage); err != nil {
 		t.Fatal(err)
 	}
 	sources, err := store.ListConversationResultSources(ctx, member.ID, value.ID, []string{ownerMessage, memberMessage})
@@ -643,14 +776,15 @@ func TestConversationResultAggregationDoesNotPublishForRemovedProjectMember(t *t
 SET created_at=t.now-interval '3 seconds',deadline=t.now-interval '1 second' FROM t WHERE state='pending'`); err != nil {
 		t.Fatal(err)
 	}
-	if count, err := store.PublishReadyConversationResults(ctx, 100); err != nil || count != 0 {
-		t.Fatalf("removed project member result published: count=%d err=%v", count, err)
+	if count, err := store.QueueReadyConversationResultReviews(ctx, 100); err != nil || count != 0 {
+		t.Fatalf("removed project member result was queued: count=%d err=%v", count, err)
 	}
 	var state, messageID string
+	var triggerID string
 	var published int
-	if err := store.pool.QueryRow(ctx, `SELECT b.state,b.message_id,(SELECT count(*) FROM conversation_messages WHERE id=b.message_id)
-FROM conversation_result_batches b WHERE b.actor_id=$1`, member.ID).Scan(&state, &messageID, &published); err != nil || state != "pending" || published != 0 {
-		t.Fatalf("removed member result was not retained safely: state=%s published=%d err=%v", state, published, err)
+	if err := store.pool.QueryRow(ctx, `SELECT b.state,b.message_id,COALESCE(b.trigger_message_id,''),(SELECT count(*) FROM conversation_messages WHERE id=b.message_id)
+FROM conversation_result_batches b WHERE b.actor_id=$1`, member.ID).Scan(&state, &messageID, &triggerID, &published); err != nil || state != "pending" || triggerID != "" || published != 0 {
+		t.Fatalf("removed member result was not retained safely: state=%s trigger=%q published=%d err=%v", state, triggerID, published, err)
 	}
 	if _, err := store.ListConversationResultSources(ctx, member.ID, value.ID, []string{messageID}); err == nil {
 		t.Fatal("removed member read project result sources")

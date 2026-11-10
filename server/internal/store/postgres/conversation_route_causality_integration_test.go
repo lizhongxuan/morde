@@ -231,7 +231,7 @@ func TestConversationRouteCausalityMigrationPreservesAndProtectsLedger(t *testin
 	if _, err := provider.DownTo(ctx, 159); err != nil {
 		t.Fatalf("roll back ordinary route history: %v", err)
 	}
-	if _, err := provider.UpTo(ctx, 160); err != nil {
+	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("restore causal routing migration: %v", err)
 	}
 	var phase, state string

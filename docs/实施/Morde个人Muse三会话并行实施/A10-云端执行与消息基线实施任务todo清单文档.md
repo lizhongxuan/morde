@@ -1,6 +1,6 @@
 # A10 云端执行与消息基线实施任务 TODO
 
-**会话：A｜阶段：P1｜状态：进行中（A10-T1/T2 完成；A10-T3/G1 的 PC/K1 API 与 Guardian/DSH 检查通过，G1 iOS App-close UI 验收在登录步骤失败，待修正后复验）。**
+**会话：A｜阶段：P1｜状态：完成（A10-T1/T2/T3 完成；本地 G1 的 PC/K1、Guardian/DSH 与 iOS App-close 集成验收通过）。**
 
 来源：[需求与架构](../../Morde个人Muse需求与架构设计方案.md)；共同规则：[执行总览](00-三会话执行总览.md)；接口：[共享合同](01-共享接口与联调合同.md)。
 
@@ -35,7 +35,7 @@ server/internal/api/ 的会话/任务入口、app/ 和 store/postgres/ 的消息
   - 2026-11-10 修复与复验：Guardian 操作锁拆为 Account Runtime 共享锁和 Task 独占锁；stop/renew/recover 等 Task 操作之间仍按 Task 串行，整 Runtime stop/recovery 保持 Runtime 独占锁。新增回归覆盖同 Runtime 兄弟 Task renewal 不受单 Task stop 阻塞、同 Task stop/renew 串行、Runtime stop 等待已有 Task 操作、写者公平和 context 取消。独立复核通过：`cd server && go test -race ./internal/dshguardian -count=1`、相关文件 `gofmt -d`、`git diff --check`。A10-T2 代码与本地回归完成。
   - A10-T3/G1 运行前只读状态核验（2026-11-10）：原 A10 fixture 中 PostgreSQL 有 3 条 Account Runtime 为 `running` 且 lease 正在续期；它们分别与 Guardian 的 3 个持久 lease JSON、专用 DSH Docker/containerd 中的 3 个 Runtime 容器一一匹配。Task 表无 queued/running/cancelling 状态；19 条 task-agent 记录均 stopped，另有 5 条 `waiting_user/dsh_recovery_unresolved` 安全暂停记录。3 个 Runtime supervisor 仍持有效续期 lease，因此原 fixture 不重启、不清理。源码构建的 Guardian candidate 含 per-Task/Runtime lock 新实现，而原 fixture 运行进程不含该实现；故旧状态留存用于隔离保护，不作为新版本发布证据。独立 G1 后续验收闭环见下。
 
-- [ ] A10-T3（进行中；G1 iOS App-close UI 验收待完成）合入两端基线并通过 G1
+- [x] A10-T3（完成；G1 iOS App-close UI 验收通过）合入两端基线并通过 G1
   - 前置：A10-T2、B10-T3、C10-T3。
   - 修改：只合入 B10/C10 已交付的本地改动，不代改其代码；在 A 的独立 fixture 汇总跨端受理、进度、停止和恢复结果，更新 00 的 G1 记录。
   - 验收：同一账号在两端看到同一消息/Task；断连重试不重复执行，关闭 App 后可从另一端读取结果。Go 与 DSH 检查通过；G1 在本地独立 fixture 发布并通过回归。
@@ -47,7 +47,9 @@ server/internal/api/ 的会话/任务入口、app/ 和 store/postgres/ 的消息
   - 独立 G1 Guardian/DSH 回归（2026-11-10）：`cd server && go test -race ./internal/dshguardian -count=1` 通过；`cd runtime/morde-cloud-runtime && npm test` 86/86 通过，包含仅停止选定 Task、同 Runtime sibling process 继续运行的用例。G1 loopback synthetic proxy 上另进行受控跨会话取消：一个 Task 取消期间，同账号另一会话的 Task 保持 `running`，释放代理后为 `completed`；目标 Task 为 `cancelled`。首次将模型请求挂起超过 DSH 20 秒模型调用期限，合成请求超时后 Task 安全进入 `waiting_user/dsh_recovery_unresolved`；没有自动重试。之后以短挂起窗口重跑通过。该安全暂停诊断 Task 保留在本地 fixture，执行状态 `active_tasks=0`。
   - G1/旧 fixture 隔离动态核验（2026-11-10）：独立 Guardian 当前进程 SHA-256 `a0f246ae723f0bf7d62948d1e81283160e36a7f3a150a15d9569a6983fddcdf8`，G1 Portal SHA-256 `c339003fb09ebf54cf6f0ace42e4fcac01d40cc0a9c16ec80da9b0a268aa114c`；两服务 active、`NRestarts=0`，健康检查 HTTP 200。G1 Guardian lease 与专用 DSH daemon 的 5 个 G1 容器 ID 对应；取消诊断 Task 后仍只操作 G1 目标。旧 Guardian 进程哈希仍为基线 `12e805df0c2a2140d4cf1e60619f433b80ccee325b1fadd175c79afded8f291d`，旧 state 中原 3 个 lease/container ID `27f61d7c…`、`a2fd899b…`、`fdac7f12…` 仍在，旧服务仍 active、无重启；未停止、删除或改动它们。此结果与此前精确 ContainerID/标签调用代码审查一致。
 
+  - G1 iOS/App-close 复验（2026-11-10）：本机重启后恢复 `morde-a10-u2604`，只读发现专用 `cloudhost` nftables 表缺失；对该隔离 VM 执行受管 `network-policy.sh apply`，Portal/Guardian active、`NRestarts=0`，`network-policy.sh check` 五项全 PASS。iOS 27.2 runtime build `24B8117` 注册到 CoreSimulator；独立 iPhone 18 Pro Simulator `Morde A20 G1 20261110` 使用当前源码与本地诊断 Keychain access group。`testMordeChatUsesSelectedModelPreferenceWhenAvailable` 1/1 passed（42.17s）；`testC10PortalMessagePersistsAcrossAppRestart` 1/1 passed（62.86s），覆盖登录、iOS 发消息、关闭 App、第二安装发消息、服务端在 App 关闭时完成回复、重新打开恢复两条消息及回复且各仅一次。结果包 `.local/morde-a10-linux-fixture-20261109/g1/evidence/A20-20261110/SelectedModelPreference.xcresult` 与 `G1-AppClose.xcresult`。G1 main conversation `c6zwlksp` 新增两条消息 client ID `c2e9f088-4b07-40a2-8dde-e1d0e37cdf3b` / `B088C9C9-391C-49C1-B080-640BFEF8D869`，关联 Task `qmnolpvw` / `qn97xcg7` 均 completed，活动 Task 为 0。相同时间其他三个本地 conversation 有三条并发 fixture 消息/Task（一个 completed、两个 cancelled），来源未确定，不纳入本项通过证据。未访问用户提供的公共测试服务器或使用其模型密钥。
+
 ## 交付
 
-A10-T1/T2 完成；A10-T3/G1 仍待验证。G1 独立服务、PC 同会话读取、K1 幂等重放和 Guardian/DSH 检查已有证据，但正确 G1 origin 上的 iOS UI 登录步骤未通过，不能发布 G1 或将下一阶段关口记为通过。没有远端部署、推送、提交或外发文件；已有实现通过本任务验证可直接复用，不为勾选任务而重写。
+A10-T1/T2/T3 完成；本地 G1 独立服务、PC 同会话读取、K1 幂等重放、Guardian/DSH 检查，以及正确 G1 origin 上的 iOS 登录与 App-close/重启恢复 UI 验收均已通过。没有远端部署、推送、提交或外发文件；已有实现通过本任务验证可直接复用，不为勾选任务而重写。
 

@@ -62,6 +62,7 @@ func TestRoutedTaskCompletionPublishesOneCombinedConversationMessage(t *testing.
 			}
 		}
 	}
+	(resultAggregationFixture{store: f.store, ownerID: f.ownerID, conversation: f.conversation}).runNextReview(t)
 	page, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 20})
 	if err != nil {
 		t.Fatal(err)
@@ -72,16 +73,17 @@ func TestRoutedTaskCompletionPublishesOneCombinedConversationMessage(t *testing.
 			replies = append(replies, message)
 		}
 	}
-	if len(replies) != 1 || replies[0].Content != "first answer\n\nsecond answer" || len(replies[0].Sources) != 2 ||
+	if len(replies) != 1 || replies[0].Content != resultReviewTestReply || len(replies[0].Sources) != 2 ||
 		replies[0].Sources[0].UserMessageID != taskMessageIDs[claimed[0].ID] || replies[0].Sources[1].UserMessageID != taskMessageIDs[claimed[1].ID] ||
-		replies[0].Sources[0].TaskID != claimed[0].ID || replies[0].Sources[1].TaskID != claimed[1].ID {
+		replies[0].Sources[0].TaskID != claimed[0].ID || replies[0].Sources[1].TaskID != claimed[1].ID ||
+		replies[0].Sources[0].Content != "first answer" || replies[0].Sources[1].Content != "second answer" {
 		t.Fatalf("combined reply is missing or duplicated: %+v", replies)
 	}
 	for _, value := range claimed {
 		details, err := f.store.GetTask(ctx, value.ID, value.OwnerID)
-		if err != nil || details.ResultMessagePending || !details.ResultMessagePublished || details.AssistantMessage == nil ||
-			details.AssistantMessage.Message.ID != replies[0].ID || details.AssistantMessage.TaskRevision == nil ||
-			details.AssistantMessage.ResultEventSequence == nil {
+		if err != nil || details.ResultMessagePending || !details.ResultMessagePublished || details.AssistantMessage != nil ||
+			details.ResultReview == nil || details.ResultReview.State != "published" || details.ResultReview.SourceTaskID != value.ID ||
+			details.ResultReview.ReplyMessageID == nil || *details.ResultReview.ReplyMessageID != replies[0].ID {
 			t.Fatalf("published result projection for %s: %+v err=%v", value.ID, details, err)
 		}
 	}

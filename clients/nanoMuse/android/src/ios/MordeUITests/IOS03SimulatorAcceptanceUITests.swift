@@ -185,7 +185,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
         app.terminate()
         XCTAssertEqual(app.state, .notRunning, "The app should stay closed while the Portal finishes processing the message.")
-        Thread.sleep(forTimeInterval: 15)
+        try await Task.sleep(nanoseconds: 15_000_000_000)
 
         let capabilities = try await portalJSON("/api/capabilities")
         guard let serviceInstanceID = capabilities["service_instance_id"] as? String,
@@ -532,6 +532,104 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "A later successful refresh should reload tasks after permission is restored.")
         XCTAssertFalse(permissionError.exists)
         attachScreen(app, named: "MDA-03 task list after permission restoration")
+    }
+
+    func testMordeChatShowsConcurrentTasksAndK2ResultProvenance() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskK2Fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN",
+        ])
+
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        XCTAssertTrue(composer.isEnabled, "Task status must not block an independent conversation message.")
+        XCTAssertTrue(app.staticTexts["Task A coordinator"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Task B research"].waitForExistence(timeout: 15),
+                      "Each Task in the same conversation should keep its own status row.")
+
+        XCTAssertTrue(app.staticTexts["q0000202 · 所需修订 1"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["等待依赖任务"].exists)
+        XCTAssertTrue(app.staticTexts["Read source material"].exists)
+        XCTAssertTrue(app.staticTexts["等待整理结果"].exists)
+        let source = app.descendants(matching: .any)["morde.chat.message.source.q0000202.r1.e7"]
+        XCTAssertTrue(source.waitForExistence(timeout: 15))
+        XCTAssertTrue(source.label.contains("Raw child task result from local research."))
+        attachScreen(app, named: "C20 concurrent tasks and source provenance")
+
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let taskRow = app.buttons["morde.tasks.row.q0000201"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 15))
+        taskRow.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["morde.task.dependencies"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["q0000202 · 所需修订 1"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["morde.task.childJobs"].exists)
+        XCTAssertTrue(app.staticTexts["Read source material"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["morde.task.resultReview"].exists)
+        XCTAssertTrue(app.staticTexts["来源 q0000202 · 修订 1 · 事件 7"].exists)
+        attachScreen(app, named: "C20 task detail with K2 relationships")
+    }
+
+    func testMordeStoppingTaskBLeavesTaskARunning() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: ["-morde.localTaskK2Fixture"])
+        XCTAssertTrue(app.staticTexts["Task A coordinator"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Task B research"].exists)
+
+        assertChatLongPressMenuOffersStopTask(app, taskID: "q0000202")
+        let stopB = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "q0000202")).firstMatch
+        XCTAssertTrue(stopB.waitForExistence(timeout: 5))
+        stopB.tap()
+
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let taskAStatus = app.staticTexts["morde.tasks.row.status.q0000201"]
+        let taskBStatus = app.staticTexts["morde.tasks.row.status.q0000202"]
+        XCTAssertTrue(taskAStatus.waitForExistence(timeout: 15))
+        XCTAssertTrue(taskBStatus.waitForExistence(timeout: 15))
+        let taskBStopped = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label != %@", taskAStatus.label), object: taskBStatus)
+        XCTAssertEqual(XCTWaiter.wait(for: [taskBStopped], timeout: 15), .completed,
+                       "Stopping Task B should update only its task status while Task A remains running.")
+        XCTAssertNotEqual(taskBStatus.label, taskAStatus.label)
+    }
+
+    func testMordeBusyConcurrentTasksAcceptIndependentMessage() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: ["-morde.localTaskK2Fixture"])
+        XCTAssertTrue(app.staticTexts["Task A coordinator"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Task B research"].exists)
+
+        let composer = app.textFields["morde.chat.composer"]
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        XCTAssertTrue(composer.isEnabled)
+        composer.tap()
+        composer.typeText("Independent message while both tasks run")
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+
+        XCTAssertTrue(app.staticTexts["Independent message while both tasks run"].waitForExistence(timeout: 20),
+                      "An active conversation Task must not block sending an unassigned independent message.")
+        XCTAssertTrue(app.staticTexts["Task A coordinator"].exists)
+        XCTAssertTrue(app.staticTexts["Task B research"].exists)
+    }
+
+    func testMordeApprovalInboxRefreshesAfterPCDecisionWhileOpen() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: ["-morde.localApprovalPollingFixture"])
+        app.buttons["morde.nav.tab.approvals"].tap()
+
+        let approval = app.buttons["mif.approval.approve.q0000101:r0000001:1"]
+        let count = app.staticTexts["mif.approval.count"]
+        XCTAssertTrue(approval.waitForExistence(timeout: 20))
+        XCTAssertTrue(count.label.contains("1"))
+
+        let remoteDecisionRefreshed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "0"), object: count)
+        XCTAssertEqual(XCTWaiter.wait(for: [remoteDecisionRefreshed], timeout: 20), .completed,
+                       "The inbox should refresh a decision made on PC without leaving the screen.")
+        XCTAssertFalse(approval.exists)
+        XCTAssertTrue(app.descendants(matching: .any)["mif.approval.empty.container"].exists)
     }
 
     func testMordeTaskDetailShowsRealStepsWithoutBudget() {

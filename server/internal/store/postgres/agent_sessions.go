@@ -121,8 +121,8 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 VALUES ($1,$2,$3,'subagent','running',$4,$5) RETURNING created_at`, request.StepID, fence.TaskID, sequence, request.Title, request.Summary).Scan(&result.Step.CreatedAt); err != nil {
 			return fmt.Errorf("create child TaskStep: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,parent_session_id,step_id,spawn_key,request_hash,allowed_tools,is_background)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, fence.TaskID, fence.OwnerID, request.SessionID, request.ParentSessionID,
+		if _, err := tx.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,parent_session_id,step_id,spawn_key,request_hash,allowed_tools,is_background,task_revision)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,(SELECT current_revision FROM tasks WHERE id=$1))`, fence.TaskID, fence.OwnerID, request.SessionID, request.ParentSessionID,
 			request.StepID, request.SpawnKey, request.RequestHash, string(allowedTools), request.Background); err != nil {
 			return fmt.Errorf("create child Agent Session: %w", err)
 		}

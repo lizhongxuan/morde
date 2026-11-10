@@ -48,6 +48,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskMediaFixtureLaunchArgument = "-morde.localTaskMediaFixture"
     static let taskMediaCapabilityDisabledFixtureLaunchArgument = "-morde.localTaskMediaCapabilityDisabled"
     static let taskPagesFixtureLaunchArgument = "-morde.localTaskPagesFixture"
+    static let taskK2FixtureLaunchArgument = "-morde.localTaskK2Fixture"
+    static let approvalPollingFixtureLaunchArgument = "-morde.localApprovalPollingFixture"
     static let taskPagesStepCountsFixtureLaunchArgument = "-morde.localTaskPagesStepCountsFixture"
     static let taskPagesDesignRowsFixtureLaunchArgument = "-morde.localTaskPagesDesignRowsFixture"
     static let taskPagesStatusFixtureLaunchArgument = "-morde.localTaskPagesStatusFixture"
@@ -178,6 +180,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var resourceControlStatusFailureCount = 0
     private static var taskPagesApprovalDecision: String?
     private static var taskPagesApprovalLoadFailureRequestCount = 0
+    private static var approvalPollingListRequestCount = 0
     private static var taskPagesTaskDetailReentryRequestCount = 0
     private static var taskPagesTimelineUnconfirmedDetailRequestCount = 0
     private static var taskPagesPermissionRecoveryFailed = false
@@ -188,6 +191,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var taskPagesTaskActionRequestCount = 0
     private static var taskPagesTaskActionServiceInstanceChanged = false
     private static var taskPagesTaskActionSecondInstanceAccepted = false
+    private static var taskK2StoppedTaskID: String?
+    private static var taskK2StopIdempotencyKey: String?
     private static var taskPagesRetryListRequestCount = 0
     private static var taskTabLifecycleTaskAccepted = false
     private static var taskTabLifecycleCompleted = false
@@ -278,6 +283,35 @@ private final class MordeAuthURLProtocol: URLProtocol {
         taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
         taskPagesApprovalLoadFailureRequestCount += 1
         return taskPagesApprovalLoadFailureRequestCount
+    }
+
+    private static func nextApprovalPollingListRequest() -> Int {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        approvalPollingListRequestCount += 1
+        return approvalPollingListRequestCount
+    }
+
+    private static var taskK2StoppedTaskIDSnapshot: String? {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        return taskK2StoppedTaskID
+    }
+
+    private static func stopK2Task(taskID: String, key: String?, payload: [String: Any]?) -> (status: Int, body: Data) {
+        guard taskID == "q0000202", let key, !key.isEmpty,
+              payload?["action"] as? String == "cancel",
+              payload?["expected_status"] as? String == "running" else {
+            return (409, Data(#"{"error":{"code":"conflict","message":"Invalid Task B stop request"}}"#.utf8))
+        }
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        if taskK2StoppedTaskID == taskID, taskK2StopIdempotencyKey == key {
+            return (202, Data(#"{"task_id":"q0000202","action":"cancel","status":"cancelled","unsettled_operation_ids":[]}"#.utf8))
+        }
+        guard taskK2StoppedTaskID == nil else {
+            return (409, Data(#"{"error":{"code":"conflict","message":"Task B was already stopped"}}"#.utf8))
+        }
+        taskK2StoppedTaskID = taskID
+        taskK2StopIdempotencyKey = key
+        return (202, Data(#"{"task_id":"q0000202","action":"cancel","status":"cancelled","unsettled_operation_ids":[]}"#.utf8))
     }
 
     private static func nextTaskPagesTaskDetailReentryRequest() -> Int {
@@ -633,6 +667,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
         serviceUpgradeFixtureRejectedSubmission = false
         taskPagesApprovalDecision = nil
         taskPagesApprovalLoadFailureRequestCount = 0
+        approvalPollingListRequestCount = 0
         taskPagesTaskDetailReentryRequestCount = 0
         taskPagesTimelineUnconfirmedDetailRequestCount = 0
         taskPagesPermissionRecoveryFailed = false
@@ -643,6 +678,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
         taskPagesTaskActionRequestCount = 0
         taskPagesTaskActionServiceInstanceChanged = false
         taskPagesTaskActionSecondInstanceAccepted = false
+        taskK2StoppedTaskID = nil
+        taskK2StopIdempotencyKey = nil
         taskTabLifecycleTaskAccepted = false
         taskTabLifecycleCompleted = false
         conversationDrawerListRequestCount = 0
@@ -1153,6 +1190,53 @@ private final class MordeAuthURLProtocol: URLProtocol {
          "created_at": "2026-11-04T00:00:00Z", "updated_at": "2026-11-04T00:00:00Z"]
     }
 
+    private static func taskPagesK2Tasks() -> [[String: Any]] {
+        var first = taskPagesSummary(id: "q0000201", status: "running", objective: "Task A coordinator")
+        first["event_sequence"] = 4
+        first["current_revision"] = 2
+        first["desired_revision"] = 2
+        first["current_revision_started"] = true
+        first["dependencies"] = [["task_id": "q0000202", "required_revision": 1,
+                                  "task_status": "running", "satisfied": false]]
+        first["child_jobs"] = [["job_id": "child-result-a", "task_step_id": "s0000201",
+                                "title": "Read source material", "task_revision": 2, "status": "running"]]
+        first["result_review"] = ["state": "pending", "source_task_id": "q0000202",
+                                  "source_task_revision": 1, "source_event_sequence": 7,
+                                  "reply_message_id": NSNull()]
+        first["result_message_pending"] = true
+        first["result_message_published"] = false
+        first["steps"] = []
+        first["artifacts"] = []
+
+        let taskBStopped = taskK2StoppedTaskIDSnapshot == "q0000202"
+        var second = taskPagesSummary(id: "q0000202", status: taskBStopped ? "cancelled" : "running",
+                                      objective: "Task B research")
+        second["event_sequence"] = taskBStopped ? 8 : 7
+        second["current_revision"] = 1
+        second["desired_revision"] = 1
+        second["current_revision_started"] = true
+        second["dependencies"] = []
+        second["child_jobs"] = [["job_id": "child-result-b", "task_step_id": "s0000202",
+                                 "title": "Check local references", "task_revision": 1, "status": "succeeded"]]
+        second["result_review"] = NSNull()
+        second["steps"] = []
+        second["artifacts"] = []
+        return [first, second]
+    }
+
+    private static func taskPagesK2Messages() -> [[String: Any]] {
+        [
+            ["id": "m0000201", "conversation_id": "c1234567", "task_id": NSNull(),
+             "role": "user", "content": "Research the two local sources.", "status": "completed",
+             "created_at": "2026-11-04T00:00:00Z"],
+            ["id": "m0000202", "conversation_id": "c1234567", "task_id": "q0000201",
+             "role": "assistant", "content": "Coordinator reply using the research result.", "status": "completed",
+             "sources": [["user_message_id": "m0000201", "task_id": "q0000202", "task_revision": 1,
+                          "event_sequence": 7, "content": "Raw child task result from local research." ]],
+             "created_at": "2026-11-04T00:00:02Z"],
+        ]
+    }
+
     private static func eventChainAccountIsolationTask(isAccountA: Bool) -> [String: Any] {
         let account = isAccountA ? "account-a" : "account-b"
         var task = taskPagesSummary(id: "q0000001", status: "waiting_user",
@@ -1176,6 +1260,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
     }
 
     private static func taskPagesDetail(id: String) -> [String: Any]? {
+        if ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument),
+           let task = taskPagesK2Tasks().first(where: { $0["id"] as? String == id }) {
+            return task
+        }
         if ["q0000005", "q0000006", "q0000007"].contains(id) {
             let isCompleted = id == "q0000005"
             let isFailed = id == "q0000006"
@@ -2352,7 +2440,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
                         ? Data(#"{"service_instance_id":"00000000-0000-0000-0000-000000000001","api_version":"1","supported_features":["password_login","client_installations","ordered_client_login","task_api"]}"#.utf8)
                         : Data(#"{"service_instance_id":"00000000-0000-0000-0000-000000000001","api_version":"1","supported_features":["password_login","client_installations","ordered_client_login","task_api","conversation_auto_routing_v1"]}"#.utf8) }
                 } else if ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
-                            ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) {
+                            ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) ||
+                            ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
                     body = Data(#"{"service_instance_id":"00000000-0000-0000-0000-000000000001","api_version":"1","supported_features":["password_login","client_installations","ordered_client_login","task_api","conversation_auto_routing_v1"]}"#.utf8)
                 } else if ProcessInfo.processInfo.arguments.contains(Self.accountIsolationFixtureLaunchArgument) {
                     body = Data(#"{"service_instance_id":"00000000-0000-0000-0000-000000000001","api_version":"1","supported_features":["password_login","client_installations","ordered_client_login","task_api"]}"#.utf8)
@@ -2395,8 +2484,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
                     body = Data("{\"installation_id\":\"\(installationID)\",\"client_credential\":\"\(credential)\",\"client_expires_at\":\"2100-01-01T00:00:00Z\"}".utf8)
                 } else {
                     if ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
+                        ProcessInfo.processInfo.arguments.contains(Self.approvalPollingFixtureLaunchArgument) ||
                         (ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) &&
                          !ProcessInfo.processInfo.arguments.contains(Self.taskPagesTaskActionServiceInstanceFixtureLaunchArgument)) ||
+                        ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
                         ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalUnknownRetryFixtureLaunchArgument) ||
                         ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalRetryWithoutCommitFixtureLaunchArgument) ||
                         ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalDelayFixtureLaunchArgument) ||
@@ -2524,6 +2615,14 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineUnconfirmedFixtureLaunchArgument) {
             statusCode = Self.taskPagesTimelineUnconfirmedDetailRequests() > 1 ? 204 : 200
             body = Data()
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000202/actions",
+                  request.httpMethod == "POST",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
+            let response = Self.stopK2Task(taskID: "q0000202",
+                                           key: request.value(forHTTPHeaderField: "Idempotency-Key"),
+                                           payload: Self.jsonPayload(request))
+            statusCode = response.status
+            body = response.body
         } else if isFixtureOrigin, request.url?.path.hasPrefix("/api/tasks/") == true,
                   request.url?.path.hasSuffix("/events") == true, request.httpMethod == "GET",
                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument),
@@ -2609,6 +2708,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 200
                 body = Data("id: 8\nevent: task.snapshot_required\ndata: {\"sequence\":8}\n\n".utf8)
             }
+        } else if isFixtureOrigin, request.url?.path.hasPrefix("/api/tasks/") == true,
+                  request.url?.path.hasSuffix("/events") == true, request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
+            statusCode = 204
+            body = Data()
         } else if isFixtureOrigin, request.url?.path.hasPrefix("/api/tasks/") == true,
                   request.url?.path.hasSuffix("/events") == true, request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) ||
@@ -2820,7 +2924,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   let taskID = request.url?.path.split(separator: "/").last.map(String.init),
                   request.url?.path == "/api/tasks/\(taskID)", request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) ||
-                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesStatusFixtureLaunchArgument)) {
+                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesStatusFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.approvalPollingFixtureLaunchArgument)) {
             if let task = Self.taskPagesDetail(id: taskID),
                let encoded = try? JSONSerialization.data(withJSONObject: task) {
                 statusCode = 200
@@ -2910,8 +3016,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
             var items: [[String: Any]] = []
             if request.url?.path == "/api/conversations/c1234567/tasks",
                (ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
-                ProcessInfo.processInfo.arguments.contains(Self.taskPagesHostStopTaskFixtureLaunchArgument)) {
-                if ProcessInfo.processInfo.arguments.contains(Self.taskQueueFixtureLaunchArgument) {
+                ProcessInfo.processInfo.arguments.contains(Self.taskPagesHostStopTaskFixtureLaunchArgument) ||
+                ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument)) {
+                if ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
+                    items = Self.taskPagesK2Tasks()
+                } else if ProcessInfo.processInfo.arguments.contains(Self.taskQueueFixtureLaunchArgument) {
                     items = [Self.taskQueueFixtureTask()]
                 } else if ProcessInfo.processInfo.arguments.contains(Self.taskTabLifecycleFixtureLaunchArgument) {
                     if Self.taskTabLifecycleTaskAcceptedSnapshot && !Self.taskTabLifecycleCompletedSnapshot {
@@ -2940,7 +3049,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   (ProcessInfo.processInfo.arguments.contains(Self.messageSendWithoutAutoRoutingFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.selectedModelPreferenceFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.selectedUnavailableHostSendFixtureLaunchArgument) ||
-                   ProcessInfo.processInfo.arguments.contains(Self.serviceUpgradeRetryFixtureLaunchArgument)) {
+                   ProcessInfo.processInfo.arguments.contains(Self.serviceUpgradeRetryFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument)) {
             let payload = Self.jsonPayload(request)
             let content = payload?["content"] as? String ?? ""
             let clientID = payload?["client_message_id"] as? String ?? ""
@@ -2950,6 +3060,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 return (value as? String)?.isEmpty == true
             }
             let targetIsUnassigned = isEmptyTarget(payload?["host_id"]) && isEmptyTarget(payload?["workspace_id"])
+            let isIndependentK2Message = !ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
+                isEmptyTarget(payload?["reference_task_id"])
             let selectedUnavailableHostIsPreserved =
                 !ProcessInfo.processInfo.arguments.contains(Self.selectedUnavailableHostSendFixtureLaunchArgument) ||
                 (payload?["host_id"] as? String == "h0000002" && isEmptyTarget(payload?["workspace_id"]))
@@ -2964,6 +3076,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 payload?["mode"] == nil && payload?["expected_task_id"] == nil &&
                 selectedUnavailableHostIsPreserved && selectedUnavailableWorkspaceIsPreserved &&
                 selectedModelPreferenceIsPreserved &&
+                isIndependentK2Message &&
                 (!ProcessInfo.processInfo.arguments.contains(Self.resourceListFailureFixtureLaunchArgument) || targetIsUnassigned) &&
                 request.value(forHTTPHeaderField: "Idempotency-Key") == clientID &&
                 request.value(forHTTPHeaderField: "X-Morde-Service-Instance-ID") == "00000000-0000-0000-0000-000000000001" &&
@@ -3134,6 +3247,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
             } else {
                 body = ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
                     ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) ||
+                    ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
                     ProcessInfo.processInfo.arguments.contains(Self.taskMediaFixtureLaunchArgument)
                     ? Data(#"{"status":"ready","conversation_id":"c1234567","version":1}"#.utf8)
                     : Data(#"{"status":"uninitialized","conversation_id":"","version":0}"#.utf8)
@@ -3196,6 +3310,12 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 }
                 body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
             } else if conversationID == "c1234567",
+                      ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
+                statusCode = 200
+                body = (try? JSONSerialization.data(withJSONObject: [
+                    "items": Self.taskPagesK2Messages(), "next_cursor": NSNull(),
+                ])) ?? Data()
+            } else if conversationID == "c1234567",
                ProcessInfo.processInfo.arguments.contains(Self.conversationHistoryPaginationFixtureLaunchArgument) {
                 let cursor = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
                     .queryItems?.first(where: { $0.name == "cursor" })?.value
@@ -3248,9 +3368,14 @@ private final class MordeAuthURLProtocol: URLProtocol {
             body = Data(#"{"error":{"code":"not_found","message":"Synthetic lookup failure"}}"#.utf8)
         } else if isFixtureOrigin, request.url?.path == "/api/conversations/c1234567/messages", request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument)) {
             statusCode = 200
-            if ProcessInfo.processInfo.arguments.contains(Self.taskSequentialSendFixtureLaunchArgument) {
+            if ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
+                body = (try? JSONSerialization.data(withJSONObject: [
+                    "items": Self.taskPagesK2Messages(), "next_cursor": NSNull(),
+                ])) ?? Data()
+            } else if ProcessInfo.processInfo.arguments.contains(Self.taskSequentialSendFixtureLaunchArgument) {
                 let contents = Self.taskSequentialSendContentsSnapshot
                 let clientID = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
                     .queryItems?.first(where: { $0.name == "client_message_id" })?.value
@@ -3285,6 +3410,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
             body = Data(#"{"items":[{"id":"c1234567","host_id":null,"title":"主会话","is_main":true},{"id":"c2345678","host_id":null,"title":"侧边栏历史会话","is_main":false}],"next_cursor":null}"#.utf8)
         } else if isFixtureOrigin, request.url?.path == "/api/conversations", request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument)) {
             if ProcessInfo.processInfo.arguments.contains(Self.conversationDrawerRetryFixtureLaunchArgument) &&
                 Self.nextConversationDrawerListRequest() == 1 {
@@ -3303,6 +3429,21 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 200
                 body = Data(#"{"items":[{"id":"c1234567","host_id":null,"title":"Local SSE fixture","is_main":true}],"next_cursor":null}"#.utf8)
             }
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.approvalPollingFixtureLaunchArgument) {
+            let status = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+                .queryItems?.first(where: { $0.name == "status" })?.value
+            let items = status == "waiting_user" && Self.nextApprovalPollingListRequest() == 1
+                ? [Self.taskPagesSummary(id: "q0000101", status: "waiting_user", objective: "PC approved while inbox is open")]
+                : []
+            statusCode = 200
+            body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
+            statusCode = 200
+            body = (try? JSONSerialization.data(withJSONObject: [
+                "items": Self.taskPagesK2Tasks(), "next_cursor": NSNull(),
+            ])) ?? Data()
         } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesPermissionRecoveryFixtureLaunchArgument) {
             let cursor = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
@@ -4216,6 +4357,19 @@ struct MordeTask: Decodable, Identifiable {
         let sha256: String?
         let created_at: String
     }
+    struct Dependency: Decodable, Identifiable {
+        let task_id: String; let required_revision: Int64; let task_status: String; let satisfied: Bool
+        var id: String { "\(task_id):\(required_revision)" }
+    }
+    struct ChildJob: Decodable, Identifiable {
+        let job_id: String; let task_step_id: String; let title: String
+        let task_revision: Int64; let status: String
+        var id: String { job_id }
+    }
+    struct ResultReview: Decodable {
+        let state: String; let source_task_id: String; let source_task_revision: Int64
+        let source_event_sequence: Int64; let reply_message_id: String?
+    }
     let owner_id: String?; let initiator_id: String?
     let id: String; let conversation_id: String; let host_id: String?; let execution_location: String?
     let model_id: String?
@@ -4228,6 +4382,7 @@ struct MordeTask: Decodable, Identifiable {
     let step_count: Int64; let completed_step_count: Int64
     let pending_request: Pending?
     let clarification_request: Clarification?; let batch_items: [MordeBatchItem]?
+    let dependencies: [Dependency]?; let child_jobs: [ChildJob]?; let result_review: ResultReview?
     let steps: [Step]?; let artifacts: [Artifact]?; let updated_at: String
     let assistant_message: MordeClientMessage?
 
@@ -11506,12 +11661,13 @@ private struct MordeIndependentSendTarget {
                               cursor.advance(eventID: eventID, for: streamed.task_id) else {
                             throw URLError(.cannotParseResponse)
                         }
+                        if updatesCurrentConversation &&
+                            !MordeTaskEventCursor.shouldPresent(sequence: sequence, initialSequence: initialSequence) {
+                            event = ""; eventID = ""; data = ""
+                            continue
+                        }
                         appendTaskTimelineEvent(streamed)
                         if updatesCurrentConversation {
-                            guard sequence >= initialSequence else {
-                                event = ""; eventID = ""; data = ""
-                                continue
-                            }
                             let snapshot: MordeTask = try await call("/api/tasks/\(taskID)")
                             guard snapshot.id == taskID, let snapshotSequence = snapshot.event_sequence,
                                   snapshot.conversation_id == selectedConversationID,
@@ -15466,6 +15622,7 @@ private struct MordeRoot: View {
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
                 Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
             }
+            conversationTaskRelations(task)
             NavigationLink {
                 MIFTaskDetailView(taskID: task.id)
             } label: {
@@ -15479,6 +15636,60 @@ private struct MordeRoot: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .accessibilityIdentifier("morde.chat.taskSummary")
+    }
+
+    @ViewBuilder
+    private func conversationTaskRelations(_ task: MordeTask) -> some View {
+        let dependencies = task.dependencies ?? []
+        let childJobs = task.child_jobs ?? []
+        if !dependencies.isEmpty || !childJobs.isEmpty || task.result_review != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                if !dependencies.isEmpty {
+                    Text(AppLocalized("Dependencies"))
+                        .font(.caption.weight(.semibold))
+                    ForEach(dependencies) { dependency in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(String(format: AppLocalized("%@ · required revision %lld"),
+                                        dependency.task_id, dependency.required_revision))
+                            Text(AppLocalized(dependency.satisfied ? "Dependency satisfied" : "Waiting for dependency"))
+                        }
+                        .font(.caption)
+                    }
+                }
+                if !childJobs.isEmpty {
+                    Text(AppLocalized("Child jobs"))
+                        .font(.caption.weight(.semibold))
+                    ForEach(childJobs) { job in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(job.title)
+                            Text(MIFTaskPresentation.stepStatusLabel(job.status))
+                        }
+                        .font(.caption)
+                    }
+                }
+                if let review = task.result_review {
+                    Text(AppLocalized("Task result review"))
+                        .font(.caption.weight(.semibold))
+                    Text(taskResultReviewLabel(review.state))
+                        .font(.caption)
+                    Text(String(format: AppLocalized("Source %@ · revision %lld · event %lld"),
+                                review.source_task_id, review.source_task_revision, review.source_event_sequence))
+                        .font(.caption)
+                }
+            }
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("morde.chat.taskRelations.\(task.id)")
+        }
+    }
+
+    private func taskResultReviewLabel(_ state: String) -> String {
+        switch state {
+        case "pending": AppLocalized("Result review pending")
+        case "processing": AppLocalized("Result review processing")
+        case "published": AppLocalized("Result published")
+        case "failed": AppLocalized("Result review failed")
+        default: AppLocalized("Result review status unknown")
+        }
     }
 
     private func conversationResultAlreadyDisplayed(_ task: MordeTask) -> Bool {

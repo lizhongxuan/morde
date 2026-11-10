@@ -208,6 +208,10 @@ func TestCloudDSHUsesModelGatewayAndLocalSyntheticModelHTTP(t *testing.T) {
 		}
 		t.Fatalf("local synthetic model request count = %d", len(observedRequests))
 	}
+	if strings.Count(observedRequests[0].Instructions, "You are Morde, the user's AI assistant.") != 1 ||
+		strings.Count(observedRequests[0].Instructions, "Morde task execution policy:") != 1 {
+		t.Fatal("local synthetic model request duplicated or omitted the Morde identity or task policy")
+	}
 	if len(fallbackModels.calls) != 0 {
 		t.Fatalf("DSH bypassed ModelGateway and called fallback models %d times", len(fallbackModels.calls))
 	}

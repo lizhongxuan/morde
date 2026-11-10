@@ -455,7 +455,7 @@ func (h *api) listConversationActiveTasks(service TaskService) gin.HandlerFunc {
 func writeConversationActiveTasks(c *gin.Context, page app.TaskPage) {
 	response := conversationActiveTaskPageResponse{Items: make([]conversationActiveTaskResponse, 0, len(page.Items)), NextCursor: cursorPointer(page.NextCursor)}
 	for _, value := range page.Items {
-		summary, err := toTaskSummaryResponse(value)
+		summary, err := toTaskSummaryResponseWithK2(value, page.K2Projections[value.ID])
 		if err != nil {
 			writeError(c, err)
 			return

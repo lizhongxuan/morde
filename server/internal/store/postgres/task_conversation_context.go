@@ -29,7 +29,7 @@ const (
 // authorized membership in m's project conversation. It proves that another
 // member's message belongs to a completed, published result in that same
 // conversation. Batch sources remain verifiable even if old events are
-// pruned; live stream results retain their exact result-event/content fence.
+// pruned; reviewed reply text is not required to match source results.
 const projectSharedHistoryEvidenceSQL = `EXISTS (
   SELECT 1 FROM conversation_messages project_result
   JOIN conversations project_scope ON project_scope.id=project_result.conversation_id
@@ -64,9 +64,6 @@ const projectSharedHistoryEvidenceSQL = `EXISTS (
           AND project_event.result_content_sha256=sha256(convert_to(project_result.content,'UTF8'))
       )) OR (project_result.output_status IS NULL AND project_batch.message_id IS NOT NULL
       AND project_batch.service_instance_id=(SELECT instance_id FROM service_identity WHERE singleton=true)
-      AND project_result.content=(SELECT string_agg(project_source.content,E'\n\n' ORDER BY project_source.source_order)
-        FROM conversation_result_sources project_source WHERE project_source.batch_message_id=project_batch.message_id
-          AND project_source.state='published')
       AND EXISTS (SELECT 1 FROM conversation_result_sources project_source
         WHERE project_source.batch_message_id=project_batch.message_id AND project_source.state='published')
       AND NOT EXISTS (SELECT 1 FROM conversation_result_sources project_source
@@ -78,7 +75,11 @@ const projectSharedHistoryEvidenceSQL = `EXISTS (
           AND (project_source_task.id IS NULL OR project_source_task.status<>'completed'
             OR project_source_task.current_revision<>project_source.task_revision
             OR project_source_task.desired_revision<>project_source.task_revision
-            OR project_source_task.result IS DISTINCT FROM project_source.content))
+            OR project_source_task.result IS DISTINCT FROM project_source.content
+            OR project_source_task.current_step IS DISTINCT FROM project_source.turn_id
+            OR project_source_task.auth_version IS DISTINCT FROM project_source.authorization_version
+            OR project_source.authorization_version IS DISTINCT FROM project_batch.authorization_version
+            OR project_source.payload_sha256 IS DISTINCT FROM sha256(convert_to(project_source.content,'UTF8'))))
     ))
 )`
 
@@ -131,7 +132,7 @@ func captureTaskConversationContextForTask(ctx context.Context, tx pgx.Tx, value
 	}
 	var through int64
 	err = tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0) FROM conversation_messages
-	WHERE owner_id=$1 AND conversation_id=$2`, value.OwnerID, value.ConversationID).Scan(&through)
+	WHERE owner_id=$1 AND conversation_id=$2 AND source_kind<>'task_result_review'`, value.OwnerID, value.ConversationID).Scan(&through)
 	if err != nil {
 		return task.ConversationContext{}, taskConversationContextManifest{}, fmt.Errorf("read conversation history boundary: %w", err)
 	}
@@ -236,6 +237,7 @@ func readTaskConversationContextWithProjectLock(ctx context.Context, tx pgx.Tx, 
 	var firstTaskMessageSequence pgtype.Int8
 	err = tx.QueryRow(ctx, `SELECT MIN(m.sequence) FROM conversation_messages m
 WHERE m.task_id=$1 AND m.owner_id=$2 AND m.conversation_id=$3 AND m.role='user'
+ AND m.source_kind<>'task_result_review'
  AND NOT EXISTS (SELECT 1 FROM task_revision_intents revision WHERE revision.message_id=m.id AND revision.task_id=m.task_id)`,
 		value.ID, value.OwnerID, value.ConversationID).Scan(&firstTaskMessageSequence)
 	if err != nil {
@@ -259,6 +261,7 @@ func readTaskConversationContextMessages(ctx context.Context, tx pgx.Tx, ownerID
 	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.role,m.content
 FROM conversation_messages m
 WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence <= $3
+  AND m.source_kind<>'task_result_review'
   AND ($5::text[] IS NULL OR m.id=ANY($5::text[]))
   AND EXISTS (SELECT 1 FROM conversations scoped WHERE scoped.id=m.conversation_id AND scoped.owner_id=m.owner_id
     AND (scoped.project_id IS NOT NULL OR m.actor_id=scoped.owner_id))

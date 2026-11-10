@@ -189,7 +189,7 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resultWorker, err := worker.NewConversationResultAggregationWorker(store, 100*time.Millisecond, zap.NewNop())
+	resultWorker, err := worker.NewConversationResultReviewWorker(store, 100*time.Millisecond, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}

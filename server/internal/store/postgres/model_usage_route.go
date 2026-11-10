@@ -633,7 +633,7 @@ WHERE message_id=$1 AND actor_id=$2 AND call_id=$3 FOR UPDATE`, call.Route.Claim
 			var prior app.ConversationRouteDecision
 			var input, output int64
 			var ledgerState string
-			if json.Unmarshal(storedDecision, &prior) == nil && prior == *decision &&
+			if json.Unmarshal(storedDecision, &prior) == nil && reflect.DeepEqual(prior, *decision) &&
 				tx.QueryRow(ctx, `SELECT state,input_tokens,output_tokens FROM model_call_ledger WHERE owner_id=$1 AND source='route' AND call_id=$2`,
 					call.OwnerID, call.CallID).Scan(&ledgerState, &input, &output) == nil && ledgerState == "settled" && input == usage.InputTokens && output == usage.OutputTokens {
 				return nil
@@ -731,14 +731,16 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, candidates []
 	}
 	switch value.Action {
 	case app.ConversationRouteNew:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && value.Reply == ""
+		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && value.Reply == "" &&
+			app.ValidConversationRouteDependencyIDs(value.DependencyTaskIDs, candidates)
 	case app.ConversationRouteReply:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && app.ValidConversationRouteReply(value.Reply)
+		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && len(value.DependencyTaskIDs) == 0 &&
+			app.ValidConversationRouteReply(value.Reply)
 	case app.ConversationRouteClarify:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Reply == "" && value.Question != "" &&
+		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 && value.Question != "" &&
 			utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if value.Question != "" || value.Reply != "" {
+		if value.Question != "" || value.Reply != "" || len(value.DependencyTaskIDs) != 0 {
 			return false
 		}
 		for _, candidate := range candidates {
