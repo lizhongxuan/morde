@@ -23,16 +23,17 @@ type modelConnectionListResponse struct {
 }
 
 type modelConnectionResponse struct {
-	ID           string                      `json:"id"`
-	Name         string                      `json:"name"`
-	BaseURL      string                      `json:"base_url"`
-	ModelName    string                      `json:"model_name"`
-	Shared       bool                        `json:"shared"`
-	HasAPIKey    bool                        `json:"has_api_key"`
-	Capabilities modelConnectionCapabilities `json:"capabilities"`
-	CheckedAt    *time.Time                  `json:"checked_at"`
-	CreatedAt    time.Time                   `json:"created_at"`
-	UpdatedAt    time.Time                   `json:"updated_at"`
+	ID                  string                      `json:"id"`
+	Name                string                      `json:"name"`
+	BaseURL             string                      `json:"base_url"`
+	ModelName           string                      `json:"model_name"`
+	ContextWindowTokens *int                        `json:"context_window_tokens"`
+	Shared              bool                        `json:"shared"`
+	HasAPIKey           bool                        `json:"has_api_key"`
+	Capabilities        modelConnectionCapabilities `json:"capabilities"`
+	CheckedAt           *time.Time                  `json:"checked_at"`
+	CreatedAt           time.Time                   `json:"created_at"`
+	UpdatedAt           time.Time                   `json:"updated_at"`
 }
 
 type modelConnectionCapabilities struct {
@@ -61,18 +62,20 @@ func modelConnectionCapabilitiesFrom(value app.ModelCapabilities) modelConnectio
 }
 
 type createModelConnectionRequest struct {
-	Name      string `json:"name"`
-	BaseURL   string `json:"base_url"`
-	ModelName string `json:"model_name"`
-	APIKey    string `json:"api_key"`
-	Shared    bool   `json:"shared"`
+	Name                string `json:"name"`
+	BaseURL             string `json:"base_url"`
+	ModelName           string `json:"model_name"`
+	ContextWindowTokens *int   `json:"context_window_tokens"`
+	APIKey              string `json:"api_key"`
+	Shared              bool   `json:"shared"`
 }
 
 type updateModelConnectionRequest struct {
-	Name      string `json:"name"`
-	BaseURL   string `json:"base_url"`
-	ModelName string `json:"model_name"`
-	APIKey    string `json:"api_key"`
+	Name                string `json:"name"`
+	BaseURL             string `json:"base_url"`
+	ModelName           string `json:"model_name"`
+	ContextWindowTokens *int   `json:"context_window_tokens"`
+	APIKey              string `json:"api_key"`
 }
 
 func (h *api) registerModelConnections(group *gin.RouterGroup) {
@@ -213,7 +216,8 @@ func (h *api) createModelConnection(c *gin.Context) {
 		return
 	}
 	item, err := h.deps.ModelConnections.Create(c.Request.Context(), principal, app.ModelConnectionCommand{
-		Name: request.Name, BaseURL: request.BaseURL, ModelName: request.ModelName, APIKey: request.APIKey, Shared: request.Shared,
+		Name: request.Name, BaseURL: request.BaseURL, ModelName: request.ModelName, ContextWindowTokens: request.ContextWindowTokens,
+		APIKey: request.APIKey, Shared: request.Shared,
 	})
 	if err != nil {
 		writeError(c, err)
@@ -253,7 +257,8 @@ func (h *api) updateModelConnection(c *gin.Context) {
 		return
 	}
 	item, err := h.deps.ModelConnections.Update(c.Request.Context(), principal, id, app.ModelConnectionCommand{
-		Name: request.Name, BaseURL: request.BaseURL, ModelName: request.ModelName, APIKey: request.APIKey,
+		Name: request.Name, BaseURL: request.BaseURL, ModelName: request.ModelName,
+		ContextWindowTokens: request.ContextWindowTokens, APIKey: request.APIKey,
 	})
 	if err != nil {
 		writeError(c, err)
@@ -406,7 +411,8 @@ func toModelConnectionResponse(item app.ModelConnectionView) (modelConnectionRes
 		return modelConnectionResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return modelConnectionResponse{
-		ID: item.ID, Name: item.Name, BaseURL: item.BaseURL, ModelName: item.ModelName, Shared: item.Shared, HasAPIKey: item.HasAPIKey,
+		ID: item.ID, Name: item.Name, BaseURL: item.BaseURL, ModelName: item.ModelName,
+		ContextWindowTokens: item.ContextWindowTokens, Shared: item.Shared, HasAPIKey: item.HasAPIKey,
 		Capabilities: modelConnectionCapabilitiesFrom(item.Capabilities),
 		CheckedAt:    item.CheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}, nil

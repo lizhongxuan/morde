@@ -71,7 +71,7 @@ func routeModelFixtureWithMember(t *testing.T, useProject, separateOwner bool, c
 	t.Helper()
 	store, _, _, principal, modelID := modelProbeFixture(t, app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1})
 	ctx := context.Background()
-	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,capability_tools=false WHERE id=$1`, modelID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,capability_tools=false,context_window_tokens=32768 WHERE id=$1`, modelID); err != nil {
 		t.Fatal(err)
 	}
 	var expires time.Time

@@ -130,6 +130,12 @@ func (f mcpRuntimeStopReconcilerFunc) ReconcileMCPRuntimeCancellations(ctx conte
 	return f(ctx)
 }
 
+type taskAgentStopReconcilerFunc func(context.Context, app.TaskStopClaim) error
+
+func (f taskAgentStopReconcilerFunc) ReconcileExpiredTaskAgentStop(ctx context.Context, claim app.TaskStopClaim) error {
+	return f(ctx, claim)
+}
+
 type workspaceInputRevisionStopStore struct {
 	*taskStopStoreStub
 	reconciled chan struct{}
@@ -356,6 +362,70 @@ func TestTaskStopWorkerNotFoundWaitsForSafeAfter(t *testing.T) {
 	}
 	if requirements := store.safeAfterRequirements(); len(requirements) != 1 || !requirements[0] {
 		t.Fatalf("safe-after requirements = %v, want [true] for not-found proof", requirements)
+	}
+}
+
+func TestTaskStopWorkerRecoversExpiredGuardianTaskBeforeCompletion(t *testing.T) {
+	var mu sync.Mutex
+	var sequence []string
+	store := &taskStopStoreStub{}
+	store.complete = func(_ context.Context, taskID, requestID, owner string, version int64) (task.Task, error) {
+		mu.Lock()
+		sequence = append(sequence, "complete")
+		mu.Unlock()
+		if taskID != "task-stop-1" || requestID != "stop-request-1" || owner != "worker-stop-test" || version != 2 {
+			t.Fatalf("completion received stale claim: %s/%s/%s/%d", taskID, requestID, owner, version)
+		}
+		return task.Task{ID: taskID}, nil
+	}
+	worker, err := NewTaskStopWorker(TaskStopWorkerOptions{
+		Store: store, Executor: taskStopExecutorFunc(func(context.Context, task.Task, task.Operation) (task.OperationStatus, string, bool, error) {
+			return "", "", false, errors.New("no operation expected")
+		}), WorkerID: "worker-stop-test", LeaseDuration: time.Second, PollInterval: time.Millisecond,
+		OperationTimeout: time.Second, TaskAgentStopper: taskAgentStopReconcilerFunc(func(_ context.Context, claim app.TaskStopClaim) error {
+			mu.Lock()
+			sequence = append(sequence, "guardian-recovery")
+			mu.Unlock()
+			if claim.Request.ID != "stop-request-1" || claim.Request.LeaseOwner != "worker-stop-test" || claim.Task.ID != "task-stop-1" {
+				return errors.New("reconciler received a stale stop claim")
+			}
+			return nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := validTaskStopClaim("worker-stop-test", time.Now().Add(-time.Second))
+	if err := worker.processClaim(context.Background(), claim); err != nil {
+		t.Fatalf("process stop claim: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sequence) != 2 || sequence[0] != "guardian-recovery" || sequence[1] != "complete" {
+		t.Fatalf("Guardian recovery/completion order = %v", sequence)
+	}
+}
+
+func TestTaskStopWorkerKeepsClaimRetryableWhenGuardianRecoveryFails(t *testing.T) {
+	store := &taskStopStoreStub{}
+	worker, err := NewTaskStopWorker(TaskStopWorkerOptions{
+		Store: store, Executor: taskStopExecutorFunc(func(context.Context, task.Task, task.Operation) (task.OperationStatus, string, bool, error) {
+			return "", "", false, errors.New("no operation expected")
+		}), WorkerID: "worker-stop-test", LeaseDuration: time.Second, PollInterval: time.Millisecond,
+		OperationTimeout: time.Second, TaskAgentStopper: taskAgentStopReconcilerFunc(func(context.Context, app.TaskStopClaim) error {
+			return errors.New("Guardian unavailable")
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := validTaskStopClaim("worker-stop-test", time.Now().Add(-time.Second))
+	if err := worker.processClaim(context.Background(), claim); err == nil {
+		t.Fatal("Guardian recovery failure did not defer stop completion")
+	}
+	_, _, _, completes, _ := store.counts()
+	if completes != 0 {
+		t.Fatalf("completed task stop after failed Guardian recovery: completes=%d", completes)
 	}
 }
 

@@ -30,6 +30,8 @@ type ConversationCoordinatorIdentity struct {
 	Generation           int64
 	AuthorizationVersion int64
 	SessionID            string
+	Purpose              string
+	OperationID          string
 }
 
 type ConversationCoordinatorCheckpointCommand struct {
@@ -97,6 +99,9 @@ func ValidateConversationCoordinatorIdentity(claim ConversationRouteClaim, ident
 		!domain.ValidUserID(claim.Message.ActorID) || !domain.ValidConversationID(claim.Message.ConversationID) ||
 		!domain.ValidMessageID(claim.Message.ID) || !conversationCoordinatorIDPattern.MatchString(identity.AgentID) ||
 		!conversationCoordinatorIDPattern.MatchString(identity.SessionID) || identity.Generation < 1 || identity.AuthorizationVersion < 1 ||
+		(identity.Purpose != "conversation" && identity.Purpose != "compaction") ||
+		(identity.Purpose == "conversation" && identity.OperationID != "") ||
+		(identity.Purpose == "compaction" && !domain.ValidOperationID(identity.OperationID)) ||
 		identity.ServiceInstanceID != claim.ServiceInstanceID || identity.OwnerID != claim.Message.OwnerID ||
 		identity.ActorID != claim.Message.ActorID || identity.ConversationID != claim.Message.ConversationID ||
 		identity.MessageID != claim.Message.ID || identity.AuthorizationVersion != claim.Authorization.Version {

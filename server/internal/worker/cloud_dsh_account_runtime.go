@@ -64,6 +64,10 @@ type CloudDSHTaskStopConfirmer interface {
 	MarkAccountAgentTaskStopAttestationAcknowledged(context.Context, app.AccountAgentTaskStopAttestation) (bool, error)
 }
 
+type CloudDSHTaskStopRecoveryIdentityProvider interface {
+	ExpiredAccountAgentTaskStopRecoveryIdentity(context.Context, app.TaskStopClaim) (app.AccountAgentTaskStopRecoveryIdentity, bool, error)
+}
+
 type CloudDSHAccountRuntimeManagerOptions struct {
 	Control      CloudDSHAccountRuntimeControl
 	Supervisor   CloudDSHAccountRuntimeSupervisor
@@ -350,12 +354,12 @@ func (m *CloudDSHAccountRuntimeManager) reapStopCandidates(ctx context.Context) 
 		session := m.sessions[candidate.Fence.ConversationID]
 		if session != nil {
 			session.mu.Lock()
-			activeTasks := len(session.tasks) > 0
-			if !activeTasks {
+			activeWork := session.hasActiveWorkLocked(nil)
+			if !activeWork {
 				session.stopping = true
 			}
 			session.mu.Unlock()
-			if activeTasks {
+			if activeWork {
 				m.mu.Unlock()
 				continue
 			}
@@ -397,6 +401,41 @@ func (m *CloudDSHAccountRuntimeManager) acknowledgeTaskStopProof(ctx context.Con
 		return fmt.Errorf("persist Guardian Task stop proof acknowledgement for task %s: %w", attestation.TaskFence.TaskID, err)
 	}
 	return nil
+}
+
+// ReconcileExpiredTaskAgentStop recovers only the current pending stop claim's
+// expired Agent generation. Guardian destroys that exact Task cgroup, then the
+// existing app verifier, DB proof write and Guardian/DB acknowledgement path
+// durably converge it. The shared Runtime and sibling Task processes are never
+// stopped by this path.
+func (m *CloudDSHAccountRuntimeManager) ReconcileExpiredTaskAgentStop(ctx context.Context, claim app.TaskStopClaim) error {
+	if ctx == nil || ctx.Err() != nil {
+		return errors.New("guardian Task stop recovery context is unavailable")
+	}
+	provider, ok := m.options.TaskStopper.(CloudDSHTaskStopRecoveryIdentityProvider)
+	if !ok {
+		return errors.New("account Task Guardian recovery identity provider is unavailable")
+	}
+	identity, ready, err := provider.ExpiredAccountAgentTaskStopRecoveryIdentity(ctx, claim)
+	if err != nil {
+		return fmt.Errorf("load exact expired Task Guardian recovery identity: %w", err)
+	}
+	if !ready {
+		return m.reapTaskStopProofAcknowledgements(ctx)
+	}
+	attestation, err := m.options.Guardian.RecoverTaskProcessStopped(ctx, identity.RuntimeFence, identity.TaskFence, identity.NonceSHA256)
+	if err != nil {
+		return fmt.Errorf("guardian could not recover exact expired Task process: %w", err)
+	}
+	if attestation.RuntimeFence != identity.RuntimeFence || attestation.TaskFence != identity.TaskFence ||
+		attestation.NonceSHA256 != identity.NonceSHA256 || attestation.ExpiresAt.IsZero() ||
+		attestation.ExpiresAt.After(time.Now()) || !attestation.Destroyed || attestation.ProofSHA256 == "" {
+		return errors.New("guardian Task stop proof did not match the exact expired recovery identity")
+	}
+	if _, err := m.options.TaskStopper.ConfirmTaskStopped(ctx, attestation); err != nil {
+		return fmt.Errorf("persist verified Guardian Task process stop proof: %w", err)
+	}
+	return m.acknowledgeTaskStopProof(ctx, attestation)
 }
 
 func (m *CloudDSHAccountRuntimeManager) reapAccountRuntimeStopProofAcknowledgements(ctx context.Context) error {
@@ -467,6 +506,22 @@ func (s *cloudDSHAccountRuntimeSession) closed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.failed != nil || s.stopping
+}
+
+// hasActiveWorkLocked must be called with s.mu held. A shared Runtime remains
+// in use while either a Task process or a conversation coordinator is active.
+func (s *cloudDSHAccountRuntimeSession) hasActiveWorkLocked(exceptTask *cloudDSHAccountTask) bool {
+	for _, task := range s.tasks {
+		if task != exceptTask {
+			return true
+		}
+	}
+	for _, coordinator := range s.coordinators {
+		if coordinator != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *cloudDSHAccountRuntimeSession) fail(err error) {
@@ -673,7 +728,8 @@ func (s *cloudDSHAccountRuntimeSession) routeCoordinatorFrame(kind string, frame
 			"runtime_id": s.runtime.Fence.RuntimeID, "runtime_generation": s.runtime.Fence.RuntimeGeneration,
 			"runtime_sequence": coordinator.sequence, "context_role": "coordinator",
 			"conversation_id": identity.ConversationID, "message_id": identity.MessageID, "actor_id": identity.ActorID, "agent_id": identity.AgentID,
-			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID})
+			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
+			"purpose": identity.Purpose, "operation_id": identity.OperationID})
 	case "coordinator_started":
 		coordinator.mu.Lock()
 		if !coordinator.admitted || coordinator.started {
@@ -846,7 +902,8 @@ func (s *cloudDSHAccountRuntimeSession) StartCoordinator(ctx context.Context, cl
 		_ = s.writeCoordinatorFrame(cancelCtx, identity, map[string]any{"type": "coordinator_cancel",
 			"context_role": "coordinator", "conversation_id": identity.ConversationID, "message_id": identity.MessageID,
 			"owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID,
-			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID})
+			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
+			"purpose": identity.Purpose, "operation_id": identity.OperationID})
 		cancel()
 		_ = s.removeCoordinator(identity, coordinator)
 		return nil, ctx.Err()
@@ -865,7 +922,7 @@ func (s *cloudDSHAccountRuntimeSession) writeCoordinatorFrame(ctx context.Contex
 	if !valid || frame["context_role"] != "coordinator" || frame["conversation_id"] != identity.ConversationID ||
 		frame["message_id"] != identity.MessageID || frame["owner_id"] != identity.OwnerID || frame["actor_id"] != identity.ActorID ||
 		frame["agent_id"] != identity.AgentID || frame["generation"] != identity.Generation || frame["authorization_version"] != identity.AuthorizationVersion ||
-		frame["session_id"] != identity.SessionID {
+		frame["session_id"] != identity.SessionID || frame["purpose"] != identity.Purpose || frame["operation_id"] != identity.OperationID {
 		return errors.New("coordinator runtime frame identity is invalid")
 	}
 	for key, value := range map[string]any{"server_instance_id": s.runtime.Fence.ServiceInstanceID,
@@ -904,14 +961,14 @@ func (s *cloudDSHAccountRuntimeSession) stopTask(ctx context.Context, task *clou
 	task.mu.Unlock()
 	if guard == nil {
 		s.mu.Lock()
-		if len(s.tasks) > 1 {
+		if s.hasActiveWorkLocked(task) {
 			s.mu.Unlock()
-			return errors.New("unarmed Task stop is unconfirmed while sibling Tasks are active")
+			return errors.New("unarmed Task stop is unconfirmed while shared Runtime work is active")
 		}
 		s.stopping = true
 		s.mu.Unlock()
 		// Retire an unguarded Task by stopping its exact Guardian-bound Runtime
-		// only when no sibling Task is active.
+		// only when no other Task or coordinator is active.
 		if err := s.manager.markRuntimeFailed(ctx, s.runtime.Fence, execution.RuntimeFailureRuntime); err != nil {
 			return errors.New("unarmed account Agent Runtime failure could not be persisted")
 		}
@@ -944,7 +1001,7 @@ func (s *cloudDSHAccountRuntimeSession) stopTask(ctx context.Context, task *clou
 			AgentID: task.fence.AgentInstanceID, SessionID: task.fence.AgentSessionID,
 			Generation: task.fence.AgentGeneration, AuthorizationVersion: task.fence.AuthorizationVersion}] = struct{}{}
 	}
-	stopRequested := len(s.tasks) == 0
+	stopRequested := !s.hasActiveWorkLocked(nil)
 	if stopRequested {
 		s.stopping = true
 	}

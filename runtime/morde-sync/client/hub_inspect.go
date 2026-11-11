@@ -9,14 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
 const (
-	HubInspectMaxEntries = 128
-	HubInspectMaxBytes   = 32 << 10
-	maxHubInspectPath    = 1024
+	HubInspectMaxEntries    = 128
+	HubInspectMaxBytes      = 32 << 10
+	HubInspectMaxChunkBytes = 4 << 20
+	maxHubInspectPath       = 1024
 )
 
 var errHubInspect = errors.New("selected directory inspection failed")
@@ -36,6 +38,21 @@ type HubFileContent struct {
 	Path      string `json:"path"`
 	Text      string `json:"text"`
 	Truncated bool   `json:"truncated"`
+}
+
+type HubFileSnapshot struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+	Version   string `json:"version"`
+}
+
+type HubFileChunk struct {
+	Path    string `json:"path"`
+	Offset  int64  `json:"offset"`
+	Version string `json:"version"`
+	SHA256  string `json:"sha256"`
+	Data    []byte `json:"data"`
 }
 
 // SelectHubRoot returns a canonical directory and a stable token derived from
@@ -197,6 +214,194 @@ func ReadHubFile(directory, identity, relative string, maxBytes int) (HubFileCon
 		return HubFileContent{}, err
 	}
 	return HubFileContent{Path: relative, Text: string(data), Truncated: truncated}, nil
+}
+
+// SnapshotHubFile computes a content digest without retaining the file in memory.
+func SnapshotHubFile(directory, identity, relative string) (HubFileSnapshot, error) {
+	file, err := openHubInspectionFile(directory, identity, relative)
+	if err != nil {
+		return HubFileSnapshot{}, err
+	}
+	defer file.close()
+
+	digest, _, size, err := hashHubInspectionFile(file.file, file.info.Size(), 0, 0)
+	if err != nil || size != file.info.Size() || file.verify() != nil {
+		return HubFileSnapshot{}, errHubInspect
+	}
+	sha := hex.EncodeToString(digest)
+	return HubFileSnapshot{
+		Path: relative, SizeBytes: size, SHA256: sha,
+		Version: hubFileSnapshotVersion(identity, relative, file.info, sha),
+	}, nil
+}
+
+// ReadHubFileChunk verifies the full snapshot while retaining at most one bounded chunk.
+func ReadHubFileChunk(directory, identity, relative, version string, offset int64, maxBytes int) (HubFileChunk, error) {
+	if len(version) != sha256.Size*2 || maxBytes < 1 || maxBytes > HubInspectMaxChunkBytes || offset < 0 {
+		return HubFileChunk{}, errHubInspect
+	}
+	if _, err := hex.DecodeString(version); err != nil {
+		return HubFileChunk{}, errHubInspect
+	}
+	file, err := openHubInspectionFile(directory, identity, relative)
+	if err != nil {
+		return HubFileChunk{}, err
+	}
+	defer file.close()
+
+	size := file.info.Size()
+	if offset > size {
+		return HubFileChunk{}, errHubInspect
+	}
+	length := min(int64(maxBytes), size-offset)
+	digest, data, readSize, err := hashHubInspectionFile(file.file, size, offset, length)
+	if err != nil || readSize != size || file.verify() != nil {
+		return HubFileChunk{}, errHubInspect
+	}
+	sha := hex.EncodeToString(digest)
+	actualVersion := hubFileSnapshotVersion(identity, relative, file.info, sha)
+	if subtle.ConstantTimeCompare([]byte(actualVersion), []byte(version)) != 1 {
+		return HubFileChunk{}, errHubInspect
+	}
+	chunkDigest := sha256.Sum256(data)
+	return HubFileChunk{Path: relative, Offset: offset, Version: actualVersion, SHA256: hex.EncodeToString(chunkDigest[:]), Data: data}, nil
+}
+
+type hubInspectionFile struct {
+	directory   string
+	identity    string
+	parentPath  string
+	name        string
+	root        *os.Root
+	parent      *os.Root
+	closeParent func()
+	file        *os.File
+	info        os.FileInfo
+}
+
+func openHubInspectionFile(directory, identity, relative string) (*hubInspectionFile, error) {
+	if len(identity) != sha256.Size*2 || !validHubInspectPath(relative) {
+		return nil, errHubInspect
+	}
+	root, canonical, _, err := openHubInspectionRoot(directory, identity)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(relative, "/")
+	parentPath := strings.Join(parts[:len(parts)-1], "/")
+	parent, closeParent, err := openHubInspectionDirectory(root, parentPath)
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	name := parts[len(parts)-1]
+	info, err := parent.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		closeParent()
+		_ = root.Close()
+		return nil, errHubInspect
+	}
+	openedFile, err := parent.Open(name)
+	if err != nil {
+		closeParent()
+		_ = root.Close()
+		return nil, errHubInspect
+	}
+	openedInfo, err := openedFile.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() < 0 || !os.SameFile(info, openedInfo) {
+		_ = openedFile.Close()
+		closeParent()
+		_ = root.Close()
+		return nil, errHubInspect
+	}
+	return &hubInspectionFile{
+		directory: canonical, identity: identity, parentPath: parentPath, name: name,
+		root: root, parent: parent, closeParent: closeParent, file: openedFile, info: openedInfo,
+	}, nil
+}
+
+func (f *hubInspectionFile) close() {
+	_ = f.file.Close()
+	f.closeParent()
+	_ = f.root.Close()
+}
+
+func (f *hubInspectionFile) verify() error {
+	opened, err := f.file.Stat()
+	if err != nil || !sameHubInspectionFileInfo(f.info, opened) {
+		return errHubInspect
+	}
+	latest, err := f.parent.Lstat(f.name)
+	if err != nil || latest.Mode()&os.ModeSymlink != 0 || !sameHubInspectionFileInfo(f.info, latest) {
+		return errHubInspect
+	}
+	if err := confirmHubInspectionDirectory(f.root, f.parentPath, f.parent); err != nil || confirmHubInspectionRoot(f.directory, f.identity, f.root) != nil {
+		return errHubInspect
+	}
+	return nil
+}
+
+func sameHubInspectionFileInfo(left, right os.FileInfo) bool {
+	return left != nil && right != nil && left.Mode().IsRegular() && right.Mode().IsRegular() &&
+		left.Size() == right.Size() && left.ModTime().Equal(right.ModTime()) && os.SameFile(left, right)
+}
+
+func confirmHubInspectionRoot(directory, identity string, expected *os.Root) error {
+	current, _, _, err := openHubInspectionRoot(directory, identity)
+	if err != nil {
+		return errHubInspect
+	}
+	defer current.Close()
+	before, err := expected.Stat(".")
+	if err != nil {
+		return errHubInspect
+	}
+	after, err := current.Stat(".")
+	if err != nil || !os.SameFile(before, after) {
+		return errHubInspect
+	}
+	return nil
+}
+
+func hubFileSnapshotVersion(identity, relative string, info os.FileInfo, sha string) string {
+	value := "morde-hub-file-v1\x00" + identity + "\x00" + relative + "\x00" +
+		strconv.FormatInt(info.Size(), 10) + "\x00" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "\x00" + sha
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func hashHubInspectionFile(file *os.File, size, offset, length int64) ([]byte, []byte, int64, error) {
+	if size < 0 || offset < 0 || offset > size || length < 0 || length > int64(HubInspectMaxChunkBytes) || length > size-offset {
+		return nil, nil, 0, errHubInspect
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, 0, errHubInspect
+	}
+	hasher := sha256.New()
+	buffer := make([]byte, 64<<10)
+	chunk := make([]byte, int(length))
+	var read int64
+	for {
+		count, err := file.Read(buffer)
+		if count > 0 {
+			if _, writeErr := hasher.Write(buffer[:count]); writeErr != nil {
+				return nil, nil, 0, errHubInspect
+			}
+			start := max(offset, read)
+			end := min(offset+length, read+int64(count))
+			if start < end {
+				copy(chunk[int(start-offset):int(end-offset)], buffer[int(start-read):int(end-read)])
+			}
+			read += int64(count)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil || count == 0 {
+			return nil, nil, 0, errHubInspect
+		}
+	}
+	return hasher.Sum(nil), chunk, read, nil
 }
 
 func openHubInspectionRoot(directory, expectedIdentity string) (*os.Root, string, string, error) {

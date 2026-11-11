@@ -10,6 +10,7 @@ func TestCloudDSHCoordinatorFrameTerminalContracts(t *testing.T) {
 		"context_role": "coordinator", "conversation_id": "c1234567", "message_id": "m1234567",
 		"owner_id": "u1234567", "actor_id": "u1234567", "agent_id": "coord_12345678",
 		"generation": 1, "authorization_version": 3, "session_id": "coord_session_12345678",
+		"purpose": "conversation", "operation_id": "",
 	}
 	tests := []struct {
 		name    string
@@ -53,6 +54,7 @@ func TestCloudDSHCoordinatorRuntimeFrameRequiresExactFields(t *testing.T) {
 		"context_role": "coordinator", "conversation_id": "c1234567", "message_id": "m1234567",
 		"actor_id": "u1234567", "agent_id": "coord_12345678", "generation": 1,
 		"authorization_version": 3, "session_id": "coord_session_12345678",
+		"purpose": "conversation", "operation_id": "",
 	})
 	if err != nil {
 		t.Fatal(err)

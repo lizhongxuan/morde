@@ -53,7 +53,8 @@ func coordinatorCheckpointFixture() (ConversationRouteClaim, ConversationCoordin
 		LeaseOwner: "route-worker", LeaseVersion: 1, Authorization: task.Authorization{Version: 3}}
 	identity := ConversationCoordinatorIdentity{ServiceInstanceID: claim.ServiceInstanceID, OwnerID: claim.Message.OwnerID,
 		ActorID: claim.Message.ActorID, ConversationID: claim.Message.ConversationID, MessageID: claim.Message.ID,
-		AgentID: "coord_12345678", Generation: 1, AuthorizationVersion: claim.Authorization.Version, SessionID: "coord_session_12345678"}
+		AgentID: "coord_12345678", Generation: 1, AuthorizationVersion: claim.Authorization.Version, SessionID: "coord_session_12345678",
+		Purpose: "conversation"}
 	return claim, identity
 }
 
@@ -82,6 +83,16 @@ func TestConversationCoordinatorContextDigestIsStableAndBindsModelAndAuthorizedI
 	fourth, err := ConversationCoordinatorContextDigest(changedModel)
 	if err != nil || bytes.Equal(first, fourth) {
 		t.Fatalf("model change did not change context digest: %x / %x, %v", first, fourth, err)
+	}
+	changedSummary := value
+	changedSummary.SummaryVersion = 1
+	changedSummary.SummaryText = "authorized older context"
+	summaryDigest := sha256.Sum256([]byte(changedSummary.SummaryText))
+	changedSummary.SummarySHA256 = summaryDigest[:]
+	changedSummary.SummarySourcesSHA256 = make([]byte, sha256.Size)
+	fifth, err := ConversationCoordinatorContextDigest(changedSummary)
+	if err != nil || bytes.Equal(first, fifth) {
+		t.Fatalf("summary change did not change context digest: %x / %x, %v", first, fifth, err)
 	}
 }
 

@@ -6,7 +6,7 @@ import { MordeIcon, type MordeIconName } from './MordeIcon';
 
 const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
   { to: '/hosts', label: '云端电脑', icon: 'monitor', end: true },
-  { to: '/assistant', label: 'AI 助手', icon: 'spark' },
+  { to: '/assistant', label: 'moder', icon: 'spark' },
   { to: '/projects', label: '项目', icon: 'folder' },
   { to: '/personal', label: '个人数据', icon: 'user' },
   { to: '/goals', label: '目标与计划', icon: 'target' },
@@ -21,7 +21,7 @@ const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
 ];
 
 const titles: Record<string, string> = {
-  '/assistant': 'AI 助手', '/hosts': '云端电脑', '/projects': '项目',
+  '/assistant': 'moder', '/hosts': '云端电脑', '/projects': '项目',
   '/personal': '个人数据', '/goals': '目标与计划',
   '/hosts/new': '创建电脑', '/workspaces': '工作区', '/connections': '模型连接',
   '/clients': '客户端', '/apikeys': 'API Key',

@@ -17,6 +17,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain/execution"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/dshguardian"
 )
 
@@ -194,15 +195,30 @@ func (accountRuntimeStopVerifierStub) VerifyAccountAgentRuntimeStop(context.Cont
 }
 
 type accountRuntimeTaskStopperStub struct {
-	pending      []app.AccountAgentTaskStopAttestation
-	confirmed    []app.AccountAgentTaskStopAttestation
-	acknowledged []app.AccountAgentTaskStopAttestation
+	pending          []app.AccountAgentTaskStopAttestation
+	confirmed        []app.AccountAgentTaskStopAttestation
+	acknowledged     []app.AccountAgentTaskStopAttestation
+	recoveryIdentity app.AccountAgentTaskStopRecoveryIdentity
+	recoveryReady    bool
+	recoveryErr      error
+	confirmErr       error
 }
 
 func (s *accountRuntimeTaskStopperStub) ConfirmTaskStopped(_ context.Context, attestation app.AccountAgentTaskStopAttestation) (bool, error) {
+	if s.confirmErr != nil {
+		return false, s.confirmErr
+	}
 	s.confirmed = append(s.confirmed, attestation)
 	s.pending = append(s.pending, attestation)
 	return false, nil
+}
+
+func (s *accountRuntimeTaskStopperStub) ExpiredAccountAgentTaskStopRecoveryIdentity(_ context.Context,
+	_ app.TaskStopClaim) (app.AccountAgentTaskStopRecoveryIdentity, bool, error) {
+	if s.recoveryErr != nil {
+		return app.AccountAgentTaskStopRecoveryIdentity{}, false, s.recoveryErr
+	}
+	return s.recoveryIdentity, s.recoveryReady, nil
 }
 
 func (s *accountRuntimeTaskStopperStub) ListPendingAccountAgentTaskStopAttestations(context.Context, int) ([]app.AccountAgentTaskStopAttestation, error) {
@@ -411,6 +427,7 @@ func TestAccountAgentRuntimeRejectsCoordinatorFromDifferentRuntimeSession(t *tes
 				"message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID,
 				"agent_id": identity.AgentID, "generation": identity.Generation,
 				"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
+				"purpose": identity.Purpose, "operation_id": identity.OperationID,
 				"model": "p1234567", "tools": []any{}, "system_prompt": "route", "prompt": "hello",
 			})
 			if err == nil {
@@ -497,6 +514,9 @@ type accountRuntimeGuardianStub struct {
 	started          bool
 	acked            []app.AccountAgentTaskStopAttestation
 	runtimeProofAcks []app.AccountAgentRuntimeStopAttestation
+	recovered        *app.AccountAgentTaskStopAttestation
+	recoveryErr      error
+	recoveryCalls    int
 }
 
 func (g *accountRuntimeGuardianStub) ArmTaskProcess(_ context.Context, guard dshguardian.TaskProcessGuard) error {
@@ -527,9 +547,22 @@ func (g *accountRuntimeGuardianStub) StopTaskProcess(_ context.Context, guard ds
 		ExpiresAt: guard.ExpiresAt, DestroyedAt: time.Now(), ProofSHA256: strings.Repeat("b", 64), Destroyed: true}, nil
 }
 
-func (g *accountRuntimeGuardianStub) RecoverTaskProcessStopped(context.Context, app.AccountAgentRuntimeFence, app.AgentInstanceFence,
-	string) (app.AccountAgentTaskStopAttestation, error) {
-	return app.AccountAgentTaskStopAttestation{}, errors.New("unexpected recovery")
+func (g *accountRuntimeGuardianStub) RecoverTaskProcessStopped(_ context.Context, runtimeFence app.AccountAgentRuntimeFence,
+	taskFence app.AgentInstanceFence, nonceSHA256 string) (app.AccountAgentTaskStopAttestation, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.recoveryCalls++
+	if g.recoveryErr != nil {
+		return app.AccountAgentTaskStopAttestation{}, g.recoveryErr
+	}
+	if g.recovered == nil {
+		return app.AccountAgentTaskStopAttestation{}, errors.New("unexpected recovery")
+	}
+	attestation := *g.recovered
+	if attestation.RuntimeFence != runtimeFence || attestation.TaskFence != taskFence || attestation.NonceSHA256 != nonceSHA256 {
+		return app.AccountAgentTaskStopAttestation{}, errors.New("recovery identity mismatch")
+	}
+	return attestation, nil
 }
 
 func (g *accountRuntimeGuardianStub) AcknowledgeTaskProcessStopped(_ context.Context, runtimeFence app.AccountAgentRuntimeFence,
@@ -554,6 +587,103 @@ func (g *accountRuntimeGuardianStub) AcknowledgeAccountRuntimeStopped(_ context.
 	g.runtimeProofAcks = append(g.runtimeProofAcks, app.AccountAgentRuntimeStopAttestation{Fence: fence,
 		NonceSHA256: nonceSHA256, ProofSHA256: proofSHA256})
 	return nil
+}
+
+func TestAccountRuntimeReconcilesOnlyExactExpiredTaskStopAndAcknowledgesProof(t *testing.T) {
+	now := time.Now().UTC()
+	runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: "12345678-1234-1234-1234-123456789abc",
+		ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 2,
+		LeaseOwner: "runtime-worker", LeaseVersion: 5, ExecutionEpoch: 3}
+	taskFence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567",
+		AgentInstanceID: "agent-2", AgentGeneration: 2, AgentSessionID: "session-2", SupervisorID: "supervisor-1",
+		LeaseOwner: "task-worker", LeaseVersion: 4, AuthorizationVersion: 3, EngineVersion: "engine-v1", ProfileVersion: "profile-v1"}
+	identity := app.AccountAgentTaskStopRecoveryIdentity{RuntimeFence: runtimeFence, TaskFence: taskFence,
+		AgentLeaseExpiresAt: now.Add(-2 * time.Minute), NonceSHA256: strings.Repeat("a", 64)}
+	attestation := app.AccountAgentTaskStopAttestation{RuntimeFence: runtimeFence, TaskFence: taskFence,
+		RuntimeContainerID: strings.Repeat("b", 64), ContainerPID: 7, HostPID: 8, StartTimeTick: 9,
+		CgroupPath: "/sys/fs/cgroup/morde-task", NonceSHA256: identity.NonceSHA256,
+		ExpiresAt: now.Add(-time.Second), DestroyedAt: now, ProofSHA256: strings.Repeat("c", 64), Destroyed: true}
+	guardian := &accountRuntimeGuardianStub{recovered: &attestation}
+	stopper := &accountRuntimeTaskStopperStub{recoveryIdentity: identity, recoveryReady: true}
+	supervisor := &accountRuntimeSupervisorStub{}
+	control := &accountRuntimeControlStub{}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: control, Supervisor: supervisor, Guardian: guardian, StopVerifier: accountRuntimeStopVerifierStub{},
+		TaskStopper: stopper, LeaseOwner: "runtime-worker", MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := app.TaskStopClaim{Task: task.Task{ID: taskFence.TaskID, OwnerID: taskFence.OwnerID, Status: task.StatusCancelling},
+		Request: task.StopRequest{ID: "stop-request-1", TaskID: taskFence.TaskID, Action: task.ActionCancel, Status: task.StopRequestPending}}
+	if err := manager.ReconcileExpiredTaskAgentStop(context.Background(), claim); err != nil {
+		t.Fatalf("reconcile exact expired Task stop: %v", err)
+	}
+	guardian.mu.Lock()
+	recoveryCalls, acked := guardian.recoveryCalls, append([]app.AccountAgentTaskStopAttestation(nil), guardian.acked...)
+	guardian.mu.Unlock()
+	if recoveryCalls != 1 || len(stopper.confirmed) != 1 || len(stopper.acknowledged) != 1 || len(acked) != 1 ||
+		stopper.confirmed[0].TaskFence != taskFence || stopper.acknowledged[0].ProofSHA256 != attestation.ProofSHA256 ||
+		acked[0].ProofSHA256 != attestation.ProofSHA256 || supervisor.stopCalls != 0 || control.stopProofs != 0 {
+		t.Fatalf("Task recovery did not follow proof/ACK path or affected shared Runtime: recover=%d confirmed=%d persistedAck=%d guardianAck=%d runtimeStops=%d runtimeProofs=%d",
+			recoveryCalls, len(stopper.confirmed), len(stopper.acknowledged), len(acked), supervisor.stopCalls, control.stopProofs)
+	}
+}
+
+func TestAccountRuntimeTaskStopRecoveryFailsClosedAndRetries(t *testing.T) {
+	now := time.Now().UTC()
+	runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: "12345678-1234-1234-1234-123456789abc",
+		ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
+		LeaseOwner: "runtime-worker", LeaseVersion: 1, ExecutionEpoch: 1}
+	taskFence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567",
+		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", SupervisorID: "supervisor-1",
+		LeaseOwner: "task-worker", LeaseVersion: 1, AuthorizationVersion: 1, EngineVersion: "engine-v1", ProfileVersion: "profile-v1"}
+	identity := app.AccountAgentTaskStopRecoveryIdentity{RuntimeFence: runtimeFence, TaskFence: taskFence,
+		AgentLeaseExpiresAt: now.Add(-time.Second), NonceSHA256: strings.Repeat("a", 64)}
+	stopper := &accountRuntimeTaskStopperStub{recoveryIdentity: identity, recoveryReady: true}
+	guardian := &accountRuntimeGuardianStub{recoveryErr: errors.New("Guardian unavailable")}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: &accountRuntimeControlStub{}, Supervisor: &accountRuntimeSupervisorStub{}, Guardian: guardian,
+		StopVerifier: accountRuntimeStopVerifierStub{}, TaskStopper: stopper, LeaseOwner: "runtime-worker", MaxTasks: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := app.TaskStopClaim{Task: task.Task{ID: taskFence.TaskID, OwnerID: taskFence.OwnerID, Status: task.StatusPausing},
+		Request: task.StopRequest{ID: "stop-request-1", TaskID: taskFence.TaskID, Action: task.ActionPause, Status: task.StopRequestPending}}
+	if err := manager.ReconcileExpiredTaskAgentStop(context.Background(), claim); err == nil {
+		t.Fatal("Guardian unavailability did not defer the stop claim")
+	}
+	if len(stopper.confirmed) != 0 || len(stopper.acknowledged) != 0 {
+		t.Fatalf("unavailable Guardian reached proof persistence or ACK: confirmed=%d acked=%d", len(stopper.confirmed), len(stopper.acknowledged))
+	}
+
+	stopper.recoveryReady = false
+	guardian.recoveryErr = nil
+	if err := manager.ReconcileExpiredTaskAgentStop(context.Background(), claim); err != nil {
+		t.Fatalf("non-ready identity should defer to DB completion/retry without failing: %v", err)
+	}
+	guardian.mu.Lock()
+	recoveryCalls := guardian.recoveryCalls
+	guardian.mu.Unlock()
+	if recoveryCalls != 1 || len(stopper.confirmed) != 0 {
+		t.Fatalf("non-ready stop identity invoked Guardian: recover=%d confirmed=%d", recoveryCalls, len(stopper.confirmed))
+	}
+
+	futureProof := app.AccountAgentTaskStopAttestation{RuntimeFence: runtimeFence, TaskFence: taskFence,
+		RuntimeContainerID: strings.Repeat("b", 64), ContainerPID: 7, HostPID: 8, StartTimeTick: 9,
+		CgroupPath: "/sys/fs/cgroup/morde-task", NonceSHA256: identity.NonceSHA256,
+		ExpiresAt: now.Add(time.Minute), DestroyedAt: now, ProofSHA256: strings.Repeat("d", 64), Destroyed: true}
+	guardian.mu.Lock()
+	guardian.recovered = &futureProof
+	guardian.mu.Unlock()
+	stopper.recoveryReady = true
+	if err := manager.ReconcileExpiredTaskAgentStop(context.Background(), claim); err == nil {
+		t.Fatal("accepted a Guardian Task stop proof with an unexpired Task lease")
+	}
+	if len(stopper.confirmed) != 0 || len(stopper.acknowledged) != 0 {
+		t.Fatalf("unexpired Guardian proof reached persistence or ACK: confirmed=%d acked=%d", len(stopper.confirmed), len(stopper.acknowledged))
+	}
 }
 
 func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
@@ -784,6 +914,98 @@ func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
 	if control.runtime.State != app.AccountAgentRuntimeStopped || control.requestStops != 0 || supervisor.stopCalls != 1 || len(taskStopper.confirmed) != 2 {
 		t.Fatalf("final Runtime state=%q requests=%d Runtime stops=%d Task proofs=%d",
 			control.runtime.State, control.requestStops, supervisor.stopCalls, len(taskStopper.confirmed))
+	}
+}
+
+func TestAccountAgentRuntimeUnarmedTaskStopProtectsActiveCoordinator(t *testing.T) {
+	control := &accountRuntimeControlStub{}
+	supervisor := &accountRuntimeSupervisorStub{}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{Control: control,
+		Supervisor: supervisor, Guardian: &accountRuntimeGuardianStub{}, StopVerifier: accountRuntimeStopVerifierStub{},
+		TaskStopper: &accountRuntimeTaskStopperStub{}, LeaseOwner: "worker-runtime", MaxTasks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567",
+		AgentInstanceID: "agent-b", AgentGeneration: 1, AgentSessionID: "session-b", AuthorizationVersion: 1}
+	task := &cloudDSHAccountTask{fence: fence}
+	session := &cloudDSHAccountRuntimeSession{manager: manager, tasks: map[app.AgentInstanceFence]*cloudDSHAccountTask{fence: task},
+		coordinators: map[string]*cloudDSHAccountCoordinator{"session-a": {}}}
+
+	if err := manager.StopTask(context.Background(), session, fence); err == nil ||
+		!strings.Contains(err.Error(), "shared Runtime work is active") {
+		t.Fatalf("unarmed Task stop with an active coordinator = %v, want an unconfirmed stop", err)
+	}
+	if session.stopping || session.tasks[fence] != task || session.coordinators["session-a"] == nil ||
+		control.failureMarks != 0 || supervisor.stopCalls != 0 {
+		t.Fatalf("unarmed Task stop affected active coordinator: stopping=%t task=%t coordinator=%t failures=%d runtimeStops=%d",
+			session.stopping, session.tasks[fence] == task, session.coordinators["session-a"] != nil,
+			control.failureMarks, supervisor.stopCalls)
+	}
+}
+
+func TestAccountAgentRuntimeStopLastTaskPreservesActiveCoordinator(t *testing.T) {
+	control := &accountRuntimeControlStub{}
+	supervisor := &accountRuntimeSupervisorStub{}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{Control: control,
+		Supervisor: supervisor, Guardian: &accountRuntimeGuardianStub{}, StopVerifier: accountRuntimeStopVerifierStub{},
+		TaskStopper: &accountRuntimeTaskStopperStub{}, LeaseOwner: "worker-runtime", MaxTasks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	session, err := manager.Acquire(ctx, "u1234567", "c1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567",
+		AgentInstanceID: "agent-b", AgentGeneration: 1, AgentSessionID: "session-b", SupervisorID: "dsh-supervisor",
+		LeaseOwner: "task-worker", LeaseVersion: 1, AuthorizationVersion: 1,
+		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	lease := app.AgentInstanceLease{Fence: fence, RuntimeFence: &session.runtime.Fence, RuntimeSequence: 1,
+		ExpiresAt: time.Now().Add(app.MaxAgentLease)}
+	input, output, err := session.StartTask(ctx, fence, []byte(strings.Repeat("n", 32)), lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = input.Close(); _ = output.Close() }()
+	if _, err := bufio.NewReader(output).ReadBytes('\n'); err != nil {
+		t.Fatalf("read Task ready frame: %v", err)
+	}
+	start := map[string]any{"type": "start", "version": 1, "task_id": fence.TaskID, "owner_id": fence.OwnerID,
+		"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
+		"authorization_version": fence.AuthorizationVersion, "model": "test-model", "tools": []any{}, "prompt": "do work"}
+	if err := writeCloudDSHFrame(ctx, input, start); err != nil {
+		t.Fatalf("start Task B: %v", err)
+	}
+	coordinator := &cloudDSHAccountCoordinator{}
+	session.mu.Lock()
+	session.coordinators["session-a"] = coordinator
+	session.mu.Unlock()
+
+	// A stop candidate can coexist with a live coordinator after Task B stops.
+	control.runtime.State = app.AccountAgentRuntimeStopping
+	if err := manager.StopTask(ctx, session, fence); err != nil {
+		t.Fatalf("stop Task B while coordinator A is active: %v", err)
+	}
+	control.candidates = []app.AccountAgentRuntimeStopIdentity{{Fence: session.runtime.Fence,
+		NonceSHA256: session.runtime.NonceSHA256, ExpiresAt: session.runtime.LeaseExpiresAt}}
+	if err := manager.reapStopCandidates(ctx); err != nil {
+		t.Fatalf("reap stop candidates with coordinator A active: %v", err)
+	}
+	supervisor.mu.Lock()
+	runtimeStops := supervisor.stopCalls
+	supervisor.mu.Unlock()
+	session.mu.Lock()
+	coordinatorStillActive := session.coordinators["session-a"] == coordinator
+	stopping := session.stopping
+	session.mu.Unlock()
+	if control.runtime.State != app.AccountAgentRuntimeStopping || control.stopProofs != 0 || runtimeStops != 0 ||
+		!coordinatorStillActive || stopping || session.closed() {
+		t.Fatalf("Task B stop affected coordinator A: runtime=%q stopProofs=%d runtimeStops=%d coordinator=%t stopping=%t closed=%t",
+			control.runtime.State, control.stopProofs, runtimeStops, coordinatorStillActive, stopping, session.closed())
 	}
 }
 

@@ -173,6 +173,21 @@ type hubFileGetParams struct {
 	MaxBytes  int    `json:"max_bytes"`
 }
 
+type hubFileSnapshotParams struct {
+	Directory string `json:"directory"`
+	Identity  string `json:"identity"`
+	Path      string `json:"path"`
+}
+
+type hubFileChunkParams struct {
+	Directory string `json:"directory"`
+	Identity  string `json:"identity"`
+	Path      string `json:"path"`
+	Version   string `json:"version"`
+	Offset    int64  `json:"offset"`
+	MaxBytes  int    `json:"max_bytes"`
+}
+
 type hubCommandParams struct {
 	Directory string `json:"directory"`
 	Identity  string `json:"identity"`
@@ -313,6 +328,10 @@ func (s *stdioServer) handleLine(line []byte) {
 		s.hubFiles(request.ID, request.Params)
 	case "hub_file_get":
 		s.hubFileGet(request.ID, request.Params)
+	case "hub_file_snapshot":
+		s.hubFileSnapshot(request.ID, request.Params)
+	case "hub_file_chunk":
+		s.hubFileChunk(request.ID, request.Params)
 	case "hub_command":
 		s.hubCommand(request.ID, request.Params)
 	case "hub_command_probe":
@@ -365,6 +384,37 @@ func (s *stdioServer) hubFileGet(id json.RawMessage, rawParams json.RawMessage) 
 		return
 	}
 	_ = s.writeResult(id, content)
+}
+
+func (s *stdioServer) hubFileSnapshot(id json.RawMessage, rawParams json.RawMessage) {
+	var params hubFileSnapshotParams
+	if err := decodeStrict(rawParams, &params); err != nil || params.Directory == "" || len(params.Directory) > 4096 || len(params.Identity) != 64 ||
+		params.Path == "" || len(params.Path) > 1024 {
+		_ = s.writeError(id, -32602, "invalid selected file parameters")
+		return
+	}
+	snapshot, err := client.SnapshotHubFile(params.Directory, params.Identity, params.Path)
+	if err != nil {
+		_ = s.writeError(id, -32030, "selected file could not be verified")
+		return
+	}
+	_ = s.writeResult(id, snapshot)
+}
+
+func (s *stdioServer) hubFileChunk(id json.RawMessage, rawParams json.RawMessage) {
+	var params hubFileChunkParams
+	if err := decodeStrict(rawParams, &params); err != nil || params.Directory == "" || len(params.Directory) > 4096 || len(params.Identity) != 64 ||
+		params.Path == "" || len(params.Path) > 1024 || len(params.Version) != 64 || params.Offset < 0 ||
+		params.MaxBytes < 1 || params.MaxBytes > client.HubInspectMaxChunkBytes {
+		_ = s.writeError(id, -32602, "invalid selected file parameters")
+		return
+	}
+	chunk, err := client.ReadHubFileChunk(params.Directory, params.Identity, params.Path, params.Version, params.Offset, params.MaxBytes)
+	if err != nil {
+		_ = s.writeError(id, -32030, "selected file could not be verified")
+		return
+	}
+	_ = s.writeResult(id, chunk)
 }
 
 func (s *stdioServer) hubCommand(id json.RawMessage, rawParams json.RawMessage) {

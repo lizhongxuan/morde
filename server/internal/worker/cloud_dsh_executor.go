@@ -213,6 +213,7 @@ type CloudDSHCompleter interface {
 
 type CloudDSHExecutorOptions struct {
 	SupervisorID     string
+	SummarySealer    *app.Sealer
 	AccountRuntimes  *CloudDSHAccountRuntimeManager
 	Instances        CloudDSHInstances
 	Checkpoints      CloudDSHCheckpoints
@@ -241,6 +242,39 @@ func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, er
 		options.StreamCapability, _ = options.Models.(CloudDSHTextStreamingCapability)
 	}
 	return &CloudDSHExecutor{options: options}, nil
+}
+
+func openCloudDSHTaskSummary(value task.Task, contextValue *task.ConversationContext, sealer *app.Sealer) error {
+	if contextValue == nil || contextValue.Summary == nil {
+		return nil
+	}
+	summary := contextValue.Summary
+	expectedScope, expectedScopeID := app.ConversationSummaryPersonalScope, ""
+	if value.ProjectID != "" {
+		expectedScope, expectedScopeID = app.ConversationSummaryProjectScope, value.ProjectID
+	}
+	if summary.OwnerID != value.OwnerID || summary.ActorID != value.InitiatorID || summary.ConversationID != value.ConversationID ||
+		summary.ScopeKind != expectedScope || summary.ScopeID != expectedScopeID ||
+		summary.AuthorizationVersion != value.Authorization.Version {
+		return errors.New("dsh conversation summary identity is invalid")
+	}
+	sources := make([]app.ConversationSummarySource, 0, len(summary.Sources))
+	for _, source := range summary.Sources {
+		sources = append(sources, app.ConversationSummarySource{Kind: source.Kind, ID: source.ID, ObjectType: source.ObjectType,
+			Version: source.Version, Sequence: source.Sequence, SHA256: append([]byte(nil), source.SHA256...)})
+	}
+	document, err := app.OpenConversationSummary(sealer, app.StoredConversationSummary{
+		Identity: app.ConversationSummaryIdentity{ServiceInstanceID: summary.ServiceInstanceID, OwnerID: summary.OwnerID,
+			ActorID: summary.ActorID, ConversationID: summary.ConversationID, ScopeKind: summary.ScopeKind, ScopeID: summary.ScopeID,
+			AuthorizationVersion: summary.AuthorizationVersion, ScopeVersion: summary.ScopeVersion},
+		Version: summary.Version, OperationID: summary.OperationID, SummarySHA256: summary.SummarySHA256,
+		SourcesSHA256: summary.SourcesSHA256, Ciphertext: summary.Ciphertext, Sources: sources,
+	})
+	if err != nil {
+		return errors.New("dsh conversation summary could not be verified")
+	}
+	summary.Text = document.Text
+	return nil
 }
 
 func cloudDSHDelegateTool(available []app.AgentToolDefinition) app.AgentToolDefinition {
@@ -350,7 +384,8 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if recoveringAgent && value.ProjectID != "" && value.CheckpointThroughSequence >= 0 {
+	projectRecovery := recoveringAgent && value.ProjectID != "" && value.CheckpointThroughSequence >= 0
+	if projectRecovery {
 		if e.options.ProjectContexts == nil {
 			return errors.New("project task context verification is unavailable")
 		}
@@ -365,7 +400,15 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			return errors.Join(errors.New("project task context could not be verified"),
 				e.options.ProjectContexts.PauseProjectTaskRecovery(pauseCtx, value))
 		}
+		if err := openCloudDSHTaskSummary(value, original, e.options.SummarySealer); err != nil {
+			pauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			return errors.Join(errors.New("project task summary could not be verified"),
+				e.options.ProjectContexts.PauseProjectTaskRecovery(pauseCtx, value))
+		}
 		value.ConversationContext = original
+	} else if err := openCloudDSHTaskSummary(value, value.ConversationContext, e.options.SummarySealer); err != nil {
+		return err
 	}
 	toolsAllowed := false
 	if e.options.ToolCapabilities != nil {

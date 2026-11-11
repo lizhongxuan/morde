@@ -15,7 +15,7 @@ const SHUTDOWN_TIMEOUT_MS = 5_000
 const TASK_START_TIMEOUT_MS = 15_000
 const TASK_STOP_TIMEOUT_MS = 2_000
 const TASK_FENCE_FIELDS = ['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
-const COORDINATOR_FENCE_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+const COORDINATOR_FENCE_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
 const RUNTIME_FIELDS = ['server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'max_concurrent_tasks']
 const RUNTIME_START_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
 const RUNTIME_SHUTDOWN_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
@@ -27,11 +27,11 @@ const ACCOUNT_START_KEYS = [
 const COORDINATOR_START_KEYS = [
   'type', 'version', ...COORDINATOR_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
   'runtime_sequence', 'model', 'tools', 'system_prompt', 'prompt', 'resume',
-  'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens',
+  'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'source_messages', 'previous_summary',
 ]
 const COORDINATOR_PROCESS_ADMIT_KEYS = [
   'type', 'server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'runtime_sequence',
-  'context_role', 'conversation_id', 'message_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id',
+  ...COORDINATOR_FENCE_FIELDS.filter(key => key !== 'owner_id'),
 ]
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
@@ -97,6 +97,8 @@ function coordinatorFence(frame) {
 function validCoordinatorFence(fence) {
   return fence.context_role === 'coordinator' &&
     ['conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'session_id'].every(key => typeof fence[key] === 'string' && ID.test(fence[key])) &&
+    ['conversation', 'compaction'].includes(fence.purpose) &&
+    (fence.purpose === 'conversation' ? fence.operation_id === '' : typeof fence.operation_id === 'string' && ID.test(fence.operation_id)) &&
     /^[a-z0-9]{1,128}$/.test(fence.message_id) &&
     ['generation', 'authorization_version'].every(key => Number.isSafeInteger(fence[key]) && fence[key] > 0)
 }
@@ -149,7 +151,8 @@ function validCoordinatorChildFrame(frame, identity) {
   if (frame.type === 'model_cancel') return exactKeys(frame, [...base, 'id']) && typeof frame.id === 'string' && frame.id.length > 0
   if (frame.type === 'coordinator_settled') {
     return exactKeys(frame, [...base, 'through_seq', 'result']) && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= 0 &&
-      typeof frame.result === 'string' && frame.result.isWellFormed() && Buffer.byteLength(frame.result, 'utf8') <= 4096
+      typeof frame.result === 'string' && frame.result.isWellFormed() &&
+      Buffer.byteLength(frame.result, 'utf8') <= (identity.purpose === 'compaction' ? 256 * 1024 : 4096)
   }
   if (frame.type === 'coordinator_cancelled') {
     return exactKeys(frame, [...base, 'through_seq']) && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= -1

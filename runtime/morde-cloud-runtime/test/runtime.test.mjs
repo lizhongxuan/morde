@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import { AccountRuntime } from '../src/account-runtime.mjs'
-import { coordinatorModelCallID, ENGINE_VERSION, modelCallID, validMessageDelivery, validStart } from '../src/engine.mjs'
+import { coordinatorCompactionModelCallID, coordinatorModelCallID, ENGINE_VERSION, modelCallID, validMessageDelivery, validStart } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
 const start = {
@@ -76,7 +76,7 @@ function taskProcessAdmission(frame) {
 }
 
 function coordinatorFence(frame) {
-  return Object.fromEntries(['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+  return Object.fromEntries(['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
     .map(key => [key, frame[key]]))
 }
 
@@ -84,6 +84,7 @@ function coordinatorStart(messageID = 'm1234567', runtimeSequence = 1) {
   return {
     type: 'coordinator_start', version: 1, context_role: 'coordinator', conversation_id: 'conversation_123', message_id: messageID,
     owner_id: account.owner_id, actor_id: 'actor_123', agent_id: 'agent_coord', generation: 1, authorization_version: 1, session_id: 'session_coord',
+    purpose: 'conversation', operation_id: '',
     server_instance_id: account.server_instance_id, runtime_id: account.runtime_id, runtime_generation: account.runtime_generation,
     runtime_sequence: runtimeSequence, model: 'test-model', tools: [], system_prompt: 'Use this coordinator instruction.',
     prompt: '{"intent":"route this request"}',
@@ -237,7 +238,7 @@ test('coordinator checkpoint acknowledgements require the complete actor fence',
   const identity = {
     context_role: 'coordinator', conversation_id: 'conversation_123', message_id: 'm1234567',
     owner_id: 'user_123', actor_id: 'project_456', agent_id: 'agent_coord', generation: 1,
-    authorization_version: 1, session_id: 'session_coord',
+    authorization_version: 1, session_id: 'session_coord', purpose: 'conversation', operation_id: '',
   }
   input.write(`${JSON.stringify({ type: 'start', version: 1, ...identity, model: 'test-model', tools: [],
     system_prompt: 'Route safely.', prompt: '{"request":"route"}' })}\n`)
@@ -2618,6 +2619,264 @@ test('account runtime starts and settles a fenced coordinator outside the Task m
     assert.deepEqual(coordinatorFence(frame), coordinatorFence(startFrame))
     assert.equal(Object.hasOwn(frame, 'task_id'), false)
   }
+})
+
+test('account runtime compacts a bounded text-only conversation through the DSH plugin', async t => {
+  const operationID = 'operation_compact_123'
+  const base = coordinatorStart('m3456789')
+  const { prompt: _prompt, ...conversationStart } = base
+  const previousSummaryText = 'The user prefers Chinese and concise answers.'
+  const previousSummarySHA256 = createHash('sha256').update(previousSummaryText).digest('hex')
+  const startFrame = {
+    ...conversationStart, purpose: 'compaction', operation_id: operationID,
+    context_window_tokens: 32_768,
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', byte_offset: 0, content: '用户偏好中文，并在本地开发 Morde。'.repeat(20) },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', byte_offset: 0, content: '我们已经确定优先复用 DSH。'.repeat(20) },
+    ],
+    previous_summary: { version: 3, sha256: previousSummarySHA256, text: previousSummaryText },
+  }
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model') {
+      assert.equal(frame.purpose, 'compaction')
+      assert.equal(frame.operation_id, operationID)
+      assert.equal(frame.id, coordinatorCompactionModelCallID(frame.conversation_id, operationID, frame.session_id, frame.through_seq))
+      assert.deepEqual(frame.request.tools, [])
+      assert.ok(JSON.stringify(frame.request).includes(previousSummaryText))
+      assert.ok(frame.request.messages.length >= 2)
+      assert.ok(frame.request.messages.every(message => message.content.every(block => block.type === 'text')))
+      replyCoordinatorWithText(proc, frame, '已确认：用户偏好中文；Morde 开发优先复用 DSH。')
+    }
+    if (['coordinator_settled', 'coordinator_failed', 'coordinator_terminated', 'protocol_error'].includes(frame.type)) {
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(frames.some(frame => frame.type === 'protocol_error'), false,
+    `protocol errors: ${JSON.stringify(frames.filter(frame => frame.type === 'protocol_error'))}`)
+  assert.equal(frames.some(frame => frame.type === 'coordinator_failed'), false,
+    `coordinator failures: ${JSON.stringify(frames.filter(frame => frame.type === 'coordinator_failed'))}`)
+  const result = frames.find(frame => frame.type === 'coordinator_settled')
+  assert.ok(result, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(result?.result, '已确认：用户偏好中文；Morde 开发优先复用 DSH。')
+  assert.deepEqual(coordinatorFence(result), coordinatorFence(startFrame))
+  const persistedEvents = frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
+  assert.ok(persistedEvents.some(event => event.type === 'compaction/start'))
+  assert.ok(persistedEvents.some(event => event.type === 'compaction/summary'))
+  assert.ok(persistedEvents.some(event => event.type === 'compaction/end'))
+  assert.ok(persistedEvents.some(event => event.type === 'user/message' && JSON.stringify(event).includes('m1234567')))
+  assert.equal(frames.some(frame => frame.type === 'settled' || frame.type === 'task_started'), false)
+})
+
+test('restores a durably checkpointed DSH compaction after runtime restart', async t => {
+  const operationID = 'operation_compact_456'
+  const { prompt: _prompt, ...base } = coordinatorStart('m4567890')
+  const startFrame = {
+    ...base, purpose: 'compaction', operation_id: operationID, context_window_tokens: 32_768,
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', content: '请用中文回答。'.repeat(40) },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', content: '我会继续使用中文。'.repeat(40) },
+    ],
+  }
+  const savedPages = []
+  const first = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') {
+      savedPages.push(frame)
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model') replyCoordinatorWithText(proc, frame, '中文')
+    if (frame.type === 'coordinator_settled') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (['coordinator_failed', 'coordinator_terminated', 'protocol_error'].includes(frame.type)) {
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => first.child.kill())
+  const firstClosed = once(first.child, 'close')
+  send(first.child, account)
+  await firstClosed
+  const completePage = savedPages.findLast(frame => JSON.parse(frame.payload).events.some(event =>
+    event.type === 'compaction/end' && !event.data.error))
+  assert.ok(completePage, `first process did not persist the completed compaction event pair: ${first.frames.map(frame => frame.type).join(', ')}; events=${JSON.stringify(savedPages.map(frame => JSON.parse(frame.payload).events.map(event => ({ type: event.type, data: event.data?.error }))))}`)
+
+  const resumeStart = { ...startFrame, resume: true, checkpoint_through_seq: completePage.through_seq,
+    checkpoint_sha256: completePage.sha256 }
+  const resumed = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, resumeStart)
+    if (frame.type === 'checkpoint_read') {
+      const page = savedPages.find(value => value.from_seq === frame.from_seq)
+      assert.ok(page, `missing persisted DSH checkpoint page from sequence ${frame.from_seq}`)
+      send(proc, { type: 'checkpoint_page', id: frame.id, ok: true, from_seq: page.from_seq,
+        through_seq: page.through_seq, payload: page.payload, sha256: page.sha256 })
+    }
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model') assert.fail('completed summary was charged again after restart')
+    if (frame.type === 'coordinator_settled') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (['coordinator_failed', 'coordinator_terminated', 'protocol_error'].includes(frame.type)) {
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => resumed.child.kill())
+  const resumedClosed = once(resumed.child, 'close')
+  send(resumed.child, account)
+  const [code] = await resumedClosed
+  assert.equal(code, 0, `resume frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(resumed.frames.some(frame => frame.type === 'protocol_error'), false)
+  assert.equal(resumed.frames.some(frame => frame.type === 'model'), false)
+  assert.equal(resumed.frames.find(frame => frame.type === 'coordinator_settled')?.result, '中文',
+    `resume terminal frames: ${JSON.stringify(resumed.frames.filter(frame => frame.type.startsWith('coordinator_') || frame.type === 'protocol_error'))}`)
+})
+
+test('resumes compaction when a runtime restart follows only the source checkpoint', async t => {
+  const operationID = 'operation_compact_source_restart'
+  const { prompt: _prompt, ...base } = coordinatorStart('m5678902')
+  const startFrame = {
+    ...base, purpose: 'compaction', operation_id: operationID, context_window_tokens: 32_768,
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', byte_offset: 0, content: 'Keep the user preference: Chinese. '.repeat(40) },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', byte_offset: 0, content: 'I will continue in Chinese. '.repeat(40) },
+    ],
+    previous_summary: { version: 0, sha256: '', text: '' },
+  }
+  const savedPages = []
+  const first = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint' && savedPages.length === 0) {
+      savedPages.push(frame)
+      proc.kill('SIGKILL')
+    }
+  })
+  t.after(() => first.child.kill())
+  const firstClosed = once(first.child, 'close')
+  send(first.child, account)
+  await firstClosed
+  assert.equal(savedPages.length, 1)
+  const sourceCheckpointEvents = JSON.parse(savedPages[0].payload).events
+  assert.ok(sourceCheckpointEvents.some(event => event.type === 'user/message'))
+  assert.equal(sourceCheckpointEvents.some(event => event.type === 'compaction/start'), false)
+
+  const resumeStart = { ...startFrame, resume: true, checkpoint_through_seq: savedPages[0].through_seq,
+    checkpoint_sha256: savedPages[0].sha256 }
+  const resumed = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, resumeStart)
+    if (frame.type === 'checkpoint_read') {
+      const page = savedPages.find(value => value.from_seq === frame.from_seq)
+      assert.ok(page, `missing source checkpoint page from sequence ${frame.from_seq}`)
+      send(proc, { type: 'checkpoint_page', id: frame.id, ok: true, from_seq: page.from_seq,
+        through_seq: page.through_seq, payload: page.payload, sha256: page.sha256 })
+    }
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model') {
+      assert.ok(JSON.stringify(frame.request).includes('Keep the user preference: Chinese.'))
+      replyCoordinatorWithText(proc, frame, 'The user prefers Chinese.')
+    }
+    if (frame.type === 'coordinator_settled') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (['coordinator_failed', 'coordinator_terminated', 'protocol_error'].includes(frame.type)) {
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => resumed.child.kill())
+  const resumedClosed = once(resumed.child, 'close')
+  send(resumed.child, account)
+  const [code] = await resumedClosed
+  assert.equal(code, 0, `resume frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(resumed.frames.some(frame => frame.type === 'protocol_error'), false)
+  assert.equal(resumed.frames.some(frame => frame.type === 'model'), true)
+  assert.equal(resumed.frames.find(frame => frame.type === 'coordinator_settled')?.result, 'The user prefers Chinese.')
+})
+
+test('compaction coordinator start rejects missing capacity, malformed sources, and tools', () => {
+  const base = coordinatorStart('m3456789')
+  const { prompt: _prompt, ...conversationStart } = base
+  const valid = {
+    ...conversationStart, purpose: 'compaction', operation_id: 'operation_compact_123',
+    context_window_tokens: 32_768,
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', content: 'first' },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', content: 'second' },
+    ],
+  }
+  assert.equal(validStart({ ...valid, type: 'start' }), true)
+  assert.equal(validStart({ ...valid, type: 'start', context_window_tokens: undefined }), false)
+  assert.equal(validStart({ ...valid, type: 'start', context_window_tokens: 2048 }), false)
+  assert.equal(validStart({ ...valid, type: 'start', source_messages: [{ ...valid.source_messages[0], id: 'foreign id' }, valid.source_messages[1]] }), false)
+  assert.equal(validStart({ ...valid, type: 'start', tools: [{ name: 'shell' }] }), false)
+  assert.equal(validStart({ ...valid, type: 'start', source_messages: [{ ...valid.source_messages[0], content: '中'.repeat(70_000) }, valid.source_messages[1]] }), false)
+  const previousText = 'Previously confirmed context.'
+  const previousDigest = createHash('sha256').update(previousText).digest('hex')
+  const source = { ...valid.source_messages[0], byte_offset: 0 }
+  assert.equal(validStart({ ...valid, type: 'start', previous_summary: { version: 1, sha256: previousDigest, text: previousText }, source_messages: [source] }), true)
+  assert.equal(validStart({ ...valid, type: 'start', previous_summary: { version: 1, sha256: '0'.repeat(64), text: previousText } }), false)
+  assert.equal(validStart({ ...valid, type: 'start', source_messages: [{ ...source, byte_offset: 1 }, { ...valid.source_messages[1], byte_offset: 0 }] }), false)
+})
+
+test('account runtime rejects an extra compaction start field', async t => {
+  const { prompt: _prompt, ...base } = coordinatorStart('m5678901')
+  const invalidStart = {
+    ...base, purpose: 'compaction', operation_id: 'operation_compact_extra', context_window_tokens: 32_768,
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', content: 'first' },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', content: 'second' },
+    ], unexpected: true,
+  }
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, invalidStart)
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0)
+  assert.equal(frames.find(frame => frame.type === 'protocol_error')?.code, 'invalid_coordinator_start')
+  assert.equal(frames.some(frame => frame.type === 'coordinator_process_ready'), false)
+})
+
+test('account runtime cancellation closes the DSH compaction without settling a summary', async t => {
+  const { prompt: _prompt, ...base } = coordinatorStart('m6789012')
+  const startFrame = {
+    ...base, purpose: 'compaction', operation_id: 'operation_compact_cancel', context_window_tokens: 32_768,
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', content: '关于长对话的已确认事实。'.repeat(40) },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', content: '需要保留关键约束并继续聊天。'.repeat(40) },
+    ],
+  }
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model') send(proc, { type: 'coordinator_cancel', ...coordinatorFence(frame) })
+    if (frame.type === 'coordinator_terminated') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (['coordinator_failed', 'protocol_error'].includes(frame.type)) send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(frames.some(frame => frame.type === 'protocol_error'), false)
+  assert.equal(frames.some(frame => frame.type === 'coordinator_settled'), false)
+  assert.equal(frames.some(frame => frame.type === 'coordinator_terminated'), true)
+  assert.equal(frames.some(frame => frame.type === 'settled' || frame.type === 'task_started'), false)
 })
 
 test('coordinator cancellation leaves an independent Task worker running', async t => {

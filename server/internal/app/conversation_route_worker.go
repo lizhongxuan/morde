@@ -16,6 +16,7 @@ const MaxConversationAgentInputBytes = maxAgentInputBytes
 // determine the fate of one accepted message.
 type ConversationRouteSnapshot struct {
 	Context                ConversationRouteContext
+	Summary                *StoredConversationSummary
 	ResultReviewSuperseded bool
 	PreviousMissing        bool
 	PreviousCycle          bool

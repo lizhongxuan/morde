@@ -27,10 +27,13 @@ func (s *Store) ListUnknownModelCalls(ctx context.Context, principal identity.Pr
 			return err
 		}
 		rows, err := tx.Query(ctx, `SELECT l.owner_id,l.source,l.call_id,l.model_id,l.provider_model,COALESCE(l.task_id,''),
- l.reserved_tokens,l.created_at,COALESCE(l.settled_at,c.updated_at) FROM model_call_ledger l
+ l.reserved_tokens,l.created_at,COALESCE(l.settled_at,c.updated_at,s.updated_at) FROM model_call_ledger l
  LEFT JOIN conversation_route_model_calls c ON c.actor_id=l.owner_id AND c.source=l.source AND c.call_id=l.call_id
  LEFT JOIN conversation_message_routes r ON r.message_id=c.message_id
- WHERE (l.state='unknown' OR (l.source='route' AND l.state='dispatched' AND c.state='dispatched'
+ LEFT JOIN conversation_compaction_operations s ON s.actor_id=l.owner_id AND s.model_call_id=l.call_id
+ WHERE (l.state='unknown' OR (l.source='compaction' AND l.state='dispatched' AND s.state='checkpointed'
+   AND s.lease_expires_at IS NOT NULL AND s.lease_expires_at<=clock_timestamp()) OR
+   (l.source='route' AND l.state='dispatched' AND c.state='dispatched'
    AND (r.state<>'processing' OR r.lease_expires_at IS NULL OR r.lease_expires_at<=clock_timestamp()
      OR r.lease_version<>c.dispatch_lease_version OR r.lease_owner<>c.dispatch_lease_owner)))
  AND ($1='' OR l.owner_id=$1)
@@ -184,7 +187,8 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 			return storeError("lock model usage", "model call", err)
 		}
 		var taskOwnerID, taskProjectID string
-		if command.Source == app.ModelCallRoute {
+		switch command.Source {
+		case app.ModelCallRoute:
 			var routeState, routeMessageID string
 			var abandoned bool
 			if taskID != "" {
@@ -212,6 +216,64 @@ WHERE c.actor_id=$1 AND c.source='route' AND c.call_id=$2 FOR UPDATE OF c,r`, co
 					return err
 				}
 				state = "unknown"
+			}
+		case app.ModelCallCompaction:
+			var scopeKind, scopeID, operationState string
+			var leaseExpired bool
+			if taskID != "" {
+				return domain.NewError(domain.CodeInvalidState, "unknown conversation summary model attribution is unavailable")
+			}
+			if err := tx.QueryRow(ctx, `SELECT scope_kind,scope_id,state,
+lease_expires_at IS NOT NULL AND lease_expires_at<=clock_timestamp() FROM conversation_compaction_operations
+WHERE actor_id=$1 AND model_call_id=$2 FOR UPDATE`, command.OwnerID, command.CallID).
+				Scan(&scopeKind, &scopeID, &operationState, &leaseExpired); err != nil {
+				return domain.NewError(domain.CodeInvalidState, "unknown conversation summary model attribution is unavailable")
+			}
+			if scopeKind == app.ConversationSummaryProjectScope {
+				if !project.ValidID(scopeID) {
+					return domain.NewError(domain.CodeInvalidState, "conversation summary project attribution is invalid")
+				}
+				taskProjectID = scopeID
+				if err := lockProjectByIDInTx(ctx, tx, taskProjectID); err != nil {
+					return err
+				}
+			} else if scopeKind != app.ConversationSummaryPersonalScope || scopeID != "" {
+				return domain.NewError(domain.CodeInvalidState, "conversation summary scope attribution is invalid")
+			}
+			if state == "dispatched" && operationState == "checkpointed" && leaseExpired {
+				if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
+					return err
+				}
+				var hasProjectCharge bool
+				if taskProjectID != "" {
+					if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM project_budget_ledger
+WHERE project_id=$1 AND source='compaction' AND call_id=$2)`, taskProjectID, command.CallID).Scan(&hasProjectCharge); err != nil {
+						return fmt.Errorf("check stale conversation summary project charge: %w", err)
+					}
+				}
+				if hasProjectCharge {
+					if err := markProjectModelCallUnknown(ctx, tx, taskProjectID, command.OwnerID, string(command.Source), command.CallID, ""); err != nil {
+						return err
+					}
+				} else if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='unknown',settled_at=clock_timestamp()
+WHERE owner_id=$1 AND source='compaction' AND call_id=$2 AND state='dispatched'`, command.OwnerID, command.CallID); err != nil {
+					return fmt.Errorf("mark stale conversation summary model usage unknown: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `UPDATE conversation_compaction_operations SET state='unknown',lease_owner='',lease_expires_at=NULL,
+updated_at=clock_timestamp() WHERE actor_id=$1 AND model_call_id=$2 AND state='checkpointed'`, command.OwnerID, command.CallID); err != nil {
+					return fmt.Errorf("mark stale conversation summary operation unknown: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `UPDATE conversation_summary_heads h SET lease_operation_id='',lease_owner='',lease_expires_at=NULL,
+updated_at=clock_timestamp() FROM conversation_compaction_operations o
+WHERE o.actor_id=$1 AND o.model_call_id=$2 AND h.service_instance_id=o.service_instance_id AND h.owner_id=o.owner_id
+ AND h.actor_id=o.actor_id AND h.conversation_id=o.conversation_id AND h.scope_kind=o.scope_kind AND h.scope_id=o.scope_id
+ AND h.lease_operation_id=o.operation_id`, command.OwnerID, command.CallID); err != nil {
+					return fmt.Errorf("release stale conversation summary lease: %w", err)
+				}
+				state, operationState = "unknown", "unknown"
+			}
+			if (state != "unknown" || operationState != "unknown") && (state != "settled" || operationState != "failed") {
+				return domain.NewError(domain.CodeInvalidState, "conversation summary model call is still active")
 			}
 		}
 		if taskID != "" {
@@ -344,6 +406,11 @@ actual_micros=NULL,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$
 					string(command.Source), command.CallID); err != nil {
 					return fmt.Errorf("restore unknown project usage after account total overflow: %w", err)
 				}
+			}
+		}
+		if command.Source == app.ModelCallCompaction && !quotaExceeded {
+			if err := finishReconciledConversationSummaryModelCallInTx(ctx, tx, command.OwnerID, command.CallID); err != nil {
+				return err
 			}
 		}
 		if taskID != "" {

@@ -1,10 +1,13 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { lstat } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import { HubError } from './hub.ts'
 
 export const HUB_FILE_ENTRY_LIMIT = 128
 export const HUB_FILE_READ_LIMIT = 32 * 1024
+export const HUB_FILE_FETCH_CHUNK_BYTES = 512 * 1024
+export const HUB_FILE_FETCH_MAX_BYTES = 16 * 1024 * 1024
 export const HUB_SCREEN_BYTES_LIMIT = 40 * 1024
 export const HUB_COMMAND_OUTPUT_LIMIT = 16 * 1024
 
@@ -19,25 +22,42 @@ export interface MordeHubFileEntry {
   size_bytes: number
 }
 
+export interface MordeHubFileSnapshot {
+  path: string
+  size_bytes: number
+  sha256: string
+  version: string
+  media_type: string
+}
+
+export interface MordeHubFileChunk {
+  path: string
+  offset: number
+  version: string
+  sha256: string
+  data: Buffer
+}
+
 export interface MordeHubTaskGrant {
   targetGrantVersion: number
   grants: { screenshot: boolean; files: boolean; command: boolean }
   fileRoot?: MordeHubFileRoot
 }
 
-export function requireMordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.get' | 'command', caller: {
+export function requireMordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.get' | 'file.fetch' | 'command', caller: {
   kind: string
-  taskContext?: { taskID: string; authorizationVersion: number; targetGrantVersion: number; operationID: string }
+  taskContext?: { taskID: string; taskRevision?: number; authorizationVersion: number; targetGrantVersion: number; operationID: string }
 }, grant: MordeHubTaskGrant): number {
   const task = caller.taskContext
   if (caller.kind !== 'task' || !task || !/^q[a-z0-9]{7}$/.test(task.taskID) ||
     !Number.isSafeInteger(task.authorizationVersion) || task.authorizationVersion < 1 ||
     !Number.isSafeInteger(task.targetGrantVersion) || task.targetGrantVersion !== grant.targetGrantVersion ||
-    !/^[A-Za-z0-9._:-]{4,80}$/.test(task.operationID)) {
+    !/^[A-Za-z0-9._:-]{4,80}$/.test(task.operationID) ||
+    action === 'file.fetch' && (!Number.isSafeInteger(task.taskRevision) || Number(task.taskRevision) < 1)) {
     throw new HubError('not_allowed', 'This action requires a current authorized Morde Task')
   }
   if (action === 'screenshot' && !grant.grants.screenshot) throw new HubError('not_allowed', 'Screenshot access is not allowed on this computer')
-  if ((action === 'files' || action === 'file.get') && (!grant.grants.files || !grant.fileRoot?.directory || !grant.fileRoot.identity)) {
+  if ((action === 'files' || action === 'file.get' || action === 'file.fetch') && (!grant.grants.files || !grant.fileRoot?.directory || !grant.fileRoot.identity)) {
     throw new HubError('not_allowed', 'File access is not allowed on this computer')
   }
   if (action === 'command' && (!grant.grants.command || !grant.fileRoot?.directory || !grant.fileRoot.identity)) {
@@ -327,4 +347,60 @@ export async function mordeHubFileGet(root: MordeHubFileRoot, path: unknown, max
   if (!value || value.path !== path || typeof value.text !== 'string' || Buffer.byteLength(value.text) > Number(maxBytes) ||
     typeof value.truncated !== 'boolean') throw new HubError('failed', 'The local file helper returned an invalid file')
   return { path, text: value.text, truncated: value.truncated, target_grant_version: targetGrantVersion }
+}
+
+export async function mordeHubFileSnapshot(
+  root: MordeHubFileRoot,
+  path: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
+  request: typeof mordeHubHelperRequest = mordeHubHelperRequest,
+): Promise<MordeHubFileSnapshot> {
+  if (!root?.directory || !root.identity || !isRelativePath(path)) throw new HubError('not_allowed', 'The file request is outside the selected folder')
+  const extension = path.slice(path.lastIndexOf('.')).toLowerCase()
+  const mediaType = ({
+    '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv', '.json': 'application/json',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pdf': 'application/pdf',
+  } as Record<string, string>)[extension]
+  if (!mediaType) {
+    throw new HubError('not_allowed', 'This file type is not supported for retrieval')
+  }
+  const value = await request('hub_file_snapshot', {
+    directory: root.directory, identity: root.identity, path,
+  }, env, spawn, 30_000, signal) as Record<string, unknown> | undefined
+  if (!value || value.path !== path || !Number.isSafeInteger(value.size_bytes) || Number(value.size_bytes) < 1 ||
+    Number(value.size_bytes) > HUB_FILE_FETCH_MAX_BYTES || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256) ||
+    typeof value.version !== 'string' || !/^[a-f0-9]{64}$/.test(value.version)) {
+    throw new HubError('failed', 'The local file helper returned an invalid snapshot')
+  }
+  return { path, size_bytes: Number(value.size_bytes), sha256: value.sha256, version: value.version, media_type: mediaType }
+}
+
+export async function mordeHubFileChunk(
+  root: MordeHubFileRoot,
+  path: string,
+  version: string,
+  offset: number,
+  maxBytes: number,
+  env: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
+  request: typeof mordeHubHelperRequest = mordeHubHelperRequest,
+): Promise<MordeHubFileChunk> {
+  if (!root?.directory || !root.identity || !isRelativePath(path) || !/^[a-f0-9]{64}$/.test(version) ||
+    !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > HUB_FILE_FETCH_CHUNK_BYTES) {
+    throw new HubError('not_allowed', 'The file chunk request is outside the selected range')
+  }
+  const value = await request('hub_file_chunk', {
+    directory: root.directory, identity: root.identity, path, version, offset, max_bytes: maxBytes,
+  }, env, spawn, 30_000, signal) as Record<string, unknown> | undefined
+  const encoded = typeof value?.data === 'string' ? value.data : ''
+  const data = Buffer.from(encoded, 'base64')
+  const expectedHash = createHash('sha256').update(data).digest('hex')
+  if (!value || value.path !== path || value.offset !== offset || value.version !== version || !encoded ||
+    data.toString('base64') !== encoded || data.length > maxBytes || value.sha256 !== expectedHash) {
+    throw new HubError('failed', 'The local file helper returned an invalid chunk')
+  }
+  return { path, offset, version, sha256: expectedHash, data }
 }

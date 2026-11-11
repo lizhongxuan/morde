@@ -118,6 +118,7 @@ function status(patch = {}) {
     targetGrantVersion: 4,
     grants: { screenshot: false, files: false, command: false, fileRoot: null },
     capabilities: { screenshot: true, files: true, command: false },
+    fileAccessRecords: [],
     ...patch,
   }
 }
@@ -204,6 +205,29 @@ test('signed in: shows installation details and the current grants', () => {
   assert.equal(findBy(markup, (node) => node.type === 'input' && node.props['aria-label'] === '共享屏幕截图').props.checked, true)
   assert.equal(findBy(markup, (node) => node.type === 'input' && node.props.type === 'password'), undefined)
   assert.equal(commandCheckbox(markup, '执行命令').props.disabled, true)
+})
+
+test('file access history shows source version, transfer progress and server retention', () => {
+  delete globalThis.window
+  const updatedAt = Date.UTC(2026, 10, 10, 10, 0)
+  const markup = bundle.renderCard(translator('zh'), status({ fileAccessRecords: [{
+    fetchID: 'o1234567', taskID: 'q1234567', targetGrantVersion: 4, path: 'reports/result.pdf', status: 'completed',
+    sourceVersion: 'abcdef0123456789'.repeat(4), confirmedBytes: 600000, sizeBytes: 600000,
+    contentID: 'o7654321', expiresAt: '2026-11-17T10:00:00Z', updatedAt,
+  }, {
+    fetchID: 'o7654322', taskID: 'q1234567', targetGrantVersion: 4, path: 'reports/annual.pdf', status: 'unknown',
+    sourceVersion: 'fedcba9876543210'.repeat(4), confirmedBytes: 512000, sizeBytes: 600000, updatedAt,
+  }] }), true)
+  assert.match(textOf(find(markup, 'nm-morde-hub-file-access-o1234567')), /reports\/result\.pdf/)
+  assert.match(textOf(markup), /已完成/)
+  assert.match(textOf(markup), /已确认 600000 \/ 600000 字节/)
+  assert.match(textOf(markup), /来源版本 abcdef012345…/)
+  assert.match(textOf(markup), /目录授权版本 4/)
+  assert.match(textOf(markup), /任务 q1234567/)
+  assert.match(textOf(markup), /更新时间 2026-11-10T10:00:00.000Z/)
+  assert.match(textOf(markup), /服务端副本保留至 2026-11-17T10:00:00Z/)
+  assert.match(textOf(markup), /结果待确认/)
+  assert.doesNotMatch(textOf(markup), /ticket|7654321/i)
 })
 
 test('workspace selection is independent from file and command grants', async () => {

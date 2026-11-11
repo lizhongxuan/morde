@@ -35,6 +35,12 @@ type MCPRuntimeStopReconciler interface {
 	ReconcileMCPRuntimeCancellations(context.Context) error
 }
 
+// TaskAgentStopReconciler recovers an expired Guardian-isolated Task process
+// while this worker still holds the exact durable stop-request claim.
+type TaskAgentStopReconciler interface {
+	ReconcileExpiredTaskAgentStop(context.Context, app.TaskStopClaim) error
+}
+
 type WorkspaceInputRevisionReconciler interface {
 	ReconcileStaleWorkspaceTasks(context.Context) error
 }
@@ -54,6 +60,7 @@ type TaskStopWorkerOptions struct {
 	OperationTimeout  time.Duration
 	RetryAfter        time.Duration
 	MCPRuntimeStopper MCPRuntimeStopReconciler
+	TaskAgentStopper  TaskAgentStopReconciler
 	Logger            *zap.Logger
 }
 
@@ -66,6 +73,7 @@ type TaskStopWorker struct {
 	operationTimeout  time.Duration
 	retryAfter        time.Duration
 	mcpRuntimeStopper MCPRuntimeStopReconciler
+	taskAgentStopper  TaskAgentStopReconciler
 	renewInterval     time.Duration
 	logger            *zap.Logger
 	runMu             sync.Mutex
@@ -107,8 +115,8 @@ func NewTaskStopWorker(options TaskStopWorkerOptions) (*TaskStopWorker, error) {
 		store: options.Store, executor: options.Executor, workerID: options.WorkerID,
 		leaseDuration: options.LeaseDuration, pollInterval: options.PollInterval,
 		operationTimeout: options.OperationTimeout, retryAfter: options.RetryAfter,
-		mcpRuntimeStopper: options.MCPRuntimeStopper,
-		renewInterval:     renewInterval, logger: logger,
+		mcpRuntimeStopper: options.MCPRuntimeStopper, taskAgentStopper: options.TaskAgentStopper,
+		renewInterval: renewInterval, logger: logger,
 	}, nil
 }
 
@@ -316,6 +324,15 @@ func (w *TaskStopWorker) processClaim(ctx context.Context, claim app.TaskStopCla
 		}
 	}
 
+	if w.taskAgentStopper != nil {
+		if err := w.renew(ctx, claim); err != nil {
+			return fmt.Errorf("renew before Guardian Task stop recovery: %w", err)
+		}
+		if err := w.reconcileTaskAgentStop(ctx, claim); err != nil {
+			return fmt.Errorf("reconcile expired Guardian Task stop: %w", err)
+		}
+	}
+
 	if err := w.renew(ctx, claim); err != nil {
 		return fmt.Errorf("renew before completing task stop: %w", err)
 	}
@@ -326,6 +343,56 @@ func (w *TaskStopWorker) processClaim(ctx context.Context, claim app.TaskStopCla
 		return fmt.Errorf("complete task stop: %w", err)
 	}
 	return nil
+}
+
+func (w *TaskStopWorker) reconcileTaskAgentStop(ctx context.Context, claim app.TaskStopClaim) error {
+	executeCtx, cancel := context.WithTimeout(ctx, w.operationTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				w.logger.Error("guardian Task stop reconciler panicked", zap.String("task_id", claim.Task.ID), zap.ByteString("stack", debug.Stack()))
+				done <- errors.New("guardian Task stop reconciler panicked")
+			}
+		}()
+		done <- w.taskAgentStopper.ReconcileExpiredTaskAgentStop(executeCtx, claim)
+	}()
+
+	ticker := time.NewTicker(w.renewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(executeCtx.Err(), context.DeadlineExceeded) {
+				return executeCtx.Err()
+			}
+			return err
+		case <-ctx.Done():
+			cancel()
+			if err := <-done; err != nil {
+				w.logger.Debug("Guardian Task stop reconciler returned after cancellation", zap.Error(err))
+			}
+			return ctx.Err()
+		case <-executeCtx.Done():
+			cancel()
+			if err := <-done; err != nil {
+				w.logger.Debug("Guardian Task stop reconciler returned after deadline", zap.Error(err))
+			}
+			return executeCtx.Err()
+		case <-ticker.C:
+			if err := w.renew(ctx, claim); err != nil {
+				cancel()
+				if stopErr := <-done; stopErr != nil {
+					w.logger.Debug("Guardian Task stop reconciler returned after claim renewal failed", zap.Error(stopErr))
+				}
+				return fmt.Errorf("renew Task stop claim during Guardian recovery: %w", err)
+			}
+		}
+	}
 }
 
 func (w *TaskStopWorker) stopOperation(ctx context.Context, claim app.TaskStopClaim, operation task.Operation) (task.OperationStatus, string, bool, error) {

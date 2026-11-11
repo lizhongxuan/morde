@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/task"
 )
 
 const MaxAgentLease = 30 * time.Second
@@ -68,6 +69,16 @@ type AgentInstanceLease struct {
 type AgentGuardianStopIdentity struct {
 	Fence       AgentInstanceFence
 	NonceSHA256 string
+}
+
+// AccountAgentTaskStopRecoveryIdentity binds an expired account Task process
+// to the current shared Runtime and Task Agent fences. The raw stop nonce is
+// never returned from persistence.
+type AccountAgentTaskStopRecoveryIdentity struct {
+	RuntimeFence        AccountAgentRuntimeFence
+	TaskFence           AgentInstanceFence
+	AgentLeaseExpiresAt time.Time
+	NonceSHA256         string
 }
 
 type AgentStopReceipt struct {
@@ -127,6 +138,10 @@ type AgentInstanceStore interface {
 
 type AgentInstanceTaskStopStore interface {
 	ConfirmAccountAgentTaskStopped(context.Context, VerifiedAccountAgentTaskStop) (bool, error)
+}
+
+type AccountAgentTaskStopRecoveryStore interface {
+	ExpiredAccountAgentTaskStopRecoveryIdentity(context.Context, TaskStopClaim) (AccountAgentTaskStopRecoveryIdentity, bool, error)
 }
 
 type AccountAgentTaskStopProofAcknowledgementStore interface {
@@ -362,6 +377,74 @@ func (s *AgentInstanceService) GuardianStopIdentity(ctx context.Context, taskID,
 		return AgentGuardianStopIdentity{}, domain.NewError(domain.CodeInternal, "agent recovery identity is inconsistent")
 	}
 	return identity, nil
+}
+
+// ExpiredAccountAgentTaskStopRecoveryIdentity only returns an identity after
+// the store has verified the live stop claim, safe_after boundary, current
+// Agent generation and expired Portal Task lease under database locks.
+func (s *AgentInstanceService) ExpiredAccountAgentTaskStopRecoveryIdentity(ctx context.Context,
+	claim TaskStopClaim) (AccountAgentTaskStopRecoveryIdentity, bool, error) {
+	request := claim.Request
+	current := claim.Task
+	if ctx == nil || !domain.ValidTaskID(current.ID) || !domain.ValidUserID(current.OwnerID) ||
+		request.ID == "" || request.TaskID != current.ID ||
+		request.Status != task.StopRequestPending || request.LeaseOwner == "" || request.LeaseVersion < 1 ||
+		request.LeaseExpiresAt == nil || request.SafeAfter.IsZero() {
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.InvalidArgument("stop_request", "current account Task recovery claim is invalid")
+	}
+	switch request.Action {
+	case task.ActionPause:
+		if current.Status != task.StatusPausing {
+			return AccountAgentTaskStopRecoveryIdentity{}, false,
+				domain.InvalidArgument("stop_request", "pause recovery claim does not match the current Task state")
+		}
+	case task.ActionCancel:
+		if current.Status != task.StatusCancelling {
+			return AccountAgentTaskStopRecoveryIdentity{}, false,
+				domain.InvalidArgument("stop_request", "cancel recovery claim does not match the current Task state")
+		}
+	default:
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.InvalidArgument("stop_request", "account Task recovery action is invalid")
+	}
+	if current.ExecutionLocation != "server" || (current.AgentInstanceID == "" && current.AgentGeneration == 0 &&
+		current.AgentSessionID == "" && current.AgentEngineVersion == "" && current.AgentProfileVersion == "") {
+		return AccountAgentTaskStopRecoveryIdentity{}, false, nil
+	}
+	if !domain.ValidUserID(current.InitiatorID) || current.AgentInstanceID == "" || current.AgentGeneration < 1 ||
+		current.AgentSessionID == "" || current.Authorization.Version < 1 || current.AgentEngineVersion == "" || current.AgentProfileVersion == "" {
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.InvalidArgument("agent_instance", "current account Task Agent fence is invalid")
+	}
+	store, ok := s.store.(AccountAgentTaskStopRecoveryStore)
+	if !ok {
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.NewError(domain.CodeInvalidState, "account Task stop recovery lookup is unavailable")
+	}
+	identity, ready, err := store.ExpiredAccountAgentTaskStopRecoveryIdentity(ctx, claim)
+	if err != nil || !ready {
+		return identity, ready, err
+	}
+	fence := identity.TaskFence
+	if fence.TaskID != current.ID || fence.OwnerID != current.OwnerID || fence.InitiatorID != current.InitiatorID ||
+		fence.AgentInstanceID != current.AgentInstanceID || fence.AgentGeneration != current.AgentGeneration ||
+		fence.AgentSessionID != current.AgentSessionID || fence.AuthorizationVersion != current.Authorization.Version ||
+		fence.EngineVersion != current.AgentEngineVersion || fence.ProfileVersion != current.AgentProfileVersion ||
+		identity.RuntimeFence.OwnerID != current.OwnerID || identity.RuntimeFence.ConversationID != current.ConversationID ||
+		identity.AgentLeaseExpiresAt.IsZero() || !isLowerHex(identity.NonceSHA256) || len(identity.NonceSHA256) != sha256.Size*2 {
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.NewError(domain.CodeInternal, "account Task stop recovery identity is inconsistent")
+	}
+	if err := fence.Validate(); err != nil {
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.NewError(domain.CodeInternal, "account Task recovery Agent fence is invalid")
+	}
+	if err := identity.RuntimeFence.Validate(); err != nil {
+		return AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.NewError(domain.CodeInternal, "account Task recovery Runtime fence is invalid")
+	}
+	return identity, true, nil
 }
 
 // AgentStopReceiptSigningPayload defines the bytes the trusted supervisor signs.

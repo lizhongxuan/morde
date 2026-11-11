@@ -15,16 +15,17 @@ import (
 )
 
 type ModelConnectionRecord struct {
-	ID           string
-	OwnerID      string
-	Name         string
-	BaseURL      string
-	ModelName    string
-	APIKeyCipher []byte
-	Capabilities ModelCapabilities
-	CheckedAt    *time.Time
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID                  string
+	OwnerID             string
+	Name                string
+	BaseURL             string
+	ModelName           string
+	ContextWindowTokens *int
+	APIKeyCipher        []byte
+	Capabilities        ModelCapabilities
+	CheckedAt           *time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type ModelConnectionStore interface {
@@ -40,16 +41,17 @@ type ModelDefaultReader interface {
 }
 
 type ModelConnectionView struct {
-	ID           string
-	Name         string
-	BaseURL      string
-	ModelName    string
-	Shared       bool
-	HasAPIKey    bool
-	Capabilities ModelCapabilities
-	CheckedAt    *time.Time
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID                  string
+	Name                string
+	BaseURL             string
+	ModelName           string
+	ContextWindowTokens *int
+	Shared              bool
+	HasAPIKey           bool
+	Capabilities        ModelCapabilities
+	CheckedAt           *time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type ModelConfigurationStatus string
@@ -74,11 +76,12 @@ func ModelConnectionsConfigurationStatus(items []ModelConnectionView) ModelConfi
 }
 
 type ModelConnectionCommand struct {
-	Name      string
-	BaseURL   string
-	ModelName string
-	APIKey    string
-	Shared    bool
+	Name                string
+	BaseURL             string
+	ModelName           string
+	ContextWindowTokens *int
+	APIKey              string
+	Shared              bool
 }
 
 type ModelConnectionService struct {
@@ -177,7 +180,7 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	}
 	record, err := s.store.CreateModelConnection(ctx, ModelConnectionRecord{
 		ID: id, OwnerID: ownerID, Name: strings.TrimSpace(command.Name), BaseURL: strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"),
-		ModelName: strings.TrimSpace(command.ModelName), APIKeyCipher: ciphertext,
+		ModelName: strings.TrimSpace(command.ModelName), ContextWindowTokens: copyInt(command.ContextWindowTokens), APIKeyCipher: ciphertext,
 	})
 	if err != nil {
 		return ModelConnectionView{}, err
@@ -217,6 +220,11 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 	current.Name = strings.TrimSpace(command.Name)
 	current.BaseURL = strings.TrimRight(strings.TrimSpace(command.BaseURL), "/")
 	current.ModelName = strings.TrimSpace(command.ModelName)
+	if command.ContextWindowTokens != nil {
+		current.ContextWindowTokens = copyInt(command.ContextWindowTokens)
+	} else if changedEndpoint {
+		current.ContextWindowTokens = nil
+	}
 	if changedEndpoint {
 		current.Capabilities = ModelCapabilities{ModelID: current.ID}
 		current.CheckedAt = nil
@@ -337,7 +345,8 @@ func (s *ModelConnectionService) ResolveGatewayEndpoint(ctx context.Context, own
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
-	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt, Personal: record.OwnerID != ""}, nil
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt,
+		Personal: record.OwnerID != "", ContextWindowTokens: copyInt(record.ContextWindowTokens)}, nil
 }
 
 func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, principal identity.Principal, id string) (ModelGatewayEndpoint, error) {
@@ -361,7 +370,8 @@ func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, princ
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
-	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt, Personal: record.OwnerID != ""}, nil
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt,
+		Personal: record.OwnerID != "", ContextWindowTokens: copyInt(record.ContextWindowTokens)}, nil
 }
 
 func (s *ModelConnectionService) SaveProbeCapabilities(ctx context.Context, principal identity.Principal, id string, expected time.Time, capabilities ModelCapabilities) (ModelCapabilities, error) {
@@ -431,7 +441,8 @@ func (s *ModelConnectionService) ResolveMediaGenerationEndpoint(ctx context.Cont
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
-	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt}, nil
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt,
+		ContextWindowTokens: copyInt(record.ContextWindowTokens)}, nil
 }
 
 func (s *ModelConnectionService) defaultModelAvailable(ctx context.Context) (bool, error) {
@@ -466,12 +477,24 @@ func canManageModelConnection(principal identity.Principal, record ModelConnecti
 func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {
 	return ModelConnectionView{
 		ID: record.ID, Name: record.Name, BaseURL: record.BaseURL, ModelName: record.ModelName,
-		Shared: record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
+		ContextWindowTokens: copyInt(record.ContextWindowTokens),
+		Shared:              record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
 		Capabilities: record.Capabilities, CheckedAt: record.CheckedAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
 }
 
+func copyInt(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 func validateModelConnectionCommand(command ModelConnectionCommand, allowed map[string]struct{}, requireKey bool) error {
+	if command.ContextWindowTokens != nil && (*command.ContextWindowTokens < 4096 || *command.ContextWindowTokens > 1_000_000) {
+		return domain.InvalidArgument("model_connection", "context window must be between 4096 and 1000000 tokens")
+	}
 	name := strings.TrimSpace(command.Name)
 	modelName := strings.TrimSpace(command.ModelName)
 	baseURL := strings.TrimSpace(command.BaseURL)

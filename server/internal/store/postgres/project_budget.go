@@ -292,6 +292,10 @@ func reserveProjectBudgetLedgerInTx(ctx context.Context, tx pgx.Tx, reservation 
 			reservation.AccountCall.Route.Claim.Input.ProjectID != reservation.ProjectID {
 			return domain.NewError(domain.CodeUnauthenticated, "project route model caller is unavailable")
 		}
+	} else if reservation.Source == app.ModelCallCompaction {
+		if err := checkConversationSummaryModelFence(ctx, tx, reservation.AccountCall); err != nil {
+			return err
+		}
 	} else if reservation.Source != app.ModelCallClient && reservation.Source != app.ModelCallChat ||
 		reservation.AccountCall.Principal.UserID != reservation.ActorID {
 		return domain.NewError(domain.CodeUnauthenticated, "project model caller is unavailable")
@@ -364,7 +368,13 @@ func projectLedgerTaskID(reservation app.ProjectModelReservation) any {
 // ledgers, keeping both holds unknown when the actual result is unsafe.
 func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.SettleProjectModelCallCommand) error {
 	if ctx == nil || settlement.Source == app.ModelCallRoute || !project.ValidID(settlement.ProjectID) || !validProjectBudgetSource(string(settlement.Source)) ||
-		!validProjectIdempotencyKey(settlement.CallID) || (!settlement.Unknown && !validProjectSettlementUsage(settlement.Usage)) {
+		!validProjectIdempotencyKey(settlement.CallID) || (!settlement.Unknown && !validProjectSettlementUsage(settlement.Usage)) ||
+		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
+		settlement.Source != app.ModelCallCompaction && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
+		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
+		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
+		!settlement.Unknown && !settlement.ResponseInvalid && settlement.Source == app.ModelCallCompaction &&
+			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32) {
 		return domain.InvalidArgument("project_model_settlement", "invalid project model settlement")
 	}
 	var actorID string
@@ -434,9 +444,22 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 		}
 		if settlement.Unknown {
 			if projectState == "unknown" {
+				if settlement.Source == app.ModelCallCompaction {
+					return recordConversationSummaryModelResultInTx(ctx, tx, app.ModelCallSettlement{
+						Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID, Unknown: true, Summary: settlement.Summary,
+					})
+				}
 				return nil
 			}
-			return markProjectModelCallUnknown(ctx, tx, settlement.ProjectID, actorID, source, settlement.CallID, projectTaskString(taskID))
+			if err := markProjectModelCallUnknown(ctx, tx, settlement.ProjectID, actorID, source, settlement.CallID, projectTaskString(taskID)); err != nil {
+				return err
+			}
+			if settlement.Source == app.ModelCallCompaction {
+				return recordConversationSummaryModelResultInTx(ctx, tx, app.ModelCallSettlement{
+					Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID, Unknown: true, Summary: settlement.Summary,
+				})
+			}
+			return nil
 		}
 		rate := project.RateSnapshot{Provider: rateProvider, ModelID: modelID, Model: rateModel, Currency: currency,
 			Version: rateVersion, InputMicrosPerMillion: inputRate, OutputMicrosPerMillion: outputRate}
@@ -447,7 +470,15 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 		}
 		if actualTokens > accountReserved || settlement.Usage.InputTokens > reservedInput || settlement.Usage.OutputTokens > reservedOutput || actualMicros > reservedMicros {
 			overBudget = true
-			return markProjectModelCallUnknown(ctx, tx, settlement.ProjectID, actorID, source, settlement.CallID, projectTaskString(taskID))
+			if err := markProjectModelCallUnknown(ctx, tx, settlement.ProjectID, actorID, source, settlement.CallID, projectTaskString(taskID)); err != nil {
+				return err
+			}
+			if settlement.Source == app.ModelCallCompaction {
+				return recordConversationSummaryModelResultInTx(ctx, tx, app.ModelCallSettlement{
+					Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID, Unknown: true, Summary: settlement.Summary,
+				})
+			}
+			return nil
 		}
 		if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=clock_timestamp()
 WHERE owner_id=$1 AND source=$2 AND call_id=$3`, actorID, source, settlement.CallID, settlement.Usage.InputTokens, settlement.Usage.OutputTokens); err != nil {
@@ -457,6 +488,16 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, actorID, source, settlement.Cal
 actual_micros=$6,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 AND call_id=$3`,
 			settlement.ProjectID, source, settlement.CallID, settlement.Usage.InputTokens, settlement.Usage.OutputTokens, actualMicros); err != nil {
 			return fmt.Errorf("settle project model call: %w", err)
+		}
+		if settlement.Source == app.ModelCallCompaction {
+			if err := recordConversationSummaryModelResultInTx(ctx, tx, app.ModelCallSettlement{
+				Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID,
+				Usage:   app.ModelUsage{Known: true, InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
+				Summary: settlement.Summary, ResponseCiphertext: settlement.ResponseCiphertext,
+				ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
+			}); err != nil {
+				return err
+			}
 		}
 		if taskID.Valid {
 			return refreshTaskModelUsageInTx(ctx, tx, taskID.String, actorID)
@@ -533,7 +574,15 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, actorID, source, set
 			(accountState != "dispatched" && accountState != "unknown") {
 			return domain.NewError(domain.CodeInvalidState, "project model call cannot be held as unknown from its current state")
 		}
-		return markProjectModelCallUnknown(holdCtx, tx, settlement.ProjectID, actorID, source, settlement.CallID, projectTaskString(taskID))
+		if err := markProjectModelCallUnknown(holdCtx, tx, settlement.ProjectID, actorID, source, settlement.CallID, projectTaskString(taskID)); err != nil {
+			return err
+		}
+		if settlement.Source == app.ModelCallCompaction {
+			return recordConversationSummaryModelResultInTx(holdCtx, tx, app.ModelCallSettlement{
+				Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID, Unknown: true, Summary: settlement.Summary,
+			})
+		}
+		return nil
 	})
 }
 
@@ -711,5 +760,6 @@ func decodeProjectBudgetLedgerCursor(value, projectID string) (*projectBudgetLed
 }
 
 func validProjectBudgetSource(value string) bool {
-	return value == string(app.ModelCallClient) || value == string(app.ModelCallChat) || value == string(app.ModelCallTask) || value == string(app.ModelCallRoute)
+	return value == string(app.ModelCallClient) || value == string(app.ModelCallChat) || value == string(app.ModelCallTask) ||
+		value == string(app.ModelCallRoute) || value == string(app.ModelCallCompaction)
 }

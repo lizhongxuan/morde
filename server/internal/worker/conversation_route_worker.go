@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -18,6 +19,9 @@ type ConversationRouteWorkerOptions struct {
 	Queue         app.ConversationRouteQueue
 	Actions       app.ConversationRouteActions
 	Models        app.ConversationRouteClassifier
+	SummaryStore  app.ConversationSummaryStore
+	SummaryInputs app.ConversationSummaryInputPageStore
+	SummarySealer *app.Sealer
 	WorkerID      string
 	LeaseDuration time.Duration
 	PollInterval  time.Duration
@@ -33,7 +37,8 @@ func NewConversationRouteWorker(options ConversationRouteWorkerOptions) (*Conver
 	if options.Queue == nil || options.Actions == nil || options.Models == nil || options.WorkerID == "" || strings.TrimSpace(options.WorkerID) != options.WorkerID ||
 		len(options.WorkerID) > 128 || options.LeaseDuration < time.Minute || options.LeaseDuration > 5*time.Minute ||
 		options.LeaseDuration%time.Second != 0 || options.PollInterval <= 0 || options.MaxConcurrent < 1 || options.MaxConcurrent > 16 ||
-		options.Logger == nil {
+		options.Logger == nil || (options.SummaryStore == nil) != (options.SummaryInputs == nil) ||
+		(options.SummaryStore != nil && options.SummarySealer == nil) {
 		return nil, errors.New("conversation routing dependencies and bounded worker options are required")
 	}
 	return &ConversationRouteWorker{options: options}, nil
@@ -113,14 +118,56 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		return true, w.failRoute(ctx, claim, "model_unavailable", err)
 	}
+	if snapshot.Context.ResultReview == nil {
+		compacted, err := w.compactConversationSummary(routeCtx, claim, modelID)
+		if err != nil {
+			if routeCtx.Err() != nil {
+				if ctx.Err() != nil {
+					return true, ctx.Err()
+				}
+				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 2*time.Second)
+			}
+			w.options.Logger.Warn("conversation summary compaction skipped", zap.String("job", "conversation_route"))
+		} else if compacted {
+			snapshot, err = w.options.Actions.LoadConversationRouteSnapshot(routeCtx, claim)
+			if err != nil {
+				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
+			}
+		}
+	}
 	snapshot.Context.ModelID = modelID
+	classifyContext := snapshot.Context
+	if snapshot.Summary != nil {
+		document, openErr := app.OpenConversationSummary(w.options.SummarySealer, *snapshot.Summary)
+		if openErr == nil && document.Identity == snapshot.Summary.Identity && document.Version == classifyContext.SummaryVersion &&
+			bytes.Equal(snapshot.Summary.SummarySHA256, classifyContext.SummarySHA256) &&
+			bytes.Equal(snapshot.Summary.SourcesSHA256, classifyContext.SummarySourcesSHA256) {
+			classifyContext.SummaryText = document.Text
+			classifyContext.History = app.ConversationRouteHistoryWithoutSummarySources(snapshot.Context.History, snapshot.Summary.Sources)
+		} else {
+			classifyContext.SummaryVersion = 0
+			classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
+			w.options.Logger.Warn("conversation route summary could not be opened", zap.String("job", "conversation_route"))
+		}
+	} else {
+		classifyContext.SummaryVersion = 0
+		classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
+	}
+	classifyContext.ModelID = modelID
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
-	if snapshot.Context.Content != "" || len(snapshot.Context.Candidates) != 0 ||
-		snapshot.Context.ReferenceTaskID != "" || snapshot.Context.PreviousUnresolved {
-		if _, err := app.ConversationRouteModelRequest(snapshot.Context); domain.CodeOf(err) == domain.CodeResultTooLarge {
+	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
+		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 {
+		if _, err := app.ConversationRouteModelRequest(classifyContext); domain.CodeOf(err) == domain.CodeResultTooLarge && classifyContext.SummaryVersion > 0 {
+			classifyContext = snapshot.Context
+			classifyContext.ModelID = modelID
+			classifyContext.SummaryVersion = 0
+			classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
+			classifyContext.SummaryText = ""
+		}
+		if _, err := app.ConversationRouteModelRequest(classifyContext); domain.CodeOf(err) == domain.CodeResultTooLarge {
 			return true, w.failRoute(ctx, claim, "message_too_long", err)
 		}
-		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, snapshot.Context)
+		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, classifyContext)
 		if err != nil {
 			if snapshot.Context.ResultReview != nil && routeCtx.Err() != nil && ctx.Err() == nil {
 				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 5*time.Second)
@@ -138,6 +185,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 						return true, nil
 					}
 				}
+			}
+			if !snapshot.PreviousMissing && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
+				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 2*time.Second)
 			}
 			return true, w.failRoute(ctx, claim, "model_unavailable", err)
 		}

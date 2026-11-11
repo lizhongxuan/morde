@@ -15,7 +15,8 @@ func TestConversationCoordinatorCheckpointsBindContextAndProtectPageSequence(t *
 	claim := f.receive(t, "coordinator-checkpoint-context-binding", "Continue the discussion", app.ConversationRoutingInput{})
 	identity := app.ConversationCoordinatorIdentity{ServiceInstanceID: claim.ServiceInstanceID, OwnerID: claim.Message.OwnerID,
 		ActorID: claim.Message.ActorID, ConversationID: claim.Message.ConversationID, MessageID: claim.Message.ID,
-		AgentID: "coord_12345678", Generation: 1, AuthorizationVersion: claim.Authorization.Version, SessionID: "coord_session_12345678"}
+		AgentID: "coord_12345678", Generation: 1, AuthorizationVersion: claim.Authorization.Version, SessionID: "coord_session_12345678",
+		Purpose: "conversation"}
 	sealer, err := app.NewSealer(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)

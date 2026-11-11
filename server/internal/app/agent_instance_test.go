@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/task"
 )
 
 type agentInstanceStoreStub struct {
@@ -21,6 +22,9 @@ type agentInstanceStoreStub struct {
 	guardianAttestation   AgentGuardianStopAttestation
 	guardianIdentity      AgentGuardianStopIdentity
 	guardianIdentityCalls int
+	recoveryIdentity      AccountAgentTaskStopRecoveryIdentity
+	recoveryIdentityReady bool
+	recoveryIdentityCalls int
 	pendingTaskStops      []AccountAgentTaskStopAttestation
 	pendingTaskStopLimit  int
 	acknowledgedTaskStop  AccountAgentTaskStopAttestation
@@ -62,6 +66,16 @@ func (s *agentInstanceStoreStub) ActiveAgentGuardianStopIdentity(_ context.Conte
 		return AgentGuardianStopIdentity{}, domain.NewError(domain.CodeInvalidState, "active Agent identity unavailable")
 	}
 	return s.guardianIdentity, nil
+}
+
+func (s *agentInstanceStoreStub) ExpiredAccountAgentTaskStopRecoveryIdentity(_ context.Context,
+	claim TaskStopClaim) (AccountAgentTaskStopRecoveryIdentity, bool, error) {
+	s.recoveryIdentityCalls++
+	if !s.recoveryIdentityReady || s.recoveryIdentity.TaskFence.TaskID != claim.Task.ID ||
+		s.recoveryIdentity.TaskFence.OwnerID != claim.Task.OwnerID {
+		return AccountAgentTaskStopRecoveryIdentity{}, false, nil
+	}
+	return s.recoveryIdentity, true, nil
 }
 
 func (s *agentInstanceStoreStub) ListPendingAccountAgentTaskStopAttestations(_ context.Context, limit int) ([]AccountAgentTaskStopAttestation, error) {
@@ -234,6 +248,72 @@ func TestAgentInstanceServiceVerifiesDistinctGuardianAttestationAndLoadsExactRec
 	}
 	if _, err := service.GuardianStopIdentity(context.Background(), fence.TaskID, fence.OwnerID, fence.AgentInstanceID, fence.AgentGeneration+1); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("stale Agent generation returned a recovery identity: %v", err)
+	}
+}
+
+func TestAgentInstanceServiceLoadsExpiredAccountTaskStopRecoveryIdentityForExactClaim(t *testing.T) {
+	key := make([]byte, 32)
+	key[0] = 9
+	supervisor, err := NewAgentStopAuthenticator("supervisor-1", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guardianKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x74}, ed25519.SeedSize))
+	taskGuardian, err := NewAccountAgentTaskGuardianStopAuthenticator(guardianKey.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardian, err := NewAgentGuardianStopAuthenticator("supervisor-1", guardianKey.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := agentInstanceTestFence()
+	fence.AgentGeneration = 2
+	fence.InitiatorID = "u7654321"
+	fence.AuthorizationVersion = 4
+	fence.EngineVersion = "engine-v1"
+	fence.ProfileVersion = "profile-v2"
+	runtimeFence := AccountAgentRuntimeFence{ServiceInstanceID: "12345678-1234-1234-1234-123456789abc",
+		ConversationID: "c1234567", OwnerID: fence.OwnerID, RuntimeID: "runtime-2", RuntimeGeneration: 3,
+		LeaseOwner: "runtime-worker", LeaseVersion: 7, ExecutionEpoch: 2}
+	store := &agentInstanceStoreStub{recoveryIdentity: AccountAgentTaskStopRecoveryIdentity{
+		RuntimeFence: runtimeFence, TaskFence: fence, AgentLeaseExpiresAt: time.Now().Add(-time.Second),
+		NonceSHA256: strings.Repeat("a", 64)}, recoveryIdentityReady: true}
+	service, err := NewAgentInstanceServiceWithGuardianStops(store, supervisor, agentGuardian, taskGuardian)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := TaskStopClaim{
+		Task: task.Task{ID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID,
+			ExecutionLocation: "server", ConversationID: runtimeFence.ConversationID, AgentInstanceID: fence.AgentInstanceID,
+			AgentGeneration: fence.AgentGeneration, AgentSessionID: fence.AgentSessionID, Authorization: task.Authorization{Version: fence.AuthorizationVersion},
+			AgentEngineVersion: fence.EngineVersion, AgentProfileVersion: fence.ProfileVersion, Status: task.StatusCancelling},
+		Request: task.StopRequest{ID: "stop-request-1", TaskID: fence.TaskID, Action: task.ActionCancel,
+			Status: task.StopRequestPending, SafeAfter: time.Now().Add(-time.Second), LeaseOwner: "stop-worker", LeaseVersion: 3,
+			LeaseExpiresAt: func() *time.Time { value := time.Now().Add(time.Minute); return &value }()},
+	}
+	identity, ready, err := service.ExpiredAccountAgentTaskStopRecoveryIdentity(context.Background(), claim)
+	if err != nil || !ready || identity != store.recoveryIdentity || store.recoveryIdentityCalls != 1 {
+		t.Fatalf("recovery identity = %#v ready=%t calls=%d err=%v", identity, ready, store.recoveryIdentityCalls, err)
+	}
+
+	claim.Task.AgentGeneration++
+	if _, _, err := service.ExpiredAccountAgentTaskStopRecoveryIdentity(context.Background(), claim); err == nil {
+		t.Fatal("accepted a Task claim whose current Agent generation does not match the stop identity")
+	}
+	if store.recoveryIdentityCalls != 2 {
+		t.Fatalf("invalid claim reached recovery lookup: calls=%d", store.recoveryIdentityCalls)
+	}
+	noAgentExpiry := time.Now().Add(time.Minute)
+	noAgentClaim := TaskStopClaim{Task: task.Task{ID: "q8765432", OwnerID: "u1234567", ExecutionLocation: "host", Status: task.StatusCancelling},
+		Request: task.StopRequest{ID: "stop-request-2", TaskID: "q8765432", Action: task.ActionCancel,
+			Status: task.StopRequestPending, SafeAfter: time.Now(), LeaseOwner: "stop-worker", LeaseVersion: 1,
+			LeaseExpiresAt: &noAgentExpiry}}
+	if _, ready, err := service.ExpiredAccountAgentTaskStopRecoveryIdentity(context.Background(), noAgentClaim); err != nil || ready {
+		t.Fatalf("non-server Task without an Account Agent should require no Guardian recovery: ready=%t err=%v", ready, err)
+	}
+	if store.recoveryIdentityCalls != 2 {
+		t.Fatalf("non-server Task reached Guardian recovery lookup: calls=%d", store.recoveryIdentityCalls)
 	}
 }
 

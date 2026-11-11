@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -596,6 +597,68 @@ func TestStdioHubInspectionBoundsTextAndRejectsInvalidUTF8(t *testing.T) {
 	})
 	if binary.Error == nil {
 		t.Fatal("hub_file_get accepted invalid UTF-8")
+	}
+}
+
+func TestStdioHubFileSnapshotAndChunkTransfersLargeBinaryFiles(t *testing.T) {
+	directory := t.TempDir()
+	content := make([]byte, client.HubInspectMaxBytes+73)
+	for index := range content {
+		content[index] = byte(index % 251)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "document.pdf"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := invokeRPC(t, map[string]any{
+		"jsonrpc": "2.0", "id": "root", "method": "hub_root",
+		"params": map[string]any{"directory": directory},
+	})
+	if selected.Error != nil {
+		t.Fatalf("hub_root response = %+v", selected)
+	}
+	var root client.HubRootSelection
+	if err := json.Unmarshal(selected.Result, &root); err != nil {
+		t.Fatal(err)
+	}
+	snapshotResponse := invokeRPC(t, map[string]any{
+		"jsonrpc": "2.0", "id": "snapshot", "method": "hub_file_snapshot",
+		"params": map[string]any{"directory": root.Directory, "identity": root.Identity, "path": "document.pdf"},
+	})
+	if snapshotResponse.Error != nil || bytes.Contains(snapshotResponse.Result, []byte(directory)) {
+		t.Fatalf("hub_file_snapshot response = %+v", snapshotResponse)
+	}
+	var snapshot client.HubFileSnapshot
+	if err := json.Unmarshal(snapshotResponse.Result, &snapshot); err != nil || snapshot.SizeBytes != int64(len(content)) {
+		t.Fatalf("hub_file_snapshot result = %+v, err=%v", snapshot, err)
+	}
+
+	var reconstructed []byte
+	for offset := int64(0); offset < snapshot.SizeBytes; {
+		chunkResponse := invokeRPC(t, map[string]any{
+			"jsonrpc": "2.0", "id": fmt.Sprintf("chunk-%d", offset), "method": "hub_file_chunk",
+			"params": map[string]any{"directory": root.Directory, "identity": root.Identity, "path": snapshot.Path,
+				"version": snapshot.Version, "offset": offset, "max_bytes": 8 << 10},
+		})
+		if chunkResponse.Error != nil || bytes.Contains(chunkResponse.Result, []byte(directory)) {
+			t.Fatalf("hub_file_chunk response exposed data/path or failed: %+v", chunkResponse)
+		}
+		var chunk client.HubFileChunk
+		if err := json.Unmarshal(chunkResponse.Result, &chunk); err != nil || chunk.Offset != offset || len(chunk.Data) == 0 {
+			t.Fatalf("hub_file_chunk result = %+v, err=%v", chunk, err)
+		}
+		if !bytes.Contains(chunkResponse.Result, []byte(`"data":"`+base64.StdEncoding.EncodeToString(chunk.Data)+`"`)) {
+			t.Fatalf("hub_file_chunk data was not JSON base64: %s", chunkResponse.Result)
+		}
+		chunkDigest := sha256.Sum256(chunk.Data)
+		if chunk.SHA256 != hex.EncodeToString(chunkDigest[:]) {
+			t.Fatalf("chunk digest = %q, want %s", chunk.SHA256, hex.EncodeToString(chunkDigest[:]))
+		}
+		reconstructed = append(reconstructed, chunk.Data...)
+		offset += int64(len(chunk.Data))
+	}
+	wholeDigest := sha256.Sum256(reconstructed)
+	if !bytes.Equal(reconstructed, content) || hex.EncodeToString(wholeDigest[:]) != snapshot.SHA256 {
+		t.Fatal("stdio file chunks did not reconstruct the snapshotted bytes")
 	}
 }
 

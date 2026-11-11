@@ -4874,6 +4874,190 @@ paths:
               schema: { $ref: '#/components/schemas/Task' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+    get:
+      tags: [Tasks]
+      operationId: getTaskFileFetch
+      summary: Get a Task-bound PC file fetch status
+      description: Portal Session only. The response is a safe status projection and never includes the PC transfer ticket or its hash. Missing and unauthorized Task fetches are hidden as not_found.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Current fetch status and confirmed transfer progress
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskFileFetch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+    get:
+      tags: [Tasks]
+      operationId: listTaskFileFetches
+      summary: List file fetches for an owned Task
+      description: Portal Session only. Returns the newest 16 safe fetch projections, including retained-copy state and deletion time. No transfer ticket or ticket hash is returned.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Task file fetch records
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskFileFetchList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}/manifest:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+    post:
+      tags: [Tasks]
+      operationId: submitTaskFileFetchManifest
+      summary: Pin a PC file manifest and reserve staging quota
+      security: [{ fileFetchTicket: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskFileFetchManifestRequest' }
+      responses:
+        '200':
+          description: Pinned manifest with confirmed chunk sequences for safe resume
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskFileFetchManifestReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}/chunks/{sequence}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+      - name: sequence
+        in: path
+        required: true
+        schema: { type: integer, minimum: 0, maximum: 31 }
+      - name: X-Chunk-SHA256
+        in: header
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+    put:
+      tags: [Tasks]
+      operationId: putTaskFileFetchChunk
+      summary: Store one idempotent PC file chunk
+      security: [{ fileFetchTicket: [] }]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, maxLength: 524288 }
+      responses:
+        '200':
+          description: Durable confirmation of this chunk and aggregate progress
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskFileFetchChunkReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}/commit:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+    post:
+      tags: [Tasks]
+      operationId: commitTaskFileFetch
+      summary: Verify all chunks and atomically publish the retained copy
+      security: [{ fileFetchTicket: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskFileFetchCommitRequest' }
+      responses:
+        '200':
+          description: Safe receipt for the durable committed copy
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskFileFetchCommitReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}/cancel:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+    post:
+      tags: [Tasks]
+      operationId: cancelTaskFileFetch
+      summary: Cancel an in-progress or waiting file fetch
+      description: Task-owner Portal Session only. Revokes the ticket and removes all staging chunks in the same serialized transition. Completed fetches cannot be cancelled.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Cancelled fetch projection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskFileFetch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}/content:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+    get:
+      tags: [Tasks]
+      operationId: getTaskFileFetchContent
+      summary: Download an active retained Task file copy
+      description: Task-owner Portal Session only. Returns original bytes after size and SHA-256 integrity verification; deleted or expired copies are unavailable.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Verified retained file bytes; response is private and non-cacheable.
+          headers:
+            Cache-Control: { schema: { type: string, const: 'private, no-store' } }
+            X-Content-Type-Options: { schema: { type: string, const: nosniff } }
+            Content-Disposition: { schema: { type: string } }
+          content:
+            text/plain: { schema: { type: string, format: binary } }
+            text/markdown: { schema: { type: string, format: binary } }
+            text/csv: { schema: { type: string, format: binary } }
+            application/json: { schema: { type: string, format: binary } }
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document: { schema: { type: string, format: binary } }
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet: { schema: { type: string, format: binary } }
+            application/vnd.openxmlformats-officedocument.presentationml.presentation: { schema: { type: string, format: binary } }
+            application/pdf: { schema: { type: string, format: binary } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Tasks]
+      operationId: deleteTaskFileFetchContent
+      summary: Delete a retained Task file copy
+      description: Task-owner Portal Session only. Idempotently deletes cloud-retained bytes and preserves a deleted_at tombstone; the PC source file and Task history are unaffected.
+      security: [{ portalSession: [] }]
+      responses:
+        '204': { description: Copy deleted or was already deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/media/{operation_id}/preview:
     parameters:
       - name: id
@@ -7202,7 +7386,7 @@ paths:
                       required: [owner_id, source, call_id, model_id, provider_model, reserved_tokens, created_at, unknown_at]
                       properties:
                         owner_id: { $ref: '#/components/schemas/UserId' }
-                        source: { type: string, enum: [client, chat, task, route, probe] }
+                        source: { type: string, enum: [client, chat, task, route, probe, compaction] }
                         call_id: { type: string }
                         model_id: { type: string }
                         provider_model: { type: string }
@@ -7231,7 +7415,7 @@ paths:
               required: [owner_id, source, call_id, input_tokens, output_tokens, evidence]
               properties:
                 owner_id: { $ref: '#/components/schemas/UserId' }
-                source: { type: string, enum: [client, chat, task, route, probe] }
+                source: { type: string, enum: [client, chat, task, route, probe, compaction] }
                 call_id: { type: string, minLength: 8, maxLength: 128 }
                 input_tokens: { type: integer, format: int64, minimum: 0 }
                 output_tokens: { type: integer, format: int64, minimum: 0 }
@@ -7425,6 +7609,11 @@ paths:
         '503': { description: A required dependency is unavailable }
 components:
   securitySchemes:
+    fileFetchTicket:
+      type: http
+      scheme: bearer
+      bearerFormat: 32-byte canonical unpadded base64url ticket
+      description: Short-lived server-generated ticket accepted only on Task file.fetch manifest, chunk, and commit routes; it is not a Portal session or client credential.
     portalSession:
       type: apiKey
       in: cookie
@@ -7772,6 +7961,7 @@ components:
           pattern: '^https://'
           description: HTTPS URL whose DNS host must be on the server's outbound allowlist.
         model_name: { type: string, minLength: 1, maxLength: 256 }
+        context_window_tokens: { type: integer, minimum: 4096, maximum: 1000000, description: Verified model context capacity from the provider's model documentation; omitted means unknown and disables compaction. }
         api_key: { type: string, minLength: 1, maxLength: 4096, writeOnly: true }
         shared:
           type: boolean
@@ -7789,6 +7979,7 @@ components:
           pattern: '^https://'
           description: HTTPS URL whose DNS host must be on the server's outbound allowlist.
         model_name: { type: string, minLength: 1, maxLength: 256 }
+        context_window_tokens: { type: integer, minimum: 4096, maximum: 1000000, description: Verified model context capacity from the provider's model documentation; omitted preserves it only when the endpoint is unchanged. }
         api_key:
           type: string
           maxLength: 4096
@@ -7821,6 +8012,7 @@ components:
         name: { type: string }
         base_url: { type: string, format: uri }
         model_name: { type: string }
+        context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 1000000, description: Unknown until the owner or administrator supplies a verified model capacity. }
         shared: { type: boolean }
         has_api_key: { type: boolean }
         capabilities: { $ref: '#/components/schemas/ModelConnectionCapabilities' }
@@ -10300,7 +10492,7 @@ components:
         call_id: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
         actor_id: { $ref: '#/components/schemas/UserId' }
         task_id: { $ref: '#/components/schemas/TaskId', description: Present only for source=task. }
-        source: { type: string, enum: [client, chat, task, route] }
+        source: { type: string, enum: [client, chat, task, route, compaction] }
         model_id: { $ref: '#/components/schemas/ModelConnectionId' }
         rate_version: { type: integer, format: int64, minimum: 1 }
         currency: { type: string, pattern: '^[A-Z]{3}$' }
@@ -10761,6 +10953,92 @@ components:
         status: { type: string, enum: [pending, completed] }
         safe_after: { type: string, format: date-time }
         unsettled_operation_ids: { type: array, items: { $ref: '#/components/schemas/OperationId' } }
+    TaskFileFetch:
+      type: object
+      additionalProperties: false
+      required: [fetch_id, task_id, source_installation_id, source_device_name, relative_path, task_revision, source_version, source_sha256, media_type, size_bytes, confirmed_bytes, status, waiting_reason, content_id, expires_at, content_state, parse_status, parse_error, deleted_at]
+      description: Task-owner Portal Session projection of a PC file fetch. It contains no transfer ticket, ticket hash, or source directory path outside the authorized relative path. A completed fetch stays completed after its retained copy is deleted or expires; content_state reports the separate copy lifecycle and parse_status reports model delivery separately from transfer completion.
+      properties:
+        fetch_id: { $ref: '#/components/schemas/OperationId' }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        source_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
+        source_device_name: { type: string, minLength: 1, maxLength: 100 }
+        relative_path: { type: string, minLength: 1, maxLength: 1024, description: Relative to the PC's current authorized root. }
+        task_revision: { type: integer, format: int64, minimum: 1 }
+        source_version: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        source_sha256: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        media_type: { type: [string, 'null'], enum: [text/plain, text/markdown, text/csv, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/pdf, null] }
+        size_bytes: { type: [integer, 'null'], format: int64, minimum: 1, maximum: 16777216 }
+        confirmed_bytes: { type: integer, format: int64, minimum: 0, maximum: 16777216 }
+        status: { type: string, enum: [queued, waiting_device, transferring, verifying, completed, cancelling, cancelled, failed] }
+        waiting_reason: { type: [string, 'null'], enum: [device_offline, null] }
+        content_id: { oneOf: [{ $ref: '#/components/schemas/OperationId' }, { type: 'null' }] }
+        expires_at: { type: [string, 'null'], format: date-time }
+        content_state: { type: string, enum: [none, retained, deleted, expired] }
+        parse_status: { type: string, enum: [pending, extracted, raw_only, failed, unavailable] }
+        parse_error: { type: [string, 'null'], enum: [invalid_encoding, invalid_document, result_too_large, content_unavailable, integrity_failed, null] }
+        deleted_at: { type: [string, 'null'], format: date-time }
+    TaskFileFetchList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/TaskFileFetch' }
+    TaskFileFetchManifestRequest:
+      type: object
+      additionalProperties: false
+      required: [source_version, source_sha256, size_bytes, media_type]
+      properties:
+        source_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+        source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        size_bytes: { type: integer, format: int64, minimum: 1, maximum: 16777216 }
+        media_type: { type: string, enum: [text/plain, text/markdown, text/csv, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/pdf] }
+    TaskFileFetchManifestReceipt:
+      type: object
+      additionalProperties: false
+      required: [fetch_id, source_version, status, confirmed_sequences]
+      properties:
+        fetch_id: { $ref: '#/components/schemas/OperationId' }
+        source_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+        status: { type: string, enum: [transferring, verifying, completed] }
+        confirmed_sequences:
+          type: array
+          uniqueItems: true
+          items: { type: integer, minimum: 0, maximum: 31 }
+    TaskFileFetchChunkReceipt:
+      type: object
+      additionalProperties: false
+      required: [fetch_id, sequence, confirmed_bytes, replayed]
+      properties:
+        fetch_id: { $ref: '#/components/schemas/OperationId' }
+        sequence: { type: integer, minimum: 0, maximum: 31 }
+        confirmed_bytes: { type: integer, format: int64, minimum: 1, maximum: 16777216 }
+        replayed: { type: boolean }
+    TaskFileFetchCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [source_version, source_sha256, size_bytes]
+      properties:
+        source_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+        source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        size_bytes: { type: integer, format: int64, minimum: 1, maximum: 16777216 }
+    TaskFileFetchCommitReceipt:
+      type: object
+      additionalProperties: false
+      required: [fetch_id, task_revision, target_grant_version, status, source_version, source_sha256, size_bytes, content_id, expires_at]
+      properties:
+        fetch_id: { $ref: '#/components/schemas/OperationId' }
+        task_revision: { type: integer, format: int64, minimum: 1 }
+        target_grant_version: { type: integer, format: int64, minimum: 1 }
+        status: { type: string, const: completed }
+        source_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+        source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        size_bytes: { type: integer, format: int64, minimum: 1, maximum: 16777216 }
+        content_id: { $ref: '#/components/schemas/OperationId' }
+        expires_at: { type: string, format: date-time }
     TaskAssistantMessage:
       type: object
       description: The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text.
@@ -11069,7 +11347,7 @@ components:
       type: object
       required: [source, call_id, model_id, provider_model, reserved_tokens, state, input_tokens, output_tokens, created_at, settled_at]
       properties:
-        source: { type: string, enum: [client, chat, task, route, probe] }
+        source: { type: string, enum: [client, chat, task, route, probe, compaction] }
         call_id: { type: string }
         model_id: { type: string }
         provider_model: { type: string }

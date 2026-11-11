@@ -197,17 +197,58 @@ type ConversationContext struct {
 	Scope           string
 	ThroughSequence int64
 	Digest          []byte
+	Summary         *ConversationContextSummary
 	Messages        []ConversationContextMessage
+}
+
+// ConversationContextSummary is an immutable reference to the encrypted
+// summary snapshot fixed when the Task was created. Ciphertext, proofs and
+// plaintext are loaded transiently and are not part of the Task event JSON.
+type ConversationContextSummary struct {
+	ServiceInstanceID    string                             `json:"service_instance_id"`
+	OwnerID              string                             `json:"owner_id"`
+	ActorID              string                             `json:"actor_id"`
+	ConversationID       string                             `json:"conversation_id"`
+	ScopeKind            string                             `json:"scope_kind"`
+	ScopeID              string                             `json:"scope_id"`
+	AuthorizationVersion int64                              `json:"authorization_version"`
+	ScopeVersion         int64                              `json:"scope_version"`
+	Version              int64                              `json:"version"`
+	OperationID          string                             `json:"operation_id"`
+	SummarySHA256        []byte                             `json:"summary_sha256"`
+	SourcesSHA256        []byte                             `json:"sources_sha256"`
+	Ciphertext           []byte                             `json:"-"`
+	Sources              []ConversationContextSummarySource `json:"-"`
+	Text                 string                             `json:"-"`
+}
+
+type ConversationContextSummarySource struct {
+	Kind       string
+	ID         string
+	ObjectType string
+	Version    int64
+	Sequence   int64
+	SHA256     []byte
 }
 
 const MaxConversationContextMessages = 128
 
 type ConversationContextMessage struct {
-	ID        string
-	Sequence  int64
-	Role      string
-	Content   string
-	Truncated bool
+	ID            string
+	Sequence      int64
+	Role          string
+	Content       string
+	Truncated     bool
+	TaskID        string                          `json:"-"`
+	TaskRevision  int64                           `json:"-"`
+	EventSequence int64                           `json:"-"`
+	TaskResults   []ConversationContextTaskResult `json:"-"`
+}
+
+type ConversationContextTaskResult struct {
+	TaskID        string `json:"task_id"`
+	TaskRevision  int64  `json:"task_revision"`
+	EventSequence int64  `json:"event_sequence"`
 }
 
 type Step struct {

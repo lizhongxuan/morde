@@ -154,6 +154,45 @@ func (f resultAggregationFixture) runNextReview(t *testing.T) *resultReviewRoute
 	return model
 }
 
+func TestConversationResultReviewUsesLatestSourceTaskModel(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx := context.Background()
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO model_connections(id,owner_id,name,base_url,model_name,api_key_cipher,checked_at,capability_text)
+VALUES ('p1234567',$1,'result source model one','https://example.test/v1','fixture-model',decode(repeat('ab',29),'hex'),clock_timestamp(),true),
+       ('p2345678',$1,'result source model two','https://example.test/v1','fixture-model',decode(repeat('ef',29),'hex'),clock_timestamp(),true),
+       ('p7654321',$1,'unready preference model','https://example.test/v1','fixture-model',decode(repeat('cd',29),'hex'),NULL,false)`, f.ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO user_preferences(user_id,selected_model_id) VALUES ($1,'p7654321')
+ON CONFLICT (user_id) DO UPDATE SET selected_model_id=EXCLUDED.selected_model_id`, f.ownerID); err != nil {
+		t.Fatal(err)
+	}
+	first := f.createTask(t, f.ownerID, "return the first result")
+	latest := f.createTask(t, f.ownerID, "return the latest result")
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET model_id='p2345678' WHERE id=$1`, latest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !f.complete(t, &first, "first task result") || !f.complete(t, &latest, "latest task result") {
+		t.Fatal("task result was not queued")
+	}
+	if _, err := f.store.pool.Exec(ctx, `WITH now AS (SELECT clock_timestamp() AS value)
+UPDATE conversation_result_batches b SET created_at=now.value-interval '3 seconds', deadline=now.value-interval '1 second'
+FROM now WHERE b.state='pending' AND b.owner_id=$1`, f.ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.QueueReadyConversationResultReviews(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	claim, found, err := f.store.ClaimConversationRoute(ctx, "result-review-model-test", time.Minute)
+	if err != nil || !found || claim.Input.ResultReviewID == "" {
+		t.Fatalf("claim hidden result review route: found=%t input=%#v err=%v", found, claim.Input, err)
+	}
+	selected, err := f.store.ResolveConversationRouteModel(ctx, claim)
+	if err != nil || selected != "p2345678" {
+		t.Fatalf("result review selected model = %q, want latest source Task model p2345678: %v", selected, err)
+	}
+}
+
 func TestConversationResultAggregationQueuesHiddenReviewAndReplaysOnce(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()

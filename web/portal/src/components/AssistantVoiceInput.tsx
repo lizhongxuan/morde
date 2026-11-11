@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { MordeIcon } from './MordeIcon';
 
 type SpeechAlternativeLike = { transcript?: string };
 type SpeechResultLike = ArrayLike<SpeechAlternativeLike> & { isFinal?: boolean };
@@ -28,6 +29,7 @@ export type AssistantVoiceInputProps = {
   onTranscript: (transcript: string) => void;
   disabled?: boolean;
   language?: string;
+  compact?: boolean;
 };
 
 function speechRecognitionConstructor(): SpeechRecognitionConstructor | undefined {
@@ -59,7 +61,7 @@ function speechErrorMessage(error: string | undefined): string {
  * audio; recognition is delegated to the browser implementation, whose
  * processing location depends on the browser and its settings.
  */
-export function AssistantVoiceInput({ onTranscript, disabled = false, language = 'zh-CN' }: AssistantVoiceInputProps) {
+export function AssistantVoiceInput({ onTranscript, disabled = false, language = 'zh-CN', compact = false }: AssistantVoiceInputProps) {
   const disclosureID = useId();
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const [listening, setListening] = useState(false);
@@ -131,19 +133,19 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     <div className="assistant-voice-control" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
       <button
         type="button"
-        className="button button-secondary button-small"
+        className={`button button-secondary button-small${compact ? ' assistant-voice-button-compact' : ''}`}
         aria-label={listening ? '停止语音输入' : '开始语音输入'}
         aria-describedby={disclosureID}
         aria-pressed={listening}
         title="语音识别由浏览器提供，可能使用在线服务。"
         disabled={disabled && !listening}
         onClick={toggleRecognition}
-        style={{ minWidth: 76, justifyContent: 'center' }}
+        style={compact ? undefined : { minWidth: 76, justifyContent: 'center' }}
       >
-        {listening ? '停止语音' : '语音输入'}
+        {compact ? <MordeIcon name="microphone" /> : listening ? '停止语音' : '语音输入'}
       </button>
       <span
-        className="assistant-voice-status"
+        className={`assistant-voice-status${compact && !status ? ' assistant-voice-status-idle' : ''}`}
         aria-label="语音输入状态"
         aria-live="polite"
         aria-atomic="true"

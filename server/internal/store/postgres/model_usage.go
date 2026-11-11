@@ -21,7 +21,7 @@ import (
 func (s *Store) ReserveModelCall(ctx context.Context, request app.ModelCallReservation) error {
 	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || !domain.ValidModelConnectionID(request.ModelID) || len(request.RequestDigest) != 32 ||
 		request.ReservedTokens <= 0 || request.ProviderModel == "" || len(request.ProviderModel) > 256 ||
-		len(request.CallID) < 8 || len(request.CallID) > 128 {
+		len(request.CallID) < 8 || len(request.CallID) > 128 || (request.Source == app.ModelCallCompaction) != (request.Summary != nil) {
 		return domain.InvalidArgument("model_call", "invalid model reservation")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error { return reserveModelCallInTx(ctx, tx, request, nil) })
@@ -91,7 +91,7 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 	}
 	projectID := request.ProjectID
 	if projectID != "" && (!project.ValidID(projectID) || (!request.PersonalModel && (projectReservation == nil || projectReservation.ProjectID != projectID)) ||
-		(request.PersonalModel && (projectReservation != nil || (request.Source != app.ModelCallTask && request.Source != app.ModelCallRoute)))) {
+		(request.PersonalModel && (projectReservation != nil || (request.Source != app.ModelCallTask && request.Source != app.ModelCallRoute && request.Source != app.ModelCallCompaction)))) {
 		return domain.NewError(domain.CodeInvalidState, "project model budget reservation is required")
 	}
 	if projectID == "" && projectReservation != nil {
@@ -157,6 +157,11 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens, request.PersonalModel); err != nil {
 		return fmt.Errorf("reserve model call: %w", err)
 	}
+	if request.Source == app.ModelCallCompaction {
+		if err := attachConversationSummaryModelCallInTx(ctx, tx, request); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -195,7 +200,8 @@ func (s *Store) BeginModelCallDispatchWithTextStreaming(ctx context.Context, req
 }
 
 func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCallReservation, requestStreaming bool) (bool, error) {
-	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || len(request.CallID) < 8 || len(request.CallID) > 128 {
+	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || len(request.CallID) < 8 || len(request.CallID) > 128 ||
+		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) {
 		return false, domain.InvalidArgument("model_call", "invalid model dispatch")
 	}
 	var streaming bool
@@ -292,8 +298,10 @@ func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.Mod
 	if !domain.ValidUserID(request.OwnerID) || !domain.ValidModelConnectionID(request.ModelID) ||
 		len(request.RequestDigest) != 32 || request.ReservedTokens <= 0 || len(request.CallID) < 8 || len(request.CallID) > 128 ||
 		(request.ProjectID != "" && !project.ValidID(request.ProjectID)) ||
-		(request.Source != app.ModelCallClient && request.Source != app.ModelCallChat && request.Source != app.ModelCallTask && request.Source != app.ModelCallProbe) ||
+		(request.Source != app.ModelCallClient && request.Source != app.ModelCallChat && request.Source != app.ModelCallTask &&
+			request.Source != app.ModelCallProbe && request.Source != app.ModelCallCompaction) ||
 		(request.Source == app.ModelCallTask) != (request.Task != nil) ||
+		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
 		(request.Task != nil && request.Task.InitiatorID != request.OwnerID) ||
 		(request.ProjectID != "" && request.Source == app.ModelCallProbe) {
 		return domain.InvalidArgument("model_call", "invalid model reservation release")
@@ -457,6 +465,10 @@ func checkModelCaller(ctx context.Context, tx pgx.Tx, request app.ModelCallReser
 			return domain.NewError(domain.CodeUnauthenticated, "route model authorization is unavailable")
 		}
 		if err := checkConversationRouteModelFence(ctx, tx, *request.Route, request.ModelID); err != nil {
+			return err
+		}
+	case app.ModelCallCompaction:
+		if err := checkConversationSummaryModelFence(ctx, tx, request); err != nil {
 			return err
 		}
 	default:
@@ -798,6 +810,12 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3 AND agent_instance_id=$
 
 func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSettlement) error {
 	if settlement.Source == app.ModelCallRoute || !domain.ValidUserID(settlement.OwnerID) || settlement.CallID == "" ||
+		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
+		settlement.Source != app.ModelCallCompaction && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
+		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
+		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
+		!settlement.Unknown && !settlement.ResponseInvalid && settlement.Source == app.ModelCallCompaction &&
+			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32) ||
 		(!settlement.Unknown && (!settlement.Usage.Known || settlement.Usage.InputTokens < 0 || settlement.Usage.OutputTokens < 0 ||
 			settlement.Usage.InputTokens > math.MaxInt64-settlement.Usage.OutputTokens)) {
 		return domain.InvalidArgument("model_call", "invalid model settlement")
@@ -826,6 +844,9 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		}
 		if state != "dispatched" {
 			if state == "unknown" && !settlement.Unknown {
+				if settlement.Source == app.ModelCallCompaction {
+					return domain.NewError(domain.CodeInvalidState, "unknown conversation summary model usage requires reconciliation")
+				}
 				_, err = tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=clock_timestamp()
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='unknown'`, settlement.OwnerID, string(settlement.Source), settlement.CallID,
 					settlement.Usage.InputTokens, settlement.Usage.OutputTokens)
@@ -865,6 +886,11 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		}
 		if err != nil {
 			return fmt.Errorf("settle model usage: %w", err)
+		}
+		if settlement.Source == app.ModelCallCompaction {
+			if err := recordConversationSummaryModelResultInTx(ctx, tx, settlement); err != nil {
+				return err
+			}
 		}
 		if taskID != nil {
 			if settlement.Unknown {

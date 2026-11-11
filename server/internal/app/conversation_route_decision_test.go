@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/sha256"
 	"strings"
 	"testing"
 
@@ -136,6 +137,35 @@ func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
 	value.Content = strings.Repeat("中", maxAgentInputBytes)
 	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeResultTooLarge {
 		t.Fatalf("oversized routing context should fail without truncation: %v", err)
+	}
+}
+
+func TestConversationRouteRequestBindsSummaryAndUsesOnlyUncoveredHistory(t *testing.T) {
+	summary := "已确认的旧结论"
+	summaryDigest := sha256.Sum256([]byte(summary))
+	sourceDigest := sha256.Sum256([]byte("已发布结果"))
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "继续", SummaryVersion: 3,
+		SummarySHA256: summaryDigest[:], SummarySourcesSHA256: make([]byte, sha256.Size), SummaryText: summary,
+		History: []ConversationRouteHistory{{MessageID: "m1234567", Sequence: 1, Role: conversation.RoleUser, Content: "旧消息"},
+			{MessageID: "m2345678", Sequence: 2, TaskID: "q1234567", TaskRevision: 2, EventSequence: 5,
+				Role: conversation.RoleAssistant, Content: "已发布结果"},
+			{MessageID: "m3456789", Sequence: 3, Role: conversation.RoleUser, Content: "尾部"}}}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil || !strings.Contains(request.Input[0].Text, `"summary":{"sha256"`) ||
+		!strings.Contains(request.Input[0].Text, summary) {
+		t.Fatalf("summary was not bound into the route request: %+v err=%v", request, err)
+	}
+	value.SummarySHA256 = append([]byte(nil), value.SummarySHA256...)
+	value.SummarySHA256[0] ^= 0xff
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("summary with a mismatched digest was accepted: %v", err)
+	}
+	history := ConversationRouteHistoryWithoutSummarySources(value.History, []ConversationSummarySource{
+		{Kind: ConversationSummarySourceMessage, ID: "m1234567", SHA256: make([]byte, sha256.Size)},
+		{Kind: ConversationSummarySourceTask, ID: "q1234567", Version: 2, Sequence: 5, SHA256: sourceDigest[:]},
+	})
+	if len(history) != 1 || history[0].MessageID != "m3456789" || len(value.History) != 3 {
+		t.Fatalf("summary overlap removed the wrong raw history or mutated the snapshot: %+v / %+v", history, value.History)
 	}
 }
 

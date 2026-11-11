@@ -800,6 +800,7 @@ struct MIFTaskDetailView: View {
                     }
                 }
                 .background(NanoMuseTones.canvas)
+                .accessibilityIdentifier("morde.task.detailScroll")
             }
         }
         .overlay(alignment: .bottom) {
@@ -927,6 +928,7 @@ struct MIFTaskDetailView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(AppLocalized("Child jobs"))
                                 .font(.subheadline.weight(.semibold))
+                                .accessibilityIdentifier("morde.task.childJobs")
                             ForEach(childJobs, id: \.job_id) { job in
                                 HStack(alignment: .top, spacing: 10) {
                                     VStack(alignment: .leading, spacing: 3) {
@@ -947,7 +949,6 @@ struct MIFTaskDetailView: View {
                                 .accessibilityIdentifier("morde.task.childJob.\(job.id)")
                             }
                         }
-                        .accessibilityIdentifier("morde.task.childJobs")
                     }
 
                     if let review = task.result_review {

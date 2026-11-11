@@ -58,6 +58,7 @@ type Deps struct {
 	ExecutionControl             ExecutionControlService
 	Tasks                        TaskService
 	TaskMedia                    TaskMediaService
+	TaskFileFetch                TaskFileFetchEndpointService
 	TaskObservationTickets       TaskWorkbenchObservationTicketService
 	Conversations                ConversationService
 	ProjectConversations         projectConversationRoutesService
@@ -170,6 +171,9 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	engine.GET("/api/mcp/oauth/callback", h.mcpConnectorOAuthCallback)
 	engine.GET("/__ch/cert-authorize", h.authorizeTLS)
 	h.registerHostReplicaRoutes(engine)
+	if deps.TaskFileFetch != nil {
+		h.registerTaskFileFetchTransferRoutes(engine, deps.TaskFileFetch)
+	}
 	if deps.AdminOperations != nil {
 		engine.GET("/api/nudges", h.getPublicNudges)
 	}
@@ -196,6 +200,9 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	RegisterProjectBudgetRoutes(group, deps.ProjectBudget)
 	RegisterProjectMCPConnectorRoutes(group, deps.ProjectMCPConnectors)
 	h.registerTasks(group, deps.Tasks)
+	if deps.TaskFileFetch != nil {
+		h.registerTaskFileFetchOwnerRoutes(group, deps.TaskFileFetch)
+	}
 	if deps.TaskMedia != nil {
 		group.GET("/tasks/:id/media/:operation_id/preview", h.getTaskMediaPreview)
 	}
@@ -398,6 +405,10 @@ func (h *api) authenticate(c *gin.Context) {
 		return
 	}
 	if principal.Kind == identity.KindClient && !clientCredentialRoute(c.Request.Method, c.FullPath()) {
+		if isTaskFileFetchOwnerRoute(c.Request.Method, c.FullPath()) {
+			writeError(c, domain.NewError(domain.CodeNotFound, "file fetch not found"))
+			return
+		}
 		writeError(c, domain.NewError(domain.CodeForbidden, "client credential is limited to user actions"))
 		c.Abort()
 		return

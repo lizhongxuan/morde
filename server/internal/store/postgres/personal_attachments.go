@@ -312,7 +312,7 @@ func (s *Store) CommitPersonalAttachment(ctx context.Context, principal identity
 		if err != nil {
 			return fmt.Errorf("hash personal attachment reference: %w", err)
 		}
-		mutationReceipt, err := applyPersonalMutationInTx(ctx, tx, principal, mutation, attachmentID)
+		mutationReceipt, err := applyPersonalMutationInTx(ctx, tx, principal, mutation, attachmentID, "")
 		if err != nil {
 			return err
 		}

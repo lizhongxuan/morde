@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"testing"
+	"time"
 )
 
 func TestDecodeFrameRequiresOneBoundedKnownJSONObject(t *testing.T) {
@@ -152,6 +153,56 @@ func TestValidateTaskContextRequiresTaskAndGrantFence(t *testing.T) {
 	}
 }
 
+func TestFileFetchArgumentsAndReceiptAreBoundedAndCredentialSafe(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Second)
+	args := FileFetchArgs{
+		FetchID: "o1234567", Path: "reports/summary.pdf", TaskRevision: 8,
+		Ticket: base64.RawURLEncoding.EncodeToString(make([]byte, 32)), TicketExpiresAt: expiresAt,
+	}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateTaskActionArgs(ActionFileFetch, raw); err != nil {
+		t.Fatalf("valid file.fetch arguments: %v", err)
+	}
+	for name, changed := range map[string]FileFetchArgs{
+		"invalid fetch ID": {FetchID: "bad", Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
+		"absolute path":    {FetchID: args.FetchID, Path: "/private/file.pdf", TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
+		"missing revision": {FetchID: args.FetchID, Path: args.Path, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
+		"padded ticket":    {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket + "=", TicketExpiresAt: expiresAt},
+		"expired ticket":   {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: time.Now().UTC().Add(-time.Second)},
+		"ticket too long":  {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: time.Now().UTC().Add(6 * time.Minute)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateTaskActionArgs(ActionFileFetch, encoded); err == nil {
+				t.Fatal("invalid file.fetch arguments were accepted")
+			}
+		})
+	}
+
+	receipt, err := json.Marshal(FileFetchReceipt{
+		FetchID: args.FetchID, TaskRevision: args.TaskRevision, Status: "completed", TargetGrantVersion: 9,
+		SourceVersion: string(bytes.Repeat([]byte{'a'}, 64)), SourceSHA256: string(bytes.Repeat([]byte{'b'}, 64)),
+		SizeBytes: 4096, ContentID: "o7654321", ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok := true
+	if err := ValidateActionResult(ActionFileFetch, Frame{Type: "result", ID: "call-file-fetch", OK: &ok, Body: receipt}); err != nil {
+		t.Fatalf("valid file.fetch commit receipt: %v", err)
+	}
+	unsafeReceipt := append(bytes.TrimSuffix(receipt, []byte("}")), []byte(`,"ticket":"secret"}`)...)
+	if err := ValidateActionResult(ActionFileFetch, Frame{Type: "result", ID: "call-file-fetch", OK: &ok, Body: unsafeReceipt}); err == nil {
+		t.Fatal("file.fetch receipt containing a ticket was accepted")
+	}
+}
+
 func TestValidateTaskActionArgsAreStrictlyBounded(t *testing.T) {
 	for name, value := range map[string]struct {
 		action string
@@ -174,6 +225,7 @@ func TestValidateTaskActionArgsAreStrictlyBounded(t *testing.T) {
 		action string
 		args   string
 	}{
+		"file.fetch":          {action: ActionFileFetch, args: `{}`},
 		"unknown action":      {action: "shell", args: `{}`},
 		"extra screen arg":    {action: ActionScreenshot, args: `{"path":"/private"}`},
 		"files absolute path": {action: ActionFiles, args: `{"path":"/private"}`},

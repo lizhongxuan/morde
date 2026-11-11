@@ -1,12 +1,15 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 
@@ -29,6 +32,7 @@ type routeWorkerStub struct {
 	classifies   int
 	requeued     bool
 	requeueCalls int
+	classified   app.ConversationRouteContext
 }
 
 func (s *routeWorkerStub) ClaimConversationRoute(context.Context, string, time.Duration) (app.ConversationRouteClaim, bool, error) {
@@ -64,8 +68,9 @@ func (s *routeWorkerStub) ResolveConversationRouteModel(context.Context, app.Con
 	s.resolves++
 	return "p1234567", s.modelErr
 }
-func (s *routeWorkerStub) ClassifyConversationRoute(context.Context, app.ConversationRouteClaim, app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+func (s *routeWorkerStub) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim, value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	s.classifies++
+	s.classified = value
 	return s.decision, s.classifyErr
 }
 
@@ -272,6 +277,14 @@ func TestConversationRouteWorkerRequeuesOnlySafelyRecoveredPredecessorRace(t *te
 	}
 }
 
+func TestConversationRouteWorkerDefersStaleContextAfterClassification(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.classifyErr = domain.NewError(domain.CodeConflict, "authorized route context changed")
+	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 1 || len(stub.failures) != 0 || len(stub.applied) != 0 {
+		t.Fatalf("stale context should be retried: deferred=%d failures=%v applied=%v err=%v", stub.deferred, stub.failures, stub.applied, err)
+	}
+}
+
 func TestConversationRouteWorkerRecordsModelFailureWithoutTaskAction(t *testing.T) {
 	for _, scenario := range []struct {
 		name string
@@ -467,5 +480,296 @@ func TestConversationRouteWorkerRunsIndependentMessageWhileOtherClassificationIs
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker did not stop after cancellation")
+	}
+}
+
+type summaryInputPageStub struct {
+	page app.ConversationSummaryInputPage
+	next *app.ConversationSummaryInputPage
+}
+
+func (s summaryInputPageStub) LoadConversationSummaryInputPage(_ context.Context, request app.ConversationSummaryInputPageRequest) (app.ConversationSummaryInputPage, error) {
+	if request.Cursor != nil && s.next != nil {
+		return *s.next, nil
+	}
+	return s.page, nil
+}
+
+type summaryRouteModelsStub struct {
+	*routeWorkerStub
+	request CloudDSHConversationSummaryRequest
+	result  CloudDSHConversationSummaryResult
+	window  int
+}
+
+func (s *summaryRouteModelsStub) ResolveConversationSummaryModel(context.Context, app.ConversationRouteClaim) (string, int, error) {
+	return "p1234567", s.window, nil
+}
+
+func (s *summaryRouteModelsStub) CompactConversationSummary(_ context.Context, request CloudDSHConversationSummaryRequest) (CloudDSHConversationSummaryResult, error) {
+	s.request = request
+	return s.result, nil
+}
+
+type summaryStoreStub struct {
+	app.ConversationSummaryStore
+	identity  app.ConversationSummaryIdentity
+	operation app.ConversationSummaryOperation
+	commit    app.ConversationSummaryCommit
+	commitErr error
+	releases  []app.ConversationSummaryOperationRelease
+}
+
+func (s *summaryStoreStub) ClaimConversationSummaryOperation(_ context.Context, command app.ClaimConversationSummaryOperation) (app.ConversationSummaryOperation, bool, error) {
+	s.operation = app.ConversationSummaryOperation{Identity: s.identity, OperationID: "o1234567",
+		InputSHA256: command.InputSHA256, BaselineVersion: command.BaselineVersion, State: "claimed",
+		LeaseOwner: command.LeaseOwner, LeaseVersion: 1, CheckpointThrough: -1}
+	return s.operation, false, nil
+}
+
+func (s *summaryStoreStub) CommitConversationSummary(_ context.Context, command app.ConversationSummaryCommit) error {
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	s.commit = command
+	return nil
+}
+
+func (s *summaryStoreStub) ReleaseConversationSummaryOperation(_ context.Context, command app.ConversationSummaryOperationRelease) error {
+	s.releases = append(s.releases, command)
+	return nil
+}
+
+func newSummaryRouteWorkerHarness(t *testing.T, fullText string, contextWindow int,
+	result CloudDSHConversationSummaryResult) (*ConversationRouteWorker, *routeWorkerStub,
+	*summaryRouteModelsStub, *summaryStoreStub, *app.Sealer, app.ConversationSummaryIdentity, []byte) {
+	t.Helper()
+	claim, routeContext := coordinatorTestClaimAndContext()
+	claim.Message.ID, claim.Message.Sequence, claim.Message.Content = "m2345678", 2, "new message"
+	claim.LeaseExpiresAt = time.Now().Add(time.Minute)
+	identity, err := app.ConversationSummaryScopeForClaim(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceDigest := sha256.Sum256([]byte(fullText))
+	source := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234567", Sequence: 1, SHA256: sourceDigest[:]}
+	page := app.ConversationSummaryInputPage{Identity: identity, BoundarySequence: 1, Head: app.ConversationSummaryHead{Identity: identity}}
+	for offset := 0; offset < len(fullText); {
+		end := min(len(fullText), offset+app.MaxConversationSummaryInputPageBytes)
+		for end < len(fullText) && !utf8.ValidString(fullText[:end]) {
+			end--
+		}
+		page.Sources = append(page.Sources, app.ConversationSummaryPromptSource{Source: source, Role: "user",
+			ByteOffset: int64(offset), Content: fullText[offset:end]})
+		offset = end
+	}
+	store := &summaryStoreStub{identity: identity}
+	route := &routeWorkerStub{claim: claim,
+		snapshot: app.ConversationRouteSnapshot{Context: routeContext}, decision: app.ConversationRouteDecision{Action: app.ConversationRouteNew}}
+	models := &summaryRouteModelsStub{routeWorkerStub: route, result: result, window: contextWindow}
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: route, Actions: route,
+		Models: models, SummaryStore: store, SummaryInputs: summaryInputPageStub{page: page}, SummarySealer: sealer,
+		WorkerID: "route-summary-test", LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker, route, models, store, sealer, identity, sourceDigest[:]
+}
+
+func TestConversationRouteWorkerCommitsBoundedDSHSummaryBeforeRouting(t *testing.T) {
+	worker, route, models, store, sealer, identity, sourceDigest := newSummaryRouteWorkerHarness(t,
+		strings.Repeat("事实", 13_000), 100_000,
+		CloudDSHConversationSummaryResult{Text: "short summary", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
+	found, err := worker.RunOnce(context.Background())
+	if err != nil || !found || len(store.commit.Sources) != 1 || store.commit.BaselineVersion != 0 ||
+		store.commit.OperationID != "o1234567" || len(store.commit.Ciphertext) == 0 || len(store.releases) != 0 ||
+		len(models.request.Sources) != 2 || models.request.Sources[1].ByteOffset != int64(len(models.request.Sources[0].Content)) ||
+		len(models.request.Sources[0].Content) > app.MaxConversationSummaryInputPageBytes || models.classifies != 1 ||
+		len(route.applied) != 1 {
+		t.Fatalf("summary maintenance result: found=%t commit=%+v releases=%+v request_sources=%d classifications=%d applied=%d err=%v",
+			found, store.commit, store.releases, len(models.request.Sources), models.classifies, len(route.applied), err)
+	}
+	opened, err := app.OpenConversationSummary(sealer, app.StoredConversationSummary{Identity: identity, Version: 1,
+		OperationID:   "o1234567",
+		SummarySHA256: store.commit.SummarySHA256, SourcesSHA256: store.commit.SourcesSHA256,
+		Ciphertext: store.commit.Ciphertext, Sources: store.commit.Sources})
+	if err != nil || opened.Text != "short summary" || !bytes.Equal(opened.Sources[0].SHA256, sourceDigest[:]) {
+		t.Fatalf("committed summary failed to reopen: %+v err=%v", opened, err)
+	}
+}
+
+func TestConversationRouteWorkerMarksPartiallyMigratedHistory(t *testing.T) {
+	worker, route, _, store, sealer, identity, _ := newSummaryRouteWorkerHarness(t,
+		strings.Repeat("x", 80<<10), 100_000,
+		CloudDSHConversationSummaryResult{Text: "Older history summary.", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
+	route.claim.Message.Sequence = 3
+	firstText := strings.Repeat("x", 80<<10)
+	firstDigest := sha256.Sum256([]byte(firstText))
+	firstSource := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234567", Sequence: 1, SHA256: firstDigest[:]}
+	firstPage := app.ConversationSummaryInputPage{Identity: identity, BoundarySequence: 2,
+		Head: app.ConversationSummaryHead{Identity: identity}}
+	for offset := 0; offset < len(firstText); {
+		end := min(len(firstText), offset+app.MaxConversationSummaryInputPageBytes)
+		firstPage.Sources = append(firstPage.Sources, app.ConversationSummaryPromptSource{Source: firstSource,
+			Role: "user", Content: firstText[offset:end], ByteOffset: int64(offset)})
+		offset = end
+	}
+	firstPage.Next = &app.ConversationSummaryInputCursor{Identity: identity, BoundarySequence: 2, Sequence: 1,
+		KindOrder: 0, ID: firstSource.ID, ByteOffset: int64(len(firstText))}
+	secondText := "A later source that remains for the next incremental pass."
+	secondDigest := sha256.Sum256([]byte(secondText))
+	secondPage := app.ConversationSummaryInputPage{Identity: identity, BoundarySequence: 2,
+		Head: app.ConversationSummaryHead{Identity: identity}, Sources: []app.ConversationSummaryPromptSource{{
+			Source: app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234568", Sequence: 2, SHA256: secondDigest[:]},
+			Role:   "user", Content: secondText,
+		}}}
+	worker.options.SummaryInputs = summaryInputPageStub{page: firstPage, next: &secondPage}
+	committed, err := worker.compactConversationSummary(context.Background(), route.claim, "p1234567")
+	if err != nil || !committed || len(store.commit.Sources) != 1 || store.commit.Sources[0].ID != firstSource.ID {
+		t.Fatalf("partial history compaction committed=%t sources=%+v err=%v", committed, store.commit.Sources, err)
+	}
+	opened, err := app.OpenConversationSummary(sealer, app.StoredConversationSummary{Identity: identity, Version: 1,
+		OperationID: "o1234567", SummarySHA256: store.commit.SummarySHA256, SourcesSHA256: store.commit.SourcesSHA256,
+		Ciphertext: store.commit.Ciphertext, Sources: store.commit.Sources})
+	if err != nil || !strings.HasPrefix(opened.Text, conversationSummaryIncompleteNotice+"\n\n") {
+		t.Fatalf("partial history was not marked in stored summary: text=%q err=%v", opened.Text, err)
+	}
+}
+
+func TestConversationRouteWorkerResumesCommittedHistoryCoverage(t *testing.T) {
+	worker, route, _, store, sealer, identity, _ := newSummaryRouteWorkerHarness(t, "", 100_000,
+		CloudDSHConversationSummaryResult{Text: "Complete history summary.", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
+	route.claim.Message.Sequence = 3
+	firstText := "First migrated history source."
+	firstDigest := sha256.Sum256([]byte(firstText))
+	firstSource := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234567", Sequence: 1, SHA256: firstDigest[:]}
+	prior, err := app.SealConversationSummary(sealer, app.ConversationSummaryDocument{Identity: identity, Version: 1,
+		OperationID: "o1234567", Text: conversationSummaryIncompleteNotice + "\n\nFirst migrated history summary.", Sources: []app.ConversationSummarySource{firstSource}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondText := strings.Repeat("y", 80<<10)
+	secondDigest := sha256.Sum256([]byte(secondText))
+	secondSource := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234568", Sequence: 2, SHA256: secondDigest[:]}
+	page := app.ConversationSummaryInputPage{Identity: identity, BoundarySequence: 2,
+		Head: app.ConversationSummaryHead{Identity: identity, Version: 1, Digest: prior.SummarySHA256}, Summary: &prior}
+	for offset := 0; offset < len(secondText); {
+		end := min(len(secondText), offset+app.MaxConversationSummaryInputPageBytes)
+		page.Sources = append(page.Sources, app.ConversationSummaryPromptSource{Source: secondSource,
+			Role: "user", Content: secondText[offset:end], ByteOffset: int64(offset)})
+		offset = end
+	}
+	worker.options.SummaryInputs = summaryInputPageStub{page: page}
+	committed, err := worker.compactConversationSummary(context.Background(), route.claim, "p1234567")
+	if err != nil || !committed || store.commit.BaselineVersion != 1 || len(store.commit.Sources) != 2 {
+		t.Fatalf("incremental coverage commit=%+v committed=%t err=%v", store.commit, committed, err)
+	}
+	opened, err := app.OpenConversationSummary(sealer, app.StoredConversationSummary{Identity: identity, Version: 2,
+		OperationID: "o1234567", SummarySHA256: store.commit.SummarySHA256, SourcesSHA256: store.commit.SourcesSHA256,
+		Ciphertext: store.commit.Ciphertext, Sources: store.commit.Sources})
+	if err != nil || strings.HasPrefix(opened.Text, conversationSummaryIncompleteNotice) {
+		t.Fatalf("completed incremental coverage retained incomplete marker: text=%q err=%v", opened.Text, err)
+	}
+}
+
+func TestConversationRouteWorkerRejectsInvalidSummaryResultsAndKeepsRouting(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		text         string
+		modelID      string
+		contextBytes int
+		commitErr    error
+	}{
+		{name: "empty", modelID: "p1234567", contextBytes: 100_000},
+		{name: "oversized", text: strings.Repeat("x", conversationSummaryMaintenanceMaxOutputBytes+1), modelID: "p1234567", contextBytes: 100_000},
+		{name: "model changed", text: "short", modelID: "p7654321", contextBytes: 100_000},
+		{name: "not smaller", text: strings.Repeat("x", 12_000), modelID: "p1234567", contextBytes: 16_000},
+		{name: "commit failed", text: "short", modelID: "p1234567", contextBytes: 100_000, commitErr: errors.New("synthetic commit failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := strings.Repeat("a", 10_000)
+			if test.contextBytes == 100_000 {
+				body = strings.Repeat("事实", 13_000)
+			}
+			worker, route, models, store, _, _, _ := newSummaryRouteWorkerHarness(t, body, test.contextBytes,
+				CloudDSHConversationSummaryResult{Text: test.text, ModelID: test.modelID, SessionID: "summary-session", Through: 12})
+			store.commitErr = test.commitErr
+			found, err := worker.RunOnce(context.Background())
+			if err != nil || !found || len(store.commit.Ciphertext) != 0 || len(store.releases) != 1 || store.releases[0].State != "failed" ||
+				len(route.applied) != 1 || models.classifies != 1 {
+				t.Fatalf("invalid summary did not fail closed while routing continued: found=%t commit=%+v releases=%+v applied=%d classifications=%d err=%v",
+					found, store.commit, store.releases, len(route.applied), models.classifies, err)
+			}
+		})
+	}
+}
+
+func TestConversationRouteWorkerUsesOnlyOpenedSummaryAndUncoveredHistory(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		name := "opened"
+		if corrupt {
+			name = "cannot-open"
+		}
+		t.Run(name, func(t *testing.T) {
+			claim, routeContext := coordinatorTestClaimAndContext()
+			claim.Message.Sequence, claim.Message.Content = 3, "继续"
+			claim.LeaseExpiresAt = time.Now().Add(time.Minute)
+			routeContext.Content = claim.Message.Content
+			routeContext.History = []app.ConversationRouteHistory{
+				{MessageID: "m2345678", Sequence: 1, Role: conversation.RoleUser, Content: "旧消息"},
+				{MessageID: "m3456789", Sequence: 2, TaskID: "q1234567", TaskRevision: 1, EventSequence: 1,
+					Role: conversation.RoleAssistant, Content: "已发布结果"},
+			}
+			identity, err := app.ConversationSummaryScopeForClaim(claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			messageDigest := sha256.Sum256([]byte("旧消息"))
+			resultDigest := sha256.Sum256([]byte("已发布结果"))
+			sources := []app.ConversationSummarySource{
+				{Kind: app.ConversationSummarySourceMessage, ID: "m2345678", Sequence: 1, SHA256: messageDigest[:]},
+				{Kind: app.ConversationSummarySourceTask, ID: "q1234567", Version: 1, Sequence: 1, SHA256: resultDigest[:]},
+			}
+			sealer, err := app.NewSealer(make([]byte, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			operationID := "o1234567"
+			stored, err := app.SealConversationSummary(sealer, app.ConversationSummaryDocument{
+				Identity: identity, Version: 1, OperationID: operationID, Text: "已核实摘要", Sources: sources,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if corrupt {
+				stored.Ciphertext[0] ^= 0xff
+			}
+			routeContext.SummaryVersion, routeContext.SummarySHA256 = stored.Version, append([]byte(nil), stored.SummarySHA256...)
+			routeContext.SummarySourcesSHA256 = append([]byte(nil), stored.SourcesSHA256...)
+			route := &routeWorkerStub{claim: claim, snapshot: app.ConversationRouteSnapshot{Context: routeContext, Summary: &stored},
+				decision: app.ConversationRouteDecision{Action: app.ConversationRouteNew}}
+			worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: route, Actions: route, Models: route,
+				SummarySealer: sealer, WorkerID: "route-summary-context-test", LeaseDuration: time.Minute,
+				PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			found, err := worker.RunOnce(context.Background())
+			if err != nil || !found || route.classifies != 1 || len(route.applied) != 1 {
+				t.Fatalf("route was not classified and applied: found=%t classified=%d applied=%d err=%v", found, route.classifies, len(route.applied), err)
+			}
+			if corrupt {
+				if route.classified.SummaryVersion != 0 || route.classified.SummaryText != "" || len(route.classified.History) != 2 {
+					t.Fatalf("unopenable summary was used or its raw history was dropped: %+v", route.classified)
+				}
+			} else if route.classified.SummaryVersion != 1 || route.classified.SummaryText != "已核实摘要" || len(route.classified.History) != 0 ||
+				len(route.snapshot.Context.History) != 2 {
+				t.Fatalf("summary routing context or immutable snapshot is wrong: classified=%+v snapshot=%+v", route.classified, route.snapshot)
+			}
+		})
 	}
 }

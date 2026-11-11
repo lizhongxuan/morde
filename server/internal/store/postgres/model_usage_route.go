@@ -21,6 +21,19 @@ import (
 
 func resolveRouteModelInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, error) {
 	selected := claim.Input.ModelID
+	if selected == "" && claim.Input.ResultReviewID != "" {
+		err := tx.QueryRow(ctx, `SELECT t.model_id
+FROM conversation_result_batches b
+JOIN conversation_result_sources s ON s.batch_message_id=b.message_id AND s.owner_id=b.owner_id
+ AND s.actor_id=b.actor_id AND s.conversation_id=b.conversation_id AND s.state='pending'
+JOIN tasks t ON t.id=s.task_id AND t.owner_id=s.owner_id AND t.initiator_id=s.actor_id AND t.conversation_id=s.conversation_id
+WHERE b.message_id=$1 AND b.service_instance_id=$2::uuid AND b.owner_id=$3 AND b.actor_id=$4 AND b.conversation_id=$5
+ORDER BY s.source_order DESC, s.task_id LIMIT 1`, claim.Input.ResultReviewID, claim.ServiceInstanceID,
+			claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).Scan(&selected)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("read result review model: %w", err)
+		}
+	}
 	if selected == "" {
 		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT selected_model_id FROM user_preferences WHERE user_id=$1),'')`, claim.Message.ActorID).Scan(&selected); err != nil {
 			return "", fmt.Errorf("read route model preference: %w", err)
@@ -98,8 +111,20 @@ func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.
 	if err != nil {
 		return err
 	}
-	snapshot.Context.ModelID = modelID
-	if snapshot.PreviousCycle || !reflect.DeepEqual(snapshot.Context, value) {
+	expected := snapshot.Context
+	expected.ModelID = modelID
+	if value.SummaryVersion > 0 {
+		if snapshot.Summary == nil || snapshot.Summary.Version != value.SummaryVersion ||
+			!bytes.Equal(snapshot.Summary.SummarySHA256, value.SummarySHA256) ||
+			!bytes.Equal(snapshot.Summary.SourcesSHA256, value.SummarySourcesSHA256) {
+			return domain.NewError(domain.CodeConflict, "authorized route summary changed")
+		}
+		expected.SummaryText = value.SummaryText
+		expected.History = app.ConversationRouteHistoryWithoutSummarySources(expected.History, snapshot.Summary.Sources)
+	} else {
+		expected.SummaryVersion, expected.SummarySHA256, expected.SummarySourcesSHA256, expected.SummaryText = 0, nil, nil, ""
+	}
+	if snapshot.PreviousCycle || !reflect.DeepEqual(expected, value) {
 		return domain.NewError(domain.CodeConflict, "authorized route context changed")
 	}
 	if claim.Input.PreviousClientMessageID == "" {
@@ -761,7 +786,7 @@ func (s *Store) RecoverConversationCoordinatorModelOutput(ctx context.Context, f
 	}
 	var output string
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
+		if err := checkConversationRouteModelFence(ctx, tx, fence, value.ModelID); err != nil {
 			return err
 		}
 		var state, modelID string

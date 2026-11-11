@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -16,9 +17,13 @@ import (
 
 type cloudDSHHubTaskStore struct {
 	*cloudDSHBrokerTaskStore
-	mu         sync.Mutex
-	operations map[string]TaskHubOperation
-	receiptErr error
+	mu           sync.Mutex
+	operations   map[string]TaskHubOperation
+	fetches      map[string]TaskFileFetch
+	ticketHashes map[string][]byte
+	fileContents map[string][]byte
+	mediaTypes   map[string]string
+	receiptErr   error
 }
 
 func (s *cloudDSHHubTaskStore) PrepareTaskHubOperation(_ context.Context, value TaskHubOperation, _ string) (TaskHubOperation, bool, error) {
@@ -28,14 +33,162 @@ func (s *cloudDSHHubTaskStore) PrepareTaskHubOperation(_ context.Context, value 
 		if existing.OwnerID != value.OwnerID || existing.TaskID != value.TaskID || existing.ToolName != value.ToolName ||
 			existing.TargetInstallationID != value.TargetInstallationID || existing.Action != value.Action ||
 			existing.TaskAuthorizationVersion != value.TaskAuthorizationVersion || existing.TargetGrantVersion != value.TargetGrantVersion ||
+			existing.TaskRevision != value.TaskRevision ||
 			!bytes.Equal(existing.RequestHash, value.RequestHash) {
 			return TaskHubOperation{}, false, domain.NewError(domain.CodeIdempotencyConflict, "task Hub operation changed")
+		}
+		if existing.Status == task.OperationUnknown && existing.Action == hub.ActionFileFetch {
+			if fetch, exists := s.fetches[value.Key]; exists && (fetch.Status == task.FileFetchQueued ||
+				fetch.Status == task.FileFetchTransferring || fetch.Status == task.FileFetchVerifying) {
+				existing.Status = task.OperationPrepared
+				existing.LeaseVersion = value.LeaseVersion
+				s.operations[value.Key] = existing
+			}
 		}
 		return existing, true, nil
 	}
 	value.RequestHash = append([]byte(nil), value.RequestHash...)
 	s.operations[value.Key] = value
 	return value, false, nil
+}
+
+func (s *cloudDSHHubTaskStore) CreateTaskFileFetch(_ context.Context, command TaskFileFetchCreate, _ string) (TaskFileFetch, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value := command.Fetch
+	if existing, ok := s.fetches[value.OperationKey]; ok {
+		if existing.OwnerID != value.OwnerID || existing.TaskID != value.TaskID || existing.SourceInstallationID != value.SourceInstallationID ||
+			existing.TargetGrantVersion != value.TargetGrantVersion || existing.TaskRevision != value.TaskRevision || existing.RelativePath != value.RelativePath {
+			return TaskFileFetch{}, false, domain.NewError(domain.CodeIdempotencyConflict, "Task file fetch changed")
+		}
+		return existing, true, nil
+	}
+	now := time.Now().UTC()
+	value.CreatedAt, value.UpdatedAt = now, now
+	value.ContentState = task.FileFetchContentNone
+	value.ParseStatus = task.FileFetchParsePending
+	if value.SourceDeviceName == "" {
+		value.SourceDeviceName = "Synthetic PC"
+	}
+	s.fetches[value.OperationKey] = value
+	return value, false, nil
+}
+
+func (s *cloudDSHHubTaskStore) GetTaskFileFetchByOperation(_ context.Context, ownerID, taskID, operationKey string) (TaskFileFetch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.fetches[operationKey]
+	if !ok || value.OwnerID != ownerID || value.TaskID != taskID {
+		return TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "Task file fetch not found")
+	}
+	return value, nil
+}
+
+func (s *cloudDSHHubTaskStore) DispatchTaskFileFetch(_ context.Context, operation TaskHubOperation, fetchID string, ticketHash []byte,
+	ticketExpiresAt *time.Time, targetOnline bool, _ string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.fetches[operation.Key]
+	storedOperation, operationOK := s.operations[operation.Key]
+	if !ok || value.ID != fetchID || !operationOK || storedOperation.Status != task.OperationPrepared {
+		return false, domain.NewError(domain.CodeConflict, "Task file fetch cannot be dispatched")
+	}
+	storedOperation.Status = task.OperationDispatched
+	s.operations[operation.Key] = storedOperation
+	if targetOnline {
+		s.ticketHashes[fetchID] = append([]byte(nil), ticketHash...)
+	} else {
+		value.Status, value.WaitingReason = task.FileFetchWaitingDevice, "device_offline"
+	}
+	value.UpdatedAt = time.Now().UTC()
+	s.fetches[operation.Key] = value
+	return true, nil
+}
+
+func (s *cloudDSHHubTaskStore) MarkTaskFileFetchWaiting(_ context.Context, operation TaskHubOperation, fetchID, reason string) (TaskFileFetch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.fetches[operation.Key]
+	if !ok || value.ID != fetchID || reason != "device_offline" {
+		return TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "Task file fetch not found")
+	}
+	value.Status, value.WaitingReason, value.UpdatedAt = task.FileFetchWaitingDevice, reason, time.Now().UTC()
+	s.fetches[operation.Key] = value
+	return value, nil
+}
+
+func (s *cloudDSHHubTaskStore) FailTaskFileFetch(_ context.Context, operation TaskHubOperation, fetchID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.fetches[operation.Key]
+	if !ok || value.ID != fetchID {
+		return domain.NewError(domain.CodeNotFound, "Task file fetch not found")
+	}
+	value.Status, value.WaitingReason, value.UpdatedAt = task.FileFetchFailed, "", time.Now().UTC()
+	s.fetches[operation.Key] = value
+	return nil
+}
+
+func (s *cloudDSHHubTaskStore) GetTaskFileFetch(_ context.Context, ownerID, taskID, fetchID string) (TaskFileFetch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, value := range s.fetches {
+		if value.ID == fetchID && value.OwnerID == ownerID && value.TaskID == taskID {
+			return value, nil
+		}
+	}
+	return TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "Task file fetch not found")
+}
+
+func (s *cloudDSHHubTaskStore) SetTaskFileFetchParseResult(_ context.Context, ownerID, taskID, fetchID string,
+	status task.FileFetchParseStatus, parseError string) (TaskFileFetch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, value := range s.fetches {
+		if value.ID != fetchID || value.OwnerID != ownerID || value.TaskID != taskID {
+			continue
+		}
+		if value.ParseStatus != task.FileFetchParsePending && (value.ParseStatus != status || value.ParseError != parseError) {
+			return TaskFileFetch{}, domain.NewError(domain.CodeConflict, "Task file fetch parse result is already final")
+		}
+		value.ParseStatus, value.ParseError = status, parseError
+		s.fetches[key] = value
+		return value, nil
+	}
+	return TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "Task file fetch not found")
+}
+
+func (s *cloudDSHHubTaskStore) OpenTaskFileFetchContent(_ context.Context, ownerID, taskID, fetchID string) (io.ReadCloser, TaskFileFetch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, value := range s.fetches {
+		if value.ID == fetchID && value.OwnerID == ownerID && value.TaskID == taskID {
+			content, ok := s.fileContents[fetchID]
+			if !ok {
+				return nil, TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "Task file fetch content not found")
+			}
+			return io.NopCloser(bytes.NewReader(content)), value, nil
+		}
+	}
+	return nil, TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "Task file fetch not found")
+}
+
+func (s *cloudDSHHubTaskStore) completeFileFetch(fetchID string, receipt hub.FileFetchReceipt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, value := range s.fetches {
+		if value.ID == fetchID {
+			value.Status, value.SourceVersion, value.SourceSHA256 = task.FileFetchCompleted, receipt.SourceVersion, receipt.SourceSHA256
+			value.SizeBytes, value.ContentID, value.ExpiresAt, value.UpdatedAt = receipt.SizeBytes, receipt.ContentID, &receipt.ExpiresAt, time.Now().UTC()
+			value.ContentState, value.MediaType = task.FileFetchContentRetained, s.mediaTypes[fetchID]
+			if value.MediaType == "" {
+				value.MediaType = "application/pdf"
+			}
+			s.fetches[key] = value
+			return nil
+		}
+	}
+	return domain.NewError(domain.CodeNotFound, "Task file fetch not found")
 }
 
 func (s *cloudDSHHubTaskStore) MarkTaskHubOperationDispatched(_ context.Context, value TaskHubOperation, _ string) error {
@@ -54,7 +207,8 @@ func (s *cloudDSHHubTaskStore) CompleteTaskHubOperation(_ context.Context, value
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	stored, ok := s.operations[value.Key]
-	if !ok || (stored.Status != task.OperationPrepared && stored.Status != task.OperationDispatched) ||
+	if !ok || (stored.Status != task.OperationPrepared && stored.Status != task.OperationDispatched &&
+		stored.Status != task.OperationUnknown) ||
 		(status != task.OperationSucceeded && status != task.OperationFailed) {
 		return domain.NewError(domain.CodeConflict, "task Hub operation is not completable")
 	}
@@ -170,7 +324,8 @@ func newCloudDSHHubBroker(t *testing.T, fixture *runtimeToolExecutorFixture, hub
 	value.Authorization.ExpiresAt = &expires
 	fixture.store.details.Task = value
 	baseStore := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
-	store := &cloudDSHHubTaskStore{cloudDSHBrokerTaskStore: baseStore, operations: make(map[string]TaskHubOperation)}
+	store := &cloudDSHHubTaskStore{cloudDSHBrokerTaskStore: baseStore, operations: make(map[string]TaskHubOperation),
+		fetches: make(map[string]TaskFileFetch), ticketHashes: make(map[string][]byte)}
 	fixture.executor.store = store
 	authorizer := &cloudDSHHubTaskAuthorizer{authorization: value.Authorization}
 	fixture.executor.authorizer = authorizer

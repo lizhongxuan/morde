@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -98,6 +99,7 @@ type TaskHubOperation struct {
 	Action                   string
 	TaskAuthorizationVersion int64
 	TargetGrantVersion       int64
+	TaskRevision             int64
 	LeaseVersion             int64
 	RequestHash              []byte
 	ResultHash               []byte
@@ -148,6 +150,7 @@ type HubTaskDevice struct {
 	ID                 string
 	Name               string
 	Platform           string
+	Online             bool
 	Actions            []string
 	TargetGrantVersion int64
 }
@@ -163,6 +166,7 @@ var hubTaskTools = []hubTaskTool{
 	{action: hub.ActionScreenshot, scope: identity.ScopeComputerObserve, base: "morde_hub_screenshot", params: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
 	{action: hub.ActionFiles, scope: identity.ScopeComputerObserve, base: "morde_hub_files", params: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","maxLength":1024}},"additionalProperties":false}`)},
 	{action: hub.ActionFileGet, scope: identity.ScopeComputerObserve, base: "morde_hub_file_get", params: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","minLength":1,"maxLength":1024},"max_bytes":{"type":"integer","minimum":1,"maximum":32768}},"required":["path","max_bytes"],"additionalProperties":false}`)},
+	{action: hub.ActionFileFetch, scope: identity.ScopeComputerObserve, base: "morde_hub_file_fetch", params: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","minLength":1,"maxLength":1024}},"required":["path"],"additionalProperties":false}`)},
 	{action: hub.ActionCommand, scope: identity.ScopeComputerOperate, base: "morde_hub_command", params: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","minLength":1,"maxLength":8192},"timeout_ms":{"type":"integer","minimum":1000,"maximum":300000}},"required":["command","timeout_ms"],"additionalProperties":false}`)},
 }
 
@@ -174,7 +178,8 @@ func (s *HubService) CallTaskAction(ctx context.Context, ownerID, targetID strin
 		if taskContext != nil || hub.ValidateCall(hub.Frame{Type: "call", ID: "task-info", To: targetID, Action: action, Args: args}) != nil {
 			return HubTaskCallResult{Error: "invalid_argument", Message: "task Hub info call is invalid"}
 		}
-	} else if taskContext == nil || hub.ValidateTaskContext(*taskContext) != nil || hub.ValidateTaskActionArgs(action, args) != nil {
+	} else if taskContext == nil || hub.ValidateTaskContext(*taskContext) != nil ||
+		hub.ValidateTaskActionArgs(action, args) != nil || !validTaskHubRevisionBinding(action, *taskContext, args) {
 		return HubTaskCallResult{Error: "invalid_argument", Message: "task Hub action is invalid"}
 	}
 
@@ -205,6 +210,9 @@ func (s *HubService) CallTaskAction(ctx context.Context, ownerID, targetID strin
 		taskFrom = map[string]any{
 			"task_id": taskContext.TaskID, "authorization_version": taskContext.AuthorizationVersion,
 			"target_grant_version": taskContext.TargetGrantVersion, "operation_id": taskContext.OperationID,
+		}
+		if taskContext.TaskRevision > 0 {
+			taskFrom["task_revision"] = taskContext.TaskRevision
 		}
 	}
 	if !hub.ValidCallID(callID) {
@@ -263,6 +271,15 @@ func (s *HubService) CallTaskAction(ctx context.Context, ownerID, targetID strin
 	}
 }
 
+func validTaskHubRevisionBinding(action string, taskContext hub.TaskContext, raw json.RawMessage) bool {
+	if action != hub.ActionFileFetch {
+		return taskContext.TaskRevision == 0
+	}
+	var args hub.FileFetchArgs
+	return taskContext.TaskRevision > 0 && json.Unmarshal(raw, &args) == nil &&
+		args.TaskRevision == taskContext.TaskRevision && args.FetchID == taskContext.OperationID
+}
+
 func (s *HubService) ListTaskDevices(ctx context.Context, ownerID, taskID string, authorizationVersion int64) ([]HubTaskDevice, error) {
 	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidTaskID(taskID) || authorizationVersion < 1 {
 		return nil, domain.InvalidArgument("task_hub_devices", "task Hub device query is invalid")
@@ -277,7 +294,8 @@ func (s *HubService) ListTaskDevices(ctx context.Context, ownerID, taskID string
 			!s.InstallationOnline(ownerID, installation.ID) {
 			continue
 		}
-		devices = append(devices, HubTaskDevice{ID: installation.ID, Name: installation.DisplayName, Platform: installation.Platform})
+		devices = append(devices, HubTaskDevice{ID: installation.ID, Name: installation.DisplayName, Platform: installation.Platform,
+			Online: true})
 		if len(devices) == HubMaxConnectionsPerAccount {
 			break
 		}
@@ -320,6 +338,39 @@ func (s *HubService) ListTaskDevices(ctx context.Context, ownerID, taskID string
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].ID < devices[j].ID })
 	return devices, nil
+}
+
+func (s *HubService) GetTaskDevice(ctx context.Context, ownerID, targetID string) (HubTaskDevice, error) {
+	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidClientInstallationID(targetID) {
+		return HubTaskDevice{}, domain.InvalidArgument("task_hub_device", "task Hub device query is invalid")
+	}
+	installation, err := s.store.GetClientInstallation(ctx, targetID)
+	if err != nil || installation.OwnerID != ownerID || installation.RevokedAt != nil || !installation.ExpiresAt.After(time.Now()) {
+		return HubTaskDevice{}, domain.NewError(domain.CodeNotFound, "Hub Task target installation is unavailable")
+	}
+	device := HubTaskDevice{ID: installation.ID, Name: installation.DisplayName, Platform: installation.Platform,
+		Online: s.InstallationOnline(ownerID, targetID)}
+	if !device.Online {
+		return device, nil
+	}
+	infoCtx, cancel := context.WithTimeout(ctx, hubTaskInfoTimeout)
+	defer cancel()
+	result := s.CallTaskAction(infoCtx, ownerID, targetID, nil, hub.ActionInfo, json.RawMessage(`{}`))
+	if !result.OK {
+		return HubTaskDevice{}, domain.NewError(domain.CodeNotFound, "Hub Task target installation is unavailable")
+	}
+	var info struct {
+		Actions            []string `json:"actions"`
+		TargetGrantVersion *int64   `json:"target_grant_version"`
+	}
+	if json.Unmarshal(result.Body, &info) != nil {
+		return HubTaskDevice{}, domain.NewError(domain.CodeInvalidState, "Hub Task target authorization response is invalid")
+	}
+	device.Actions = info.Actions
+	if info.TargetGrantVersion != nil {
+		device.TargetGrantVersion = *info.TargetGrantVersion
+	}
+	return device, nil
 }
 
 func (b *CloudDSHToolBroker) hubTaskDefinitions(ctx context.Context, current task.Task) ([]AgentToolDefinition, error) {
@@ -381,7 +432,16 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Task authorization does not allow this Hub action")
 	}
 	args, err := hubTaskActionArguments(call.Arguments)
-	if err != nil || hub.ValidateTaskActionArgs(tool.action, args) != nil {
+	if err != nil {
+		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Task Hub action arguments are invalid")
+	}
+	var fileFetchPath string
+	if tool.action == hub.ActionFileFetch {
+		fileFetchPath, err = hub.ValidateFileFetchToolArgs(args)
+	} else {
+		err = hub.ValidateTaskActionArgs(tool.action, args)
+	}
+	if err != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Task Hub action arguments are invalid")
 	}
 	var writeRequest hub.WorkspaceWriteArgs
@@ -394,6 +454,14 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 			return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "Task Workspace write receipt storage is unavailable")
 		}
 	}
+	var taskRevision int64
+	if tool.action == hub.ActionFileFetch {
+		if current.Status != task.StatusRunning || current.CurrentRevision == nil || current.DesiredRevision == nil ||
+			*current.CurrentRevision < 1 || *current.CurrentRevision != *current.DesiredRevision {
+			return AgentToolResult{}, domain.NewError(domain.CodeConflict, "file.fetch requires the current running Task revision")
+		}
+		taskRevision = *current.CurrentRevision
+	}
 	requestHash, err := hubTaskOperationHash(call.Name, targetID, grantVersion, args)
 	if err != nil {
 		return AgentToolResult{}, err
@@ -403,7 +471,7 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		OwnerID: current.OwnerID, TaskID: current.ID, Key: operationKey, ToolName: call.Name,
 		TargetInstallationID: targetID, Action: tool.action,
 		TaskAuthorizationVersion: current.Authorization.Version, TargetGrantVersion: grantVersion,
-		LeaseVersion: current.Lease.Version, RequestHash: requestHash[:], Status: task.OperationPrepared,
+		TaskRevision: taskRevision, LeaseVersion: current.Lease.Version, RequestHash: requestHash[:], Status: task.OperationPrepared,
 	}
 	if tool.action == hub.ActionFilePut {
 		operation.WorkspaceID, operation.WorkspacePath = writeRequest.WorkspaceID, writeRequest.Path
@@ -432,7 +500,14 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 			break
 		}
 	}
-	if target == nil || target.TargetGrantVersion != grantVersion || !containsAction(target.Actions, tool.action) {
+	if target == nil && tool.action == hub.ActionFileFetch {
+		candidate, targetErr := b.hub.GetTaskDevice(ctx, current.OwnerID, targetID)
+		if targetErr == nil {
+			target = &candidate
+		}
+	}
+	if target == nil || (target.Online && (target.TargetGrantVersion != grantVersion || !containsAction(target.Actions, tool.action))) ||
+		(!target.Online && tool.action != hub.ActionFileFetch) {
 		return AgentToolResult{Status: AgentToolNeedsUser, WaitingReason: "hub_target_authorization_changed", Output: "The target device or its action authorization changed. Review the target and try again."}, nil
 	}
 	operation, replayed, err := operationStore.PrepareTaskHubOperation(ctx, operation, current.Lease.Owner)
@@ -447,12 +522,15 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 	if err := b.authorizeServerTaskScope(ctx, current, tool.scope); err != nil {
 		return b.failHubTaskBeforeDispatch(ctx, current, call, operation, "Task authorization changed before the Hub action was dispatched.")
 	}
+	if tool.action == hub.ActionFileFetch {
+		return b.executeTaskFileFetch(ctx, current, call, operation, target, fileFetchPath)
+	}
 	if err := operationStore.MarkTaskHubOperationDispatched(ctx, operation, current.Lease.Owner); err != nil {
 		return AgentToolResult{}, err
 	}
 	taskContext := &hub.TaskContext{
 		TaskID: current.ID, AuthorizationVersion: current.Authorization.Version,
-		TargetGrantVersion: grantVersion, OperationID: operationKey,
+		TargetGrantVersion: grantVersion, OperationID: operationKey, TaskRevision: taskRevision,
 	}
 	callCtx := ctx
 	cancel := func() {}
@@ -515,6 +593,203 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 	return AgentToolResult{Status: agentStatus, ExternalID: operationKey, Output: output, Images: images}, nil
 }
 
+func (b *CloudDSHToolBroker) executeTaskFileFetch(ctx context.Context, current task.Task, call ModelToolCall,
+	operation TaskHubOperation, target *HubTaskDevice, relativePath string) (AgentToolResult, error) {
+	fetchStore, ok := b.store.(TaskFileFetchStore)
+	if !ok || fetchStore == nil {
+		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "Task file fetch storage is unavailable")
+	}
+	fetchID, err := domain.NewOperationID()
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	fetch := TaskFileFetch{
+		ID: fetchID, OwnerID: current.OwnerID, TaskID: current.ID, OperationKey: operation.Key,
+		SourceInstallationID: operation.TargetInstallationID, TargetGrantVersion: operation.TargetGrantVersion,
+		TaskAuthorizationVersion: operation.TaskAuthorizationVersion, TaskRevision: operation.TaskRevision,
+		RelativePath: relativePath, Status: task.FileFetchQueued,
+	}
+	fetch, replayedFetch, err := fetchStore.CreateTaskFileFetch(ctx, TaskFileFetchCreate{Operation: operation, Fetch: fetch}, current.Lease.Owner)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if !validTaskFileFetchProjection(fetch) {
+		return AgentToolResult{}, domain.NewError(domain.CodeInternal, "Task file fetch receipt is invalid")
+	}
+	if replayedFetch && !target.Online && (fetch.Status == task.FileFetchTransferring || fetch.Status == task.FileFetchVerifying) {
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "The PC is offline while a prior file transfer is still staged; the same fetch will resume when the device is available.")
+	}
+	var ticket string
+	var ticketHash []byte
+	var expiresAt *time.Time
+	if target.Online {
+		randomToken := make([]byte, 32)
+		if _, err := rand.Read(randomToken); err != nil {
+			return AgentToolResult{}, fmt.Errorf("generate PC file fetch ticket: %w", err)
+		}
+		ticket = base64.RawURLEncoding.EncodeToString(randomToken)
+		hash := sha256.Sum256([]byte(ticket))
+		ticketHash = hash[:]
+		expires := time.Now().UTC().Add(TaskFileFetchTicketLifetime)
+		expiresAt = &expires
+	}
+	dispatched, err := fetchStore.DispatchTaskFileFetch(ctx, operation, fetch.ID, ticketHash, expiresAt, target.Online, current.Lease.Owner)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if !dispatched {
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "A concurrent file fetch attempt already owns this Task operation.")
+	}
+	if !target.Online {
+		waiting, err := fetchStore.GetTaskFileFetch(ctx, current.OwnerID, current.ID, fetch.ID)
+		if err != nil || waiting.Status != task.FileFetchWaitingDevice || waiting.WaitingReason != "device_offline" {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "offline Task file fetch was not durably recorded")
+		}
+		return b.finishTaskFileFetch(ctx, current, call, operation, waiting, task.OperationSucceeded,
+			map[string]any{"fetch_id": waiting.ID, "status": waiting.Status})
+	}
+	if err := b.authorizeServerTaskScope(ctx, current, identity.ScopeComputerObserve); err != nil {
+		if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "Task authorization changed before the PC file request was dispatched.")
+	}
+	args, err := json.Marshal(hub.FileFetchArgs{
+		FetchID: fetch.ID, Path: relativePath, TaskRevision: operation.TaskRevision,
+		Ticket: ticket, TicketExpiresAt: *expiresAt,
+	})
+	if err != nil {
+		return AgentToolResult{}, fmt.Errorf("encode Task file fetch Hub action: %w", err)
+	}
+	taskContext := &hub.TaskContext{
+		TaskID: current.ID, AuthorizationVersion: current.Authorization.Version, TargetGrantVersion: operation.TargetGrantVersion,
+		OperationID: fetch.ID, TaskRevision: operation.TaskRevision,
+	}
+	result := b.hub.CallTaskAction(ctx, current.OwnerID, operation.TargetInstallationID, taskContext, hub.ActionFileFetch, args)
+	if result.Unknown {
+		if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "The PC file request outcome is unknown; reconcile its fetch record before retrying.")
+	}
+	if err := b.authorizeServerTaskScope(ctx, current, identity.ScopeComputerObserve); err != nil {
+		if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "Task authorization changed while the PC file request was in flight.")
+	}
+	if !result.OK {
+		if result.Error == "device_offline" {
+			waiting, err := fetchStore.MarkTaskFileFetchWaiting(ctx, operation, fetch.ID, "device_offline")
+			if err != nil {
+				return AgentToolResult{}, err
+			}
+			return b.finishTaskFileFetch(ctx, current, call, operation, waiting, task.OperationSucceeded,
+				map[string]any{"fetch_id": waiting.ID, "status": waiting.Status, "waiting_reason": waiting.WaitingReason})
+		}
+		if err := fetchStore.FailTaskFileFetch(ctx, operation, fetch.ID); err != nil {
+			return AgentToolResult{}, err
+		}
+		failed, err := fetchStore.GetTaskFileFetch(ctx, current.OwnerID, current.ID, fetch.ID)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.finishTaskFileFetch(ctx, current, call, operation, failed, task.OperationFailed,
+			map[string]any{"fetch_id": failed.ID, "status": failed.Status, "error": result.Error})
+	}
+	ok = true
+	if err := hub.ValidateActionResult(hub.ActionFileFetch, hub.Frame{Type: "result", ID: "task-result", OK: &ok, Body: result.Body}); err != nil {
+		if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "The PC file receipt did not match the bounded K4 contract.")
+	}
+	var receipt hub.FileFetchReceipt
+	if err := json.Unmarshal(result.Body, &receipt); err != nil || receipt.FetchID != fetch.ID || receipt.TaskRevision != operation.TaskRevision ||
+		receipt.TargetGrantVersion != operation.TargetGrantVersion {
+		if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "The PC file receipt did not match this Task revision or target authorization.")
+	}
+	completed, err := fetchStore.GetTaskFileFetch(ctx, current.OwnerID, current.ID, fetch.ID)
+	if err != nil || completed.Status != task.FileFetchCompleted || completed.SourceVersion != receipt.SourceVersion ||
+		completed.SourceSHA256 != receipt.SourceSHA256 || completed.SizeBytes != receipt.SizeBytes || completed.ContentID != receipt.ContentID ||
+		completed.ExpiresAt == nil || !completed.ExpiresAt.Equal(receipt.ExpiresAt) {
+		if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(ctx, current, call, operation.Key, "The PC completion receipt is not backed by a committed server file copy.")
+	}
+	return b.finishTaskFileFetch(ctx, current, call, operation, completed, task.OperationSucceeded,
+		map[string]any{"fetch_id": completed.ID, "status": completed.Status, "source_sha256": completed.SourceSHA256,
+			"size_bytes": completed.SizeBytes, "content_id": completed.ContentID, "expires_at": completed.ExpiresAt})
+}
+
+func (b *CloudDSHToolBroker) finishTaskFileFetch(ctx context.Context, current task.Task, call ModelToolCall,
+	operation TaskHubOperation, fetch TaskFileFetch, operationStatus task.OperationStatus, safeOutput any) (AgentToolResult, error) {
+	modelContent := taskFileFetchModelContent{Status: fetch.ParseStatus, ParseError: fetch.ParseError}
+	if operationStatus == task.OperationSucceeded && fetch.Status == task.FileFetchCompleted {
+		parsed, err := b.taskFileFetchContentForModel(ctx, fetch)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		modelContent = parsed
+		if metadata, ok := safeOutput.(map[string]any); ok {
+			metadata["parse_status"] = parsed.Status
+			metadata["parse_error"] = nullableTaskFileFetchParseError(parsed.ParseError)
+		}
+	}
+	outputBytes, err := json.Marshal(safeOutput)
+	if err != nil {
+		return AgentToolResult{}, fmt.Errorf("encode safe Task file fetch result: %w", err)
+	}
+	operationStore := b.store.(TaskHubOperationStore)
+	resultHash := sha256.Sum256(outputBytes)
+	if err := operationStore.CompleteTaskHubOperation(ctx, operation, current.Lease.Owner, operationStatus, resultHash[:]); err != nil {
+		return AgentToolResult{}, err
+	}
+	details, err := b.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	stepStatus := task.StepSucceeded
+	summary := "The PC file fetch completed; its transfer and safe content delivery states were recorded."
+	agentStatus := AgentToolSucceeded
+	if operationStatus == task.OperationFailed {
+		stepStatus, agentStatus = task.StepFailed, AgentToolFailed
+		summary = "The PC refused or failed the file fetch; the source file was not published."
+	} else if fetch.Status == task.FileFetchCompleted && modelContent.Status != task.FileFetchParseExtracted {
+		summary = "The PC file transfer completed, but the file was not extracted for model input."
+	}
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", stepStatus, "Request PC file fetch", summary)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if err := b.commitProgress(ctx, current, step, current.Usage, task.StatusRunning, "", "task.step", map[string]any{
+		"tool": call.Name, "operation_key": operation.Key, "operation_status": operationStatus,
+		"fetch_id": fetch.ID, "fetch_status": fetch.Status, "target_installation_id": fetch.SourceInstallationID,
+		"target_grant_version": fetch.TargetGrantVersion, "task_revision": fetch.TaskRevision,
+		"content_state": fetch.ContentState, "parse_status": modelContent.Status,
+		"parse_error": nullableTaskFileFetchParseError(modelContent.ParseError),
+	}); err != nil {
+		return AgentToolResult{}, err
+	}
+	output := string(outputBytes)
+	var images []ModelImage
+	if modelContent.Output != "" {
+		output, images = modelContent.Output, modelContent.Images
+	}
+	return AgentToolResult{Status: agentStatus, ExternalID: operation.Key, Output: output, Images: images}, nil
+}
+
+func nullableTaskFileFetchParseError(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
 func (b *CloudDSHToolBroker) recordHubTaskFilePutReceipt(ctx context.Context, current task.Task, call ModelToolCall,
 	operationStore TaskHubOperationStore, operation TaskHubOperation, request hub.WorkspaceWriteArgs,
 	taskContext hub.TaskContext, result HubTaskCallResult) (AgentToolResult, error) {
@@ -554,6 +829,50 @@ func (b *CloudDSHToolBroker) reconcileHubTaskOperation(ctx context.Context, curr
 	if !sameTaskHubOperation(operation, expected) {
 		result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The stored Hub operation does not match this exact Task action.")
 		return result, true, err
+	}
+	if expected.Action == hub.ActionFileFetch && (operation.Status == task.OperationPrepared ||
+		operation.Status == task.OperationDispatched || operation.Status == task.OperationUnknown) {
+		fetchStore, ok := b.store.(TaskFileFetchStore)
+		if !ok || fetchStore == nil {
+			return AgentToolResult{}, true, domain.NewError(domain.CodeUnsupported, "Task file fetch storage is unavailable")
+		}
+		fetch, fetchErr := fetchStore.GetTaskFileFetchByOperation(ctx, current.OwnerID, current.ID, expected.Key)
+		if fetchErr != nil {
+			if domain.CodeOf(fetchErr) != domain.CodeNotFound {
+				return AgentToolResult{}, true, fetchErr
+			}
+			if operation.Status == task.OperationPrepared {
+				return AgentToolResult{}, false, nil
+			}
+			result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The file.fetch operation has no durable fetch record and will not create a second transfer.")
+			return result, true, err
+		}
+		if !validTaskFileFetchProjection(fetch) || fetch.OperationKey != expected.Key || fetch.TaskRevision != expected.TaskRevision ||
+			fetch.TargetGrantVersion != expected.TargetGrantVersion || fetch.SourceInstallationID != expected.TargetInstallationID {
+			result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The stored file.fetch record does not match this Task action.")
+			return result, true, err
+		}
+		switch fetch.Status {
+		case task.FileFetchCompleted:
+			result, err := b.finishTaskFileFetch(ctx, current, call, operation, fetch, task.OperationSucceeded, taskFileFetchSafeOutput(fetch))
+			return result, true, err
+		case task.FileFetchWaitingDevice:
+			result, err := b.finishTaskFileFetch(ctx, current, call, operation, fetch, task.OperationSucceeded, taskFileFetchSafeOutput(fetch))
+			return result, true, err
+		case task.FileFetchQueued, task.FileFetchTransferring, task.FileFetchVerifying:
+			if operation.Status == task.OperationDispatched {
+				if err := markTaskHubOperationUnknown(ctx, b.store.(TaskHubOperationStore), operation, current.Lease.Owner); err != nil {
+					return AgentToolResult{}, true, err
+				}
+			}
+			return AgentToolResult{}, false, nil
+		case task.FileFetchFailed, task.FileFetchCancelled, task.FileFetchCancelling:
+			result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The prior file.fetch did not commit a retrievable copy; inspect its status before starting a new operation.")
+			return result, true, err
+		default:
+			result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The file.fetch record has an unsupported recovery state.")
+			return result, true, err
+		}
 	}
 	if expected.Action == hub.ActionFilePut {
 		switch operation.SyncStage {
@@ -608,6 +927,23 @@ func (b *CloudDSHToolBroker) reconcileHubTaskOperation(ctx context.Context, curr
 		result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The prior Hub operation has an invalid state.")
 		return result, true, err
 	}
+}
+
+func taskFileFetchSafeOutput(fetch TaskFileFetch) map[string]any {
+	output := map[string]any{"fetch_id": fetch.ID, "status": fetch.Status}
+	if fetch.WaitingReason != "" {
+		output["waiting_reason"] = fetch.WaitingReason
+	}
+	if fetch.Status == task.FileFetchCompleted {
+		output["source_sha256"] = fetch.SourceSHA256
+		output["size_bytes"] = fetch.SizeBytes
+		output["content_id"] = fetch.ContentID
+		output["expires_at"] = fetch.ExpiresAt
+		output["content_state"] = fetch.ContentState
+		output["parse_status"] = fetch.ParseStatus
+		output["parse_error"] = nullableTaskFileFetchParseError(fetch.ParseError)
+	}
+	return output
 }
 
 func markTaskHubOperationUnknown(ctx context.Context, store TaskHubOperationStore, operation TaskHubOperation, leaseOwner string) error {
@@ -727,7 +1063,7 @@ func sameTaskHubOperation(actual, expected TaskHubOperation) bool {
 	return actual.OwnerID == expected.OwnerID && actual.TaskID == expected.TaskID && actual.Key == expected.Key &&
 		actual.ToolName == expected.ToolName && actual.TargetInstallationID == expected.TargetInstallationID &&
 		actual.Action == expected.Action && actual.TaskAuthorizationVersion == expected.TaskAuthorizationVersion &&
-		actual.TargetGrantVersion == expected.TargetGrantVersion &&
+		actual.TargetGrantVersion == expected.TargetGrantVersion && actual.TaskRevision == expected.TaskRevision &&
 		bytes.Equal(actual.RequestHash, expected.RequestHash) && actual.WorkspaceID == expected.WorkspaceID &&
 		actual.WorkspacePath == expected.WorkspacePath && actual.WorkspaceSizeBytes == expected.WorkspaceSizeBytes &&
 		actual.WorkspaceSHA256 == expected.WorkspaceSHA256 && actual.SourceCheckpointRevision == expected.SourceCheckpointRevision

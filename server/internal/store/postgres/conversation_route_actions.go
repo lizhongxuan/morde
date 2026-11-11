@@ -285,7 +285,8 @@ SELECT COALESCE(bool_or(cycle OR (depth=128 AND previous_id IS NOT NULL)),false)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, err
 	}
-	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.role,m.content FROM conversation_messages m
+	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,COALESCE(m.task_id,''),COALESCE(m.output_task_revision,0),
+COALESCE(m.output_result_event_sequence,0),m.role,m.content FROM conversation_messages m
 LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
 WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind<>'task_result_review'
  AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
@@ -319,7 +320,7 @@ ORDER BY m.sequence DESC LIMIT 8`, claim.Message.OwnerID, claim.Message.Conversa
 	for rows.Next() {
 		var item app.ConversationRouteHistory
 		var role string
-		if err := rows.Scan(&item.MessageID, &item.Sequence, &role, &item.Content); err != nil {
+		if err := rows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role, &item.Content); err != nil {
 			rows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("scan route history: %w", err)
 		}
@@ -337,10 +338,11 @@ ORDER BY m.sequence DESC LIMIT 8`, claim.Message.OwnerID, claim.Message.Conversa
 	if value.PreviousSequence > claim.Message.Sequence && !value.PreviousCycle {
 		var item app.ConversationRouteHistory
 		var role string
-		err := tx.QueryRow(ctx, `SELECT id,sequence,role,content FROM conversation_messages
+		err := tx.QueryRow(ctx, `SELECT id,sequence,COALESCE(task_id,''),COALESCE(output_task_revision,0),
+COALESCE(output_result_event_sequence,0),role,content FROM conversation_messages
 WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user'`,
 			value.PreviousMessageID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).
-			Scan(&item.MessageID, &item.Sequence, &role, &item.Content)
+			Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role, &item.Content)
 		if err == nil {
 			item.Role = conversation.Role(role)
 			value.Context.History = append(value.Context.History, item)
@@ -383,7 +385,80 @@ ORDER BY id LIMIT 65`
 	if len(value.Context.Candidates) > 64 {
 		return app.ConversationRouteSnapshot{}, domain.NewError(domain.CodeInvalidState, "too many active tasks to route safely")
 	}
+	if value.Context.ResultReview == nil {
+		stored, err := loadConversationRouteSummaryInTx(ctx, tx, claim, value.PreviousMessageID, descendants)
+		if err != nil {
+			return app.ConversationRouteSnapshot{}, err
+		}
+		if stored != nil {
+			value.Summary = stored
+			value.Context.SummaryVersion = stored.Version
+			value.Context.SummarySHA256 = append([]byte(nil), stored.SummarySHA256...)
+			value.Context.SummarySourcesSHA256 = append([]byte(nil), stored.SourcesSHA256...)
+		}
+	}
 	return value, nil
+}
+
+func loadConversationRouteSummaryInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
+	previousMessageID string, descendants []string) (*app.StoredConversationSummary, error) {
+	identity, err := lockConversationSummaryScope(ctx, tx, claim)
+	if err != nil {
+		return nil, err
+	}
+	head, err := ensureConversationSummaryHead(ctx, tx, identity, false)
+	if err != nil {
+		return nil, err
+	}
+	if head.Version < 1 || head.Identity.AuthorizationVersion != identity.AuthorizationVersion || head.Identity.ScopeVersion != identity.ScopeVersion {
+		return nil, nil
+	}
+	// shortcut: only the 32 newest valid versions are searched; raise the bound if causal gaps can span more compactions.
+	rows, err := tx.Query(ctx, `SELECT version,summary_digest FROM conversation_summary_versions
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4
+ AND scope_kind=$5 AND scope_id=$6 AND authorization_version=$7 AND scope_version=$8 AND state='valid'
+ AND version<=$9 ORDER BY version DESC LIMIT 32`, identity.ServiceInstanceID, identity.OwnerID, identity.ActorID,
+		identity.ConversationID, identity.ScopeKind, identity.ScopeID, identity.AuthorizationVersion, identity.ScopeVersion, head.Version)
+	if err != nil {
+		return nil, fmt.Errorf("read candidate conversation route summaries: %w", err)
+	}
+	type summaryCandidate struct {
+		version int64
+		digest  []byte
+	}
+	var candidates []summaryCandidate
+	for rows.Next() {
+		var candidate summaryCandidate
+		if err := rows.Scan(&candidate.version, &candidate.digest); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan candidate conversation route summary: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate candidate conversation route summaries: %w", err)
+	}
+	rows.Close()
+	for _, value := range candidates {
+		candidate := head
+		candidate.Version, candidate.Digest = value.version, value.digest
+		stored, err := readConversationSummaryForInputPage(ctx, tx, candidate)
+		if err != nil {
+			if domain.CodeOf(err) != "" {
+				continue
+			}
+			return nil, err
+		}
+		if err := validateConversationSummarySources(ctx, tx, claim, identity, previousMessageID, descendants, stored.Sources); err != nil {
+			if domain.CodeOf(err) != "" {
+				continue
+			}
+			return nil, err
+		}
+		return &stored, nil
+	}
+	return nil, nil
 }
 
 func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
@@ -470,7 +545,7 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		}
 		switch decision.Action {
 		case app.ConversationRouteNew:
-			return createConversationRouteTask(ctx, tx, claim, modelID, decision.DependencyTaskIDs, current.Context.Candidates)
+			return createConversationRouteTask(ctx, tx, claim, modelID, decision.DependencyTaskIDs, current.Context.Candidates, current.Summary)
 		case app.ConversationRouteReply:
 			if current.Context.ResultReview != nil {
 				return publishConversationResultReviewInTx(ctx, tx, claim, decision.Reply)
@@ -558,7 +633,7 @@ WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, candidate.
 }
 
 func createConversationRouteTask(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, modelID string,
-	dependencyTaskIDs []string, candidates []app.ConversationRouteCandidate) error {
+	dependencyTaskIDs []string, candidates []app.ConversationRouteCandidate, storedSummary *app.StoredConversationSummary) error {
 	if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
 		return err
 	}
@@ -629,14 +704,19 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 		}
 		prior = kept
 	}
-	contextValue := buildTaskConversationContext(value.OwnerID, value.ProjectID, value.InitiatorID, value.ConversationID, through, prior)
+	var summary *task.ConversationContextSummary
+	if storedSummary != nil {
+		summary = taskConversationSummaryReference(*storedSummary)
+		prior = taskConversationContextWithoutSummarySources(prior, taskConversationSummarySources(storedSummary.Sources))
+	}
+	contextValue := buildTaskConversationContext(value.OwnerID, value.ProjectID, value.InitiatorID, value.ConversationID, through, prior, summary)
 	ids := make([]string, 0, len(contextValue.Messages))
 	for _, message := range contextValue.Messages {
 		ids = append(ids, message.ID)
 	}
 	manifest := taskConversationContextManifest{OwnerID: value.OwnerID, ProjectID: value.ProjectID, InitiatorID: value.InitiatorID,
 		ConversationID: value.ConversationID, Scope: contextValue.Scope, ThroughSequence: through,
-		MessageCount: len(ids), MessageIDs: ids, DigestSHA256: hex.EncodeToString(contextValue.Digest)}
+		MessageCount: len(ids), MessageIDs: ids, DigestSHA256: hex.EncodeToString(contextValue.Digest), Summary: contextValue.Summary}
 	payload, err := attachTaskConversationContextManifest([]byte(`{"status":"queued"}`), manifest)
 	if err != nil {
 		return err

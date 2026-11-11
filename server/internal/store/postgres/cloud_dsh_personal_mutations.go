@@ -97,7 +97,7 @@ WHERE p.service_instance_id=$1::uuid AND p.owner_id=$2
 			return domain.NewError(domain.CodeForbidden, "personal memory is disabled")
 		}
 	}
-	if _, err := applyPersonalMutationInTx(ctx, tx, principal, commit.Mutation, ""); err != nil {
+	if _, err := applyPersonalMutationInTx(ctx, tx, principal, commit.Mutation, "", current.ID); err != nil {
 		return err
 	}
 	return nil

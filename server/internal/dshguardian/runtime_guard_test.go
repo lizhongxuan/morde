@@ -678,12 +678,51 @@ func TestTaskProcessStopFailureRetainsLeaseUntilRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskProcesses.proof = taskProof
+	now = taskGuard.ExpiresAt.Add(time.Nanosecond)
 	restarted := newService(reopened, docker, combinedFakeProcessInspector{processes, taskProcesses}, func() time.Time { return now })
 	attestation, err := restarted.RecoverTaskProcessStopped(context.Background(), runtimeGuard.Fence, taskGuard.TaskFence, taskGuard.NonceSHA256)
 	if err != nil || !attestation.Destroyed || taskProcesses.killCalls != 1 || !docker.exists {
 		t.Fatalf("Task recovery did not independently prove its cgroup stopped: proof=%+v err=%v task=%+v docker=%+v", attestation, err, taskProcesses, docker)
 	}
 	verifyTaskAttestation(t, attestation)
+}
+
+func TestRecoverTaskProcessStoppedRejectsUnexpiredGuardianLease(t *testing.T) {
+	now := time.Now().UTC()
+	runtimeGuard := testAccountRuntimeGuard(now)
+	taskGuard := testTaskProcessGuard(runtimeGuard, now)
+	store, err := openLeaseStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeProof := processProof{PID: 321, StartTimeTick: 88, CgroupPath: "/system.slice/docker-" + runtimeGuard.ContainerID + ".scope"}
+	taskProof := taskProcessProof{ContainerPID: taskGuard.ContainerPID, HostPID: 654, StartTimeTick: 1001,
+		CgroupPath: taskCgroupPath(runtimeProof.CgroupPath, taskProcessKey(taskGuard)), NamespaceInode: 77}
+	processes := &fakeProcessInspector{proof: runtimeProof}
+	taskProcesses := &fakeTaskProcessInspector{proof: taskProof}
+	docker := newFakeAccountRuntimeDocker(runtimeGuard, false, 0)
+	service := newService(store, docker, combinedFakeProcessInspector{processes, taskProcesses}, func() time.Time { return now })
+	if err := service.ArmAccountRuntime(context.Background(), runtimeGuard); err != nil {
+		t.Fatal(err)
+	}
+	docker.setRunning(runtimeProof.PID)
+	if err := service.StartedAccountRuntime(context.Background(), runtimeGuard); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ArmTaskProcess(context.Background(), taskGuard); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.StartedTaskProcess(context.Background(), taskGuard); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RecoverTaskProcessStopped(context.Background(), runtimeGuard.Fence, taskGuard.TaskFence, taskGuard.NonceSHA256); err == nil {
+		t.Fatal("Guardian recovered a Task process before its lease expired")
+	}
+	value, found := store.getTask(taskProcessKey(taskGuard))
+	if !found || value.Destroyed || taskProcesses.killCalls != 0 || !docker.exists {
+		t.Fatalf("unexpired Task recovery affected a process or shared Runtime: lease=%+v found=%t task=%+v docker=%+v",
+			value, found, taskProcesses, docker)
+	}
 }
 
 func TestAccountAndTaskLeaseRenewalRequireUnchangedHostIdentity(t *testing.T) {

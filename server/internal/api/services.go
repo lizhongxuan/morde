@@ -46,6 +46,19 @@ type TaskMediaService interface {
 	GenerationReady() bool
 }
 
+// TaskFileFetchEndpointService contains the ticket-only PC data plane and the
+// owner Portal Session lifecycle endpoints for one Task-bound file fetch.
+type TaskFileFetchEndpointService interface {
+	GetTaskFileFetch(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
+	ListTaskFileFetches(context.Context, identity.Principal, string) ([]app.TaskFileFetch, error)
+	ManifestTaskFileFetch(context.Context, string, string, string, app.TaskFileFetchManifestRequest) (app.TaskFileFetchManifestReceipt, error)
+	PutTaskFileFetchChunk(context.Context, string, string, string, int32, string, io.Reader) (app.TaskFileFetchChunkReceipt, error)
+	CommitTaskFileFetch(context.Context, string, string, string, app.TaskFileFetchCommitRequest) (app.TaskFileFetchCommitReceipt, error)
+	CancelTaskFileFetch(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
+	OpenTaskFileFetchContent(context.Context, identity.Principal, string, string) (app.TaskFileFetchContent, error)
+	DeleteTaskFileFetchContent(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
+}
+
 type WorkspaceSyncDeviceService interface {
 	CreateChallenge(context.Context, identity.Principal, string, string, []byte) (app.WorkspaceSyncDeviceChallengeResult, error)
 	Register(context.Context, identity.Principal, string, string, string, []byte) (app.WorkspaceSyncDeviceRegistration, error)

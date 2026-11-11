@@ -51,6 +51,30 @@ WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND status='prepared' RETU
 					return fmt.Errorf("adopt prepared Hub Task operation lease: %w", err)
 				}
 			}
+			if stored.Status == task.OperationUnknown && stored.Action == hub.ActionFileFetch {
+				var fetchStatus string
+				err := tx.QueryRow(ctx, `SELECT status FROM task_file_fetches
+WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 FOR UPDATE`, value.OwnerID, value.TaskID, value.Key).Scan(&fetchStatus)
+				if errors.Is(err, pgx.ErrNoRows) {
+					return domain.NewError(domain.CodeConflict, "unknown file.fetch operation has no durable fetch record")
+				}
+				if err != nil {
+					return fmt.Errorf("lock file.fetch record for safe retry: %w", err)
+				}
+				if fetchStatus != string(task.FileFetchQueued) && fetchStatus != string(task.FileFetchTransferring) && fetchStatus != string(task.FileFetchVerifying) {
+					result, replayed = stored, true
+					return nil
+				}
+				if err := tx.QueryRow(ctx, `UPDATE task_hub_operations SET status='prepared',lease_version=$4,updated_at=clock_timestamp()
+WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND action='file.fetch' AND status='unknown'
+RETURNING status,lease_version`, value.OwnerID, value.TaskID, value.Key, value.LeaseVersion).
+					Scan(&stored.Status, &stored.LeaseVersion); err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						return domain.NewError(domain.CodeConflict, "unknown file.fetch operation changed before safe retry")
+					}
+					return fmt.Errorf("prepare safe file.fetch retry: %w", err)
+				}
+			}
 			result, replayed = stored, true
 			return nil
 		}
@@ -59,12 +83,12 @@ WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND status='prepared' RETU
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO task_hub_operations (
 task_id, owner_id, operation_key, tool_name, target_installation_id, action,
-task_authorization_version, target_grant_version, lease_version, request_hash,
+task_authorization_version, target_grant_version, task_revision, lease_version, request_hash,
 workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision, sync_stage, status
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'prepared')
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'prepared')
 ON CONFLICT (owner_id, task_id, operation_key) DO NOTHING`,
 			value.TaskID, value.OwnerID, value.Key, value.ToolName, value.TargetInstallationID, value.Action,
-			value.TaskAuthorizationVersion, value.TargetGrantVersion, value.LeaseVersion, value.RequestHash,
+			value.TaskAuthorizationVersion, value.TargetGrantVersion, value.TaskRevision, value.LeaseVersion, value.RequestHash,
 			nullableString(value.WorkspaceID), nullableString(value.WorkspacePath), nullableInt64(value.Action == hub.ActionFilePut, value.WorkspaceSizeBytes),
 			nullableString(value.WorkspaceSHA256), nullableInt64(value.Action == hub.ActionFilePut, value.SourceCheckpointRevision), value.SyncStage)
 		if err != nil {
@@ -127,6 +151,9 @@ func (s *Store) CompleteTaskHubOperation(ctx context.Context, value app.TaskHubO
 	if value.Action == hub.ActionFilePut && status == task.OperationSucceeded {
 		return domain.NewError(domain.CodeConflict, "file.put requires a verified Workspace sync commit")
 	}
+	if value.Action == hub.ActionFileFetch && status == task.OperationSucceeded {
+		return s.completeTaskFileFetchHubOperation(ctx, value, status, resultHash)
+	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
 		row, err := lockTaskHubOperationLease(ctx, tx, value, leaseOwner)
 		if err != nil {
@@ -160,6 +187,55 @@ WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND lease_version=$6 AND s
 		}
 		if command.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "Hub Task operation changed before completion")
+		}
+		return nil
+	})
+}
+
+func (s *Store) completeTaskFileFetchHubOperation(ctx context.Context, value app.TaskHubOperation,
+	status task.OperationStatus, resultHash []byte) error {
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockTaskHubOperationTask(ctx, tx, value.TaskID, value.OwnerID); err != nil {
+			return err
+		}
+		stored, err := getTaskHubOperationForUpdate(ctx, tx, value.OwnerID, value.TaskID, value.Key)
+		if err != nil {
+			return fmt.Errorf("read file.fetch operation before durable completion: %w", err)
+		}
+		if !sameTaskHubOperationRequest(stored, value) || stored.Action != hub.ActionFileFetch {
+			return idempotencyConflict()
+		}
+		if stored.Status == status && bytes.Equal(stored.ResultHash, resultHash) {
+			return nil
+		}
+		if stored.Status != task.OperationPrepared && stored.Status != task.OperationDispatched && stored.Status != task.OperationUnknown {
+			return domain.NewError(domain.CodeConflict, "file.fetch operation cannot accept a durable completion")
+		}
+		var fetchStatus, contentState string
+		if err := tx.QueryRow(ctx, `SELECT status,content_state FROM task_file_fetches
+WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 FOR UPDATE`, value.OwnerID, value.TaskID, value.Key).
+			Scan(&fetchStatus, &contentState); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeConflict, "file.fetch completion has no durable fetch record")
+			}
+			return fmt.Errorf("lock file.fetch record before durable completion: %w", err)
+		}
+		if fetchStatus != string(task.FileFetchCompleted) && fetchStatus != string(task.FileFetchWaitingDevice) {
+			return domain.NewError(domain.CodeConflict, "file.fetch completion is not backed by a completed or offline fetch")
+		}
+		if fetchStatus == string(task.FileFetchCompleted) && contentState == string(task.FileFetchContentNone) {
+			return domain.NewError(domain.CodeConflict, "completed file.fetch has no retained content receipt")
+		}
+		// A prepared operation can be completed only from an already committed
+		// fetch row; this is recovery of a durable result, not a Hub replay.
+		command, err := tx.Exec(ctx, `UPDATE task_hub_operations SET status='succeeded',result_hash=$4,updated_at=clock_timestamp()
+WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND status=$5`, value.OwnerID, value.TaskID, value.Key,
+			resultHash, string(stored.Status))
+		if err != nil {
+			return fmt.Errorf("persist durable file.fetch operation result: %w", err)
+		}
+		if command.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "file.fetch operation changed before durable completion")
 		}
 		return nil
 	})
@@ -673,7 +749,7 @@ func (s *Store) GetTaskHubOperation(ctx context.Context, ownerID, taskID, key st
 		return app.TaskHubOperation{}, domain.InvalidArgument("operation", "Hub Task operation identity is invalid")
 	}
 	result, err := scanTaskHubOperation(s.pool.QueryRow(ctx, `SELECT task_id, owner_id, operation_key, tool_name, target_installation_id, action,
-task_authorization_version, target_grant_version, lease_version, request_hash, result_hash, status,
+task_authorization_version, target_grant_version, task_revision, lease_version, request_hash, result_hash, status,
 workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision,
 local_receipt_hash, sync_stage, sync_session_id, sync_revision
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`, ownerID, taskID, key))
@@ -707,6 +783,18 @@ func lockTaskHubOperationLease(ctx context.Context, tx pgx.Tx, value app.TaskHub
 	}
 	if !authorized {
 		return sqlcgen.Task{}, domain.NewError(domain.CodeUnauthenticated, "Hub Task authorization is unavailable")
+	}
+	if value.Action == hub.ActionFileFetch {
+		var currentRevision, desiredRevision pgtype.Int8
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT current_revision,desired_revision,status FROM tasks WHERE id=$1 AND owner_id=$2`,
+			value.TaskID, value.OwnerID).Scan(&currentRevision, &desiredRevision, &status); err != nil {
+			return sqlcgen.Task{}, fmt.Errorf("read Task revision for file fetch: %w", err)
+		}
+		if !currentRevision.Valid || !desiredRevision.Valid || currentRevision.Int64 != value.TaskRevision ||
+			desiredRevision.Int64 != value.TaskRevision || status != string(task.StatusRunning) {
+			return sqlcgen.Task{}, domain.NewError(domain.CodeConflict, "file.fetch Task revision is no longer current")
+		}
 	}
 	if value.Action == hub.ActionFilePut {
 		var workspaceID pgtype.Text
@@ -751,7 +839,7 @@ FROM client_installations WHERE id=$1 FOR SHARE`, value.TargetInstallationID).Sc
 
 func getTaskHubOperationForUpdate(ctx context.Context, tx pgx.Tx, ownerID, taskID, key string) (app.TaskHubOperation, error) {
 	return scanTaskHubOperation(tx.QueryRow(ctx, `SELECT task_id, owner_id, operation_key, tool_name, target_installation_id, action,
-task_authorization_version, target_grant_version, lease_version, request_hash, result_hash, status,
+task_authorization_version, target_grant_version, task_revision, lease_version, request_hash, result_hash, status,
 workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision,
 local_receipt_hash, sync_stage, sync_session_id, sync_revision
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 FOR UPDATE`, ownerID, taskID, key))
@@ -763,7 +851,7 @@ func scanTaskHubOperation(row pgx.Row) (app.TaskHubOperation, error) {
 	var workspaceSizeBytes, sourceCheckpointRevision, syncRevision pgtype.Int8
 	err := row.Scan(
 		&result.TaskID, &result.OwnerID, &result.Key, &result.ToolName, &result.TargetInstallationID, &result.Action,
-		&result.TaskAuthorizationVersion, &result.TargetGrantVersion, &result.LeaseVersion, &result.RequestHash,
+		&result.TaskAuthorizationVersion, &result.TargetGrantVersion, &result.TaskRevision, &result.LeaseVersion, &result.RequestHash,
 		&result.ResultHash, &result.Status, &workspaceID, &workspacePath, &workspaceSizeBytes, &workspaceSHA256,
 		&sourceCheckpointRevision, &result.LocalReceiptHash, &result.SyncStage, &syncSessionID, &syncRevision)
 	if err != nil {
@@ -810,7 +898,8 @@ func validTaskHubOperationState(value app.TaskHubOperation) bool {
 		return false
 	}
 	if value.Action != hub.ActionFilePut {
-		return value.WorkspaceID == "" && value.WorkspacePath == "" && value.WorkspaceSizeBytes == 0 && value.WorkspaceSHA256 == "" &&
+		return (value.Action == hub.ActionFileFetch && value.TaskRevision > 0 || value.Action != hub.ActionFileFetch && value.TaskRevision == 0) &&
+			value.WorkspaceID == "" && value.WorkspacePath == "" && value.WorkspaceSizeBytes == 0 && value.WorkspaceSHA256 == "" &&
 			value.SourceCheckpointRevision == 0 && len(value.LocalReceiptHash) == 0 && value.SyncStage == "" && value.SyncSessionID == "" &&
 			value.SyncRevision == 0 && (len(value.ResultHash) == 0 || len(value.ResultHash) == 32)
 	}
@@ -822,7 +911,7 @@ func validTaskHubOperationState(value app.TaskHubOperation) bool {
 
 func validTaskHubAction(action string) bool {
 	switch action {
-	case hub.ActionScreenshot, hub.ActionFiles, hub.ActionFileGet, hub.ActionCommand:
+	case hub.ActionScreenshot, hub.ActionFiles, hub.ActionFileGet, hub.ActionFileFetch, hub.ActionCommand:
 		return true
 	default:
 		return false
@@ -841,7 +930,7 @@ func sameTaskHubOperationRequest(stored, requested app.TaskHubOperation) bool {
 	return stored.OwnerID == requested.OwnerID && stored.TaskID == requested.TaskID && stored.Key == requested.Key &&
 		stored.ToolName == requested.ToolName && stored.TargetInstallationID == requested.TargetInstallationID &&
 		stored.Action == requested.Action && stored.TaskAuthorizationVersion == requested.TaskAuthorizationVersion &&
-		stored.TargetGrantVersion == requested.TargetGrantVersion && bytes.Equal(stored.RequestHash, requested.RequestHash) &&
+		stored.TargetGrantVersion == requested.TargetGrantVersion && stored.TaskRevision == requested.TaskRevision && bytes.Equal(stored.RequestHash, requested.RequestHash) &&
 		stored.WorkspaceID == requested.WorkspaceID && stored.WorkspacePath == requested.WorkspacePath &&
 		stored.WorkspaceSizeBytes == requested.WorkspaceSizeBytes && stored.WorkspaceSHA256 == requested.WorkspaceSHA256 &&
 		stored.SourceCheckpointRevision == requested.SourceCheckpointRevision

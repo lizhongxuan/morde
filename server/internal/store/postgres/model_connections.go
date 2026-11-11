@@ -17,7 +17,7 @@ import (
 func (s *Store) CreateModelConnection(ctx context.Context, value app.ModelConnectionRecord) (app.ModelConnectionRecord, error) {
 	row, err := s.q.CreateModelConnection(ctx, sqlcgen.CreateModelConnectionParams{
 		ID: value.ID, OwnerID: nullableText(value.OwnerID), Name: value.Name, BaseUrl: value.BaseURL,
-		ModelName: value.ModelName, ApiKeyCipher: value.APIKeyCipher,
+		ModelName: value.ModelName, ContextWindowTokens: nullableInt4(value.ContextWindowTokens), ApiKeyCipher: value.APIKeyCipher,
 	})
 	if err != nil {
 		var postgresErr *pgconn.PgError
@@ -87,7 +87,10 @@ WHERE model_id=ANY($1::text[]) AND state='verified'`, ids)
 func (s *Store) UpdateModelConnection(ctx context.Context, value app.ModelConnectionRecord) (app.ModelConnectionRecord, error) {
 	row, err := s.q.UpdateModelConnection(ctx, sqlcgen.UpdateModelConnectionParams{
 		ID: value.ID, Name: value.Name, BaseUrl: value.BaseURL, ModelName: value.ModelName,
-		ApiKeyCipher: value.APIKeyCipher, CapabilityText: value.Capabilities.Text, CapabilityTools: value.Capabilities.Tools,
+		ContextWindowTokens:             nullableInt4(value.ContextWindowTokens),
+		ApiKeyCipher:                    value.APIKeyCipher,
+		CapabilityText:                  value.Capabilities.Text,
+		CapabilityTools:                 value.Capabilities.Tools,
 		CapabilityVision:                value.Capabilities.Vision,
 		CapabilityMediaImageGeneration:  pgtype.Bool{Bool: value.Capabilities.MediaGeneration.ImageGeneration, Valid: true},
 		CapabilityMediaVideoGeneration:  pgtype.Bool{Bool: value.Capabilities.MediaGeneration.VideoGeneration, Valid: true},
@@ -115,7 +118,8 @@ func (s *Store) DeleteModelConnection(ctx context.Context, id string) error {
 func modelConnectionDomain(row sqlcgen.ModelConnection) app.ModelConnectionRecord {
 	return app.ModelConnectionRecord{
 		ID: row.ID, OwnerID: row.OwnerID.String, Name: row.Name, BaseURL: row.BaseUrl, ModelName: row.ModelName,
-		APIKeyCipher: append([]byte(nil), row.ApiKeyCipher...),
+		ContextWindowTokens: intPointer(row.ContextWindowTokens),
+		APIKeyCipher:        append([]byte(nil), row.ApiKeyCipher...),
 		Capabilities: app.ModelCapabilities{
 			Text: row.CapabilityText, Tools: row.CapabilityTools, Vision: row.CapabilityVision,
 			MediaGeneration: app.ModelMediaGenerationCapabilities{

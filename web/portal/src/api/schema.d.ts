@@ -3342,6 +3342,164 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{id}/file-fetches/{fetch_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a Task-bound PC file fetch status
+         * @description Portal Session only. The response is a safe status projection and never includes the PC transfer ticket or its hash. Missing and unauthorized Task fetches are hidden as not_found.
+         */
+        get: operations["getTaskFileFetch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List file fetches for an owned Task
+         * @description Portal Session only. Returns the newest 16 safe fetch projections, including retained-copy state and deletion time. No transfer ticket or ticket hash is returned.
+         */
+        get: operations["listTaskFileFetches"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Pin a PC file manifest and reserve staging quota */
+        post: operations["submitTaskFileFetchManifest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/chunks/{sequence}": {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Store one idempotent PC file chunk */
+        put: operations["putTaskFileFetchChunk"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify all chunks and atomically publish the retained copy */
+        post: operations["commitTaskFileFetch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel an in-progress or waiting file fetch
+         * @description Task-owner Portal Session only. Revokes the ticket and removes all staging chunks in the same serialized transition. Completed fetches cannot be cancelled.
+         */
+        post: operations["cancelTaskFileFetch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download an active retained Task file copy
+         * @description Task-owner Portal Session only. Returns original bytes after size and SHA-256 integrity verification; deleted or expired copies are unavailable.
+         */
+        get: operations["getTaskFileFetchContent"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a retained Task file copy
+         * @description Task-owner Portal Session only. Idempotently deletes cloud-retained bytes and preserves a deleted_at tombstone; the PC source file and Task history are unaffected.
+         */
+        delete: operations["deleteTaskFileFetchContent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{id}/media/{operation_id}/preview": {
         parameters: {
             query?: never;
@@ -5310,6 +5468,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Verified model context capacity from the provider's model documentation; omitted means unknown and disables compaction. */
+            context_window_tokens?: number;
             api_key: string;
             /**
              * @description Shared connections require an administrator; authorization is checked by the server.
@@ -5325,6 +5485,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Verified model context capacity from the provider's model documentation; omitted preserves it only when the endpoint is unchanged. */
+            context_window_tokens?: number;
             /** @description Omit or send an empty string to keep the current key; a non-empty value replaces it. */
             api_key?: string;
         };
@@ -5348,6 +5510,8 @@ export interface components {
             /** Format: uri */
             base_url: string;
             model_name: string;
+            /** @description Unknown until the owner or administrator supplies a verified model capacity. */
+            context_window_tokens?: number | null;
             shared: boolean;
             has_api_key: boolean;
             capabilities: components["schemas"]["ModelConnectionCapabilities"];
@@ -7464,7 +7628,7 @@ export interface components {
             /** @description Present only for source=task. */
             task_id?: components["schemas"]["TaskId"];
             /** @enum {string} */
-            source: "client" | "chat" | "task" | "route";
+            source: "client" | "chat" | "task" | "route" | "compaction";
             model_id: components["schemas"]["ModelConnectionId"];
             /** Format: int64 */
             rate_version: number;
@@ -7899,6 +8063,87 @@ export interface components {
             safe_after: string;
             unsettled_operation_ids: components["schemas"]["OperationId"][];
         };
+        /** @description Task-owner Portal Session projection of a PC file fetch. It contains no transfer ticket, ticket hash, or source directory path outside the authorized relative path. A completed fetch stays completed after its retained copy is deleted or expires; content_state reports the separate copy lifecycle and parse_status reports model delivery separately from transfer completion. */
+        TaskFileFetch: {
+            fetch_id: components["schemas"]["OperationId"];
+            task_id: components["schemas"]["TaskId"];
+            source_installation_id: components["schemas"]["ClientInstallationId"];
+            source_device_name: string;
+            /** @description Relative to the PC's current authorized root. */
+            relative_path: string;
+            /** Format: int64 */
+            task_revision: number;
+            source_version: string | null;
+            source_sha256: string | null;
+            /** @enum {string|null} */
+            media_type: "text/plain" | "text/markdown" | "text/csv" | "application/json" | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "application/pdf" | null;
+            /** Format: int64 */
+            size_bytes: number | null;
+            /** Format: int64 */
+            confirmed_bytes: number;
+            /** @enum {string} */
+            status: "queued" | "waiting_device" | "transferring" | "verifying" | "completed" | "cancelling" | "cancelled" | "failed";
+            /** @enum {string|null} */
+            waiting_reason: "device_offline" | null;
+            content_id: components["schemas"]["OperationId"] | null;
+            /** Format: date-time */
+            expires_at: string | null;
+            /** @enum {string} */
+            content_state: "none" | "retained" | "deleted" | "expired";
+            /** @enum {string} */
+            parse_status: "pending" | "extracted" | "raw_only" | "failed" | "unavailable";
+            /** @enum {string|null} */
+            parse_error: "invalid_encoding" | "invalid_document" | "result_too_large" | "content_unavailable" | "integrity_failed" | null;
+            /** Format: date-time */
+            deleted_at: string | null;
+        };
+        TaskFileFetchList: {
+            items: components["schemas"]["TaskFileFetch"][];
+        };
+        TaskFileFetchManifestRequest: {
+            source_version: string;
+            source_sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+            /** @enum {string} */
+            media_type: "text/plain" | "text/markdown" | "text/csv" | "application/json" | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "application/pdf";
+        };
+        TaskFileFetchManifestReceipt: {
+            fetch_id: components["schemas"]["OperationId"];
+            source_version: string;
+            /** @enum {string} */
+            status: "transferring" | "verifying" | "completed";
+            confirmed_sequences: number[];
+        };
+        TaskFileFetchChunkReceipt: {
+            fetch_id: components["schemas"]["OperationId"];
+            sequence: number;
+            /** Format: int64 */
+            confirmed_bytes: number;
+            replayed: boolean;
+        };
+        TaskFileFetchCommitRequest: {
+            source_version: string;
+            source_sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+        };
+        TaskFileFetchCommitReceipt: {
+            fetch_id: components["schemas"]["OperationId"];
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            target_grant_version: number;
+            /** @constant */
+            status: "completed";
+            source_version: string;
+            source_sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+            content_id: components["schemas"]["OperationId"];
+            /** Format: date-time */
+            expires_at: string;
+        };
         /** @description The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text. */
         TaskAssistantMessage: {
             id: components["schemas"]["MessageId"];
@@ -8196,7 +8441,7 @@ export interface components {
         /** @description Request digests and prompt or response content are not returned. */
         AdminModelCall: {
             /** @enum {string} */
-            source: "client" | "chat" | "task" | "route" | "probe";
+            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
             call_id: string;
             model_id: string;
             provider_model: string;
@@ -14616,6 +14861,242 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current fetch status and confirmed transfer progress */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetch"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listTaskFileFetches: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Task file fetch records */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    submitTaskFileFetchManifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskFileFetchManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Pinned manifest with confirmed chunk sequences for safe resume */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchManifestReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putTaskFileFetchChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Durable confirmation of this chunk and aggregate progress */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchChunkReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskFileFetchCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description Safe receipt for the durable committed copy */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchCommitReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled fetch projection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetch"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskFileFetchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified retained file bytes; response is private and non-cacheable. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "X-Content-Type-Options"?: "nosniff";
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                    "text/markdown": string;
+                    "text/csv": string;
+                    "application/json": string;
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": string;
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": string;
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": string;
+                    "application/pdf": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteTaskFileFetchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Copy deleted or was already deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     getTaskMediaPreview: {
         parameters: {
             query?: never;
@@ -17597,7 +18078,7 @@ export interface operations {
                         items: {
                             owner_id: components["schemas"]["UserId"];
                             /** @enum {string} */
-                            source: "client" | "chat" | "task" | "route" | "probe";
+                            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
                             call_id: string;
                             model_id: string;
                             provider_model: string;
@@ -17630,7 +18111,7 @@ export interface operations {
                 "application/json": {
                     owner_id: components["schemas"]["UserId"];
                     /** @enum {string} */
-                    source: "client" | "chat" | "task" | "route" | "probe";
+                    source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
                     call_id: string;
                     /** Format: int64 */
                     input_tokens: number;

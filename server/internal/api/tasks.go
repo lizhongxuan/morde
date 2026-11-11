@@ -37,6 +37,10 @@ type TaskService interface {
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
+type TaskFileFetchQueryService interface {
+	GetTaskFileFetch(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
+}
+
 type TaskRevisionFencedActionService interface {
 	RequestActionWithRevisionFence(context.Context, identity.Principal, string, task.Action, task.Status, *app.TaskActionRevisionFence, string) (app.TaskActionResult, error)
 }
@@ -126,6 +130,32 @@ type taskResponse struct {
 	StopRequest            *taskStopRequestResponse          `json:"stop_request"`
 	AssistantMessage       *taskAssistantMessageResponse     `json:"assistant_message"`
 	FinishedAt             *time.Time                        `json:"finished_at"`
+}
+
+type taskFileFetchResponse struct {
+	FetchID              string                     `json:"fetch_id"`
+	TaskID               string                     `json:"task_id"`
+	SourceInstallationID string                     `json:"source_installation_id"`
+	SourceDeviceName     string                     `json:"source_device_name"`
+	RelativePath         string                     `json:"relative_path"`
+	TaskRevision         int64                      `json:"task_revision"`
+	SourceVersion        *string                    `json:"source_version"`
+	SourceSHA256         *string                    `json:"source_sha256"`
+	MediaType            *string                    `json:"media_type"`
+	SizeBytes            *int64                     `json:"size_bytes"`
+	ConfirmedBytes       int64                      `json:"confirmed_bytes"`
+	Status               task.FileFetchStatus       `json:"status"`
+	WaitingReason        *string                    `json:"waiting_reason"`
+	ContentID            *string                    `json:"content_id"`
+	ExpiresAt            *time.Time                 `json:"expires_at"`
+	ContentState         task.FileFetchContentState `json:"content_state"`
+	ParseStatus          task.FileFetchParseStatus  `json:"parse_status"`
+	ParseError           *string                    `json:"parse_error"`
+	DeletedAt            *time.Time                 `json:"deleted_at"`
+}
+
+type taskFileFetchListResponse struct {
+	Items []taskFileFetchResponse `json:"items"`
 }
 
 type taskStopRequestResponse struct {
@@ -308,6 +338,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks", h.submitTask(service))
 	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
+	if fetchService, ok := service.(TaskFileFetchQueryService); ok {
+		group.GET("/tasks/:id/file-fetches/:fetch_id", h.getTaskFileFetch(fetchService))
+	}
 	group.GET("/tasks/:id/workspace-view-deletions", h.getTaskWorkspaceViewDeletion(service))
 	group.POST("/tasks/:id/workspace-view-deletions", h.requestTaskWorkspaceViewDeletion(service))
 	group.POST("/tasks/:id/actions", h.taskAction(service))
@@ -682,6 +715,72 @@ func (h *api) getTask(service TaskService) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, response)
 	}
+}
+
+func (h *api) getTaskFileFetch(service TaskFileFetchQueryService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("request", "file fetch status query must not include a query string or body"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok || principal.Kind != identity.KindSession {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		fetchID, ok := safeIDParam(c, "fetch_id", "fetch_id", domain.ValidOperationID)
+		if !ok {
+			return
+		}
+		fetch, err := service.GetTaskFileFetch(c.Request.Context(), principal, taskID, fetchID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toTaskFileFetchResponse(fetch)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.JSON(http.StatusOK, response)
+	}
+}
+
+func toTaskFileFetchResponse(value app.TaskFileFetch) (taskFileFetchResponse, error) {
+	if !domain.ValidOperationID(value.ID) || !domain.ValidTaskID(value.TaskID) || !domain.ValidClientInstallationID(value.SourceInstallationID) ||
+		!validTaskText(value.SourceDeviceName, 100) || value.TargetGrantVersion < 1 || value.TaskAuthorizationVersion < 1 ||
+		value.TaskRevision < 1 || !validTaskText(value.RelativePath, 1024) || !task.ValidFileFetchStatus(value.Status) ||
+		!task.ValidFileFetchContentState(value.ContentState) ||
+		!task.ValidFileFetchParseStatus(value.ParseStatus) || !app.ValidTaskFileFetchParseResult(value.ParseStatus, value.ParseError) ||
+		(value.Status != task.FileFetchCompleted && value.ParseStatus != task.FileFetchParsePending) ||
+		value.ConfirmedBytes < 0 || value.SizeBytes < 0 || value.SizeBytes > app.TaskFileFetchMaxFileBytes ||
+		value.ConfirmedBytes > value.SizeBytes || (value.SourceVersion != "" && len(value.SourceVersion) != 64) ||
+		(value.SourceSHA256 != "" && len(value.SourceSHA256) != 64) ||
+		(value.ContentID != "" && !domain.ValidOperationID(value.ContentID)) ||
+		((value.ContentState == task.FileFetchContentNone) != (value.ContentID == "")) ||
+		((value.ContentState == task.FileFetchContentDeleted) != (value.DeletedAt != nil)) ||
+		(value.MediaType != "" && !app.TaskFileFetchMediaTypeValid(value.MediaType)) || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
+		return taskFileFetchResponse{}, domain.NewError(domain.CodeInternal, "Task file fetch status is invalid")
+	}
+	response := taskFileFetchResponse{
+		FetchID: value.ID, TaskID: value.TaskID, SourceInstallationID: value.SourceInstallationID,
+		SourceDeviceName: value.SourceDeviceName, RelativePath: value.RelativePath, TaskRevision: value.TaskRevision,
+		SourceVersion: stringPointer(value.SourceVersion), SourceSHA256: stringPointer(value.SourceSHA256), MediaType: stringPointer(value.MediaType),
+		ConfirmedBytes: value.ConfirmedBytes, Status: value.Status, WaitingReason: stringPointer(value.WaitingReason),
+		ContentID: stringPointer(value.ContentID), ExpiresAt: value.ExpiresAt, ContentState: value.ContentState, DeletedAt: value.DeletedAt,
+		ParseStatus: value.ParseStatus, ParseError: stringPointer(value.ParseError),
+	}
+	if value.SizeBytes > 0 {
+		size := value.SizeBytes
+		response.SizeBytes = &size
+	}
+	return response, nil
 }
 
 func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projection) (taskSummaryResponse, error) {

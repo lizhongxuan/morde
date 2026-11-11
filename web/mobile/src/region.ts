@@ -9,7 +9,7 @@
  * number (codes reach mainland numbers only), or the relay says `region: "cn"`. A relay
  * that does not say yet is fine: the other two signs still work.
  */
-import catalogue from "../../nanomuse/llm/providers.json";
+import catalogue from "../../../clients/desktop/nanomuse/llm/providers.json";
 import { getLocale } from "./i18n";
 import type { Capability, CatalogueProvider, CloudAccount, ProviderPreset } from "./types";
 

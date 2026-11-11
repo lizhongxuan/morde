@@ -9,8 +9,8 @@ import { useToast } from '../app/toast';
 import { MCPConnectorsPanel } from './MCPConnectorsPanel';
 
 type ModelConnection = Awaited<ReturnType<typeof api.modelConnections>>['items'][number];
-type PersonalModelDraft = { name: string; baseURL: string; modelName: string; apiKey: string };
-const emptyDraft: PersonalModelDraft = { name: '', baseURL: '', modelName: '', apiKey: '' };
+type PersonalModelDraft = { name: string; baseURL: string; modelName: string; contextWindowTokens: string; apiKey: string };
+const emptyDraft: PersonalModelDraft = { name: '', baseURL: '', modelName: '', contextWindowTokens: '', apiKey: '' };
 
 export function Connections() {
   const client = useQueryClient();
@@ -66,6 +66,7 @@ export function Connections() {
     try {
       const connection = {
         name: submittedDraft.name.trim(), base_url: submittedDraft.baseURL.trim(), model_name: submittedDraft.modelName.trim(),
+        ...(submittedDraft.contextWindowTokens ? { context_window_tokens: Number(submittedDraft.contextWindowTokens) } : {}),
       };
       const saved = editingID
         ? await api.updateModelConnection(editingID, { ...connection, ...(submittedDraft.apiKey ? { api_key: submittedDraft.apiKey } : {}) })
@@ -138,6 +139,7 @@ export function Connections() {
           </select><small className="muted">{editingID ? '选择后会自动填写显示名称、模型名和服务地址。' : '选择后会自动填写显示名称、模型名和服务地址；保存时会检查文本和工具调用能力。检查可能产生少量服务商费用。'}</small></div>
           <div><label htmlFor="personal-model-name">显示名称</label><input id="personal-model-name" value={draft.name} maxLength={80} required onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></div>
           <div><label htmlFor="personal-model-provider-name">模型名</label><input id="personal-model-provider-name" value={draft.modelName} maxLength={256} required onChange={(event) => setDraft({ ...draft, modelName: event.target.value })} /></div>
+          <div className="connection-form-wide"><label htmlFor="personal-model-context-window">上下文窗口（tokens）</label><input id="personal-model-context-window" type="number" min={4096} max={1000000} step={1} value={draft.contextWindowTokens} onChange={(event) => setDraft({ ...draft, contextWindowTokens: event.target.value })} /><small className="muted">按服务商模型文档填写。压缩需要此值；留空时会安全停用该模型的自动压缩。</small></div>
           <div className="connection-form-wide"><label htmlFor="personal-model-base-url">服务地址</label><input id="personal-model-base-url" type="url" pattern="https://.*" value={draft.baseURL} required onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} /><small className="muted">仅接受 HTTPS，并且必须通过服务端当前配置的域名 allowlist。</small></div>
           <div className="connection-form-wide"><label htmlFor="personal-model-api-key">API 密钥</label><input id="personal-model-api-key" type="password" autoComplete="new-password" value={draft.apiKey} maxLength={4096} required={!editingID} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} /><small className="muted">{editingID ? '留空保留已保存的密钥，输入新值才会替换。' : '仅发送给服务端并加密保存。服务端不会返回密钥；不要在此输入共享密钥。'}</small></div>
         </div>
@@ -145,7 +147,7 @@ export function Connections() {
         <div className="form-actions"><button type="button" className="button button-secondary" disabled={saving} onClick={cancelForm}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? '正在保存…' : editingID ? '保存修改' : presetID ? '保存并检查连接' : '保存个人模型'}</button></div>
       </form>}
       {models.isPending ? null : models.isError ? null : !personalModels.length ? <div className="empty-card connection-empty"><h3>尚未添加个人模型</h3><p>添加后可以检查能力，并在 Assistant 的模型选项中选择。</p></div>
-        : <div className="model-connection-list">{personalModels.map((model: ModelConnection) => <ModelCard key={model.id} model={model} checked={checked} check={check} streamCheck={streamCheck} onEdit={() => { setEditingID(model.id); setDraft({ name: model.name, baseURL: model.base_url, modelName: model.model_name, apiKey: '' }); setPresetID(''); setSaveError(null); check.reset(); setFormOpen(true); }} />)}</div>}
+        : <div className="model-connection-list">{personalModels.map((model: ModelConnection) => <ModelCard key={model.id} model={model} checked={checked} check={check} streamCheck={streamCheck} onEdit={() => { setEditingID(model.id); setDraft({ name: model.name, baseURL: model.base_url, modelName: model.model_name, contextWindowTokens: model.context_window_tokens ? String(model.context_window_tokens) : '', apiKey: '' }); setPresetID(''); setSaveError(null); check.reset(); setFormOpen(true); }} />)}</div>}
     </section>
     <MCPConnectorsPanel />
   </section>;
@@ -162,6 +164,7 @@ function ModelCard({ model, shared, checked, check, streamCheck, onEdit }: {
   return <article className="model-connection-card">
     <div className="model-connection-main"><div className="model-connection-title"><h3>{model.name}</h3><span className={`status ${model.checked_at ? 'status-running' : 'status-stopped'}`}>{shared ? '团队共享' : '个人'}</span><span className="muted">{model.has_api_key ? '密钥已保存' : '未配置密钥'}</span></div>
       <p className="muted">{model.model_name} · {new URL(model.base_url).host}</p>
+      <p className="muted">上下文窗口：{model.context_window_tokens ? `${model.context_window_tokens.toLocaleString()} tokens` : '未配置，暂不可压缩'}</p>
       {model.checked_at
         ? <div className="model-capabilities">{capabilityLabel('文本', model.capabilities.text)}{capabilityLabel('工具调用', model.capabilities.tools)}{capabilityLabel('视觉', model.capabilities.vision)}{capabilityLabel('流式能力', model.capabilities.text_stream)}</div>
         : <p className="muted">尚未检查；检查通过后可在 Assistant 的模型选项中选择。</p>}

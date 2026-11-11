@@ -61,6 +61,20 @@ func TestPostgresCloudDSHPersonalMutationIsAtomicFencedAndRedacted(t *testing.T)
 	if err != nil || stored.Revision != 1 || !strings.Contains(string(stored.Body), "private-personal-body-7f9c") {
 		t.Fatalf("personal object = %+v, err=%v", stored, err)
 	}
+	var sourceID, sourceTaskID, sourceConversationID string
+	var sourceSequence int64
+	var sourceDigest []byte
+	if err := store.pool.QueryRow(ctx, `SELECT source_id,source_task_id,source_conversation_id,source_sequence,source_sha256
+FROM personal_memory_sources WHERE owner_id=$1 AND object_id='global' AND object_revision=1 AND source_kind='conversation_message'`, owner.ID).
+		Scan(&sourceID, &sourceTaskID, &sourceConversationID, &sourceSequence, &sourceDigest); err != nil {
+		t.Fatalf("read Task memory provenance: %v", err)
+	}
+	wantSourceDigest := sha256.Sum256([]byte(created.Message.Content))
+	if sourceID != created.Message.ID || sourceTaskID != created.Task.ID || sourceConversationID != created.Task.ConversationID ||
+		sourceSequence != created.Message.Sequence || !strings.EqualFold(hex.EncodeToString(sourceDigest), hex.EncodeToString(wantSourceDigest[:])) {
+		t.Fatalf("personal memory provenance = id=%q task=%q conversation=%q sequence=%d digest=%x", sourceID, sourceTaskID,
+			sourceConversationID, sourceSequence, sourceDigest)
+	}
 	if strings.Contains(string(first.Payload), "private-personal-body-7f9c") || strings.Contains(string(first.Payload), "secret") {
 		t.Fatalf("personal Task audit event leaked object content: %s", first.Payload)
 	}
@@ -173,8 +187,8 @@ func TestPostgresDeletedPersonalMemorySuppressesMatchingAIHistoryOnlyAndCannotRo
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := provider.DownTo(ctx, 168); err == nil || !strings.Contains(err.Error(), "cannot roll back personal history suppression") {
-		t.Fatalf("history suppression rollback with deletion tombstones error = %v", err)
+	if _, err := provider.DownTo(ctx, 179); err == nil || !strings.Contains(err.Error(), "cannot roll back personal memory source provenance") {
+		t.Fatalf("memory source provenance rollback = %v", err)
 	}
 	deletedIDs, err = store.ListSuppressedPersonalHistoryMessageIDs(ctx, owner.ID, []string{deletedConversation.Message.ID})
 	if err != nil {
@@ -182,6 +196,32 @@ func TestPostgresDeletedPersonalMemorySuppressesMatchingAIHistoryOnlyAndCannotRo
 	}
 	if _, ok := deletedIDs[deletedConversation.Message.ID]; !ok {
 		t.Fatalf("history suppression tombstone was lost after refused rollback: %+v", deletedIDs)
+	}
+}
+
+func TestPersonalHistorySuppressionRollbackGuard(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "history-suppression-rollback", "deleted preference"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceInstanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO personal_history_suppressions(service_instance_id,owner_id,message_id)
+VALUES ($1::uuid,$2,$3)`, serviceInstanceID, owner.ID, created.Message.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider, closeProvider, err := newMigrationProvider(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProvider()
+	if _, err := provider.DownTo(ctx, 168); err == nil || !strings.Contains(err.Error(), "cannot roll back personal history suppression") {
+		t.Fatalf("history suppression rollback with deletion tombstones error = %v", err)
 	}
 }
 
@@ -224,7 +264,7 @@ func TestPostgresCloudDSHMemoryWriteCannotRaceConsentWithdrawal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := applyPersonalMutationInTx(ctx, tx, principal, disable, ""); err != nil {
+	if _, err := applyPersonalMutationInTx(ctx, tx, principal, disable, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	progress := cloudDSHPersonalMutationProgress(t, claimed, principal, service, "memory_racing_write", 0, json.RawMessage(`{"content":"should not be written"}`))

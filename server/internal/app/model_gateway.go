@@ -24,11 +24,12 @@ import (
 type ModelCallSource string
 
 const (
-	ModelCallClient ModelCallSource = "client"
-	ModelCallChat   ModelCallSource = "chat"
-	ModelCallTask   ModelCallSource = "task"
-	ModelCallProbe  ModelCallSource = "probe"
-	ModelCallRoute  ModelCallSource = "route"
+	ModelCallClient     ModelCallSource = "client"
+	ModelCallChat       ModelCallSource = "chat"
+	ModelCallTask       ModelCallSource = "task"
+	ModelCallProbe      ModelCallSource = "probe"
+	ModelCallRoute      ModelCallSource = "route"
+	ModelCallCompaction ModelCallSource = "compaction"
 )
 
 type ModelTaskFence struct {
@@ -57,6 +58,7 @@ type ModelCall struct {
 	Source        ModelCallSource
 	Principal     identity.Principal
 	Task          *ModelTaskFence
+	Summary       *ConversationSummaryModelFence
 	ModelID       string
 	CallID        string
 	RawRequest    json.RawMessage
@@ -68,6 +70,7 @@ type ModelCallReservation struct {
 	Source            ModelCallSource
 	Principal         identity.Principal
 	Task              *ModelTaskFence
+	Summary           *ConversationSummaryModelFence
 	Route             *ConversationRouteModelFence
 	ProjectID         string
 	PersonalModel     bool
@@ -85,11 +88,15 @@ type ModelCallReservation struct {
 }
 
 type ModelCallSettlement struct {
-	Source  ModelCallSource
-	OwnerID string
-	CallID  string
-	Usage   ModelUsage
-	Unknown bool
+	Source             ModelCallSource
+	OwnerID            string
+	CallID             string
+	Usage              ModelUsage
+	Unknown            bool
+	Summary            *ConversationSummaryModelFence
+	ResponseCiphertext []byte
+	ResponseDigest     []byte
+	ResponseInvalid    bool
 }
 
 type ModelCallStore interface {
@@ -99,6 +106,10 @@ type ModelCallStore interface {
 	// prove no provider request was sent, including a failed Begin.
 	AbandonModelCallReservation(context.Context, ModelCallReservation) error
 	SettleModelCall(context.Context, ModelCallSettlement) error
+}
+
+type ConversationSummaryModelOutputStore interface {
+	RecoverConversationSummaryModelOutput(context.Context, ModelCallReservation) (ConversationSummaryModelOutput, bool, error)
 }
 
 type ModelGatewayResolver interface {
@@ -112,6 +123,7 @@ type ModelGatewayService struct {
 	models        ModelGatewayResolver
 	client        ModelClient
 	projectBudget *ProjectBudgetService
+	summarySealer *Sealer
 }
 
 const modelRequestItemTokenReserve int64 = 32
@@ -136,9 +148,10 @@ func normalizedModelTaskFence(value *ModelTaskFence) *ModelTaskFence {
 }
 
 type ModelGatewayEndpoint struct {
-	Endpoint ModelEndpoint
-	Version  time.Time
-	Personal bool
+	Endpoint            ModelEndpoint
+	Version             time.Time
+	Personal            bool
+	ContextWindowTokens *int
 }
 
 func isFirstPartyGPT6Luna(endpoint ModelEndpoint) bool {
@@ -158,6 +171,14 @@ func NewModelGatewayService(store ModelCallStore, models ModelGatewayResolver, c
 		service.projectBudget = projectBudgets[0]
 	}
 	return service, nil
+}
+
+func (s *ModelGatewayService) SetConversationSummarySealer(sealer *Sealer) error {
+	if s == nil || sealer == nil {
+		return errors.New("conversation summary model result sealer is required")
+	}
+	s.summarySealer = sealer
+	return nil
 }
 
 // TaskToolCapability resolves the selected model for the task initiator, not
@@ -227,6 +248,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
 	}
 	call.Task = normalizedModelTaskFence(call.Task)
+	if call.Source == ModelCallCompaction && s.summarySealer == nil {
+		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation summary model encryption is unavailable")
+	}
 	if call.Source == ModelCallTask {
 		if call.Task == nil || call.Request.Endpoint != (ModelEndpoint{}) {
 			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid task model call")
@@ -261,6 +285,8 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		if err != nil {
 			return ModelResponse{}, err
 		}
+	} else if call.Source == ModelCallCompaction && call.Summary != nil {
+		projectID = call.Summary.Claim.Input.ProjectID
 	}
 	needsTools := len(call.Request.Tools) != 0
 	needsVision := false
@@ -280,20 +306,48 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
+	if call.Source == ModelCallCompaction && (call.Summary == nil || endpoint.ContextWindowTokens == nil ||
+		*endpoint.ContextWindowTokens != call.Summary.ContextWindowTokens) {
+		return ModelResponse{}, domain.NewError(domain.CodeConflict, "conversation summary model capacity changed")
+	}
 	if projectID != "" && !endpoint.Personal && s.projectBudget == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
 	reservation := ModelCallReservation{
-		Source: call.Source, Principal: call.Principal, Task: call.Task, OwnerID: ownerID,
+		Source: call.Source, Principal: call.Principal, Task: call.Task, Summary: call.Summary, OwnerID: ownerID,
 		ProjectID: projectID, PersonalModel: endpoint.Personal,
 		ModelID: call.ModelID, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
 		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
 	}
+	if call.Source == ModelCallCompaction {
+		if recovery, ok := s.store.(ConversationSummaryModelOutputStore); ok {
+			stored, found, err := recovery.RecoverConversationSummaryModelOutput(ctx, reservation)
+			if err != nil {
+				return ModelResponse{}, err
+			}
+			if found {
+				output, err := OpenConversationSummaryModelOutput(s.summarySealer, stored.Ciphertext, stored.Digest,
+					call.Summary.Identity, call.Summary.OperationID, call.CallID, call.ModelID)
+				if err != nil {
+					return ModelResponse{}, err
+				}
+				return ModelResponse{Text: output.Text, StopReason: "stop", Usage: output.Usage}, nil
+			}
+		} else {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation summary model recovery is unavailable")
+		}
+	}
 	projectCall := projectID != "" && !endpoint.Personal
 	if projectCall {
 		usage := projectUsageReservation(call.Request, reserve)
-		if _, _, err := s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage); err != nil {
-			return ModelResponse{}, err
+		var reserveErr error
+		if call.Source == ModelCallCompaction {
+			_, _, reserveErr = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
+		} else {
+			_, _, reserveErr = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
+		}
+		if reserveErr != nil {
+			return ModelResponse{}, reserveErr
 		}
 	} else if err := s.store.ReserveModelCall(ctx, reservation); err != nil {
 		return ModelResponse{}, err
@@ -376,11 +430,28 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	response, callErr := s.client.Complete(providerCtx, request)
 	finishProvider()
-	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage, Unknown: callErr != nil || !response.Usage.Known}
+	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
+		Unknown: callErr != nil || !response.Usage.Known, Summary: call.Summary}
 	if response.Usage.Known && (response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 || response.Usage.InputTokens > math.MaxInt64-response.Usage.OutputTokens) {
 		settlement.Unknown = true
 		settlement.Usage = ModelUsage{}
 		callErr = &ModelClientError{Kind: ModelErrorInvalidResponse}
+	}
+	var summaryOutputErr error
+	if call.Source == ModelCallCompaction && !settlement.Unknown {
+		if response.StopReason != "stop" || len(response.ToolCalls) != 0 || strings.TrimSpace(response.Text) == "" ||
+			!utf8.ValidString(response.Text) || strings.ContainsRune(response.Text, '\x00') || len(response.Text) > MaxConversationSummaryBytes {
+			settlement.ResponseInvalid = true
+			summaryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid conversation summary")
+		} else {
+			settlement.ResponseCiphertext, settlement.ResponseDigest, err = SealConversationSummaryModelOutput(s.summarySealer,
+				ConversationSummaryModelOutput{Identity: call.Summary.Identity, OperationID: call.Summary.OperationID,
+					CallID: call.CallID, ModelID: call.ModelID, Text: response.Text, Usage: response.Usage})
+			if err != nil {
+				settlement.ResponseInvalid = true
+				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely")
+			}
+		}
 	}
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -389,11 +460,23 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		settleErr = s.projectBudget.SettleModelCall(settleCtx, SettleProjectModelCallCommand{
 			ProjectID: projectID, Source: call.Source, CallID: call.CallID,
 			Usage: project.Usage{InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens}, Unknown: settlement.Unknown,
+			Summary: call.Summary, ResponseCiphertext: settlement.ResponseCiphertext,
+			ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
 		})
 	} else {
 		settleErr = s.store.SettleModelCall(settleCtx, settlement)
 	}
 	if settleErr != nil {
+		if call.Source == ModelCallCompaction && !projectCall {
+			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelUnknown()
+			unknownErr := s.store.SettleModelCall(unknownCtx, ModelCallSettlement{Source: call.Source, OwnerID: ownerID,
+				CallID: call.CallID, Unknown: true, Summary: call.Summary})
+			if unknownErr != nil {
+				return ModelResponse{}, errors.Join(fmt.Errorf("settle model call: %w", settleErr),
+					fmt.Errorf("preserve unknown model usage: %w", unknownErr))
+			}
+		}
 		return ModelResponse{}, fmt.Errorf("settle model call: %w", settleErr)
 	}
 	if err := ctx.Err(); err != nil {
@@ -409,6 +492,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	if callErr != nil {
 		return ModelResponse{}, modelConnectionCheckError(callErr)
+	}
+	if summaryOutputErr != nil {
+		return ModelResponse{}, summaryOutputErr
 	}
 	if !response.Usage.Known {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
@@ -463,7 +549,7 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	ownerID := call.Principal.UserID
 	switch call.Source {
 	case ModelCallClient, ModelCallChat, ModelCallProbe:
-		if call.Task != nil {
+		if call.Task != nil || call.Summary != nil {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid user model call")
 		}
 		if err := validateClientAccountPrincipal(call.Principal); err != nil {
@@ -481,6 +567,27 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
 		}
 		ownerID = call.Task.InitiatorID
+	case ModelCallCompaction:
+		if call.Task != nil || call.Summary == nil || ownerID != call.Summary.Claim.Message.ActorID ||
+			call.Summary.Identity.ActorID != ownerID || call.Summary.BaselineVersion < 0 ||
+			len(call.Summary.InputSHA256) != sha256.Size || len(call.Request.Tools) != 0 || call.Request.RequiredTool != "" {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid conversation summary model fence")
+		}
+		for _, input := range call.Request.Input {
+			if input.Type != "message" || len(input.Images) != 0 || input.CallID != "" || input.Name != "" || input.Arguments != "" || input.Output != "" {
+				return "", empty, 0, domain.InvalidArgument("model_call", "conversation summary model call must be text-only")
+			}
+			for _, part := range input.Parts {
+				if part.Type == "image" || part.Image != nil {
+					return "", empty, 0, domain.InvalidArgument("model_call", "conversation summary model call cannot include images")
+				}
+			}
+		}
+		expectedCallID, err := DSHConversationSummaryModelCallID(call.Summary.Claim.Message.ConversationID,
+			call.Summary.OperationID, call.Summary.SessionID, call.Summary.ThroughSequence)
+		if err != nil || expectedCallID != call.CallID {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid conversation summary model call identity")
+		}
 	default:
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call source")
 	}

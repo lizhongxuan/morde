@@ -582,6 +582,11 @@ WHERE project_id=$1 AND user_id=$2 AND version=$4`, projectID, userID, string(ro
 		if tag.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "project member version changed")
 		}
+		if member.Role == project.RoleMember && role != project.RoleMember {
+			if err := invalidateProjectConversationSummariesInTx(ctx, tx, projectID, userID); err != nil {
+				return err
+			}
+		}
 		if err := bumpProjectVersionInTx(ctx, tx, projectID, locked.Version); err != nil {
 			return err
 		}
@@ -643,6 +648,9 @@ func (s *Store) RemoveProjectMember(ctx context.Context, actorID, projectID, use
 		}
 		if tag.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "project membership changed")
+		}
+		if err := invalidateProjectConversationSummariesInTx(ctx, tx, projectID, userID); err != nil {
+			return err
 		}
 		if err := revokeProjectMCPConnectorMemberInTx(ctx, tx, projectID, userID); err != nil {
 			return err

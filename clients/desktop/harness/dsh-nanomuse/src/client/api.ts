@@ -55,6 +55,19 @@ export interface MordeHubStatus {
   targetGrantVersion: number
   grants: { screenshot: boolean; files: boolean; command: boolean; fileRoot: string | null }
   capabilities: { screenshot: boolean; files: boolean; command: boolean }
+  fileAccessRecords: {
+    fetchID: string
+    taskID: string
+    targetGrantVersion: number
+    path: string
+    status: 'transferring' | 'verifying' | 'completed' | 'cancelled' | 'failed' | 'interrupted' | 'unknown'
+    sourceVersion: string
+    confirmedBytes: number
+    sizeBytes: number
+    contentID?: string
+    expiresAt?: string
+    updatedAt: number
+  }[]
 }
 
 const API = 'nanomuse/cloud'

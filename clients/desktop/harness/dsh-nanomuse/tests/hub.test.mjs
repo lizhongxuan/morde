@@ -264,15 +264,25 @@ test('an incoming Task caller is trusted only with a complete valid Task and tar
   const base = { id: 'server-task', name: 'Morde Task', kind: 'task' }
   s.push({
     type: 'call', id: 'c1', from: {
-      ...base, task_id: 'q1234567', authorization_version: 3, target_grant_version: 2, operation_id: 'op_abcd-1234',
+      ...base, task_id: 'q1234567', task_revision: 4, authorization_version: 3, target_grant_version: 2, operation_id: 'op_abcd-1234',
     }, action: 'command', args: {},
   })
   await tick()
   assert.deepEqual(callers[0], {
     ...base, taskContext: {
-      taskID: 'q1234567', authorizationVersion: 3, targetGrantVersion: 2, operationID: 'op_abcd-1234',
+      taskID: 'q1234567', taskRevision: 4, authorizationVersion: 3, targetGrantVersion: 2, operationID: 'op_abcd-1234',
     },
   })
+
+  s.push({
+    type: 'call', id: 'c5', from: {
+      ...base, task_id: 'q1234567', authorization_version: 3, target_grant_version: 2, operation_id: 'op_abcd-1234',
+    }, action: 'command', args: {},
+  })
+  await tick()
+  assert.deepEqual(callers[1], {
+    ...base, taskContext: { taskID: 'q1234567', authorizationVersion: 3, targetGrantVersion: 2, operationID: 'op_abcd-1234' },
+  }, 'older Task frames remain valid for actions that do not need a source revision')
 
   s.push({
     type: 'call', id: 'c2', from: {
@@ -280,7 +290,7 @@ test('an incoming Task caller is trusted only with a complete valid Task and tar
     }, action: 'command', args: {},
   })
   await tick()
-  assert.deepEqual(callers[1], base, 'a missing target grant version discards the whole Task context')
+  assert.deepEqual(callers[2], base, 'a missing target grant version discards the whole Task context')
 
   s.push({
     type: 'call', id: 'c3', from: {
@@ -288,7 +298,7 @@ test('an incoming Task caller is trusted only with a complete valid Task and tar
     }, action: 'command', args: {},
   })
   await tick()
-  assert.deepEqual(callers[2], base, 'an invalid operation id cannot leave a partial Task context')
+  assert.deepEqual(callers[3], base, 'an invalid operation id cannot leave a partial Task context')
 
   s.push({
     type: 'call', id: 'c4', from: {
@@ -296,7 +306,7 @@ test('an incoming Task caller is trusted only with a complete valid Task and tar
     }, action: 'command', args: {},
   })
   await tick()
-  assert.deepEqual(callers[3], { ...base, kind: 'desktop' }, 'a device caller cannot claim Task metadata')
+  assert.deepEqual(callers[4], { ...base, kind: 'desktop' }, 'a device caller cannot claim Task metadata')
   h.client.stop()
 })
 

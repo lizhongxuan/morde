@@ -3,4 +3,5 @@ web/portal/public/downloads/
 .idea
 /runtime/morde-runtime/.tmp-t21-shell/
 node_modules
+runtime/morde-cloud-runtime/vendor/deepseek-harness/packages/compaction/compaction-basic/dist/
 docs/实施/.local-baseline

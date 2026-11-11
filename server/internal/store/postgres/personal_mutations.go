@@ -9,6 +9,7 @@ import (
 	"math"
 	"strings"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/personal"
@@ -36,7 +37,7 @@ func (s *Store) ApplyPersonalMutation(ctx context.Context, principal identity.Pr
 	var receipt personal.MutationReceipt
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		var applyErr error
-		receipt, applyErr = applyPersonalMutationInTx(ctx, tx, principal, mutation, "")
+		receipt, applyErr = applyPersonalMutationInTx(ctx, tx, principal, mutation, "", "")
 		return applyErr
 	})
 	if err != nil {
@@ -48,7 +49,8 @@ func (s *Store) ApplyPersonalMutation(ctx context.Context, principal identity.Pr
 // applyPersonalMutationInTx lets attachment commit combine a library-item
 // reference, its version/change event, and this minimal idempotency receipt
 // with the committed upload in one PostgreSQL transaction.
-func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identity.Principal, mutation personal.Mutation, allowedNewAttachmentID string) (personal.MutationReceipt, error) {
+func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identity.Principal, mutation personal.Mutation,
+	allowedNewAttachmentID, sourceTaskID string) (personal.MutationReceipt, error) {
 	if principal.UserID != mutation.OwnerID {
 		return personal.MutationReceipt{}, domain.NewError(domain.CodeForbidden, "personal mutation owner is not authorized")
 	}
@@ -187,6 +189,21 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	}); err != nil {
 		return personal.MutationReceipt{}, err
 	}
+	if mutation.ObjectType == personal.ObjectTypeMemory && objectExists {
+		if err := invalidateAllPersonalConversationSummariesInTx(ctx, tx, mutation.OwnerID); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
+	if mutation.ObjectType == personal.ObjectTypeSkillSetting && mutation.ObjectID == "builtin_memory" && !mutation.Delete {
+		var setting struct {
+			Enabled bool `json:"enabled"`
+		}
+		if json.Unmarshal(mutation.Body, &setting) == nil && !setting.Enabled {
+			if err := invalidateAllPersonalConversationSummariesInTx(ctx, tx, mutation.OwnerID); err != nil {
+				return personal.MutationReceipt{}, err
+			}
+		}
+	}
 	var receipt personal.MutationReceipt
 	if err := tx.QueryRow(ctx, `SELECT revision FROM account_object_versions
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4`,
@@ -209,17 +226,119 @@ VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8)`, instanceID, mutation.OwnerID, mutation.
 		mutation.RequestHash, mutation.ObjectType, mutation.ObjectID, receipt.ResultRevision, receipt.AccountChangeSequence); err != nil {
 		return personal.MutationReceipt{}, fmt.Errorf("write personal mutation receipt: %w", err)
 	}
+	if mutation.ObjectType == personal.ObjectTypeMemory && !mutation.Delete {
+		if err := recordPersonalMemorySourcesInTx(ctx, tx, instanceID, mutation, receipt.ResultRevision, sourceTaskID); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
 	return receipt, nil
 }
 
 func suppressPersonalHistoryForDeletedMemoryInTx(ctx context.Context, tx pgx.Tx, serviceInstanceID, ownerID, content string) error {
-	if _, err := tx.Exec(ctx, `INSERT INTO personal_history_suppressions (service_instance_id, owner_id, message_id)
-SELECT $1::uuid, $2, messages.id
+	type suppressedSource struct {
+		messageID string
+		sequence  int64
+	}
+	rows, err := tx.Query(ctx, `WITH suppressed AS (
+ INSERT INTO personal_history_suppressions (service_instance_id, owner_id, message_id)
+ SELECT $1::uuid, $2, messages.id
 FROM conversation_messages messages
 JOIN conversations conversations ON conversations.id=messages.conversation_id AND conversations.owner_id=messages.owner_id
 WHERE messages.owner_id=$2 AND conversations.project_id IS NULL AND position($3 IN messages.content)>0
-ON CONFLICT (service_instance_id, owner_id, message_id) DO NOTHING`, serviceInstanceID, ownerID, content); err != nil {
+	ON CONFLICT (service_instance_id, owner_id, message_id) DO NOTHING
+	RETURNING message_id
+)
+SELECT suppressed.message_id,messages.sequence FROM suppressed
+JOIN conversation_messages messages ON messages.id=suppressed.message_id ORDER BY messages.sequence`, serviceInstanceID, ownerID, content)
+	if err != nil {
 		return fmt.Errorf("suppress deleted personal memory history: %w", err)
+	}
+	var sources []suppressedSource
+	for rows.Next() {
+		var source suppressedSource
+		if err := rows.Scan(&source.messageID, &source.sequence); err != nil {
+			rows.Close()
+			return fmt.Errorf("read suppressed personal history source: %w", err)
+		}
+		sources = append(sources, source)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate suppressed personal history sources: %w", err)
+	}
+	rows.Close()
+	for _, source := range sources {
+		if _, err := invalidateConversationSummarySourcesInTx(ctx, tx, app.ConversationSummarySourceInvalidation{
+			OwnerID: ownerID, Kind: app.ConversationSummarySourceMessage, ID: source.messageID,
+			Sequence: source.sequence, Reason: "source_suppressed",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func recordPersonalMemorySourcesInTx(ctx context.Context, tx pgx.Tx, instanceID string, mutation personal.Mutation,
+	revision int64, sourceTaskID string) error {
+	if sourceTaskID == "" {
+		_, err := tx.Exec(ctx, `INSERT INTO personal_memory_sources
+(service_instance_id,owner_id,object_id,object_revision,source_order,mutation_id,source_kind,source_id,source_sha256)
+VALUES ($1::uuid,$2,$3,$4,1,$5,'mutation_receipt',$5,$6)`, instanceID, mutation.OwnerID, mutation.ObjectID,
+			revision, mutation.MutationID, mutation.RequestHash)
+		if err != nil {
+			return fmt.Errorf("record direct personal memory mutation source: %w", err)
+		}
+		return nil
+	}
+	if !domain.ValidTaskID(sourceTaskID) {
+		return domain.InvalidArgument("task_id", "personal memory source Task is invalid")
+	}
+	rows, err := tx.Query(ctx, `SELECT message.id,message.conversation_id,message.sequence,
+sha256(convert_to(message.content,'UTF8'))
+FROM tasks task
+JOIN conversation_messages message ON message.task_id=task.id AND message.owner_id=task.owner_id
+ AND message.conversation_id=task.conversation_id AND message.actor_id=task.initiator_id
+WHERE task.id=$1 AND task.owner_id=$2 AND task.initiator_id=$2 AND task.project_id IS NULL AND task.status='running'
+ AND message.role='user' AND message.delivery_status='applied'
+ AND message.source_kind NOT IN ('history_import','legacy_instant','task_result_review')
+ AND NOT EXISTS (SELECT 1 FROM task_revision_intents revision WHERE revision.message_id=message.id AND revision.task_id=task.id)
+ORDER BY message.sequence`, sourceTaskID, mutation.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read authorized Task messages for personal memory source: %w", err)
+	}
+	type source struct {
+		messageID      string
+		conversationID string
+		sequence       int64
+		digest         []byte
+	}
+	var sources []source
+	for rows.Next() {
+		var value source
+		if err := rows.Scan(&value.messageID, &value.conversationID, &value.sequence, &value.digest); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan personal memory source message: %w", err)
+		}
+		sources = append(sources, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate personal memory source messages: %w", err)
+	}
+	rows.Close()
+	if len(sources) == 0 {
+		return domain.NewError(domain.CodeInvalidState, "personal memory write has no verified user message source")
+	}
+	for index, source := range sources {
+		_, err := tx.Exec(ctx, `INSERT INTO personal_memory_sources
+(service_instance_id,owner_id,object_id,object_revision,source_order,mutation_id,source_kind,source_id,source_task_id,
+ source_conversation_id,source_sequence,source_sha256)
+VALUES ($1::uuid,$2,$3,$4,$5,$6,'conversation_message',$7,$8,$9,$10,$11)`, instanceID, mutation.OwnerID,
+			mutation.ObjectID, revision, index+1, mutation.MutationID, source.messageID, sourceTaskID,
+			source.conversationID, source.sequence, source.digest)
+		if err != nil {
+			return fmt.Errorf("record personal memory Task source: %w", err)
+		}
 	}
 	return nil
 }

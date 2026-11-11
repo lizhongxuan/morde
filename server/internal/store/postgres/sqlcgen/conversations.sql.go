@@ -77,8 +77,8 @@ const listConversations = `-- name: ListConversations :many
 SELECT id, owner_id, host_id, title, created_at, updated_at, model_id, source_kind, message_seq, archived_at, project_id FROM conversations
 WHERE owner_id = $1
   AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
-  AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz OR (created_at = $3::timestamptz AND id < $4))
-ORDER BY created_at DESC, id DESC
+  AND ($3::timestamptz IS NULL OR updated_at < $3::timestamptz OR (updated_at = $3::timestamptz AND id < $4))
+ORDER BY updated_at DESC, id DESC
 LIMIT $5
 `
 

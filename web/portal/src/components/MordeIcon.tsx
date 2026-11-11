@@ -13,6 +13,11 @@ const paths = {
   shield: 'M12 2.5 19.5 5v6c0 5-3.5 8.2-7.5 10.5C8 19.2 4.5 16 4.5 11V5Zm-3 9 2 2 4-4',
   bell: 'M6 16.5h12l-1.5-2v-4a4.5 4.5 0 0 0-9 0v4ZM10 19a2 2 0 0 0 4 0',
   file: 'M6 3.5h8l4 4v13H6zM14 3.5v4h4M9 12h6m-6 3h6',
+  refresh: 'M20 11a8 8 0 1 1-2.5-5.8L20 7M20 3v4h-4',
+  panel: 'M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm10 0v16',
+  paperclip: 'm9 12 5-5a3 3 0 0 1 4 4l-7 7a5 5 0 0 1-7-7l8-8',
+  microphone: 'M9 6a3 3 0 0 1 6 0v6a3 3 0 0 1-6 0ZM6 11a6 6 0 0 0 12 0m-6 6v4m-3 0h6',
+  sliders: 'M4 7h16M4 17h16M9 4v6m6 4v6',
 } as const;
 
 export type MordeIconName = keyof typeof paths;

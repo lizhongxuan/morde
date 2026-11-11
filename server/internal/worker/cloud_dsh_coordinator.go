@@ -103,6 +103,7 @@ type CloudDSHConversationCoordinatorOptions struct {
 	AccountRuntimes *CloudDSHAccountRuntimeManager
 	Models          CloudDSHCoordinatorModelGateway
 	Checkpoints     CloudDSHCoordinatorCheckpoints
+	SummaryStore    app.ConversationSummaryStore
 }
 
 // CloudDSHConversationCoordinator runs one isolated DSH turn for one persisted
@@ -156,6 +157,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 		"conversation_id": identity.ConversationID, "message_id": identity.MessageID,
 		"owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID, "generation": identity.Generation,
 		"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
+		"purpose": identity.Purpose, "operation_id": identity.OperationID,
 		"model": value.ModelID, "tools": []any{}, "system_prompt": request.Instructions,
 		"resume": head.Through >= 0,
 	}
@@ -210,7 +212,8 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 			if err := runtime.WriteCoordinatorFrame(ctx, identity, map[string]any{"type": "checkpoint_ack", "context_role": "coordinator",
 				"conversation_id": identity.ConversationID, "message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID,
 				"agent_id": identity.AgentID, "generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
-				"session_id": identity.SessionID, "id": frame.ID, "ok": true, "through_seq": session.through, "sha256": frame.SHA256}); err != nil {
+				"session_id": identity.SessionID, "purpose": identity.Purpose, "operation_id": identity.OperationID,
+				"id": frame.ID, "ok": true, "through_seq": session.through, "sha256": frame.SHA256}); err != nil {
 				return app.ConversationRouteDecision{}, err
 			}
 		case "checkpoint_read":
@@ -233,7 +236,8 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 			if err := runtime.WriteCoordinatorFrame(ctx, identity, map[string]any{"type": "checkpoint_page", "context_role": "coordinator",
 				"conversation_id": identity.ConversationID, "message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID,
 				"agent_id": identity.AgentID, "generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
-				"session_id": identity.SessionID, "id": frame.ID, "ok": true, "from_seq": page.From, "through_seq": page.Through,
+				"session_id": identity.SessionID, "purpose": identity.Purpose, "operation_id": identity.OperationID,
+				"id": frame.ID, "ok": true, "from_seq": page.From, "through_seq": page.Through,
 				"payload": string(page.Payload), "sha256": hex.EncodeToString(page.Digest)}); err != nil {
 				return app.ConversationRouteDecision{}, err
 			}
@@ -249,14 +253,15 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 				return app.ConversationRouteDecision{}, errors.New("DSH coordinator model identity is invalid")
 			}
 			response, err := c.options.Models.CompleteConversationCoordinatorModel(ctx, claim, value, identity.SessionID, session.through, frame.Request)
-			if err != nil || !validCoordinatorModelResponse(response) {
+			if err != nil || !validCoordinatorModelResponse(response, app.MaxConversationRouteModelOutputBytes) {
 				if err == nil {
 					err = errors.New("DSH coordinator model response is invalid")
 				}
 				return app.ConversationRouteDecision{}, err
 			}
 			lastModel = &response
-			if err := writeCloudDSHCoordinatorModel(ctx, runtime, identity, frame.ID, response); err != nil {
+			if err := writeCloudDSHCoordinatorModel(ctx, runtime, identity, frame.ID, response,
+				app.MaxConversationRouteModelOutputBytes); err != nil {
 				return app.ConversationRouteDecision{}, err
 			}
 		case "model_cancel":
@@ -297,24 +302,24 @@ func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim) app.Conversat
 	return app.ConversationCoordinatorIdentity{ServiceInstanceID: claim.ServiceInstanceID, OwnerID: claim.Message.OwnerID,
 		ActorID: claim.Message.ActorID, ConversationID: claim.Message.ConversationID, MessageID: claim.Message.ID,
 		AgentID: "coord_" + hexDigest[:32], Generation: 1, AuthorizationVersion: claim.Authorization.Version,
-		SessionID: "coord_session_" + hexDigest[:40]}
+		SessionID: "coord_session_" + hexDigest[:40], Purpose: "conversation"}
 }
 
-func validCoordinatorModelResponse(response app.ModelResponse) bool {
+func validCoordinatorModelResponse(response app.ModelResponse, maxOutputBytes int) bool {
 	return response.StopReason == "stop" && len(response.ToolCalls) == 0 && response.Usage.Known &&
 		response.Usage.InputTokens >= 0 && response.Usage.OutputTokens >= 0 &&
-		utf8.ValidString(response.Text) && len(response.Text) > 0 && len(response.Text) <= app.MaxConversationRouteModelOutputBytes
+		utf8.ValidString(response.Text) && len(response.Text) > 0 && len(response.Text) <= maxOutputBytes
 }
 
 func writeCloudDSHCoordinatorModel(ctx context.Context, runtime cloudDSHCoordinatorRuntime,
-	identity app.ConversationCoordinatorIdentity, id string, response app.ModelResponse) error {
-	if !validCoordinatorModelResponse(response) || id == "" {
+	identity app.ConversationCoordinatorIdentity, id string, response app.ModelResponse, maxOutputBytes int) error {
+	if !validCoordinatorModelResponse(response, maxOutputBytes) || id == "" {
 		return errors.New("DSH coordinator model response cannot be encoded")
 	}
 	base := map[string]any{"context_role": "coordinator", "conversation_id": identity.ConversationID,
 		"message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID,
 		"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
-		"session_id": identity.SessionID, "id": id}
+		"session_id": identity.SessionID, "purpose": identity.Purpose, "operation_id": identity.OperationID, "id": id}
 	chunks := []any{
 		map[string]any{"type": "block-start", "index": 0, "blockType": "text"},
 		map[string]any{"type": "text-delta", "index": 0, "text": response.Text},

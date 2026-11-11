@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -398,6 +399,232 @@ test('Morde Hub caller permits approved opens and bounded notifications to activ
     out.svc.mordeHub.deviceId = 'i9999999'
     await assert.rejects(out.svc.mordeHubCall('i7654325', 'notify', { text: 'Hello' }), (error) => error.code === 'offline')
   } finally {
+    await out.done()
+  }
+})
+
+test('file.fetch requires server-supplied Task revision while existing file.get remains compatible', async () => {
+  const out = await service()
+  try {
+    await out.credentials.set(credentialRef(MORDE_CLIENT_CREDENTIAL), 'chc_target-secret')
+    out.svc.state = { mordeHub: {
+      baseURL: 'https://morde.example', installationID: 'i1234567', targetGrantVersion: 2,
+      grants: { screenshot: false, files: true, command: false },
+      fileRoot: { directory: '/tmp/selected', identity: 'a'.repeat(64) },
+    } }
+    const caller = { kind: 'task', taskContext: { taskID: 'q1234567', authorizationVersion: 1, targetGrantVersion: 2, operationID: 'op_0123456789abcdef' } }
+    await assert.doesNotReject(out.svc.mordeHubTaskGrant('file.get', caller))
+    await assert.rejects(out.svc.mordeHubTaskGrant('file.fetch', caller), (error) => error.code === 'not_allowed')
+    await assert.doesNotReject(out.svc.mordeHubTaskGrant('file.fetch', {
+      ...caller, taskContext: { ...caller.taskContext, taskRevision: 3 },
+    }))
+  } finally {
+    await out.done()
+  }
+})
+
+test('persisted file access history is bounded, safe and resumes as interrupted', async () => {
+  const out = await service()
+  try {
+    await writeFile(out.statePath, JSON.stringify({ mordeHub: {
+      baseURL: 'https://morde.example', targetGrantVersion: 4,
+      grants: { files: true }, fileRoot: { directory: '/tmp/selected', identity: 'a'.repeat(64) },
+      fileAccessRecords: [
+        { fetchID: 'o1234567', taskID: 'q1234567', targetGrantVersion: 4, path: 'reports/annual.pdf', status: 'transferring', sourceVersion: 'ab'.repeat(32), confirmedBytes: 512000, sizeBytes: 600000, updatedAt: 100, ticket: 'never-store-me' },
+        { fetchID: 'o7654321', taskID: 'q1234567', targetGrantVersion: 4, path: '../outside.txt', status: 'completed', sourceVersion: 'cd'.repeat(32), confirmedBytes: 20, sizeBytes: 20, contentID: 'o7654322', expiresAt: '2030-01-01T00:00:00Z', updatedAt: 200 },
+        ...Array.from({ length: 21 }, (_, index) => ({ fetchID: `o${String(index).padStart(7, '0')}`, taskID: 'q1234567', targetGrantVersion: 4, path: `reports/${index}.pdf`, status: 'failed', sourceVersion: 'ef'.repeat(32), confirmedBytes: 0, sizeBytes: 600000, updatedAt: index + 1 })),
+      ],
+    } }))
+    const parsed = await out.svc.readState()
+    const records = parsed.mordeHub.fileAccessRecords
+    assert.equal(records.length, 20)
+    assert.equal(records.find((record) => record.fetchID === 'o1234567')?.status, 'interrupted')
+    assert.equal(records.find((record) => record.fetchID === 'o1234567')?.confirmedBytes, 512000)
+    assert.equal(records.some((record) => record.path.includes('outside')), false)
+    assert.equal(JSON.stringify(records).includes('never-store-me'), false)
+  } finally {
+    await out.done()
+  }
+})
+
+test('file.fetch transfers the full selected file with a ticket and stops an aborted upload', async () => {
+  const out = await service()
+  const previousHelper = process.env.MORDE_SYNC_BIN
+  const originalFetch = globalThis.fetch
+  const originalHandle = HubClient.prototype.handle
+  const originalStart = HubClient.prototype.start
+  const helper = `${out.statePath}.helper`
+  const path = 'reports/quarterly.pdf'
+  const content = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(600 * 1024, 0x5a)])
+  const ticket = Buffer.alloc(32, 0x5a).toString('base64url')
+  const ticket2 = Buffer.alloc(32, 0x5b).toString('base64url')
+  const ticket3 = Buffer.alloc(32, 0x5c).toString('base64url')
+  const ticket4 = Buffer.alloc(32, 0x5d).toString('base64url')
+  const ticket5 = Buffer.alloc(32, 0x5e).toString('base64url')
+  const ticket6 = Buffer.alloc(32, 0x5f).toString('base64url')
+  const digest = createHash('sha256').update(content).digest('hex')
+  const version = 'cd'.repeat(32)
+  const snapshot = { path, size_bytes: content.length, sha256: digest, version }
+  const chunks = [content.subarray(0, 512 * 1024), content.subarray(512 * 1024)]
+  const helperReplies = [
+    snapshot,
+    { path, offset: 0, version, sha256: createHash('sha256').update(chunks[0]).digest('hex'), data: chunks[0].toString('base64') },
+    { path, offset: 512 * 1024, version, sha256: createHash('sha256').update(chunks[1]).digest('hex'), data: chunks[1].toString('base64') },
+  ].map((result) => JSON.stringify({ jsonrpc: '2.0', id: 'morde-hub', result }))
+  await writeFile(helper, `#!/bin/sh\nIFS= read -r request\ncase "$request" in\n  *hub_file_snapshot*) printf '%s\\n' '${helperReplies[0]}' ;;\n  *offset\\\":524288,*) printf '%s\\n' '${helperReplies[2]}' ;;\n  *hub_file_chunk*) printf '%s\\n' '${helperReplies[1]}' ;;\n  *) exit 1 ;;\nesac\n`)
+  await chmod(helper, 0o700)
+  process.env.MORDE_SYNC_BIN = helper
+  const handlers = new Map()
+  HubClient.prototype.handle = function (action, handler) { handlers.set(action, handler); return this }
+  HubClient.prototype.start = function () {}
+  const requests = []
+  let signalChunkStarted
+  const chunkStarted = new Promise((resolve) => { signalChunkStarted = resolve })
+  let waitForCancel = false
+  let serverHasInterruptedChunk = false
+  let manifestConflictFor = ''
+  let revokeAfterManifestFor = ''
+  let unknownCommitFor = ''
+  let activeFetchID = ''
+  let expectedTicket = ticket
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input))
+    requests.push({ url, init })
+    assert.equal(init.headers.authorization, `Bearer ${expectedTicket}`)
+    if (url.pathname.endsWith('/manifest')) {
+      const fetchID = url.pathname.split('/')[5]
+      if (fetchID === manifestConflictFor) return response({ error: { code: 'conflict', message: 'source version changed' } }, 409)
+      if (fetchID === revokeAfterManifestFor) {
+        out.svc.state.mordeHub = { ...out.svc.state.mordeHub, targetGrantVersion: 3, grants: { ...out.svc.state.mordeHub.grants, files: false } }
+      }
+      assert.deepEqual(JSON.parse(init.body), {
+        source_version: version, source_sha256: digest, size_bytes: content.length, media_type: 'application/pdf',
+      })
+      return response({
+        fetch_id: fetchID, source_version: version, status: 'transferring',
+        confirmed_sequences: fetchID === activeFetchID && serverHasInterruptedChunk ? [0] : [],
+      })
+    }
+    if (url.pathname.endsWith('/chunks/0')) {
+      assert.equal(init.headers['x-chunk-sha256'], JSON.parse(helperReplies[1]).result.sha256)
+      assert.deepEqual(Buffer.from(init.body), chunks[0])
+      if (waitForCancel) {
+        serverHasInterruptedChunk = true
+        signalChunkStarted()
+        return new Promise((resolve, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }))
+      }
+      return response({ fetch_id: url.pathname.split('/')[5], sequence: 0, confirmed_bytes: chunks[0].length, replayed: false })
+    }
+    if (url.pathname.endsWith('/chunks/1')) {
+      assert.equal(init.headers['x-chunk-sha256'], JSON.parse(helperReplies[2]).result.sha256)
+      assert.deepEqual(Buffer.from(init.body), chunks[1])
+      return response({ fetch_id: url.pathname.split('/')[5], sequence: 1, confirmed_bytes: content.length, replayed: false })
+    }
+    if (url.pathname.endsWith('/commit')) {
+      if (url.pathname.split('/')[5] === unknownCommitFor) throw new TypeError('simulated response loss after commit')
+      return response({
+        fetch_id: url.pathname.split('/')[5], status: 'completed', source_version: version, source_sha256: digest,
+        size_bytes: content.length, content_id: 'o7654321', expires_at: '2030-01-01T00:00:00Z',
+      })
+    }
+    throw new Error(`unexpected local request: ${url}`)
+  }
+  try {
+    await out.credentials.set(credentialRef(MORDE_CLIENT_CREDENTIAL), 'chc_client-secret')
+    out.svc.state = { mordeHub: {
+      baseURL: 'https://morde.example', installationID: 'i1234567', targetGrantVersion: 2,
+      grants: { screenshot: false, files: true, command: false },
+      fileRoot: { directory: '/tmp/selected', identity: 'ab'.repeat(32) },
+    } }
+    out.svc.mordeHubCapabilities = { screenshot: false, files: true, command: false }
+    out.svc.startMordeHub = NanomuseCloud.prototype.startMordeHub.bind(out.svc)
+    out.svc.startMordeHub()
+    const handler = handlers.get('file.fetch')
+    const args = {
+      fetch_id: 'o1234567', path, task_revision: 3,
+      ticket, ticket_expires_at: '2030-01-01T00:05:00Z',
+    }
+    const events = []
+    const result = await handler(args, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
+      signal: new AbortController().signal, event: (body) => events.push(body),
+    })
+    assert.deepEqual(result, {
+      fetch_id: 'o1234567', task_revision: 3, status: 'completed', target_grant_version: 2,
+      source_version: version, source_sha256: digest, size_bytes: content.length, content_id: 'o7654321', expires_at: '2030-01-01T00:00:00Z',
+    })
+    assert.equal(JSON.stringify(result).includes(args.ticket), false)
+    const accessRecord = out.svc.mordeHubView().fileAccessRecords.find((record) => record.fetchID === args.fetch_id)
+    assert.deepEqual({ path: accessRecord.path, status: accessRecord.status, targetGrantVersion: accessRecord.targetGrantVersion, sourceVersion: accessRecord.sourceVersion,
+      confirmedBytes: accessRecord.confirmedBytes, sizeBytes: accessRecord.sizeBytes, contentID: accessRecord.contentID }, {
+      path, status: 'completed', targetGrantVersion: 2, sourceVersion: version, confirmedBytes: content.length, sizeBytes: content.length, contentID: 'o7654321',
+    })
+    assert.equal(JSON.stringify(accessRecord).includes(args.ticket), false)
+    assert.equal(requests.length, 4)
+    assert.deepEqual(requests.map(({ url }) => url.pathname.split('/').at(-1)), ['manifest', '0', '1', 'commit'])
+    assert.ok(events.every((event) => !JSON.stringify(event).includes(args.ticket)))
+    for (const { init } of requests) assert.notEqual(init.headers.authorization, 'Bearer chc_client-secret')
+
+    requests.length = 0
+    waitForCancel = true
+    activeFetchID = 'o7654321'
+    expectedTicket = ticket2
+    const controller = new AbortController()
+    const cancelled = handler({ ...args, fetch_id: activeFetchID, ticket: ticket2 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: activeFetchID } },
+      signal: controller.signal, event() {},
+    })
+    await chunkStarted
+    controller.abort(new Error('cancelled by caller'))
+    await assert.rejects(cancelled, (error) => error.code === 'cancelled')
+    assert.equal(requests.some(({ url }) => url.pathname.endsWith('/commit')), false)
+    assert.equal(requests.length, 2, 'abort stops the transfer before another block or commit')
+    assert.equal(out.svc.mordeHubView().fileAccessRecords.find((record) => record.fetchID === activeFetchID)?.status, 'cancelled')
+
+    requests.length = 0
+    waitForCancel = false
+    expectedTicket = ticket3
+    const resumed = await handler({ ...args, fetch_id: activeFetchID, ticket: ticket3 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: activeFetchID } },
+      signal: new AbortController().signal, event() {},
+    })
+    assert.equal(resumed.status, 'completed')
+    assert.deepEqual(requests.map(({ url }) => url.pathname.split('/').at(-1)), ['manifest', '1', 'commit'], 'confirmed chunks resume without rereading or uploading the block')
+
+    requests.length = 0
+    unknownCommitFor = 'o4567890'
+    expectedTicket = ticket6
+    await assert.rejects(handler({ ...args, fetch_id: unknownCommitFor, ticket: ticket6 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: unknownCommitFor } },
+      signal: new AbortController().signal, event() {},
+    }), (error) => error.code === 'failed')
+    assert.equal(out.svc.mordeHubView().fileAccessRecords.find((record) => record.fetchID === unknownCommitFor)?.status, 'unknown')
+
+    requests.length = 0
+    unknownCommitFor = ''
+    manifestConflictFor = 'o2345678'
+    expectedTicket = ticket4
+    await assert.rejects(handler({ ...args, fetch_id: manifestConflictFor, ticket: ticket4 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: manifestConflictFor } },
+      signal: new AbortController().signal, event() {},
+    }), (error) => error.code === 'conflict')
+    assert.equal(requests.length, 1, 'a source version conflict stops before sending bytes')
+
+    requests.length = 0
+    manifestConflictFor = ''
+    revokeAfterManifestFor = 'o3456789'
+    expectedTicket = ticket5
+    await assert.rejects(handler({ ...args, fetch_id: revokeAfterManifestFor, ticket: ticket5 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: revokeAfterManifestFor } },
+      signal: new AbortController().signal, event() {},
+    }), (error) => error.code === 'not_allowed')
+    assert.equal(requests.length, 1, 'revoking the selected folder stops the next helper read and transfer block')
+  } finally {
+    globalThis.fetch = originalFetch
+    HubClient.prototype.handle = originalHandle
+    HubClient.prototype.start = originalStart
+    if (previousHelper === undefined) delete process.env.MORDE_SYNC_BIN
+    else process.env.MORDE_SYNC_BIN = previousHelper
     await out.done()
   }
 })

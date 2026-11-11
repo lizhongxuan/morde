@@ -15,7 +15,7 @@ type Authorization = Awaited<ReturnType<typeof portalApi.adminUserAuthorizations
 type ModelCall = Awaited<ReturnType<typeof portalApi.adminUserModelCalls>>['items'][number];
 
 const modelUsageSourceLabel: Record<UnknownModelCall['source'], string> = {
-  client: '客户端', chat: '对话', task: '云端任务', route: '消息分流', probe: '连接检查',
+  client: '客户端', chat: '对话', task: '云端任务', route: '消息分流', probe: '连接检查', compaction: '摘要压缩',
 };
 
 function UserResourceEditor({ user }: { user: AdminUser }) {

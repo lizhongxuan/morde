@@ -454,6 +454,129 @@ FOR UPDATE OF t,i`, taskID, ownerID, agentInstanceID, generation).Scan(
 	return result, err
 }
 
+// ExpiredAccountAgentTaskStopRecoveryIdentity is read-only. It locks the
+// current Task, its pending stop request and the current Agent generation so
+// the caller only receives a recovery identity for the exact live claim after
+// safe_after and the Portal Task lease have both expired.
+func (s *Store) ExpiredAccountAgentTaskStopRecoveryIdentity(ctx context.Context,
+	claim app.TaskStopClaim) (app.AccountAgentTaskStopRecoveryIdentity, bool, error) {
+	request := claim.Request
+	current := claim.Task
+	if ctx == nil || !domain.ValidTaskID(current.ID) || !domain.ValidUserID(current.OwnerID) ||
+		!domain.ValidTaskActionID(request.ID) || request.TaskID != current.ID || request.Status != task.StopRequestPending ||
+		request.LeaseOwner == "" || len(request.LeaseOwner) > 255 || request.LeaseVersion < 1 || request.SafeAfter.IsZero() {
+		return app.AccountAgentTaskStopRecoveryIdentity{}, false,
+			domain.InvalidArgument("stop_request", "account Task recovery claim is invalid")
+	}
+	var result app.AccountAgentTaskStopRecoveryIdentity
+	var ready bool
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockStopClaimTask(ctx, tx, current.ID); err != nil {
+			return err
+		}
+		var taskOwnerID, initiatorID, taskStatus, executionLocation, conversationID string
+		var agentInstanceID, agentSessionID, engineVersion, profileVersion, action string
+		var agentGeneration, authorizationVersion int64
+		var safeAfter time.Time
+		err := tx.QueryRow(ctx, `SELECT t.owner_id,t.initiator_id,t.status,t.execution_location,t.conversation_id,
+t.agent_instance_id,t.agent_generation,t.agent_session_id,t.agent_engine_version,t.agent_profile_version,t.auth_version,
+sr.action,sr.safe_after
+FROM tasks t JOIN task_stop_requests sr ON sr.task_id=t.id
+WHERE t.id=$1 AND t.owner_id=$2 AND sr.id=$3 AND sr.status='pending' AND sr.action=$4
+  AND sr.lease_owner=$5 AND sr.lease_version=$6 AND sr.lease_expires_at>clock_timestamp()
+  AND t.status IN ('pausing','cancelling')
+FOR UPDATE OF t,sr`, current.ID, current.OwnerID, request.ID, string(request.Action), request.LeaseOwner, request.LeaseVersion).Scan(
+			&taskOwnerID, &initiatorID, &taskStatus, &executionLocation, &conversationID,
+			&agentInstanceID, &agentGeneration, &agentSessionID, &engineVersion, &profileVersion, &authorizationVersion,
+			&action, &safeAfter)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return stopClaimConflict()
+		}
+		if err != nil {
+			return fmt.Errorf("lock exact Task stop claim for Guardian recovery: %w", err)
+		}
+		if taskOwnerID != current.OwnerID || initiatorID != current.InitiatorID ||
+			task.Status(taskStatus) != current.Status || executionLocation != current.ExecutionLocation ||
+			conversationID != current.ConversationID || agentInstanceID != current.AgentInstanceID ||
+			agentGeneration != current.AgentGeneration || agentSessionID != current.AgentSessionID ||
+			engineVersion != current.AgentEngineVersion || profileVersion != current.AgentProfileVersion ||
+			authorizationVersion != current.Authorization.Version || action != string(request.Action) || !safeAfter.Equal(request.SafeAfter) {
+			return stopClaimConflict()
+		}
+		if (request.Action == task.ActionPause && taskStatus != string(task.StatusPausing)) ||
+			(request.Action == task.ActionCancel && taskStatus != string(task.StatusCancelling)) ||
+			(request.Action != task.ActionPause && request.Action != task.ActionCancel) {
+			return stopClaimConflict()
+		}
+		var now time.Time
+		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			return fmt.Errorf("read database time for Task Guardian recovery: %w", err)
+		}
+		if now.Before(safeAfter) || agentInstanceID == "" || agentGeneration < 1 {
+			return nil
+		}
+		instance, err := lockAgentInstance(ctx, tx, current.ID, current.OwnerID, agentGeneration)
+		if err != nil {
+			return fmt.Errorf("lock current Agent generation for Guardian recovery: %w", err)
+		}
+		if instance.Fence.AgentInstanceID != agentInstanceID || instance.Fence.AgentSessionID != agentSessionID ||
+			instance.Fence.InitiatorID != initiatorID || instance.Fence.AuthorizationVersion != authorizationVersion ||
+			instance.Fence.EngineVersion != engineVersion || instance.Fence.ProfileVersion != profileVersion {
+			return agentStopUnconfirmed()
+		}
+		if instance.State == "stopped" {
+			return nil
+		}
+		if instance.State != "active" {
+			return agentStopUnconfirmed()
+		}
+		if instance.ExpiresAt.After(now) {
+			return nil
+		}
+		if instance.RuntimeServiceInstanceID == "" || instance.RuntimeID == "" || instance.RuntimeGeneration < 1 {
+			return agentStopUnconfirmed()
+		}
+
+		var runtimeOwnerID, runtimeID, runtimeState, runtimeLeaseOwner string
+		var runtimeGeneration, runtimeLeaseVersion, executionEpoch int64
+		err = tx.QueryRow(ctx, `SELECT owner_id,runtime_id,runtime_generation,state,lease_owner,lease_version,execution_epoch
+FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND conversation_id=$2 AND owner_id=$3
+  AND runtime_id=$4 AND runtime_generation=$5`, instance.RuntimeServiceInstanceID, conversationID,
+			current.OwnerID, instance.RuntimeID, instance.RuntimeGeneration).Scan(
+			&runtimeOwnerID, &runtimeID, &runtimeGeneration, &runtimeState, &runtimeLeaseOwner, &runtimeLeaseVersion, &executionEpoch)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return agentStopUnconfirmed()
+		}
+		if err != nil {
+			return fmt.Errorf("load exact shared Runtime fence for Task Guardian recovery: %w", err)
+		}
+		if runtimeOwnerID != current.OwnerID || runtimeID != instance.RuntimeID || runtimeGeneration != instance.RuntimeGeneration ||
+			(runtimeState != string(app.AccountAgentRuntimeRunning) && runtimeState != string(app.AccountAgentRuntimeStopping) &&
+				runtimeState != string(app.AccountAgentRuntimeFailed)) {
+			return agentStopUnconfirmed()
+		}
+		runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: instance.RuntimeServiceInstanceID,
+			ConversationID: conversationID, OwnerID: runtimeOwnerID, RuntimeID: runtimeID, RuntimeGeneration: runtimeGeneration,
+			LeaseOwner: runtimeLeaseOwner, LeaseVersion: runtimeLeaseVersion, ExecutionEpoch: executionEpoch}
+		if err := runtimeFence.Validate(); err != nil {
+			return domain.NewError(domain.CodeInternal, "current account Runtime recovery fence is invalid")
+		}
+		if err := instance.Fence.Validate(); err != nil {
+			return domain.NewError(domain.CodeInternal, "current account Task Agent recovery fence is invalid")
+		}
+		nonceSHA256 := hex.EncodeToString(instance.NonceHash)
+		if !validAgentNonceDigest(nonceSHA256) {
+			return domain.NewError(domain.CodeInternal, "current account Task Guardian nonce digest is invalid")
+		}
+		result = app.AccountAgentTaskStopRecoveryIdentity{RuntimeFence: runtimeFence, TaskFence: instance.Fence,
+			AgentLeaseExpiresAt: instance.ExpiresAt, NonceSHA256: nonceSHA256}
+		ready = true
+		return nil
+	})
+	return result, ready, err
+}
+
 func (s *Store) ConfirmAgentStopped(ctx context.Context, proof app.VerifiedAgentStop) (bool, error) {
 	receipt, encoded := proof.Value()
 	if err := validateExistingAgentFence(receipt.Fence); err != nil || len(receipt.SupervisorNonce) != 32 ||

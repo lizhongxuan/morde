@@ -15271,6 +15271,7 @@ private struct MordeRoot: View {
 #endif
     private func userIDChanged(_ userID: String?) {
         revealedUnconfirmedIDs.removeAll()
+        model = ""
         if !client.expiredConversationAvailable && !client.isRetainedOfflineAccount(userID) { clearComposer() }
     }
     private func modelsChanged(_ state: MordeResourceLoadState?) {

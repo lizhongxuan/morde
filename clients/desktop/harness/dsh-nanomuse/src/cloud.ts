@@ -50,12 +50,16 @@ import { helloLlm, HubClient, HubError, type CallOptions, type Caller, type HubD
 import {
   mordeHubCommandAvailable,
   mordeHubCommand,
+  mordeHubFileChunk,
   mordeHubFileGet,
+  mordeHubFileSnapshot,
   mordeHubFiles,
   mordeHubFilesAvailable,
   mordeHubScreenshot,
   mordeHubScreenshotAvailable,
   mordeHubSelectedRoot,
+  HUB_FILE_FETCH_CHUNK_BYTES,
+  HUB_FILE_FETCH_MAX_BYTES,
   requireMordeHubTaskGrant,
   type MordeHubFileRoot,
 } from './morde-hub-actions.ts'
@@ -172,10 +176,25 @@ export interface MordeHubStatus {
   targetGrantVersion: number
   grants: { screenshot: boolean; files: boolean; command: boolean; fileRoot: string | null }
   capabilities: { screenshot: boolean; files: boolean; command: boolean }
+  fileAccessRecords: MordeHubFileAccessRecord[]
   accountName?: string
   installationID?: string
   expiresAt?: string
   lastError?: string
+}
+
+export interface MordeHubFileAccessRecord {
+  fetchID: string
+  taskID: string
+  targetGrantVersion: number
+  path: string
+  status: 'transferring' | 'verifying' | 'completed' | 'cancelled' | 'failed' | 'interrupted' | 'unknown'
+  sourceVersion: string
+  confirmedBytes: number
+  sizeBytes: number
+  contentID?: string
+  expiresAt?: string
+  updatedAt: number
 }
 
 export interface MordeHubDevice {
@@ -258,6 +277,7 @@ interface MordeHubState {
   accountName?: string
   installationID?: string
   expiresAt?: string
+  fileAccessRecords?: MordeHubFileAccessRecord[]
 }
 
 export interface HubState {
@@ -610,6 +630,40 @@ function mordeHubDevicesOf(value: unknown): MordeHubDevice[] {
   })
 }
 
+function mordeHubFileAccessRecordsOf(value: unknown): MordeHubFileAccessRecord[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 40).flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const raw = item as Record<string, unknown>
+    const path = typeof raw.path === 'string' ? raw.path : ''
+    const parts = path.split('/')
+    const targetGrantVersion = Number(raw.targetGrantVersion)
+    const sizeBytes = Number(raw.sizeBytes)
+    const confirmedBytes = Number(raw.confirmedBytes)
+    const updatedAt = Number(raw.updatedAt)
+    const status = String(raw.status)
+    if (typeof raw.fetchID !== 'string' || !/^o[a-z0-9]{7}$/.test(raw.fetchID) ||
+      typeof raw.taskID !== 'string' || !/^q[a-z0-9]{7}$/.test(raw.taskID) ||
+      !Number.isSafeInteger(targetGrantVersion) || targetGrantVersion < 1 ||
+      !path || Buffer.byteLength(path) > 1024 || path.startsWith('/') || path.includes('\\') || path.includes('\0') ||
+      parts.some((part) => !part || part === '.' || part === '..') ||
+      !['transferring', 'verifying', 'completed', 'cancelled', 'failed', 'interrupted', 'unknown'].includes(status) ||
+      typeof raw.sourceVersion !== 'string' || !/^[a-f0-9]{64}$/.test(raw.sourceVersion) ||
+      !Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > HUB_FILE_FETCH_MAX_BYTES ||
+      !Number.isSafeInteger(confirmedBytes) || confirmedBytes < 0 || confirmedBytes > sizeBytes ||
+      !Number.isSafeInteger(updatedAt) || updatedAt < 1) return []
+    const completed = status === 'completed'
+    if (completed && (typeof raw.contentID !== 'string' || !/^o[a-z0-9]{7}$/.test(raw.contentID) ||
+      typeof raw.expiresAt !== 'string' || !Number.isFinite(Date.parse(raw.expiresAt)))) return []
+    return [{
+      fetchID: raw.fetchID, taskID: raw.taskID, targetGrantVersion, path, status: status as MordeHubFileAccessRecord['status'],
+      sourceVersion: raw.sourceVersion, confirmedBytes, sizeBytes,
+      ...(completed ? { contentID: raw.contentID as string, expiresAt: new Date(raw.expiresAt as string).toISOString() } : {}),
+      updatedAt,
+    }]
+  }).slice(0, 20)
+}
+
 function mordeHubStateOf(value: unknown): MordeHubState | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const raw = value as Record<string, unknown>
@@ -648,6 +702,8 @@ function mordeHubStateOf(value: unknown): MordeHubState | undefined {
     ...(typeof raw.accountName === 'string' ? { accountName: raw.accountName.slice(0, 100) } : {}),
     ...(typeof raw.installationID === 'string' ? { installationID: raw.installationID.slice(0, 128) } : {}),
     ...(typeof raw.expiresAt === 'string' && Number.isFinite(Date.parse(raw.expiresAt)) ? { expiresAt: new Date(raw.expiresAt).toISOString() } : {}),
+    ...(Array.isArray(raw.fileAccessRecords) ? { fileAccessRecords: mordeHubFileAccessRecordsOf(raw.fileAccessRecords).map((record) =>
+      record.status === 'transferring' || record.status === 'verifying' ? { ...record, status: 'interrupted' as const } : record) } : {}),
   }
 }
 
@@ -655,7 +711,7 @@ async function mordeRequest<T>(baseURL: string, route: string, init: RequestInit
   const response = await fetch(mordeAPIURL(baseURL, route), {
     ...init,
     redirect: 'error',
-    signal: AbortSignal.timeout(30_000),
+    signal: init.signal ? AbortSignal.any([AbortSignal.timeout(30_000), init.signal]) : AbortSignal.timeout(30_000),
   })
   if (response.status === 204) return undefined as T
   const text = await response.text()
@@ -3010,6 +3066,18 @@ export default class NanomuseCloud extends Service {
     this.mordeHubCapabilities = { screenshot, files, command }
   }
 
+  private async recordMordeHubFileAccess(record: MordeHubFileAccessRecord, persist = false): Promise<void> {
+    await this.serialize(async () => {
+      const current = this.state.mordeHub
+      if (!current) return
+      const fileAccessRecords = [record, ...(current.fileAccessRecords ?? []).filter((item) => item.fetchID !== record.fetchID)]
+        .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20)
+      this.state = { ...this.state, mordeHub: { ...current, fileAccessRecords } }
+      if (persist) await this.writeState()
+      this.broadcast()
+    })
+  }
+
   async mordeHubUpdateGrants(input: unknown): Promise<MordeHubStatus> {
     return this.serialize(async () => {
       if (!input || typeof input !== 'object' || Array.isArray(input)) throw new RelayError(400, 'invalid_grant', 'Choose valid Hub permissions')
@@ -3097,6 +3165,7 @@ export default class NanomuseCloud extends Service {
         fileRoot: state?.fileRoot?.directory ?? null,
       },
       capabilities: { ...this.mordeHubCapabilities },
+      fileAccessRecords: state?.fileAccessRecords ?? [],
       ...(state?.accountName ? { accountName: state.accountName } : {}),
       ...(state?.installationID ? { installationID: state.installationID } : {}),
       ...(state?.expiresAt ? { expiresAt: state.expiresAt } : {}),
@@ -3274,7 +3343,7 @@ export default class NanomuseCloud extends Service {
       const state = this.state.mordeHub
       const actions = ['info', 'open', 'notify']
       if (state?.grants.screenshot && this.mordeHubCapabilities.screenshot) actions.push('screenshot')
-      if (state?.grants.files && state.fileRoot && this.mordeHubCapabilities.files) actions.push('files', 'file.get')
+      if (state?.grants.files && state.fileRoot && this.mordeHubCapabilities.files) actions.push('files', 'file.get', 'file.fetch')
       if (state?.grants.command && state.fileRoot && this.mordeHubCapabilities.command) actions.push('command')
       return {
         name: bounded(this.deviceName(), 100),
@@ -3321,6 +3390,143 @@ export default class NanomuseCloud extends Service {
       await this.recheckMordeHubTaskGrant('file.get', call.from)
       return result
     })
+    hub.handle('file.fetch', async (args, call) => {
+      if (Object.keys(args).some((key) => !['fetch_id', 'path', 'task_revision', 'ticket', 'ticket_expires_at'].includes(key)) ||
+        typeof args.fetch_id !== 'string' || !/^o[a-z0-9]{7}$/.test(args.fetch_id) ||
+        typeof args.path !== 'string' || !Number.isSafeInteger(args.task_revision) || Number(args.task_revision) < 1 ||
+        typeof args.ticket !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(args.ticket) ||
+        typeof args.ticket_expires_at !== 'string' ||
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(args.ticket_expires_at) || !Number.isFinite(Date.parse(args.ticket_expires_at))) {
+        throw new HubError('not_allowed', 'The file retrieval request is invalid')
+      }
+      const ticket = args.ticket
+      const ticketBytes = Buffer.from(ticket, 'base64url')
+      if (ticketBytes.length !== 32 || ticketBytes.toString('base64url') !== ticket) {
+        throw new HubError('not_allowed', 'The file retrieval request is invalid')
+      }
+      const { state, targetGrantVersion } = await this.mordeHubTaskGrant('file.fetch', call.from)
+      const callerTask = call.from.taskContext!
+      const fetchID = args.fetch_id
+      const taskRevision = Number(args.task_revision)
+      if (fetchID !== callerTask.operationID || taskRevision !== callerTask.taskRevision) {
+        throw new HubError('not_allowed', 'The file retrieval Task context is invalid')
+      }
+      if (!state.fileRoot) throw new HubError('not_allowed', 'File access is not allowed on this computer')
+
+      const snapshot = await mordeHubFileSnapshot(state.fileRoot, args.path, process.env, call.signal)
+      let accessRecord: MordeHubFileAccessRecord = {
+        fetchID, taskID: callerTask.taskID, targetGrantVersion, path: snapshot.path, status: 'transferring', sourceVersion: snapshot.version,
+        confirmedBytes: 0, sizeBytes: snapshot.size_bytes, updatedAt: Date.now(),
+      }
+      const saveAccessRecord = async (patch: Partial<MordeHubFileAccessRecord> = {}, persist = false) => {
+        accessRecord = { ...accessRecord, ...patch, updatedAt: Date.now() }
+        await this.recordMordeHubFileAccess(accessRecord, persist).catch(() => {
+          this.ctx.logger.warn('nanomuse: Morde file access history could not be saved')
+        })
+      }
+      await saveAccessRecord({}, true)
+      const route = `tasks/${encodeURIComponent(callerTask.taskID)}/file-fetches/${encodeURIComponent(fetchID)}`
+      let commitStarted = false
+      const request = async (method: 'POST' | 'PUT', suffix: string, body: Record<string, unknown> | Uint8Array, chunkSHA?: string): Promise<Record<string, unknown>> => {
+        if (call.signal.aborted) throw new HubError('cancelled', 'The file transfer was cancelled')
+        await this.recheckMordeHubTaskGrant('file.fetch', call.from)
+        const binary = body instanceof Uint8Array
+        try {
+          const value = await mordeRequest<unknown>(state.baseURL, `${route}${suffix}`, {
+            method,
+            headers: {
+              authorization: `Bearer ${ticket}`,
+              'content-type': binary ? 'application/octet-stream' : 'application/json',
+              ...(chunkSHA ? { 'x-chunk-sha256': chunkSHA } : {}),
+            },
+            body: binary ? body as BodyInit : JSON.stringify(body),
+            signal: call.signal,
+          })
+          if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HubError('failed', 'The file server returned an invalid receipt')
+          return value as Record<string, unknown>
+        } catch (error: unknown) {
+          if (error instanceof HubError) throw error
+          if (call.signal.aborted) throw new HubError('cancelled', 'The file transfer was cancelled')
+          const code = error instanceof RelayError && /^[a-z_]{3,64}$/.test(error.code) ? error.code : 'failed'
+          throw new HubError(code, 'The file transfer could not be completed')
+        }
+      }
+
+      try {
+        await this.recheckMordeHubTaskGrant('file.fetch', call.from)
+        const manifest = await request('POST', '/manifest', {
+          source_version: snapshot.version,
+          source_sha256: snapshot.sha256,
+          size_bytes: snapshot.size_bytes,
+          media_type: snapshot.media_type,
+        })
+        const chunkCount = Math.ceil(snapshot.size_bytes / HUB_FILE_FETCH_CHUNK_BYTES)
+        if (manifest.fetch_id !== fetchID || manifest.source_version !== snapshot.version ||
+          !['transferring', 'verifying', 'completed'].includes(String(manifest.status)) ||
+          !Array.isArray(manifest.confirmed_sequences)) {
+          throw new HubError('failed', 'The file server returned an invalid manifest receipt')
+        }
+        const confirmed = new Set<number>()
+        for (const sequence of manifest.confirmed_sequences) {
+          if (!Number.isSafeInteger(sequence) || Number(sequence) < 0 || Number(sequence) >= chunkCount || confirmed.has(Number(sequence))) {
+            throw new HubError('failed', 'The file server returned an invalid manifest receipt')
+          }
+          confirmed.add(Number(sequence))
+        }
+        if (manifest.status !== 'transferring' && confirmed.size !== chunkCount) {
+          throw new HubError('failed', 'The file server returned an incomplete transfer receipt')
+        }
+        const bytesConfirmed = () => [...confirmed].reduce((sum, sequence) =>
+          sum + Math.min(HUB_FILE_FETCH_CHUNK_BYTES, snapshot.size_bytes - sequence * HUB_FILE_FETCH_CHUNK_BYTES), 0)
+        await saveAccessRecord({ status: manifest.status === 'transferring' ? 'transferring' : 'verifying', confirmedBytes: bytesConfirmed() }, true)
+        call.event({ fetch_id: fetchID, task_revision: taskRevision, target_grant_version: targetGrantVersion, status: String(manifest.status), confirmed_bytes: bytesConfirmed(), size_bytes: snapshot.size_bytes })
+
+        for (let sequence = 0; sequence < chunkCount; sequence++) {
+          if (confirmed.has(sequence)) continue
+          if (call.signal.aborted) throw new HubError('cancelled', 'The file transfer was cancelled')
+          await this.recheckMordeHubTaskGrant('file.fetch', call.from)
+          const offset = sequence * HUB_FILE_FETCH_CHUNK_BYTES
+          const expectedBytes = Math.min(HUB_FILE_FETCH_CHUNK_BYTES, snapshot.size_bytes - offset)
+          const chunk = await mordeHubFileChunk(state.fileRoot, snapshot.path, snapshot.version, offset, expectedBytes, process.env, call.signal)
+          if (chunk.data.length !== expectedBytes) throw new HubError('conflict', 'The selected file changed during retrieval')
+          const ack = await request('PUT', `/chunks/${sequence}`, new Uint8Array(chunk.data), chunk.sha256)
+          if (ack.fetch_id !== fetchID || ack.sequence !== sequence || !Number.isSafeInteger(ack.confirmed_bytes) ||
+            Number(ack.confirmed_bytes) !== bytesConfirmed() + expectedBytes || typeof ack.replayed !== 'boolean') {
+            throw new HubError('failed', 'The file server returned an invalid chunk receipt')
+          }
+          confirmed.add(sequence)
+          if (Number(ack.confirmed_bytes) !== bytesConfirmed()) throw new HubError('failed', 'The file server returned an invalid chunk receipt')
+          await saveAccessRecord({ confirmedBytes: bytesConfirmed() }, true)
+          call.event({ fetch_id: fetchID, task_revision: taskRevision, target_grant_version: targetGrantVersion, status: 'transferring', confirmed_bytes: bytesConfirmed(), size_bytes: snapshot.size_bytes })
+        }
+
+        if (bytesConfirmed() !== snapshot.size_bytes) throw new HubError('failed', 'The file transfer is incomplete')
+        await saveAccessRecord({ status: 'verifying' }, true)
+        commitStarted = true
+        const receipt = await request('POST', '/commit', {
+          source_version: snapshot.version,
+          source_sha256: snapshot.sha256,
+          size_bytes: snapshot.size_bytes,
+        })
+        if (receipt.fetch_id !== fetchID || receipt.status !== 'completed' || receipt.source_sha256 !== snapshot.sha256 ||
+          receipt.source_version !== snapshot.version || receipt.size_bytes !== snapshot.size_bytes ||
+          typeof receipt.content_id !== 'string' || !/^o[a-z0-9]{7}$/.test(receipt.content_id) ||
+          typeof receipt.expires_at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(receipt.expires_at) ||
+          !Number.isFinite(Date.parse(receipt.expires_at))) {
+          throw new HubError('failed', 'The file server returned an invalid commit receipt')
+        }
+        await saveAccessRecord({ status: 'completed', confirmedBytes: snapshot.size_bytes, contentID: receipt.content_id, expiresAt: receipt.expires_at }, true)
+        return {
+          fetch_id: fetchID, task_revision: taskRevision, status: 'completed', target_grant_version: targetGrantVersion,
+          source_version: snapshot.version, source_sha256: snapshot.sha256, size_bytes: snapshot.size_bytes,
+          content_id: receipt.content_id, expires_at: receipt.expires_at,
+        }
+      } catch (error: unknown) {
+        const status = commitStarted ? 'unknown' : call.signal.aborted || error instanceof HubError && error.code === 'cancelled' ? 'cancelled' : 'failed'
+        await saveAccessRecord({ status }, true)
+        throw error
+      }
+    })
     hub.handle('command', async (args, call) => {
       if (Object.keys(args).some((key) => key !== 'command' && key !== 'timeout_ms') ||
         typeof args.command !== 'string' || Buffer.byteLength(args.command) < 1 || Buffer.byteLength(args.command) > 8192 ||
@@ -3358,7 +3564,7 @@ export default class NanomuseCloud extends Service {
     this.broadcast()
   }
 
-  private async mordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.get' | 'command', caller: Caller): Promise<{ state: MordeHubState; targetGrantVersion: number }> {
+  private async mordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.get' | 'file.fetch' | 'command', caller: Caller): Promise<{ state: MordeHubState; targetGrantVersion: number }> {
     const state = this.state.mordeHub
     if (!state?.installationID || !(await this.credential(MORDE_CLIENT_CREDENTIAL))) {
       throw new HubError('not_allowed', 'Morde Hub is signed out on this computer')
@@ -3370,7 +3576,7 @@ export default class NanomuseCloud extends Service {
     return { state, targetGrantVersion }
   }
 
-  private async recheckMordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.get' | 'command', caller: Caller): Promise<void> {
+  private async recheckMordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.get' | 'file.fetch' | 'command', caller: Caller): Promise<void> {
     const state = this.state.mordeHub
     if (!state?.installationID || !(await this.credential(MORDE_CLIENT_CREDENTIAL))) {
       throw new HubError('not_allowed', 'Morde Hub is signed out on this computer')

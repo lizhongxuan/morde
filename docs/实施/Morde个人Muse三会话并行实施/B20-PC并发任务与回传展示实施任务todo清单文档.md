@@ -1,6 +1,6 @@
 # B20 PC 并发任务与回传展示实施任务 TODO
 
-**会话：B｜阶段：P2｜状态：进行中（2026-11-10；B20-T1/T2 已完成，T3 正在正式 API 与本地 UI 验收）。**
+**会话：B｜阶段：P2｜状态：已完成（2026-11-10；B20-T1 至 T4 已完成）。**
 
 来源：[需求与架构](../../Morde个人Muse需求与架构设计方案.md)；共同规则：[执行总览](00-三会话执行总览.md)；接口：[共享合同](01-共享接口与联调合同.md)。
 
@@ -27,13 +27,18 @@ B 独占的 PC/Web 聊天、任务详情、审批/澄清、事件订阅及对应
   - 验收：停止 B 不误停 A；查询不产生任务，过期审批能提示；重复点击、跨端已经处理及撤权后答复均与合同一致。
   - 完成：Assistant 与项目任务停止/继续按真实 Task ID、状态和修订请求正式接口；Assistant 发请求前重取同一 Task，服务端在任务行锁事务内原子比较状态与成对修订号。Portal 类型、MSW mock、审批/澄清既有版本和幂等行为保持同步。`api`、K2 投影、Assistant、Projects 与 mock 定向测试 241 项通过；Portal typecheck、lint、Vite 生产构建通过；本地内置浏览器选择 Task A 并提交停止后显示“正在停止 / 等待服务端确认”，Task B/C/D 状态未变。`go test ./internal/api ./internal/app ./internal/store/postgres` 通过；Postgres 集成测试因未配置 `CH_TEST_DATABASE_URL` 按约定跳过。`make -C server lint` 通过（0 issues），`git diff --check` 通过。
 
-- [ ] B20-T3（进行中）联调并行任务与主助手回传
+- [x] B20-T3（已完成）联调并行任务与主助手回传
   - 前置：B20-T2、A21-T3。
   - 修改：接 A21-T3 的正式 API，更新 B 生成类型和实际视图映射；在独立浏览器/Electron fixture 验证，不以样例页面代替。
   - 验收：完成 A3–A6/A11 的 PC 路径：A 执行中发 B、修改 A、停止 B、主助手消费 A 的结果继续回复、重连后不重复最终回复。向 A21-T4 交付本地证据。
-  - 当前状态（2026-11-10）：正式 OpenAPI/TypeScript 已含 K2 `dependencies`、`child_jobs`、`result_review`；服务端迁移、投影、依赖执行和结果审阅队列已接入。Postgres 定向集成、worker 全包、DSH Runtime 94 项、Portal typecheck 与 lint 通过。本机 Portal 浏览器确认 A/B 同时运行、可单独选中并停止 B，服务端确认 B 已停止；“Reply exactly OK.” 的完成回复在重新加载后只显示一条。A 的本地 held-model 验收在修订前因模型服务超时而失败，故不据此宣称 A 修订及主助手因结果继续已通过。C10/G1 Simulator 登录/App-close 对账已通过；当前仍待 A 修订与主助手结果审阅的浏览器联验、全量 `make it` 复跑，本项保持进行中。
+  - 完成（2026-11-10）：在本地 Portal + DSH 真实服务运行 `G2PC-20261110-013` 完成 A 修订（revision 1/1）、停止 B，并由主助手消费 A 结果发布唯一最终回复。重载并重新打开会话后回复仍恰好一条，保留 Task A/revision 1/event 9 来源；PC 浏览器同一会话中的并发/修订/停止/结果回传路径全部通过。Chromium Playwright 助手 E2E 4/4、Assistant 组件定向测试 106/106、Portal typecheck/lint 及服务端 `make it` 全包通过。先前 held-model 超时只记为早期失败，不影响本次完整成功运行。
+
+- [x] B20-T4（已完成）主会话置顶及旁路会话分页
+  - 修改：主会话固定在列表顶部；其余会话放入默认折叠的“旁路会话”，按最后活动时间倒序；点击“更多”每次显示 5 条；新建会话按钮位于旁路会话标题右侧。浏览器验收与现有并发测试优先在主会话内进行。
+  - 验收：列表初次加载仅显示主会话；旁路分组默认折叠，展开后按 `updated_at` 排序，每次点击更多恰好多显示 5 条；服务端分页跨页顺序一致。
+  - 完成（2026-11-10）：主会话固定置顶；旁路会话默认折叠，按 `updated_at` 倒序并按 ID 去重；“更多”每次增加 5 条；新建入口在旁路标题右侧，加号为 22×22px 圆形。服务端分页及游标按 `updated_at` 排序。真实 G1 Chromium 实测侧栏由 4 条增至 9 条、再增至 14 条，主会话始终置顶；主会话存在 7 个活动任务时，将 SSE 并发数限制为 4，剩余任务继续使用既有 1.5 秒状态轮询，避免 HTTP/1.1 连接占满后“更多”请求挂起。Assistant 定向测试 106/106（含连续两次每次加 5 条及 SSE 上限）、Playwright 助手 E2E 4/4、Portal typecheck/lint/Vite 构建通过。本地 G1 API 连续读取 3 页共 15 条，页大小均为 5、顺序正确且无重复；Postgres 分页集成测试因未配置 `CH_TEST_DATABASE_URL` 跳过。
 
 ## 交付
 
-通过后等待 G2，随后 B30。 只汇报本地位置、版本、验证及未完成项；不得外发文件。已有实现通过本任务验证可直接复用，不为勾选任务而重写。
+本任务完成，等待 G2，随后 B30。只汇报本地位置、版本、验证及未完成项；不得外发文件。Postgres 集成测试因 `CH_TEST_DATABASE_URL` 未配置而按项目约定跳过；`make it` 中 OpenSandbox 集成也因未配置服务地址而跳过。Portal Vite 生产构建成功；`npm run build` 后续 mobile 构建因 `web/mobile` 未安装 React/lucide-react/vitest 依赖而未完成。
 

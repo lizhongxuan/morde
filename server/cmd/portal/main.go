@@ -326,6 +326,9 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model gateway: %w", err)
 	}
+	if err := modelGateway.SetConversationSummarySealer(sealer); err != nil {
+		return fmt.Errorf("initialize conversation summary model encryption: %w", err)
+	}
 	modelUsageAdmin, err := app.NewModelUsageAdminService(store)
 	if err != nil {
 		return fmt.Errorf("initialize model usage admin: %w", err)
@@ -652,6 +655,7 @@ func serve(ctx context.Context, configPath string) error {
 	var executionControlService api.ExecutionControlService
 	var taskWorker *worker.TaskWorker
 	var routeWorker *worker.ConversationRouteWorker
+	var taskAgentStopReconciler worker.TaskAgentStopReconciler
 	if cfg.CloudDSH.Enabled {
 		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
 		if err != nil {
@@ -665,18 +669,20 @@ func serve(ctx context.Context, configPath string) error {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
 		}
 		taskWorker = cloudDSHWorkers.taskWorker
+		taskAgentStopReconciler = cloudDSHWorkers.accountRuntimes
 		coordinatorCheckpoints, err := app.NewConversationCoordinatorCheckpointService(store, sealer)
 		if err != nil {
 			return err
 		}
 		coordinator, err := worker.NewCloudDSHConversationCoordinator(worker.CloudDSHConversationCoordinatorOptions{
-			AccountRuntimes: cloudDSHWorkers.accountRuntimes, Models: modelGateway, Checkpoints: coordinatorCheckpoints,
+			AccountRuntimes: cloudDSHWorkers.accountRuntimes, Models: modelGateway, Checkpoints: coordinatorCheckpoints, SummaryStore: store,
 		})
 		if err != nil {
 			return err
 		}
 		routeWorker, err = worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
 			Queue: store, Actions: store, Models: coordinator, WorkerID: workerSuffix + "-route",
+			SummaryStore: store, SummaryInputs: store, SummarySealer: sealer,
 			LeaseDuration: 2 * time.Minute, PollInterval: 500 * time.Millisecond,
 			MaxConcurrent: min(cfg.CloudDSH.MaxConcurrentTasks, 16), Logger: logger,
 		})
@@ -691,7 +697,8 @@ func serve(ctx context.Context, configPath string) error {
 	taskStopWorker, err := worker.NewTaskStopWorker(worker.TaskStopWorkerOptions{
 		Store: store, Executor: runtimeControl, WorkerID: workerSuffix + "-stop",
 		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond,
-		OperationTimeout: 10 * time.Second, RetryAfter: time.Second, MCPRuntimeStopper: mcpRuntimeTools, Logger: logger,
+		OperationTimeout: 10 * time.Second, RetryAfter: time.Second, MCPRuntimeStopper: mcpRuntimeTools,
+		TaskAgentStopper: taskAgentStopReconciler, Logger: logger,
 	})
 	if err != nil {
 		return err
@@ -721,7 +728,8 @@ func serve(ctx context.Context, configPath string) error {
 		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
-		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskObservationTickets: tasks, Conversations: conversations,
+		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskFileFetch: tasks,
+		TaskObservationTickets: tasks, Conversations: conversations,
 		ProjectConversations:           projectConversations,
 		ProjectConversationAttachments: projectConversationAttachments,
 		ProjectWorkItems:               projectWorkItems,
@@ -811,7 +819,34 @@ func serve(ctx context.Context, configPath string) error {
 	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
 	defer stopPersonalCleanup()
 	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, tasks, logger)
+	fileFetchCleanupCtx, stopFileFetchCleanup := context.WithCancel(ctx)
+	defer stopFileFetchCleanup()
+	go runTaskFileFetchCleanup(fileFetchCleanupCtx, tasks, logger)
 	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+}
+
+func runTaskFileFetchCleanup(ctx context.Context, tasks *app.TaskService, logger *zap.Logger) {
+	ticker := time.NewTicker(app.TaskFileFetchCleanupInterval)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if count, err := tasks.CleanupExpiredTaskFileFetches(cleanupCtx, time.Now().UTC(), app.TaskFileFetchCleanupBatch); err != nil {
+			if logger != nil {
+				logger.Warn("Task file fetch cleanup failed", zap.Error(err))
+			}
+		} else if count > 0 && logger != nil {
+			logger.Info("Task file fetch cleanup completed", zap.Int32("records", count))
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService,
@@ -944,7 +979,8 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 		return nil, err
 	}
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
-		SupervisorID: cfg.SupervisorID, AccountRuntimes: accountRuntimes, Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools,
+		SupervisorID: cfg.SupervisorID, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
+		Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools,
 		Children: childSessions, Completion: tools, RevisionStops: store, TextStreams: store, ProjectContexts: store,
 	})
 	if err != nil {

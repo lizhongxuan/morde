@@ -377,6 +377,398 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The restored task source should contain the cloud reply text.")
     }
 
+    @MainActor
+    func testC20PortalConcurrentResultReviewPersistsAcrossAppRestart() async throws {
+        guard let username = ProcessInfo.processInfo.environment["MORDE_C20_TEST_USERNAME"],
+              !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let password = ProcessInfo.processInfo.environment["MORDE_C20_TEST_PASSWORD"],
+              !password.isEmpty else {
+            throw XCTSkip("Set local synthetic C20 credentials for the Portal acceptance test.")
+        }
+
+        let configuredOrigin = ProcessInfo.processInfo.environment["MORDE_C20_PORTAL_ORIGIN"]
+            ?? "http://127.0.0.1:24941"
+        guard configuredOrigin == configuredOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
+              var components = URLComponents(string: configuredOrigin),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host?.lowercased(), ["127.0.0.1", "localhost"].contains(host),
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              components.port.map({ (1...65_535).contains($0) }) ?? true,
+              components.url != nil else {
+            XCTFail("The C20 Portal acceptance origin must be a local loopback origin.")
+            return
+        }
+        components.scheme = scheme
+        components.host = host
+        components.path = ""
+        let portalOrigin = components.string!
+        let portalBaseURL = URL(string: portalOrigin)!
+        let serverArguments = ["-morde.server", portalOrigin, "-AppleLanguages", "(zh-Hans)"]
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.timeoutIntervalForRequest = 30
+        let portalSession = URLSession(configuration: sessionConfiguration)
+        defer { portalSession.invalidateAndCancel() }
+
+        func portalJSON(_ path: String, method: String = "GET", bearerCredential: String? = nil,
+                        headers: [String: String] = [:], requestBody: [String: Any]? = nil,
+                        expectedStatus: Int = 200) async throws -> [String: Any] {
+            guard let url = URL(string: path, relativeTo: portalBaseURL)?.absoluteURL else {
+                throw URLError(.badURL)
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            if method != "GET" { request.setValue(portalOrigin, forHTTPHeaderField: "Origin") }
+            if let bearerCredential {
+                request.setValue("Bearer \(bearerCredential)", forHTTPHeaderField: "Authorization")
+            }
+            for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+            if let requestBody {
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+            }
+            let (data, response) = try await portalSession.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == expectedStatus,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw URLError(.cannotParseResponse)
+            }
+            return object
+        }
+
+        let capabilities = try await portalJSON("/api/capabilities")
+        guard let serviceInstanceID = capabilities["service_instance_id"] as? String,
+              let features = capabilities["supported_features"] as? [String],
+              ["task_api", "conversation_auto_routing_v1"].allSatisfy(features.contains) else {
+            XCTFail("The local Portal must expose Task API and conversation auto-routing.")
+            return
+        }
+        let clientInstanceID = UUID().uuidString.lowercased()
+        let login = try await portalJSON("/api/auth/client-login", method: "POST",
+            headers: ["Idempotency-Key": UUID().uuidString], requestBody: [
+                "name": username,
+                "password": password,
+                "platform": "ios",
+                "display_name": "C20 simulator \(clientInstanceID.prefix(8))",
+                "client_instance_id": clientInstanceID,
+                "attempt_generation": 1,
+            ])
+        guard let credential = login["client_credential"] as? String,
+              let user = login["user"] as? [String: Any],
+              let actorID = user["id"] as? String,
+              !credential.isEmpty, !actorID.isEmpty else {
+            XCTFail("The local synthetic account must support a second iOS installation for server readback.")
+            return
+        }
+        let webSession = try await portalJSON("/api/auth/client-web-session", method: "POST", bearerCredential: credential)
+        guard let webCredential = webSession["web_session_credential"] as? String, !webCredential.isEmpty else {
+            XCTFail("The local synthetic iOS account must support its Portal web session.")
+            return
+        }
+        let portalCookie = "ch_portal=\(webCredential)"
+        let executionHeaders = ["Cookie": portalCookie]
+        let execution = try await portalJSON("/api/execution", headers: executionHeaders)
+        if execution["state"] as? String != "enabled" {
+            guard let epoch = (execution["epoch"] as? NSNumber)?.int64Value, epoch > 0 else {
+                XCTFail("The local synthetic account must expose its execution-control epoch.")
+                return
+            }
+            let enabledExecution = try await portalJSON("/api/execution/enable", method: "POST", headers: [
+                "Cookie": portalCookie,
+                "Idempotency-Key": UUID().uuidString,
+            ], requestBody: ["expected_epoch": epoch])
+            XCTAssertEqual(enabledExecution["state"] as? String, "enabled",
+                           "The C20 test must enable its synthetic account through the Portal control API.")
+        }
+        let scopedHeaders = [
+            "X-Morde-Actor-ID": actorID,
+            "X-Morde-Service-Instance-ID": serviceInstanceID,
+        ]
+        let ensuredMainConversation = try await portalJSON("/api/me/main-conversation/ensure", method: "POST",
+            bearerCredential: credential, headers: ["Idempotency-Key": UUID().uuidString])
+        let mainConversation = try await portalJSON("/api/me/main-conversation", bearerCredential: credential)
+        guard ensuredMainConversation["status"] as? String == "ready",
+              mainConversation["status"] as? String == "ready",
+              let conversationID = mainConversation["conversation_id"] as? String,
+              !conversationID.isEmpty,
+              ensuredMainConversation["conversation_id"] as? String == conversationID else {
+            XCTFail("The synthetic account needs a persisted ready main conversation.")
+            return
+        }
+        let historyPath = "/api/conversations/\(conversationID)/messages?limit=100"
+
+        func history() async throws -> [[String: Any]] {
+            let response = try await portalJSON(historyPath, bearerCredential: credential, headers: scopedHeaders)
+            return response["items"] as? [[String: Any]] ?? []
+        }
+        func task(_ taskID: String) async throws -> [String: Any] {
+            try await portalJSON("/api/tasks/\(taskID)", bearerCredential: credential, headers: scopedHeaders)
+        }
+        func waitForTaskID(messageID: String) async throws -> String {
+            for _ in 0..<90 {
+                let response = try await portalJSON("\(historyPath)&client_message_id=\(messageID)",
+                    bearerCredential: credential, headers: scopedHeaders)
+                let items = response["items"] as? [[String: Any]] ?? []
+                if let message = items.first(where: { $0["client_message_id"] as? String == messageID }) {
+                    if message["routing_status"] as? String == "failed" {
+                        let reason = message["routing_failure_reason"] as? String ?? "unknown"
+                        throw NSError(domain: "Morde C20 Portal routing", code: 1,
+                                      userInfo: [NSLocalizedDescriptionKey: "Conversation routing failed: \(reason)"])
+                    }
+                    if let taskID = message["task_id"] as? String, !taskID.isEmpty { return taskID }
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            throw URLError(.timedOut)
+        }
+        func waitForTask(_ taskID: String, matches: ([String: Any]) -> Bool) async throws -> [String: Any] {
+            for _ in 0..<180 {
+                let current = try await task(taskID)
+                if matches(current) { return current }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            throw URLError(.timedOut)
+        }
+        func number(_ value: Any?) -> Int64? { (value as? NSNumber)?.int64Value }
+        func submitFromChat(_ app: XCUIApplication, _ content: String, targetTaskID: String? = nil,
+                            selectTarget: Bool = true) async throws -> String {
+            if let targetTaskID, selectTarget { selectChatTaskTarget(app, taskID: targetTaskID) }
+            let composer = app.textFields["morde.chat.composer"]
+            XCTAssertTrue(composer.waitForExistence(timeout: 20))
+            composer.tap()
+            composer.typeText(content)
+            let submit: XCUIElement
+            if targetTaskID != nil {
+                let enqueue = app.buttons["morde.chat.enqueueTask"]
+                XCTAssertTrue(enqueue.waitForExistence(timeout: 10),
+                              "A revision must be submitted to the selected active Task.")
+                XCTAssertTrue(enqueue.isEnabled)
+                submit = enqueue
+            } else {
+                submit = app.buttons["morde.task.send"]
+                XCTAssertTrue(submit.waitForExistence(timeout: 15))
+            }
+            XCTAssertTrue(submit.isEnabled)
+            submit.tap()
+            let message = app.staticTexts.matching(NSPredicate(format: "label == %@", content)).firstMatch
+            if !message.waitForExistence(timeout: 5) {
+                let transcript = app.scrollViews["morde.chat.transcript"]
+                for _ in 0..<4 where !message.exists {
+                    transcript.swipeDown()
+                    _ = message.waitForExistence(timeout: 3)
+                }
+            }
+            XCTAssertTrue(message.exists, "The Portal conversation should show the submitted message.")
+            let prefix = "morde.chat.message.content."
+            if message.identifier.hasPrefix(prefix) {
+                return String(message.identifier.dropFirst(prefix.count))
+            }
+            for _ in 0..<10 {
+                if let matched = try await history().first(where: { $0["content"] as? String == content }),
+                   let messageID = matched["client_message_id"] as? String, !messageID.isEmpty { return messageID }
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
+            throw URLError(.cannotParseResponse)
+        }
+
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = serverArguments
+        app.launch()
+        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu")).firstMatch
+        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
+        if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
+        let usernameField = app.textFields["morde.auth.username"]
+        XCTAssertTrue(usernameField.waitForExistence(timeout: 15))
+        usernameField.tap()
+        usernameField.typeText(username)
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        passwordField.tap()
+        passwordField.typeText(password)
+        app.buttons["morde.auth.submit"].tap()
+        let composer = app.textFields["morde.chat.composer"]
+        let chatTab = app.buttons["morde.nav.tab.chat"]
+        if !composer.waitForExistence(timeout: 5), chatTab.waitForExistence(timeout: 10) { chatTab.tap() }
+        XCTAssertTrue(composer.waitForExistence(timeout: 30), "The local Portal login should open chat.")
+
+        let runID = UUID().uuidString.lowercased()
+        let startA = "C20-A-HOLD \(runID): Start a long-running task and delegate one short result to a child agent. Keep the task active until I revise it."
+        let startB = "C20-B-HOLD \(runID): Start an independent long-running task with its own child agent; do not modify Task A."
+        let reviseA = "C20-A-REV2 \(runID): Revise Task A to include the latest instruction \(runID), then finish that revision."
+        let messageA = try await submitFromChat(app, startA)
+        let taskAID = try await waitForTaskID(messageID: messageA)
+        let taskAStarted = try await waitForTask(taskAID) { $0["status"] as? String == "running" }
+        let initialDesiredRevision = try XCTUnwrap(number(taskAStarted["desired_revision"]))
+        XCTAssertEqual(taskAStarted["conversation_id"] as? String, conversationID)
+        print("C20_G2_GATE A_RUNNING task=\(taskAID) desired_revision=\(initialDesiredRevision) marker=C20-A-HOLD")
+
+        let messageB = try await submitFromChat(app, startB)
+        let taskBID = try await waitForTaskID(messageID: messageB)
+        XCTAssertNotEqual(taskBID, taskAID, "B must be an independent Task in the same conversation.")
+        let taskBStarted = try await waitForTask(taskBID) { $0["status"] as? String == "waiting_user" }
+        XCTAssertEqual(taskBStarted["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(taskBStarted["status"] as? String, "waiting_user",
+                       "The synthetic B task must wait at a durable clarification before it is stopped.")
+        let taskAWhileBStarts = try await task(taskAID)
+        XCTAssertEqual(taskAWhileBStarts["status"] as? String, "running",
+                       "A must still be running when B starts.")
+        print("C20_G2_GATE A_B_ACTIVE task_a=\(taskAID) task_b=\(taskBID) status_b=waiting_user marker=C20-B-HOLD")
+
+        selectChatTaskTarget(app, taskID: taskAID)
+        let taskAReadyForRevision = try await waitForTask(taskAID) {
+            guard $0["status"] as? String == "running",
+                  let jobs = $0["child_jobs"] as? [[String: Any]], !jobs.isEmpty else { return false }
+            return jobs.contains { $0["status"] as? String == "succeeded" }
+        }
+        XCTAssertEqual(taskAReadyForRevision["status"] as? String, "running",
+                       "The completed initial child must leave A active before its revision.")
+        let revisionMessage = try await submitFromChat(app, reviseA, targetTaskID: taskAID, selectTarget: false)
+        let revisedA = try await waitForTask(taskAID) {
+            (number($0["desired_revision"]) ?? initialDesiredRevision) > initialDesiredRevision &&
+                $0["status"] as? String == "running"
+        }
+        XCTAssertEqual(revisedA["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(revisedA["status"] as? String, "running",
+                       "The revised A Task must remain active while the held child work is pending.")
+        let routedRevisionTaskID = try await waitForTaskID(messageID: revisionMessage)
+        XCTAssertEqual(routedRevisionTaskID, taskAID,
+                       "The revision message must stay attached to Task A.")
+        print("C20_G2_GATE A_REVISED task=\(taskAID) desired_revision=\(number(revisedA["desired_revision"]) ?? 0) marker=C20-A-REV2")
+
+        assertChatLongPressMenuOffersStopTask(app, taskID: taskBID)
+        let stopB = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", taskBID)).firstMatch
+        XCTAssertTrue(stopB.waitForExistence(timeout: 5))
+        stopB.tap()
+        let stoppingB = try await waitForTask(taskBID) {
+            ["cancelling", "cancelled"].contains($0["status"] as? String ?? "")
+        }
+        print("C20_G2_RELEASE B marker=C20-B-HOLD task=\(taskBID) status=\(stoppingB["status"] as? String ?? "unknown")")
+        _ = try await waitForTask(taskBID) { $0["status"] as? String == "cancelled" }
+        var taskAAfterStop = try await task(taskAID)
+        XCTAssertEqual(taskAAfterStop["status"] as? String, "running",
+                       "Stopping B must leave A's execution tree alone.")
+        let taskAWithChild = try await waitForTask(taskAID) {
+            let requiredRevision = number($0["desired_revision"]) ?? Int64.max
+            guard let jobs = $0["child_jobs"] as? [[String: Any]] else { return false }
+            return jobs.contains {
+                $0["status"] as? String == "succeeded" &&
+                    (number($0["task_revision"]) ?? -1) >= requiredRevision
+            }
+        }
+        let successfulChildJob = try XCTUnwrap((taskAWithChild["child_jobs"] as? [[String: Any]])?.first {
+            $0["status"] as? String == "succeeded" &&
+                (number($0["task_revision"]) ?? -1) >= (number(taskAWithChild["desired_revision"]) ?? Int64.max)
+        })
+        let childJobID = try XCTUnwrap(successfulChildJob["job_id"] as? String)
+        taskAAfterStop = try await task(taskAID)
+        XCTAssertEqual(taskAAfterStop["status"] as? String, "running",
+                       "A must stay running after its child finishes and before release.")
+        print("C20_G2_RELEASE A marker=C20-A-REV2 task=\(taskAID) status=\(taskAAfterStop["status"] as? String ?? "unknown") desired_revision=\(number(taskAAfterStop["desired_revision"]) ?? 0) child_job=succeeded")
+
+        let publishedA = try await waitForTask(taskAID) {
+            guard let review = $0["result_review"] as? [String: Any] else { return false }
+            return review["state"] as? String == "published" &&
+                (review["reply_message_id"] as? String)?.isEmpty == false
+        }
+        guard let review = publishedA["result_review"] as? [String: Any],
+              let sourceTaskID = review["source_task_id"] as? String,
+              let sourceRevision = number(review["source_task_revision"]),
+              let sourceSequence = number(review["source_event_sequence"]),
+              let replyMessageID = review["reply_message_id"] as? String else {
+            XCTFail("Published K2 result review must identify the source revision, event, and reply.")
+            return
+        }
+        let currentRevision = try XCTUnwrap(number(publishedA["current_revision"]))
+        let desiredRevision = try XCTUnwrap(number(publishedA["desired_revision"]))
+        XCTAssertGreaterThan(desiredRevision, initialDesiredRevision,
+                             "The Task must retain the newer requested revision.")
+        XCTAssertGreaterThanOrEqual(currentRevision, desiredRevision,
+                                     "The result review must come from the latest requested revision.")
+        XCTAssertEqual(sourceTaskID, taskAID)
+        XCTAssertEqual(sourceRevision, currentRevision,
+                       "The coordinator reply must cite the Task A revision that completed.")
+        XCTAssertGreaterThanOrEqual(sourceRevision, desiredRevision)
+        XCTAssertTrue((publishedA["child_jobs"] as? [[String: Any]])?.contains {
+            $0["job_id"] as? String == childJobID && $0["status"] as? String == "succeeded"
+        } == true, "Task A must retain the successful child result through publication.")
+        var finalHistory = try await history()
+        var replyMatches = finalHistory.filter { $0["id"] as? String == replyMessageID }
+        for _ in 0..<30 where replyMatches.count != 1 {
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            finalHistory = try await history()
+            replyMatches = finalHistory.filter { $0["id"] as? String == replyMessageID }
+        }
+        XCTAssertEqual(replyMatches.count, 1, "The result review must publish exactly one final assistant message.")
+        let reply = try XCTUnwrap(replyMatches.first)
+        XCTAssertEqual(reply["role"] as? String, "assistant")
+        let replyText = try XCTUnwrap(reply["content"] as? String)
+        let sources = reply["sources"] as? [[String: Any]] ?? []
+        XCTAssertTrue(sources.contains {
+            $0["task_id"] as? String == sourceTaskID &&
+            number($0["task_revision"]) == sourceRevision &&
+            number($0["event_sequence"]) == sourceSequence
+        }, "The final reply must preserve the K2 task, revision, and event source.")
+        for messageID in [messageA, messageB, revisionMessage] {
+            XCTAssertEqual(finalHistory.filter { $0["client_message_id"] as? String == messageID }.count, 1,
+                           "Each iOS client message should be persisted once.")
+        }
+
+        app.terminate()
+        app.launchArguments = serverArguments
+        app.launch()
+        XCTAssertTrue(composer.waitForExistence(timeout: 40), "The signed-in iOS app should restore the same chat.")
+        let restoredA = app.staticTexts.matching(NSPredicate(format: "label == %@", startA))
+        let restoredB = app.staticTexts.matching(NSPredicate(format: "label == %@", startB))
+        let restoredRevision = app.staticTexts.matching(NSPredicate(format: "label == %@", reviseA))
+        XCTAssertTrue(restoredA.firstMatch.waitForExistence(timeout: 40))
+        XCTAssertEqual(restoredA.count, 1)
+        XCTAssertEqual(restoredB.count, 1)
+        XCTAssertEqual(restoredRevision.count, 1)
+        let sourceIdentifier = "morde.chat.message.source.\(sourceTaskID).r\(sourceRevision).e\(sourceSequence)"
+        let restoredReply = app.staticTexts.matching(identifier: sourceIdentifier)
+        XCTAssertTrue(restoredReply.firstMatch.waitForExistence(timeout: 60),
+                      "The published result source should be restored from the Portal after app restart.")
+        XCTAssertEqual(restoredReply.count, 1,
+                       "A final task result should not reappear as both a Task snapshot and a published message.")
+        XCTAssertTrue(restoredReply.firstMatch.label.contains("任务 \(taskAID)"))
+        let restoredReplyContent = app.staticTexts.matching(
+            identifier: "morde.chat.message.content.\(replyMessageID)")
+        XCTAssertTrue(restoredReplyContent.firstMatch.waitForExistence(timeout: 60),
+                      "The final coordinator reply should be restored separately from its source card.")
+        XCTAssertEqual(restoredReplyContent.count, 1)
+        XCTAssertTrue(restoredReplyContent.firstMatch.label.contains(replyText))
+
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let taskARow = app.buttons["morde.tasks.row.\(taskAID)"]
+        let taskBRow = app.buttons["morde.tasks.row.\(taskBID)"]
+        XCTAssertTrue(taskARow.waitForExistence(timeout: 30))
+        XCTAssertTrue(taskBRow.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["morde.tasks.row.status.\(taskAID)"].label.contains("已完成"))
+        XCTAssertTrue(app.staticTexts["morde.tasks.row.status.\(taskBID)"].label.contains("已取消"))
+        taskARow.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["morde.task.resultReview"].waitForExistence(timeout: 20),
+                      "The restored K2 task detail should decode and show its published result review.")
+        XCTAssertTrue(app.descendants(matching: .any)["morde.task.childJobs"].exists,
+                      "The restored Task should keep its child job status in the K2 projection.")
+        let completedChildJob = app.descendants(matching: .any)["morde.task.childJob.\(childJobID)"]
+        let taskDetailScroll = app.scrollViews["morde.task.detailScroll"]
+        XCTAssertTrue(taskDetailScroll.waitForExistence(timeout: 10))
+        for _ in 0..<8 where !completedChildJob.exists { taskDetailScroll.swipeUp() }
+        XCTAssertTrue(completedChildJob.waitForExistence(timeout: 15),
+                      "The restored child-job projection should retain the successful child result.")
+        XCTAssertTrue(completedChildJob.label.contains("已完成"))
+        let sourceLine = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@",
+            sourceTaskID, String(sourceSequence))).firstMatch
+        XCTAssertTrue(sourceLine.exists, "Task detail should keep the result's source Task and event sequence.")
+        finalHistory = try await history()
+        XCTAssertEqual(finalHistory.filter { $0["id"] as? String == replyMessageID }.count, 1,
+                       "Reloading the iOS app must not duplicate the published assistant reply on the server.")
+    }
+
     func testMordeDesignNavigationRoutes() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localTaskPagesFixture", "-morde.localExecutionFixture"])

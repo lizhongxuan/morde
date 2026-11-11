@@ -66,6 +66,7 @@ export interface Caller {
   /** Valid only when the service supplied the complete Task and target grant fence. */
   taskContext?: {
     taskID: string
+    taskRevision?: number
     authorizationVersion: number
     targetGrantVersion: number
     operationID: string
@@ -677,6 +678,9 @@ function toDevices(value: unknown): HubDevice[] {
 function toCaller(value: unknown): Caller {
   const d = value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
   const taskID = typeof d.task_id === 'string' && /^q[a-z0-9]{7}$/.test(d.task_id) ? d.task_id : undefined
+  const taskRevision = Number.isSafeInteger(d.task_revision) && (d.task_revision as number) > 0
+    ? d.task_revision as number
+    : undefined
   const authorizationVersion = Number.isSafeInteger(d.authorization_version) && (d.authorization_version as number) > 0
     ? d.authorization_version as number
     : undefined
@@ -687,7 +691,7 @@ function toCaller(value: unknown): Caller {
     ? d.operation_id
     : undefined
   const taskContext = d.kind === 'task' && taskID && authorizationVersion && targetGrantVersion && operationID
-    ? { taskID, authorizationVersion, targetGrantVersion, operationID }
+    ? { taskID, ...(taskRevision ? { taskRevision } : {}), authorizationVersion, targetGrantVersion, operationID }
     : undefined
   return {
     id: String(d.id ?? ''), name: String(d.name ?? ''), kind: String(d.kind ?? ''),

@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 )
 
@@ -46,6 +48,130 @@ func DSHConversationCoordinatorModelCallID(conversationID, messageID, sessionID 
 	}
 	digest := sha256.Sum256([]byte("morde-dsh-coordinator-model-v1\n" + conversationID + "\n" + messageID + "\n" + sessionID + "\n" + strconv.FormatInt(throughSequence, 10)))
 	return "mdl_" + hex.EncodeToString(digest[:]), nil
+}
+
+func (s *ModelGatewayService) CompleteConversationSummaryModel(ctx context.Context, fence ConversationSummaryModelFence,
+	modelID string, request ModelRequest) (ModelResponse, error) {
+	claim := fence.Claim
+	if ctx == nil || !domain.ValidServiceInstanceID(claim.ServiceInstanceID) || !domain.ValidMessageID(claim.Message.ID) ||
+		!domain.ValidConversationID(claim.Message.ConversationID) || !domain.ValidUserID(claim.Message.OwnerID) ||
+		!domain.ValidUserID(claim.Message.ActorID) || claim.Message.Role != conversation.RoleUser || claim.Message.Sequence < 1 ||
+		claim.LeaseOwner == "" || claim.LeaseVersion < 1 || claim.Authorization.Version < 1 ||
+		!domain.ValidOperationID(fence.OperationID) || len(fence.InputSHA256) != sha256.Size ||
+		strings.TrimSpace(fence.LeaseOwner) != fence.LeaseOwner || fence.LeaseOwner == "" || fence.LeaseVersion < 1 ||
+		!dshModelIdentityPattern.MatchString(fence.SessionID) || fence.ThroughSequence < 0 || fence.ThroughSequence > 1<<53-1 ||
+		fence.ContextWindowTokens < 4096 || fence.ContextWindowTokens > 1_000_000 || fence.BaselineVersion < 0 || !domain.ValidModelConnectionID(modelID) ||
+		request.Endpoint != (ModelEndpoint{}) || len(request.Tools) != 0 || request.RequiredTool != "" || len(request.Input) == 0 || request.OnTextDelta != nil {
+		return ModelResponse{}, domain.InvalidArgument("conversation_summary_model_call", "conversation summary model identity is invalid")
+	}
+	claimIdentity, err := ConversationSummaryScopeForClaim(claim)
+	if err != nil {
+		return ModelResponse{}, err
+	}
+	if !validConversationSummaryIdentity(fence.Identity) ||
+		fence.Identity.ServiceInstanceID != claimIdentity.ServiceInstanceID || fence.Identity.OwnerID != claimIdentity.OwnerID ||
+		fence.Identity.ActorID != claimIdentity.ActorID || fence.Identity.ConversationID != claimIdentity.ConversationID ||
+		fence.Identity.ScopeKind != claimIdentity.ScopeKind || fence.Identity.ScopeID != claimIdentity.ScopeID ||
+		fence.Identity.AuthorizationVersion != claimIdentity.AuthorizationVersion ||
+		(fence.Identity.ScopeKind == ConversationSummaryPersonalScope && fence.Identity.ScopeVersion != 0) ||
+		(fence.Identity.ScopeKind == ConversationSummaryProjectScope && fence.Identity.ScopeVersion < 1) {
+		return ModelResponse{}, domain.NewError(domain.CodeConflict, "conversation summary authorization identity changed")
+	}
+	if err := validateGatewayModelInput(request.Input, nil); err != nil {
+		return ModelResponse{}, domain.InvalidArgument("conversation_summary_model_call", "conversation summary model input is invalid")
+	}
+	for _, input := range request.Input {
+		if input.Type != "message" || len(input.Images) != 0 || input.CallID != "" || input.Name != "" || input.Arguments != "" || input.Output != "" {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation summary model call must be text-only and have no tools")
+		}
+		for _, part := range input.Parts {
+			if part.Type == "image" || part.Image != nil {
+				return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation summary model call cannot include images")
+			}
+		}
+	}
+	callID, err := DSHConversationSummaryModelCallID(claim.Message.ConversationID, fence.OperationID, fence.SessionID, fence.ThroughSequence)
+	if err != nil {
+		return ModelResponse{}, err
+	}
+	encoded, err := json.Marshal(struct {
+		ServiceInstanceID   string
+		OwnerID             string
+		ActorID             string
+		ConversationID      string
+		MessageID           string
+		MessageSequence     int64
+		ProjectID           string
+		AuthorizationKind   string
+		AuthorizationID     string
+		InstallationID      string
+		AuthorizationScopes []string
+		Authorization       int64
+		ScopeInputDigest    []byte
+		ScopeKind           string
+		ScopeID             string
+		ScopeVersion        int64
+		OperationID         string
+		BaselineVersion     int64
+		SessionID           string
+		ThroughSequence     int64
+		ModelID             string
+		Request             struct {
+			Instructions    string
+			Input           []ModelInput
+			MaxOutputTokens int
+			Temperature     *float64
+			DisableThinking bool
+		}
+	}{claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID,
+		claim.Message.ID, claim.Message.Sequence, claim.Input.ProjectID, claim.Authorization.Kind, claim.Authorization.TokenID,
+		claim.Authorization.ClientInstallationID, claim.Authorization.Scopes, claim.Authorization.Version,
+		fence.InputSHA256, fence.Identity.ScopeKind, fence.Identity.ScopeID, fence.Identity.ScopeVersion,
+		fence.OperationID, fence.BaselineVersion, fence.SessionID, fence.ThroughSequence, modelID,
+		struct {
+			Instructions    string
+			Input           []ModelInput
+			MaxOutputTokens int
+			Temperature     *float64
+			DisableThinking bool
+		}{request.Instructions, request.Input, request.MaxOutputTokens, request.Temperature, request.DisableThinking}})
+	if err != nil {
+		return ModelResponse{}, domain.InvalidArgument("conversation_summary_model_call", "conversation summary model request cannot be encoded")
+	}
+	principal := identity.Principal{UserID: claim.Message.ActorID, Kind: identity.Kind(claim.Authorization.Kind),
+		TokenID: claim.Authorization.TokenID, ClientInstallationID: claim.Authorization.ClientInstallationID}
+	for _, scope := range claim.Authorization.Scopes {
+		principal.Scopes = append(principal.Scopes, identity.Scope(scope))
+	}
+	return s.Complete(ctx, ModelCall{Source: ModelCallCompaction, Principal: principal, Summary: &fence,
+		ModelID: modelID, CallID: callID, RawRequest: encoded, Request: request})
+}
+
+func (s *ModelGatewayService) ResolveConversationSummaryModel(ctx context.Context, claim ConversationRouteClaim) (string, int, error) {
+	modelID, err := s.ResolveConversationRouteModel(ctx, claim)
+	if err != nil {
+		return "", 0, err
+	}
+	endpoint, err := s.models.ResolveGatewayEndpoint(ctx, claim.Message.ActorID, modelID, false, false)
+	if err != nil {
+		return "", 0, err
+	}
+	if endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > 1_000_000 {
+		return "", 0, domain.NewError(domain.CodeUnsupported, "selected model context capacity is unavailable")
+	}
+	return modelID, *endpoint.ContextWindowTokens, nil
+}
+
+func (s *ModelGatewayService) CompleteConversationSummaryDSHModel(ctx context.Context, fence ConversationSummaryModelFence,
+	modelID string, raw json.RawMessage) (ModelResponse, error) {
+	if len(raw) == 0 || len(raw) > 1<<20 {
+		return ModelResponse{}, domain.NewError(domain.CodeResultTooLarge, "conversation summary model request exceeds its limit")
+	}
+	request, err := parseDSHModelRequest(ctx, ModelTaskFence{}, modelID, raw, nil)
+	if err != nil {
+		return ModelResponse{}, err
+	}
+	return s.CompleteConversationSummaryModel(ctx, fence, modelID, request)
 }
 
 // ResolveConversationRouteModel selects under the current message lease and

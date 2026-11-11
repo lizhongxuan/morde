@@ -5,12 +5,13 @@ FROM ${NODE_IMAGE} AS build
 
 WORKDIR /opt/morde-cloud-runtime
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY bin.mjs ./bin.mjs
 COPY bin-account.mjs ./bin-account.mjs
 COPY src ./src
+COPY vendor ./vendor
 COPY test ./test
-RUN npm test
+RUN npm test && npm prune --omit=dev --ignore-scripts --no-audit --no-fund
 
 FROM ${RUNTIME_IMAGE} AS runtime
 
@@ -22,6 +23,7 @@ COPY --from=build --chown=65532:65532 /opt/morde-cloud-runtime/node_modules ./no
 COPY --from=build --chown=65532:65532 /opt/morde-cloud-runtime/bin.mjs ./bin.mjs
 COPY --from=build --chown=65532:65532 /opt/morde-cloud-runtime/bin-account.mjs ./bin-account.mjs
 COPY --from=build --chown=65532:65532 /opt/morde-cloud-runtime/src ./src
+COPY --from=build --chown=65532:65532 /opt/morde-cloud-runtime/vendor/deepseek-harness/packages/compaction/compaction-basic/dist ./vendor/deepseek-harness/packages/compaction/compaction-basic/dist
 COPY --chown=65532:65532 smoke-account-runtime.mjs ./smoke-account-runtime.mjs
 
 USER 65532:65532

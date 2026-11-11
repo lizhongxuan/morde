@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router';
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { ConversationDeliveryStatus } from '../app/api';
 import { readK2TaskProjection } from '../app/k2-task-projection';
@@ -16,17 +16,19 @@ import { MessageReceiptOrder } from '../app/message-receipt-order';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
 import { ApiError } from '../api/client';
 import { useAuth } from '../app/auth';
-import { formatDate, hostStateLabel } from '../app/format';
+import { formatBytes, formatDate, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
-import { AssistantReplySpeech } from '../components/AssistantReplySpeech';
 import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { ChatMarkdown } from '../components/ChatMarkdown';
+import { MordeIcon } from '../components/MordeIcon';
 import { sha256Hex } from './personal-data-store';
 import { extractAssistantPDFText } from './assistant-pdf';
 
 type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items'][number];
 type ConversationMessage = Awaited<ReturnType<typeof portalApi.conversationMessages>>['items'][number];
+type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
+type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type WorkspaceBinding = Host['workspaces'][number];
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
@@ -197,10 +199,20 @@ export function mergeTaskAssistantMessage(items: AssistantDisplayMessage[], task
 function mergeTaskAssistantMessages(items: ConversationMessage[], tasks: Task[]): AssistantDisplayMessage[] {
   const initial: AssistantDisplayMessage[] = items.map((message) => message.output_status
     ? { ...message, snapshotStatus: message.output_status } : message);
-  return sortAssistantMessages(tasks.reduce<AssistantDisplayMessage[]>((messages, task) => mergeTaskAssistantMessage(messages, task), initial));
+  return tasks.reduce<AssistantDisplayMessage[]>((current, task) => mergeTaskAssistantMessage(current, task), initial);
 }
 
 const terminalTaskStatuses = new Set<Task['status']>(['completed', 'failed', 'cancelled']);
+const activeTaskFileFetchStatuses = new Set<TaskFileFetch['status']>(['queued', 'waiting_device', 'transferring', 'verifying', 'cancelling']);
+const taskFileFetchStatusLabel: Record<TaskFileFetch['status'], string> = {
+  queued: '排队中', waiting_device: '等待设备', transferring: '正在传输', verifying: '正在核验', completed: '已完成',
+  cancelling: '正在取消', cancelled: '已取消', failed: '失败',
+};
+const taskFileFetchContentStateLabel: Record<TaskFileFetch['content_state'], string> = {
+  none: '无服务端副本', retained: '服务端副本保留中', deleted: '服务端副本已删除', expired: '服务端副本已到期',
+};
+// shortcut: stream four tasks per tab; the rest use 1.5s snapshot polling until task events are multiplexed.
+const maxTaskEventStreams = 4;
 function resolveTaskSnapshotStatus(task: Task | undefined, status: AssistantDisplayMessage['snapshotStatus']): AssistantDisplayMessage['snapshotStatus'] {
   if (status === 'streaming' && task && terminalTaskStatuses.has(task.status)) {
     return task.status === 'completed' ? 'completed' : 'interrupted';
@@ -223,7 +235,7 @@ function workspaceBindingReady(binding: WorkspaceBinding): boolean {
     binding.applied_revision === binding.desired_revision && binding.applied_revision === binding.workspace.revision;
 }
 
-function taskTargetText(task: Task, hosts: Host[]): string {
+function taskTargetText(task: TaskSummary, hosts: Host[]): string {
   const host = task.host_id ? hosts.find((item) => item.id === task.host_id) : undefined;
   const computer = task.host_id ? host ? `${host.name || host.id}（${hostStateLabel[host.state] || host.state}）` : `主机 ${task.host_id}（当前不可访问）` : '无电脑目标';
   const binding = task.workspace_id ? host?.workspaces.find((item) => item.workspace.id === task.workspace_id) : undefined;
@@ -374,6 +386,7 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
         if (!disposed) {
           cursor.current = snapshot.event_sequence;
           void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
+          void client.invalidateQueries({ queryKey: ['task-file-fetches', task.id] });
           setGeneration((value) => value + 1);
         }
       }).catch(() => {
@@ -402,6 +415,8 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
         cursor.current = value.sequence;
         onState(task.id, 'connected');
         void client.invalidateQueries({ queryKey: ['task', task.id] });
+        void client.invalidateQueries({ queryKey: ['task-file-fetches', task.id] });
+        if (type === 'task.status' || type === 'task.waiting_user') void client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
         if (type === 'task.message' || type === 'task.result' || type === 'task.response') {
           void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
         }
@@ -434,8 +449,12 @@ export function Assistant() {
   const [officePreviews, setOfficePreviews] = useState<Record<string, OfficePreviewState>>({});
   const [preparingAttachmentCount, setPreparingAttachmentCount] = useState(0);
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
-  const [controlTaskID, setControlTaskID] = useState<string | null>(null);
-  const [referenceTaskID, setReferenceTaskID] = useState<string | null>(null);
+  const [taskSupplementDrafts, setTaskSupplementDrafts] = useState<Record<string, string>>({});
+  const [supplementTaskID, setSupplementTaskID] = useState<string | null>(null);
+  const [expandedTaskIDs, setExpandedTaskIDs] = useState<string[]>([]);
+  const [taskPanelOpen, setTaskPanelOpen] = useState(false);
+  const [sideConversationsOpen, setSideConversationsOpen] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [openingTaskID, setOpeningTaskID] = useState('');
   const [taskObservationError, setTaskObservationError] = useState<{ taskID: string; message: string } | null>(null);
   const taskObservationRequest = useRef(false);
@@ -451,12 +470,14 @@ export function Assistant() {
   const ensureMainKey = useRef<{ userID: string; key: string } | null>(null);
   const ensureAttemptedUserID = useRef<string | null>(null);
   const conversationView = useRef<HTMLDivElement>(null);
+  const taskPanelToggle = useRef<HTMLButtonElement>(null);
   const followConversation = useRef(true);
   useEffect(() => () => {
     for (const controller of pdfPreparationControllers.current) controller.abort();
     pdfPreparationControllers.current.clear();
   }, []);
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
+  const [visibleSideConversationCount, setVisibleSideConversationCount] = useState(5);
   const setTaskEventFeed = useCallback((taskID: string, state: TaskFeedState) => {
     setTaskEventFeeds((current) => current[taskID] === state ? current : { ...current, [taskID]: state });
   }, []);
@@ -464,7 +485,12 @@ export function Assistant() {
   const outbox = useMessageOutbox(user?.id, capabilities.data?.service_instance_id);
   const activeOutboxScope = useRef(outbox.currentScope);
   useLayoutEffect(() => { activeOutboxScope.current = outbox.currentScope; }, [outbox.currentScope]);
-  const conversations = useQuery({ queryKey: ['conversations'], queryFn: () => portalApi.conversations() });
+  const conversations = useInfiniteQuery({
+    queryKey: ['conversations'],
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => portalApi.conversations(pageParam, 5),
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+  });
   const mainConversation = useQuery({
     queryKey: ['main-conversation', user?.id], queryFn: portalApi.mainConversation,
     enabled: Boolean(user), retry: false,
@@ -479,7 +505,9 @@ export function Assistant() {
   });
   const execution = useQuery({ queryKey: ['execution-control'], queryFn: portalApi.execution, refetchInterval: 15000,
     enabled: capabilities.data?.supported_features.includes('cloud_tasks') === true });
-  const conversationsData = conversations.data?.items ?? [];
+  const conversationsData = [...new Map((conversations.data?.pages.flatMap((page) => page.items) ?? [])
+    .map((item) => [item.id, item])).values()]
+    .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at) || right.id.localeCompare(left.id));
   const ensureMainConversation = useMutation({
     mutationFn: portalApi.ensureMainConversation,
     onSuccess: (state) => client.setQueryData(['main-conversation', user?.id], state),
@@ -516,6 +544,13 @@ export function Assistant() {
     queryFn: () => portalApi.conversation(conversationID!),
     enabled: Boolean(conversationID) && !conversationsData.some((item) => item.id === conversationID),
   });
+  const mainConversationDetail = useQuery({
+    queryKey: ['conversation', mainConversationID],
+    queryFn: () => portalApi.conversation(mainConversationID!),
+    enabled: Boolean(mainConversationID) && !conversationsData.some((item) => item.id === mainConversationID),
+  });
+  const mainConversationItem = conversationsData.find((item) => item.id === mainConversationID) ?? mainConversationDetail.data;
+  const sideConversations = conversationsData.filter((item) => item.id !== mainConversationID);
   const messages = useQuery({
     queryKey: ['conversation-messages', conversationID],
     queryFn: () => conversationHistory(conversationID!),
@@ -529,16 +564,52 @@ export function Assistant() {
     enabled: Boolean(conversationID),
     refetchInterval: 5000,
   });
+  const accountTasksEnabled = Boolean(user?.id && capabilities.data?.service_instance_id);
+  const accountTasks = useQuery({
+    queryKey: ['assistant-account-tasks', capabilities.data?.service_instance_id, user?.id],
+    queryFn: () => portalApi.tasks(),
+    enabled: accountTasksEnabled,
+    refetchInterval: 30000,
+  });
+  const accountTaskIDs = accountTasks.data?.items.map((item) => item.id) ?? [];
   const taskIDs = [...new Set([
+    ...accountTaskIDs,
     ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
     ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
   ])];
+  const currentConversationTaskIDs = new Set([
+    ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
+    ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
+  ]);
   const taskQueries = useQueries({ queries: taskIDs.map((id) => ({
     queryKey: ['task', id], queryFn: () => portalApi.task(id),
+    enabled: currentConversationTaskIDs.has(id) || expandedTaskIDs.includes(id),
     refetchInterval: (query: { state: { data: Task | undefined } }) => query.state.data?.result_message_pending ? 1000
-      : query.state.data && terminalTaskStatuses.has(query.state.data.status) ? false : 1500,
+      : query.state.data && terminalTaskStatuses.has(query.state.data.status) ? false
+        : query.state.data && query.state.data.conversation_id !== conversationID ? 5000 : 1500,
   })) });
-  const tasks = taskQueries.flatMap((query) => query.data?.conversation_id === conversationID ? [query.data] : []);
+  const taskFileFetchQueries = useQueries({ queries: taskIDs.map((id, index) => ({
+    queryKey: ['task-file-fetches', id], queryFn: () => portalApi.taskFileFetches(id),
+    enabled: currentConversationTaskIDs.has(id) || expandedTaskIDs.includes(id),
+    refetchInterval: (query: { state: { data: { items: TaskFileFetch[] } | undefined } }) => {
+      const task = taskQueries[index]?.data;
+      return query.state.data?.items.some((item) => activeTaskFileFetchStatuses.has(item.status)) ||
+        (task && !terminalTaskStatuses.has(task.status)) ? 1000 : false;
+    },
+  })) });
+  const allTasks = taskQueries.flatMap((query) => query.data ? [query.data] : []);
+  const tasks = allTasks.filter((task) => task.conversation_id === conversationID);
+  const allTasksByID = new Map(allTasks.map((task) => [task.id, task]));
+  const accountTaskByID = new Map((accountTasks.data?.items ?? []).map((item) => [item.id, item]));
+  const taskPanelIDs = [...new Set([...accountTaskIDs,
+    ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
+    ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
+  ])];
+  const taskPanelTasks = taskPanelIDs.flatMap((id) => {
+    const summary = accountTaskByID.get(id) ?? conversationTasks.data?.items.find((item) => item.id === id) ?? allTasksByID.get(id);
+    return summary ? [summary] : [];
+  });
+  const pendingTaskCount = accountTasks.data?.items.filter((item) => item.status === 'waiting_user').length ?? null;
   const resultsAwaitingMessages = tasks.some((task) => task.result_message_pending || (task.result_message_published &&
     !messages.data?.items.some((message) => message.sources?.some((source) => source.task_id === task.id &&
       source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence))));
@@ -548,9 +619,7 @@ export function Assistant() {
     return () => window.clearInterval(timer);
   }, [client, conversationID, resultsAwaitingMessages]);
   const tasksByID = new Map(tasks.map((task) => [task.id, task]));
-  const activeTasks = tasks.filter((task) => !terminalTaskStatuses.has(task.status));
-  const activeTaskID = controlTaskID && activeTasks.some((task) => task.id === controlTaskID)
-    ? controlTaskID : activeTasks.length === 1 ? activeTasks[0]!.id : null;
+  const activePanelTasks = allTasks.filter((task) => !terminalTaskStatuses.has(task.status));
   const networkReadFailures = [
     { failed: capabilities.isError, error: capabilities.error, retry: () => capabilities.refetch() },
     { failed: conversations.isError, error: conversations.error, retry: () => conversations.refetch() },
@@ -563,6 +632,7 @@ export function Assistant() {
     { failed: Boolean(conversationID) && conversationDetail.isError, error: conversationDetail.error, retry: () => conversationDetail.refetch() },
     { failed: Boolean(conversationID) && messages.isError, error: messages.error, retry: () => messages.refetch() },
     { failed: Boolean(conversationID) && conversationTasks.isError, error: conversationTasks.error, retry: () => conversationTasks.refetch() },
+    { failed: Boolean(user?.id) && accountTasks.isError, error: accountTasks.error, retry: () => accountTasks.refetch() },
     ...taskQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
   ].filter((item) => item.failed && isTransientNetworkError(item.error));
   const showConsolidatedNetworkError = networkReadFailures.length > 1;
@@ -590,7 +660,6 @@ export function Assistant() {
   const hostIsReady = selectedHost?.state === 'running' && selectedHost.control_state === 'ai';
   const workspaceBindings = selectedHost?.workspaces ?? [];
   const selectedBinding = workspaceBindings.find((binding) => binding.workspace.id === workspaceSelection);
-  const activeTask = activeTaskID ? tasksByID.get(activeTaskID) : undefined;
   async function openTaskObservation(task: Task, host: Host) {
     if (taskObservationRequest.current) return;
     const popup = window.open('about:blank', '_blank');
@@ -782,6 +851,7 @@ export function Assistant() {
     onSuccess: async (_response, request) => {
       clearTaskActionKey(request.actionScope, request.key);
       await client.invalidateQueries({ queryKey: ['task', request.taskID] });
+      await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
       notify(request.decision === 'approve' ? '已批准，任务正在恢复。' : '已拒绝，任务正在处理决定。', 'success');
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
@@ -795,6 +865,7 @@ export function Assistant() {
       clearTaskActionKey(request.actionScope, request.key);
       setClarificationAnswers((current) => ({ ...current, [request.taskID]: '' }));
       await client.invalidateQueries({ queryKey: ['task', request.taskID] });
+      await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
       notify('补充信息已提交，任务正在恢复。', 'success');
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
@@ -826,6 +897,7 @@ export function Assistant() {
     onSuccess: async (response, request) => {
       clearTaskActionKey(request.actionScope, request.key);
       await client.invalidateQueries({ queryKey: ['task', request.taskID] });
+      await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
       if (request.action === 'cancel' && response.status === 'cancelled' && response.unsettled_operation_ids.length === 0) {
         notify('服务端已确认任务停止。', 'success');
       } else if (request.action === 'cancel' && response.unsettled_operation_ids.length > 0) {
@@ -835,6 +907,14 @@ export function Assistant() {
       }
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
+  });
+  const deleteTaskFileFetchContent = useMutation({
+    mutationFn: ({ taskID, fetchID }: { taskID: string; fetchID: string }) => portalApi.deleteTaskFileFetchContent(taskID, fetchID),
+    onSuccess: async (_response, request) => {
+      await client.invalidateQueries({ queryKey: ['task-file-fetches', request.taskID] });
+      notify('服务端副本已请求删除，正在核对删除状态。', 'success');
+    },
+    onError: (error) => notify(errorDetails(error).message, 'error'),
   });
 
   const cancelComposerAttachmentPreparation = () => {
@@ -943,7 +1023,6 @@ export function Assistant() {
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
           ...(hostSelection ? { host_id: hostSelection } : {}),
           ...(workspaceSelection ? { workspace_id: workspaceSelection } : {}),
-          ...(referenceTaskID ? { reference_task_id: referenceTaskID } : {}),
           ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
           ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
         },
@@ -961,7 +1040,6 @@ export function Assistant() {
           for (const attachment of attachments) delete next[attachment.id];
           return next;
         });
-        setReferenceTaskID(null);
         followConversation.current = true;
       }
       void sendMessage(entry, false);
@@ -972,14 +1050,47 @@ export function Assistant() {
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
 
-  const submitTaskControl = (action: 'pause' | 'resume' | 'cancel') => {
-    if (!activeTask) return;
-    const actionScope = `${action}:${activeTask.id}`;
-    const expectedCurrentRevision = activeTask.current_revision ?? null;
-    const expectedDesiredRevision = activeTask.desired_revision ?? null;
-    const fingerprint = JSON.stringify({ action, expected_status: activeTask.status,
+  const submitTaskSupplement = (event: FormEvent<HTMLFormElement>, task: Task) => {
+    event.preventDefault();
+    const text = (taskSupplementDrafts[task.id] ?? '').trim();
+    if (savingMessageRef.current || !text) return;
+    if (new TextEncoder().encode(text).length > maxMessageBytes) {
+      notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
+      return;
+    }
+    const id = newIdempotencyKey();
+    savingMessageRef.current = true;
+    setSavingMessage(true);
+    const previous = pendingMessageSave.current.then(async () => {
+      const targetMessages = task.conversation_id === conversationID && messages.data
+        ? messages.data.items : (await conversationHistory(task.conversation_id)).items;
+      const pending: PendingConversationMessage = {
+        actorID: user?.id ?? '',
+        request: { client_message_id: id, content: text, reference_task_id: task.id },
+        conversationID: task.conversation_id,
+        ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
+        attachments: [], status: 'pending', createdAt: Date.now(),
+      };
+      const entry = await outbox.enqueue(pending, latestConversationClientMessageID(targetMessages));
+      if (activeOutboxScope.current === entry.scope) {
+        setTaskSupplementDrafts((current) => ({ ...current, [task.id]: '' }));
+        setSupplementTaskID(null);
+      }
+      void sendMessage(entry, false);
+    }).finally(() => {
+      savingMessageRef.current = false;
+      setSavingMessage(false);
+    });
+    pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
+  };
+
+  const submitTaskControl = (action: 'pause' | 'resume' | 'cancel', task: TaskSummary) => {
+    const actionScope = `${action}:${task.id}`;
+    const expectedCurrentRevision = task.current_revision ?? null;
+    const expectedDesiredRevision = task.desired_revision ?? null;
+    const fingerprint = JSON.stringify({ action, expected_status: task.status,
       current_revision: expectedCurrentRevision, desired_revision: expectedDesiredRevision });
-    taskControl.mutate({ taskID: activeTask.id, action, expectedStatus: activeTask.status,
+    taskControl.mutate({ taskID: task.id, action, expectedStatus: task.status,
       expectedCurrentRevision, expectedDesiredRevision, actionScope,
       key: taskActionKey(actionScope, fingerprint) });
   };
@@ -989,8 +1100,6 @@ export function Assistant() {
     newConversationKey.current = null;
     setConversationID(null);
     setMcpConnectorIDs([]);
-    setControlTaskID(null);
-    setReferenceTaskID(null);
     setContent('');
     setComposerAttachments([]);
     setOfficePreviews({});
@@ -1000,19 +1109,38 @@ export function Assistant() {
     }
   };
 
-  const selectConversation = (item: Conversation) => {
+  const selectConversationID = (id: string) => {
     cancelComposerAttachmentPreparation();
-    setConversationID(item.id);
-    setControlTaskID(null);
-    setReferenceTaskID(null);
+    setConversationID(id);
     setContent('');
     setComposerAttachments([]);
     setOfficePreviews({});
     if (recentConversationKey) {
-      writeRecentConversation(recentConversationKey, item.id);
-      client.setQueryData(['assistant-recent-conversation', recentConversationKey], item.id);
+      writeRecentConversation(recentConversationKey, id);
+      client.setQueryData(['assistant-recent-conversation', recentConversationKey], id);
     }
   };
+  const selectConversation = (item: Conversation) => selectConversationID(item.id);
+  const showMoreSideConversations = async () => {
+    const targetCount = Math.min(sideConversations.length, visibleSideConversationCount) + 5;
+    let result = conversations;
+    let loadedSideCount = sideConversations.length;
+    while (loadedSideCount < targetCount && result.hasNextPage) {
+      result = await conversations.fetchNextPage();
+      loadedSideCount = new Set((result.data?.pages.flatMap((page) => page.items) ?? [])
+        .filter((item) => item.id !== mainConversationID).map((item) => item.id)).size;
+      if (result.isFetchNextPageError) break;
+    }
+    setVisibleSideConversationCount(targetCount);
+  };
+  const renderConversationItem = (item: Conversation, isMain = false) => <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`} key={item.id}>
+    <button type="button" className={`conversation-item ${conversationID === item.id ? 'is-selected' : ''}`}
+      onClick={() => selectConversation(item)}>
+      <strong>{isMain ? '主会话' : item.title || '新对话'}</strong>
+      {item.id === recentConversationID && !isMain && <small>本机最近查看</small>}
+      <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
+    </button>
+  </div>;
 
   const submitClarification = (event: FormEvent<HTMLFormElement>, task: Task) => {
     event.preventDefault();
@@ -1028,8 +1156,21 @@ export function Assistant() {
   const finishedTaskIDs = tasks.filter((task) => terminalTaskStatuses.has(task.status)).map((task) => task.id).join(',');
   useEffect(() => { followConversation.current = true; }, [conversationID]);
   useEffect(() => {
+    if (!taskPanelOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setTaskPanelOpen(false);
+      taskPanelToggle.current?.focus();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [taskPanelOpen]);
+  useEffect(() => {
     const view = conversationView.current;
-    if (view && followConversation.current) view.scrollTop = view.scrollHeight;
+    if (view && followConversation.current) {
+      view.scrollTop = view.scrollHeight;
+      setShowJumpToLatest(false);
+    }
   }, [conversationID, displayMessages.length, latestDisplayMessageContent, outbox.entries.length]);
 
   useEffect(() => {
@@ -1044,8 +1185,6 @@ export function Assistant() {
     navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
   }, [hasNavigationIdea, location.hash, location.pathname, location.search, navigate]);
 
-  const lastMessageByTask = new Map<string, string>();
-  for (const message of displayMessages) if (message.task_id) lastMessageByTask.set(message.task_id, message.id);
   const pendingMessages = outbox.entries.filter(({ message }) => !message.projectID && message.conversationID === conversationID);
   const renderPendingMessage = (entry: MessageOutboxEntry) => {
     const { message, scope } = entry;
@@ -1053,7 +1192,7 @@ export function Assistant() {
     const status = message.status === 'accepted' ? (message.attachments.length ? '消息已发送，附件等待处理' : '消息已发送')
       : message.status === 'sending' ? '正在发送' : message.status === 'unknown' ? '发送结果待确认'
         : message.status === 'failed' ? '发送失败' : '已保存在本机，等待发送';
-    return <article className="chat-message chat-message-user" key={`outbox:${message.request.client_message_id}`}>
+    return <article className="chat-message chat-message-user chat-message-pending" aria-label="你的消息" key={`outbox:${message.request.client_message_id}`}>
       {!alreadyVisible && <><strong className="chat-message-author">你</strong><p>{message.request.content}</p></>}
       <small role="status">{status}{message.error ? `：${message.error}` : ''}</small>
       {message.attachments.length > 0 && <small>附件 · {message.attachments.length}</small>}
@@ -1061,61 +1200,139 @@ export function Assistant() {
         onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' && message.attachments.length ? '重试附件' : '核对并重试'}</button>}
     </article>;
   };
-  const renderTaskActivity = (task: Task) => {
+  const renderTaskActivity = (summary: TaskSummary) => {
+    const task = allTasksByID.get(summary.id);
+    const listItem = task ?? summary;
+    const busy = !terminalTaskStatuses.has(listItem.status);
+    const taskConversation = conversationsData.find((item) => item.id === listItem.conversation_id);
+    const expanded = expandedTaskIDs.includes(listItem.id);
+    const taskQuery = taskQueries[taskIDs.indexOf(listItem.id)];
+    const taskFileFetchQuery = taskFileFetchQueries[taskIDs.indexOf(listItem.id)];
+    if (!task || (!expanded && !currentConversationTaskIDs.has(listItem.id))) return <section className="task-activity task-activity-summary" key={`activity:${listItem.id}`}
+      aria-label={`任务 ${listItem.id} 的工作过程`}>
+      <header className="task-activity-heading">
+        <div><strong>{listItem.objective || `任务 ${listItem.id}`}</strong>
+          <small>{taskConversation?.title || `会话 ${listItem.conversation_id}`} · 任务 {listItem.id}</small></div>
+          <span>服务端状态：{taskStatusLabel[listItem.status]}{listItem.current_revision !== undefined || listItem.desired_revision !== undefined
+          ? ` · 修订 ${listItem.current_revision ?? '—'} / ${listItem.desired_revision ?? '—'}` : ''}</span>
+      </header>
+      {listItem.host_id && <p className="assistant-task-target">当前任务使用：{taskTargetText(listItem, hostItems)}。输入区的目标只影响下一条消息。</p>}
+      <div className="inline-actions task-activity-actions">
+        <button type="button" className="button button-small button-secondary" onClick={() => selectConversationID(listItem.conversation_id)}>打开关联会话</button>
+        <button type="button" className="button button-small button-secondary" aria-expanded={expanded}
+          onClick={() => setExpandedTaskIDs((current) => expanded ? current.filter((id) => id !== listItem.id) : [...current, listItem.id])}>
+          {expanded ? '收起任务详情' : '查看任务详情'}
+        </button>
+        {busy && listItem.status === 'paused' && <button type="button" className="button button-small button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('resume', listItem)}>继续任务</button>}
+        {busy && ['queued', 'running', 'waiting_user'].includes(listItem.status) && <button type="button" className="button button-small button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('pause', listItem)}>暂停任务</button>}
+        {busy && ['queued', 'running', 'waiting_user', 'paused'].includes(listItem.status) && <button type="button" className="button button-small button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('cancel', listItem)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
+      </div>
+      {expanded && taskQuery?.isPending && <p className="muted" role="status">正在读取任务详情…</p>}
+    </section>;
     const k2Read = readK2TaskProjection(task);
     const k2 = k2Read.kind === 'available' ? k2Read.projection : null;
     const review = k2?.result_review ?? null;
-    const busy = !terminalTaskStatuses.has(task.status);
     const currentStep = task.steps.find((step) => step.id === task.current_step);
     const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
     const visibleSteps = task.steps.filter((step) => ['tool', 'subagent', 'verification', 'verify', 'batch_item', 'batch_result', 'progress'].includes(step.kind) &&
       !(task.waiting_reason === 'dsh_recovery_unresolved' && step.status === 'unknown'));
-    const hasReply = displayMessages.some((message) => message.role === 'assistant' && (message.task_id === task.id ||
+    const ownConversationReplyVisible = task.conversation_id === conversationID && displayMessages.some((message) => message.role === 'assistant' && (message.task_id === task.id ||
       message.sources?.some((source) => source.task_id === task.id && source.task_revision === task.assistant_message?.task_revision &&
         source.event_sequence === task.assistant_message?.result_event_sequence)));
     const publishedReplyVisible = Boolean(review?.state === 'published' && review.source_task_id === task.id && review.reply_message_id &&
-      displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
+      (task.conversation_id !== conversationID || displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
         message.sources?.some((source) => source.task_id === review.source_task_id &&
-          source.task_revision === review.source_task_revision && source.event_sequence === review.source_event_sequence)));
-    const canUseLegacyResultAsReply = k2Read.kind === 'legacy';
-    const hasK2Activity = k2Read.kind === 'invalid' || Boolean(k2 && (k2.dependencies.length || k2.child_jobs.length || review || task.result));
+          source.task_revision === review.source_task_revision && source.event_sequence === review.source_event_sequence))));
+    const hasReply = ownConversationReplyVisible || (task.conversation_id !== conversationID && publishedReplyVisible);
     const taskHost = task.host_id ? hostItems.find((host) => host.id === task.host_id) : undefined;
     const browserHandoffRequested = task.waiting_reason === 'clarification' && Boolean(task.clarification_request) && task.steps.some((step) =>
       step.kind === 'tool' && (step.title === 'Run cloud dsh tool: browser_prepare_user_handoff' ||
         step.title === 'Run cloud dsh MCP tool: browser_prepare_user_handoff'));
     const answer = clarificationAnswers[task.id] ?? '';
-    const hasPanel = busy || task.status === 'failed' || task.status === 'cancelled' || visibleSteps.length > 0 ||
-      task.artifacts.length > 0 || task.result_message_pending || (task.result_message_published && !hasReply) ||
-      Boolean(task.host_id || task.pending_request || task.clarification_request || hasK2Activity);
-    return <Fragment key={`activity:${task.id}`}>
-      {task.status === 'completed' && task.result && canUseLegacyResultAsReply && !hasReply && !task.result_message_pending && !task.result_message_published && <article className="chat-message chat-message-assistant">
-        <strong className="chat-message-author">AI 助手</strong><p>{task.result}</p>
-        <AssistantReplySpeech text={task.result} sessionKey={`${conversationID}:${task.id}`} />
-      </article>}
-      {hasPanel && <section className="task-activity" aria-label={`任务 ${task.id} 的工作过程`}>
+    const supplementEntries = outbox.entries.filter(({ message }) => message.conversationID === task.conversation_id &&
+      message.request.reference_task_id === task.id);
+    return <section className="task-activity" key={`activity:${task.id}`} aria-label={`任务 ${task.id} 的工作过程`}>
         <header className="task-activity-heading">
-          <strong>任务 {task.id}</strong>
+          <div><strong>{task.objective || `任务 ${task.id}`}</strong>
+            <small>{taskConversation?.title || `会话 ${task.conversation_id}`} · 任务 {task.id}</small></div>
           <span>服务端状态：{taskStatusLabel[task.status]}{task.current_revision !== undefined || task.desired_revision !== undefined
             ? ` · 修订 ${task.current_revision ?? '—'} / ${task.desired_revision ?? '—'}` : ''}</span>
         </header>
         {(busy || task.status === 'failed' || task.status === 'cancelled' || task.result_message_pending ||
-          (task.result_message_published && !hasReply) || (!hasReply && !task.result)) && <div className="assistant-progress" role={task.status === 'failed' ? 'alert' : 'status'}>
+          (task.result_message_published && !hasReply)) && <div className="assistant-progress" role={task.status === 'failed' ? 'alert' : 'status'}>
           <span>{taskStatusText(task, cloudTasksAvailable)}</span>
           {recoveryMessage && <span>{recoveryMessage}</span>}
           {busy && currentStep?.title && task.waiting_reason !== 'dsh_recovery_unresolved' && currentStep.kind !== 'model' && <span>{stepTitle(currentStep)}</span>}
           {busy && taskEventFeeds[task.id] === 'disconnected' && !showConsolidatedNetworkError && <span>连接中断，正在重连…</span>}
         </div>}
+        <div className="inline-actions task-activity-actions">
+          <button type="button" className="button button-small button-secondary" onClick={() => selectConversationID(task.conversation_id)}>打开关联会话</button>
+          {!currentConversationTaskIDs.has(task.id) && <button type="button" className="button button-small button-secondary"
+            onClick={() => setExpandedTaskIDs((current) => current.filter((id) => id !== task.id))}>收起任务详情</button>}
+        </div>
         {task.host_id && <p className="assistant-task-target">当前任务使用：{taskTargetText(task, hostItems)}。下面的目标选择只影响下一条新消息。</p>}
+        {(taskFileFetchQuery?.isPending || taskFileFetchQuery?.isError || (taskFileFetchQuery?.data?.items.length ?? 0) > 0) &&
+          <section className="task-activity-k2 task-activity-file-fetches" aria-label={`任务 ${task.id} 的文件取回`}>
+            <h4>PC 文件取回</h4>
+            {taskFileFetchQuery?.isPending && <p className="muted" role="status">正在读取文件取回状态…</p>}
+            {taskFileFetchQuery?.isError && <p className="error-inline" role="alert">无法读取文件取回状态：{errorDetails(taskFileFetchQuery.error).message}
+              <button type="button" className="button button-small button-secondary" onClick={() => void taskFileFetchQuery.refetch()}>重试</button>
+            </p>}
+            {taskFileFetchQuery?.data?.items.length ? <ul>{taskFileFetchQuery.data.items.map((item) => {
+              const hasSize = item.size_bytes !== null;
+              const progressValue = hasSize ? Math.min(item.confirmed_bytes, item.size_bytes!) : 0;
+              return <li key={item.fetch_id}>
+                <span><strong>{item.relative_path}</strong><small>{taskFileFetchStatusLabel[item.status]}</small></span>
+                <small>来源设备：{item.source_device_name} · 已确认 {formatBytes(item.confirmed_bytes)}{hasSize ? ` / ${formatBytes(item.size_bytes!)}` : ' / 总大小待确认'}</small>
+                <small>来源版本：{item.source_version ?? '待确认'}</small>
+                {hasSize && item.size_bytes! > 0 && <progress max={item.size_bytes!} value={progressValue}
+                  aria-label={`文件取回进度：${item.relative_path}`} />}
+                <small>服务端副本：{taskFileFetchContentStateLabel[item.content_state]}
+                  {item.expires_at ? ` · 保留到 ${formatDate(item.expires_at)}` : ''}
+                  {item.deleted_at ? ` · 删除于 ${formatDate(item.deleted_at)}` : ''}</small>
+                {item.status === 'completed' && item.content_state === 'retained' && <button type="button" className="button button-small button-secondary"
+                  disabled={deleteTaskFileFetchContent.isPending}
+                  onClick={() => {
+                    if (window.confirm(`确认删除“${item.relative_path}”的服务端副本？删除后无法恢复。`)) {
+                      deleteTaskFileFetchContent.mutate({ taskID: task.id, fetchID: item.fetch_id });
+                    }
+                  }}>删除服务端副本</button>}
+              </li>;
+            })}</ul> : null}
+          </section>}
         {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
           <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
           <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
         </div>}
-        {busy && <div className="inline-actions">
+        {busy && <div className="inline-actions task-activity-actions">
+          {task.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+            onClick={() => submitTaskControl('resume', task)}>继续任务</button>}
+          {['queued', 'running', 'waiting_user'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+            onClick={() => submitTaskControl('pause', task)}>暂停任务</button>}
+          {['queued', 'running', 'waiting_user', 'paused'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+            onClick={() => submitTaskControl('cancel', task)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
           <button type="button" className="button button-secondary"
-            onClick={() => document.getElementById('assistant-content')?.focus()}>继续对话</button>
-          {task.waiting_reason !== 'project_recovery_unavailable' && <button type="button" className="button button-secondary"
-            onClick={() => { setReferenceTaskID(task.id); document.getElementById('assistant-content')?.focus(); }}>补充任务</button>}
+            onClick={() => setSupplementTaskID((current) => current === task.id ? null : task.id)}>
+            {supplementTaskID === task.id ? '收起补充任务' : '补充任务'}
+          </button>
         </div>}
+        {busy && supplementTaskID === task.id && task.waiting_reason !== 'project_recovery_unavailable' && <form className="task-supplement-form"
+          aria-label={`补充任务 ${task.id}`} onSubmit={(event) => submitTaskSupplement(event, task)}>
+          <label htmlFor={`task-supplement-${task.id}`}>补充任务内容</label>
+          <textarea id={`task-supplement-${task.id}`} value={taskSupplementDrafts[task.id] ?? ''} maxLength={maxMessageBytes}
+            onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))}
+            disabled={savingMessage} />
+          <button type="submit" className="button button-primary" disabled={!taskSupplementDrafts[task.id]?.trim() || savingMessage}>发送补充任务</button>
+        </form>}
+        {supplementEntries.map(({ message, scope }) => <div className="task-supplement-status" key={message.request.client_message_id}>
+          <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
+            : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{message.error ? `：${message.error}` : ''}</small>
+          {message.status !== 'sending' && <button type="button" className="button button-small button-secondary"
+            onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' ? '核对消息' : '核对并重试'}</button>}
+        </div>)}
         {visibleSteps.length > 0 && <details><summary>查看工作过程</summary><ol className="task-activity-steps">
           {visibleSteps.map((step) => <li key={step.id}><span aria-hidden="true">•</span><span><strong>{stepTitle(step)}</strong>
             {step.kind !== 'progress' && <small>{stepStatus[step.status]}</small>}
@@ -1124,7 +1341,6 @@ export function Assistant() {
         </ol></details>}
         {k2Read.kind === 'invalid' && <div className="notice notice-warning" role="alert">
           并发任务投影格式无效；当前只显示服务端 Task 状态，不会把未核验的结果当作最终回复。
-          {task.result && <details><summary>查看未核验的 Task 原始结果</summary><ChatMarkdown content={task.result} /></details>}
         </div>}
         {k2 && k2.dependencies.length > 0 && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的依赖`}>
           <h4>依赖任务</h4>
@@ -1145,7 +1361,7 @@ export function Assistant() {
           <small>来源任务 {review.source_task_id} · 修订 {review.source_task_revision} · 结果事件 {review.source_event_sequence}</small>
           {review.reply_message_id && <small>最终回复消息 {review.reply_message_id}</small>}
         </section>}
-        {k2 && task.result && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的原始结果`}>
+        {task.result && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的原始结果`}>
           <h4>Task 原始结果</h4>
           <details><summary>查看 Task 原始结果（不是最终回复）</summary><ChatMarkdown content={task.result} /></details>
         </section>}
@@ -1178,8 +1394,7 @@ export function Assistant() {
             {answerClarification.isPending ? '正在提交…' : '提交并继续'}
           </button>
         </form>}
-      </section>}
-    </Fragment>;
+      </section>;
   };
 
   return <section className="assistant-page">
@@ -1194,79 +1409,78 @@ export function Assistant() {
       服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。
     </div>}
     {capabilities.isSuccess && cloudTasksAvailable === false && <div className="notice notice-warning" role="status">
-      云端任务工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
+      云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
     </div>}
-    <div className="assistant-layout">
+    <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}`}>
       <aside className="assistant-sidebar" aria-label="最近对话">
-        <div className="assistant-sidebar-heading"><h2>会话</h2><button type="button" className="icon-button" aria-label="刷新对话" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); }}>↻</button></div>
-        <button type="button" className="button button-primary button-small assistant-new" onClick={startNew}>＋ 新对话</button>
-        {conversations.isPending ? <p className="muted" role="status">正在加载对话…</p> : conversations.isError
+        <div className="assistant-sidebar-heading"><button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); }}><MordeIcon name="refresh" /></button></div>
+        {conversations.isPending ? <p className="muted" role="status">正在加载对话…</p> : conversations.isError && !conversations.data
           ? showConsolidatedNetworkError ? <p className="muted">对话列表暂不可用</p>
             : <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.refetch()}>重试</button></div>
-          : !conversationsData.length ? <p className="muted assistant-sidebar-empty">还没有对话。发送一条消息即可开始。</p>
-            : <div className="conversation-list">{conversationsData.map((item: Conversation) => <div className="conversation-row" key={item.id}>
-              <button type="button" className={`conversation-item ${conversationID === item.id ? 'is-selected' : ''}`}
-                onClick={() => selectConversation(item)}>
-                <strong>{item.title || '新对话'}</strong>
-                {item.id === mainConversationID && <small>主会话</small>}
-                {item.id === recentConversationID && item.id !== mainConversationID && <small>本机最近查看</small>}
-                <small>{formatDate(item.updated_at)}</small>
-              </button>
-            </div>)}</div>}
+          : <>
+            {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
+              : mainConversationDetail.isError ? <div className="error-inline" role="alert">无法读取主会话：{errorDetails(mainConversationDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void mainConversationDetail.refetch()}>重试</button></div>
+                : <p className="muted" role="status">正在读取主会话…</p>)}
+            <div className="conversation-group">
+              <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
+                <summary>旁路会话</summary>
+                <div className="conversation-list">{sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}</div>
+                {conversations.isFetchNextPageError && <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></div>}
+                {(sideConversations.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
+                  disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
+                  {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
+                </button>}
+                {!sideConversations.length && !conversations.hasNextPage && <p className="muted assistant-sidebar-empty">还没有旁路会话。</p>}
+              </details>
+              <button type="button" className="button button-secondary conversation-new" aria-label="新建旁路会话" title="新建旁路会话" onClick={startNew}>+</button>
+            </div>
+          </>}
+        <p className="assistant-sidebar-hint">主会话保留日常交流，旁路会话可用于单独讨论。</p>
       </aside>
       <div className="assistant-main">
+        <header className="conversation-view-heading">
+          <div className="assistant-chat-title"><span className="assistant-logo assistant-logo-header" aria-hidden="true" /><div>
+            <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selected?.title || (conversationID ? '对话' : '新旁路会话')}</h2>
+            <p>{conversationID && conversationID === mainConversationID ? '你的 moder' : '旁路会话 · 你的 moder'}</p>
+          </div></div>
+          <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
+            aria-label="任务动态" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
+            aria-expanded={taskPanelOpen} aria-controls="assistant-task-panel"
+            title={pendingTaskCount === null ? '任务动态，待处理数量暂不可用' : `任务动态，${pendingTaskCount} 项等待用户`}
+            onClick={() => setTaskPanelOpen((open) => !open)}>
+            <MordeIcon name="panel" />任务动态{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
+            {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
+          </button>
+        </header>
+        {activePanelTasks.slice(0, maxTaskEventStreams).map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
         <div className={`conversation-view${conversationID ? '' : ' conversation-view-welcome'}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
           const view = event.currentTarget;
-          followConversation.current = view.scrollHeight - view.scrollTop - view.clientHeight < 80;
+          const atLatest = view.scrollHeight - view.scrollTop - view.clientHeight < 80;
+          followConversation.current = atLatest;
+          setShowJumpToLatest(!atLatest);
         }}>
-          {!conversationID ? <><div className="assistant-welcome"><span className="assistant-mark" aria-hidden="true">M</span>
-            <h2>今天想聊些什么？</h2><p>告诉我你想完成的任务。</p>
+          {!conversationID ? <><div className="assistant-welcome"><span className="assistant-mark assistant-logo" aria-hidden="true" />
+            <h2>今天想聊些什么？</h2><p>告诉我你想完成的事情。</p>
           </div>{pendingMessages.map(renderPendingMessage)}</> : <>
-          <header className="conversation-view-heading"><h2>{selected?.title || '对话'}</h2></header>
-          {activeTasks.map((task) => <TaskStream key={task.id} task={task} conversationID={conversationID} onState={setTaskEventFeed} />)}
           {messages.isPending && displayMessages.length === 0 ? <div className="loading-card" role="status">正在加载消息…</div>
             : messages.isError && displayMessages.length === 0 ? showConsolidatedNetworkError ? <div className="loading-card">消息暂不可用</div>
               : <div className="error-card" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试</button></div>
               : <div className="message-list">
                 {messages.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void messages.refetch()}>重试</button></div>}
-                {conversationTasks.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取任务列表：{errorDetails(conversationTasks.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversationTasks.refetch()}>重试</button></div>}
-                {taskQueries.map((query, index) => query.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert" key={`task-error:${taskIDs[index]}`}>无法读取任务 {taskIDs[index]} 的状态：{errorDetails(query.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void query.refetch()}>重试</button></div>)}
-                {displayMessages.map((message) => {
+                {displayMessages.map((message, index) => {
                   const messageTask = message.task_id ? tasksByID.get(message.task_id) : undefined;
                   const routingStatus = message.role === 'user' ? routingStatusText(message.routing_status) : null;
-                  const sources = message.role === 'assistant' ? message.sources ?? [] : [];
-                  const sourceContentMatches = sources.length > 0 && sources.every((source) => source.content.length > 0) &&
-                    sources.map((source) => source.content).join('\n\n') === message.content;
+                  const previous = displayMessages[index - 1];
+                  const showDate = !previous || formatDate(previous.created_at).split(' ')[0] !== formatDate(message.created_at).split(' ')[0];
                   return <Fragment key={message.id}>
-                    <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}`}>
-                      <strong className="chat-message-author">{message.role === 'user' ? '你' : 'AI 助手'}</strong>
-                      {sourceContentMatches ? <div className="chat-message-source-list">
-                        {sources.map((source) => {
-                          const sourceMessage = displayMessages.find((candidate) => candidate.id === source.user_message_id);
-                          const prompt = sourceMessage?.content.trim().replace(/\s+/g, ' ');
-                          const excerpt = prompt && [...prompt].length > 72 ? `${[...prompt].slice(0, 72).join('')}…` : prompt;
-                          return <section className="chat-message-source" key={`${source.task_id}:${source.task_revision}:${source.event_sequence}`}>
-                            <div className="chat-message-source-meta">
-                              {sourceMessage ? <a className="chat-message-source-origin"
-                                href={`#conversation-message-${encodeURIComponent(source.user_message_id)}`}
-                                title={prompt} aria-label={`查看关联的用户消息：${prompt}`}>
-                                {excerpt ? `回复消息：${excerpt}` : '查看关联消息'}
-                              </a> : <span className="chat-message-source-origin">关联消息 {source.user_message_id}</span>}
-                              <span className="chat-message-source-task">任务 {source.task_id} · 修订 {source.task_revision} · 结果事件 {source.event_sequence}</span>
-                            </div>
-                            <ChatMarkdown content={source.content} />
-                          </section>;
-                        })}
-                      </div> : <>
-                        {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
-                        {sources.length > 0 && <div className="chat-message-source-meta" aria-label="回复来源">
-                          {sources.map((source) => <span className="chat-message-source-task" key={`${source.task_id}:${source.task_revision}:${source.event_sequence}`}>
-                            关联消息 {source.user_message_id} · 任务 {source.task_id} · 修订 {source.task_revision} · 结果事件 {source.event_sequence}
-                          </span>)}
-                        </div>}
-                      </>}
-                      {message.role === 'assistant' && message.snapshotStatus !== 'streaming' && message.snapshotStatus !== 'interrupted' &&
-                        <AssistantReplySpeech text={message.content} sessionKey={conversationID ?? message.conversation_id} />}
+                    {showDate && <div className="conversation-time-divider"><time dateTime={message.created_at}>{formatDate(message.created_at)}</time></div>}
+                    <div className={`chat-message-row chat-message-row-${message.role}`}>
+                    {message.role === 'assistant' && <span className="assistant-logo assistant-logo-message" aria-hidden="true" />}
+                    <div className="chat-message-body">
+                    {message.role === 'assistant' && <strong className="chat-message-author">moder</strong>}
+                    <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}`}
+                      aria-label={message.role === 'assistant' ? 'moder 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
+                      {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
                         {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
                           href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {index + 1}</a></span>)}
@@ -1275,7 +1489,7 @@ export function Assistant() {
                       {message.snapshotStatus === 'interrupted' && <small role="status">回复已中断</small>}
                       {message.role === 'user' && (routingStatus || (message.delivery_status !== 'applied' && message.delivery_status)) && <small role="status">
                         {routingStatus ?? (message.delivery_status === 'pending' && messageTask && terminalTaskStatuses.has(messageTask.status)
-                          ? '任务已结束，消息未处理' : deliveryStatusText(message.delivery_status))}
+                          ? '消息未处理，处理已结束' : deliveryStatusText(message.delivery_status))}
                         {!routingStatus && message.delivery_status === 'unknown' && <button type="button" className="button button-small button-secondary"
                           disabled={messages.isFetching} onClick={() => {
                             void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
@@ -1287,12 +1501,12 @@ export function Assistant() {
                         {message.routing_failure_reason !== 'message_too_long' && <button type="button" className="button button-small button-secondary" disabled={retryProcessing.isPending}
                           onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>重试处理</button>}
                       </div>}
-                      <small>{formatDate(message.created_at)}</small>
+                      {message.role === 'user' && <small>{formatDate(message.created_at)}</small>}
                     </article>
-                    {messageTask && lastMessageByTask.get(messageTask.id) === message.id && renderTaskActivity(messageTask)}
+                    {message.role === 'assistant' && <time className="assistant-reply-time" dateTime={message.created_at} aria-label={`回复时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>}
+                    </div></div>
                   </Fragment>;
                 })}
-                {tasks.filter((task) => !lastMessageByTask.has(task.id)).map(renderTaskActivity)}
               </div>}
           {pendingMessages.map(renderPendingMessage)}
           </>}
@@ -1306,12 +1520,15 @@ export function Assistant() {
           {preferredHostID && !selectedHost && !hosts.isPending && !hosts.isError && <p className="notice notice-warning" role="status">所选电脑状态待核对；实际使用该目标时会检查权限和状态。</p>}
           {selectedHost && !hostIsReady && <p className="notice notice-warning" role="status">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</p>}
           {workspaceSelection && !selectedBinding && <p className="notice notice-warning" role="status">所选 Workspace 状态待核对；消息仍可发送，使用时会再次核验。</p>}
+          {showJumpToLatest && conversationID && <div className="assistant-jump-latest"><button type="button" className="button button-secondary"
+            onClick={() => { followConversation.current = true; if (conversationView.current) conversationView.current.scrollTop = conversationView.current.scrollHeight; setShowJumpToLatest(false); }}>
+            ↓ 回到最新消息</button></div>}
         </div>
         <section className="assistant-composer" aria-label="发送对话消息">
           <form onSubmit={submit}>
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
             <textarea id="assistant-content" value={content} onChange={(event) => setContent(event.target.value)}
-              placeholder="输入你想问的问题…" />
+              placeholder="告诉我你想完成什么…" />
             {composerAttachments.length > 0 && <div className="assistant-attachment-list" aria-label="待发送附件">
               {composerAttachments.map((item) => {
                 const mediaType = assistantFileMediaType(item.file);
@@ -1339,64 +1556,83 @@ export function Assistant() {
                 </Fragment>;
               })}
             </div>}
-            <div className="assistant-composer-footer"><div className="assistant-selectors"><label><span>AI 模型</span><select aria-label="选择 AI 模型"
-              value={effectiveModelID} onChange={(event) => setModelID(event.target.value)} disabled={models.isPending}>
-              <option value="">自动选择模型</option>{effectiveModelID && !readyModels.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
-            </select></label>
-          {enabledMCPConnectors.length > 0 && <fieldset className="assistant-tool-connectors">
-            <legend>工具连接</legend>
-            <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
-              <input type="checkbox" checked={mcpConnectorIDs.includes(connector.id)} onChange={(event) => setMcpConnectorIDs((current) => event.target.checked
-                ? [...new Set([...current, connector.id])] : current.filter((id) => id !== connector.id))} />
-              <span>{connector.name}</span>
-            </label>)}</div>
-          </fieldset>}
-          {mcpConnectors.isError && !showConsolidatedNetworkError && <div className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></div>}
-          <div className="assistant-target-row">
-            <label><span>目标电脑</span><select aria-label="选择目标电脑" value={selectedHost?.id ?? hostSelection ?? ''}
-              disabled={hosts.isPending}
-              onChange={(event) => { setHostSelection(event.target.value); setWorkspaceSelection(''); }}>
-              <option value="">无电脑目标</option>
-              {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
-              {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
-            </select></label>
-            {selectedHost && <label><span>Workspace</span><select aria-label="选择目标 Workspace" value={selectedBinding?.workspace.id ?? workspaceSelection}
-              onChange={(event) => setWorkspaceSelection(event.target.value)}>
-              <option value="">不附加 Workspace</option>
-              {workspaceSelection && !selectedBinding && <option value={workspaceSelection}>所选 Workspace 状态待核验</option>}
-              {workspaceBindings.map((binding) => <option key={binding.workspace.id} value={binding.workspace.id}>
-                {binding.workspace.name || binding.workspace.id} · v{binding.workspace.revision} · {workspaceBindingReady(binding) ? '已应用' : '未就绪'}
-              </option>)}
-            </select></label>}
-          </div>
-            </div>
+            <div className="assistant-composer-footer">
               <div className="assistant-composer-actions">
-                {referenceTaskID && <span role="status">正在补充任务 {referenceTaskID} <button type="button" onClick={() => setReferenceTaskID(null)}>取消</button></span>}
-                <label className="assistant-attach-control">
-                  <span>＋ 附件</span>
+                <label className="assistant-attach-control" title="添加附件">
+                  <MordeIcon name="paperclip" /><span className="sr-only">附件</span>
                   <input type="file" aria-label="添加附件" accept=".txt,.jpg,.jpeg,.png,.docx,.xlsx,.pptx,.pdf,text/plain,image/jpeg,image/png,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                    multiple
-                    onChange={(event) => { void addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
+                    multiple onChange={(event) => { void addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
                 </label>
-                <AssistantVoiceInput onTranscript={(transcript) => setContent((current) => current.trim()
+                <AssistantVoiceInput compact onTranscript={(transcript) => setContent((current) => current.trim()
                   ? `${current.trimEnd()} ${transcript}` : transcript)} />
-                <div className="assistant-task-actions" role="group" aria-label="任务控制与发送">
-                  {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
-                  {activeTasks.length > 1 && <select aria-label="选择要停止的任务" value={activeTaskID ?? ''} disabled={taskControl.isPending}
-                    onChange={(event) => setControlTaskID(event.target.value || null)}>
-                    <option value="">选择要停止的任务</option>{activeTasks.map((task) => <option key={task.id} value={task.id}>{task.objective.slice(0, 24)} · {task.id}</option>)}
-                  </select>}
-                  {activeTask?.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending} onClick={() => submitTaskControl('resume')}>继续任务</button>}
-                  {activeTask && ['queued', 'running', 'waiting_user', 'paused'].includes(activeTask.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending} onClick={() => submitTaskControl('cancel')}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
-                  <button className="button button-primary assistant-send" type="submit" disabled={savingMessage || preparingAttachmentCount > 0 || (!content.trim() && !composerAttachments.length)}>
-                    {preparingAttachmentCount > 0 ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
-                  </button>
+              </div>
+              <div className="assistant-selectors">
+                <label className="assistant-selector"><MordeIcon name="spark" /><span className="sr-only">AI 模型</span><select aria-label="选择 AI 模型"
+                  value={effectiveModelID} onChange={(event) => setModelID(event.target.value)} disabled={models.isPending}>
+                  <option value="">自动选择模型</option>{effectiveModelID && !readyModels.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
+                </select></label>
+                <div className="assistant-target-row">
+                  <label className="assistant-selector"><MordeIcon name="monitor" /><span className="sr-only">目标电脑</span><select aria-label="选择目标电脑" value={selectedHost?.id ?? hostSelection ?? ''}
+                    disabled={hosts.isPending} onChange={(event) => { setHostSelection(event.target.value); setWorkspaceSelection(''); }}>
+                    <option value="">无电脑目标</option>
+                    {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
+                    {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
+                  </select></label>
+                  {selectedHost && <label className="assistant-selector"><MordeIcon name="folder" /><span className="sr-only">Workspace</span><select aria-label="选择目标 Workspace" value={selectedBinding?.workspace.id ?? workspaceSelection}
+                    onChange={(event) => setWorkspaceSelection(event.target.value)}>
+                    <option value="">不附加 Workspace</option>
+                    {workspaceSelection && !selectedBinding && <option value={workspaceSelection}>所选 Workspace 状态待核验</option>}
+                    {workspaceBindings.map((binding) => <option key={binding.workspace.id} value={binding.workspace.id}>
+                      {binding.workspace.name || binding.workspace.id} · v{binding.workspace.revision} · {workspaceBindingReady(binding) ? '已应用' : '未就绪'}
+                    </option>)}
+                  </select></label>}
                 </div>
+                {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
+                  <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
+                    <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
+                      <input type="checkbox" checked={mcpConnectorIDs.includes(connector.id)} onChange={(event) => setMcpConnectorIDs((current) => event.target.checked
+                        ? [...new Set([...current, connector.id])] : current.filter((id) => id !== connector.id))} />
+                      <span>{connector.name}</span>
+                    </label>)}</div>
+                  </fieldset>
+                </details>}
+                {mcpConnectors.isError && !showConsolidatedNetworkError && <div className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></div>}
+              </div>
+              <div className="assistant-task-actions" role="group" aria-label="发送操作">
+                {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
+                <button className="button button-primary assistant-send" type="submit" disabled={savingMessage || preparingAttachmentCount > 0 || (!content.trim() && !composerAttachments.length)}>
+                  {preparingAttachmentCount > 0 ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
+                </button>
               </div>
             </div>
           </form>
         </section>
       </div>
+      {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="任务动态">
+        <header className="task-panel-heading">
+          <div><h2>任务动态</h2><span>{accountTasks.isSuccess ? `账号任务 · ${accountTasks.data.items.length} 项` : '当前账号可见任务'}</span></div>
+          <div className="inline-actions">
+            <button type="button" className="icon-button" aria-label="刷新任务动态" onClick={() => { void accountTasks.refetch(); void conversationTasks.refetch(); }}>↻</button>
+            <button type="button" className="icon-button" aria-label="关闭任务动态" onClick={() => { setTaskPanelOpen(false); taskPanelToggle.current?.focus(); }}>×</button>
+          </div>
+        </header>
+        <div className="task-panel-list">
+          {capabilities.isPending && <p className="muted" role="status">正在确认账号与服务身份…</p>}
+          {!accountTasksEnabled && !capabilities.isPending && <p className="muted" role="status">账号或服务身份尚未确认，任务列表暂不可用。</p>}
+          {accountTasksEnabled && accountTasks.isPending && <p className="muted" role="status">正在读取账号任务…</p>}
+          {accountTasks.isError && <div className="error-inline" role="alert">无法读取完整任务列表，当前任务可能不全：{errorDetails(accountTasks.error).message}
+            <button type="button" className="button button-small button-secondary" onClick={() => void accountTasks.refetch()}>重试</button></div>}
+          {conversationTasks.isError && accountTasks.isError && <div className="error-inline" role="alert">当前会话活动任务也无法读取：{errorDetails(conversationTasks.error).message}
+            <button type="button" className="button button-small button-secondary" onClick={() => void conversationTasks.refetch()}>重试</button></div>}
+          {taskQueries.some((query, index) => query.isPending && (currentConversationTaskIDs.has(taskIDs[index] ?? '') || expandedTaskIDs.includes(taskIDs[index] ?? '')))
+            && <p className="muted" role="status">正在读取任务详情…</p>}
+          {taskQueries.map((query, index) => query.isError && <div className="error-inline" role="alert" key={`task-error:${taskIDs[index]}`}>
+            无法读取任务 {taskIDs[index]} 的详情：{errorDetails(query.error).message}
+            <button type="button" className="button button-small button-secondary" onClick={() => void query.refetch()}>重试</button></div>)}
+          {!accountTasks.isPending && !accountTasks.isError && taskPanelTasks.length === 0 && <p className="muted">还没有任务。</p>}
+          {taskPanelTasks.map(renderTaskActivity)}
+        </div>
+      </aside>}
     </div>
   </section>;
 }

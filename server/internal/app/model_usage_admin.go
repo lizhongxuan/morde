@@ -123,7 +123,7 @@ func (s *ModelUsageAdminService) SetBudget(ctx context.Context, principal identi
 
 func validModelCallSource(source ModelCallSource) bool {
 	switch source {
-	case ModelCallClient, ModelCallChat, ModelCallTask, ModelCallProbe, ModelCallRoute:
+	case ModelCallClient, ModelCallChat, ModelCallTask, ModelCallProbe, ModelCallRoute, ModelCallCompaction:
 		return true
 	default:
 		return false

@@ -757,6 +757,49 @@ func TestModelConnectionRejectsUnapprovedEndpointsAndResetsChecks(t *testing.T) 
 	}
 }
 
+func TestModelConnectionContextWindowIsBoundToConfiguredModel(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
+	service := modelConnectionTestService(t, store, client)
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
+	window := 32_768
+	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
+		ContextWindowTokens: &window,
+	})
+	if err != nil || created.ContextWindowTokens == nil || *created.ContextWindowTokens != window {
+		t.Fatalf("created context window = %+v, %v", created.ContextWindowTokens, err)
+	}
+	if _, err := checkModelForTest(t, service, client, principal, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := service.ResolveGatewayEndpoint(context.Background(), principal.UserID, created.ID, false, false)
+	if err != nil || endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens != window {
+		t.Fatalf("resolved model context window = %+v, %v", endpoint.ContextWindowTokens, err)
+	}
+	unchanged, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
+		Name: "platform", BaseURL: created.BaseURL, ModelName: created.ModelName,
+	})
+	if err != nil || unchanged.ContextWindowTokens == nil || *unchanged.ContextWindowTokens != window {
+		t.Fatalf("same endpoint update lost context window = %+v, %v", unchanged.ContextWindowTokens, err)
+	}
+	changed, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
+		Name: "platform", BaseURL: created.BaseURL, ModelName: "gpt-next",
+	})
+	if err != nil || changed.ContextWindowTokens != nil {
+		t.Fatalf("model change retained stale context window = %+v, %v", changed.ContextWindowTokens, err)
+	}
+	for _, invalid := range []int{4095, 1_000_001} {
+		invalidWindow := invalid
+		if _, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+			Name: "invalid", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
+			ContextWindowTokens: &invalidWindow,
+		}); err == nil {
+			t.Errorf("context window %d was accepted", invalid)
+		}
+	}
+}
+
 func TestModelConnectionRejectsSingleLabelAllowlist(t *testing.T) {
 	sealer, err := NewSealer(make([]byte, 32))
 	if err != nil {
@@ -800,6 +843,10 @@ func TestModelConnectionDirectCheckIsDisabledWithoutLedger(t *testing.T) {
 
 func cloneModelConnection(value ModelConnectionRecord) ModelConnectionRecord {
 	value.APIKeyCipher = append([]byte(nil), value.APIKeyCipher...)
+	if value.ContextWindowTokens != nil {
+		window := *value.ContextWindowTokens
+		value.ContextWindowTokens = &window
+	}
 	if value.CheckedAt != nil {
 		checked := *value.CheckedAt
 		value.CheckedAt = &checked

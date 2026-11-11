@@ -23,6 +23,8 @@ type cloudDSHCoordinatorIdentityWire struct {
 	Generation           int64  `json:"generation"`
 	AuthorizationVersion int64  `json:"authorization_version"`
 	SessionID            string `json:"session_id"`
+	Purpose              string `json:"purpose"`
+	OperationID          string `json:"operation_id"`
 }
 
 type cloudDSHCoordinatorFrame struct {
@@ -36,6 +38,8 @@ type cloudDSHCoordinatorFrame struct {
 	Generation           int64           `json:"generation"`
 	AuthorizationVersion int64           `json:"authorization_version"`
 	SessionID            string          `json:"session_id"`
+	Purpose              string          `json:"purpose"`
+	OperationID          string          `json:"operation_id"`
 	ID                   string          `json:"id,omitempty"`
 	From                 *int64          `json:"from_seq,omitempty"`
 	Through              *int64          `json:"through_seq,omitempty"`
@@ -51,7 +55,7 @@ type cloudDSHCoordinatorFrame struct {
 
 func cloudDSHCoordinatorFrameBaseKeys() []string {
 	return []string{"type", "server_instance_id", "owner_id", "runtime_id", "runtime_generation",
-		"context_role", "conversation_id", "message_id", "actor_id", "agent_id", "generation", "authorization_version", "session_id"}
+		"context_role", "conversation_id", "message_id", "actor_id", "agent_id", "generation", "authorization_version", "session_id", "purpose", "operation_id"}
 }
 
 func cloudDSHExactFrameKeys(frame map[string]json.RawMessage, expected []string) bool {
@@ -97,8 +101,8 @@ func validCloudDSHCoordinatorRuntimeFrame(kind string, frame map[string]json.Raw
 
 func decodeCloudDSHCoordinatorIdentity(frame map[string]json.RawMessage) (app.ConversationCoordinatorIdentity, error) {
 	var wire cloudDSHCoordinatorIdentityWire
-	identityFrame := make(map[string]json.RawMessage, 9)
-	for _, key := range []string{"context_role", "conversation_id", "message_id", "owner_id", "actor_id", "agent_id", "generation", "authorization_version", "session_id"} {
+	identityFrame := make(map[string]json.RawMessage, 11)
+	for _, key := range []string{"context_role", "conversation_id", "message_id", "owner_id", "actor_id", "agent_id", "generation", "authorization_version", "session_id", "purpose", "operation_id"} {
 		if value, ok := frame[key]; ok {
 			identityFrame[key] = value
 		}
@@ -111,7 +115,10 @@ func decodeCloudDSHCoordinatorIdentity(frame map[string]json.RawMessage) (app.Co
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&wire) != nil || decoder.Decode(new(any)) != io.EOF || wire.Role != "coordinator" ||
 		!cloudDSHID.MatchString(wire.OwnerID) || !cloudDSHID.MatchString(wire.ActorID) || !cloudDSHID.MatchString(wire.AgentID) ||
-		!cloudDSHID.MatchString(wire.SessionID) || wire.Generation < 1 || wire.AuthorizationVersion < 1 {
+		!cloudDSHID.MatchString(wire.SessionID) || wire.Generation < 1 || wire.AuthorizationVersion < 1 ||
+		(wire.Purpose != "conversation" && wire.Purpose != "compaction") ||
+		(wire.Purpose == "conversation" && wire.OperationID != "") ||
+		(wire.Purpose == "compaction" && !domain.ValidOperationID(wire.OperationID)) {
 		return app.ConversationCoordinatorIdentity{}, errors.New("account Agent Runtime coordinator identity is invalid")
 	}
 	// The service instance ID is inherited from the account Runtime fence, so
@@ -121,7 +128,8 @@ func decodeCloudDSHCoordinatorIdentity(frame map[string]json.RawMessage) (app.Co
 	}
 	return app.ConversationCoordinatorIdentity{OwnerID: wire.OwnerID, ActorID: wire.ActorID,
 		ConversationID: wire.ConversationID, MessageID: wire.MessageID, AgentID: wire.AgentID,
-		Generation: wire.Generation, AuthorizationVersion: wire.AuthorizationVersion, SessionID: wire.SessionID}, nil
+		Generation: wire.Generation, AuthorizationVersion: wire.AuthorizationVersion, SessionID: wire.SessionID,
+		Purpose: wire.Purpose, OperationID: wire.OperationID}, nil
 }
 
 func (c *cloudDSHAccountCoordinator) identityMatches(value app.ConversationCoordinatorIdentity) bool {
@@ -154,7 +162,8 @@ func (c *cloudDSHAccountCoordinator) read(ctx context.Context) (cloudDSHCoordina
 func (f cloudDSHCoordinatorFrame) identity() app.ConversationCoordinatorIdentity {
 	return app.ConversationCoordinatorIdentity{ServiceInstanceID: "", OwnerID: f.OwnerID, ActorID: f.ActorID,
 		ConversationID: f.ConversationID, MessageID: f.MessageID, AgentID: f.AgentID,
-		Generation: f.Generation, AuthorizationVersion: f.AuthorizationVersion, SessionID: f.SessionID}
+		Generation: f.Generation, AuthorizationVersion: f.AuthorizationVersion, SessionID: f.SessionID,
+		Purpose: f.Purpose, OperationID: f.OperationID}
 }
 
 func decodeCloudDSHCoordinatorFrame(raw []byte) (cloudDSHCoordinatorFrame, error) {
@@ -170,10 +179,12 @@ func decodeCloudDSHCoordinatorFrame(raw []byte) (cloudDSHCoordinatorFrame, error
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&frame) != nil || decoder.Decode(new(any)) != io.EOF || frame.Role != "coordinator" ||
 		!cloudDSHID.MatchString(frame.OwnerID) || !cloudDSHID.MatchString(frame.ActorID) || !cloudDSHID.MatchString(frame.AgentID) || !cloudDSHID.MatchString(frame.SessionID) ||
+		(frame.Purpose != "conversation" && frame.Purpose != "compaction") ||
+		(frame.Purpose == "conversation" && frame.OperationID != "") || (frame.Purpose == "compaction" && !domain.ValidOperationID(frame.OperationID)) ||
 		frame.Generation < 1 || frame.AuthorizationVersion < 1 || frame.ConversationID == "" || frame.MessageID == "" {
 		return cloudDSHCoordinatorFrame{}, errors.New("DSH coordinator frame fields are invalid")
 	}
-	base := []string{"type", "context_role", "conversation_id", "message_id", "owner_id", "actor_id", "agent_id", "generation", "authorization_version", "session_id"}
+	base := []string{"type", "context_role", "conversation_id", "message_id", "owner_id", "actor_id", "agent_id", "generation", "authorization_version", "session_id", "purpose", "operation_id"}
 	var expected []string
 	switch frame.Type {
 	case "checkpoint":

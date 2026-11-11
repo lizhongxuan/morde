@@ -5,8 +5,8 @@ SELECT * FROM conversations WHERE id = $1 AND owner_id = $2;
 SELECT * FROM conversations
 WHERE owner_id = $1
   AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
-  AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz OR (created_at = $3::timestamptz AND id < $4))
-ORDER BY created_at DESC, id DESC
+  AND ($3::timestamptz IS NULL OR updated_at < $3::timestamptz OR (updated_at = $3::timestamptz AND id < $4))
+ORDER BY updated_at DESC, id DESC
 LIMIT $5;
 
 -- name: GetMessage :one

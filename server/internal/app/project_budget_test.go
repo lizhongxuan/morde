@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -396,7 +397,7 @@ func TestProjectBudgetSettlementKeepsUnknownUsageHeld(t *testing.T) {
 		t.Fatalf("unknown SettleModelCall() = %#v, err=%v", store.settlement, err)
 	}
 	known := SettleProjectModelCallCommand{ProjectID: projectBudgetTestID, Source: ModelCallChat, CallID: "chat-call-0001", Usage: project.Usage{InputTokens: 120}}
-	if err := service.SettleModelCall(context.Background(), known); err != nil || store.settleCalls != 2 || store.settlement != known {
+	if err := service.SettleModelCall(context.Background(), known); err != nil || store.settleCalls != 2 || !reflect.DeepEqual(store.settlement, known) {
 		t.Fatalf("known SettleModelCall() = %#v, err=%v", store.settlement, err)
 	}
 	known.Usage.InputTokens = -1
@@ -413,7 +414,7 @@ func TestProjectBudgetSettlementDoesNotHideOverReservationResult(t *testing.T) {
 		Usage: project.Usage{InputTokens: 200, OutputTokens: 100},
 	}
 	if err := service.SettleModelCall(context.Background(), command); domain.CodeOf(err) != domain.CodeQuotaExceeded ||
-		store.settleCalls != 1 || store.settlement != command {
+		store.settleCalls != 1 || !reflect.DeepEqual(store.settlement, command) {
 		t.Fatalf("over-reservation settlement error=%v, stored=%#v calls=%d", err, store.settlement, store.settleCalls)
 	}
 }
@@ -447,7 +448,7 @@ func TestProjectBudgetKnownSettlementFailurePropagates(t *testing.T) {
 		Usage: project.Usage{InputTokens: 90, OutputTokens: 10},
 	}
 	if err := service.SettleModelCall(context.Background(), command); !errors.Is(err, want) || err == nil ||
-		store.settleCalls != 1 || store.settlement != command {
+		store.settleCalls != 1 || !reflect.DeepEqual(store.settlement, command) {
 		t.Fatalf("known settlement failure was hidden or changed: err=%v stored=%#v calls=%d", err, store.settlement, store.settleCalls)
 	}
 }

@@ -161,6 +161,15 @@ func (b *CloudDSHToolBroker) currentTaskDetails(ctx context.Context, claimed tas
 		// The worker's claimed task owns the immutable conversation snapshot; GetTask omits it.
 		details.Task.ConversationContext = contextValue
 	}
+	if details.Task.ConversationContext != nil && details.Task.ConversationContext.Summary != nil {
+		validator, ok := b.store.(TaskConversationSummaryValidator)
+		if !ok {
+			return TaskDetails{}, domain.NewError(domain.CodeInvalidState, "Task summary authorization cannot be revalidated")
+		}
+		if err := validator.ValidateTaskConversationSummary(ctx, details.Task); err != nil {
+			return TaskDetails{}, err
+		}
+	}
 	return details, nil
 }
 
@@ -188,6 +197,9 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		details, err := b.currentServerTask(ctx, claimed)
 		if err != nil {
 			return nil, err
+		}
+		if cloudDSHCurrentConversationHistoryEligible(details.Task) {
+			definitions = append(definitions, cloudDSHCurrentConversationHistoryDefinition())
 		}
 		if b.workspaceTools != nil && routed && details.Task.HostID == "" {
 			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization)...)
@@ -798,6 +810,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if call.Name == cloudDSHConversationHistorySearchToolName {
 		return b.executeConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
 	}
+	if call.Name == cloudDSHCurrentHistorySearchToolName {
+		return b.executeCurrentConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
+	}
 	if call.Name == cloudDSHRecentHistorySummaryToolName {
 		return b.executeRecentHistorySummary(ctx, claimed, call, recovering, checkpointOutput)
 	}
@@ -1243,7 +1258,7 @@ func validCloudDSHToolImages(name string, result AgentToolResult) bool {
 		return len(result.Images) <= 1 && (len(result.Images) == 0 ||
 			validCloudDSHMCPImage(result.Images[0].MediaType, result.Images[0].Data))
 	}
-	if name == cloudDSHTaskAttachmentReadToolName {
+	if name == cloudDSHTaskAttachmentReadToolName || strings.HasPrefix(name, "morde_hub_file_fetch_") {
 		if len(result.Images) > maxCloudDSHTaskAttachmentImages {
 			return false
 		}

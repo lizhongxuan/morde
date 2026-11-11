@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
@@ -36,6 +37,7 @@ const (
 	ActionFiles      = "files"
 	ActionFileGet    = "file.get"
 	ActionFilePut    = "file.put" // Remains unavailable until its target and durable sync fences are integrated.
+	ActionFileFetch  = "file.fetch"
 	ActionCommand    = "command"
 )
 
@@ -66,6 +68,39 @@ type TaskContext struct {
 	AuthorizationVersion int64  `json:"authorization_version"`
 	TargetGrantVersion   int64  `json:"target_grant_version"`
 	OperationID          string `json:"operation_id"`
+	TaskRevision         int64  `json:"task_revision,omitempty"`
+}
+
+// FileFetchArgs is created by the server after authorizing the current Task.
+// Its ticket is never accepted from model-supplied tool arguments.
+type FileFetchArgs struct {
+	FetchID         string    `json:"fetch_id"`
+	Path            string    `json:"path"`
+	TaskRevision    int64     `json:"task_revision"`
+	Ticket          string    `json:"ticket"`
+	TicketExpiresAt time.Time `json:"ticket_expires_at"`
+}
+
+type FileFetchReceipt struct {
+	FetchID            string    `json:"fetch_id"`
+	TaskRevision       int64     `json:"task_revision"`
+	Status             string    `json:"status"`
+	TargetGrantVersion int64     `json:"target_grant_version"`
+	SourceVersion      string    `json:"source_version"`
+	SourceSHA256       string    `json:"source_sha256"`
+	SizeBytes          int64     `json:"size_bytes"`
+	ContentID          string    `json:"content_id"`
+	ExpiresAt          time.Time `json:"expires_at"`
+}
+
+func ValidateFileFetchToolArgs(raw json.RawMessage) (string, error) {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := decodeArgs(raw, &args); err != nil || !validRelativePath(args.Path) {
+		return "", ProtocolError{Code: "invalid_argument", Message: "file.fetch requires one authorized relative path"}
+	}
+	return args.Path, nil
 }
 
 // WorkspaceWriteArgs binds a future PC write to a Workspace-relative path and
@@ -131,7 +166,8 @@ func ValidCallID(id string) bool {
 }
 
 func ValidateTaskContext(value TaskContext) error {
-	if !domain.ValidTaskID(value.TaskID) || value.AuthorizationVersion < 1 || value.TargetGrantVersion < 1 || !ValidCallID(value.OperationID) {
+	if !domain.ValidTaskID(value.TaskID) || value.AuthorizationVersion < 1 || value.TargetGrantVersion < 1 ||
+		!ValidCallID(value.OperationID) || value.TaskRevision < 0 {
 		return ProtocolError{Code: "invalid_argument", Message: "task action context is invalid"}
 	}
 	return nil
@@ -247,6 +283,13 @@ func ValidateTaskActionArgs(action string, raw json.RawMessage) error {
 	case ActionFilePut:
 		if _, err := ValidateWorkspaceWriteArgs(raw); err != nil {
 			return ProtocolError{Code: "invalid_argument", Message: "file.put requires bounded Workspace write metadata"}
+		}
+	case ActionFileFetch:
+		var args FileFetchArgs
+		if err := decodeArgs(raw, &args); err != nil || !domain.ValidOperationID(args.FetchID) || !validRelativePath(args.Path) ||
+			args.TaskRevision < 1 || !validFetchTicket(args.Ticket) || args.TicketExpiresAt.IsZero() ||
+			!args.TicketExpiresAt.After(time.Now()) || args.TicketExpiresAt.After(time.Now().Add(5*time.Minute+time.Second)) {
+			return ProtocolError{Code: "invalid_argument", Message: "file.fetch requires an authorized relative path and short-lived ticket"}
 		}
 	case ActionCommand:
 		var args struct {
@@ -406,6 +449,14 @@ func ValidateActionResult(action string, frame Frame) error {
 			receipt.TargetGrantVersion == nil || *receipt.TargetGrantVersion < 1 || receipt.Stage == nil || *receipt.Stage != "local_applied" {
 			return ProtocolError{Code: "bad_result", Message: "file.put result must contain a valid local Workspace write receipt"}
 		}
+	case ActionFileFetch:
+		var receipt FileFetchReceipt
+		if err := decodeArgs(frame.Body, &receipt); err != nil || !domain.ValidOperationID(receipt.FetchID) ||
+			receipt.TaskRevision < 1 || receipt.Status != "completed" || receipt.TargetGrantVersion < 1 ||
+			!validSHA256(receipt.SourceVersion) || !validSHA256(receipt.SourceSHA256) || receipt.SizeBytes < 1 ||
+			receipt.SizeBytes > 16<<20 || !domain.ValidOperationID(receipt.ContentID) || receipt.ExpiresAt.IsZero() || !receipt.ExpiresAt.After(time.Now()) {
+			return ProtocolError{Code: "bad_result", Message: "file.fetch result must match a completed server receipt without exposing credentials"}
+		}
 	case ActionCommand:
 		var result struct {
 			ExitCode           *int    `json:"exit_code"`
@@ -431,7 +482,7 @@ func ValidateActionResult(action string, frame Frame) error {
 
 func validAdvertisedAction(action string) bool {
 	switch action {
-	case ActionInfo, ActionOpen, ActionNotify, ActionScreenshot, ActionFiles, ActionFileGet, ActionCommand:
+	case ActionInfo, ActionOpen, ActionNotify, ActionScreenshot, ActionFiles, ActionFileGet, ActionFileFetch, ActionCommand:
 		return true
 	default:
 		return false
@@ -462,6 +513,14 @@ func validSHA256(value string) bool {
 		}
 	}
 	return true
+}
+
+func validFetchTicket(value string) bool {
+	if len(value) != base64.RawURLEncoding.EncodedLen(32) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == 32 && base64.RawURLEncoding.EncodeToString(decoded) == value
 }
 
 func jsonObject(raw json.RawMessage) bool {

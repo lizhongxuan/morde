@@ -176,6 +176,21 @@ func nullableText(value string) pgtype.Text {
 	return pgtype.Text{String: value, Valid: value != ""}
 }
 
+func nullableInt4(value *int) pgtype.Int4 {
+	if value == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(*value), Valid: true}
+}
+
+func intPointer(value pgtype.Int4) *int {
+	if !value.Valid {
+		return nil
+	}
+	result := int(value.Int32)
+	return &result
+}
+
 func timestamp(value time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: value, Valid: true}
 }

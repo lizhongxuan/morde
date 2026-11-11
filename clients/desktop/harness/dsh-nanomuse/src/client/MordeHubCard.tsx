@@ -11,6 +11,10 @@ declare global {
 }
 
 const cardHeading: Record<string, string | number> = { fontSize: 14, fontWeight: 600, margin: '0 0 4px' }
+const fileFetchStatusLabel = {
+  transferring: 'mordeHubFetchTransferring', verifying: 'mordeHubFetchVerifying', completed: 'mordeHubFetchCompleted',
+  cancelled: 'mordeHubFetchCancelled', failed: 'mordeHubFetchFailed', interrupted: 'mordeHubFetchInterrupted', unknown: 'mordeHubFetchUnknown',
+} as const
 
 /** Login for a Morde Hub installation. Its credentials and status never touch CloudStatus. */
 export function MordeHubCard({ t }: { t: Translate }): ReactNode {
@@ -197,6 +201,22 @@ export function MordeHubCard({ t }: { t: Translate }): ReactNode {
               h('span', null, t('mordeHubCommand'))),
             h('div', { style: muted }, t('mordeHubCommandHelp')),
             capabilities?.command === true ? null : h('div', { style: muted, 'data-testid': 'nm-morde-hub-command-unavailable' }, t('mordeHubCommandUnavailable'))),
+          h('section', { style: column, 'data-testid': 'nm-morde-hub-file-access' },
+            h('h4', { style: cardHeading }, t('mordeHubFileAccess')),
+            currentStatus.fileAccessRecords.length
+              ? currentStatus.fileAccessRecords.slice(0, 8).map((record) => h('div', {
+                  key: record.fetchID, style: { ...column, gap: 2 }, 'data-testid': `nm-morde-hub-file-access-${record.fetchID}`,
+                },
+                h('strong', null, record.path),
+                h('div', { style: muted }, t(fileFetchStatusLabel[record.status])),
+                h('div', { style: muted }, t('mordeHubFetchProgress', { confirmed: record.confirmedBytes, size: record.sizeBytes })),
+                h('div', { style: muted }, t('mordeHubFetchVersion', { version: record.sourceVersion.slice(0, 12) })),
+                h('div', { style: muted }, t('mordeHubFetchGrant', { version: record.targetGrantVersion })),
+                h('div', { style: muted }, t('mordeHubFetchTask', { id: record.taskID })),
+                h('div', { style: muted }, t('mordeHubFetchTime', { time: new Date(record.updatedAt).toISOString() })),
+                record.status === 'completed' && record.expiresAt
+                  ? h('div', { style: muted }, t('mordeHubFetchRetention', { expiresAt: record.expiresAt })) : null))
+              : h('div', { style: muted }, t('mordeHubFileAccessEmpty'))),
           h('div', { style: row },
             h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: signOut }, busy ? t('mordeHubDisconnecting') : t('mordeHubDisconnect'))))
       : h('form', { style: { ...column, marginTop: 8 }, onSubmit: login },

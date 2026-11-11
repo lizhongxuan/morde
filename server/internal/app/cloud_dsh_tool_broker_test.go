@@ -41,6 +41,9 @@ func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) 
 	if !validCloudDSHToolImages(cloudDSHTaskAttachmentReadToolName, valid) {
 		t.Fatal("Task Reader rejected four fully decoded bounded images")
 	}
+	if !validCloudDSHToolImages("morde_hub_file_fetch_i1234567_v5", valid) {
+		t.Fatal("Task file.fetch rejected bounded images extracted from a presentation")
+	}
 
 	tooMany := valid
 	tooMany.Images = append(append([]ModelImage(nil), images...), images[0])

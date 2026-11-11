@@ -20,10 +20,10 @@ test.describe("Assistant durable tasks", () => {
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
-    await page.getByRole("link", { name: "AI 助手", exact: true }).click();
+    await page.getByRole("link", { name: "moder", exact: true }).click();
     await expect(page.getByRole("link", { name: "任务与计划", exact: true })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "＋ 新对话" }).click();
+    await page.getByRole("button", { name: "新建旁路会话" }).click();
     await page.getByRole("combobox", { name: "选择目标电脑" }).selectOption("");
     const firstPrompt = `普通文字问题一 ${Date.now()}`;
     const secondPrompt = `普通文字问题二 ${Date.now()}`;
@@ -36,6 +36,7 @@ test.describe("Assistant durable tasks", () => {
     await page.getByRole("button", { name: "发送", exact: true }).click();
     await expect(page.locator(".chat-message-user p").filter({ hasText: secondPrompt })).toBeVisible();
     await expect(page.locator(".chat-message-user").filter({ hasText: "已受理，等待处理" })).toHaveCount(2);
+    await expect(page.getByRole("button", { name: "任务动态" })).toHaveAttribute("aria-expanded", "false");
     await expect(page.locator(".task-activity")).toHaveCount(0);
 
     const taskIDs = await page.evaluate(({ firstPrompt, secondPrompt }) => {
@@ -100,6 +101,13 @@ test.describe("Assistant durable tasks", () => {
     await page.getByRole("button", { name: /新对话 本机最近查看/ }).click();
     await expect(page.locator(".chat-message-user p").filter({ hasText: firstPrompt })).toBeVisible();
     await expect(page.locator(".chat-message-user p").filter({ hasText: secondPrompt })).toBeVisible();
+    const assistantReply = page.locator(".chat-message-assistant").filter({ hasText: "第一项任务已完成首轮建议。" });
+    const replyTime = assistantReply.locator("..").locator(".assistant-reply-time");
+    await expect(replyTime).toHaveCSS("opacity", "0");
+    await assistantReply.hover();
+    await expect(replyTime).toHaveCSS("opacity", "1");
+    await expect(replyTime).toHaveAttribute("datetime", /.+/);
+    await page.getByRole("button", { name: "任务动态" }).click();
     const firstPanel = page.locator(`.task-activity[aria-label="任务 ${taskIDs[0]} 的工作过程"]`);
     const secondPanel = page.locator(`.task-activity[aria-label="任务 ${taskIDs[1]} 的工作过程"]`);
     await expect(firstPanel).toContainText("任务正在等待你的确认或补充信息。");
@@ -108,25 +116,16 @@ test.describe("Assistant durable tasks", () => {
     await expect(secondPanel).toContainText("读取网页");
     await expect(page.getByText("第一项任务已完成首轮建议。")).toBeVisible();
     await expect(page.getByText("第二项任务正在读取网页。")).toBeVisible();
-    const statusIsAfterItsMessage = await firstPanel.evaluate((panel, content) => {
-      const answer = [...document.querySelectorAll<HTMLElement>(".chat-message-assistant")]
-        .find((item) => item.textContent?.includes(content));
-      return Boolean(answer && (answer.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING));
-    }, "第一项任务已完成首轮建议。");
-    expect(statusIsAfterItsMessage).toBeTruthy();
-    const secondStatusIsAfterItsMessage = await secondPanel.evaluate((panel, content) => {
-      const answer = [...document.querySelectorAll<HTMLElement>(".chat-message-assistant")]
-        .find((item) => item.textContent?.includes(content));
-      return Boolean(answer && (answer.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING));
-    }, "第二项任务正在读取网页。");
-    expect(secondStatusIsAfterItsMessage).toBeTruthy();
-    expect(await page.locator(".message-list").evaluate((list) => list.firstElementChild?.classList.contains("chat-message-user"))).toBeTruthy();
+    await expect(page.locator(".message-list article").first()).toHaveClass(/chat-message-user/);
+    await expect(page.locator(".message-list .task-activity")).toHaveCount(0);
 
-    await page.getByRole("combobox", { name: "选择要停止的任务" }).selectOption(taskIDs[0]!);
-    await page.getByRole("button", { name: "停止任务" }).click();
+    await expect(firstPanel.getByRole("button", { name: "暂停任务" })).toBeVisible();
+    await expect(secondPanel.getByRole("button", { name: "暂停任务" })).toBeVisible();
+    await firstPanel.getByRole("button", { name: "停止任务" }).click();
     await expect(firstPanel).toContainText("正在等待服务端确认停止结果。");
     await expect(secondPanel).toContainText("AI 正在处理…");
-    await expect(page.getByRole("button", { name: "暂停任务" })).toHaveCount(0);
+    await expect(page.locator(".assistant-composer").getByRole("button", { name: "停止任务" })).toHaveCount(0);
+    await expect(page.locator(".assistant-composer").getByRole("button", { name: "暂停任务" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "设为主会话" })).toHaveCount(0);
     await expect(page.locator(".assistant-composer .assistant-progress")).toHaveCount(0);
     await expect(page.locator(".assistant-composer")).not.toContainText("AI 正在处理…");
@@ -137,8 +136,8 @@ test.describe("Assistant durable tasks", () => {
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
-    await page.getByRole("link", { name: "AI 助手", exact: true }).click();
-    await page.getByRole("button", { name: "＋ 新对话" }).click();
+    await page.getByRole("link", { name: "moder", exact: true }).click();
+    await page.getByRole("button", { name: "新建旁路会话" }).click();
     await page.getByRole("combobox", { name: "选择目标电脑" }).selectOption("");
 
     const prompt = "长消息中文🙂".repeat(4_500);
@@ -164,7 +163,7 @@ test.describe("Assistant durable tasks", () => {
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
-    await page.getByRole("link", { name: "AI 助手", exact: true }).click();
+    await page.getByRole("link", { name: "moder", exact: true }).click();
 
     for (const scenario of [{ width: 1280, height: 720, fontSize: "16px" }, { width: 640, height: 360, fontSize: "16px" }]) {
       await page.setViewportSize({ width: scenario.width, height: scenario.height });
@@ -184,6 +183,14 @@ test.describe("Assistant durable tasks", () => {
       expect(afterHeight).toBe(beforeHeight);
       expect(inputHeight).toBeLessThanOrEqual(120);
       expect(afterBottom).toBe(beforeBottom);
+      await page.getByRole("button", { name: "任务动态" }).click();
+      const sendIsUsable = await page.getByRole("button", { name: "发送", exact: true }).evaluate((button) => {
+        const rect = button.getBoundingClientRect();
+        const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return rect.top >= 0 && rect.bottom <= window.innerHeight && (target === button || button.contains(target));
+      });
+      expect(sendIsUsable).toBeTruthy();
+      await page.getByRole("button", { name: "关闭任务动态" }).click();
     }
   });
 });

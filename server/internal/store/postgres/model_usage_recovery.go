@@ -29,7 +29,7 @@ func (s *Store) MarkStaleModelCallsUnknown(ctx context.Context) (int, error) {
 	marked := 0
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT DISTINCT owner_id FROM model_call_ledger
-WHERE state='dispatched' AND source<>'route' AND created_at < clock_timestamp() - ($1 * interval '1 second')
+ WHERE state='dispatched' AND source NOT IN ('route','compaction') AND created_at < clock_timestamp() - ($1 * interval '1 second')
 ORDER BY owner_id LIMIT $2`, staleModelCallAge.Seconds(), staleModelCallBatchSize)
 		if err != nil {
 			return fmt.Errorf("list stale model call owners: %w", err)
@@ -58,7 +58,7 @@ ORDER BY owner_id LIMIT $2`, staleModelCallAge.Seconds(), staleModelCallBatchSiz
 				return err
 			}
 			var hasPlatform bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE owner_id=$1 AND state='dispatched' AND source<>'route'
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE owner_id=$1 AND state='dispatched' AND source NOT IN ('route','compaction')
 AND NOT personal_model AND created_at < clock_timestamp() - ($2 * interval '1 second'))`, ownerID, staleModelCallAge.Seconds()).Scan(&hasPlatform); err != nil {
 				return fmt.Errorf("inspect stale model calls: %w", err)
 			}
@@ -70,7 +70,7 @@ AND NOT personal_model AND created_at < clock_timestamp() - ($2 * interval '1 se
 		}
 		projectRows, err := tx.Query(ctx, `WITH stale_calls AS (
  SELECT owner_id,source,call_id,task_id FROM model_call_ledger
- WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source<>'route'
+ WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source NOT IN ('route','compaction')
    AND created_at < clock_timestamp() - ($2 * interval '1 second')
  ORDER BY owner_id,created_at,source,call_id LIMIT $3
 )
@@ -103,7 +103,7 @@ ORDER BY p.project_id`, owners, staleModelCallAge.Seconds(), staleModelCallBatch
 		}
 
 		rows, err = tx.Query(ctx, `SELECT owner_id,source,call_id,COALESCE(task_id,''),personal_model FROM model_call_ledger
-WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source<>'route'
+WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source NOT IN ('route','compaction')
   AND created_at < clock_timestamp() - ($2 * interval '1 second')
 ORDER BY owner_id,created_at,source,call_id LIMIT $3 FOR UPDATE SKIP LOCKED`,
 			owners, staleModelCallAge.Seconds(), staleModelCallBatchSize)

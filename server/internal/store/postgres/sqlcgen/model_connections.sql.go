@@ -13,22 +13,23 @@ import (
 
 const createModelConnection = `-- name: CreateModelConnection :one
 INSERT INTO model_connections (
-  id, owner_id, name, base_url, model_name, api_key_cipher,
+  id, owner_id, name, base_url, model_name, context_window_tokens, api_key_cipher,
   capability_text, capability_tools, capability_vision, checked_at
 ) VALUES (
-  $1, $2, $3, $4, $5, $6,
+  $1, $2, $3, $4, $5, $6, $7,
   false, false, false, NULL
 )
-RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation
+RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens
 `
 
 type CreateModelConnectionParams struct {
-	ID           string      `json:"id"`
-	OwnerID      pgtype.Text `json:"owner_id"`
-	Name         string      `json:"name"`
-	BaseUrl      string      `json:"base_url"`
-	ModelName    string      `json:"model_name"`
-	ApiKeyCipher []byte      `json:"api_key_cipher"`
+	ID                  string      `json:"id"`
+	OwnerID             pgtype.Text `json:"owner_id"`
+	Name                string      `json:"name"`
+	BaseUrl             string      `json:"base_url"`
+	ModelName           string      `json:"model_name"`
+	ContextWindowTokens pgtype.Int4 `json:"context_window_tokens"`
+	ApiKeyCipher        []byte      `json:"api_key_cipher"`
 }
 
 func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConnectionParams) (ModelConnection, error) {
@@ -38,6 +39,7 @@ func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConn
 		arg.Name,
 		arg.BaseUrl,
 		arg.ModelName,
+		arg.ContextWindowTokens,
 		arg.ApiKeyCipher,
 	)
 	var i ModelConnection
@@ -57,6 +59,7 @@ func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConn
 		&i.CapabilityMediaImageGeneration,
 		&i.CapabilityMediaVideoGeneration,
 		&i.CapabilityMediaSpeechGeneration,
+		&i.ContextWindowTokens,
 	)
 	return i, err
 }
@@ -73,7 +76,7 @@ func (q *Queries) DeleteModelConnection(ctx context.Context, id string) (string,
 }
 
 const getModelConnection = `-- name: GetModelConnection :one
-SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation FROM model_connections WHERE id = $1
+SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens FROM model_connections WHERE id = $1
 `
 
 func (q *Queries) GetModelConnection(ctx context.Context, id string) (ModelConnection, error) {
@@ -95,12 +98,13 @@ func (q *Queries) GetModelConnection(ctx context.Context, id string) (ModelConne
 		&i.CapabilityMediaImageGeneration,
 		&i.CapabilityMediaVideoGeneration,
 		&i.CapabilityMediaSpeechGeneration,
+		&i.ContextWindowTokens,
 	)
 	return i, err
 }
 
 const listModelConnections = `-- name: ListModelConnections :many
-SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation FROM model_connections
+SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens FROM model_connections
 WHERE owner_id IS NULL OR owner_id = $1
 ORDER BY owner_id NULLS FIRST, lower(name), id
 `
@@ -130,6 +134,7 @@ func (q *Queries) ListModelConnections(ctx context.Context, ownerID pgtype.Text)
 			&i.CapabilityMediaImageGeneration,
 			&i.CapabilityMediaVideoGeneration,
 			&i.CapabilityMediaSpeechGeneration,
+			&i.ContextWindowTokens,
 		); err != nil {
 			return nil, err
 		}
@@ -144,20 +149,22 @@ func (q *Queries) ListModelConnections(ctx context.Context, ownerID pgtype.Text)
 const updateModelConnection = `-- name: UpdateModelConnection :one
 UPDATE model_connections SET
   name = $1, base_url = $2, model_name = $3,
-  api_key_cipher = $4, capability_text = $5,
-  capability_tools = $6, capability_vision = $7,
-  capability_media_image_generation = COALESCE($8, capability_media_image_generation),
-  capability_media_video_generation = COALESCE($9, capability_media_video_generation),
-  capability_media_speech_generation = COALESCE($10, capability_media_speech_generation),
-  checked_at = $11, updated_at = clock_timestamp()
-WHERE id = $12 AND updated_at = $13
-RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation
+  context_window_tokens = $4,
+  api_key_cipher = $5, capability_text = $6,
+  capability_tools = $7, capability_vision = $8,
+  capability_media_image_generation = COALESCE($9, capability_media_image_generation),
+  capability_media_video_generation = COALESCE($10, capability_media_video_generation),
+  capability_media_speech_generation = COALESCE($11, capability_media_speech_generation),
+  checked_at = $12, updated_at = clock_timestamp()
+WHERE id = $13 AND updated_at = $14
+RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens
 `
 
 type UpdateModelConnectionParams struct {
 	Name                            string             `json:"name"`
 	BaseUrl                         string             `json:"base_url"`
 	ModelName                       string             `json:"model_name"`
+	ContextWindowTokens             pgtype.Int4        `json:"context_window_tokens"`
 	ApiKeyCipher                    []byte             `json:"api_key_cipher"`
 	CapabilityText                  bool               `json:"capability_text"`
 	CapabilityTools                 bool               `json:"capability_tools"`
@@ -175,6 +182,7 @@ func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConn
 		arg.Name,
 		arg.BaseUrl,
 		arg.ModelName,
+		arg.ContextWindowTokens,
 		arg.ApiKeyCipher,
 		arg.CapabilityText,
 		arg.CapabilityTools,
@@ -203,6 +211,7 @@ func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConn
 		&i.CapabilityMediaImageGeneration,
 		&i.CapabilityMediaVideoGeneration,
 		&i.CapabilityMediaSpeechGeneration,
+		&i.ContextWindowTokens,
 	)
 	return i, err
 }

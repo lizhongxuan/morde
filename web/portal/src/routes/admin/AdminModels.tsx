@@ -9,9 +9,9 @@ import { useToast } from '../../app/toast';
 import { Modal } from '../../components/Modal';
 
 type AdminModelConnection = Awaited<ReturnType<typeof portalApi.adminModelConnections>>['items'][number];
-type ModelConnectionForm = { name: string; baseURL: string; modelName: string; apiKey: string };
+type ModelConnectionForm = { name: string; baseURL: string; modelName: string; contextWindowTokens: string; apiKey: string };
 
-const emptyForm: ModelConnectionForm = { name: '', baseURL: '', modelName: '', apiKey: '' };
+const emptyForm: ModelConnectionForm = { name: '', baseURL: '', modelName: '', contextWindowTokens: '', apiKey: '' };
 
 export function AdminModels() {
   const client = useQueryClient();
@@ -49,6 +49,7 @@ export function AdminModels() {
   const create = useMutation({
     mutationFn: ({ value }: { value: ModelConnectionForm; presetID: string }) => portalApi.createModelConnection({
       name: value.name.trim(), base_url: value.baseURL.trim(), model_name: value.modelName.trim(), api_key: value.apiKey, shared: true,
+      ...(value.contextWindowTokens ? { context_window_tokens: Number(value.contextWindowTokens) } : {}),
     }),
     onSuccess: async (created, { presetID: selectedPresetID }) => {
       setFormOpen(false);
@@ -71,6 +72,7 @@ export function AdminModels() {
   const update = useMutation({
     mutationFn: ({ id, value }: { id: string; value: ModelConnectionForm }) => portalApi.updateModelConnection(id, {
       name: value.name.trim(), base_url: value.baseURL.trim(), model_name: value.modelName.trim(),
+      ...(value.contextWindowTokens ? { context_window_tokens: Number(value.contextWindowTokens) } : {}),
       ...(value.apiKey ? { api_key: value.apiKey } : {}),
     }),
     onSuccess: async () => {
@@ -109,7 +111,8 @@ export function AdminModels() {
   function openEdit(model: AdminModelConnection) {
     setFormOpen(true);
     setFormID(model.id);
-    setForm({ name: model.name, baseURL: model.base_url, modelName: model.model_name, apiKey: '' });
+    setForm({ name: model.name, baseURL: model.base_url, modelName: model.model_name,
+      contextWindowTokens: model.context_window_tokens ? String(model.context_window_tokens) : '', apiKey: '' });
     setPresetID('');
     create.reset();
     update.reset();
@@ -134,10 +137,11 @@ export function AdminModels() {
     {query.isPending ? <div className="loading-card" role="status">正在加载平台模型连接…</div>
       : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>
         : !models.length ? <div className="empty-card compact"><h2>尚未配置平台模型</h2><p>可选择 GPT 或 DeepSeek 预设，也可以手动填写其他兼容服务。</p><button type="button" className="button button-secondary" onClick={openCreate}>添加平台模型</button></div>
-          : <div className="table-wrap"><table><thead><tr><th>连接</th><th>服务地址</th><th>密钥</th><th>能力 / 检查状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
+          : <div className="table-wrap"><table><thead><tr><th>连接</th><th>服务地址</th><th>上下文窗口</th><th>密钥</th><th>能力 / 检查状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
             {models.map((model) => <tr key={model.id}>
               <td><strong>{model.name}</strong><small className="table-sub">{model.model_name}</small></td>
               <td className="mono">{model.base_url}</td>
+              <td>{model.context_window_tokens ? `${model.context_window_tokens.toLocaleString()} tokens` : '未配置'}</td>
               <td>{model.has_api_key ? '已配置' : '未配置'}</td>
               <td>{model.checked_at ? <><span>{capabilitySummary(model.capabilities)} · 流式能力{model.capabilities.text_stream ? '可用' : '未验证'}</span><small className="table-sub">已检查 · {formatDate(model.checked_at)}</small></> : <span className="muted">尚未检查</span>}
                 {checked?.id === model.id && <p className="notice notice-info model-check-result">本次检查：{capabilitySummary(checked.capabilities)}</p>}
@@ -198,6 +202,7 @@ function ModelConnectionFormView({ form, setForm, presetID, setPresetID, isEditi
       </select><small className="muted">自动填写模型名和服务地址；连接检查验证文本和工具调用，可能产生少量服务商费用。</small></div>}
       <div><label htmlFor="admin-model-name">显示名称</label><input id="admin-model-name" value={form.name} maxLength={80} required onChange={(event) => setForm({ ...form, name: event.target.value })} /></div>
       <div><label htmlFor="admin-model-provider-name">模型名</label><input id="admin-model-provider-name" value={form.modelName} maxLength={256} required onChange={(event) => setForm({ ...form, modelName: event.target.value })} /></div>
+      <div className="connection-form-wide"><label htmlFor="admin-model-context-window">上下文窗口（tokens）</label><input id="admin-model-context-window" type="number" min={4096} max={1000000} step={1} value={form.contextWindowTokens} onChange={(event) => setForm({ ...form, contextWindowTokens: event.target.value })} /><small className="muted">按服务商模型文档填写。压缩需要此值；留空时会安全停用该模型的自动压缩。</small></div>
       <div className="connection-form-wide"><label htmlFor="admin-model-base-url">服务地址</label><input id="admin-model-base-url" type="url" pattern="https://.*" value={form.baseURL} required onChange={(event) => setForm({ ...form, baseURL: event.target.value })} /><small className="muted">只接受 HTTPS；服务端还会执行出站地址校验。</small></div>
       <div className="connection-form-wide"><label htmlFor="admin-model-api-key">API 密钥</label><input id="admin-model-api-key" type="password" autoComplete="new-password" value={form.apiKey} maxLength={4096} required={!isEditing} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} /><small className="muted">{isEditing ? '密钥不会回显；留空则保留已保存的密钥，输入新值才会替换。' : '密钥只提交给 Morde 服务端，保存后只显示“已配置”。'}</small></div>
     </div>

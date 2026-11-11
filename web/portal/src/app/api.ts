@@ -159,7 +159,7 @@ export const portalApi = {
   clients: async () => unwrapApiResponse(await api.GET('/api/clients')),
   revokeClient: async (id: string) => unwrapApiResponse(await api.DELETE('/api/clients/{id}', { params: { path: { id } } })),
   capabilities: async () => unwrapApiResponse(await api.GET('/api/capabilities')),
-  conversations: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
+  conversations: async (cursor?: string, limit = 100) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit, ...(cursor ? { cursor } : {}) } } })),
   createConversation: async (body: components['schemas']['CreateConversationRequest'], idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
     if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
     return unwrapApiResponse(await api.POST('/api/conversations', {
@@ -208,7 +208,25 @@ export const portalApi = {
     }
     throw new Error('任务页数超过读取上限');
   },
+  tasks: async (): Promise<components['schemas']['TaskPage']> => {
+    const items: components['schemas']['TaskSummary'][] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 1000; page += 1) {
+      const result = unwrapApiResponse(await api.GET('/api/tasks', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } }));
+      items.push(...result.items);
+      if (!result.next_cursor) return { items, next_cursor: null };
+      if (seen.has(result.next_cursor)) throw new Error('任务分页游标重复，无法继续读取');
+      seen.add(result.next_cursor);
+      cursor = result.next_cursor;
+    }
+    throw new Error('任务页数超过读取上限');
+  },
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  taskFileFetches: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/file-fetches', { params: { path: { id } } })),
+  deleteTaskFileFetchContent: async (id: string, fetchID: string): Promise<void> => {
+    unwrapApiResponse(await api.DELETE('/api/tasks/{id}/file-fetches/{fetch_id}/content', { params: { path: { id, fetch_id: fetchID } } }));
+  },
   taskWorkbenchObservationTicket: async (id: string): Promise<TaskWorkbenchObservationTicket> => readTaskWorkbenchObservationTicket(
     await requestFetch(`/api/tasks/${encodeURIComponent(id)}/workbench-observation-ticket`, { method: 'POST' }), id,
   ),

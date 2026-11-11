@@ -48,6 +48,11 @@ VALUES ('p1234567',$1,'route test','http://127.0.0.1','test',decode(repeat('01',
 }
 
 func (f routeActionsTestFixture) receive(t *testing.T, clientID, content string, input app.ConversationRoutingInput) app.ConversationRouteClaim {
+	return f.receiveInConversation(t, f.conversation.ID, clientID, content, input)
+}
+
+func (f routeActionsTestFixture) receiveInConversation(t *testing.T, conversationID, clientID, content string,
+	input app.ConversationRoutingInput) app.ConversationRouteClaim {
 	t.Helper()
 	ctx := context.Background()
 	input.ModelID = "p1234567"
@@ -55,7 +60,7 @@ func (f routeActionsTestFixture) receive(t *testing.T, clientID, content string,
 	hash := sha256.Sum256([]byte(clientID))
 	message, _, err := f.store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
 		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: f.ownerID, ActorID: f.ownerID,
-			ConversationID: f.conversation.ID, Role: conversation.RoleUser, Content: content},
+			ConversationID: conversationID, Role: conversation.RoleUser, Content: content},
 		ServiceInstanceID: f.instanceID, ClientID: clientID, RequestHash: hash[:], Input: input, Authorization: f.authorization,
 	})
 	if err != nil {

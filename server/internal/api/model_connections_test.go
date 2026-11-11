@@ -76,9 +76,11 @@ func (s *modelConnectionManagerStub) Check(context.Context, identity.Principal, 
 
 func TestModelConnectionAPIAllowsClientPersonalCreateAndNeverReturnsAPIKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	window := 32_768
 	manager := &modelConnectionManagerStub{created: app.ModelConnectionView{
 		ID: "p1234567", Name: "OpenAI", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test",
-		Shared: false, HasAPIKey: true, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		ContextWindowTokens: &window,
+		Shared:              false, HasAPIKey: true, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}}
 	services := newServices()
 	deps := services.deps()
@@ -91,12 +93,14 @@ func TestModelConnectionAPIAllowsClientPersonalCreateAndNeverReturnsAPIKey(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","api_key":"secret-model-key","shared":false}`
+	body := `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_tokens":32768,"api_key":"secret-model-key","shared":false}`
 	response := request(router, http.MethodPost, "/api/model-connections", body, "Bearer "+clientCredential, "")
-	if response.Code != http.StatusCreated || strings.Contains(response.Body.String(), "secret-model-key") || strings.Contains(response.Body.String(), `"api_key"`) {
+	if response.Code != http.StatusCreated || strings.Contains(response.Body.String(), "secret-model-key") || strings.Contains(response.Body.String(), `"api_key"`) ||
+		!strings.Contains(response.Body.String(), `"context_window_tokens":32768`) {
 		t.Fatalf("create response = %d %s", response.Code, response.Body)
 	}
-	if manager.calls != 1 || manager.command.APIKey != "secret-model-key" || manager.principal.Kind != identity.KindClient || manager.command.Shared {
+	if manager.calls != 1 || manager.command.APIKey != "secret-model-key" || manager.command.ContextWindowTokens == nil ||
+		*manager.command.ContextWindowTokens != window || manager.principal.Kind != identity.KindClient || manager.command.Shared {
 		t.Fatalf("create command not forwarded: calls=%d command=%+v", manager.calls, manager.command)
 	}
 

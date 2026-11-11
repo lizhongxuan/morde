@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
-import { validMessageDelivery } from './engine.mjs'
+import { coordinatorCompactionModelCallID, coordinatorModelCallID, validMessageDelivery } from './engine.mjs'
 
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024
 const MAX_MODEL_QUEUE_BYTES = 1024 * 1024
@@ -15,7 +15,7 @@ const CHECKPOINT_TIMEOUT_MS = 30_000
 const TOOL_RESULT_TIMEOUT_MS = 6 * 60_000
 const CHILD_RESULT_TIMEOUT_MS = 6 * 60_000
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
-const COORDINATOR_IDENTITY_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+const COORDINATOR_IDENTITY_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
 
 function deferred() {
   let resolve, reject
@@ -532,6 +532,16 @@ export class WorkerIPC {
 
   async *streamModel(identity, id, through, request, signal) {
     if (this.models.size >= 17 || this.models.has(id) || this.cancelledModels.has(id)) throw new Error('too many active model requests')
+    if (identity.context_role === 'coordinator') {
+      const expectedID = identity.purpose === 'compaction'
+        ? coordinatorCompactionModelCallID(identity.conversation_id, identity.operation_id, identity.session_id, through)
+        : coordinatorModelCallID(identity.conversation_id, identity.message_id, identity.session_id, through)
+      if (id !== expectedID || identity.purpose !== (identity.operation_id ? 'compaction' : 'conversation')) {
+        throw new Error('model call does not match the coordinator purpose')
+      }
+    } else if (Object.hasOwn(identity, 'purpose') || Object.hasOwn(identity, 'operation_id')) {
+      throw new Error('Task model call cannot use a coordinator purpose')
+    }
     signal?.throwIfAborted()
     const queue = []
     let queuedBytes = 0

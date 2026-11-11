@@ -512,8 +512,8 @@ func (s *Store) ListConversations(ctx context.Context, ownerID string, hostIDs [
 FROM conversations
 WHERE owner_id=$1 AND project_id IS NULL
   AND ($2::text[] IS NULL OR host_id=ANY($2::text[]))
-  AND ($3::timestamptz IS NULL OR created_at<$3 OR (created_at=$3 AND id<$4))
-ORDER BY created_at DESC,id DESC LIMIT $5`, ownerID, hostIDs, cursorAt, cursorID, limit+1)
+  AND ($3::timestamptz IS NULL OR updated_at<$3 OR (updated_at=$3 AND id<$4))
+ORDER BY updated_at DESC,id DESC LIMIT $5`, ownerID, hostIDs, cursorAt, cursorID, limit+1)
 	if err != nil {
 		return app.ConversationPage{}, fmt.Errorf("list conversations: %w", err)
 	}
@@ -534,7 +534,7 @@ ORDER BY created_at DESC,id DESC LIMIT $5`, ownerID, hostIDs, cursorAt, cursorID
 	rows.Close()
 	pageResult := app.ConversationPage{Items: items}
 	pageResult.NextCursor = nextPageCursor(items, limit, func(value conversation.Conversation) (string, time.Time) {
-		return value.ID, value.CreatedAt
+		return value.ID, value.UpdatedAt
 	})
 	if int32(len(items)) > limit {
 		pageResult.Items = items[:limit]

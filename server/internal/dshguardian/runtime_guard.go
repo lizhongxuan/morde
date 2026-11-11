@@ -474,6 +474,9 @@ func (s *Service) RecoverTaskProcessStopped(ctx context.Context, runtimeFence ap
 	if err != nil || !ok {
 		return app.AccountAgentTaskStopAttestation{}, errors.New("guardian lease for the exact account Runtime and Task fences is unknown")
 	}
+	if !value.Destroyed && value.Guard.ExpiresAt.After(s.now()) {
+		return app.AccountAgentTaskStopAttestation{}, errors.New("guardian Task process lease has not expired")
+	}
 	if err := s.destroyTaskProcess(ctx, &value); err != nil {
 		return app.AccountAgentTaskStopAttestation{}, fmt.Errorf("guardian could not verify recovered Task cgroup destruction: %w", err)
 	}

@@ -83,11 +83,15 @@ type ProjectModelReservation struct {
 }
 
 type SettleProjectModelCallCommand struct {
-	ProjectID string
-	Source    ModelCallSource
-	CallID    string
-	Usage     project.Usage
-	Unknown   bool
+	ProjectID          string
+	Source             ModelCallSource
+	CallID             string
+	Usage              project.Usage
+	Unknown            bool
+	Summary            *ConversationSummaryModelFence
+	ResponseCiphertext []byte
+	ResponseDigest     []byte
+	ResponseInvalid    bool
 }
 
 type ProjectBudgetStore interface {
@@ -295,6 +299,53 @@ func (s *ProjectBudgetService) reserveTaskModelCall(ctx context.Context, project
 	return reservation, replay, nil
 }
 
+func (s *ProjectBudgetService) reserveConversationSummaryModelCall(ctx context.Context, projectID string,
+	call ModelCallReservation, usage project.Usage) (ProjectModelReservation, bool, error) {
+	if ctx == nil || !project.ValidID(projectID) || call.Source != ModelCallCompaction || call.Summary == nil ||
+		!domain.ValidUserID(call.OwnerID) || call.OwnerID != call.Summary.Identity.ActorID ||
+		call.Summary.Identity.ScopeKind != ConversationSummaryProjectScope || call.Summary.Identity.ScopeID != projectID ||
+		!domain.ValidModelConnectionID(call.ModelID) || !idempotencyKeyPattern.MatchString(call.CallID) ||
+		len(call.RequestDigest) != 32 || !validProjectTokenUsage(usage) || call.ReservedTokens != usage.InputTokens+usage.OutputTokens {
+		return ProjectModelReservation{}, false, domain.InvalidArgument("project_model_call", "project summary model call reservation is invalid")
+	}
+	rate, err := s.rates.ProjectRateSnapshot(ctx, call.ModelID)
+	if err != nil || rate.Validate() != nil || rate.ModelID != call.ModelID || rate.Model != call.ProviderModel {
+		return ProjectModelReservation{}, false, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	reservedMicros, err := rate.EstimateTokenCost(usage)
+	if err != nil || reservedMicros < 1 {
+		return ProjectModelReservation{}, false, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	digest, err := hashIdempotencyRequest(struct {
+		ProjectID string
+		ActorID   string
+		Source    ModelCallSource
+		CallID    string
+		ModelID   string
+		Usage     project.Usage
+		Request   []byte
+	}{projectID, call.OwnerID, call.Source, call.CallID, call.ModelID, usage, call.RequestDigest})
+	if err != nil {
+		return ProjectModelReservation{}, false, err
+	}
+	reservation, replay, err := s.store.ReserveProjectModelCall(ctx, ProjectModelReservation{
+		ProjectID: projectID, ActorID: call.OwnerID, Source: call.Source, CallID: call.CallID,
+		ModelID: call.ModelID, Usage: usage, ReservedTokens: call.ReservedTokens,
+		Rate: rate, ReservedMicros: reservedMicros, RequestDigest: digest, AccountCall: call,
+	})
+	if err != nil {
+		return ProjectModelReservation{}, false, err
+	}
+	command := ReserveProjectModelCallCommand{ProjectID: projectID, Source: call.Source, CallID: call.CallID,
+		ModelID: call.ModelID, Usage: usage, AccountCall: call}
+	if err := validateProjectModelReservation(reservation, command, call.OwnerID, digest); err != nil ||
+		!sameProjectAccountCall(reservation.AccountCall, call) {
+		return ProjectModelReservation{}, false, fmt.Errorf("reserve project summary model call: %w", domain.NewError(domain.CodeInternal,
+			"project budget store returned an invalid account reservation"))
+	}
+	return reservation, replay, nil
+}
+
 func projectAccountCallMatchesCommand(call ModelCallReservation, principal identity.Principal, command ReserveProjectModelCallCommand, reservedTokens int64, providerModel string) bool {
 	if call.Source != command.Source || call.ProjectID != command.ProjectID || call.OwnerID != principal.UserID ||
 		call.CallID != command.CallID || call.ModelID != command.ModelID || call.ReservedTokens != reservedTokens ||
@@ -305,6 +356,10 @@ func projectAccountCallMatchesCommand(call ModelCallReservation, principal ident
 	if command.Source == ModelCallTask {
 		return call.Task != nil && call.Task.TaskID == command.TaskID && call.Task.InitiatorID == principal.UserID &&
 			domain.ValidUserID(call.Task.OwnerID) && call.Principal.UserID == ""
+	}
+	if command.Source == ModelCallCompaction {
+		return call.Task == nil && call.Summary != nil && call.Summary.Claim.Message.ActorID == principal.UserID &&
+			call.Summary.Identity.ScopeKind == ConversationSummaryProjectScope && call.Summary.Identity.ScopeID == command.ProjectID
 	}
 	return call.Task == nil && call.Principal.UserID == principal.UserID
 }
@@ -324,7 +379,23 @@ func sameProjectAccountCall(value, expected ModelCallReservation) bool {
 	if value.Task != nil {
 		return *value.Task == *expected.Task
 	}
-	return true
+	return sameConversationSummaryModelFence(value.Summary, expected.Summary)
+}
+
+func sameConversationSummaryModelFence(value, expected *ConversationSummaryModelFence) bool {
+	if value == nil || expected == nil {
+		return value == expected
+	}
+	return value.Identity == expected.Identity && value.OperationID == expected.OperationID && value.LeaseOwner == expected.LeaseOwner &&
+		value.LeaseVersion == expected.LeaseVersion && value.SessionID == expected.SessionID &&
+		value.ThroughSequence == expected.ThroughSequence && value.BaselineVersion == expected.BaselineVersion &&
+		value.ContextWindowTokens == expected.ContextWindowTokens &&
+		bytes.Equal(value.InputSHA256, expected.InputSHA256) && value.Claim.ServiceInstanceID == expected.Claim.ServiceInstanceID &&
+		value.Claim.Message.ID == expected.Claim.Message.ID && value.Claim.Message.OwnerID == expected.Claim.Message.OwnerID &&
+		value.Claim.Message.ActorID == expected.Claim.Message.ActorID && value.Claim.Message.ConversationID == expected.Claim.Message.ConversationID &&
+		value.Claim.Message.Sequence == expected.Claim.Message.Sequence && value.Claim.LeaseOwner == expected.Claim.LeaseOwner &&
+		value.Claim.LeaseVersion == expected.Claim.LeaseVersion && value.Claim.Authorization.Version == expected.Claim.Authorization.Version &&
+		value.Claim.Authorization.TokenID == expected.Claim.Authorization.TokenID && value.Claim.Input.ProjectID == expected.Claim.Input.ProjectID
 }
 
 func sameProjectAccountPrincipal(value, expected identity.Principal) bool {
@@ -339,7 +410,12 @@ func sameProjectAccountPrincipal(value, expected identity.Principal) bool {
 // SettleModelCall is an internal model-gateway use case. Unknown charges stay reserved until reconciliation.
 func (s *ProjectBudgetService) SettleModelCall(ctx context.Context, command SettleProjectModelCallCommand) error {
 	if ctx == nil || command.Source == ModelCallRoute || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
-		!idempotencyKeyPattern.MatchString(command.CallID) || (!command.Unknown && !validProjectTokenUsage(command.Usage)) {
+		!idempotencyKeyPattern.MatchString(command.CallID) || (!command.Unknown && !validProjectTokenUsage(command.Usage)) ||
+		(command.Source == ModelCallCompaction) != (command.Summary != nil) || command.Unknown && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0) ||
+		command.Source != ModelCallCompaction && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0 || command.ResponseInvalid) ||
+		command.ResponseInvalid && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0) ||
+		!command.Unknown && !command.ResponseInvalid && command.Source == ModelCallCompaction &&
+			(len(command.ResponseCiphertext) == 0 || len(command.ResponseCiphertext) > MaxConversationSummaryCiphertext || len(command.ResponseDigest) != 32) {
 		return domain.InvalidArgument("project_model_settlement", "project model call settlement is invalid")
 	}
 	return s.store.SettleProjectModelCall(ctx, command)
@@ -384,7 +460,7 @@ func validateProjectLedgerEntry(value ProjectLedgerEntry) error {
 }
 
 func validProjectBudgetSource(source ModelCallSource) bool {
-	return source == ModelCallClient || source == ModelCallChat || source == ModelCallTask || source == ModelCallRoute
+	return source == ModelCallClient || source == ModelCallChat || source == ModelCallTask || source == ModelCallRoute || source == ModelCallCompaction
 }
 
 func validProjectTokenUsage(value project.Usage) bool {

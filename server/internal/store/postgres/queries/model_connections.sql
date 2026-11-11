@@ -1,9 +1,9 @@
 -- name: CreateModelConnection :one
 INSERT INTO model_connections (
-  id, owner_id, name, base_url, model_name, api_key_cipher,
+  id, owner_id, name, base_url, model_name, context_window_tokens, api_key_cipher,
   capability_text, capability_tools, capability_vision, checked_at
 ) VALUES (
-  sqlc.arg(id), sqlc.narg(owner_id), sqlc.arg(name), sqlc.arg(base_url), sqlc.arg(model_name), sqlc.arg(api_key_cipher),
+  sqlc.arg(id), sqlc.narg(owner_id), sqlc.arg(name), sqlc.arg(base_url), sqlc.arg(model_name), sqlc.narg(context_window_tokens), sqlc.arg(api_key_cipher),
   false, false, false, NULL
 )
 RETURNING *;
@@ -19,6 +19,7 @@ SELECT * FROM model_connections WHERE id = sqlc.arg(id);
 -- name: UpdateModelConnection :one
 UPDATE model_connections SET
   name = sqlc.arg(name), base_url = sqlc.arg(base_url), model_name = sqlc.arg(model_name),
+  context_window_tokens = sqlc.narg(context_window_tokens),
   api_key_cipher = sqlc.arg(api_key_cipher), capability_text = sqlc.arg(capability_text),
   capability_tools = sqlc.arg(capability_tools), capability_vision = sqlc.arg(capability_vision),
   capability_media_image_generation = COALESCE(sqlc.narg(capability_media_image_generation), capability_media_image_generation),
