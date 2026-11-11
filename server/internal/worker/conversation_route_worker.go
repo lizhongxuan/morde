@@ -116,6 +116,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		if err == nil {
 			err = errors.New("resolved conversation model identity is invalid")
 		}
+		w.options.Logger.Warn("conversation route model resolution failed", zap.String("code", string(domain.CodeOf(err))))
 		return true, w.failRoute(ctx, claim, "model_unavailable", err)
 	}
 	if snapshot.Context.ResultReview == nil {
@@ -169,6 +170,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, classifyContext)
 		if err != nil {
+			w.options.Logger.Warn("conversation route classification failed", zap.String("code", string(domain.CodeOf(err))), zap.Error(err))
 			if snapshot.Context.ResultReview != nil && routeCtx.Err() != nil && ctx.Err() == nil {
 				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 5*time.Second)
 			}

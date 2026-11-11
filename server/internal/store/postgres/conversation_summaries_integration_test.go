@@ -1114,8 +1114,8 @@ func TestConversationSummaryMigrationUpgradesExistingSchema(t *testing.T) {
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("upgrade existing schema: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 180 {
-		t.Fatalf("upgraded schema version = %d, want 180, err=%v", version, err)
+	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 183 {
+		t.Fatalf("upgraded schema version = %d, want 183, err=%v", version, err)
 	}
 	var summariesExist, memorySourcesExist bool
 	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.conversation_summary_heads') IS NOT NULL,

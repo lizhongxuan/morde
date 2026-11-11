@@ -17,10 +17,11 @@ import (
 )
 
 type TaskFileFetchManifestRequest struct {
-	SourceVersion string `json:"source_version"`
-	SourceSHA256  string `json:"source_sha256"`
-	SizeBytes     int64  `json:"size_bytes"`
-	MediaType     string `json:"media_type"`
+	SourceVersion       string `json:"source_version"`
+	SourceSHA256        string `json:"source_sha256"`
+	SizeBytes           int64  `json:"size_bytes"`
+	MediaType           string `json:"media_type"`
+	SourceDirectoryName string `json:"source_directory_name"`
 }
 
 type TaskFileFetchManifestReceipt struct {
@@ -90,7 +91,7 @@ func (s *TaskService) ManifestTaskFileFetch(ctx context.Context, taskID, fetchID
 	}
 	if !domain.ValidTaskID(taskID) || !domain.ValidOperationID(fetchID) || !validSHA256Hex(request.SourceVersion) ||
 		!validSHA256Hex(request.SourceSHA256) || request.SizeBytes < 1 || request.SizeBytes > TaskFileFetchMaxFileBytes ||
-		!taskFileFetchMediaTypeAllowed(request.MediaType) {
+		!taskFileFetchMediaTypeAllowed(request.MediaType) || !ValidTaskFileFetchDirectoryName(request.SourceDirectoryName) {
 		return TaskFileFetchManifestReceipt{}, domain.InvalidArgument("manifest", "Task file fetch manifest is invalid")
 	}
 	return store.AcceptTaskFileFetchManifest(ctx, taskID, fetchID, ticketHash, request)

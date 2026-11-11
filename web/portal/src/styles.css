@@ -311,7 +311,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .conversation-group { position: relative; margin-top: 8px; }
 .conversation-group-details > summary { padding: 9px 42px 9px 10px; border-radius: 8px; color: var(--muted); cursor: pointer; font-size: .88rem; }
 .conversation-group-details > summary:hover { background: #f5f8fc; }
-.morde-page .assistant-sidebar .conversation-new { position: absolute; top: 6px; right: 6px; width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; border-color: #e2e8f2; border-radius: 50%; color: var(--brand); font-size: 15px; line-height: 1; }
+.morde-page .assistant-sidebar .conversation-new { position: absolute; top: 9px; right: 8px; width: 18px; min-width: 18px; height: 18px; min-height: 18px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; color: #8390a4; background: transparent; font-size: 12px; line-height: 1; }
 .conversation-more { width: 100%; margin-top: 8px; }
 .conversation-row { display: grid; grid-template-columns: minmax(0, 1fr); }
 .conversation-item { width: 100%; padding: 11px 10px; display: grid; gap: 6px; border: 1px solid transparent; border-radius: 8px; color: var(--ink); background: transparent; cursor: pointer; text-align: left; }
@@ -1021,7 +1021,8 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .conversation-item small { overflow: hidden; color: #9aa6b8; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .assistant-page .conversation-group { margin-top: 20px; }
 .assistant-page .conversation-group-details > summary { padding: 7px 37px 7px 6px; color: #7c899d; font-size: 11px; font-weight: 700; }
-.assistant-page .conversation-new { top: 4px; right: 3px; width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; border: 0; border-radius: 7px; color: #8390a4; background: transparent; font-size: 15px; }
+.assistant-page .conversation-new:hover { color: #0969e6; background: #edf5ff; }
+.assistant-page .conversation-new:focus-visible { outline: 2px solid #8eb5ff; outline-offset: 2px; }
 .assistant-sidebar-hint { margin: auto 5px 0; padding-top: 26px; color: #aab4c1; font-size: 10px; line-height: 1.6; }
 .assistant-page .assistant-main { min-height: 0; background: #fff; }
 .assistant-page .conversation-view-heading { flex: 0 0 76px; min-width: 0; margin: 0; padding: 13px 30px; align-items: center; border-bottom: 1px solid #eff1f5; }
@@ -1036,7 +1037,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .task-panel-toggle .morde-icon { width: 15px; height: 15px; }
 .task-pending-count { min-width: 18px; height: 18px; border-radius: 6px; background: #fff3df; color: #a87520; font-size: 10px; }
 .assistant-page .conversation-view { min-height: 0; padding: 21px 28px 16px; }
-.assistant-page .message-list { width: min(100%, 714px); max-width: none; gap: 12px; }
+.assistant-page .message-list { width: min(100%, 770px); max-width: none; gap: 12px; }
 .conversation-time-divider { justify-self: center; margin-bottom: 6px; color: #9ba6b5; font-size: 11px; }
 .chat-message-row { display: flex; align-items: flex-start; gap: 11px; min-width: 0; }
 .chat-message-row-user { justify-content: flex-end; }
@@ -1085,7 +1086,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:has(.assistant-page) { grid-template-columns: 208px minmax(0, 1fr); }
 }
 @media (min-width: 1281px) {
-  .assistant-page .assistant-layout-with-task-panel { grid-template-columns: 232px minmax(0, 1fr) 300px; }
+  .assistant-page .assistant-layout-with-task-panel { grid-template-columns: 232px minmax(0, 1fr) 282px; }
   .assistant-page .assistant-task-panel { position: static; grid-column: 3; grid-row: 1; width: auto; border: 0; border-left: 1px solid #e9edf3; border-radius: 0; box-shadow: none; }
 }
 @media (max-width: 1280px) {

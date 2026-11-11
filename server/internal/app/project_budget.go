@@ -89,6 +89,7 @@ type SettleProjectModelCallCommand struct {
 	Usage              project.Usage
 	Unknown            bool
 	Summary            *ConversationSummaryModelFence
+	TaskCall           *ModelCallReservation
 	ResponseCiphertext []byte
 	ResponseDigest     []byte
 	ResponseInvalid    bool
@@ -409,13 +410,22 @@ func sameProjectAccountPrincipal(value, expected identity.Principal) bool {
 
 // SettleModelCall is an internal model-gateway use case. Unknown charges stay reserved until reconciliation.
 func (s *ProjectBudgetService) SettleModelCall(ctx context.Context, command SettleProjectModelCallCommand) error {
+	var taskCallErr error
+	if command.TaskCall != nil {
+		_, _, taskCallErr = taskModelResponseAAD(*command.TaskCall)
+	}
 	if ctx == nil || command.Source == ModelCallRoute || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
 		!idempotencyKeyPattern.MatchString(command.CallID) || (!command.Unknown && !validProjectTokenUsage(command.Usage)) ||
 		(command.Source == ModelCallCompaction) != (command.Summary != nil) || command.Unknown && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0) ||
-		command.Source != ModelCallCompaction && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0 || command.ResponseInvalid) ||
+		command.Source != ModelCallCompaction && command.Source != ModelCallTask && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0 || command.ResponseInvalid) ||
+		command.TaskCall != nil && (taskCallErr != nil || command.Source != ModelCallTask || command.TaskCall.CallID != command.CallID || command.TaskCall.ProjectID != command.ProjectID || len(command.ResponseCiphertext) == 0) ||
+		command.Source == ModelCallTask && ((len(command.ResponseCiphertext) == 0) != (len(command.ResponseDigest) == 0) ||
+			len(command.ResponseDigest) != 0 && len(command.ResponseDigest) != 32 || len(command.ResponseCiphertext) > MaxTaskModelResponseCiphertext) ||
 		command.ResponseInvalid && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0) ||
 		!command.Unknown && !command.ResponseInvalid && command.Source == ModelCallCompaction &&
-			(len(command.ResponseCiphertext) == 0 || len(command.ResponseCiphertext) > MaxConversationSummaryCiphertext || len(command.ResponseDigest) != 32) {
+			(len(command.ResponseCiphertext) == 0 || len(command.ResponseCiphertext) > MaxConversationSummaryCiphertext || len(command.ResponseDigest) != 32) ||
+		command.Source == ModelCallTask && len(command.ResponseCiphertext) != 0 && (command.TaskCall == nil || command.ResponseInvalid) ||
+		command.Unknown && command.TaskCall != nil {
 		return domain.InvalidArgument("project_model_settlement", "project model call settlement is invalid")
 	}
 	return s.store.SettleProjectModelCall(ctx, command)

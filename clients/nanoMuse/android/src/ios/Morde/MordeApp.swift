@@ -76,6 +76,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskPagesTimelineRecoveryFixtureLaunchArgument = "-morde.localTaskPagesTimelineRecoveryFixture"
     static let taskPagesTimelinePermissionFixtureLaunchArgument = "-morde.localTaskPagesTimelinePermissionFixture"
     static let taskPagesTimelineUnconfirmedFixtureLaunchArgument = "-morde.localTaskPagesTimelineUnconfirmedFixture"
+    static let taskFileFetchFixtureLaunchArgument = "-morde.localTaskFileFetchFixture"
     static let taskPagesEventChainTimelineFixtureLaunchArgument = "-morde.localTaskPagesEventChainTimelineFixture"
     static let taskPagesEventChainEmptyTimelineFixtureLaunchArgument = "-morde.localTaskPagesEventChainEmptyTimelineFixture"
     static let eventChainVisualFixtureLaunchArgument = "-morde.localEventChainVisualFixture"
@@ -191,6 +192,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var taskPagesTaskActionRequestCount = 0
     private static var taskPagesTaskActionServiceInstanceChanged = false
     private static var taskPagesTaskActionSecondInstanceAccepted = false
+    private static var taskFileFetchCancellationStatus = "waiting_device"
+    private static var taskFileFetchCancelListReads = 0
+    private static var taskFileFetchCopyDeleted = false
     private static var taskK2StoppedTaskID: String?
     private static var taskK2StopIdempotencyKey: String?
     private static var taskPagesRetryListRequestCount = 0
@@ -263,6 +267,27 @@ private final class MordeAuthURLProtocol: URLProtocol {
         0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
         0xae, 0x42, 0x60, 0x82,
     ])
+    private static let taskFileFetchPDF: Data = {
+        let stream = "BT\n/F1 18 Tf\n72 720 Td\n(Synthetic PC file) Tj\nET\n"
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+            "4 0 obj\n<< /Length \(stream.utf8.count) >>\nstream\n\(stream)endstream\nendobj\n",
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        ]
+        var data = Data("%PDF-1.4\n".utf8)
+        var offsets = [Int]()
+        for object in objects {
+            offsets.append(data.count)
+            data.append(contentsOf: object.utf8)
+        }
+        let xrefOffset = data.count
+        data.append(contentsOf: "xref\n0 6\n0000000000 65535 f \n".utf8)
+        for offset in offsets { data.append(contentsOf: String(format: "%010d 00000 n \n", offset).utf8) }
+        data.append(contentsOf: "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n\(xrefOffset)\n%%EOF\n".utf8)
+        return data
+    }()
     private static let taskMediaWaitingTask = Data(#"{"id":"q1234567","conversation_id":"c1234567","host_id":null,"execution_location":"server","workspace_id":null,"input_revision":null,"objective":"local media fixture","status":"waiting_user","event_sequence":1,"result":null,"current_step":"Generated media is ready for review","step_count":0,"completed_step_count":0,"waiting_reason":"approval_required","stop_request":null,"pending_request":{"id":"r1234567","version":1,"kind":"approval","title":"Save generated image?","object":"image","content":"Review this generated image before saving it to the task Workspace.","impact":"Saving publishes the generated image to the authorized Workspace.","media_preview_operation_id":"o1234567"},"clarification_request":null,"batch_items":null,"updated_at":"2026-11-04T00:00:00Z"}"#.utf8)
 
     static var usesLocalFixture: Bool {
@@ -277,6 +302,113 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static func setTaskPagesApprovalDecision(_ decision: String?) {
         taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
         taskPagesApprovalDecision = decision
+    }
+
+    private static func resetTaskFileFetchFixture() {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        taskFileFetchCancellationStatus = "waiting_device"
+        taskFileFetchCancelListReads = 0
+        taskFileFetchCopyDeleted = false
+    }
+
+    private static func taskFileFetchRecords() -> [[String: Any]] {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        if taskFileFetchCancellationStatus == "cancelling" {
+            taskFileFetchCancelListReads += 1
+            if taskFileFetchCancelListReads >= 2 { taskFileFetchCancellationStatus = "cancelled" }
+        }
+        let digest = MordePersonalAttachmentHash.sha256(taskFileFetchPDF)
+        let common: [String: Any] = [
+            "task_id": "q0000001", "source_installation_id": "i0000001",
+            "source_device_name": "Local Work Mac", "task_revision": 1,
+        ]
+        func record(_ id: String, directory: Any, path: String, version: Any, hash: Any,
+                    media: Any, size: Any, confirmed: Int, status: String, waiting: Any,
+                    contentID: Any, contentState: String, parseStatus: String,
+                    parseError: Any = NSNull(), failureReason: Any = NSNull(),
+                    expires: Any = NSNull(), deletedAt: Any = NSNull()) -> [String: Any] {
+            var value = common
+            value.merge([
+                "fetch_id": id, "source_directory_name": directory, "relative_path": path,
+                "source_version": version, "source_sha256": hash, "media_type": media,
+                "size_bytes": size, "confirmed_bytes": confirmed, "status": status,
+                "waiting_reason": waiting, "failure_reason": failureReason,
+                "content_id": contentID, "expires_at": expires,
+                "content_state": contentState, "parse_status": parseStatus,
+                "parse_error": parseError, "deleted_at": deletedAt,
+            ]) { _, new in new }
+            return value
+        }
+        let offlineStatus = taskFileFetchCancellationStatus
+        let offline = record("o0000001", directory: NSNull(), path: "reports/offline.pdf",
+            version: NSNull(), hash: NSNull(), media: NSNull(), size: NSNull(), confirmed: 0,
+            status: offlineStatus, waiting: offlineStatus == "waiting_device" ? "device_offline" : NSNull(),
+            contentID: NSNull(), contentState: "none", parseStatus: "pending")
+        let progress = record("o0000002", directory: "Authorized Reports", path: "reports/current.txt",
+            version: String(repeating: "a", count: 64), hash: NSNull(), media: "text/plain",
+            size: 10, confirmed: 4, status: "transferring", waiting: NSNull(),
+            contentID: NSNull(), contentState: "none", parseStatus: "pending")
+        let pdf = record("o0000003", directory: "Reference Materials", path: "docs/source.pdf",
+            version: String(repeating: "b", count: 64), hash: digest, media: "application/pdf",
+            size: taskFileFetchPDF.count, confirmed: taskFileFetchPDF.count, status: "completed", waiting: NSNull(),
+            contentID: "o0000003", contentState: taskFileFetchCopyDeleted ? "deleted" : "retained",
+            parseStatus: "raw_only", expires: "2026-11-18T00:00:00Z",
+            deletedAt: taskFileFetchCopyDeleted ? "2026-11-11T00:00:00Z" : NSNull())
+        var corrupted = taskFileFetchPDF
+        if !corrupted.isEmpty { corrupted[corrupted.startIndex] = corrupted[corrupted.startIndex] ^ 0xff }
+        let badIntegrity = record("o0000004", directory: "Reference Materials", path: "docs/changed.pdf",
+            version: String(repeating: "c", count: 64), hash: digest, media: "application/pdf",
+            size: taskFileFetchPDF.count, confirmed: taskFileFetchPDF.count, status: "completed", waiting: NSNull(),
+            contentID: "o0000004", contentState: "retained", parseStatus: "failed", parseError: "integrity_failed")
+        let failed = record("o0000005", directory: "Reference Materials", path: "docs/changed.txt",
+            version: NSNull(), hash: NSNull(), media: NSNull(), size: NSNull(), confirmed: 0,
+            status: "failed", waiting: NSNull(), contentID: NSNull(), contentState: "none",
+            parseStatus: "pending", failureReason: "source_changed")
+        return [offline, progress, pdf, badIntegrity, failed]
+    }
+
+    private static func taskFileFetchFixtureResponse(for request: URLRequest) -> (status: Int, body: Data, headers: [String: String])? {
+        guard ProcessInfo.processInfo.arguments.contains(taskFileFetchFixtureLaunchArgument),
+              let path = request.url?.path else { return nil }
+        let listPath = "/api/tasks/q0000001/file-fetches"
+        let parts = path.split(separator: "/").map(String.init)
+        func json(_ object: Any) -> Data { (try? JSONSerialization.data(withJSONObject: object)) ?? Data() }
+        if path == listPath, request.httpMethod == "GET" {
+            return (200, json(["items": taskFileFetchRecords()]), ["Cache-Control": "no-store"])
+        }
+        if parts.count == 6, parts[0] == "api", parts[1] == "tasks", parts[2] == "q0000001",
+           parts[3] == "file-fetches", parts[5] == "cancel", request.httpMethod == "POST",
+           parts[4] == "o0000001" {
+            taskFixtureLock.lock()
+            taskFileFetchCancellationStatus = "cancelling"
+            taskFileFetchCancelListReads = 0
+            taskFixtureLock.unlock()
+            let item = taskFileFetchRecords().first { $0["fetch_id"] as? String == "o0000001" } ?? [:]
+            return (200, json(item), ["Cache-Control": "no-store"])
+        }
+        if parts.count == 6, parts[0] == "api", parts[1] == "tasks", parts[2] == "q0000001",
+           parts[3] == "file-fetches", parts[5] == "content", parts[4] == "o0000003" {
+            if request.httpMethod == "GET" {
+                taskFixtureLock.lock(); let deleted = taskFileFetchCopyDeleted; taskFixtureLock.unlock()
+                return deleted
+                    ? (410, Data(#"{"error":{"code":"gone","message":"Synthetic retained copy was deleted"}}"#.utf8), ["Cache-Control": "no-store"])
+                    : (200, taskFileFetchPDF, ["Content-Type": "application/pdf", "Cache-Control": "private, no-store",
+                                               "X-Content-Type-Options": "nosniff"])
+            }
+            if request.httpMethod == "DELETE" {
+                taskFixtureLock.lock(); taskFileFetchCopyDeleted = true; taskFixtureLock.unlock()
+                return (204, Data(), ["Cache-Control": "no-store"])
+            }
+        }
+        if parts.count == 6, parts[0] == "api", parts[1] == "tasks", parts[2] == "q0000001",
+           parts[3] == "file-fetches", parts[5] == "content", parts[4] == "o0000004",
+           request.httpMethod == "GET" {
+            var corrupted = taskFileFetchPDF
+            if !corrupted.isEmpty { corrupted[corrupted.startIndex] = corrupted[corrupted.startIndex] ^ 0xff }
+            return (200, corrupted, ["Content-Type": "application/pdf", "Cache-Control": "private, no-store",
+                                     "X-Content-Type-Options": "nosniff"])
+        }
+        return nil
     }
 
     private static func nextTaskPagesApprovalLoadFailureRequest() -> Int {
@@ -619,6 +751,35 @@ private final class MordeAuthURLProtocol: URLProtocol {
 
     private static func isAccountA(_ request: URLRequest) -> Bool {
         request.value(forHTTPHeaderField: "Authorization") == "Bearer local-account-a-credential"
+    }
+
+    private static func fixtureLoginUser(for request: URLRequest) -> [String: String] {
+        let login = jsonPayload(request)
+        let accountName = login?["name"] as? String
+        if ProcessInfo.processInfo.arguments.contains(accountIsolationFixtureLaunchArgument) {
+            let isAccountA = request.value(forHTTPHeaderField: "X-Morde-Local-Account") == "account-a"
+            return ["id": isAccountA ? "u_accounta1" : "u_accountb1",
+                    "name": isAccountA ? "account-a" : "account-b"]
+        }
+        if ProcessInfo.processInfo.arguments.contains(chatAttachmentScopedAccountFixtureLaunchArgument),
+           let accountName {
+            let suffix = String(SHA256.hash(data: Data(accountName.utf8))
+                .map { String(format: "%02x", $0) }.joined().prefix(7))
+            return ["id": "u" + suffix, "name": "chat-attachment-fixture"]
+        }
+        if let accountArgument = ProcessInfo.processInfo.arguments.firstIndex(of: "-morde.localFixtureAccountID"),
+           accountArgument + 1 < ProcessInfo.processInfo.arguments.count {
+            return ["id": ProcessInfo.processInfo.arguments[accountArgument + 1], "name": "local-chat-fixture"]
+        }
+        if ProcessInfo.processInfo.arguments.contains(resourceAcceptanceFixtureLaunchArgument) ||
+            ProcessInfo.processInfo.arguments.contains(resourceRefreshRecoveryFixtureLaunchArgument) {
+            return ["id": "u0000001", "name": "Local resource user"]
+        }
+        return ["id": "u_localtest1", "name": "morde-test-user"]
+    }
+
+    private static func fixtureJSON(_ value: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: value)) ?? Data("{}".utf8)
     }
 
     private static func chatAttachmentScopedUserID(for request: URLRequest) -> String? {
@@ -2329,6 +2490,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
             Self.resetMainChatFixture()
         }
         if isFixtureOrigin, request.url?.path == "/api/auth/client-login",
+           ProcessInfo.processInfo.arguments.contains(Self.taskFileFetchFixtureLaunchArgument) {
+            Self.resetTaskFileFetchFixture()
+        }
+        if isFixtureOrigin, request.url?.path == "/api/auth/client-login",
            ProcessInfo.processInfo.arguments.contains(Self.chatOfflineRecoveryFixtureLaunchArgument),
            ProcessInfo.processInfo.arguments.contains(Self.chatSendOfflineFixtureLaunchArgument) {
             UserDefaults.standard.removeObject(forKey: Self.chatOfflineRecoveryMessageDefaultsKey)
@@ -2355,6 +2520,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
             Self.resetExecutionFixture()
         }
         let personalAttachmentDownloadResponse = isFixtureOrigin ? Self.personalAttachmentDownloadFixtureResponse(for: request) : nil
+        let taskFileFetchResponse = isFixtureOrigin ? Self.taskFileFetchFixtureResponse(for: request) : nil
         let shouldDelayAttachmentDownloadResponse = isFixtureOrigin &&
             ProcessInfo.processInfo.arguments.contains(Self.chatAttachmentDownloadDelayFixtureLaunchArgument) &&
             personalAttachmentDownloadResponse?.status == 200
@@ -2370,6 +2536,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
         if personalSyncUnavailableResponse {
             statusCode = 503
             body = Data(#"{"error":{"code":"unavailable","message":"Synthetic personal sync is unavailable"}}"#.utf8)
+        } else if let taskFileFetchResponse {
+            statusCode = taskFileFetchResponse.status
+            body = taskFileFetchResponse.body
+            mediaResponseHeaders = taskFileFetchResponse.headers
         } else if let personalAttachmentDownloadResponse {
             statusCode = personalAttachmentDownloadResponse.status
             body = personalAttachmentDownloadResponse.body
@@ -2388,6 +2558,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
             body = workItemResponse.body
         } else if isFixtureOrigin, request.url?.path == "/api/auth/client-web-session", request.httpMethod == "POST" {
             body = Data(#"{"web_session_credential":"chs_t1234567_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","web_session_expires_at":"2100-01-01T00:00:00Z"}"#.utf8)
+        } else if isFixtureOrigin, request.url?.path == "/api/auth/login", request.httpMethod == "POST" {
+            statusCode = 200
+            body = Self.fixtureJSON(["user": Self.fixtureLoginUser(for: request)])
+            mediaResponseHeaders["Set-Cookie"] = "ch_portal=chs_t7654321_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; Path=/; Expires=Fri, 01 Jan 2100 00:00:00 GMT; HttpOnly; SameSite=Strict"
         } else if isFixtureOrigin, request.url?.path == "/api/auth/register", request.httpMethod == "POST",
            request.value(forHTTPHeaderField: "Content-Type") == "application/json" {
             if ProcessInfo.processInfo.arguments.contains("-morde.localRegistrationBusyFixture") {
@@ -2476,12 +2650,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
                    let login = Self.jsonPayload(request), let accountName = login["name"] as? String {
                     let suffix = String(SHA256.hash(data: Data(accountName.utf8))
                         .map { String(format: "%02x", $0) }.joined().prefix(7))
-                    body = Data("{\"installation_id\":\"i\(suffix)\",\"client_credential\":\"local-chat-attachment-\(suffix)\",\"client_expires_at\":\"2100-01-01T00:00:00Z\"}".utf8)
+                    body = Self.fixtureJSON(["installation_id": "i\(suffix)",
+                        "client_credential": "local-chat-attachment-\(suffix)",
+                        "client_expires_at": "2100-01-01T00:00:00Z",
+                        "user": Self.fixtureLoginUser(for: request)])
                 } else if ProcessInfo.processInfo.arguments.contains(Self.accountIsolationFixtureLaunchArgument) {
                     let isAccountA = request.value(forHTTPHeaderField: "X-Morde-Local-Account") == "account-a"
                     let installationID = isAccountA ? "i0000001" : "i0000002"
                     let credential = isAccountA ? "local-account-a-credential" : "local-account-b-credential"
-                    body = Data("{\"installation_id\":\"\(installationID)\",\"client_credential\":\"\(credential)\",\"client_expires_at\":\"2100-01-01T00:00:00Z\"}".utf8)
+                    body = Self.fixtureJSON(["installation_id": installationID, "client_credential": credential,
+                        "client_expires_at": "2100-01-01T00:00:00Z", "user": Self.fixtureLoginUser(for: request)])
                 } else {
                     if ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
                         ProcessInfo.processInfo.arguments.contains(Self.approvalPollingFixtureLaunchArgument) ||
@@ -2503,12 +2681,18 @@ private final class MordeAuthURLProtocol: URLProtocol {
                        let login = Self.jsonPayload(request), let accountName = login["name"] as? String {
                         let suffix = String(SHA256.hash(data: Data(accountName.utf8))
                             .map { String(format: "%02x", $0) }.joined().prefix(7))
-                        body = Data("{\"installation_id\":\"i\(suffix)\",\"client_credential\":\"local-client-credential\",\"client_expires_at\":\"2100-01-01T00:00:00Z\"}".utf8)
+                        body = Self.fixtureJSON(["installation_id": "i\(suffix)",
+                            "client_credential": "local-client-credential",
+                            "client_expires_at": "2100-01-01T00:00:00Z", "user": Self.fixtureLoginUser(for: request)])
                     } else if ProcessInfo.processInfo.arguments.contains(Self.taskPagesTaskActionServiceInstanceFixtureLaunchArgument),
                        Self.taskPagesTaskActionServiceInstanceChangedSnapshot {
-                        body = Data(#"{"installation_id":"i0000002","client_credential":"local-task-instance-2-credential","client_expires_at":"2100-01-01T00:00:00Z"}"#.utf8)
+                        body = Self.fixtureJSON(["installation_id": "i0000002",
+                            "client_credential": "local-task-instance-2-credential",
+                            "client_expires_at": "2100-01-01T00:00:00Z", "user": Self.fixtureLoginUser(for: request)])
                     } else {
-                        body = Data(#"{"installation_id":"i0000001","client_credential":"local-client-credential","client_expires_at":"2100-01-01T00:00:00Z"}"#.utf8)
+                        body = Self.fixtureJSON(["installation_id": "i0000001",
+                            "client_credential": "local-client-credential",
+                            "client_expires_at": "2100-01-01T00:00:00Z", "user": Self.fixtureLoginUser(for: request)])
                     }
                 }
             } else if ProcessInfo.processInfo.arguments.contains("-morde.localRegistrationRejected") {
@@ -2524,6 +2708,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
         } else if isFixtureOrigin, request.url?.path == "/api/auth/client-logout", request.httpMethod == "POST" {
             statusCode = 200
             body = Data("{}".utf8)
+        } else if isFixtureOrigin, request.url?.path == "/api/auth/logout", request.httpMethod == "POST" {
+            statusCode = 204
+            body = Data()
+            mediaResponseHeaders["Set-Cookie"] = "ch_portal=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; SameSite=Strict"
         } else if isFixtureOrigin, ProcessInfo.processInfo.arguments.contains(Self.hubFixtureLaunchArgument),
                   ["/api/clients", "/api/devices"].contains(request.url?.path ?? ""), request.httpMethod == "GET" {
             statusCode = 200
@@ -3928,6 +4116,14 @@ func isValidMordeHostTicketURL(_ ticket: URL, for origin: URL) -> Bool {
 }
 // END Morde host navigation helpers
 
+private final class MordeNoRedirectURLSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 private struct MordeKeychain {
     private let service = "io.morde.client"
     func get(_ account: String) -> String? {
@@ -3948,6 +4144,7 @@ private struct MordeKeychain {
         let addStatus = SecItemAdd(query as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
 #if DEBUG
+            NSLog("Morde local Keychain SecItemAdd failed status=%d", addStatus)
             if ProcessInfo.processInfo.arguments.contains(MordeAuthURLProtocol.selectedModelPreferenceFixtureLaunchArgument) {
                 NSLog("Morde local fixture Keychain add failed status=%d", addStatus)
             }
@@ -3963,9 +4160,20 @@ private struct MordeKeychain {
 }
 
 private struct MordeLoginResult: Decodable {
-    let installation_id: String
-    let client_credential: String
-    let client_expires_at: String
+    struct User: Decodable { let id: String?; let name: String? }
+    let installation_id: String?
+    let client_credential: String?
+    let client_expires_at: String?
+    let user: User?
+}
+private struct MordeOwnerPortalLoginResult: Decodable {
+    struct User: Decodable { let id: String?; let name: String? }
+    let user: User?
+}
+private struct MordeStoredOwnerPortalSession: Codable {
+    let credential: String
+    let expiresAt: String
+    let userID: String
 }
 private struct MordeRegistrationResult: Decodable {
     struct User: Decodable { let id: String; let status: String }
@@ -4401,6 +4609,109 @@ struct MordeTask: Decodable, Identifiable {
             status: status, waitingReason: waiting_reason, stopRequestStatus: stop_request?.status)
         return NSLocalizedString(key, comment: "Task status shown in the conversation")
     }
+}
+
+struct MordeTaskFileFetch: Decodable, Identifiable, Equatable {
+    let fetch_id: String
+    let task_id: String
+    let source_installation_id: String
+    let source_device_name: String
+    let source_directory_name: String?
+    let relative_path: String
+    let task_revision: Int64
+    let source_version: String?
+    let source_sha256: String?
+    let media_type: String?
+    let size_bytes: Int64?
+    let confirmed_bytes: Int64
+    let status: String
+    let waiting_reason: String?
+    let failure_reason: String?
+    let content_id: String?
+    let expires_at: String?
+    let content_state: String
+    let parse_status: String
+    let parse_error: String?
+    let deleted_at: String?
+
+    var id: String { fetch_id }
+
+    var canCancel: Bool { ["queued", "waiting_device", "transferring", "verifying"].contains(status) }
+    var canOpen: Bool {
+        status == "completed" && content_state == "retained" &&
+            content_id != nil &&
+            size_bytes.map { $0 > 0 && $0 <= 16 * 1024 * 1024 } == true &&
+            source_sha256?.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil &&
+            Self.supportedMediaTypes.contains(media_type ?? "")
+    }
+    var canDeleteCopy: Bool { status == "completed" && content_state == "retained" && content_id != nil }
+    var sourceDirectoryLabel: String { source_directory_name ?? AppLocalized("Not provided") }
+    var progress: Double? {
+        guard let size_bytes, size_bytes > 0 else { return nil }
+        return min(1, max(0, Double(confirmed_bytes) / Double(size_bytes)))
+    }
+
+    private static let supportedMediaTypes: Set<String> = [
+        "text/plain", "text/markdown", "text/csv", "application/json",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/pdf",
+    ]
+
+    var previewExtension: String? {
+        switch media_type {
+        case "text/plain": "txt"
+        case "text/markdown": "md"
+        case "text/csv": "csv"
+        case "application/json": "json"
+        case "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx"
+        case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx"
+        case "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx"
+        case "application/pdf": "pdf"
+        default: nil
+        }
+    }
+
+    func isValid(for requestedTaskID: String) -> Bool {
+        func validDisplayName(_ value: String) -> Bool {
+            !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && value.utf8.count <= 100 &&
+                value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        }
+        let validDirectory = source_directory_name.map { name in
+            validDisplayName(name) && name != "." && name != ".." &&
+                !name.contains("/") && !name.contains("\\")
+        } ?? true
+        guard task_id == requestedTaskID,
+              MordeTaskResponsePolicy.hasValidTaskID(requestedTaskID),
+              fetch_id.range(of: "^o[a-z0-9]{7}$", options: .regularExpression) != nil,
+              source_installation_id.range(of: "^i[a-z0-9]{7}$", options: .regularExpression) != nil,
+              validDisplayName(source_device_name), validDirectory,
+              relative_path.utf8.count <= 1024,
+              (try? MordeWorkspaceTransferSupport.validatePath(relative_path)) != nil,
+              task_revision > 0, confirmed_bytes >= 0,
+              ["queued", "waiting_device", "transferring", "verifying", "completed", "cancelling", "cancelled", "failed"].contains(status),
+              failure_reason == nil || (status == "failed" && ["access_denied", "source_changed", "file_unavailable", "limit_exceeded", "unsupported", "source_unavailable", "transfer_failed"].contains(failure_reason ?? "")),
+              ["none", "retained", "deleted", "expired"].contains(content_state),
+              ["pending", "extracted", "raw_only", "failed", "unavailable"].contains(parse_status),
+              waiting_reason == (status == "waiting_device" ? "device_offline" : nil),
+              content_id == nil || content_id?.range(of: "^o[a-z0-9]{7}$", options: .regularExpression) != nil,
+              source_version == nil || source_version?.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              source_sha256 == nil || source_sha256?.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              media_type == nil || Self.supportedMediaTypes.contains(media_type ?? ""),
+              size_bytes.map({ (1...(16 * 1024 * 1024)).contains($0) }) ?? true,
+              size_bytes.map({ confirmed_bytes <= $0 }) ?? true,
+              size_bytes != nil || confirmed_bytes == 0,
+              parse_error == nil || ["invalid_encoding", "invalid_document", "result_too_large", "content_unavailable", "integrity_failed"].contains(parse_error ?? ""),
+              ((content_state == "none") == (content_id == nil)),
+              (content_state == "deleted") == (deleted_at != nil),
+              (status == "completed" || (parse_status == "pending" && parse_error == nil)) else { return false }
+        return true
+    }
+}
+
+private struct MordeTaskFileFetchList: Decodable {
+    let items: [MordeTaskFileFetch]
 }
 
 enum MordeConversationTasksPolicy {
@@ -5711,8 +6022,10 @@ private struct MordeIndependentSendTarget {
     @Published var messageHistoryError: String?
     @Published var tasks: [MordeTask] = []
     @Published private(set) var taskPageDetails: [String: MordeTask] = [:]
+    @Published private(set) var taskFileFetches: [String: [MordeTaskFileFetch]] = [:]
     @Published private(set) var taskTimelineEvents: [String: [MordeTaskTimelineEvent]] = [:]
     @Published private(set) var taskTimelineErrors: [String: String] = [:]
+    @Published private(set) var taskFileFetchErrors: [String: String] = [:]
     @Published private(set) var taskTimelineHistoryExpired: Set<String> = []
     @Published private(set) var taskTimelineLoading: Set<String> = []
     @Published private(set) var taskTimelineNoHistory: Set<String> = []
@@ -5810,8 +6123,25 @@ private struct MordeIndependentSendTarget {
         configuration.protocolClasses = [MordeAuthURLProtocol.self]
         return URLSession(configuration: configuration)
     }()
+    private let sensitiveURLSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        if MordeAuthURLProtocol.usesLocalFixture {
+            configuration.protocolClasses = [MordeAuthURLProtocol.self]
+        }
+        return URLSession(configuration: configuration,
+                          delegate: MordeNoRedirectURLSessionDelegate(), delegateQueue: nil)
+    }()
 #else
     private let urlSession = URLSession.shared
+    private let sensitiveURLSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        return URLSession(configuration: configuration,
+                          delegate: MordeNoRedirectURLSessionDelegate(), delegateQueue: nil)
+    }()
 #endif
     private static let scopedInstallationPrefix = "morde.installation.scope."
     private static let activeInstallationsKey = "morde.installation.activeScopes.v1"
@@ -5826,6 +6156,7 @@ private struct MordeIndependentSendTarget {
     private var conversationLoadMoreGeneration = UUID()
     private var messageLoadMoreGeneration = UUID()
     private var taskDetailLoadGenerations: [String: UUID] = [:]
+    private var taskFileFetchLoadGenerations: [String: UUID] = [:]
     private var clientInstallationsLoadGeneration = UUID()
     private var revocationReconciliationInProgress = false
     private var hostControlLoadGenerations: [String: UUID] = [:]
@@ -5837,6 +6168,10 @@ private struct MordeIndependentSendTarget {
     private var portalSessionCredential: String?
     private var portalSessionExpiresAt: Date?
     private var portalSessionScope: MordeClientDataScope?
+    private var ownerPortalSessionCredential: String?
+    private var ownerPortalSessionExpiresAt: Date?
+    private var ownerPortalSessionUserID: String?
+    private var ownerPortalSessionScope: MordeClientDataScope?
 
     private func publishShellAuthorization() {
         MordeShellAuthorization.shared.update(signedIn: signedIn,
@@ -6070,6 +6405,98 @@ private struct MordeIndependentSendTarget {
         guard value.id == id else { throw URLError(.cannotParseResponse) }
         taskPageDetails[id] = value
         return value
+    }
+
+    func loadTaskFileFetches(taskID: String, expectedScope: MordeClientDataScope? = nil) async throws {
+        guard MordeTaskResponsePolicy.hasValidTaskID(taskID),
+              let scope = expectedScope ?? currentDataScope, scope == currentDataScope else {
+            throw CancellationError()
+        }
+        let generation = UUID()
+        taskFileFetchLoadGenerations[taskID] = generation
+        defer { if taskFileFetchLoadGenerations[taskID] == generation { taskFileFetchLoadGenerations.removeValue(forKey: taskID) } }
+        do {
+            let page: MordeTaskFileFetchList = try await ownerPortalCall(
+                "/api/tasks/\(taskID)/file-fetches", expectedScope: scope)
+            guard scope == currentDataScope, taskFileFetchLoadGenerations[taskID] == generation else {
+                throw CancellationError()
+            }
+            guard page.items.count <= 16, page.items.allSatisfy({ $0.isValid(for: taskID) }),
+                  Set(page.items.map(\.fetch_id)).count == page.items.count else {
+                throw URLError(.cannotParseResponse)
+            }
+            taskFileFetches[taskID] = page.items
+            taskFileFetchErrors.removeValue(forKey: taskID)
+        } catch {
+            guard scope == currentDataScope, taskFileFetchLoadGenerations[taskID] == generation else { throw error }
+            taskFileFetchErrors[taskID] = AppLocalized("Unable to load PC file requests.")
+            throw error
+        }
+    }
+
+    func cancelTaskFileFetch(taskID: String, fetchID: String) async throws {
+        guard let scope = currentDataScope,
+              let fetch = taskFileFetches[taskID]?.first(where: { $0.fetch_id == fetchID }),
+              fetch.isValid(for: taskID), fetch.canCancel else { throw URLError(.badURL) }
+        do {
+            let updated: MordeTaskFileFetch = try await ownerPortalCall(
+                "/api/tasks/\(taskID)/file-fetches/\(fetchID)/cancel", method: "POST", expectedScope: scope)
+            guard scope == currentDataScope, updated.isValid(for: taskID), updated.fetch_id == fetchID else {
+                throw URLError(.cannotParseResponse)
+            }
+            if var records = taskFileFetches[taskID], let index = records.firstIndex(where: { $0.fetch_id == fetchID }) {
+                records[index] = updated
+                taskFileFetches[taskID] = records
+            }
+            taskFileFetchErrors.removeValue(forKey: taskID)
+            try await loadTaskFileFetches(taskID: taskID, expectedScope: scope)
+        } catch {
+            guard scope == currentDataScope else { throw error }
+            do {
+                try await loadTaskFileFetches(taskID: taskID, expectedScope: scope)
+                if let authoritative = taskFileFetches[taskID]?.first(where: { $0.fetch_id == fetchID }),
+                   authoritative.isValid(for: taskID), !authoritative.canCancel {
+                    return
+                }
+            } catch {
+                // Keep the original cancellation error when reconciliation fails.
+            }
+            throw error
+        }
+    }
+
+    func taskFileFetchContent(taskID: String, fetchID: String) async throws -> Data {
+        guard let scope = currentDataScope,
+              let fetch = taskFileFetches[taskID]?.first(where: { $0.fetch_id == fetchID }),
+              fetch.isValid(for: taskID), fetch.canOpen,
+              let expectedSize = fetch.size_bytes, let expectedDigest = fetch.source_sha256 else {
+            throw URLError(.badURL)
+        }
+        let (data, response) = try await ownerPortalResponse(
+            "/api/tasks/\(taskID)/file-fetches/\(fetchID)/content", expectedScope: scope)
+        let mediaType = response.value(forHTTPHeaderField: "Content-Type")?.split(separator: ";", maxSplits: 1)
+            .first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        let cacheDirectives = Set((response.value(forHTTPHeaderField: "Cache-Control") ?? "")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        guard scope == currentDataScope, response.statusCode == 200,
+              mediaType == fetch.media_type, cacheDirectives.contains("private"), cacheDirectives.contains("no-store"),
+              response.value(forHTTPHeaderField: "X-Content-Type-Options")?.lowercased() == "nosniff",
+              response.value(forHTTPHeaderField: "Content-Length").flatMap(Int64.init).map({ $0 == expectedSize }) ?? true,
+              Int64(data.count) == expectedSize,
+              MordePersonalAttachmentHash.sha256(data) == expectedDigest else {
+            throw NSError(domain: "MordeTaskFileFetchIntegrity", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: AppLocalized("The downloaded file failed integrity verification.")])
+        }
+        return data
+    }
+
+    func deleteTaskFileFetchContent(taskID: String, fetchID: String) async throws {
+        guard let scope = currentDataScope,
+              let fetch = taskFileFetches[taskID]?.first(where: { $0.fetch_id == fetchID }),
+              fetch.isValid(for: taskID), fetch.canDeleteCopy else { throw URLError(.badURL) }
+        _ = try await ownerPortalData(
+            "/api/tasks/\(taskID)/file-fetches/\(fetchID)/content", method: "DELETE", expectedScope: scope)
+        try await loadTaskFileFetches(taskID: taskID, expectedScope: scope)
     }
 
     @discardableResult
@@ -7616,6 +8043,12 @@ private struct MordeIndependentSendTarget {
         let previousOrigin = MordeLoginStateStore.serviceOrigin(previousServer)
         let nextOrigin = MordeLoginStateStore.serviceOrigin(normalized)
         if previousOrigin != nextOrigin {
+            if let activeInstallation = installation {
+                clearOwnerPortalSession(for: activeInstallation)
+            }
+            if let cachedOwnerScope = ownerPortalSessionScope {
+                clearOwnerPortalSession(for: cachedOwnerScope)
+            }
             if let previousOrigin { try? loginStateStore.invalidatePendingAttempts(origin: previousOrigin) }
             verifiedServiceInstanceID = nil
             resetViewState()
@@ -7630,6 +8063,12 @@ private struct MordeIndependentSendTarget {
         let oldConversation = currentConversation
         let oldMessages = messages
         let hasProjectMessages = oldScope.map { !MordeOfflineProjectQueue.messages(pendingMessages, scope: $0).isEmpty } ?? false
+        if let activeInstallation = installation {
+            clearOwnerPortalSession(for: activeInstallation)
+        }
+        if let cachedOwnerScope = ownerPortalSessionScope {
+            clearOwnerPortalSession(for: cachedOwnerScope)
+        }
         verifiedServiceInstanceID = nil
         resetViewState()
         if let oldScope, oldConversation != nil || hasProjectMessages {
@@ -7657,6 +8096,7 @@ private struct MordeIndependentSendTarget {
         conversationLoadMoreGeneration = UUID()
         messageLoadMoreGeneration = UUID()
         taskDetailLoadGenerations = [:]
+        taskFileFetchLoadGenerations = [:]
         clientInstallationsLoadGeneration = UUID()
         devicesLoadGeneration = UUID()
         projectLoadGeneration = UUID()
@@ -7679,7 +8119,8 @@ private struct MordeIndependentSendTarget {
         conversations = []; conversationNextCursor = nil; loadingMoreConversations = false
         messages = []; messageNextCursor = nil; loadingEarlierMessages = false; messageHistoryError = nil
         tasks = []; notifications = []; notificationNextCursor = nil
-        taskPageDetails = [:]; taskTimelineEvents = [:]; taskTimelineErrors = [:]
+        taskPageDetails = [:]; taskFileFetches = [:]; taskTimelineEvents = [:]; taskTimelineErrors = [:]
+        taskFileFetchErrors = [:]
         taskTimelineHistoryExpired = []; taskTimelineLoading = []; taskTimelineNoHistory = []
         taskPageActionErrors = [:]
         loadingMoreNotifications = false
@@ -7709,6 +8150,7 @@ private struct MordeIndependentSendTarget {
         executionControlActionInFlight = false
         executionControlGeneration = UUID(); executionControlActionGeneration = UUID()
         portalSessionCredential = nil; portalSessionExpiresAt = nil; portalSessionScope = nil
+        clearOwnerPortalSessionCache()
         cloudTasksAvailable = nil
         taskAPIAvailable = nil
         autoRoutingAvailable = nil
@@ -8289,7 +8731,18 @@ private struct MordeIndependentSendTarget {
            let expiresAt = portalSessionExpiresAt, expiresAt.timeIntervalSinceNow > 30 {
             return (credential, expiresAt)
         }
-        let session: MordeClientWebSession = try await call("/api/auth/client-web-session", method: "POST")
+        guard let origin = MordeLoginStateStore.serviceOrigin(server), let clientCredential = token else {
+            throw NSError(domain: "Morde", code: 401,
+                          userInfo: [NSLocalizedDescriptionKey: "登录已到期，请重新登录"])
+        }
+        let (data, response) = try await authSessionResponse(origin: origin,
+            path: "/api/auth/client-web-session", method: "POST",
+            headers: ["Authorization": "Bearer \(clientCredential)"])
+        if response.statusCode == 401, let currentInstallation = installation {
+            signOutLocally(installation: currentInstallation)
+        }
+        try requireSuccessfulAuthResponse(response, data: data)
+        let session = try JSONDecoder().decode(MordeClientWebSession.self, from: data)
         guard scope == currentDataScope else { throw CancellationError() }
         guard session.web_session_credential.range(
             of: "^chs_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$", options: .regularExpression) != nil,
@@ -8302,11 +8755,276 @@ private struct MordeIndependentSendTarget {
         return (session.web_session_credential, expiresAt)
     }
 
-    private func portalData(_ path: String, method: String = "GET", body: Data? = nil,
-                            contentType: String? = nil, key: String? = nil,
-                            expectedScope: MordeClientDataScope? = nil,
-                            headers: [String: String] = [:],
-                            renewalAttempt: Int = 0) async throws -> Data {
+    private func ownerPortalSessionStorageKey(_ scope: MordeClientDataScope) -> String {
+        "owner-portal-session.\(scope.storageKey)"
+    }
+
+    private func clearOwnerPortalSessionCache() {
+        ownerPortalSessionCredential = nil
+        ownerPortalSessionExpiresAt = nil
+        ownerPortalSessionUserID = nil
+        ownerPortalSessionScope = nil
+    }
+
+    private func clearOwnerPortalSession(for scope: MordeClientDataScope) {
+        keychain.remove(ownerPortalSessionStorageKey(scope))
+        if ownerPortalSessionScope == scope { clearOwnerPortalSessionCache() }
+    }
+
+    private func clearOwnerPortalSession(for installation: MordeInstallation) {
+        guard let scope = authorizationScope(for: installation) else { return }
+        clearOwnerPortalSession(for: scope)
+    }
+
+    private func isValidOwnerPortalCredential(_ value: String) -> Bool {
+        value.range(of: #"^chs_[a-z0-9]{8}_[A-Za-z0-9_-]{43}$"#,
+                    options: .regularExpression) != nil
+    }
+
+    private func response(_ response: HTTPURLResponse, matchesOrigin origin: String) -> Bool {
+        guard let responseURL = response.url,
+              let responseOrigin = MordeLoginStateStore.serviceOrigin(responseURL.absoluteString),
+              let expectedOrigin = MordeLoginStateStore.serviceOrigin(origin) else { return false }
+        return responseOrigin == expectedOrigin
+    }
+
+    private func authSessionResponse(origin: String, path: String, method: String,
+                                     body: [String: Any]? = nil,
+                                     headers: [String: String] = [:]) async throws ->
+        (Data, HTTPURLResponse) {
+        guard ["/api/auth/login", "/api/auth/client-login", "/api/auth/logout", "/api/auth/client-logout",
+               "/api/auth/client-web-session"].contains(path),
+              let normalizedOrigin = MordeLoginStateStore.serviceOrigin(origin),
+              let base = URL(string: normalizedOrigin),
+              let url = URL(string: path, relativeTo: base)?.absoluteURL,
+              url.scheme == base.scheme, url.host == base.host, url.port == base.port else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpShouldHandleCookies = false
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        if method != "GET", let origin = URLComponents(string: normalizedOrigin)?.string {
+            request.setValue(origin, forHTTPHeaderField: "Origin")
+        }
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, response) = try await sensitiveURLSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard self.response(http, matchesOrigin: normalizedOrigin) else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+
+    private func requireSuccessfulAuthResponse(_ response: HTTPURLResponse, data: Data) throws {
+        guard (200..<300).contains(response.statusCode) else {
+            let reason = try? JSONDecoder().decode(MordeError.self, from: data)
+            throw NSError(domain: "Morde", code: response.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: reason?.displayMessage ?? "请求失败 (\(response.statusCode))"])
+        }
+    }
+
+    private func ownerSessionCookie(from response: HTTPURLResponse, origin: String) throws -> HTTPCookie {
+        guard let normalizedOrigin = MordeLoginStateStore.serviceOrigin(origin),
+              let base = URL(string: normalizedOrigin),
+              let expectedHost = base.host?.lowercased() else { throw URLError(.badURL) }
+        var headerFields: [String: String] = [:]
+        for (key, value) in response.allHeaderFields {
+            if let key = key as? String, let value = value as? String { headerFields[key] = value }
+        }
+        guard let cookie = HTTPCookie.cookies(withResponseHeaderFields: headerFields, for: base)
+                .first(where: { $0.name == "ch_portal" }) else {
+            throw URLError(.cannotParseResponse)
+        }
+        let cookieDomain = cookie.domain.lowercased()
+        let cookieHost = cookieDomain.hasPrefix(".") ? String(cookieDomain.dropFirst()) : cookieDomain
+        guard cookieHost == expectedHost, cookie.path == "/", cookie.isHTTPOnly,
+              base.scheme?.lowercased() != "https" || cookie.isSecure,
+              isValidOwnerPortalCredential(cookie.value),
+              cookie.expiresDate.map({ $0 > Date() }) == true else {
+            throw URLError(.cannotParseResponse)
+        }
+        return cookie
+    }
+
+    private func revokeOwnerSession(credential: String, origin: String) async -> Bool {
+        do {
+            let (_, response) = try await authSessionResponse(origin: origin, path: "/api/auth/logout",
+                method: "POST", headers: ["Cookie": "ch_portal=\(credential)"])
+            return (200..<300).contains(response.statusCode)
+        } catch { return false }
+    }
+
+    private func revokeClientInstallation(credential: String, origin: String) async -> Bool {
+        do {
+            let (_, response) = try await authSessionResponse(origin: origin, path: "/api/auth/client-logout",
+                method: "POST", headers: ["Authorization": "Bearer \(credential)"])
+            return (200..<300).contains(response.statusCode)
+        } catch { return false }
+    }
+
+    private func storedOwnerPortalSession(for installation: MordeInstallation) -> MordeStoredOwnerPortalSession? {
+        guard let scope = authorizationScope(for: installation) else { return nil }
+        let key = ownerPortalSessionStorageKey(scope)
+        let stored: MordeStoredOwnerPortalSession?
+        if ownerPortalSessionScope == scope,
+           let credential = ownerPortalSessionCredential,
+           let expiresAt = ownerPortalSessionExpiresAt,
+           let userID = ownerPortalSessionUserID {
+            stored = MordeStoredOwnerPortalSession(credential: credential,
+                expiresAt: ISO8601DateFormatter().string(from: expiresAt), userID: userID)
+        } else if let raw = keychain.get(key), let data = raw.data(using: .utf8) {
+            stored = try? JSONDecoder().decode(MordeStoredOwnerPortalSession.self, from: data)
+        } else {
+            stored = nil
+        }
+        guard let stored, isValidOwnerPortalCredential(stored.credential),
+              let expiresAt = Self.parseISO8601(stored.expiresAt), expiresAt > Date(),
+              user.map({ $0.id == stored.userID }) ?? true else {
+            clearOwnerPortalSession(for: scope)
+            return nil
+        }
+        return stored
+    }
+
+    private func restoreKeychainValue(_ value: String?, key: String) {
+        guard let value else { keychain.remove(key); return }
+        try? keychain.set(value, key: key)
+    }
+
+    private func ownerPortalSession(for requestScope: MordeClientDataScope) throws ->
+        (credential: String, expiresAt: Date, installationScope: MordeClientDataScope) {
+        guard requestScope == currentDataScope, let currentInstallation = installation,
+              currentInstallation.id == requestScope.installationID,
+              let currentUser = user,
+              let installationScope = authorizationScope(for: currentInstallation) else {
+            throw CancellationError()
+        }
+        if let cachedScope = ownerPortalSessionScope, cachedScope != installationScope {
+            clearOwnerPortalSession(for: cachedScope)
+        }
+        if ownerPortalSessionScope == installationScope,
+           ownerPortalSessionUserID == currentUser.id,
+           let credential = ownerPortalSessionCredential,
+           let expiresAt = ownerPortalSessionExpiresAt,
+           isValidOwnerPortalCredential(credential), expiresAt.timeIntervalSinceNow > 30 {
+            return (credential, expiresAt, installationScope)
+        }
+
+        let storageKey = ownerPortalSessionStorageKey(installationScope)
+        guard let raw = keychain.get(storageKey), let data = raw.data(using: .utf8),
+              let stored = try? JSONDecoder().decode(MordeStoredOwnerPortalSession.self, from: data),
+              stored.userID == currentUser.id, isValidOwnerPortalCredential(stored.credential),
+              let expiresAt = Self.parseISO8601(stored.expiresAt), expiresAt.timeIntervalSinceNow > 30 else {
+            keychain.remove(storageKey)
+            clearOwnerPortalSessionCache()
+            throw NSError(domain: "Morde.OwnerPortalSession", code: 401,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "The file access session expired. Sign in again to access PC files."])
+        }
+        ownerPortalSessionCredential = stored.credential
+        ownerPortalSessionExpiresAt = expiresAt
+        ownerPortalSessionUserID = stored.userID
+        ownerPortalSessionScope = installationScope
+        return (stored.credential, expiresAt, installationScope)
+    }
+
+    private func isOwnerFileFetchRequest(_ path: String, method: String) -> Bool {
+        guard !path.contains("?"), path.hasPrefix("/api/tasks/") else { return false }
+        let parts = path.split(separator: "/")
+        guard parts.count >= 4, parts[0] == "api", parts[1] == "tasks", parts[2].count == 8,
+              parts[3] == "file-fetches" else { return false }
+        switch method {
+        case "GET":
+            return parts.count == 4 || parts.count == 5 ||
+                (parts.count == 6 && parts[5] == "content")
+        case "POST":
+            return parts.count == 6 && parts[5] == "cancel"
+        case "DELETE":
+            return parts.count == 6 && parts[5] == "content"
+        default:
+            return false
+        }
+    }
+
+    private func ownerPortalResponse(_ path: String, method: String = "GET", body: Data? = nil,
+                                     contentType: String? = nil, key: String? = nil,
+                                     expectedScope: MordeClientDataScope? = nil) async throws ->
+        (Data, HTTPURLResponse) {
+        guard isOwnerFileFetchRequest(path, method: method),
+              let requestScope = expectedScope ?? currentDataScope,
+              requestScope == currentDataScope else { throw CancellationError() }
+        let ownerSession = try ownerPortalSession(for: requestScope)
+        guard requestScope == currentDataScope, ownerPortalSessionScope == ownerSession.installationScope else {
+            throw CancellationError()
+        }
+        let requestServer = server
+        guard let base = URL(string: requestServer),
+              let url = URL(string: path, relativeTo: base)?.absoluteURL,
+              MordeLoginStateStore.serviceOrigin(requestServer) != nil,
+              url.scheme == base.scheme, url.host == base.host, url.port == base.port else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpShouldHandleCookies = false
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        request.setValue("ch_portal=\(ownerSession.credential)", forHTTPHeaderField: "Cookie")
+        var origin = URLComponents()
+        origin.scheme = base.scheme
+        origin.host = base.host
+        origin.port = base.port
+        if let origin = origin.string { request.setValue(origin, forHTTPHeaderField: "Origin") }
+        if let key { request.setValue(key, forHTTPHeaderField: "Idempotency-Key") }
+        if let contentType { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
+        if let body { request.httpBody = body }
+        let (data, response) = try await sensitiveURLSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard self.response(http, matchesOrigin: requestScope.serviceOrigin) else { throw URLError(.badServerResponse) }
+        guard requestScope == currentDataScope,
+              ownerPortalSessionScope == ownerSession.installationScope else { throw CancellationError() }
+        if http.statusCode == 401 {
+            clearOwnerPortalSession(for: ownerSession.installationScope)
+            throw NSError(domain: "Morde.OwnerPortalSession", code: 401,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "The file access session expired. Sign in again to access PC files."])
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let reason = try? JSONDecoder().decode(MordeError.self, from: data)
+            throw NSError(domain: "Morde", code: http.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: reason?.displayMessage ?? "请求失败 (\(http.statusCode))"])
+        }
+        return (data, http)
+    }
+
+    private func ownerPortalData(_ path: String, method: String = "GET", body: Data? = nil,
+                                 contentType: String? = nil, key: String? = nil,
+                                 expectedScope: MordeClientDataScope? = nil) async throws -> Data {
+        try await ownerPortalResponse(path, method: method, body: body, contentType: contentType,
+                                      key: key, expectedScope: expectedScope).0
+    }
+
+    private func ownerPortalCall<T: Decodable>(_ path: String, method: String = "GET",
+                                               body: [String: Any]? = nil, key: String? = nil,
+                                               expectedScope: MordeClientDataScope? = nil) async throws -> T {
+        let bytes = try body.map { try JSONSerialization.data(withJSONObject: $0) }
+        let data = try await ownerPortalData(path, method: method, body: bytes,
+                                             contentType: bytes == nil ? nil : "application/json", key: key,
+                                             expectedScope: expectedScope)
+        return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+    }
+
+    private func portalResponse(_ path: String, method: String = "GET", body: Data? = nil,
+                                contentType: String? = nil, key: String? = nil,
+                                expectedScope: MordeClientDataScope? = nil,
+                                headers: [String: String] = [:],
+                                renewalAttempt: Int = 0) async throws -> (Data, HTTPURLResponse) {
         guard let requestScope = expectedScope ?? currentDataScope,
               requestScope == currentDataScope else { throw CancellationError() }
         let portalSession = try await portalWebSession(forceRenew: renewalAttempt > 0)
@@ -8341,8 +9059,8 @@ private struct MordeIndependentSendTarget {
             portalSessionCredential = nil
             portalSessionExpiresAt = nil
             portalSessionScope = nil
-            return try await portalData(path, method: method, body: body, contentType: contentType,
-                                        key: key, expectedScope: requestScope, headers: headers, renewalAttempt: 1)
+            return try await portalResponse(path, method: method, body: body, contentType: contentType,
+                                            key: key, expectedScope: requestScope, headers: headers, renewalAttempt: 1)
         }
         guard requestScope == currentDataScope else { throw CancellationError() }
         guard (200..<300).contains(http.statusCode) else {
@@ -8350,7 +9068,17 @@ private struct MordeIndependentSendTarget {
             throw NSError(domain: "Morde", code: http.statusCode,
                           userInfo: [NSLocalizedDescriptionKey: reason?.displayMessage ?? "请求失败 (\(http.statusCode))"])
         }
-        return data
+        return (data, http)
+    }
+
+    private func portalData(_ path: String, method: String = "GET", body: Data? = nil,
+                            contentType: String? = nil, key: String? = nil,
+                            expectedScope: MordeClientDataScope? = nil,
+                            headers: [String: String] = [:],
+                            renewalAttempt: Int = 0) async throws -> Data {
+        try await portalResponse(path, method: method, body: body, contentType: contentType,
+                                 key: key, expectedScope: expectedScope, headers: headers,
+                                 renewalAttempt: renewalAttempt).0
     }
 
     private func portalCall<T: Decodable>(_ path: String, method: String = "GET",
@@ -10121,7 +10849,40 @@ private struct MordeIndependentSendTarget {
         busy = true; defer { busy = false }
         var intent: MordeLoginIntent?
         var attempt: MordeLoginAttemptTicket?
+        var rollbackOrigin: String?
+        var rollbackClientCredential: String?
+        var rollbackOwnerCredential: String?
+        var rollbackClientStorageKey: String?
+        var rollbackOwnerStorageKey: String?
+        var rollbackInstallationRecordKey: String?
+        var rollbackPreviousClientAuthorization: String?
+        var rollbackPreviousOwnerSession: String?
+        var rollbackPreviousInstallationData: Data?
+        var rollbackPreviousActiveInstallationMap: [String: String]?
+        var rollbackPreviousInstallationLookupKey: String?
+        var previousOwnerSessions: [(scope: MordeClientDataScope, credential: String)] = []
+        var clientAuthorizationWasWritten = false
+        var ownerSessionWasWritten = false
+        var installationWasWritten = false
+        var loginCommitted = false
+
+        func capturePreviousOwnerSession(for target: MordeInstallation) {
+            guard let origin = target.serviceOrigin.flatMap(MordeLoginStateStore.serviceOrigin),
+                  let serviceID = target.serviceInstanceID,
+                  let scope = MordeClientDataScope(serviceOrigin: origin, serviceInstanceID: serviceID,
+                                                   accountID: target.accountName, installationID: target.id),
+                  let raw = keychain.get(ownerPortalSessionStorageKey(scope)),
+                  let data = raw.data(using: .utf8),
+                  let stored = try? JSONDecoder().decode(MordeStoredOwnerPortalSession.self, from: data),
+                  isValidOwnerPortalCredential(stored.credential),
+                  !previousOwnerSessions.contains(where: { $0.credential == stored.credential }) else { return }
+            previousOwnerSessions.append((scope, stored.credential))
+        }
+
         do {
+            if let oldActiveInstallation = installation {
+                capturePreviousOwnerSession(for: oldActiveInstallation)
+            }
             try setServer(server)
             guard let origin = MordeLoginStateStore.serviceOrigin(server) else { throw URLError(.badURL) }
             let loginIntent = try loginStateStore.registerIntent(origin: origin, accountName: trimmedName)
@@ -10130,6 +10891,7 @@ private struct MordeIndependentSendTarget {
             guard let loginAttempt = try loginStateStore.beginAttempt(
                 for: loginIntent, serviceInstanceID: capabilities.service_instance_id) else { return }
             attempt = loginAttempt
+            rollbackOrigin = loginAttempt.origin
             var body: [String: Any] = ["name": trimmedName, "password": password,
                                        "platform": "ios", "display_name": UIDevice.current.name,
                                        "client_instance_id": loginAttempt.clientInstanceID.uuidString,
@@ -10137,6 +10899,7 @@ private struct MordeIndependentSendTarget {
             let previousInstallation = installationForLogin(origin: origin,
                                                             serviceInstanceID: capabilities.service_instance_id,
                                                             accountName: trimmedName)?.installation
+            if let previousInstallation { capturePreviousOwnerSession(for: previousInstallation) }
             if let previousInstallation,
                MordeLoginContract.mayRenewInstallation(
                 installationOrigin: previousInstallation.serviceOrigin,
@@ -10156,36 +10919,122 @@ private struct MordeIndependentSendTarget {
                 loginHeaders["X-Morde-Local-Account"] = trimmedName
             }
 #endif
-            let result: MordeLoginResult = try await call("/api/auth/client-login", method: "POST",
-                body: body, key: loginAttempt.idempotencyKey, authorized: false, headers: loginHeaders)
-            let validClientCredential = MordeCredentialExpiry.validCredential(
-                result.client_credential, expiresAt: result.client_expires_at) != nil
-            guard !result.installation_id.isEmpty, !result.client_credential.isEmpty,
-                  validClientCredential else {
+            guard loginStateStore.isCurrent(loginAttempt),
+                  MordeLoginStateStore.serviceOrigin(server) == loginAttempt.origin else {
+                throw CancellationError()
+            }
+            let (ownerLoginData, ownerLoginResponse) = try await authSessionResponse(
+                origin: loginAttempt.origin, path: "/api/auth/login", method: "POST",
+                body: ["name": trimmedName, "password": password], headers: loginHeaders)
+            try requireSuccessfulAuthResponse(ownerLoginResponse, data: ownerLoginData)
+            let ownerCookie = try ownerSessionCookie(from: ownerLoginResponse, origin: loginAttempt.origin)
+            rollbackOwnerCredential = ownerCookie.value
+            guard ownerCookie.path == "/", ownerCookie.isHTTPOnly,
+                  let ownerExpiresAt = ownerCookie.expiresDate,
+                  ownerExpiresAt.timeIntervalSinceNow > 30 else {
                 throw URLError(.cannotParseResponse)
             }
-            let stored = MordeAuthorization(credential: result.client_credential, expiresAt: result.client_expires_at)
+            let ownerLogin = try JSONDecoder().decode(MordeOwnerPortalLoginResult.self, from: ownerLoginData)
+            guard let ownerUserID = ownerLogin.user?.id, !ownerUserID.isEmpty,
+                  let ownerUserName = ownerLogin.user?.name, !ownerUserName.isEmpty else {
+                throw URLError(.cannotParseResponse)
+            }
+            guard loginStateStore.isCurrent(loginAttempt),
+                  MordeLoginStateStore.serviceOrigin(server) == loginAttempt.origin else {
+                throw CancellationError()
+            }
+
+            var clientLoginHeaders = loginHeaders
+            clientLoginHeaders["Idempotency-Key"] = loginAttempt.idempotencyKey
+            let (clientLoginData, clientLoginResponse) = try await authSessionResponse(
+                origin: loginAttempt.origin, path: "/api/auth/client-login", method: "POST",
+                body: body, headers: clientLoginHeaders)
+            try requireSuccessfulAuthResponse(clientLoginResponse, data: clientLoginData)
+            let result = try JSONDecoder().decode(MordeLoginResult.self, from: clientLoginData)
+            rollbackClientCredential = result.client_credential
+            guard let installationID = result.installation_id else { throw URLError(.cannotParseResponse) }
+            guard let clientExpiresAt = result.client_expires_at else { throw URLError(.cannotParseResponse) }
+            let validClientCredential = result.client_credential.flatMap {
+                MordeCredentialExpiry.validCredential($0, expiresAt: clientExpiresAt)
+            } != nil
+            guard !installationID.isEmpty, let clientCredential = result.client_credential,
+                  !clientCredential.isEmpty, validClientCredential,
+                  let clientUserID = result.user?.id, !clientUserID.isEmpty,
+                  let clientUserName = result.user?.name, !clientUserName.isEmpty,
+                  clientUserID == ownerUserID,
+                  clientUserName.caseInsensitiveCompare(ownerUserName) == .orderedSame else {
+                throw URLError(.cannotParseResponse)
+            }
+            rollbackClientCredential = clientCredential
+
+            let stored = MordeAuthorization(credential: clientCredential, expiresAt: clientExpiresAt)
             guard let lookupKey = Self.installationLookupKey(origin: loginAttempt.origin,
                                                              serviceInstanceID: loginAttempt.serviceInstanceID,
                                                              accountName: trimmedName),
                   let credentialScope = MordeClientDataScope(serviceOrigin: loginAttempt.origin,
                                                              serviceInstanceID: loginAttempt.serviceInstanceID,
                                                              accountID: trimmedName,
-                                                             installationID: result.installation_id) else {
+                                                             installationID: installationID) else {
                 throw URLError(.cannotParseResponse)
             }
-            let newInstallation = MordeInstallation(id: result.installation_id, accountName: trimmedName,
+            let newInstallation = MordeInstallation(id: installationID, accountName: trimmedName,
                                                      serviceOrigin: loginAttempt.origin,
                                                      serviceInstanceID: loginAttempt.serviceInstanceID,
-                                                     accountID: nil,
+                                                     accountID: ownerUserID,
                                                      clientInstanceID: loginAttempt.clientInstanceID,
                                                      revocationStatus: "active")
+            let ownerScope = credentialScope
+            let ownerStorageKey = ownerPortalSessionStorageKey(ownerScope)
+            let clientAuthorizationKey = "authorization.\(credentialScope.storageKey)"
+            rollbackOwnerStorageKey = ownerStorageKey
+            rollbackClientStorageKey = clientAuthorizationKey
+
+            guard loginStateStore.isCurrent(loginAttempt),
+                  MordeLoginStateStore.serviceOrigin(server) == loginAttempt.origin else {
+                throw CancellationError()
+            }
+            let confirmedCapabilities = try await checkCapabilities()
+            guard loginStateStore.isCurrent(loginAttempt),
+                  MordeLoginStateStore.serviceOrigin(server) == loginAttempt.origin,
+                  confirmedCapabilities.service_instance_id.caseInsensitiveCompare(loginAttempt.serviceInstanceID) == .orderedSame else {
+                throw CancellationError()
+            }
+            let ownerSession = MordeStoredOwnerPortalSession(
+                credential: ownerCookie.value,
+                expiresAt: ISO8601DateFormatter().string(from: ownerExpiresAt),
+                userID: ownerUserID)
+            rollbackPreviousClientAuthorization = keychain.get(clientAuthorizationKey)
+            rollbackPreviousOwnerSession = keychain.get(ownerStorageKey)
+            let installationRecordKey = Self.scopedInstallationPrefix + lookupKey
+            rollbackInstallationRecordKey = installationRecordKey
+            rollbackPreviousInstallationData = UserDefaults.standard.data(forKey: installationRecordKey)
+            rollbackPreviousActiveInstallationMap = Self.activeInstallationMap()
+            rollbackPreviousInstallationLookupKey = installationLookupKey
             let accepted = try loginStateStore.commitIfCurrent(loginAttempt) {
+                clientAuthorizationWasWritten = true
                 try keychain.set(String(decoding: JSONEncoder().encode(stored), as: UTF8.self),
-                                 key: "authorization.\(credentialScope.storageKey)")
+                                 key: clientAuthorizationKey)
+                ownerSessionWasWritten = true
+                try keychain.set(String(decoding: JSONEncoder().encode(ownerSession), as: UTF8.self),
+                                 key: ownerStorageKey)
+                installationWasWritten = true
                 try saveInstallation(newInstallation, lookupKey: lookupKey, makeActive: true)
             }
-            guard accepted else { return }
+            guard accepted else {
+                await rollbackPendingLogin(origin: loginAttempt.origin,
+                    clientCredential: rollbackClientCredential, ownerCredential: rollbackOwnerCredential)
+                return
+            }
+            loginCommitted = true
+            var previousOwnerSessionsRevoked = true
+            for previousOwnerSession in previousOwnerSessions where previousOwnerSession.credential != ownerCookie.value {
+                let revoked = await revokeOwnerSession(credential: previousOwnerSession.credential,
+                                                       origin: previousOwnerSession.scope.serviceOrigin)
+                previousOwnerSessionsRevoked = previousOwnerSessionsRevoked && revoked
+                if previousOwnerSession.scope != ownerScope {
+                    clearOwnerPortalSession(for: previousOwnerSession.scope)
+                }
+            }
             if expiredConversationAvailable {
                 let oldScope = retainedOfflineScope
                 let oldConversation = currentConversation
@@ -10196,14 +11045,41 @@ private struct MordeIndependentSendTarget {
                 retainedOfflineMessages = oldMessages
                 expiredConversationAvailable = oldScope != nil && oldConversation != nil
             }
+            ownerPortalSessionCredential = ownerCookie.value
+            ownerPortalSessionExpiresAt = ownerExpiresAt
+            ownerPortalSessionUserID = ownerUserID
+            ownerPortalSessionScope = ownerScope
             verifiedServiceInstanceID = loginAttempt.serviceInstanceID
             publishShellAuthorization()
             UserDefaults.standard.removeObject(forKey: "morde.installation")
             clearLegacyAuthorization()
             error = nil
             registrationMessage = nil
+            if !previousOwnerSessionsRevoked {
+                error = "Previous Portal session could not be revoked. Sign out again from the old device if it remains active."
+            }
             await load()
         } catch {
+            if !loginCommitted, let rollbackOrigin {
+                if clientAuthorizationWasWritten, let key = rollbackClientStorageKey {
+                    restoreKeychainValue(rollbackPreviousClientAuthorization, key: key)
+                }
+                if ownerSessionWasWritten, let key = rollbackOwnerStorageKey {
+                    restoreKeychainValue(rollbackPreviousOwnerSession, key: key)
+                }
+                if installationWasWritten, let recordKey = rollbackInstallationRecordKey {
+                    if let rollbackPreviousInstallationData {
+                        UserDefaults.standard.set(rollbackPreviousInstallationData, forKey: recordKey)
+                    } else {
+                        UserDefaults.standard.removeObject(forKey: recordKey)
+                    }
+                    UserDefaults.standard.set(rollbackPreviousActiveInstallationMap ?? [:],
+                                              forKey: Self.activeInstallationsKey)
+                    installationLookupKey = rollbackPreviousInstallationLookupKey
+                }
+                await rollbackPendingLogin(origin: rollbackOrigin,
+                    clientCredential: rollbackClientCredential, ownerCredential: rollbackOwnerCredential)
+            }
             if let intent, !loginStateStore.isLatest(intent) { return }
             if let attempt, !loginStateStore.isCurrent(attempt) { return }
             if let intent { _ = try? loginStateStore.finish(intent) }
@@ -10211,23 +11087,42 @@ private struct MordeIndependentSendTarget {
         }
     }
 
+    private func rollbackPendingLogin(origin: String, clientCredential: String?, ownerCredential: String?) async {
+        if let ownerCredential {
+            _ = await revokeOwnerSession(credential: ownerCredential, origin: origin)
+        }
+        if let clientCredential {
+            _ = await revokeClientInstallation(credential: clientCredential, origin: origin)
+        }
+    }
+
     func signOut() async {
         guard !busy else { return }
         busy = true; defer { busy = false }
         let oldInstallation = installation
+        let oldClientCredential = authorization?.credential
         var confirmed = false
+        var ownerLogoutConfirmed: Bool?
         if signedIn, oldInstallation != nil {
-            do {
-                let _: MordeEmpty = try await call("/api/auth/client-logout", method: "POST",
-                                                   handleUnauthorized: false)
-                confirmed = true
-            } catch { confirmed = false }
+            if let oldInstallation,
+               let ownerSession = storedOwnerPortalSession(for: oldInstallation),
+               let origin = oldInstallation.serviceOrigin.flatMap(MordeLoginStateStore.serviceOrigin) {
+                ownerLogoutConfirmed = await revokeOwnerSession(credential: ownerSession.credential, origin: origin)
+            }
+            if let oldInstallation,
+               let origin = oldInstallation.serviceOrigin.flatMap(MordeLoginStateStore.serviceOrigin),
+               let oldClientCredential {
+                confirmed = await revokeClientInstallation(credential: oldClientCredential, origin: origin)
+            }
         }
         let offlineScope = currentDataScope
         let offlineConversation = currentConversation
         let offlineMessages = messages
         let hasProjectMessages = offlineScope.map { !MordeOfflineProjectQueue.messages(pendingMessages, scope: $0).isEmpty } ?? false
         signOutLocally(installation: oldInstallation, confirmed: confirmed)
+        if ownerLogoutConfirmed == false {
+            error = "Could not confirm Portal session sign-out. The local file-access session was removed."
+        }
         if let offlineScope, offlineConversation != nil || hasProjectMessages {
             retainedOfflineScope = offlineScope
             expiredConversationAvailable = true
@@ -11816,6 +12711,11 @@ private struct MordeIndependentSendTarget {
         let oldInstallation = target ?? installation
         var localStateFailed = false
         if let oldInstallation {
+            clearOwnerPortalSession(for: oldInstallation)
+        } else if let ownerPortalSessionScope {
+            clearOwnerPortalSession(for: ownerPortalSessionScope)
+        }
+        if let oldInstallation {
             let status = confirmed ? "confirmed" : "unconfirmed"
             if let scope = revocationScope(for: oldInstallation) {
                 do {
@@ -11894,8 +12794,10 @@ private struct MordeIndependentSendTarget {
     var taskMediaGenerationAvailable: Bool? { client.taskMediaGenerationAvailable }
     var tasks: [MordeTask] { client.tasks }
     var details: [String: MordeTask] { client.taskPageDetails }
+    var fileFetches: [String: [MordeTaskFileFetch]] { client.taskFileFetches }
     var timelineEvents: [String: [MordeTaskTimelineEvent]] { client.taskTimelineEvents }
     var timelineErrors: [String: String] { client.taskTimelineErrors }
+    var fileFetchErrors: [String: String] { client.taskFileFetchErrors }
     var expiredTimelines: Set<String> { client.taskTimelineHistoryExpired }
     var loadingTimelines: Set<String> { client.taskTimelineLoading }
     var emptyTimelines: Set<String> { client.taskTimelineNoHistory }
@@ -11905,6 +12807,21 @@ private struct MordeIndependentSendTarget {
         try await client.taskPage(status: status, cursor: cursor)
     }
     func task(id: String) async throws -> MordeTask { try await client.task(id: id) }
+    func refreshFileFetches(taskID: String) async throws {
+        try await client.loadTaskFileFetches(taskID: taskID)
+    }
+    func sourceDeviceOnline(installationID: String) -> Bool? {
+        client.devices.first(where: { $0.id == installationID })?.online
+    }
+    func cancelFileFetch(taskID: String, fetchID: String) async throws {
+        try await client.cancelTaskFileFetch(taskID: taskID, fetchID: fetchID)
+    }
+    func fileFetchContent(taskID: String, fetchID: String) async throws -> Data {
+        try await client.taskFileFetchContent(taskID: taskID, fetchID: fetchID)
+    }
+    func deleteFileFetchCopy(taskID: String, fetchID: String) async throws {
+        try await client.deleteTaskFileFetchContent(taskID: taskID, fetchID: fetchID)
+    }
     func actOnTask(taskID: String, action: MordeTaskPageAction) async -> Bool {
         await client.actOnTaskPage(taskID: taskID, action: action)
     }
@@ -13852,7 +14769,7 @@ private struct MordeWorkspaceShareAcceptanceView: View {
     }
 }
 
-private struct MordeWorkspaceQuickLook: UIViewControllerRepresentable {
+struct MordeWorkspaceQuickLook: UIViewControllerRepresentable {
     let url: URL
 
     func makeUIViewController(context: Context) -> QLPreviewController {
@@ -16200,6 +17117,7 @@ private struct MordeRoot: View {
                         Text("离线或登录状态待确认，消息将保存在本机。")
                         Spacer()
                         Button(AppLocalized("Sign in")) { showExpiredSessionLogin = true }
+                            .accessibilityIdentifier("morde.auth.expiredSignIn")
                     }
                     .font(.footnote).padding(12).background(Color.orange.opacity(0.15))
                     conversationContent

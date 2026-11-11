@@ -129,12 +129,38 @@ func TestTaskStreamingDispatchFallsBackBeforeProviderCall(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		setTestModelResponseSealer(t, gateway)
 		var deltas int
 		call.Request.OnTextDelta = func(string) error { deltas++; return nil }
 		response, err := gateway.Complete(context.Background(), call)
 		if err != nil || response.Text != "hello" || client.calls != 1 || (client.request.OnTextDelta != nil) != allowed || deltas != boolInt(allowed) {
 			t.Fatalf("stream allowed=%t response=%+v err=%v calls=%d deltas=%d", allowed, response, err, client.calls, deltas)
 		}
+	}
+}
+
+func TestTaskModelResponseRecoveryDoesNotReplayProviderOrTextDeltas(t *testing.T) {
+	_, _, _, call := revisionSettlementFixture(t)
+	store := &textStreamingStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}, streamAtDispatch: true}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "hello", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}}
+	gateway, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestModelResponseSealer(t, gateway)
+	var deltas int
+	call.Request.OnTextDelta = func(string) error { deltas++; return nil }
+
+	first, err := gateway.Complete(context.Background(), call)
+	if err != nil || first.Text != "hello" || deltas != 1 {
+		t.Fatalf("first call response=%+v deltas=%d err=%v", first, deltas, err)
+	}
+	second, err := gateway.Complete(context.Background(), call)
+	if err != nil || second.Text != first.Text || second.Usage != first.Usage || deltas != 1 || client.calls != 1 ||
+		store.reserveN != 1 || store.dispatchN != 1 || store.settleN != 1 || store.recoverN != 2 {
+		t.Fatalf("recovered call response=%+v deltas=%d provider=%d reserve=%d dispatch=%d settle=%d recover=%d err=%v",
+			second, deltas, client.calls, store.reserveN, store.dispatchN, store.settleN, store.recoverN, err)
 	}
 }
 

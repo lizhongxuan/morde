@@ -687,7 +687,8 @@ func (b *CloudDSHToolBroker) executeTaskFileFetch(ctx context.Context, current t
 			return b.finishTaskFileFetch(ctx, current, call, operation, waiting, task.OperationSucceeded,
 				map[string]any{"fetch_id": waiting.ID, "status": waiting.Status, "waiting_reason": waiting.WaitingReason})
 		}
-		if err := fetchStore.FailTaskFileFetch(ctx, operation, fetch.ID); err != nil {
+		failureReason := TaskFileFetchFailureReason(result.Error)
+		if err := fetchStore.FailTaskFileFetch(ctx, operation, fetch.ID, failureReason); err != nil {
 			return AgentToolResult{}, err
 		}
 		failed, err := fetchStore.GetTaskFileFetch(ctx, current.OwnerID, current.ID, fetch.ID)
@@ -695,7 +696,7 @@ func (b *CloudDSHToolBroker) executeTaskFileFetch(ctx context.Context, current t
 			return AgentToolResult{}, err
 		}
 		return b.finishTaskFileFetch(ctx, current, call, operation, failed, task.OperationFailed,
-			map[string]any{"fetch_id": failed.ID, "status": failed.Status, "error": result.Error})
+			map[string]any{"fetch_id": failed.ID, "status": failed.Status, "failure_reason": failureReason})
 	}
 	ok = true
 	if err := hub.ValidateActionResult(hub.ActionFileFetch, hub.Frame{Type: "result", ID: "task-result", OK: &ok, Body: result.Body}); err != nil {
@@ -933,6 +934,9 @@ func taskFileFetchSafeOutput(fetch TaskFileFetch) map[string]any {
 	output := map[string]any{"fetch_id": fetch.ID, "status": fetch.Status}
 	if fetch.WaitingReason != "" {
 		output["waiting_reason"] = fetch.WaitingReason
+	}
+	if fetch.FailureReason != "" {
+		output["failure_reason"] = fetch.FailureReason
 	}
 	if fetch.Status == task.FileFetchCompleted {
 		output["source_sha256"] = fetch.SourceSHA256

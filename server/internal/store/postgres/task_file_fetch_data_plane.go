@@ -31,7 +31,8 @@ func (s *Store) AcceptTaskFileFetchManifest(ctx context.Context, taskID, fetchID
 	request app.TaskFileFetchManifestRequest) (app.TaskFileFetchManifestReceipt, error) {
 	if ctx == nil || !domain.ValidTaskID(taskID) || !domain.ValidOperationID(fetchID) || len(ticketHash) != sha256.Size ||
 		!validPostgresSHA256(request.SourceVersion) || !validPostgresSHA256(request.SourceSHA256) ||
-		request.SizeBytes < 1 || request.SizeBytes > app.TaskFileFetchMaxFileBytes || !app.TaskFileFetchMediaTypeValid(request.MediaType) {
+		request.SizeBytes < 1 || request.SizeBytes > app.TaskFileFetchMaxFileBytes || !app.TaskFileFetchMediaTypeValid(request.MediaType) ||
+		!app.ValidTaskFileFetchDirectoryName(request.SourceDirectoryName) {
 		return app.TaskFileFetchManifestReceipt{}, domain.InvalidArgument("manifest", "Task file fetch manifest is invalid")
 	}
 	var receipt app.TaskFileFetchManifestReceipt
@@ -59,6 +60,13 @@ func (s *Store) AcceptTaskFileFetchManifest(ctx context.Context, taskID, fetchID
 			if !sameTaskFileFetchManifest(fetch, request) {
 				return domain.NewError(domain.CodeConflict, "Task file fetch manifest changed during transfer")
 			}
+			if fetch.SourceDirectoryName == "" {
+				if _, err := tx.Exec(ctx, `UPDATE task_file_fetches SET source_directory_name=$4,updated_at=clock_timestamp()
+WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND source_directory_name=''`, fetch.OwnerID, taskID, fetchID, request.SourceDirectoryName); err != nil {
+					return fmt.Errorf("save Task file fetch directory display name: %w", err)
+				}
+				fetch.SourceDirectoryName = request.SourceDirectoryName
+			}
 			confirmed, err := listTaskFileFetchSequences(ctx, tx, fetch.OwnerID, taskID, fetchID)
 			if err != nil {
 				return err
@@ -84,10 +92,10 @@ WHERE owner_id=$1 AND status IN ('transferring','verifying')`, fetch.OwnerID).Sc
 			return domain.NewError(domain.CodeQuotaExceeded, "Task file fetch staging quota has been reached")
 		}
 		command, err := tx.Exec(ctx, `UPDATE task_file_fetches SET source_version=$4,source_sha256=$5,size_bytes=$6,
-media_type=$7,status='transferring',waiting_reason=NULL,confirmed_bytes=0,
-staging_expires_at=clock_timestamp()+$8::interval,updated_at=clock_timestamp()
+media_type=$7,source_directory_name=$8,status='transferring',waiting_reason=NULL,confirmed_bytes=0,
+staging_expires_at=clock_timestamp()+$9::interval,updated_at=clock_timestamp()
 WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND status='queued'`, fetch.OwnerID, taskID, fetchID,
-			request.SourceVersion, request.SourceSHA256, request.SizeBytes, request.MediaType, app.TaskFileFetchStagingLifetime.String())
+			request.SourceVersion, request.SourceSHA256, request.SizeBytes, request.MediaType, request.SourceDirectoryName, app.TaskFileFetchStagingLifetime.String())
 		if err != nil {
 			return fmt.Errorf("pin Task file fetch manifest: %w", err)
 		}
@@ -497,7 +505,7 @@ updated_at=clock_timestamp() WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AN
 				if _, err := tx.Exec(ctx, `DELETE FROM task_file_fetch_chunks WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`, value.ownerID, value.taskID, value.fetchID); err != nil {
 					return fmt.Errorf("delete expired Task file fetch staging: %w", err)
 				}
-				if _, err := tx.Exec(ctx, `UPDATE task_file_fetches SET status='failed',waiting_reason=NULL,ticket_hash=NULL,
+				if _, err := tx.Exec(ctx, `UPDATE task_file_fetches SET status='failed',waiting_reason=NULL,failure_reason='transfer_failed',ticket_hash=NULL,
 ticket_expires_at=NULL,staging_expires_at=NULL,confirmed_bytes=0,updated_at=clock_timestamp()
 WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND status IN ('transferring','verifying')`, value.ownerID, value.taskID, value.fetchID); err != nil {
 					return fmt.Errorf("expire Task file fetch staging: %w", err)
@@ -629,7 +637,8 @@ WHERE f.owner_id=$1 AND f.task_id=$2 AND f.fetch_id=$3 FOR UPDATE OF f`, ownerID
 
 func sameTaskFileFetchManifest(fetch app.TaskFileFetch, request app.TaskFileFetchManifestRequest) bool {
 	return fetch.SourceVersion == request.SourceVersion && fetch.SourceSHA256 == request.SourceSHA256 &&
-		fetch.SizeBytes == request.SizeBytes && fetch.MediaType == request.MediaType
+		fetch.SizeBytes == request.SizeBytes && fetch.MediaType == request.MediaType &&
+		(fetch.SourceDirectoryName == "" || fetch.SourceDirectoryName == request.SourceDirectoryName)
 }
 
 func manifestReceipt(fetch app.TaskFileFetch, confirmed []int32) app.TaskFileFetchManifestReceipt {

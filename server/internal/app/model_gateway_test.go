@@ -20,21 +20,41 @@ import (
 )
 
 type modelGatewayStoreTest struct {
-	reservation ModelCallReservation
-	settlement  ModelCallSettlement
-	taskProject string
-	scopeErr    error
-	reserveN    int
-	dispatchN   int
-	abandonN    int
-	settleN     int
-	reserveErr  error
-	dispatchErr error
-	abandonErr  error
-	deliveryErr error
-	dispatch    bool
-	settleErr   error
-	settledCtx  error
+	reservation     ModelCallReservation
+	settlement      ModelCallSettlement
+	recovered       TaskModelResponseRecord
+	recoveredCallID string
+	recoverErr      error
+	taskProject     string
+	scopeErr        error
+	recoverN        int
+	reserveN        int
+	dispatchN       int
+	abandonN        int
+	settleN         int
+	reserveErr      error
+	dispatchErr     error
+	abandonErr      error
+	deliveryErr     error
+	dispatch        bool
+	settleErr       error
+	settledCtx      error
+}
+
+func setTestModelResponseSealer(t *testing.T, service *ModelGatewayService) {
+	t.Helper()
+	sealer, err := NewSealer(bytes.Repeat([]byte{0x5a}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (s *modelGatewayStoreTest) RecoverTaskModelResponse(_ context.Context, request ModelCallReservation) (TaskModelResponseRecord, bool, error) {
+	s.recoverN++
+	return s.recovered, s.recovered.AgentGeneration != 0 && s.recoveredCallID == request.CallID, s.recoverErr
 }
 
 func (s *modelGatewayStoreTest) ReserveModelCall(_ context.Context, value ModelCallReservation) error {
@@ -62,6 +82,12 @@ func (s *modelGatewayStoreTest) AbandonModelCallReservation(_ context.Context, v
 func (s *modelGatewayStoreTest) SettleModelCall(ctx context.Context, value ModelCallSettlement) error {
 	s.settleN++
 	s.settlement, s.settledCtx = value, ctx.Err()
+	if value.TaskCall != nil {
+		s.recovered = TaskModelResponseRecord{AgentInstanceID: value.TaskCall.Task.AgentInstanceID,
+			AgentGeneration: value.TaskCall.Task.AgentGeneration, Ciphertext: append([]byte(nil), value.ResponseCiphertext...),
+			Digest: append([]byte(nil), value.ResponseDigest...)}
+		s.recoveredCallID = value.CallID
+	}
 	return s.settleErr
 }
 
@@ -238,6 +264,7 @@ func TestModelGatewayRejectsTaskToolCallsOutsideWorkerContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			setTestModelResponseSealer(t, service)
 			call := ModelCall{Source: ModelCallTask, Task: fence, ModelID: "p1234567", CallID: callID,
 				RawRequest: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[{"name":"lookup","parameters":{"type":"object"}}]}`)}
 			response, err := service.Complete(context.Background(), call)
@@ -370,6 +397,7 @@ func TestTaskModelRequestUsesTheCheckpointedDSHFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, service)
 	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
 		EngineVersion: "dsh-1", ProfileVersion: "v1"}
@@ -416,6 +444,7 @@ func TestTaskModelGatewayPreservesSoulAndUntrustedContextAcrossTurns(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, service)
 	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1,
 		EngineVersion: "dsh-1", ProfileVersion: "v1"}
@@ -521,6 +550,7 @@ func TestTaskModelRequestReportsOversizeBeforeReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, service)
 	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1,
 		EngineVersion: "dsh-1", ProfileVersion: "v1"}
@@ -591,6 +621,7 @@ func TestModelGatewayProjectTaskUsesAtomicBudgetPathAndFailsClosedWhenUnwired(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, service)
 	if response, err := service.Complete(context.Background(), call); err != nil || response.Text != "done" {
 		t.Fatalf("project Task model call = %#v, %v", response, err)
 	}
@@ -609,6 +640,7 @@ func TestModelGatewayProjectTaskUsesAtomicBudgetPathAndFailsClosedWhenUnwired(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, unwiredService)
 	if _, err := unwiredService.Complete(context.Background(), call); domain.CodeOf(err) != domain.CodeUnsupported ||
 		unwired.reserveN != 0 || unwiredClient.calls != 0 {
 		t.Fatalf("project call without budget integration was not rejected before dispatch: %v", err)
@@ -620,6 +652,7 @@ func TestModelGatewayProjectTaskUsesAtomicBudgetPathAndFailsClosedWhenUnwired(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, personalService)
 	if _, err := personalService.Complete(context.Background(), call); err != nil || personalStore.reserveN != 1 ||
 		!personalStore.reservation.PersonalModel || personalStore.reservation.ProjectID != projectBudgetTestID || personalClient.calls != 1 {
 		t.Fatalf("personal project model should not require project billing: store=%#v calls=%d err=%v", personalStore, personalClient.calls, err)
@@ -642,6 +675,7 @@ func TestTaskModelRequestDisablesReasoningOnlyForFirstPartyGPT6Luna(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
+			setTestModelResponseSealer(t, service)
 			fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 				AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
 				EngineVersion: "dsh-1", ProfileVersion: "v1"}

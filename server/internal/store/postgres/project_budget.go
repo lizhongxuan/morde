@@ -367,12 +367,21 @@ func projectLedgerTaskID(reservation app.ProjectModelReservation) any {
 // SettleProjectModelCall reconciles both project money and account token
 // ledgers, keeping both holds unknown when the actual result is unsafe.
 func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.SettleProjectModelCallCommand) error {
+	taskCall := settlement.TaskCall
+	taskCallValid := taskCall != nil && taskCall.Source == app.ModelCallTask && taskCall.Task != nil &&
+		taskCall.OwnerID != "" && taskCall.CallID == settlement.CallID && taskCall.ProjectID == settlement.ProjectID &&
+		len(taskCall.RequestDigest) == 32
 	if ctx == nil || settlement.Source == app.ModelCallRoute || !project.ValidID(settlement.ProjectID) || !validProjectBudgetSource(string(settlement.Source)) ||
 		!validProjectIdempotencyKey(settlement.CallID) || (!settlement.Unknown && !validProjectSettlementUsage(settlement.Usage)) ||
 		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
-		settlement.Source != app.ModelCallCompaction && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
-		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
-		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
+		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
+		settlement.TaskCall != nil && !taskCallValid ||
+		settlement.Source == app.ModelCallTask && ((len(settlement.ResponseCiphertext) == 0) != (len(settlement.ResponseDigest) == 0) ||
+			len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
+			len(settlement.ResponseCiphertext) != 0 && (!taskCallValid || settlement.ResponseInvalid || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext)) ||
+		settlement.TaskCall != nil && len(settlement.ResponseCiphertext) == 0 ||
+		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
+		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
 		!settlement.Unknown && !settlement.ResponseInvalid && settlement.Source == app.ModelCallCompaction &&
 			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32) {
 		return domain.InvalidArgument("project_model_settlement", "invalid project model settlement")
@@ -389,6 +398,7 @@ func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.Settl
 		return settleErr
 	}
 	var overBudget bool
+	var responseRejected error
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockModelLedgerOwner(ctx, tx, actorID); err != nil {
 			return err
@@ -396,6 +406,14 @@ func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.Settl
 		var accountID string
 		if err := tx.QueryRow(ctx, `SELECT owner_id FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, actorID).Scan(&accountID); err != nil {
 			return storeError("lock project model settlement account budget", "model budget", err)
+		}
+		if settlement.TaskCall != nil && len(settlement.ResponseCiphertext) != 0 {
+			if err := checkModelCaller(ctx, tx, *settlement.TaskCall); err != nil {
+				if !taskModelResponseFenceRejected(err) {
+					return err
+				}
+				responseRejected = err
+			}
 		}
 		if err := lockProjectByIDInTx(ctx, tx, settlement.ProjectID); err != nil {
 			return err
@@ -434,6 +452,12 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 			if !settlement.Unknown && projectInput != nil && projectOutput != nil && accountInput != nil && accountOutput != nil &&
 				*projectInput == settlement.Usage.InputTokens && *projectOutput == settlement.Usage.OutputTokens &&
 				*accountInput == settlement.Usage.InputTokens && *accountOutput == settlement.Usage.OutputTokens {
+				if settlement.Source == app.ModelCallTask {
+					return verifySettledTaskModelResponseInTx(ctx, tx, app.ModelCallSettlement{Source: settlement.Source,
+						OwnerID: actorID, CallID: settlement.CallID, Usage: app.ModelUsage{Known: true,
+							InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens}, TaskCall: settlement.TaskCall,
+						ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid})
+				}
 				return nil
 			}
 			return domain.NewError(domain.CodeIdempotencyConflict, "project model settlement was already recorded differently")
@@ -441,6 +465,9 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 		if projectState != "reserved" && projectState != "unknown" || accountState != "dispatched" && accountState != "unknown" ||
 			(projectState == "unknown") != (accountState == "unknown") {
 			return domain.NewError(domain.CodeInvalidState, "project model call is not awaiting settlement")
+		}
+		if projectState == "unknown" && settlement.TaskCall != nil {
+			return domain.NewError(domain.CodeInvalidState, "unknown Task model calls cannot deliver a saved response")
 		}
 		if settlement.Unknown {
 			if projectState == "unknown" {
@@ -499,6 +526,20 @@ actual_micros=$6,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 
 				return err
 			}
 		}
+		if settlement.Source == app.ModelCallTask {
+			responseSettlement := app.ModelCallSettlement{Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID,
+				Usage:    app.ModelUsage{Known: true, InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
+				TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
+				ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid}
+			if responseRejected == nil {
+				if _, err := recordTaskModelResponseInTx(ctx, tx, responseSettlement); err != nil {
+					if !taskModelResponseFenceRejected(err) {
+						return err
+					}
+					responseRejected = err
+				}
+			}
+		}
 		if taskID.Valid {
 			return refreshTaskModelUsageInTx(ctx, tx, taskID.String, actorID)
 		}
@@ -515,7 +556,7 @@ actual_micros=$6,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 
 	if overBudget {
 		return domain.NewError(domain.CodeQuotaExceeded, "project model usage exceeded its reservation")
 	}
-	return nil
+	return responseRejected
 }
 
 // bestEffortUnknownProjectModelCall preserves the original known-settlement

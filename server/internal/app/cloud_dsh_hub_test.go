@@ -117,14 +117,14 @@ func (s *cloudDSHHubTaskStore) MarkTaskFileFetchWaiting(_ context.Context, opera
 	return value, nil
 }
 
-func (s *cloudDSHHubTaskStore) FailTaskFileFetch(_ context.Context, operation TaskHubOperation, fetchID string) error {
+func (s *cloudDSHHubTaskStore) FailTaskFileFetch(_ context.Context, operation TaskHubOperation, fetchID, failureReason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	value, ok := s.fetches[operation.Key]
 	if !ok || value.ID != fetchID {
 		return domain.NewError(domain.CodeNotFound, "Task file fetch not found")
 	}
-	value.Status, value.WaitingReason, value.UpdatedAt = task.FileFetchFailed, "", time.Now().UTC()
+	value.Status, value.WaitingReason, value.FailureReason, value.UpdatedAt = task.FileFetchFailed, "", failureReason, time.Now().UTC()
 	s.fetches[operation.Key] = value
 	return nil
 }

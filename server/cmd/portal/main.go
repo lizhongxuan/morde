@@ -326,8 +326,8 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model gateway: %w", err)
 	}
-	if err := modelGateway.SetConversationSummarySealer(sealer); err != nil {
-		return fmt.Errorf("initialize conversation summary model encryption: %w", err)
+	if err := modelGateway.SetModelResponseSealer(sealer); err != nil {
+		return fmt.Errorf("initialize model response encryption: %w", err)
 	}
 	modelUsageAdmin, err := app.NewModelUsageAdminService(store)
 	if err != nil {

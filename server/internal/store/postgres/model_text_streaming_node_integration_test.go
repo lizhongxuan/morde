@@ -199,6 +199,7 @@ func TestRealDSHTextStreamingPersistsSameMessageAndMeteredUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTaskModelResponseSealer(t, gateway)
 	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}
 	proof, err := gateway.CheckModelCapability(ctx, principal, "p1234567", "node-text-stream-proof-001", "text_stream")
 	if err != nil || !proof.TextStream || provider.probes.Load() != 1 {

@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -433,7 +434,8 @@ VALUES ($1,$2,'agent-1',2,'session-1','engine','profile','supervisor-1',$3,'work
 		t.Fatal(err)
 	}
 	fence := app.ModelTaskFence{TaskID: taskID, OwnerID: principal.UserID, InitiatorID: principal.UserID, LeaseOwner: "worker-1", LeaseVersion: 3,
-		AgentInstanceID: "agent-1", AgentGeneration: 2, AgentSessionID: "session-1", AuthorizationVersion: 7, ThroughSequence: 0,
+		AgentInstanceID: "agent-1", AgentGeneration: 2, AgentSessionID: "session-1", AgentRootSessionID: "session-1",
+		AuthorizationVersion: 7, ThroughSequence: 0,
 		EngineVersion: "engine", ProfileVersion: "profile"}
 	callID, err := app.DSHModelCallID(taskID, fence.AgentSessionID, fence.ThroughSequence)
 	if err != nil {
@@ -450,16 +452,58 @@ VALUES ($1,$2,'agent-1',2,'session-1','engine','profile','supervisor-1',$3,'work
 	reservation := app.ProjectModelReservation{ProjectID: projectID, ActorID: principal.UserID, TaskID: taskID, Source: app.ModelCallTask,
 		CallID: callID, ModelID: accountCall.ModelID, Usage: project.Usage{InputTokens: 90, OutputTokens: 10},
 		ReservedTokens: 100, Rate: rate, ReservedMicros: 100, RequestDigest: projectDigest[:], AccountCall: accountCall}
-	if _, _, err := store.ReserveProjectModelCall(ctx, reservation); err != nil {
-		t.Fatalf("reserve persisted project Task call: %v", err)
+	const concurrentTaskCallAttempts = 4
+	startReservations := make(chan struct{})
+	reservationResults := make(chan error, concurrentTaskCallAttempts)
+	for range concurrentTaskCallAttempts {
+		go func() {
+			<-startReservations
+			_, _, err := store.ReserveProjectModelCall(ctx, reservation)
+			reservationResults <- err
+		}()
+	}
+	close(startReservations)
+	winners := 0
+	for range concurrentTaskCallAttempts {
+		err := <-reservationResults
+		if err == nil {
+			winners++
+		} else if domain.CodeOf(err) != domain.CodeConflict {
+			t.Fatalf("concurrent project Task reservation: %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent project Task call reservations=%d, want one provider-dispatch winner", winners)
 	}
 	if err := store.BeginModelCallDispatch(ctx, accountCall); err != nil {
 		t.Fatalf("begin persisted project Task call: %v", err)
 	}
 	settlement := app.SettleProjectModelCallCommand{ProjectID: projectID, Source: app.ModelCallTask, CallID: callID,
 		Usage: project.Usage{InputTokens: 40, OutputTokens: 8}}
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x71}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantResponse := app.ModelResponse{Reasoning: "private reasoning", Text: "completed", StopReason: "stop",
+		Usage: app.ModelUsage{Known: true, InputTokens: 40, OutputTokens: 8}}
+	sealed, err := app.SealTaskModelResponse(sealer, accountCall, wantResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settlement.TaskCall, settlement.ResponseCiphertext, settlement.ResponseDigest = &accountCall, sealed.Ciphertext, sealed.Digest
 	if err := store.SettleProjectModelCall(ctx, settlement); err != nil {
 		t.Fatalf("settle persisted project Task call: %v", err)
+	}
+	recovered, found, err := store.RecoverTaskModelResponse(ctx, accountCall)
+	if err != nil || !found {
+		t.Fatalf("recover persisted project Task response: found=%t err=%v", found, err)
+	}
+	response, err := app.OpenTaskModelResponse(sealer, recovered, accountCall)
+	if err != nil || response.Text != wantResponse.Text || response.Reasoning != wantResponse.Reasoning || response.Usage != wantResponse.Usage {
+		t.Fatalf("open persisted project Task response: response=%+v err=%v", response, err)
+	}
+	if err := store.SettleProjectModelCall(ctx, settlement); err != nil {
+		t.Fatalf("verify duplicate project Task response settlement: %v", err)
 	}
 	var projectActor, projectTask, projectState string
 	var actualMicros int64
@@ -489,6 +533,55 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, principal.UserID, callID).
 			taskProject, taskInitiator, taskUsage)
 	}
 
+	stopReceipt := []byte("verified guardian stop")
+	stopDigest := sha256.Sum256(stopReceipt)
+	if _, err := store.pool.Exec(ctx, `UPDATE task_agent_instances SET state='stopped',stop_receipt=$3,stop_receipt_digest=$4,
+ stopped_at=clock_timestamp() WHERE task_id=$1 AND owner_id=$2 AND agent_generation=2`, taskID, principal.UserID, stopReceipt, stopDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET agent_instance_id='agent-2',agent_generation=3,lease_owner='worker-2',
+ lease_version=4,lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_instances
+(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,engine_version,profile_version,supervisor_id,
+ stop_nonce_digest,lease_owner,lease_version,auth_version,initial_lease_ms,lease_expires_at,state)
+VALUES ($1,$2,'agent-2',3,'session-1','engine','profile','supervisor-2',$3,'worker-2',4,7,30000,
+ clock_timestamp()+interval '30 seconds','active')`, taskID, principal.UserID, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	successorFence := fence
+	successorFence.AgentInstanceID, successorFence.AgentGeneration = "agent-2", 3
+	successorFence.LeaseOwner, successorFence.LeaseVersion = "worker-2", 4
+	successor := accountCall
+	successor.Task = &successorFence
+	recovered, found, err = store.RecoverTaskModelResponse(ctx, successor)
+	if err != nil || !found {
+		t.Fatalf("recover prior-generation Task response after verified stop: found=%t err=%v", found, err)
+	}
+	response, err = app.OpenTaskModelResponse(sealer, recovered, successor)
+	if err != nil || response.Text != wantResponse.Text {
+		t.Fatalf("open prior-generation Task response: response=%+v err=%v", response, err)
+	}
+	advanceCheckpoint := func(sequence int64, label string) []byte {
+		t.Helper()
+		digest := sha256.Sum256([]byte(label))
+		if _, err := store.pool.Exec(ctx, `UPDATE tasks SET checkpoint_through_seq=$2,checkpoint_digest=$3 WHERE id=$1`, taskID, sequence, digest[:]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_through_seq=$2,checkpoint_digest=$3
+ WHERE task_id=$1 AND owner_id=$4 AND session_id='session-1'`, taskID, sequence, digest[:], principal.UserID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,
+ agent_session_id,agent_root_session_id,from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+ VALUES ($1,$2,'agent-2',3,'session-1','session-1',$3,$3,$4,decode('02','hex'),'engine','profile',7,4)`,
+			taskID, principal.UserID, sequence, digest[:]); err != nil {
+			t.Fatal(err)
+		}
+		return digest[:]
+	}
+
 	var personalVersion time.Time
 	if err := store.pool.QueryRow(ctx, `INSERT INTO model_connections(id,owner_id,name,base_url,model_name,api_key_cipher,
 capability_text,capability_tools,checked_at) VALUES ('p7654321',$1,'personal project model','https://model.example/v1','test-model',
@@ -498,23 +591,67 @@ decode(repeat('01',29),'hex'),true,true,now()) RETURNING updated_at`, principal.
 	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET model_id='p7654321',budget_model_tokens=1000 WHERE id=$1`, taskID); err != nil {
 		t.Fatal(err)
 	}
+	advanceCheckpoint(1, "project-task-checkpoint-next")
 	if _, err := store.pool.Exec(ctx, `DELETE FROM model_account_budgets WHERE owner_id=$1`, principal.UserID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `DELETE FROM project_budgets WHERE project_id=$1`, projectID); err != nil {
 		t.Fatal(err)
 	}
-	personal := accountCall
-	personal.ModelID, personal.ConnectionVersion, personal.PersonalModel, personal.CallID = "p7654321", personalVersion, true, "personal-project-call-01"
+	personal := successor
+	personalFence := successorFence
+	personalFence.ThroughSequence = 1
+	personal.Task = &personalFence
+	personal.ModelID, personal.ConnectionVersion, personal.PersonalModel = "p7654321", personalVersion, true
+	personal.CallID, err = app.DSHModelCallID(taskID, personalFence.AgentSessionID, personalFence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalDigest := sha256.Sum256([]byte("personal-task-model-request"))
+	personal.RequestDigest = personalDigest[:]
 	if err := store.ReserveModelCall(ctx, personal); err != nil {
 		t.Fatalf("personal project model without account or project budget: %v", err)
 	}
 	if err := store.BeginModelCallDispatch(ctx, personal); err != nil {
 		t.Fatalf("personal project model dispatch: %v", err)
 	}
-	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: personal.Source, OwnerID: personal.OwnerID,
-		CallID: personal.CallID, Usage: app.ModelUsage{Known: true, InputTokens: 10, OutputTokens: 5}}); err != nil {
+	personalResponse := app.ModelResponse{Reasoning: "private personal reasoning", Text: "personal result", StopReason: "stop",
+		Usage: app.ModelUsage{Known: true, InputTokens: 10, OutputTokens: 5}}
+	personalSealed, err := app.SealTaskModelResponse(sealer, personal, personalResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalSettlement := app.ModelCallSettlement{Source: personal.Source, OwnerID: personal.OwnerID, CallID: personal.CallID,
+		Usage: personalResponse.Usage, TaskCall: &personal, ResponseCiphertext: personalSealed.Ciphertext, ResponseDigest: personalSealed.Digest}
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE task_model_call_responses ADD CONSTRAINT task_model_response_test_reject CHECK (agent_generation <> 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SettleModelCall(ctx, personalSettlement); err == nil {
+		t.Fatal("injected response insert failure unexpectedly settled")
+	}
+	var failedState string
+	var failedResponses int
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2`,
+		principal.UserID, personal.CallID).Scan(&failedState); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_model_call_responses WHERE owner_id=$1 AND source='task' AND call_id=$2`,
+		principal.UserID, personal.CallID).Scan(&failedResponses); err != nil || failedResponses != 0 || failedState != "dispatched" {
+		t.Fatalf("failed response transaction left partial data: state=%s response rows=%d err=%v", failedState, failedResponses, err)
+	}
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE task_model_call_responses DROP CONSTRAINT task_model_response_test_reject`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SettleModelCall(ctx, personalSettlement); err != nil {
 		t.Fatalf("personal project model settlement: %v", err)
+	}
+	recovered, found, err = store.RecoverTaskModelResponse(ctx, personal)
+	if err != nil || !found {
+		t.Fatalf("recover personal Task response: found=%t err=%v", found, err)
+	}
+	response, err = app.OpenTaskModelResponse(sealer, recovered, personal)
+	if err != nil || response.Text != personalResponse.Text || response.Reasoning != personalResponse.Reasoning {
+		t.Fatalf("open personal Task response: response=%+v err=%v", response, err)
 	}
 	var projectCharges int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM project_budget_ledger WHERE project_id=$1 AND call_id=$2`, projectID, personal.CallID).Scan(&projectCharges); err != nil || projectCharges != 0 {
@@ -523,7 +660,46 @@ decode(repeat('01',29),'hex'),true,true,now()) RETURNING updated_at`, principal.
 	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&taskUsage); err != nil || taskUsage != 63 {
 		t.Fatalf("personal model was not included in task usage: %d, %v", taskUsage, err)
 	}
+	for sequence, kind := range []struct {
+		name       string
+		usage      app.ModelUsage
+		invalidOut bool
+	}{
+		{name: "settled-without-response", usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}},
+		{name: "invalid-response", usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}, invalidOut: true},
+	} {
+		checkpointSequence := int64(sequence + 2)
+		advanceCheckpoint(checkpointSequence, kind.name)
+		fence := personalFence
+		fence.ThroughSequence = checkpointSequence
+		callID, err := app.DSHModelCallID(taskID, fence.AgentSessionID, checkpointSequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requestDigest := sha256.Sum256([]byte(kind.name))
+		request := personal
+		request.Task, request.CallID, request.RequestDigest = &fence, callID, requestDigest[:]
+		if err := store.ReserveModelCall(ctx, request); err != nil {
+			t.Fatalf("reserve %s: %v", kind.name, err)
+		}
+		if err := store.BeginModelCallDispatch(ctx, request); err != nil {
+			t.Fatalf("dispatch %s: %v", kind.name, err)
+		}
+		if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: request.Source, OwnerID: request.OwnerID,
+			CallID: request.CallID, Usage: kind.usage, ResponseInvalid: kind.invalidOut}); err != nil {
+			t.Fatalf("settle %s without response: %v", kind.name, err)
+		}
+		if _, found, err := store.RecoverTaskModelResponse(ctx, request); err == nil || found {
+			t.Fatalf("recovered %s without a valid stored response: found=%t err=%v", kind.name, found, err)
+		}
+		if err := store.ReserveModelCall(ctx, request); domain.CodeOf(err) != domain.CodeConflict {
+			t.Fatalf("re-dispatched %s call without prior response: %v", kind.name, err)
+		}
+	}
 	stale := personal
+	staleFence := personalFence
+	staleFence.ThroughSequence = 3
+	stale.Task = &staleFence
 	stale.CallID = "personal-project-stale-01"
 	if err := store.ReserveModelCall(ctx, stale); err != nil {
 		t.Fatal(err)
@@ -544,8 +720,35 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, stale.OwnerID, stale.Source, st
 		Source: stale.Source, CallID: stale.CallID, InputTokens: 4, OutputTokens: 2, Evidence: "provider reference"}); err != nil {
 		t.Fatalf("reconcile personal project usage without budgets: %v", err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&taskUsage); err != nil || taskUsage != 69 {
+	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&taskUsage); err != nil || taskUsage != 73 {
 		t.Fatalf("reconciled personal project task usage: %d, %v", taskUsage, err)
+	}
+	advanceCheckpoint(4, "unknown-task-model-checkpoint")
+	unknownFence := personalFence
+	unknownFence.ThroughSequence = 4
+	unknownCallID, err := app.DSHModelCallID(taskID, unknownFence.AgentSessionID, unknownFence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownDigest := sha256.Sum256([]byte("unknown-task-model-request"))
+	unknownCall := personal
+	unknownCall.Task, unknownCall.CallID, unknownCall.RequestDigest = &unknownFence, unknownCallID, unknownDigest[:]
+	if err := store.ReserveModelCall(ctx, unknownCall); err != nil {
+		t.Fatalf("reserve unknown Task model call: %v", err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, unknownCall); err != nil {
+		t.Fatalf("dispatch unknown Task model call: %v", err)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: unknownCall.Source, OwnerID: unknownCall.OwnerID,
+		CallID: unknownCall.CallID, Unknown: true}); err != nil {
+		t.Fatalf("hold unknown Task model call: %v", err)
+	}
+	if _, found, err := store.RecoverTaskModelResponse(ctx, unknownCall); err == nil || found {
+		t.Fatalf("recovered unknown Task model call: found=%t err=%v", found, err)
+	}
+	var unknownTaskUsage *int64
+	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&unknownTaskUsage); err != nil || unknownTaskUsage != nil {
+		t.Fatalf("unknown Task model usage was reported as settled: usage=%v err=%v", unknownTaskUsage, err)
 	}
 }
 

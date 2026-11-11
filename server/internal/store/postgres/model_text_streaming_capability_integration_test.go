@@ -81,6 +81,7 @@ func TestModelTextStreamingProbeAndDispatchUseCurrentProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTaskModelResponseSealer(t, gateway)
 	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}
 	claimed := modelStreamingTask(f, fence)
 	if enabled, err := gateway.TaskTextStreamingCapability(ctx, claimed); err != nil || enabled {
@@ -143,6 +144,7 @@ func TestModelTextStreamingFallsBackWhenConnectionChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTaskModelResponseSealer(t, gateway)
 	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}
 	if _, err := gateway.CheckModelCapability(ctx, principal, "p1234567", "synthetic-stream-probe-003", "text_stream"); err != nil {
 		t.Fatal(err)

@@ -6,7 +6,7 @@ import { writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -148,6 +148,7 @@ test('real PC helper resumes and commits through the local K4 HTTP service', asy
     })), (error) => error.code === 'not_allowed')
     assert.equal(changedSource, true)
     const incompleteA = (await ownerFetches(a))[0]
+    assert.equal(incompleteA.source_directory_name, basename(rootA.directory))
     assert.equal(incompleteA.status, 'transferring')
     assert.equal(incompleteA.confirmed_bytes, a.chunk_bytes)
     assert.equal(incompleteA.content_state, 'none')
@@ -182,9 +183,11 @@ test('real PC helper resumes and commits through the local K4 HTTP service', asy
     assert.equal(result.size_bytes, source.length)
     assert.equal(JSON.stringify([result, eventsB, eventsResume, service.mordeHubView()]).includes(b.ticket), false)
     const completed = (await ownerFetches(b))[0]
+    assert.equal(completed.source_directory_name, basename(rootB.directory))
     assert.equal(completed.status, 'completed')
     assert.equal(completed.content_state, 'retained')
     assert.equal(completed.confirmed_bytes, source.length)
+    assert.equal(JSON.stringify(completed).includes(b.ticket), false)
     const download = await ownerRequest(b, `/${b.fetch_id}/content`)
     assert.equal(download.status, 200)
     assert.equal(download.headers.get('content-type'), 'application/pdf')

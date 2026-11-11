@@ -330,7 +330,7 @@ func ValidateActionResult(action string, frame Frame) error {
 		if action == ActionCommand && frame.Error == "timeout" {
 			return ProtocolError{Code: "unknown_result", Message: "command timed out before stop was confirmed"}
 		}
-		if !validResultError(frame.Error) {
+		if !validResultError(frame.Error) && !(action == ActionFileFetch && validFileFetchResultError(frame.Error)) {
 			return ProtocolError{Code: "bad_result", Message: "result error code is not allowed"}
 		}
 		return nil
@@ -535,6 +535,15 @@ func validPlatform(platform string) bool {
 func validResultError(code string) bool {
 	switch code {
 	case "cancelled", "denied", "failed", "notification_denied", "not_allowed", "permission_required", "unsupported", "timeout":
+		return true
+	default:
+		return false
+	}
+}
+
+func validFileFetchResultError(code string) bool {
+	switch code {
+	case "conflict", "not_found", "quota_exceeded", "too_large":
 		return true
 	default:
 		return false

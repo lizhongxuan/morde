@@ -15,6 +15,97 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(MordeTask.self, from: Data(missingCounts.utf8)))
     }
 
+    func testTaskFileFetchPresentationSeparatesOfflineWaitFromContentAndCancellation() throws {
+        let offline = try makeFileFetch([
+            "status": "waiting_device", "waiting_reason": "device_offline",
+        ])
+        XCTAssertTrue(offline.isValid(for: "q1234567"))
+        XCTAssertEqual(offline.sourceDirectoryLabel, AppLocalized("Not provided"))
+        XCTAssertTrue(offline.canCancel)
+        XCTAssertFalse(offline.canOpen)
+        XCTAssertFalse(offline.canDeleteCopy)
+
+        let retained = try makeFileFetch([
+            "source_directory_name": "Project Docs",
+            "status": "completed", "waiting_reason": NSNull(),
+            "source_version": String(repeating: "a", count: 64),
+            "source_sha256": String(repeating: "b", count: 64),
+            "media_type": "application/pdf", "size_bytes": 31, "confirmed_bytes": 31,
+            "content_id": "o2345678", "expires_at": "2026-11-18T00:00:00Z",
+            "content_state": "retained", "parse_status": "raw_only",
+        ])
+        XCTAssertTrue(retained.isValid(for: "q1234567"))
+        XCTAssertEqual(retained.sourceDirectoryLabel, "Project Docs")
+        XCTAssertFalse(retained.canCancel)
+        XCTAssertTrue(retained.canOpen)
+        XCTAssertTrue(retained.canDeleteCopy)
+
+        let completedRace = try makeFileFetch([
+            "status": "completed", "waiting_reason": NSNull(),
+            "source_sha256": String(repeating: "c", count: 64), "media_type": "text/plain",
+            "size_bytes": 4, "confirmed_bytes": 4, "content_id": "o3456789",
+            "content_state": "retained", "parse_status": "raw_only",
+        ])
+        XCTAssertTrue(completedRace.isValid(for: "q1234567"))
+        XCTAssertFalse(completedRace.canCancel)
+
+        let failedRace = try makeFileFetch([
+            "status": "failed", "waiting_reason": NSNull(),
+            "parse_status": "pending", "failure_reason": "source_changed",
+        ])
+        XCTAssertTrue(failedRace.isValid(for: "q1234567"))
+        XCTAssertFalse(failedRace.canCancel)
+        XCTAssertEqual(failedRace.failure_reason, "source_changed")
+        XCTAssertFalse(try makeFileFetch(["failure_reason": "raw /Users/private/secret.txt"]).isValid(for: "q1234567"))
+        XCTAssertFalse(try makeFileFetch(["status": "transferring", "failure_reason": "source_changed"]).isValid(for: "q1234567"))
+
+        let deleted = try makeFileFetch([
+            "status": "completed", "waiting_reason": NSNull(),
+            "source_sha256": String(repeating: "b", count: 64), "media_type": "text/plain",
+            "size_bytes": 4, "confirmed_bytes": 4, "content_id": "o2345678",
+            "content_state": "deleted", "deleted_at": "2026-11-11T00:00:00Z",
+            "parse_status": "extracted",
+        ])
+        XCTAssertTrue(deleted.isValid(for: "q1234567"))
+        XCTAssertFalse(deleted.canOpen)
+        XCTAssertFalse(deleted.canDeleteCopy)
+    }
+
+    func testTaskFileFetchRejectsUnsafeDirectoryPathAndInvalidProgress() throws {
+        let valid = try makeFileFetch()
+        XCTAssertTrue(valid.isValid(for: "q1234567"))
+        XCTAssertFalse(valid.isValid(for: "q7654321"))
+
+        let absolutePath = try makeFileFetch(["relative_path": "/Users/private/secret.txt"])
+        XCTAssertFalse(absolutePath.isValid(for: "q1234567"))
+        let traversalPath = try makeFileFetch(["relative_path": "../secret.txt"])
+        XCTAssertFalse(traversalPath.isValid(for: "q1234567"))
+        let directoryPath = try makeFileFetch(["source_directory_name": "Project/Private"])
+        XCTAssertFalse(directoryPath.isValid(for: "q1234567"))
+        let overLimit = try makeFileFetch(["size_bytes": 16 * 1024 * 1024 + 1])
+        XCTAssertFalse(overLimit.isValid(for: "q1234567"))
+        let overConfirmed = try makeFileFetch(["confirmed_bytes": 5])
+        XCTAssertFalse(overConfirmed.isValid(for: "q1234567"))
+        let badWaitReason = try makeFileFetch(["waiting_reason": "device_offline"])
+        XCTAssertFalse(badWaitReason.isValid(for: "q1234567"))
+    }
+
+    private func makeFileFetch(_ overrides: [String: Any] = [:]) throws -> MordeTaskFileFetch {
+        var payload: [String: Any] = [
+            "fetch_id": "o1234567", "task_id": "q1234567",
+            "source_installation_id": "i1234567", "source_device_name": "Work Mac",
+            "source_directory_name": NSNull(), "relative_path": "docs/report.pdf",
+            "task_revision": 1, "source_version": NSNull(), "source_sha256": NSNull(),
+            "media_type": NSNull(), "size_bytes": NSNull(), "confirmed_bytes": 0,
+            "status": "queued", "waiting_reason": NSNull(), "failure_reason": NSNull(), "content_id": NSNull(),
+            "expires_at": NSNull(), "content_state": "none", "parse_status": "pending",
+            "parse_error": NSNull(), "deleted_at": NSNull(),
+        ]
+        payload.merge(overrides) { _, replacement in replacement }
+        return try JSONDecoder().decode(MordeTaskFileFetch.self,
+            from: JSONSerialization.data(withJSONObject: payload))
+    }
+
     func testNewRevisionWaitsForItsOwnPersistedStart() throws {
         func task(started: Bool?, current: Int64, desired: Int64, status: String = "running") throws -> MordeTask {
             var payload: [String: Any] = ["id": "q1234567", "conversation_id": "c1234567", "objective": "demo",

@@ -1681,6 +1681,8 @@ type TaskFileFetch struct {
 	ParseStatus              string             `json:"parse_status"`
 	ParseError               pgtype.Text        `json:"parse_error"`
 	DeletedAt                pgtype.Timestamptz `json:"deleted_at"`
+	SourceDirectoryName      string             `json:"source_directory_name"`
+	FailureReason            pgtype.Text        `json:"failure_reason"`
 }
 
 type TaskFileFetchChunk struct {
@@ -1810,6 +1812,34 @@ type TaskMediaStagedObject struct {
 	CleanupState  string             `json:"cleanup_state"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TaskModelCallResponse struct {
+	OwnerID              string             `json:"owner_id"`
+	Source               string             `json:"source"`
+	CallID               string             `json:"call_id"`
+	TaskID               string             `json:"task_id"`
+	TaskOwnerID          string             `json:"task_owner_id"`
+	InitiatorID          string             `json:"initiator_id"`
+	ProjectID            string             `json:"project_id"`
+	PersonalModel        bool               `json:"personal_model"`
+	AgentInstanceID      string             `json:"agent_instance_id"`
+	AgentGeneration      int64              `json:"agent_generation"`
+	AgentSessionID       string             `json:"agent_session_id"`
+	AgentRootSessionID   string             `json:"agent_root_session_id"`
+	LeaseOwner           string             `json:"lease_owner"`
+	LeaseVersion         int64              `json:"lease_version"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	ThroughSequence      int64              `json:"through_sequence"`
+	EngineVersion        string             `json:"engine_version"`
+	ProfileVersion       string             `json:"profile_version"`
+	ModelID              string             `json:"model_id"`
+	ProviderModel        string             `json:"provider_model"`
+	ConnectionVersion    pgtype.Timestamptz `json:"connection_version"`
+	RequestDigest        []byte             `json:"request_digest"`
+	ResponseCiphertext   []byte             `json:"response_ciphertext"`
+	ResponseDigest       []byte             `json:"response_digest"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 }
 
 type TaskOperation struct {

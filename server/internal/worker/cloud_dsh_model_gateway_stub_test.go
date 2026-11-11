@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -134,6 +135,10 @@ func (store *a10LocalGatewayStore) SettleModelCall(_ context.Context, value app.
 	return nil
 }
 
+func (*a10LocalGatewayStore) RecoverTaskModelResponse(context.Context, app.ModelCallReservation) (app.TaskModelResponseRecord, bool, error) {
+	return app.TaskModelResponseRecord{}, false, nil
+}
+
 func (*a10LocalGatewayStore) ModelTaskProjectID(_ context.Context, fence app.ModelTaskFence) (string, error) {
 	if fence.TaskID == "" {
 		return "", errors.New("task model fence is missing")
@@ -189,6 +194,13 @@ func TestCloudDSHUsesModelGatewayAndLocalSyntheticModelHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x5a}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
 
 	executor, _, _, _, fallbackModels, value := cloudDSHFixture(t)
 	executor.options.Models = gateway
@@ -218,7 +230,7 @@ func TestCloudDSHUsesModelGatewayAndLocalSyntheticModelHTTP(t *testing.T) {
 
 	gatewayStore.mu.Lock()
 	defer gatewayStore.mu.Unlock()
-	if len(gatewayStore.reservations) != 1 || len(gatewayStore.settlements) != 1 || len(gatewayStore.deliveries) != 1 {
+	if len(gatewayStore.reservations) != 1 || len(gatewayStore.settlements) != 1 || len(gatewayStore.deliveries) != 2 {
 		t.Fatalf("model gateway ledger: reservations=%d settlements=%d deliveries=%d",
 			len(gatewayStore.reservations), len(gatewayStore.settlements), len(gatewayStore.deliveries))
 	}

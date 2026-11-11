@@ -809,18 +809,27 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3 AND agent_instance_id=$
 }
 
 func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSettlement) error {
+	taskCall := settlement.TaskCall
+	taskCallValid := taskCall != nil && taskCall.Source == app.ModelCallTask && taskCall.Task != nil &&
+		taskCall.OwnerID == settlement.OwnerID && taskCall.CallID == settlement.CallID && len(taskCall.RequestDigest) == 32
 	if settlement.Source == app.ModelCallRoute || !domain.ValidUserID(settlement.OwnerID) || settlement.CallID == "" ||
 		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
-		settlement.Source != app.ModelCallCompaction && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
-		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
-		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0) ||
+		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
+		settlement.TaskCall != nil && !taskCallValid ||
+		settlement.Source == app.ModelCallTask && ((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
+			len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
+			len(settlement.ResponseCiphertext) != 0 && (!taskCallValid || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext) ||
+			settlement.TaskCall != nil && len(settlement.ResponseCiphertext) == 0) ||
+		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
+		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
 		!settlement.Unknown && !settlement.ResponseInvalid && settlement.Source == app.ModelCallCompaction &&
 			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32) ||
 		(!settlement.Unknown && (!settlement.Usage.Known || settlement.Usage.InputTokens < 0 || settlement.Usage.OutputTokens < 0 ||
 			settlement.Usage.InputTokens > math.MaxInt64-settlement.Usage.OutputTokens)) {
 		return domain.InvalidArgument("model_call", "invalid model settlement")
 	}
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+	var responseRejected error
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockModelLedgerOwner(ctx, tx, settlement.OwnerID); err != nil {
 			return err
 		}
@@ -844,6 +853,9 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		}
 		if state != "dispatched" {
 			if state == "unknown" && !settlement.Unknown {
+				if settlement.TaskCall != nil {
+					return domain.NewError(domain.CodeInvalidState, "unknown Task model calls cannot deliver a saved response")
+				}
 				if settlement.Source == app.ModelCallCompaction {
 					return domain.NewError(domain.CodeInvalidState, "unknown conversation summary model usage requires reconciliation")
 				}
@@ -872,6 +884,9 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 			}
 			if (state == "unknown" && settlement.Unknown) || (state == "settled" && !settlement.Unknown &&
 				input != nil && output != nil && *input == settlement.Usage.InputTokens && *output == settlement.Usage.OutputTokens) {
+				if state == "settled" && settlement.Source == app.ModelCallTask {
+					return verifySettledTaskModelResponseInTx(ctx, tx, settlement)
+				}
 				return nil
 			}
 			return domain.NewError(domain.CodeIdempotencyConflict, "model settlement was already recorded differently")
@@ -892,6 +907,14 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 				return err
 			}
 		}
+		if settlement.Source == app.ModelCallTask {
+			if _, err := recordTaskModelResponseInTx(ctx, tx, settlement); err != nil {
+				if !taskModelResponseFenceRejected(err) {
+					return err
+				}
+				responseRejected = err
+			}
+		}
 		if taskID != nil {
 			if settlement.Unknown {
 				_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=now() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
@@ -905,6 +928,10 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return responseRejected
 }
 
 var _ app.ModelCallStore = (*Store)(nil)

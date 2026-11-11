@@ -17,8 +17,8 @@ import (
 )
 
 const taskFileFetchProjectionColumns = `f.fetch_id,f.owner_id,f.task_id,f.operation_key,f.source_installation_id,
-i.display_name,f.target_grant_version,f.task_authorization_version,f.task_revision,f.relative_path,f.status,
-f.waiting_reason,f.source_version,f.source_sha256,f.size_bytes,f.confirmed_bytes,f.content_id,f.expires_at,
+i.display_name,f.source_directory_name,f.target_grant_version,f.task_authorization_version,f.task_revision,f.relative_path,f.status,
+f.waiting_reason,f.failure_reason,f.source_version,f.source_sha256,f.size_bytes,f.confirmed_bytes,f.content_id,f.expires_at,
 f.media_type,CASE WHEN f.content_state='retained' AND f.expires_at<=clock_timestamp() THEN 'expired' ELSE f.content_state END,
 f.parse_status,f.parse_error,f.deleted_at,f.staging_expires_at,f.created_at,f.updated_at`
 
@@ -209,8 +209,9 @@ WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND status='queued'`,
 	return result, err
 }
 
-func (s *Store) FailTaskFileFetch(ctx context.Context, operation app.TaskHubOperation, fetchID string) error {
-	if ctx == nil || operation.Action != hub.ActionFileFetch || !validTaskHubOperationState(operation) || !domain.ValidOperationID(fetchID) {
+func (s *Store) FailTaskFileFetch(ctx context.Context, operation app.TaskHubOperation, fetchID, failureReason string) error {
+	if ctx == nil || operation.Action != hub.ActionFileFetch || !validTaskHubOperationState(operation) || !domain.ValidOperationID(fetchID) ||
+		!task.ValidFileFetchFailureReason(failureReason) {
 		return domain.InvalidArgument("file_fetch", "Task file fetch identity is invalid")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
@@ -224,17 +225,23 @@ func (s *Store) FailTaskFileFetch(ctx context.Context, operation app.TaskHubOper
 		if !sameTaskHubOperationRequest(storedOperation, operation) {
 			return idempotencyConflict()
 		}
-		command, err := tx.Exec(ctx, `UPDATE task_file_fetches SET status='failed',waiting_reason=NULL,ticket_hash=NULL,
-ticket_expires_at=NULL,updated_at=clock_timestamp()
-WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND operation_key=$4 AND status IN ('queued','waiting_device')`,
-			operation.OwnerID, operation.TaskID, fetchID, operation.Key)
+		command, err := tx.Exec(ctx, `UPDATE task_file_fetches SET status='failed',waiting_reason=NULL,failure_reason=$5,
+ticket_hash=NULL,ticket_expires_at=NULL,staging_expires_at=NULL,confirmed_bytes=0,updated_at=clock_timestamp()
+WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND operation_key=$4 AND content_state='none'
+AND status IN ('queued','waiting_device','transferring','verifying')`,
+			operation.OwnerID, operation.TaskID, fetchID, operation.Key, failureReason)
 		if err != nil {
 			return fmt.Errorf("persist failed Task file fetch: %w", err)
 		}
-		if command.RowsAffected() == 0 {
+		if command.RowsAffected() == 1 {
+			if _, err := tx.Exec(ctx, `DELETE FROM task_file_fetch_chunks WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`,
+				operation.OwnerID, operation.TaskID, fetchID); err != nil {
+				return fmt.Errorf("delete failed Task file fetch staging chunks: %w", err)
+			}
+		} else {
 			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_file_fetches WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND operation_key=$4 AND status='failed')`,
-				operation.OwnerID, operation.TaskID, fetchID, operation.Key).Scan(&exists); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_file_fetches WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND operation_key=$4 AND status='failed' AND failure_reason=$5)`,
+				operation.OwnerID, operation.TaskID, fetchID, operation.Key, failureReason).Scan(&exists); err != nil {
 				return fmt.Errorf("check failed Task file fetch replay: %w", err)
 			}
 			if !exists {
@@ -291,13 +298,13 @@ WHERE f.owner_id=$1 AND f.task_id=$2 AND f.fetch_id=$3 FOR UPDATE OF f`, ownerID
 
 func scanTaskFileFetch(row pgx.Row) (app.TaskFileFetch, error) {
 	var value app.TaskFileFetch
-	var waitingReason, sourceVersion, sourceSHA256, contentID, mediaType, contentState, parseError pgtype.Text
+	var waitingReason, failureReason, sourceVersion, sourceSHA256, contentID, mediaType, contentState, parseError pgtype.Text
 	var sizeBytes pgtype.Int8
 	var expiresAt, deletedAt, stagingExpiresAt pgtype.Timestamptz
 	var status, parseStatus string
 	err := row.Scan(&value.ID, &value.OwnerID, &value.TaskID, &value.OperationKey, &value.SourceInstallationID,
-		&value.SourceDeviceName, &value.TargetGrantVersion, &value.TaskAuthorizationVersion, &value.TaskRevision, &value.RelativePath,
-		&status, &waitingReason, &sourceVersion, &sourceSHA256, &sizeBytes, &value.ConfirmedBytes, &contentID, &expiresAt,
+		&value.SourceDeviceName, &value.SourceDirectoryName, &value.TargetGrantVersion, &value.TaskAuthorizationVersion, &value.TaskRevision, &value.RelativePath,
+		&status, &waitingReason, &failureReason, &sourceVersion, &sourceSHA256, &sizeBytes, &value.ConfirmedBytes, &contentID, &expiresAt,
 		&mediaType, &contentState, &parseStatus, &parseError, &deletedAt, &stagingExpiresAt, &value.CreatedAt, &value.UpdatedAt)
 	if err != nil {
 		return app.TaskFileFetch{}, err
@@ -305,6 +312,9 @@ func scanTaskFileFetch(row pgx.Row) (app.TaskFileFetch, error) {
 	value.Status = task.FileFetchStatus(status)
 	if waitingReason.Valid {
 		value.WaitingReason = waitingReason.String
+	}
+	if failureReason.Valid {
+		value.FailureReason = failureReason.String
 	}
 	if sourceVersion.Valid {
 		value.SourceVersion = sourceVersion.String

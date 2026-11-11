@@ -82,6 +82,12 @@ type CloudDSHAccountRuntimeManager struct {
 	options  CloudDSHAccountRuntimeManagerOptions
 	mu       sync.Mutex
 	sessions map[string]*cloudDSHAccountRuntimeSession
+	keys     map[string]*cloudDSHAccountRuntimeKeyLock
+}
+
+type cloudDSHAccountRuntimeKeyLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type cloudDSHRuntimeStartupError struct {
@@ -103,7 +109,30 @@ func NewCloudDSHAccountRuntimeManager(options CloudDSHAccountRuntimeManagerOptio
 		options.TaskStopper == nil || options.LeaseOwner == "" || options.MaxTasks < 1 || options.MaxTasks > 16 {
 		return nil, errors.New("account Agent Runtime dependencies and quota are required")
 	}
-	return &CloudDSHAccountRuntimeManager{options: options, sessions: make(map[string]*cloudDSHAccountRuntimeSession)}, nil
+	return &CloudDSHAccountRuntimeManager{options: options, sessions: make(map[string]*cloudDSHAccountRuntimeSession),
+		keys: make(map[string]*cloudDSHAccountRuntimeKeyLock)}, nil
+}
+
+func (m *CloudDSHAccountRuntimeManager) lockConversation(conversationID string) func() {
+	m.mu.Lock()
+	key := m.keys[conversationID]
+	if key == nil {
+		key = &cloudDSHAccountRuntimeKeyLock{}
+		m.keys[conversationID] = key
+	}
+	key.refs++
+	m.mu.Unlock()
+
+	key.mu.Lock()
+	return func() {
+		key.mu.Unlock()
+		m.mu.Lock()
+		key.refs--
+		if key.refs == 0 {
+			delete(m.keys, conversationID)
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *CloudDSHAccountRuntimeManager) markRuntimeFailed(ctx context.Context, fence app.AccountAgentRuntimeFence, reason execution.RuntimeFailureReason) error {
@@ -119,9 +148,12 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID, co
 	if ctx == nil || !app.ValidAccountAgentRuntimeOwnerID(ownerID) || !domain.ValidConversationID(conversationID) {
 		return nil, errors.New("conversation Agent Runtime identity is invalid")
 	}
+	unlock := m.lockConversation(conversationID)
+	defer unlock()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if session := m.sessions[conversationID]; session != nil && !session.closed() {
+	session := m.sessions[conversationID]
+	m.mu.Unlock()
+	if session != nil && !session.closed() {
 		if session.runtime.Fence.OwnerID != ownerID {
 			return nil, errors.New("conversation Agent Runtime owner does not match")
 		}
@@ -131,7 +163,11 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID, co
 		}
 		return session, nil
 	}
-	delete(m.sessions, conversationID)
+	m.mu.Lock()
+	if m.sessions[conversationID] == session {
+		delete(m.sessions, conversationID)
+	}
+	m.mu.Unlock()
 	current, found, err := m.options.Control.Get(ctx, conversationID)
 	if err != nil {
 		return nil, cloudDSHStartupFailure("runtime_control_read", "account Agent Runtime state is unavailable", err)
@@ -215,13 +251,15 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID, co
 		_ = process.Output.Close()
 		return nil, failStartup(cloudDSHStartupFailure("runtime_control_ready", "account Agent Runtime ready state was not persisted", err))
 	}
-	session := &cloudDSHAccountRuntimeSession{manager: m, runtime: ready, process: process, frames: frames,
+	session = &cloudDSHAccountRuntimeSession{manager: m, runtime: ready, process: process, frames: frames,
 		leaseExpiresAt: ready.LeaseExpiresAt, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask),
 		coordinators: make(map[string]*cloudDSHAccountCoordinator), coordinatorSlots: make(chan struct{}, max(1, ready.MaxConcurrentTasks)),
 		stopped: make(map[cloudDSHIdentity]struct{}),
 		input:   &cloudDSHRuntimeInput{target: process.Input}}
 	go session.route()
+	m.mu.Lock()
 	m.sessions[conversationID] = session
+	m.mu.Unlock()
 	return session, nil
 }
 
@@ -313,24 +351,40 @@ func (m *CloudDSHAccountRuntimeManager) Run(ctx context.Context) error {
 
 func (m *CloudDSHAccountRuntimeManager) renewIdleSessions(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	sessions := make(map[string]*cloudDSHAccountRuntimeSession, len(m.sessions))
 	for conversationID, session := range m.sessions {
+		sessions[conversationID] = session
+	}
+	m.mu.Unlock()
+	for conversationID, session := range sessions {
+		unlock := m.lockConversation(conversationID)
+		m.mu.Lock()
+		current := m.sessions[conversationID]
+		m.mu.Unlock()
+		if current != session {
+			unlock()
+			continue
+		}
 		session.mu.Lock()
 		idle := session.failed == nil && len(session.tasks) == 0
 		session.mu.Unlock()
 		if !idle {
+			unlock()
 			continue
 		}
 		session.renewMu.Lock()
 		expiresAt := session.leaseExpiresAt
 		session.renewMu.Unlock()
 		if time.Until(expiresAt) > app.MaxAgentLease/3 {
+			unlock()
 			continue
 		}
 		if err := m.renewAccountRuntime(ctx, session); err != nil {
 			session.fail(err)
+			unlock()
 			return fmt.Errorf("renew idle conversation Agent Runtime %s: %w", conversationID, err)
 		}
+		unlock()
 	}
 	return nil
 }
@@ -350,8 +404,10 @@ func (m *CloudDSHAccountRuntimeManager) reapStopCandidates(ctx context.Context) 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		unlock := m.lockConversation(candidate.Fence.ConversationID)
 		m.mu.Lock()
 		session := m.sessions[candidate.Fence.ConversationID]
+		m.mu.Unlock()
 		if session != nil {
 			session.mu.Lock()
 			activeWork := session.hasActiveWorkLocked(nil)
@@ -360,21 +416,25 @@ func (m *CloudDSHAccountRuntimeManager) reapStopCandidates(ctx context.Context) 
 			}
 			session.mu.Unlock()
 			if activeWork {
-				m.mu.Unlock()
+				unlock()
 				continue
 			}
 		}
 		if err := m.stopUnattachedRuntime(ctx, candidate.Fence); err != nil {
-			m.mu.Unlock()
+			unlock()
 			return fmt.Errorf("stop account Agent Runtime %s: %w", candidate.Fence.OwnerID, err)
 		}
-		delete(m.sessions, candidate.Fence.ConversationID)
+		m.mu.Lock()
+		if m.sessions[candidate.Fence.ConversationID] == session {
+			delete(m.sessions, candidate.Fence.ConversationID)
+		}
+		m.mu.Unlock()
 		if session != nil {
 			session.fail(errors.New("account Agent Runtime was stopped by lifecycle recovery"))
 			_ = session.process.Input.Close()
 			_ = session.process.Output.Close()
 		}
-		m.mu.Unlock()
+		unlock()
 	}
 	return nil
 }
@@ -1175,8 +1235,8 @@ func (m *CloudDSHAccountRuntimeManager) RenewTask(ctx context.Context, session *
 }
 
 func (m *CloudDSHAccountRuntimeManager) StopTask(ctx context.Context, session *cloudDSHAccountRuntimeSession, fence app.AgentInstanceFence) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	unlock := m.lockConversation(session.runtime.Fence.ConversationID)
+	defer unlock()
 	session.mu.Lock()
 	task := session.tasks[fence]
 	session.mu.Unlock()

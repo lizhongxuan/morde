@@ -15,6 +15,27 @@ const (
 	FileFetchFailed        FileFetchStatus = "failed"
 )
 
+const (
+	FileFetchFailureAccessDenied      = "access_denied"
+	FileFetchFailureSourceChanged     = "source_changed"
+	FileFetchFailureUnavailable       = "file_unavailable"
+	FileFetchFailureLimitExceeded     = "limit_exceeded"
+	FileFetchFailureUnsupported       = "unsupported"
+	FileFetchFailureSourceUnavailable = "source_unavailable"
+	FileFetchFailureTransfer          = "transfer_failed"
+)
+
+func ValidFileFetchFailureReason(value string) bool {
+	switch value {
+	case FileFetchFailureAccessDenied, FileFetchFailureSourceChanged, FileFetchFailureUnavailable,
+		FileFetchFailureLimitExceeded, FileFetchFailureUnsupported, FileFetchFailureSourceUnavailable,
+		FileFetchFailureTransfer:
+		return true
+	default:
+		return false
+	}
+}
+
 func ValidFileFetchStatus(value FileFetchStatus) bool {
 	switch value {
 	case FileFetchQueued, FileFetchWaitingDevice, FileFetchTransferring, FileFetchVerifying,

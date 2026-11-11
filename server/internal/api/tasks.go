@@ -137,6 +137,7 @@ type taskFileFetchResponse struct {
 	TaskID               string                     `json:"task_id"`
 	SourceInstallationID string                     `json:"source_installation_id"`
 	SourceDeviceName     string                     `json:"source_device_name"`
+	SourceDirectoryName  *string                    `json:"source_directory_name"`
 	RelativePath         string                     `json:"relative_path"`
 	TaskRevision         int64                      `json:"task_revision"`
 	SourceVersion        *string                    `json:"source_version"`
@@ -146,6 +147,7 @@ type taskFileFetchResponse struct {
 	ConfirmedBytes       int64                      `json:"confirmed_bytes"`
 	Status               task.FileFetchStatus       `json:"status"`
 	WaitingReason        *string                    `json:"waiting_reason"`
+	FailureReason        *string                    `json:"failure_reason"`
 	ContentID            *string                    `json:"content_id"`
 	ExpiresAt            *time.Time                 `json:"expires_at"`
 	ContentState         task.FileFetchContentState `json:"content_state"`
@@ -754,8 +756,10 @@ func (h *api) getTaskFileFetch(service TaskFileFetchQueryService) gin.HandlerFun
 
 func toTaskFileFetchResponse(value app.TaskFileFetch) (taskFileFetchResponse, error) {
 	if !domain.ValidOperationID(value.ID) || !domain.ValidTaskID(value.TaskID) || !domain.ValidClientInstallationID(value.SourceInstallationID) ||
-		!validTaskText(value.SourceDeviceName, 100) || value.TargetGrantVersion < 1 || value.TaskAuthorizationVersion < 1 ||
+		!validTaskText(value.SourceDeviceName, 100) || (value.SourceDirectoryName != "" && !app.ValidTaskFileFetchDirectoryName(value.SourceDirectoryName)) ||
+		value.TargetGrantVersion < 1 || value.TaskAuthorizationVersion < 1 ||
 		value.TaskRevision < 1 || !validTaskText(value.RelativePath, 1024) || !task.ValidFileFetchStatus(value.Status) ||
+		(value.FailureReason != "" && (value.Status != task.FileFetchFailed || !task.ValidFileFetchFailureReason(value.FailureReason))) ||
 		!task.ValidFileFetchContentState(value.ContentState) ||
 		!task.ValidFileFetchParseStatus(value.ParseStatus) || !app.ValidTaskFileFetchParseResult(value.ParseStatus, value.ParseError) ||
 		(value.Status != task.FileFetchCompleted && value.ParseStatus != task.FileFetchParsePending) ||
@@ -770,10 +774,12 @@ func toTaskFileFetchResponse(value app.TaskFileFetch) (taskFileFetchResponse, er
 	}
 	response := taskFileFetchResponse{
 		FetchID: value.ID, TaskID: value.TaskID, SourceInstallationID: value.SourceInstallationID,
-		SourceDeviceName: value.SourceDeviceName, RelativePath: value.RelativePath, TaskRevision: value.TaskRevision,
+		SourceDeviceName: value.SourceDeviceName, SourceDirectoryName: stringPointer(value.SourceDirectoryName),
+		RelativePath: value.RelativePath, TaskRevision: value.TaskRevision,
 		SourceVersion: stringPointer(value.SourceVersion), SourceSHA256: stringPointer(value.SourceSHA256), MediaType: stringPointer(value.MediaType),
 		ConfirmedBytes: value.ConfirmedBytes, Status: value.Status, WaitingReason: stringPointer(value.WaitingReason),
-		ContentID: stringPointer(value.ContentID), ExpiresAt: value.ExpiresAt, ContentState: value.ContentState, DeletedAt: value.DeletedAt,
+		FailureReason: stringPointer(value.FailureReason),
+		ContentID:     stringPointer(value.ContentID), ExpiresAt: value.ExpiresAt, ContentState: value.ContentState, DeletedAt: value.DeletedAt,
 		ParseStatus: value.ParseStatus, ParseError: stringPointer(value.ParseError),
 	}
 	if value.SizeBytes > 0 {

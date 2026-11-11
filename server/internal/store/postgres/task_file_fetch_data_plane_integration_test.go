@@ -77,7 +77,7 @@ WHERE id=$1 AND owner_id=$2`, claimed.ID, owner.ID, revision); err != nil {
 		digest := sha256.Sum256(data)
 		return app.TaskFileFetchManifestRequest{
 			SourceVersion: hex.EncodeToString(version[:]), SourceSHA256: hex.EncodeToString(digest[:]),
-			SizeBytes: int64(len(data)), MediaType: "text/plain",
+			SizeBytes: int64(len(data)), MediaType: "text/plain", SourceDirectoryName: "Synthetic reports",
 		}
 	}
 	chunkDigest := func(data []byte) string {
@@ -138,9 +138,15 @@ WHERE id=$1 AND owner_id=$2`, claimed.ID, owner.ID, revision); err != nil {
 	if err != nil || len(manifestReceipt.ConfirmedSequences) != 1 || manifestReceipt.ConfirmedSequences[0] != 0 {
 		t.Fatalf("resume manifest: receipt=%+v err=%v", manifestReceipt, err)
 	}
+	changedDirectoryName := request
+	changedDirectoryName.SourceDirectoryName += " renamed"
+	if _, err := store.AcceptTaskFileFetchManifest(ctx, claimed.ID, fetch.ID, newTicketHash[:], changedDirectoryName); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("changed source directory display name err=%v; want conflict", err)
+	}
 	putAll(fetch.ID, newTicketHash[:], 1, data[app.TaskFileFetchChunkBytes:], app.TaskFileFetchChunkBytes)
 	completed, err := store.GetTaskFileFetch(ctx, owner.ID, claimed.ID, fetch.ID)
-	if err != nil || completed.Status != task.FileFetchVerifying || completed.ConfirmedBytes != int64(len(data)) {
+	if err != nil || completed.Status != task.FileFetchVerifying || completed.ConfirmedBytes != int64(len(data)) ||
+		completed.SourceDirectoryName != request.SourceDirectoryName {
 		t.Fatalf("verified transfer state: fetch=%+v err=%v", completed, err)
 	}
 	commitRequest := app.TaskFileFetchCommitRequest{SourceVersion: request.SourceVersion, SourceSHA256: request.SourceSHA256, SizeBytes: request.SizeBytes}
@@ -150,7 +156,8 @@ WHERE id=$1 AND owner_id=$2`, claimed.ID, owner.ID, revision); err != nil {
 		t.Fatalf("commit file fetch: receipt=%+v err=%v", commit, err)
 	}
 	completed, err = store.GetTaskFileFetch(ctx, owner.ID, claimed.ID, fetch.ID)
-	if err != nil || completed.ContentState != task.FileFetchContentRetained || completed.MediaType != "text/plain" {
+	if err != nil || completed.ContentState != task.FileFetchContentRetained || completed.MediaType != "text/plain" ||
+		completed.SourceDirectoryName != request.SourceDirectoryName {
 		t.Fatalf("retained content projection: fetch=%+v err=%v", completed, err)
 	}
 	parsed, err := store.SetTaskFileFetchParseResult(ctx, owner.ID, claimed.ID, fetch.ID, task.FileFetchParseExtracted, "")
@@ -242,5 +249,27 @@ WHERE id=$1 AND owner_id=$2`, claimed.ID, owner.ID, revision); err != nil {
 	var storedTicket []byte
 	if err := store.pool.QueryRow(ctx, `SELECT ticket_hash FROM task_file_fetches WHERE fetch_id=$1`, cancelFetch.ID).Scan(&storedTicket); err != nil || len(storedTicket) != 0 {
 		t.Fatalf("cancelled ticket digest remains: len=%d err=%v", len(storedTicket), err)
+	}
+
+	// A source change after partial transfer fails the owner projection and drops staged bytes.
+	failureOperation, failureFetch, failureTicketHash := newFetch("agent:file-fetch-failed", "reports/changed.txt")
+	failureData := []byte("partial bytes")
+	failureManifest := manifest(failureData)
+	if _, err := store.AcceptTaskFileFetchManifest(ctx, claimed.ID, failureFetch.ID, failureTicketHash, failureManifest); err != nil {
+		t.Fatalf("pin failed fetch manifest: %v", err)
+	}
+	if _, err := store.PutTaskFileFetchChunk(ctx, claimed.ID, failureFetch.ID, failureTicketHash, 0,
+		chunkDigest(failureData), failureData); err != nil {
+		t.Fatalf("store failed fetch partial chunk: %v", err)
+	}
+	if err := store.FailTaskFileFetch(ctx, failureOperation, failureFetch.ID, task.FileFetchFailureSourceChanged); err != nil {
+		t.Fatalf("fail changed-source transfer: %v", err)
+	}
+	failed, err := store.GetTaskFileFetch(ctx, owner.ID, claimed.ID, failureFetch.ID)
+	if err != nil || failed.Status != task.FileFetchFailed || failed.FailureReason != task.FileFetchFailureSourceChanged || failed.ConfirmedBytes != 0 {
+		t.Fatalf("failed transfer projection = %+v err=%v", failed, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_file_fetch_chunks WHERE fetch_id=$1`, failureFetch.ID).Scan(&chunkCount); err != nil || chunkCount != 0 {
+		t.Fatalf("failed staging chunks: count=%d err=%v", chunkCount, err)
 	}
 }

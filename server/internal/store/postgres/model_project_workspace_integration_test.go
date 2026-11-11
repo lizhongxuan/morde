@@ -129,6 +129,7 @@ VALUES ($1,$2,'agent-1',1,'session-1','session-1',0,0,$3,decode('01','hex'),'eng
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTaskModelResponseSealer(t, gateway)
 	requestHash := sha256.Sum256([]byte("synthetic project Workspace model request"))
 	reservation := app.ModelCallReservation{Source: app.ModelCallTask, Task: &fence, OwnerID: f.member.UserID, ProjectID: f.projectID,
 		PersonalModel: true, ModelID: "p1234567", ProviderModel: "test", ConnectionVersion: connectionVersion,

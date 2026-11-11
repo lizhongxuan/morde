@@ -1,4 +1,4 @@
 {
   "extends": "./tsconfig.json",
-  "include": ["src/morde-*.ts"]
+  "include": ["src/morde-*.ts", "src/host-work.ts"]
 }

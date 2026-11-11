@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
@@ -25,8 +26,8 @@ const (
 	TaskFileFetchCleanupBatch    = int32(500)
 )
 
-// TaskFileFetch is the safe status projection. It intentionally contains no
-// ticket, ticket hash, or PC directory information.
+// TaskFileFetch is the safe status projection. It contains no ticket, ticket
+// hash, or PC directory path.
 type TaskFileFetch struct {
 	ID                       string
 	OwnerID                  string
@@ -34,12 +35,14 @@ type TaskFileFetch struct {
 	OperationKey             string
 	SourceInstallationID     string
 	SourceDeviceName         string
+	SourceDirectoryName      string
 	TargetGrantVersion       int64
 	TaskAuthorizationVersion int64
 	TaskRevision             int64
 	RelativePath             string
 	Status                   task.FileFetchStatus
 	WaitingReason            string
+	FailureReason            string
 	SourceVersion            string
 	SourceSHA256             string
 	MediaType                string
@@ -68,8 +71,27 @@ type TaskFileFetchStore interface {
 	GetTaskFileFetchByOperation(context.Context, string, string, string) (TaskFileFetch, error)
 	DispatchTaskFileFetch(context.Context, TaskHubOperation, string, []byte, *time.Time, bool, string) (bool, error)
 	MarkTaskFileFetchWaiting(context.Context, TaskHubOperation, string, string) (TaskFileFetch, error)
-	FailTaskFileFetch(context.Context, TaskHubOperation, string) error
+	FailTaskFileFetch(context.Context, TaskHubOperation, string, string) error
 	GetTaskFileFetch(context.Context, string, string, string) (TaskFileFetch, error)
+}
+
+func TaskFileFetchFailureReason(code string) string {
+	switch code {
+	case "denied", "forbidden", "not_allowed", "permission_required", "unauthenticated":
+		return task.FileFetchFailureAccessDenied
+	case "conflict", "source_changed":
+		return task.FileFetchFailureSourceChanged
+	case "not_found":
+		return task.FileFetchFailureUnavailable
+	case "too_large", "quota_exceeded":
+		return task.FileFetchFailureLimitExceeded
+	case "unsupported":
+		return task.FileFetchFailureUnsupported
+	case "timeout", "device_unavailable":
+		return task.FileFetchFailureSourceUnavailable
+	default:
+		return task.FileFetchFailureTransfer
+	}
 }
 
 func (s *TaskService) GetTaskFileFetch(ctx context.Context, principal identity.Principal, taskID, fetchID string) (TaskFileFetch, error) {
@@ -101,8 +123,10 @@ func validTaskFileFetchProjection(value TaskFileFetch) bool {
 	return domain.ValidOperationID(value.ID) && domain.ValidUserID(value.OwnerID) && domain.ValidTaskID(value.TaskID) &&
 		validTaskFileFetchOperationKey(value.OperationKey) && domain.ValidClientInstallationID(value.SourceInstallationID) &&
 		value.SourceDeviceName != "" &&
+		(value.SourceDirectoryName == "" || ValidTaskFileFetchDirectoryName(value.SourceDirectoryName)) &&
 		value.TargetGrantVersion > 0 && value.TaskAuthorizationVersion > 0 && value.TaskRevision > 0 &&
 		workspace.ValidateRelativePath(value.RelativePath) == nil && task.ValidFileFetchStatus(value.Status) &&
+		(value.FailureReason == "" || value.Status == task.FileFetchFailed && task.ValidFileFetchFailureReason(value.FailureReason)) &&
 		task.ValidFileFetchContentState(value.ContentState) &&
 		task.ValidFileFetchParseStatus(value.ParseStatus) && validTaskFileFetchParseProjection(value.ParseStatus, value.ParseError) &&
 		(value.Status == task.FileFetchCompleted || value.ParseStatus == task.FileFetchParsePending) &&
@@ -113,6 +137,18 @@ func validTaskFileFetchProjection(value TaskFileFetch) bool {
 		((value.ContentState == task.FileFetchContentNone) == (value.ContentID == "")) &&
 		((value.ContentState == task.FileFetchContentDeleted) == (value.DeletedAt != nil)) &&
 		(value.MediaType == "" || taskFileFetchMediaTypeAllowed(value.MediaType)) && !value.CreatedAt.IsZero() && !value.UpdatedAt.IsZero()
+}
+
+func ValidTaskFileFetchDirectoryName(value string) bool {
+	if len(value) < 1 || len(value) > 100 || !utf8.ValidString(value) || value == "." || value == ".." || strings.TrimSpace(value) == "" || strings.ContainsAny(value, "/\\") {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func validTaskFileFetchParseProjection(status task.FileFetchParseStatus, parseError string) bool {

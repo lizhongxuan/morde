@@ -40,7 +40,7 @@ func TestGetTaskFileFetchReturnsSafeOwnerSessionProjection(t *testing.T) {
 		taskServiceStub: &taskServiceStub{},
 		value: app.TaskFileFetch{
 			ID: "o1234567", OwnerID: "u1234567", TaskID: "q1234567", OperationKey: "agent:test",
-			SourceInstallationID: "i1234567", SourceDeviceName: "My desktop", TargetGrantVersion: 4,
+			SourceInstallationID: "i1234567", SourceDeviceName: "My desktop", SourceDirectoryName: "reports", TargetGrantVersion: 4,
 			TaskAuthorizationVersion: 3, TaskRevision: 8, RelativePath: "reports/result.pdf",
 			Status: task.FileFetchTransferring, ContentState: task.FileFetchContentNone,
 			ParseStatus: task.FileFetchParsePending, CreatedAt: now, UpdatedAt: now,
@@ -60,12 +60,33 @@ func TestGetTaskFileFetchReturnsSafeOwnerSessionProjection(t *testing.T) {
 	}
 	if body["fetch_id"] != "o1234567" || body["task_revision"] != float64(8) ||
 		body["status"] != string(task.FileFetchTransferring) || body["relative_path"] != "reports/result.pdf" ||
+		body["source_directory_name"] != "reports" ||
+		body["failure_reason"] != nil ||
 		body["content_state"] != string(task.FileFetchContentNone) || body["parse_status"] != string(task.FileFetchParsePending) || body["parse_error"] != nil {
 		t.Fatalf("file fetch status projection = %#v", body)
 	}
 	for _, forbidden := range []string{"ticket", "ticket_hash", "target_grant_version", "task_authorization_version"} {
 		if _, exists := body[forbidden]; exists {
 			t.Fatalf("file fetch status leaked %q: %#v", forbidden, body)
+		}
+	}
+
+	failedService := *service
+	failedService.value.Status = task.FileFetchFailed
+	failedService.value.FailureReason = task.FileFetchFailureSourceChanged
+	failedResponse := httptest.NewRecorder()
+	taskAPIRouter(&failedService, nil).ServeHTTP(failedResponse, httptest.NewRequest(http.MethodGet,
+		"/api/tasks/q1234567/file-fetches/o1234567", nil))
+	if failedResponse.Code != http.StatusOK {
+		t.Fatalf("failed file fetch status=%d body=%s", failedResponse.Code, failedResponse.Body.String())
+	}
+	body = nil
+	if err := json.Unmarshal(failedResponse.Body.Bytes(), &body); err != nil || body["failure_reason"] != task.FileFetchFailureSourceChanged {
+		t.Fatalf("sanitized failed file fetch projection=%#v err=%v", body, err)
+	}
+	for _, forbidden := range []string{"/Users/private/secret.txt", "ticket_hash", "target_grant_version"} {
+		if strings.Contains(failedResponse.Body.String(), forbidden) {
+			t.Fatalf("failed file fetch projection leaked %q: %s", forbidden, failedResponse.Body.String())
 		}
 	}
 }
@@ -103,7 +124,7 @@ func TestTaskFileFetchTransferRoutesRequireTicketAndStrictRequestShape(t *testin
 	engine := gin.New()
 	(&api{}).registerTaskFileFetchTransferRoutes(engine, service)
 
-	validManifest := `{"source_version":"` + strings.Repeat("a", 64) + `","source_sha256":"` + strings.Repeat("b", 64) + `","size_bytes":1,"media_type":"text/plain"}`
+	validManifest := `{"source_version":"` + strings.Repeat("a", 64) + `","source_sha256":"` + strings.Repeat("b", 64) + `","size_bytes":1,"media_type":"text/plain","source_directory_name":"reports"}`
 	for _, test := range []struct {
 		name        string
 		url         string

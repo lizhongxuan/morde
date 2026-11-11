@@ -40,6 +40,17 @@ type revisionProviderTest struct {
 	calls   atomic.Int32
 }
 
+func setTaskModelResponseSealer(t *testing.T, gateway *app.ModelGatewayService) {
+	t.Helper()
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (p *revisionProviderTest) Complete(ctx context.Context, _ app.ModelRequest) (app.ModelResponse, error) {
 	p.calls.Add(1)
 	close(p.started)
@@ -115,6 +126,7 @@ VALUES ($1,$2,'agent-1',1,'session-1','engine','profile','revision-supervisor',$
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTaskModelResponseSealer(t, gateway)
 	fence := app.ModelTaskFence{TaskID: taskID, OwnerID: f.ownerID, InitiatorID: f.ownerID,
 		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0, EngineVersion: "engine", ProfileVersion: "profile"}
@@ -259,6 +271,7 @@ func TestTaskModelRevisionRealDSHSettlesDispatchedUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTaskModelResponseSealer(t, gateway)
 	executor := revisionTestExecutor(t, f.store, gateway)
 	service, stopService := context.WithCancel(context.Background())
 	defer stopService()

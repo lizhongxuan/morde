@@ -483,9 +483,11 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
   let waitForCancel = false
   let serverHasInterruptedChunk = false
   let manifestConflictFor = ''
+  let manifestFailureFor
   let revokeAfterManifestFor = ''
   let unknownCommitFor = ''
   let activeFetchID = ''
+  let expectedDirectoryName = 'é'.repeat(50)
   let expectedTicket = ticket
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input))
@@ -494,10 +496,14 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     if (url.pathname.endsWith('/manifest')) {
       const fetchID = url.pathname.split('/')[5]
       if (fetchID === manifestConflictFor) return response({ error: { code: 'conflict', message: 'source version changed' } }, 409)
+      if (manifestFailureFor?.fetchID === fetchID) {
+        return response({ error: { code: manifestFailureFor.code, message: 'private server detail' } }, manifestFailureFor.status)
+      }
       if (fetchID === revokeAfterManifestFor) {
         out.svc.state.mordeHub = { ...out.svc.state.mordeHub, targetGrantVersion: 3, grants: { ...out.svc.state.mordeHub.grants, files: false } }
       }
       assert.deepEqual(JSON.parse(init.body), {
+        source_directory_name: expectedDirectoryName,
         source_version: version, source_sha256: digest, size_bytes: content.length, media_type: 'application/pdf',
       })
       return response({
@@ -534,7 +540,7 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     out.svc.state = { mordeHub: {
       baseURL: 'https://morde.example', installationID: 'i1234567', targetGrantVersion: 2,
       grants: { screenshot: false, files: true, command: false },
-      fileRoot: { directory: '/tmp/selected', identity: 'ab'.repeat(32) },
+      fileRoot: { directory: `/tmp/${expectedDirectoryName}`, identity: 'ab'.repeat(32) },
     } }
     out.svc.mordeHubCapabilities = { screenshot: false, files: true, command: false }
     out.svc.startMordeHub = NanomuseCloud.prototype.startMordeHub.bind(out.svc)
@@ -544,6 +550,15 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
       fetch_id: 'o1234567', path, task_revision: 3,
       ticket, ticket_expires_at: '2030-01-01T00:05:00Z',
     }
+    for (const directory of ['/', '/tmp/.', '/tmp/..', '/tmp/folder\\name', `/tmp/${'x'.repeat(101)}`, `/tmp/${'目录'.repeat(17)}`, '/tmp/folder\u0007name']) {
+      out.svc.state.mordeHub.fileRoot.directory = directory
+      await assert.rejects(handler(args, {
+        from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
+        signal: new AbortController().signal, event() {},
+      }), (error) => error.code === 'not_allowed', `unsafe source directory name must be rejected: ${JSON.stringify(directory)}`)
+      assert.equal(requests.length, 0, 'invalid directory names stop before any server request')
+    }
+    out.svc.state.mordeHub.fileRoot.directory = `/tmp/${expectedDirectoryName}`
     const events = []
     const result = await handler(args, {
       from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
@@ -612,6 +627,22 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
 
     requests.length = 0
     manifestConflictFor = ''
+    for (const [index, failure] of [
+      { code: 'not_found', status: 404, expected: 'not_found' },
+      { code: 'too_large', status: 413, expected: 'too_large' },
+      { code: 'permission_required', status: 403, expected: 'permission_required' },
+      { code: 'internal_path_private', status: 500, expected: 'failed' },
+    ].entries()) {
+      manifestFailureFor = { ...failure, fetchID: `o900000${index + 1}` }
+      expectedTicket = Buffer.alloc(32, 0x61 + index).toString('base64url')
+      await assert.rejects(handler({ ...args, fetch_id: manifestFailureFor.fetchID, ticket: expectedTicket }, {
+        from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: manifestFailureFor.fetchID } },
+        signal: new AbortController().signal, event() {},
+      }), (error) => error.code === failure.expected && error.message === 'The file transfer could not be completed')
+      assert.equal(requests.length, 1, 'a failed receipt stops before uploading a file chunk')
+      requests.length = 0
+    }
+    manifestFailureFor = undefined
     revokeAfterManifestFor = 'o3456789'
     expectedTicket = ticket5
     await assert.rejects(handler({ ...args, fetch_id: revokeAfterManifestFor, ticket: ticket5 }, {

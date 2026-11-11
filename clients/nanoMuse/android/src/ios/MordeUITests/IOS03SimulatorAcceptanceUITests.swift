@@ -1,4 +1,34 @@
+import CryptoKit
 import XCTest
+
+private final class IOS03NoRedirectURLSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+private func ios03HTTPResponseMatchesOrigin(_ response: HTTPURLResponse, origin: URL) -> Bool {
+    guard let responseURL = response.url,
+          let expected = URLComponents(url: origin, resolvingAgainstBaseURL: false),
+          let actual = URLComponents(url: responseURL, resolvingAgainstBaseURL: false),
+          let expectedScheme = expected.scheme?.lowercased(),
+          let actualScheme = actual.scheme?.lowercased(),
+          let expectedHost = expected.host?.lowercased(),
+          let actualHost = actual.host?.lowercased() else { return false }
+    func effectivePort(_ components: URLComponents) -> Int? {
+        if let port = components.port { return port }
+        switch components.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+    return expectedScheme == actualScheme && expectedHost == actualHost &&
+        effectivePort(expected) == effectivePort(actual) &&
+        actual.user == nil && actual.password == nil
+}
 
 final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     func testLoginAndReadWorkspaceResources() throws {
@@ -78,8 +108,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let portalBaseURL = URL(string: portalOrigin)!
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
         sessionConfiguration.timeoutIntervalForRequest = 30
-        let portalSession = URLSession(configuration: sessionConfiguration)
+        let portalSession = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
         defer { portalSession.invalidateAndCancel() }
 
         func portalJSON(_ path: String, method: String = "GET", bearerCredential: String? = nil,
@@ -91,6 +123,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             }
             var request = URLRequest(url: url)
             request.httpMethod = method
+            request.httpShouldHandleCookies = false
             request.cachePolicy = .reloadIgnoringLocalCacheData
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             if let bearerCredential {
@@ -420,6 +453,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             }
             var request = URLRequest(url: url)
             request.httpMethod = method
+            request.httpShouldHandleCookies = false
             request.cachePolicy = .reloadIgnoringLocalCacheData
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             if method != "GET" { request.setValue(portalOrigin, forHTTPHeaderField: "Origin") }
@@ -767,6 +801,402 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         finalHistory = try await history()
         XCTAssertEqual(finalHistory.filter { $0["id"] as? String == replyMessageID }.count, 1,
                        "Reloading the iOS app must not duplicate the published assistant reply on the server.")
+    }
+
+    @MainActor
+    func testMordeG3RealPortalFetchesSyntheticPCFile() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let configuredOrigin = environment["MORDE_G3_PORTAL_ORIGIN"], !configuredOrigin.isEmpty,
+              let username = environment["MORDE_G3_USERNAME"], !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let password = environment["MORDE_G3_PASSWORD"], !password.isEmpty else {
+            throw XCTSkip("Set MORDE_G3_PORTAL_ORIGIN, MORDE_G3_USERNAME, and MORDE_G3_PASSWORD for local G3 acceptance.")
+        }
+
+        // Xcode's test runner can collapse the scheme separator in injected
+        // environment values (for example, http://127.0.0.1:24951 becomes
+        // http:/127.0.0.1:24951). Repair only that exact single-slash form for
+        // the two loopback hostnames allowed by this test; all other input is
+        // parsed and validated as supplied.
+        let collapsedLoopbackPrefixes = [
+            "http:/127.0.0.1:", "https:/127.0.0.1:",
+            "http:/localhost:", "https:/localhost:"
+        ]
+        let configuredOriginLowercased = configuredOrigin.lowercased()
+        let collapsedPrefix = collapsedLoopbackPrefixes.first {
+            configuredOriginLowercased.hasPrefix($0)
+        }
+        let parsingOrigin: String
+        if let collapsedPrefix {
+            let authoritySuffix = String(configuredOrigin.dropFirst(collapsedPrefix.count))
+            let scheme = collapsedPrefix.hasPrefix("https:") ? "https" : "http"
+            let loopbackHost = collapsedPrefix.contains("127.0.0.1") ? "127.0.0.1" : "localhost"
+            parsingOrigin = "\(scheme)://\(loopbackHost):\(authoritySuffix)"
+        } else {
+            parsingOrigin = configuredOrigin
+        }
+        let originComponents = URLComponents(string: parsingOrigin)
+        let originScheme = originComponents?.scheme?.lowercased()
+        let originHost = originComponents?.host?.lowercased()
+        let originChecks = [
+            "trim": configuredOrigin == configuredOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
+            "parsed": originComponents != nil,
+            "scheme": originScheme.map { ["http", "https"].contains($0) } ?? false,
+            "host": originHost.map { ["127.0.0.1", "localhost"].contains($0) } ?? false,
+            "userinfo": originComponents?.user == nil && originComponents?.password == nil,
+            "query_fragment": originComponents?.query == nil && originComponents?.fragment == nil,
+            "path": originComponents.map { $0.path.isEmpty || $0.path == "/" } ?? false,
+            "port": originComponents?.port.map { (1...65_535).contains($0) } ?? (originComponents != nil),
+            "url": originComponents?.url != nil,
+        ]
+        func safeOriginPart(_ value: String?) -> String {
+            guard let value else { return "<nil>" }
+            guard value.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+                return "<redacted-control-bytes>"
+            }
+            return String(value.prefix(80))
+        }
+        let hostDiagnostic = originChecks["userinfo"] == true ? safeOriginPart(originHost) : "<redacted-userinfo>"
+        let pathDiagnostic = originChecks["userinfo"] == true ? safeOriginPart(originComponents?.path) : "<redacted-userinfo>"
+        guard originChecks.values.allSatisfy({ $0 }), var components = originComponents,
+              let scheme = originScheme, let host = originHost else {
+            XCTFail("MORDE_G3_PORTAL_ORIGIN failed loopback validation: \(originChecks), xcode_separator_repaired=\(collapsedPrefix != nil), host=\(hostDiagnostic), path=\(pathDiagnostic)")
+            return
+        }
+        components.scheme = scheme
+        components.host = host
+        components.path = ""
+        let portalOrigin = components.string!
+        let portalBaseURL = URL(string: portalOrigin)!
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
+        sessionConfiguration.timeoutIntervalForRequest = 30
+        let portalSession = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
+        defer { portalSession.invalidateAndCancel() }
+
+        func portalResponse(_ path: String, method: String = "GET", bearerCredential: String? = nil,
+                            headers: [String: String] = [:], requestBody: [String: Any]? = nil) async throws ->
+            (Data, HTTPURLResponse) {
+            guard let url = URL(string: path, relativeTo: portalBaseURL)?.absoluteURL else {
+                throw URLError(.badURL)
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.httpShouldHandleCookies = false
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            if method != "GET" { request.setValue(portalOrigin, forHTTPHeaderField: "Origin") }
+            if let bearerCredential {
+                request.setValue("Bearer \(bearerCredential)", forHTTPHeaderField: "Authorization")
+            }
+            for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+            if let requestBody {
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+            }
+            let (data, response) = try await portalSession.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  ios03HTTPResponseMatchesOrigin(httpResponse, origin: portalBaseURL) else {
+                throw URLError(.badServerResponse)
+            }
+            return (data, httpResponse)
+        }
+
+        func portalJSON(_ path: String, method: String = "GET", bearerCredential: String? = nil,
+                        headers: [String: String] = [:], requestBody: [String: Any]? = nil) async throws -> [String: Any] {
+            let (data, httpResponse) = try await portalResponse(path, method: method,
+                bearerCredential: bearerCredential, headers: headers, requestBody: requestBody)
+            guard httpResponse.statusCode == 200,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw URLError(.cannotParseResponse)
+            }
+            return object
+        }
+
+        func portalBytes(_ path: String, headers: [String: String]) async throws -> Data {
+            guard let url = URL(string: path, relativeTo: portalBaseURL)?.absoluteURL else {
+                throw URLError(.badURL)
+            }
+            var request = URLRequest(url: url)
+            request.httpShouldHandleCookies = false
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+            for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+            let (data, response) = try await portalSession.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  ios03HTTPResponseMatchesOrigin(httpResponse, origin: portalBaseURL),
+                  httpResponse.statusCode == 200 else {
+                throw URLError(.cannotParseResponse)
+            }
+            return data
+        }
+
+        func validResourceID(_ value: String, prefix: UInt8) -> Bool {
+            let bytes = Array(value.utf8)
+            return bytes.count == 8 && bytes.first == prefix &&
+                bytes.dropFirst().allSatisfy { (48...57).contains($0) || (97...122).contains($0) }
+        }
+
+        func validMessageID(_ value: String) -> Bool {
+            let bytes = Array(value.utf8)
+            return (8...128).contains(bytes.count) && bytes.allSatisfy {
+                (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) ||
+                    [45, 46, 95, 126].contains($0)
+            }
+        }
+
+        func waitForClientMessageID(conversationID: String, content: String,
+                                    headers: [String: String]) async throws -> String {
+            for _ in 0..<30 {
+                let response = try await portalJSON(
+                    "/api/conversations/\(conversationID)/messages?limit=100", headers: headers)
+                let messages = response["items"] as? [[String: Any]] ?? []
+                if let message = messages.first(where: {
+                    $0["role"] as? String == "user" && $0["content"] as? String == content
+                }), let messageID = message["client_message_id"] as? String, validMessageID(messageID) {
+                    return messageID
+                }
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
+            throw URLError(.timedOut)
+        }
+
+        func waitForTaskID(conversationID: String, messageID: String,
+                           headers: [String: String]) async throws -> String {
+            for _ in 0..<90 {
+                let response = try await portalJSON(
+                    "/api/conversations/\(conversationID)/messages?limit=100&client_message_id=\(messageID)",
+                    headers: headers)
+                let messages = response["items"] as? [[String: Any]] ?? []
+                if let message = messages.first(where: { $0["client_message_id"] as? String == messageID }) {
+                    if message["routing_status"] as? String == "failed" {
+                        let allowedReasons: Set<String> = [
+                            "model_unavailable", "routing_context_unavailable",
+                            "routing_action_unavailable", "message_too_long"
+                        ]
+                        let reportedReason = message["routing_failure_reason"] as? String
+                        let safeReason = reportedReason.flatMap { allowedReasons.contains($0) ? $0 : nil } ?? "unknown"
+                        throw NSError(domain: "Morde G3 Portal routing", code: 1,
+                                      userInfo: [NSLocalizedDescriptionKey:
+                                                    "Conversation routing failed: \(safeReason)"])
+                    }
+                    if let taskID = message["task_id"] as? String, validResourceID(taskID, prefix: 113) {
+                        return taskID
+                    }
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            throw URLError(.timedOut)
+        }
+
+        func waitForCompletedTask(_ taskID: String, headers: [String: String]) async throws -> [String: Any] {
+            for _ in 0..<180 {
+                let task = try await portalJSON("/api/tasks/\(taskID)", headers: headers)
+                let status = task["status"] as? String
+                if status == "completed" { return task }
+                if status == "failed" || status == "cancelled" {
+                    throw URLError(.cannotConnectToHost)
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            throw URLError(.timedOut)
+        }
+
+        func waitForCompletedFileFetch(taskID: String, headers: [String: String]) async throws -> [String: Any] {
+            for _ in 0..<180 {
+                let response = try await portalJSON("/api/tasks/\(taskID)/file-fetches", headers: headers)
+                let items = response["items"] as? [[String: Any]] ?? []
+                if let item = items.first(where: { $0["relative_path"] as? String == "reports/summary.txt" }),
+                   let fetchID = item["fetch_id"] as? String, validResourceID(fetchID, prefix: 111) {
+                    let current = try await portalJSON(
+                        "/api/tasks/\(taskID)/file-fetches/\(fetchID)", headers: headers)
+                    let status = current["status"] as? String
+                    if status == "completed" { return current }
+                    if status == "failed" || status == "cancelled" {
+                        throw URLError(.cannotConnectToHost)
+                    }
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            throw URLError(.timedOut)
+        }
+
+        let capabilities = try await portalJSON("/api/capabilities")
+        guard let serviceInstanceID = capabilities["service_instance_id"] as? String,
+              !serviceInstanceID.isEmpty,
+              let features = capabilities["supported_features"] as? [String],
+              ["task_api", "cloud_tasks", "conversation_auto_routing_v1"].allSatisfy(features.contains) else {
+            XCTFail("The local Portal must expose Task API, cloud Tasks, and conversation auto-routing.")
+            return
+        }
+        let clientInstanceID = UUID().uuidString.lowercased()
+        let login = try await portalJSON("/api/auth/client-login", method: "POST",
+            headers: ["Idempotency-Key": UUID().uuidString], requestBody: [
+                "name": username,
+                "password": password,
+                "platform": "ios",
+                "display_name": "G3 simulator \(clientInstanceID.prefix(8))",
+                "client_instance_id": clientInstanceID,
+                "attempt_generation": 1,
+            ])
+        guard let credential = login["client_credential"] as? String,
+              let user = login["user"] as? [String: Any],
+              let actorID = user["id"] as? String,
+              !credential.isEmpty, !actorID.isEmpty else {
+            XCTFail("The local Portal did not create an iOS API session for the configured test account.")
+            return
+        }
+        let webSession = try await portalJSON("/api/auth/client-web-session", method: "POST",
+            bearerCredential: credential)
+        guard let webCredential = webSession["web_session_credential"] as? String,
+              !webCredential.isEmpty,
+              webCredential.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) ||
+                  (97...122).contains($0) || [45, 95].contains($0) }) else {
+            XCTFail("The local Portal did not create a safe Portal Session for the configured test account.")
+            return
+        }
+        let portalCookie = "ch_portal=\(webCredential)"
+        let scopedHeaders = [
+            "X-Morde-Actor-ID": actorID,
+            "X-Morde-Service-Instance-ID": serviceInstanceID,
+        ]
+        let portalSessionHeaders = scopedHeaders.merging(["Cookie": portalCookie]) { _, new in new }
+        let (ownerLoginData, ownerLoginResponse) = try await portalResponse("/api/auth/login", method: "POST",
+            requestBody: ["name": username, "password": password])
+        guard ownerLoginResponse.statusCode == 200,
+              let ownerLogin = try JSONSerialization.jsonObject(with: ownerLoginData) as? [String: Any],
+              let ownerUser = ownerLogin["user"] as? [String: Any],
+              ownerUser["id"] as? String == actorID else {
+            XCTFail("The local Portal did not create a regular owner session for the configured test account.")
+            return
+        }
+        let ownerHeaderFields: [String: String] = Dictionary(uniqueKeysWithValues:
+            ownerLoginResponse.allHeaderFields.compactMap { item -> (String, String)? in
+            guard let name = item.key as? String, let value = item.value as? String else { return nil }
+            return (name, value)
+        })
+        let ownerCookies = HTTPCookie.cookies(withResponseHeaderFields: ownerHeaderFields, for: portalBaseURL)
+        let cookieDomain = ownerCookies.first(where: { $0.name == "ch_portal" })?.domain.lowercased()
+        let ownerCookieHost: String? = cookieDomain.map {
+            $0.hasPrefix(".") ? String($0.dropFirst()) : $0
+        }
+        let portalHost = portalBaseURL.host?.lowercased()
+        guard let ownerCookie = ownerCookies.first(where: { $0.name == "ch_portal" }),
+              ownerCookieHost == portalHost,
+              ownerCookie.isHTTPOnly, ownerCookie.path == "/",
+              portalBaseURL.scheme?.lowercased() != "https" || ownerCookie.isSecure,
+              ownerCookie.value.range(of: #"^chs_[a-z0-9]{8}_[A-Za-z0-9_-]{43}$"#,
+                  options: .regularExpression) != nil,
+              ownerCookie.expiresDate.map({ $0 > Date() }) == true else {
+            XCTFail("The local Portal did not return a valid short-lived owner session cookie.")
+            return
+        }
+        let ownerSessionHeaders = scopedHeaders.merging(["Cookie": "ch_portal=\(ownerCookie.value)"]) { _, new in new }
+        let ownerIdentity = try await portalJSON("/api/me", headers: ownerSessionHeaders)
+        XCTAssertEqual(ownerIdentity["id"] as? String, actorID,
+                       "The regular Portal session must represent the same account as the iOS installation.")
+        let currentExecution = try await portalJSON("/api/execution", headers: portalSessionHeaders)
+        if currentExecution["state"] as? String != "enabled" {
+            guard let epoch = (currentExecution["epoch"] as? NSNumber)?.int64Value, epoch > 0 else {
+                XCTFail("The local test account did not expose an execution-control epoch.")
+                return
+            }
+            let enabledExecution = try await portalJSON("/api/execution/enable", method: "POST", headers: [
+                "Idempotency-Key": UUID().uuidString,
+            ].merging(portalSessionHeaders) { _, new in new }, requestBody: ["expected_epoch": epoch])
+            XCTAssertEqual(enabledExecution["state"] as? String, "enabled")
+        }
+        let conversation = try await portalJSON("/api/me/main-conversation/ensure", method: "POST",
+            headers: portalSessionHeaders.merging(["Idempotency-Key": UUID().uuidString]) { _, new in new })
+        guard conversation["status"] as? String == "ready",
+              let conversationID = conversation["conversation_id"] as? String,
+              validResourceID(conversationID, prefix: 99) else {
+            XCTFail("The local test account did not provide a ready main conversation.")
+            return
+        }
+
+        let expectedBytes = Data("Morde G3 synthetic summary\n".utf8)
+        let expectedHash = SHA256.hash(data: expectedBytes).map { String(format: "%02x", $0) }.joined()
+        let messageText = "G3-\(UUID().uuidString.lowercased()) G3_FETCH_PATH:reports/summary.txt"
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = ["-morde.server", portalOrigin, "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launch()
+        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu")).firstMatch
+        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
+        if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
+        let usernameField = app.textFields["morde.auth.username"]
+        XCTAssertTrue(usernameField.waitForExistence(timeout: 15))
+        usernameField.tap()
+        if let currentUsername = usernameField.value as? String,
+           currentUsername != usernameField.placeholderValue {
+            usernameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentUsername.count))
+        }
+        usernameField.typeText(username)
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        passwordField.tap()
+        passwordField.typeText(password)
+        app.buttons["morde.auth.submit"].tap()
+        let composer = app.textFields["morde.chat.composer"]
+        let chatTab = app.buttons["morde.nav.tab.chat"]
+        if !composer.waitForExistence(timeout: 5), chatTab.waitForExistence(timeout: 10) { chatTab.tap() }
+        XCTAssertTrue(composer.waitForExistence(timeout: 30), "Real loopback Portal login should open chat.")
+        composer.tap()
+        composer.typeText(messageText)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 15))
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
+            .firstMatch.waitForExistence(timeout: 30), "The unique file request should appear in the real conversation.")
+
+        let messageID = try await waitForClientMessageID(
+            conversationID: conversationID, content: messageText, headers: portalSessionHeaders)
+        let taskID = try await waitForTaskID(
+            conversationID: conversationID, messageID: messageID, headers: portalSessionHeaders)
+        let task = try await waitForCompletedTask(taskID, headers: portalSessionHeaders)
+        XCTAssertEqual(task["conversation_id"] as? String, conversationID)
+        let (clientFileFetchData, clientFileFetchResponse) = try await portalResponse(
+            "/api/tasks/\(taskID)/file-fetches", headers: portalSessionHeaders)
+        _ = clientFileFetchData
+        XCTAssertEqual(clientFileFetchResponse.statusCode, 404,
+                       "An installation-bound client web session must not read the owner file-fetch list.")
+        let fetch = try await waitForCompletedFileFetch(taskID: taskID, headers: ownerSessionHeaders)
+        let fetchID = try XCTUnwrap(fetch["fetch_id"] as? String)
+        XCTAssertEqual(fetch["task_id"] as? String, taskID)
+        XCTAssertEqual(fetch["relative_path"] as? String, "reports/summary.txt")
+        XCTAssertEqual(fetch["status"] as? String, "completed")
+        XCTAssertEqual((fetch["size_bytes"] as? NSNumber)?.intValue, expectedBytes.count)
+        XCTAssertEqual((fetch["confirmed_bytes"] as? NSNumber)?.intValue, expectedBytes.count)
+        XCTAssertEqual(fetch["source_sha256"] as? String, expectedHash)
+        let directoryName = try XCTUnwrap(fetch["source_directory_name"] as? String)
+        XCTAssertFalse(directoryName.isEmpty)
+        XCTAssertLessThanOrEqual(directoryName.utf8.count, 100)
+        XCTAssertNotEqual(directoryName, ".")
+        XCTAssertNotEqual(directoryName, "..")
+        XCTAssertFalse(directoryName.contains("/"))
+        XCTAssertFalse(directoryName.contains("\\"))
+        XCTAssertTrue(directoryName.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) })
+
+        let actualBytes = try await portalBytes(
+            "/api/tasks/\(taskID)/file-fetches/\(fetchID)/content", headers: ownerSessionHeaders)
+        let actualHash = SHA256.hash(data: actualBytes).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(actualBytes, expectedBytes)
+        XCTAssertEqual(actualHash, expectedHash)
+
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let taskRow = app.buttons["morde.tasks.row.\(taskID)"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 30))
+        taskRow.tap()
+        let fetchStatus = app.staticTexts["morde.task.fileFetch.status.\(fetchID)"]
+        XCTAssertTrue(fetchStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(fetchStatus.label.localizedCaseInsensitiveContains("received"))
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.directory.\(fetchID)"].label.contains(directoryName))
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.path.\(fetchID)"].label.contains("reports/summary.txt"))
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.size.\(fetchID)"].label.contains(String(expectedBytes.count)))
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.sha256.\(fetchID)"].label.contains(expectedHash))
+        XCTAssertEqual(actualBytes.count, expectedBytes.count)
     }
 
     func testMordeDesignNavigationRoutes() {
@@ -1156,6 +1586,105 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         answer.typeText("Synthetic response")
         XCTAssertTrue(submit.isEnabled, "A nonempty answer should enable the existing submit action.")
         attachScreen(app, named: "MDA-04 waiting clarification task detail")
+    }
+
+    func testMordeTaskFileFetchShowsSafeProgressAndDoesNotBlockIndependentMessages() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture", "-morde.localTaskFileFetchFixture",
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+
+        let task = app.buttons["morde.tasks.row.q0000001"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        let waiting = app.staticTexts["morde.task.fileFetch.status.o0000001"]
+        XCTAssertTrue(waiting.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Source device · Local Work Mac"].exists)
+        XCTAssertTrue(app.staticTexts["Source device offline"].exists)
+        XCTAssertTrue(app.staticTexts["Authorized directory · Reference Materials"].exists)
+        XCTAssertTrue(app.staticTexts["Relative path · docs/source.pdf"].exists,
+                      "The relative path is shown separately from the authorized directory name.")
+        XCTAssertTrue(app.staticTexts["Source snapshot bbbbbbbbbbbb"].exists)
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.size.o0000003"].exists,
+                      "A completed result displays its total file size.")
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.sha256.o0000003"].exists,
+                      "A completed result exposes its verified SHA-256 digest.")
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.directory.o0000001"].label.contains("Not provided"),
+                      "A missing directory name is explicit and is never inferred from the relative path.")
+
+        XCTAssertEqual(waiting.label, "Waiting for PC to reconnect")
+        let transferProgress = app.staticTexts["morde.task.fileFetch.progress.o0000002"]
+        XCTAssertTrue(transferProgress.waitForExistence(timeout: 10))
+        XCTAssertTrue(transferProgress.label.contains("Transfer progress"),
+                      "A related file transfer should show its own byte progress.")
+
+        let parseFailure = app.staticTexts["morde.task.fileFetch.parseStatus.o0000004"]
+        XCTAssertTrue(parseFailure.waitForExistence(timeout: 10))
+        XCTAssertTrue(parseFailure.label.contains("transfer completed"),
+                      "A parser failure must remain distinct from transfer failure.")
+        let transferFailure = app.staticTexts["morde.task.fileFetch.failureReason.o0000005"]
+        XCTAssertTrue(transferFailure.exists)
+        XCTAssertTrue(transferFailure.label.localizedCaseInsensitiveContains("changed"),
+                      "A sanitized source-change failure reason should be shown separately from parser status.")
+        let retainedCopy = app.staticTexts["morde.task.fileFetch.copyStatus.o0000003"]
+        XCTAssertTrue(retainedCopy.waitForExistence(timeout: 10))
+        XCTAssertTrue(retainedCopy.label.contains("Cloud copy retained until"))
+
+        let visibleLabels = app.descendants(matching: .any).allElementsBoundByIndex
+            .map(\.label).joined(separator: " ")
+        for forbidden in ["/Users/", "/private/", "/tmp/", "file://", "chs_t", "ticket"] {
+            XCTAssertFalse(visibleLabels.localizedCaseInsensitiveContains(forbidden),
+                           "File task UI must not expose absolute paths or transfer/session credentials.")
+        }
+
+        app.buttons["morde.task.back"].tap()
+        let otherTask = app.buttons["morde.tasks.row.q0000002"]
+        XCTAssertTrue(otherTask.waitForExistence(timeout: 10),
+                      "An offline file request must not lock the task list.")
+        otherTask.tap()
+        XCTAssertTrue(app.scrollViews["morde.task.detailScroll"].waitForExistence(timeout: 10),
+                      "An unrelated task should open while the file request is waiting.")
+        app.buttons["morde.task.back"].tap()
+        app.buttons["morde.nav.tab.chat"].tap()
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        XCTAssertTrue(composer.isEnabled,
+                      "A PC-offline file wait must not disable unrelated conversation messages.")
+        let independentMessage = "Independent message while the PC file is waiting"
+        composer.tap()
+        composer.typeText(independentMessage + "\n")
+        XCTAssertTrue(app.staticTexts[independentMessage].waitForExistence(timeout: 20))
+
+        app.buttons["morde.nav.tab.tasks"].tap()
+        XCTAssertTrue(task.waitForExistence(timeout: 10))
+        task.tap()
+        let scroll = app.scrollViews["morde.task.detailScroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 10))
+        let cancel = app.buttons["morde.task.fileFetch.cancel.o0000001"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 10))
+        cancel.tap()
+        let confirmCancel = app.buttons.matching(identifier: "morde.task.fileFetch.confirmCancel").firstMatch
+        XCTAssertTrue(confirmCancel.waitForExistence(timeout: 5))
+        confirmCancel.tap()
+
+        let acceptedOrCancelled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                ["Cancellation pending", "File request cancelled"].contains(waiting.label)
+            }, object: waiting)
+        XCTAssertEqual(XCTWaiter.wait(for: [acceptedOrCancelled], timeout: 8), .completed,
+                       "The response should expose cancellation acceptance or its confirmed final state.")
+        if waiting.label == "Cancellation pending" {
+            XCTAssertEqual(cancel.label, "Cancellation pending")
+            XCTAssertFalse(cancel.isEnabled, "An accepted cancellation cannot be submitted again.")
+        }
+        let cancelled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in waiting.label == "File request cancelled" }, object: waiting)
+        XCTAssertEqual(XCTWaiter.wait(for: [cancelled], timeout: 12), .completed,
+                       "Cancellation acceptance must eventually become a confirmed cancelled state.")
+        XCTAssertFalse(cancel.exists, "The final cancelled state should no longer offer cancellation.")
     }
 
     func testMordeTaskWaitingOtherReasonDoesNotShowApprovalControls() {
@@ -2381,7 +2910,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(accountRow.frame.height, 45, accuracy: 3)
 
         accountRow.tap()
-        XCTAssertTrue(app.staticTexts["账号"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "Morde"))
+            .firstMatch.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["服务地址"].exists)
         XCTAssertTrue(app.buttons["morde.account.manageInstallations"].exists)
         XCTAssertTrue(app.buttons["morde.account.signOut"].exists)
@@ -3683,6 +4213,165 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The selected primary tab should match the destination chat screen.")
     }
 
+    func testMordeTaskFileFetchShowsOfflineWaitProgressAndCancellation() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskFileFetchFixture",
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let task = app.buttons["morde.tasks.row.q0000001"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        let scroll = app.scrollViews["morde.task.detailScroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 10))
+        let offline = app.staticTexts["morde.task.fileFetch.status.o0000001"]
+        for _ in 0..<12 where !offline.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(offline.waitForExistence(timeout: 15))
+        XCTAssertTrue(offline.label.contains("PC") || offline.label.lowercased().contains("reconnect") ||
+                      offline.label.contains("离线"), "The offline request should remain tied to its source device.")
+        let offlinePath = app.staticTexts["morde.task.fileFetch.path.o0000001"]
+        XCTAssertTrue(offlinePath.exists)
+        XCTAssertTrue(offlinePath.label.contains("reports/offline.pdf"))
+        XCTAssertFalse(offlinePath.label.contains("/Users/") || offlinePath.label.contains("/tmp/"),
+                       "The task projection must not display an absolute local path.")
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.directory.o0000001"].label.contains("Not provided"),
+                      "A missing authorized directory name must be explicit rather than inferred from the path.")
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.progress.o0000002"].exists,
+                      "A separate transfer should display its confirmed byte count.")
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.directory.o0000003"].label.contains("Reference Materials"),
+                      "A manifest-projected safe basename should be shown without inferring it from the path.")
+
+        let cancel = app.buttons["morde.task.fileFetch.cancel.o0000001"]
+        let pinnedTaskAction = app.buttons["morde.task.action.pause"]
+        XCTAssertTrue(pinnedTaskAction.waitForExistence(timeout: 10))
+        XCTAssertTrue(scrollTaskControlIntoView(cancel, scroll: scroll, above: pinnedTaskAction),
+                      "The offline request cancel control must be visible above pinned Task actions.")
+        cancel.tap()
+        let confirmCancel = app.buttons.matching(identifier: "morde.task.fileFetch.confirmCancel").firstMatch
+        XCTAssertTrue(confirmCancel.waitForExistence(timeout: 5))
+        confirmCancel.tap()
+        let acceptedOrCancelled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                offline.label.localizedCaseInsensitiveContains("pending") ||
+                    offline.label.localizedCaseInsensitiveContains("cancelled") || offline.label.contains("已取消")
+            }, object: offline)
+        XCTAssertEqual(XCTWaiter.wait(for: [acceptedOrCancelled], timeout: 8), .completed,
+                       "Cancellation should expose an accepted or confirmed state.")
+        if offline.label.localizedCaseInsensitiveContains("pending") || offline.label.contains("取消中") {
+            XCTAssertFalse(cancel.isEnabled,
+                           "An accepted cancellation should disable its cancel action while it is pending.")
+        }
+        let cancelled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                offline.label.localizedCaseInsensitiveContains("cancelled") || offline.label.contains("已取消")
+            }, object: offline)
+        XCTAssertEqual(XCTWaiter.wait(for: [cancelled], timeout: 12), .completed,
+                       "The subsequent status projection should confirm cancellation.")
+
+        app.buttons["morde.task.back"].tap()
+        let otherTask = app.buttons["morde.tasks.row.q0000002"]
+        XCTAssertTrue(otherTask.waitForExistence(timeout: 10),
+                      "A waiting PC file request must not remove or block an independent Task.")
+    }
+
+    func testMordeTaskFileFetchOpensVerifiedRawOnlyPDF() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskFileFetchFixture",
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let task = app.buttons["morde.tasks.row.q0000001"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        let scroll = app.scrollViews["morde.task.detailScroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 10))
+        let parseStatus = app.staticTexts["morde.task.fileFetch.parseStatus.o0000003"]
+        for _ in 0..<12 where !parseStatus.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(parseStatus.waitForExistence(timeout: 15))
+        XCTAssertTrue(parseStatus.label.localizedCaseInsensitiveContains("model") || parseStatus.label.contains("模型"),
+                      "PDF stays raw-only and is not represented as text read by the model.")
+        let open = app.buttons["morde.task.fileFetch.open.o0000003"]
+        let pinnedTaskAction = app.buttons["morde.task.action.pause"]
+        XCTAssertTrue(pinnedTaskAction.waitForExistence(timeout: 10))
+        for _ in 0..<12 where !open.isHittable || open.frame.maxY >= pinnedTaskAction.frame.minY {
+            scroll.swipeUp()
+        }
+        XCTAssertTrue(open.isHittable)
+        XCTAssertTrue(open.isEnabled)
+        XCTAssertLessThan(open.frame.maxY, pinnedTaskAction.frame.minY,
+                          "The file action must be clear of the pinned Task controls before tapping.")
+        open.tap()
+        let quickLook = app.descendants(matching: .any)["morde.task.fileFetch.preview"]
+        XCTAssertTrue(quickLook.waitForExistence(timeout: 15),
+                      "The verified retained PDF should open in its full-screen Quick Look sheet.")
+        XCTAssertGreaterThan(quickLook.frame.height, app.frame.height * 0.7,
+                             "Quick Look should occupy the preview sheet rather than remain a transient tap.")
+        let renderedPDFText = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS[c] %@", "Synthetic PC file")
+        ).firstMatch
+        XCTAssertTrue(renderedPDFText.waitForExistence(timeout: 15),
+                      "Quick Look should render the synthetic PDF body after opening the verified local copy.")
+        XCTAssertTrue(renderedPDFText.isHittable,
+                      "The rendered PDF text should be exposed in the visible preview, not a hidden accessibility node.")
+        attachScreen(app, named: "C30 verified raw-only PDF Quick Look")
+    }
+
+    func testMordeTaskFileFetchRejectsTamperedContentAndDeletesRetainedCopy() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskFileFetchFixture",
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+        let task = app.buttons["morde.tasks.row.q0000001"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        let scroll = app.scrollViews["morde.task.detailScroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 10))
+        let corruptOpen = app.buttons["morde.task.fileFetch.open.o0000004"]
+        let pinnedTaskAction = app.buttons["morde.task.action.pause"]
+        XCTAssertTrue(pinnedTaskAction.waitForExistence(timeout: 10))
+        XCTAssertTrue(scrollTaskControlIntoView(corruptOpen, scroll: scroll, above: pinnedTaskAction),
+                      "The tampered file action must be visible above pinned Task actions.")
+        XCTAssertTrue(corruptOpen.isHittable)
+        XCTAssertLessThan(corruptOpen.frame.maxY, pinnedTaskAction.frame.minY)
+        corruptOpen.tap()
+        let integrityError = app.descendants(matching: .any)["morde.task.fileFetch.actionError"]
+        XCTAssertTrue(integrityError.waitForExistence(timeout: 10),
+                      "A same-size response with a different SHA-256 must fail closed.")
+        XCTAssertTrue(integrityError.label.localizedCaseInsensitiveContains("integrity") ||
+                      integrityError.label.contains("完整性"),
+                      "Unexpected file fetch error: \(integrityError.label)")
+        XCTAssertFalse(app.descendants(matching: .any)["QLPreviewControllerView"].exists,
+                       "Tampered file content must never reach Quick Look.")
+
+        let delete = app.buttons["morde.task.fileFetch.delete.o0000003"]
+        XCTAssertTrue(scrollTaskControlIntoView(delete, scroll: scroll, above: pinnedTaskAction),
+                      "The retained copy delete control must be visible above pinned Task actions.")
+        XCTAssertTrue(delete.isHittable)
+        XCTAssertLessThan(delete.frame.maxY, pinnedTaskAction.frame.minY)
+        delete.tap()
+        let confirmDelete = app.buttons.matching(identifier: "morde.task.fileFetch.confirmDelete").firstMatch
+        XCTAssertTrue(confirmDelete.waitForExistence(timeout: 5))
+        confirmDelete.tap()
+        let copyStatus = app.staticTexts["morde.task.fileFetch.copyStatus.o0000003"]
+        let deleted = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in copyStatus.label.localizedCaseInsensitiveContains("deleted") || copyStatus.label.contains("已删除") },
+            object: copyStatus)
+        XCTAssertEqual(XCTWaiter.wait(for: [deleted], timeout: 15), .completed,
+                       "Deleting a cloud copy should update its lifecycle without changing Task history.")
+        XCTAssertFalse(app.buttons["morde.task.fileFetch.open.o0000003"].exists,
+                       "A deleted cloud copy should no longer be openable.")
+    }
+
     func testMordeTaskArtifactQuickLookShowsSyntheticPreview() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: [
@@ -4087,8 +4776,15 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             }
         }
         let usernameField = app.textFields["morde.auth.username"]
+        if !usernameField.waitForExistence(timeout: 3) {
+            let expiredSessionSignIn = app.buttons["morde.auth.expiredSignIn"]
+            if expiredSessionSignIn.waitForExistence(timeout: 2) { expiredSessionSignIn.tap() }
+        }
         if usernameField.waitForExistence(timeout: 5) {
             usernameField.tap()
+            if let currentName = usernameField.value as? String, currentName != usernameField.placeholderValue {
+                usernameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentName.count))
+            }
             let keyboard = app.keyboards.firstMatch
             if !keyboard.waitForExistence(timeout: 2) {
                 // The first tap can dismiss an alert surfaced by the initial local capability read.
@@ -4164,8 +4860,9 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let accountSettings = app.buttons["morde.settings.row.account"]
         XCTAssertTrue(waitForHittable(accountSettings, timeout: 10))
         accountSettings.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
-        XCTAssertTrue(app.staticTexts["账号"].waitForExistence(timeout: 10))
         let signOut = app.buttons["morde.account.signOut"]
+        XCTAssertTrue(signOut.waitForExistence(timeout: 10),
+                      "The account settings page should expose its sign-out control.")
         let bottomTab = app.buttons["morde.nav.tab.approvals"]
         let accountList = app.collectionViews.firstMatch.exists ? app.collectionViews.firstMatch :
             (app.tables.firstMatch.exists ? app.tables.firstMatch : app.scrollViews.firstMatch)
@@ -4202,6 +4899,43 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"),
                                                     object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func scrollTaskControlIntoView(_ element: XCUIElement, scroll: XCUIElement,
+                                           above pinnedTaskAction: XCUIElement,
+                                           maxDrags: Int = 24) -> Bool {
+        guard element.waitForExistence(timeout: 5) else { return false }
+        for _ in 0..<maxDrags {
+            let elementFrame = element.frame
+            let scrollFrame = scroll.frame
+            let pinnedFrame = pinnedTaskAction.frame
+            if element.isHittable && elementFrame.maxY < pinnedFrame.minY { return true }
+            let visibleBottom = min(scrollFrame.maxY, pinnedFrame.minY) - 10
+            let height = max(scrollFrame.height, 1)
+            let distance: CGFloat
+            let startY: CGFloat
+            let direction: CGFloat
+            if elementFrame.maxY < scrollFrame.minY {
+                distance = scrollFrame.minY - elementFrame.maxY + 36
+                startY = 0.28
+                direction = 1
+            } else if elementFrame.maxY > visibleBottom {
+                distance = elementFrame.maxY - visibleBottom + 24
+                startY = 0.66
+                direction = -1
+            } else {
+                distance = 48
+                startY = 0.66
+                direction = -1
+            }
+            let dragDistance = min(max(distance, 60), 100)
+            let normalizedDistance = dragDistance / height
+            let endY = min(max(startY + direction * normalizedDistance, 0.20), 0.70)
+            let start = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: startY))
+            let end = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: endY))
+            start.press(forDuration: 0.05, thenDragTo: end)
+        }
+        return element.isHittable && element.frame.maxY < pinnedTaskAction.frame.minY
     }
 
     private func attachScreen(_ app: XCUIApplication, named name: String) {

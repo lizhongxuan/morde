@@ -80,6 +80,7 @@ func revisionSettlementFixture(t *testing.T) (*ModelGatewayService, *revisionSet
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestModelResponseSealer(t, service)
 	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1,
 		EngineVersion: "dsh-1", ProfileVersion: "v1"}

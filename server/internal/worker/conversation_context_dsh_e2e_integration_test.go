@@ -73,7 +73,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.SetConversationSummarySealer(sealer); err != nil {
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
 		t.Fatal(err)
 	}
 	audit, err := app.NewAuditService(store)

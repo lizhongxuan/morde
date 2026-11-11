@@ -10956,13 +10956,14 @@ components:
     TaskFileFetch:
       type: object
       additionalProperties: false
-      required: [fetch_id, task_id, source_installation_id, source_device_name, relative_path, task_revision, source_version, source_sha256, media_type, size_bytes, confirmed_bytes, status, waiting_reason, content_id, expires_at, content_state, parse_status, parse_error, deleted_at]
-      description: Task-owner Portal Session projection of a PC file fetch. It contains no transfer ticket, ticket hash, or source directory path outside the authorized relative path. A completed fetch stays completed after its retained copy is deleted or expires; content_state reports the separate copy lifecycle and parse_status reports model delivery separately from transfer completion.
+      required: [fetch_id, task_id, source_installation_id, source_device_name, source_directory_name, relative_path, task_revision, source_version, source_sha256, media_type, size_bytes, confirmed_bytes, status, waiting_reason, failure_reason, content_id, expires_at, content_state, parse_status, parse_error, deleted_at]
+      description: Task-owner Portal Session projection of a PC file fetch. source_directory_name is an optional safe basename used only for display; it contains no root path and grants no access. It contains no transfer ticket or ticket hash. A completed fetch stays completed after its retained copy is deleted or expires; content_state reports the separate copy lifecycle and parse_status reports model delivery separately from transfer completion.
       properties:
         fetch_id: { $ref: '#/components/schemas/OperationId' }
         task_id: { $ref: '#/components/schemas/TaskId' }
         source_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
         source_device_name: { type: string, minLength: 1, maxLength: 100 }
+        source_directory_name: { type: [string, 'null'], minLength: 1, maxLength: 100, description: Safe basename of the selected root; null before the PC confirms its manifest or for legacy records. }
         relative_path: { type: string, minLength: 1, maxLength: 1024, description: Relative to the PC's current authorized root. }
         task_revision: { type: integer, format: int64, minimum: 1 }
         source_version: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
@@ -10972,6 +10973,7 @@ components:
         confirmed_bytes: { type: integer, format: int64, minimum: 0, maximum: 16777216 }
         status: { type: string, enum: [queued, waiting_device, transferring, verifying, completed, cancelling, cancelled, failed] }
         waiting_reason: { type: [string, 'null'], enum: [device_offline, null] }
+        failure_reason: { type: [string, 'null'], enum: [access_denied, source_changed, file_unavailable, limit_exceeded, unsupported, source_unavailable, transfer_failed, null], description: Sanitized failure category; never contains raw PC errors or filesystem paths. }
         content_id: { oneOf: [{ $ref: '#/components/schemas/OperationId' }, { type: 'null' }] }
         expires_at: { type: [string, 'null'], format: date-time }
         content_state: { type: string, enum: [none, retained, deleted, expired] }
@@ -10990,12 +10992,13 @@ components:
     TaskFileFetchManifestRequest:
       type: object
       additionalProperties: false
-      required: [source_version, source_sha256, size_bytes, media_type]
+      required: [source_version, source_sha256, size_bytes, media_type, source_directory_name]
       properties:
         source_version: { type: string, pattern: '^[a-f0-9]{64}$' }
         source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
         size_bytes: { type: integer, format: int64, minimum: 1, maximum: 16777216 }
         media_type: { type: string, enum: [text/plain, text/markdown, text/csv, application/json, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/pdf] }
+        source_directory_name: { type: string, minLength: 1, maxLength: 100, description: Safe basename of the selected PC root; not a path and not used for authorization. }
     TaskFileFetchManifestReceipt:
       type: object
       additionalProperties: false

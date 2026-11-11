@@ -1,6 +1,6 @@
 # A30 PC 文件服务与工具接入实施任务 TODO
 
-**会话：A｜阶段：P3 / G3｜状态：A30-T3 已完成（A30-T1/T2 已完成）；A30-T4 仅等待 C30-T3（B30-T4 已完成）。**
+**会话：A｜阶段：P3 / G3｜状态：进行中（2026-11-11；A30-T1/T2/T3、B30-T4 v2 联验已完成；A30-T4 等待 C30-T3 真服务联验）。**
 
 来源：[需求与架构](../../Morde个人Muse需求与架构设计方案.md)；共同规则：[执行总览](00-三会话执行总览.md)；接口：[共享合同](01-共享接口与联调合同.md)。
 
@@ -45,9 +45,10 @@ server/internal/domain/hub/、app/hub_task_actions.go、相关 API/存储/工具
 - 提供只编入测试的 Go HTTP fixture：`CH_K4_FIXTURE=1 go test ./internal/store/postgres -run '^TestK4NodeHTTPFixture$' -count=1 -v`；连接本机 `CH_TEST_DATABASE_URL`，真实迁移/store/API router 和合成 Task/fetch/ticket，只绑定 `127.0.0.1`。启动打印 `K4_FIXTURE_READY` JSON；POST `/__test/k4-fixture/shutdown` 后测试清理临时数据库。生产 API 不注册 shutdown 路由。
 - 定向 `go test ./internal/app ./internal/api`、临时本机 PostgreSQL `TestPostgresTaskFileFetchTransferResumeContentLifecycleAndCancel`、fixture 的 manifest/chunk/commit HTTP 实测通过；B30 报告真实 helper 到临时 PostgreSQL/API 的两轮 live 测试通过，涵盖源变化 fail-closed、按 confirmed sequences 续传、16 MiB+1 拒绝、owner 状态/下载/删除及 file.get 文本读取。
 - `make generate` 通过。全量 `make it` 已退出，最终由 `morde/server/internal/worker` 失败（`FAIL ... 212.407s`、退出码 1）；全量 `make test`、`make race`、`make cover` 同样被并发用例 `TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH` 阻断。`make lint` 仍有 8 项错误，涉及 worker、model usage 与 conversation summary 文件，均不在本任务边界内；A30 触及的 Go 文件格式及 diff 空白检查通过。临时 PostgreSQL 容器已由清理流程移除。
+- K4 v2 变更与验收（2026-11-11）：为兑现 C30 页面显示授权根名称的合同要求，manifest 增加仅供显示的安全 basename `source_directory_name`，owner 投影离线/历史记录允许 null；该值不参与鉴权且不包含根路径。服务端校验和持久化由迁移 `00181_task_file_fetch_directory_name.sql` 实施，manifest 幂等重放固定目录名。B30-T4 v2 联验已通过：真实 `morde-sync` helper + Go API/PostgreSQL loopback fixture 1/1，涵盖完整字节/hash、源变化、断线续传、16 MiB+1 拒绝、撤权、目录名投影及 ticket 不泄漏；B30 build、typecheck、442 项测试通过。该链路尚未包含真实 iOS Task 发起，不代表 G3 完成。
 
-- [ ] A30-T4（未开始）集成真实本机桥接并通过 G3
-  - 前置：A30-T3、B30-T4 已完成；仅等待 C30-T3。
+- [ ] A30-T4（进行中；等待 C30-T3）集成真实本机桥接并通过 G3
+  - 前置：A30-T3 与 B30-T4 v2 联验已完成；等待 C30-T3。
   - 修改：合入 B30/C30 后在 A 独立环境跑真实本机 helper 到本地服务；使用合成目录，所有文件只在本机隔离端点流动。跨模块缺口交对应会话修复。
   - 验收：覆盖 A8–A10：iOS 发起完整文件任务、越界拒绝、离线等待、源变化、断线恢复和撤权；UI、实际字节与服务端状态一致后记录 G3。
 

@@ -90,11 +90,13 @@ func TestValidateActionResultKeepsResultsWithinActionContract(t *testing.T) {
 		action string
 		frame  Frame
 	}{
-		"info":         {action: ActionInfo, frame: Frame{Type: "result", ID: "call-1", OK: &ok, Body: json.RawMessage(`{"name":"Phone","platform":"ios","actions":["info","open"]}`)}},
-		"info actions": {action: ActionInfo, frame: Frame{Type: "result", ID: "call-1", OK: &ok, Body: json.RawMessage(`{"name":"PC","platform":"desktop","actions":["info","screenshot","files","file.get","command"],"target_grant_version":2}`)}},
-		"open":         {action: ActionOpen, frame: Frame{Type: "result", ID: "call-2", OK: &ok, Body: json.RawMessage(`{"opened":true}`)}},
-		"notify":       {action: ActionNotify, frame: Frame{Type: "result", ID: "call-3", OK: &ok, Body: json.RawMessage(`{"notified":true}`)}},
-		"action error": {action: ActionOpen, frame: Frame{Type: "result", ID: "call-4", OK: &failed, Error: "denied"}},
+		"info":                     {action: ActionInfo, frame: Frame{Type: "result", ID: "call-1", OK: &ok, Body: json.RawMessage(`{"name":"Phone","platform":"ios","actions":["info","open"]}`)}},
+		"info actions":             {action: ActionInfo, frame: Frame{Type: "result", ID: "call-1", OK: &ok, Body: json.RawMessage(`{"name":"PC","platform":"desktop","actions":["info","screenshot","files","file.get","command"],"target_grant_version":2}`)}},
+		"open":                     {action: ActionOpen, frame: Frame{Type: "result", ID: "call-2", OK: &ok, Body: json.RawMessage(`{"opened":true}`)}},
+		"notify":                   {action: ActionNotify, frame: Frame{Type: "result", ID: "call-3", OK: &ok, Body: json.RawMessage(`{"notified":true}`)}},
+		"action error":             {action: ActionOpen, frame: Frame{Type: "result", ID: "call-4", OK: &failed, Error: "denied"}},
+		"file fetch source change": {action: ActionFileFetch, frame: Frame{Type: "result", ID: "call-5", OK: &failed, Error: "conflict"}},
+		"file fetch size limit":    {action: ActionFileFetch, frame: Frame{Type: "result", ID: "call-6", OK: &failed, Error: "too_large"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateActionResult(test.action, test.frame); err != nil {
@@ -107,12 +109,14 @@ func TestValidateActionResultKeepsResultsWithinActionContract(t *testing.T) {
 		body   string
 		error  string
 	}{
-		"info path leak":           {action: ActionInfo, body: `{"name":"Phone","platform":"ios","path":"/private"}`},
-		"info invalid platform":    {action: ActionInfo, body: `{"name":"Phone","platform":"server"}`},
-		"info unimplemented write": {action: ActionInfo, body: `{"name":"PC","platform":"desktop","actions":["file.put"]}`},
-		"open incomplete":          {action: ActionOpen, body: `{"opened":false}`},
-		"notify incomplete":        {action: ActionNotify, body: `{"notified":false}`},
-		"unknown action error":     {action: ActionNotify, error: "shell_executed"},
+		"info path leak":                   {action: ActionInfo, body: `{"name":"Phone","platform":"ios","path":"/private"}`},
+		"info invalid platform":            {action: ActionInfo, body: `{"name":"Phone","platform":"server"}`},
+		"info unimplemented write":         {action: ActionInfo, body: `{"name":"PC","platform":"desktop","actions":["file.put"]}`},
+		"open incomplete":                  {action: ActionOpen, body: `{"opened":false}`},
+		"notify incomplete":                {action: ActionNotify, body: `{"notified":false}`},
+		"unknown action error":             {action: ActionNotify, error: "shell_executed"},
+		"file fetch error on other action": {action: ActionNotify, error: "conflict"},
+		"unknown file fetch error":         {action: ActionFileFetch, error: "shell_executed"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			frame := Frame{Type: "result", ID: "call-5", OK: &ok, Body: json.RawMessage(test.body)}

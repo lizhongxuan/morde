@@ -1,6 +1,6 @@
 # B30 PC 授权目录与完整文件桥接实施任务 TODO
 
-**会话：B｜阶段：P3｜状态：已完成（T1–T4 全部完成；G2 已通过，B30 的真实 PC→本地服务数据链路已验收；G3 由 A30-T4 汇总）。**
+**会话：B｜阶段：P3｜状态：已完成（T1–T4 全部完成；T4 已适配 `muse-k4-v2`；G2 已通过，B30 的真实 PC→本地服务数据链路已验收；G3 由 A30-T4 汇总）。**
 
 来源：[需求与架构](../../Morde个人Muse需求与架构设计方案.md)；共同规则：[执行总览](00-三会话执行总览.md)；接口：[共享合同](01-共享接口与联调合同.md)。
 
@@ -33,11 +33,12 @@ clients/desktop/ 中目录授权、Hub、morde-hub-actions、Electron 主进程/
   - 验收：实际 Electron 选择合成目录可建立授权，撤销后立即阻止新请求；页面和 helper 状态一致。发布可供 C30-T3 使用的本地桥接版本，但不宣称 G3 已通过。
   - 完成与验收证据（2026-11-11）：Morde Hub 卡片继续复用授权/撤销与在线状态，最近 20 条本机取回记录展示相对路径、来源版本、确认字节、状态和保留期限且不持久化 ticket；已有卡片测试覆盖 Electron directory-picker 回调、授权撤销保留所选目录和访问记录展示。Portal Assistant 任务动态展示设备/版本、进度、期限、副本状态与删除时间，删除需确认并刷新 owner 状态。真实 Node live test 通过 production `mordeHubUpdateGrants` + `morde-sync` 对本机合成目录建立目录身份，实际 `file.fetch` 联到本机服务；本地撤权后 handler 在发出新 HTTP 请求前拒绝。owner Session 列表、完整下载、删除 tombstone 由同一 live test 验证。Portal 页面定向浏览器验收确认主会话固定在顶部、旁路组初始折叠及 +5 分页；Morde Hub/Portal UI 定向测试通过，桌面 Morde 主进程/渲染器测试 86/86、Portal 测试 553/553，Electron 隔离用户目录 build 通过。未使用远端测试站点。
 
-- [x] B30-T4（完成）完成真实 helper 到本地服务的联调
+- [x] B30-T4（完成；适配 `muse-k4-v2`）完成真实 helper 到本地服务的联调
   - 前置：B30-T3、A30-T3。
   - 修改：连接 A30-T3 的实现，使用独立 B 数据库/桥接进程与合成资料；修复仅归 B 的差异，服务器问题交 A。
   - 验收：A8–A10 的真实字节链路通过：完整文件、断线、越界、源变化、撤权和未完成副本不交付；普通文本 file.get 行为保留。向 A30-T4 交付证据。
   - 完成与验收证据（2026-11-11）：新增 live test 以真实 PC handler、生产 helper、真实本地 Go routes 和独立临时 PostgreSQL 验证完整文件字节、断线后按服务端确认序号续传、源变化和 16 MiB+1 越界拒绝、撤权后不再读取/传输、未完成副本不可下载、owner 下载/删除，以及普通文本 `file.get` 保持可用；测试 1/1 通过，下载 PDF 字节与合成源文件逐字节一致，ticket 未进入返回结果、事件或状态。B30 专项 `go test ./client ./cmd/morde-sync`、DSH 包 442/442、Portal 553/553、TypeScript typecheck/build、浏览器 UI 验收均通过，临时 PostgreSQL 与测试进程已清理。服务端 PostgreSQL/API 前序包通过；全量 `make it` 在 `TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH` 失败（worker 并发改动，超出 B30 文件边界），故不记作全仓集成通过。
+  - K4 v2 适配完成（2026-11-11）：PC 仅从 helper 校验后的 canonical 授权根派生 `source_directory_name` basename，校验 1–100 UTF-8 bytes、拒绝空名、`.`/`..`、分隔符和控制字符；绝对路径不进入 manifest。PC 单测覆盖恰好 100 UTF-8 bytes、超限 UTF-8 名称和非法名在发出网络请求前拒绝。`npm run build`、`npm run typecheck`、DSH 包 `npm test`（442/442）通过；使用 loopback PostgreSQL fixture 的 `node --test tests/cloud-morde-hub.live.mjs` 1/1 通过，真实 `morde-sync` 与 Go API manifest/owner 投影对账目录名，保留完整字节、断线续传、源变化、16 MiB+1 拒绝、撤权、ticket 不泄漏等回归。测试创建的 helper、合成目录和临时数据库已清理；A 的专属 loopback PG 容器由 A 统一清理。
 
 ## 交付
 

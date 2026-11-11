@@ -13,6 +13,37 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func TestValidTaskFileFetchDirectoryName(t *testing.T) {
+	for _, value := range []string{"reports", "报告", strings.Repeat("a", 100)} {
+		if !ValidTaskFileFetchDirectoryName(value) {
+			t.Errorf("expected valid directory display name %q", value)
+		}
+	}
+	for _, value := range []string{"", " ", ".", "..", "/", `\`, "reports/archive", `reports\archive`, "line\nbreak", "nul\x00", strings.Repeat("a", 101), string([]byte{0xff})} {
+		if ValidTaskFileFetchDirectoryName(value) {
+			t.Errorf("expected invalid directory display name %q", value)
+		}
+	}
+}
+
+func TestTaskFileFetchFailureReasonSanitizesPCAndServerErrors(t *testing.T) {
+	for input, want := range map[string]string{
+		"not_allowed":                   task.FileFetchFailureAccessDenied,
+		"permission_required":           task.FileFetchFailureAccessDenied,
+		"conflict":                      task.FileFetchFailureSourceChanged,
+		"not_found":                     task.FileFetchFailureUnavailable,
+		"too_large":                     task.FileFetchFailureLimitExceeded,
+		"quota_exceeded":                task.FileFetchFailureLimitExceeded,
+		"unsupported":                   task.FileFetchFailureUnsupported,
+		"timeout":                       task.FileFetchFailureSourceUnavailable,
+		"raw /Users/private/secret.txt": task.FileFetchFailureTransfer,
+	} {
+		if got := TaskFileFetchFailureReason(input); got != want || !task.ValidFileFetchFailureReason(got) {
+			t.Errorf("TaskFileFetchFailureReason(%q) = %q, want safe %q", input, got, want)
+		}
+	}
+}
+
 func TestCloudDSHFileFetchUsesCurrentRevisionAndKeepsTicketOutOfTaskOutput(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	hubService, _ := newHubFixture(t)
@@ -118,6 +149,47 @@ func TestCloudDSHFileFetchPersistsOfflineWaitWithoutTicket(t *testing.T) {
 	for _, fetch := range store.fetches {
 		if fetch.Status != task.FileFetchWaitingDevice || fetch.WaitingReason != "device_offline" {
 			t.Fatalf("offline fetch state = %+v", fetch)
+		}
+	}
+}
+
+func TestCloudDSHFileFetchPersistsSanitizedFailureReason(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+	_ = target.next(t, "devices")
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	revision := int64(2)
+	claimed.CurrentRevision, claimed.DesiredRevision = &revision, &revision
+	fixture.store.details.Task.CurrentRevision, fixture.store.details.Task.DesiredRevision = &revision, &revision
+	call := ModelToolCall{CallID: "call_file_fetch_conflict", Name: "morde_hub_file_fetch_i7654321_v5",
+		Arguments: `{"path":"reports/changed.txt"}`}
+	resultCh := make(chan AgentToolResult, 1)
+	errorCh := make(chan error, 1)
+	go func() {
+		result, err := broker.Execute(context.Background(), claimed, call)
+		resultCh <- result
+		errorCh <- err
+	}()
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionFileFetch}, int64(5))
+	action := target.next(t, "call")
+	target.push(t, map[string]any{"type": "result", "id": action["id"], "ok": false,
+		"error": "conflict", "message": "selected file changed at /Users/private/secret.txt"})
+	select {
+	case result := <-resultCh:
+		if err := <-errorCh; err != nil || result.Status != AgentToolFailed ||
+			strings.Contains(result.Output, "/Users/") || !strings.Contains(result.Output, `"failure_reason":"source_changed"`) {
+			t.Fatalf("sanitized file.fetch failure = %#v err=%v", result, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("file.fetch failure did not settle after the target returned a bounded error code")
+	}
+	if len(store.fetches) != 1 {
+		t.Fatalf("file.fetch records = %#v", store.fetches)
+	}
+	for _, fetch := range store.fetches {
+		if fetch.Status != task.FileFetchFailed || fetch.FailureReason != task.FileFetchFailureSourceChanged {
+			t.Fatalf("file.fetch failure projection = %+v", fetch)
 		}
 	}
 }

@@ -94,6 +94,7 @@ type ModelCallSettlement struct {
 	Usage              ModelUsage
 	Unknown            bool
 	Summary            *ConversationSummaryModelFence
+	TaskCall           *ModelCallReservation
 	ResponseCiphertext []byte
 	ResponseDigest     []byte
 	ResponseInvalid    bool
@@ -119,11 +120,11 @@ type ModelGatewayResolver interface {
 }
 
 type ModelGatewayService struct {
-	store         ModelCallStore
-	models        ModelGatewayResolver
-	client        ModelClient
-	projectBudget *ProjectBudgetService
-	summarySealer *Sealer
+	store          ModelCallStore
+	models         ModelGatewayResolver
+	client         ModelClient
+	projectBudget  *ProjectBudgetService
+	responseSealer *Sealer
 }
 
 const modelRequestItemTokenReserve int64 = 32
@@ -173,11 +174,11 @@ func NewModelGatewayService(store ModelCallStore, models ModelGatewayResolver, c
 	return service, nil
 }
 
-func (s *ModelGatewayService) SetConversationSummarySealer(sealer *Sealer) error {
+func (s *ModelGatewayService) SetModelResponseSealer(sealer *Sealer) error {
 	if s == nil || sealer == nil {
-		return errors.New("conversation summary model result sealer is required")
+		return errors.New("model response sealer is required")
 	}
-	s.summarySealer = sealer
+	s.responseSealer = sealer
 	return nil
 }
 
@@ -248,8 +249,8 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
 	}
 	call.Task = normalizedModelTaskFence(call.Task)
-	if call.Source == ModelCallCompaction && s.summarySealer == nil {
-		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation summary model encryption is unavailable")
+	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask) && s.responseSealer == nil {
+		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "model response encryption is unavailable")
 	}
 	if call.Source == ModelCallTask {
 		if call.Task == nil || call.Request.Endpoint != (ModelEndpoint{}) {
@@ -268,11 +269,16 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, err
 	}
 	var taskDelivery ModelTaskDeliveryGuard
+	var taskResponseStore TaskModelResponseStore
 	if call.Source == ModelCallTask {
 		var ok bool
 		taskDelivery, ok = s.store.(ModelTaskDeliveryGuard)
 		if !ok {
 			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "task model delivery fence is unavailable")
+		}
+		taskResponseStore, ok = s.store.(TaskModelResponseStore)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "task model response recovery is unavailable")
 		}
 	}
 	projectID := ""
@@ -326,7 +332,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 				return ModelResponse{}, err
 			}
 			if found {
-				output, err := OpenConversationSummaryModelOutput(s.summarySealer, stored.Ciphertext, stored.Digest,
+				output, err := OpenConversationSummaryModelOutput(s.responseSealer, stored.Ciphertext, stored.Digest,
 					call.Summary.Identity, call.Summary.OperationID, call.CallID, call.ModelID)
 				if err != nil {
 					return ModelResponse{}, err
@@ -335,6 +341,25 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			}
 		} else {
 			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation summary model recovery is unavailable")
+		}
+	}
+	if call.Source == ModelCallTask {
+		stored, found, err := taskResponseStore.RecoverTaskModelResponse(ctx, reservation)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+		if found {
+			response, err := OpenTaskModelResponse(s.responseSealer, stored, reservation)
+			if err != nil {
+				return ModelResponse{}, err
+			}
+			if err := taskDelivery.ValidateTaskModelDelivery(ctx, reservation); err != nil {
+				return ModelResponse{}, err
+			}
+			if err := validateTaskModelResponse(call.Request, response); err != nil {
+				return ModelResponse{}, err
+			}
+			return response, nil
 		}
 	}
 	projectCall := projectID != "" && !endpoint.Personal
@@ -444,13 +469,32 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			settlement.ResponseInvalid = true
 			summaryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid conversation summary")
 		} else {
-			settlement.ResponseCiphertext, settlement.ResponseDigest, err = SealConversationSummaryModelOutput(s.summarySealer,
+			settlement.ResponseCiphertext, settlement.ResponseDigest, err = SealConversationSummaryModelOutput(s.responseSealer,
 				ConversationSummaryModelOutput{Identity: call.Summary.Identity, OperationID: call.Summary.OperationID,
 					CallID: call.CallID, ModelID: call.ModelID, Text: response.Text, Usage: response.Usage})
 			if err != nil {
 				settlement.ResponseInvalid = true
 				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely")
 			}
+		}
+	}
+	var taskOutputErr error
+	if call.Source == ModelCallTask && !settlement.Unknown {
+		taskOutputErr = validateTaskModelResponse(call.Request, response)
+		if taskOutputErr == nil {
+			taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
+		}
+		if taskOutputErr == nil {
+			stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, response)
+			if sealErr != nil {
+				settlement.ResponseInvalid = true
+				taskOutputErr = domain.NewError(domain.CodeInvalidState, "task model response could not be stored safely")
+			} else {
+				settlement.TaskCall = &reservation
+				settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+			}
+		} else {
+			settlement.ResponseInvalid = true
 		}
 	}
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -460,7 +504,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		settleErr = s.projectBudget.SettleModelCall(settleCtx, SettleProjectModelCallCommand{
 			ProjectID: projectID, Source: call.Source, CallID: call.CallID,
 			Usage: project.Usage{InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens}, Unknown: settlement.Unknown,
-			Summary: call.Summary, ResponseCiphertext: settlement.ResponseCiphertext,
+			Summary: call.Summary, TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
 			ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
 		})
 	} else {
@@ -495,6 +539,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	if summaryOutputErr != nil {
 		return ModelResponse{}, summaryOutputErr
+	}
+	if taskOutputErr != nil {
+		return ModelResponse{}, taskOutputErr
 	}
 	if !response.Usage.Known {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")

@@ -1001,6 +1001,9 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
 	fence := app.ModelTaskFence{TaskID: claimed.ID, OwnerID: principal.UserID, InitiatorID: principal.UserID,
 		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		AgentInstanceID: started.Fence.AgentInstanceID, AgentGeneration: started.Fence.AgentGeneration,
@@ -1016,8 +1019,9 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	if err != nil || response.Text != "OK" || model.calls != 1 {
 		t.Fatalf("model response = %#v, calls=%d, %v", response, model.calls, err)
 	}
-	if _, err := gateway.Complete(ctx, call); domain.CodeOf(err) != domain.CodeConflict || model.calls != 1 {
-		t.Fatalf("repeated task model call = %v, calls=%d", err, model.calls)
+	recovered, err := gateway.Complete(ctx, call)
+	if err != nil || recovered.Text != response.Text || recovered.Usage != response.Usage || model.calls != 1 {
+		t.Fatalf("repeated task model call did not recover the saved response: response=%+v err=%v calls=%d", recovered, err, model.calls)
 	}
 	result, err := store.GetTask(ctx, claimed.ID, principal.UserID)
 	if err != nil || result.Task.Usage.ModelTokens == nil || *result.Task.Usage.ModelTokens != 12 {

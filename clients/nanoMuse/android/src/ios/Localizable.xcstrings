@@ -4,6 +4,846 @@
     "" : {
 
     },
+    "Cancel this file request?" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Diese Dateianfrage abbrechen?" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancel this file request?" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "¿Cancelar esta solicitud de archivo?" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Annuler cette demande de fichier ?" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "このファイル取得をキャンセルしますか？" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 파일 요청을 취소할까요?" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отменить запрос этого файла?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "取消此文件请求？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "取消此檔案請求？" } }
+      }
+    },
+    "Cancel file request" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateianfrage abbrechen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancel file request" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Cancelar solicitud de archivo" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Annuler la demande de fichier" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル取得をキャンセル" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 요청 취소" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отменить запрос файла" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "取消文件请求" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "取消檔案請求" } }
+      }
+    },
+    "Cancel fetch for %@?" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateiabruf für %@ abbrechen?" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancel fetch for %@?" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "¿Cancelar la descarga de %@?" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Annuler la récupération de %@ ?" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "%@ の取得をキャンセルしますか？" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "%@ 가져오기를 취소할까요?" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отменить получение файла %@?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "取消获取 %@？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "取消取得 %@？" } }
+      }
+    },
+    "Delete retained file copy?" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Gespeicherte Dateikopie löschen?" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete retained file copy?" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "¿Eliminar la copia guardada?" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Supprimer la copie conservée ?" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "保存済みファイルを削除しますか？" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "보관된 파일 사본을 삭제할까요?" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить сохранённую копию файла?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除已保留的文件副本？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "要刪除已保留的檔案副本嗎？" } }
+      }
+    },
+    "Delete cloud copy" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Kopie löschen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete cloud copy" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Eliminar copia en la nube" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Supprimer la copie cloud" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドのコピーを削除" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 사본 삭제" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить облачную копию" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除云端副本" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除雲端副本" } }
+      }
+    },
+    "The PC source file and Task history are unaffected." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Quelldatei auf dem PC und der Aufgabenverlauf bleiben unverändert." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The PC source file and Task history are unaffected." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El archivo de origen del PC y el historial de la tarea no se verán afectados." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le fichier source sur le PC et l’historique de la tâche ne seront pas modifiés." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PC上の元ファイルとTask履歴には影響しません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC 원본 파일과 작업 기록에는 영향이 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Исходный файл на ПК и история задачи не изменятся." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "PC 源文件和任务历史不会受到影响。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "PC 來源檔案和工作記錄不會受到影響。" } }
+      }
+    },
+    "PC file requests" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateianfragen vom PC" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "PC file requests" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Solicitudes de archivos del PC" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Demandes de fichiers du PC" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PCのファイル取得" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC 파일 요청" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Запросы файлов с ПК" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "PC 文件请求" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "PC 檔案請求" } }
+      }
+    },
+    "No PC file requests" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine Dateianfragen vom PC" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No PC file requests" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No hay solicitudes de archivos del PC" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucune demande de fichier du PC" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PCからのファイル取得はありません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC 파일 요청 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Запросов файлов с ПК нет" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "暂无 PC 文件请求" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目前沒有 PC 檔案請求" } }
+      }
+    },
+    "Source snapshot %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Quellmomentaufnahme %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Source snapshot %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Instantánea de origen %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Instantané source %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "取得元スナップショット %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원본 스냅샷 %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Снимок источника %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "来源快照 %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "來源快照 %@" } }
+      }
+    },
+    "Transfer progress %@ of %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Übertragungsfortschritt %@ von %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Transfer progress %@ of %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Progreso de transferencia %@ de %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Progression du transfert %@ sur %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "転送量 %@ / %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "전송 진행률 %@ / %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Передано %@ из %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "传输进度 %@ / %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "傳輸進度 %@ / %@" } }
+      }
+    },
+    "PC file transfer progress" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Fortschritt der PC-Dateiübertragung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "PC file transfer progress" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Progreso de transferencia de archivos del PC" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Progression du transfert de fichier du PC" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PCファイル転送の進行状況" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC 파일 전송 진행률" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ход передачи файла с ПК" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "PC 文件传输进度" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "PC 檔案傳輸進度" } }
+      }
+    },
+    "Cancellation pending" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Abbruch ausstehend" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancellation pending" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Cancelación pendiente" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Annulation en attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "キャンセル保留中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "취소 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидается отмена" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待取消" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待取消" } }
+      }
+    },
+    "Waiting to request file" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Warte auf Dateiabruf" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Waiting to request file" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando para solicitar el archivo" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En attente de la demande du fichier" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル取得待ち" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 요청 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидание запроса файла" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待请求文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待請求檔案" } }
+      }
+    },
+    "Waiting for PC to reconnect" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Warte, bis der PC wieder online ist" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Waiting for PC to reconnect" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando a que el PC se reconecte" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En attente de la reconnexion du PC" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PCの再接続待ち" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC 재연결 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидание повторного подключения ПК" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待 PC 重新连接" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待 PC 重新連線" } }
+      }
+    },
+    "Receiving file from PC" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Datei wird vom PC empfangen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Receiving file from PC" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Recibiendo archivo del PC" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réception du fichier depuis le PC" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PCからファイルを受信中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC에서 파일 수신 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Получение файла с ПК" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在从 PC 接收文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在從 PC 接收檔案" } }
+      }
+    },
+    "Verifying received file" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Empfangene Datei wird überprüft" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Verifying received file" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Verificando archivo recibido" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Vérification du fichier reçu" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "受信したファイルを検証中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "받은 파일 확인 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Проверка полученного файла" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在校验接收的文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在驗證接收的檔案" } }
+      }
+    },
+    "File size · %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateigröße · %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File size · %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tamaño del archivo · %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Taille du fichier · %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルサイズ · %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 크기 · %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Размер файла · %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件大小 · %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案大小 · %@" } }
+      }
+    },
+    "Received so far · %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Bisher empfangen · %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Received so far · %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Recibido hasta ahora · %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Reçu jusqu’ici · %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在までの受信量 · %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "현재까지 받은 크기 · %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Получено · %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已接收 · %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已接收 · %@" } }
+      }
+    },
+    "SHA-256 · %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "SHA-256 · %@" } }
+      }
+    },
+    "File hash pending" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Datei-Hash ausstehend" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File hash pending" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Hash del archivo pendiente" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Empreinte du fichier en attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルハッシュ待機中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 해시 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидание хеша файла" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待文件哈希" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待檔案雜湊" } }
+      }
+    },
+    "File received" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Datei empfangen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File received" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Archivo recibido" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Fichier reçu" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルを受信しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 수신 완료" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Файл получен" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件已接收" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案已接收" } }
+      }
+    },
+    "File request cancelled" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateianfrage abgebrochen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File request cancelled" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Solicitud de archivo cancelada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Demande de fichier annulée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル取得をキャンセルしました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 요청 취소됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Запрос файла отменён" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件请求已取消" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案請求已取消" } }
+      }
+    },
+    "File request failed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateianfrage fehlgeschlagen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File request failed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Error en la solicitud de archivo" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Échec de la demande de fichier" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル取得に失敗しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 요청 실패" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось выполнить запрос файла" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件请求失败" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案請求失敗" } }
+      }
+    },
+    "A safe failure reason is unavailable" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Ein sicherer Fehlergrund ist nicht verfügbar"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "A safe failure reason is unavailable"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "No hay un motivo de error seguro disponible"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "Aucun motif d’échec sûr n’est disponible"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "安全に表示できる失敗理由はありません"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "안전하게 표시할 실패 사유가 없습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Безопасная причина сбоя недоступна"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "没有可安全显示的失败原因"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "沒有可安全顯示的失敗原因"}}
+      }
+    },
+    "File access denied or revoked" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Dateizugriff verweigert oder widerrufen"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "File access denied or revoked"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "Acceso al archivo denegado o revocado"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "Accès au fichier refusé ou révoqué"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "ファイルへのアクセスが拒否または取り消されました"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "파일 접근이 거부되었거나 권한이 취소되었습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Доступ к файлу запрещён или отозван"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "文件访问被拒绝或授权已撤销"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "檔案存取遭拒或授權已撤銷"}}
+      }
+    },
+    "File size or storage limit exceeded" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Datei- oder Speicherlimit überschritten"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "File size or storage limit exceeded"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "Se superó el límite de tamaño o almacenamiento"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "La limite de taille ou de stockage est dépassée"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "ファイルサイズまたは保存容量の上限を超えました"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "파일 크기 또는 저장 용량 한도를 초과했습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Превышен лимит размера файла или хранилища"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "超出文件大小或存储空间限制"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "超出檔案大小或儲存空間限制"}}
+      }
+    },
+    "File transfer did not complete" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Dateiübertragung nicht abgeschlossen"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "File transfer did not complete"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "La transferencia del archivo no se completó"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "Le transfert du fichier n’a pas abouti"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "ファイル転送が完了しませんでした"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "파일 전송이 완료되지 않았습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Передача файла не завершена"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "文件传输未完成"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "檔案傳輸未完成"}}
+      }
+    },
+    "The source device or service is unavailable" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Quellgerät oder Dienst nicht verfügbar"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "The source device or service is unavailable"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "El dispositivo o servicio de origen no está disponible"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "L’appareil ou le service source est indisponible"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "転送元デバイスまたはサービスを利用できません"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "원본 기기 또는 서비스를 사용할 수 없습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Исходное устройство или служба недоступны"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "来源设备或服务不可用"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "來源裝置或服務無法使用"}}
+      }
+    },
+    "The source file changed during transfer" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Die Quelldatei wurde während der Übertragung geändert"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "The source file changed during transfer"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "El archivo de origen cambió durante la transferencia"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "Le fichier source a changé pendant le transfert"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "転送中に元のファイルが変更されました"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "전송 중 원본 파일이 변경되었습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Исходный файл изменился во время передачи"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "源文件在传输过程中发生变化"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "來源檔案在傳輸期間有所變更"}}
+      }
+    },
+    "The source file is unavailable" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Die Quelldatei ist nicht verfügbar"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "The source file is unavailable"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "El archivo de origen no está disponible"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "Le fichier source est indisponible"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "元のファイルを利用できません"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "원본 파일을 사용할 수 없습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Исходный файл недоступен"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "源文件不可用"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "來源檔案無法使用"}}
+      }
+    },
+    "This file type is not supported" : {
+      "extractionState": "manual",
+      "localizations": {
+        "de" : {"stringUnit": {"state": "translated", "value": "Dieser Dateityp wird nicht unterstützt"}},
+        "en" : {"stringUnit": {"state": "translated", "value": "This file type is not supported"}},
+        "es" : {"stringUnit": {"state": "translated", "value": "Este tipo de archivo no es compatible"}},
+        "fr" : {"stringUnit": {"state": "translated", "value": "Ce type de fichier n’est pas pris en charge"}},
+        "ja" : {"stringUnit": {"state": "translated", "value": "このファイル形式はサポートされていません"}},
+        "ko" : {"stringUnit": {"state": "translated", "value": "이 파일 형식은 지원되지 않습니다"}},
+        "ru" : {"stringUnit": {"state": "translated", "value": "Этот тип файла не поддерживается"}},
+        "zh-Hans" : {"stringUnit": {"state": "translated", "value": "不支持此文件类型"}},
+        "zh-Hant" : {"stringUnit": {"state": "translated", "value": "不支援此檔案類型"}}
+      }
+    },
+    "File request status unknown" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Status der Dateianfrage unbekannt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File request status unknown" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Estado de la solicitud de archivo desconocido" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "État de la demande de fichier inconnu" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル取得の状態は不明です" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 요청 상태를 알 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Состояние запроса файла неизвестно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件请求状态未知" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案請求狀態不明" } }
+      }
+    },
+    "Safe text was extracted for the task as untrusted data." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Sicherer Text wurde als nicht vertrauenswürdige Daten für die Aufgabe extrahiert." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Safe text was extracted for the task as untrusted data." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se extrajo texto seguro para la tarea como datos no confiables." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Du texte sûr a été extrait pour la tâche comme donnée non fiable." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "信頼できないデータとして安全なテキストをTask用に抽出しました。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업에 안전한 텍스트를 신뢰할 수 없는 데이터로 추출했습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Для задачи извлечён безопасный текст как недоверенные данные." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已为任务提取安全文本，并将其标记为不可信数据。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已為工作擷取安全文字，並標示為不受信任的資料。" } }
+      }
+    },
+    "The file is stored, but its content was not read by the model." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Datei ist gespeichert, ihr Inhalt wurde jedoch nicht vom Modell gelesen." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The file is stored, but its content was not read by the model." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El archivo está guardado, pero el modelo no leyó su contenido." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le fichier est stocké, mais son contenu n’a pas été lu par le modèle." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルは保存されていますが、モデルは内容を読み取っていません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일은 저장되었지만 모델은 내용을 읽지 않았습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Файл сохранён, но модель не читала его содержимое." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件已存储，但模型未读取其内容。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案已儲存，但模型沒有讀取其內容。" } }
+      }
+    },
+    "Content unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Inhalt nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Content unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Contenido no disponible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Contenu indisponible" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "内容を利用できません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "내용을 사용할 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Содержимое недоступно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "内容不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "內容無法使用" } }
+      }
+    },
+    "File transfer completed; content extraction failed: %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateiübertragung abgeschlossen; Inhaltsextraktion fehlgeschlagen: %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File transfer completed; content extraction failed: %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La transferencia terminó, pero falló la extracción del contenido: %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Transfert terminé ; échec de l’extraction du contenu : %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルの転送は完了しましたが、内容を抽出できませんでした：%@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 전송은 완료됐지만 내용 추출에 실패했습니다: %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Передача файла завершена, но не удалось извлечь содержимое: %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件传输已完成，但内容提取失败：%@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案傳輸已完成，但內容擷取失敗：%@" } }
+      }
+    },
+    "File content is unavailable to the task." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Der Dateiinhalt ist für die Aufgabe nicht verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File content is unavailable to the task." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El contenido del archivo no está disponible para la tarea." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le contenu du fichier est indisponible pour la tâche." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルの内容をTaskで利用できません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업에서 파일 내용을 사용할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Содержимое файла недоступно задаче." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务无法使用此文件内容。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "工作無法使用此檔案內容。" } }
+      }
+    },
+    "File content is being prepared." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateiinhalt wird vorbereitet." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File content is being prepared." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Preparando el contenido del archivo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Préparation du contenu du fichier." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルの内容を準備しています。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 내용을 준비하는 중입니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подготовка содержимого файла." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在准备文件内容。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在準備檔案內容。" } }
+      }
+    },
+    "Cloud copy retained" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Kopie gespeichert" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud copy retained" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Copia en la nube conservada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Copie cloud conservée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドにコピーを保存" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 사본 보관됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Облачная копия сохранена" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "云端副本已保留" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "雲端副本已保留" } }
+      }
+    },
+    "Cloud copy retained until %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Kopie gespeichert bis %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud copy retained until %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Copia en la nube conservada hasta %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Copie cloud conservée jusqu’au %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドのコピーは %@ まで保存されます" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 사본 보관 기한: %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Облачная копия хранится до %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "云端副本保留至 %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "雲端副本保留至 %@" } }
+      }
+    },
+    "Cloud copy deleted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Kopie gelöscht" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud copy deleted" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Copia en la nube eliminada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Copie cloud supprimée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドのコピーを削除しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 사본 삭제됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Облачная копия удалена" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "云端副本已删除" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "雲端副本已刪除" } }
+      }
+    },
+    "Cloud copy expired" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Kopie abgelaufen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud copy expired" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Copia en la nube caducada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Copie cloud expirée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドのコピーの期限が切れました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 사본 만료됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Срок хранения облачной копии истёк" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "云端副本已过期" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "雲端副本已過期" } }
+      }
+    },
+    "No cloud copy available" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine Cloud-Kopie verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No cloud copy available" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No hay copias en la nube disponibles" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucune copie cloud disponible" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドのコピーはありません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "사용 가능한 클라우드 사본 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Облачная копия недоступна" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "没有可用的云端副本" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "沒有可用的雲端副本" } }
+      }
+    },
+    "Open file" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Datei öffnen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open file" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Abrir archivo" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Ouvrir le fichier" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルを開く" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 열기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Открыть файл" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "打开文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "開啟檔案" } }
+      }
+    },
+    "Source device · %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Quellgerät · %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Source device · %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Dispositivo de origen · %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Appareil source · %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "取得元デバイス · %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원본 기기 · %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Исходное устройство · %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "来源设备 · %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "來源裝置 · %@" } }
+      }
+    },
+    "Source device online" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Quellgerät online" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Source device online" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Dispositivo de origen en línea" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Appareil source en ligne" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "取得元デバイスはオンライン" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원본 기기 온라인" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Исходное устройство в сети" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "来源设备在线" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "來源裝置上線" } }
+      }
+    },
+    "Source device offline" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Quellgerät offline" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Source device offline" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Dispositivo de origen sin conexión" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Appareil source hors ligne" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "取得元デバイスはオフライン" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원본 기기 오프라인" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Исходное устройство не в сети" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "来源设备离线" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "來源裝置離線" } }
+      }
+    },
+    "Device status unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Gerätestatus nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Device status unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Estado del dispositivo no disponible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "État de l’appareil indisponible" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "デバイスの状態は不明" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "기기 상태를 확인할 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Состояние устройства недоступно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "设备状态不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "裝置狀態無法使用" } }
+      }
+    },
+    "Authorized folder" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Autorisierter Ordner" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Authorized folder" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Carpeta autorizada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Dossier autorisé" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "許可済みフォルダ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인된 폴더" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Разрешённая папка" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已授权目录" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已授權目錄" } }
+      }
+    },
+    "Authorized directory · %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Autorisierter Ordner · %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Authorized directory · %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Carpeta autorizada · %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Dossier autorisé · %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "許可済みフォルダ · %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인된 폴더 · %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Разрешённая папка · %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已授权目录 · %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已授權目錄 · %@" } }
+      }
+    },
+    "Authorized directory name pending" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Name des autorisierten Ordners wird geladen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Authorized directory name pending" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando el nombre de la carpeta autorizada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Nom du dossier autorisé en attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "許可済みフォルダ名を待機中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인된 폴더 이름 확인 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидается имя разрешённой папки" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待已授权目录名称" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待已授權目錄名稱" } }
+      }
+    },
+    "Authorized directory name unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Name des autorisierten Ordners nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Authorized directory name unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Nombre de la carpeta autorizada no disponible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Nom du dossier autorisé indisponible" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "許可済みフォルダ名は不明" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인된 폴더 이름을 사용할 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Имя разрешённой папки недоступно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已授权目录名称不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已授權目錄名稱無法使用" } }
+      }
+    },
+    "Relative path · %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Relativer Pfad · %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Relative path · %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Ruta relativa · %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Chemin relatif · %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "相対パス · %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "상대 경로 · %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Относительный путь · %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "相对路径 · %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "相對路徑 · %@" } }
+      }
+    },
+    "Source version pending" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Quellversion wird geladen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Source version pending" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando la versión de origen" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Version source en attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "取得元バージョンを待機中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원본 버전 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидается версия источника" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待来源版本" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待來源版本" } }
+      }
+    },
+    "invalid_encoding" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ungültige UTF-8-Kodierung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "invalid_encoding" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Codificación UTF-8 no válida" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Encodage UTF-8 invalide" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "無効な UTF-8 エンコード" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "잘못된 UTF-8 인코딩" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Недопустимая кодировка UTF-8" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "UTF-8 编码无效" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "UTF-8 編碼無效" } }
+      }
+    },
+    "invalid_document" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ungültiges oder nicht unterstütztes Dokumentformat" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "invalid_document" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Documento no válido o no compatible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Format de document invalide ou non pris en charge" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "無効または未対応のドキュメント形式" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "잘못되었거나 지원되지 않는 문서 형식" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Недопустимый или неподдерживаемый формат документа" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文档格式无效或不受支持" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "文件格式無效或不受支援" } }
+      }
+    },
+    "result_too_large" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Extrahierter Inhalt ist zu groß" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "result_too_large" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El contenido extraído es demasiado grande" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le contenu extrait est trop volumineux" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "抽出した内容が大きすぎます" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "추출한 내용이 너무 큼" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Извлечённое содержимое слишком велико" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "提取的内容过大" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "擷取的內容過大" } }
+      }
+    },
+    "content_unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Inhalt nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "content_unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Contenido no disponible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Contenu indisponible" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "内容を利用できません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "내용을 사용할 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Содержимое недоступно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "内容不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "內容無法使用" } }
+      }
+    },
+    "integrity_failed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Integritätsprüfung fehlgeschlagen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "integrity_failed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Error de integridad" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Échec de vérification de l’intégrité" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "整合性の検証に失敗" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "무결성 확인 실패" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Проверка целостности не пройдена" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "完整性校验失败" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "完整性驗證失敗" } }
+      }
+    },
+    "The downloaded file failed integrity verification." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die heruntergeladene Datei hat die Integritätsprüfung nicht bestanden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The downloaded file failed integrity verification." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El archivo descargado no superó la verificación de integridad." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le fichier téléchargé n’a pas passé la vérification d’intégrité." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ダウンロードしたファイルの整合性を検証できませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "다운로드한 파일의 무결성 확인에 실패했습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загруженный файл не прошёл проверку целостности." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "下载的文件未通过完整性校验。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "下載的檔案未通過完整性驗證。" } }
+      }
+    },
     "Retry will wait until the independent message is received." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -187709,6 +188549,118 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидает зависимость" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待依赖任务" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待相依任務" } }
+      }
+    },
+    "Could not cancel the file request." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateianfrage konnte nicht abgebrochen werden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Could not cancel the file request." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudo cancelar la solicitud de archivo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Impossible d’annuler la demande de fichier." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル取得をキャンセルできませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 요청을 취소할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось отменить запрос файла." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法取消文件请求。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法取消檔案請求。" } }
+      }
+    },
+    "Could not delete the cloud copy." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Kopie konnte nicht gelöscht werden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Could not delete the cloud copy." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudo eliminar la copia en la nube." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Impossible de supprimer la copie cloud." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドのコピーを削除できませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 사본을 삭제할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось удалить облачную копию." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法删除云端副本。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法刪除雲端副本。" } }
+      }
+    },
+    "Could not open the file." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Datei konnte nicht geöffnet werden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Could not open the file." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudo abrir el archivo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Impossible d’ouvrir le fichier." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルを開けませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일을 열 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось открыть файл." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法打开文件。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法開啟檔案。" } }
+      }
+    },
+    "Document could not be parsed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dokument konnte nicht verarbeitet werden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Document could not be parsed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudo analizar el documento." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le document n’a pas pu être analysé." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ドキュメントを解析できませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "문서를 분석할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось разобрать документ." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法解析文档。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法解析文件。" } }
+      }
+    },
+    "Extracted content is too large" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Extrahierter Inhalt ist zu groß." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Extracted content is too large" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El contenido extraído es demasiado grande." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le contenu extrait est trop volumineux." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "抽出された内容が大きすぎます。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "추출된 콘텐츠가 너무 큽니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Извлечённое содержимое слишком велико." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "提取的内容过大。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "擷取的內容過大。" } }
+      }
+    },
+    "File integrity check failed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dateiintegrität konnte nicht bestätigt werden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File integrity check failed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudo verificar la integridad del archivo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’intégrité du fichier n’a pas pu être vérifiée." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイルの整合性を確認できませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 무결성을 확인할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось проверить целостность файла." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件完整性校验失败。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案完整性驗證失敗。" } }
+      }
+    },
+    "Text encoding is invalid" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Textkodierung ist ungültig." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Text encoding is invalid" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La codificación del texto no es válida." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’encodage du texte est invalide." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "テキストの文字コードが無効です。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "텍스트 인코딩이 올바르지 않습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Неверная кодировка текста." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文本编码无效。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "文字編碼無效。" } }
+      }
+    },
+    "Unable to load PC file requests." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "PC-Dateianfragen können nicht geladen werden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Unable to load PC file requests." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudieron cargar las solicitudes de archivos del PC." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Impossible de charger les demandes de fichiers du PC." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PCファイル取得を読み込めませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC 파일 요청을 불러올 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось загрузить запросы файлов с ПК." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法加载 PC 文件请求。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法載入 PC 檔案請求。" } }
       }
     }
   },

@@ -134,8 +134,9 @@ func (s *accountRuntimeControlStub) MarkAccountAgentRuntimeStopAttestationAcknow
 
 type ownerScopedAccountRuntimeControlStub struct {
 	*accountRuntimeControlStub
-	mu       sync.Mutex
-	runtimes map[string]app.AccountAgentRuntime
+	mu          sync.Mutex
+	runtimes    map[string]app.AccountAgentRuntime
+	startCounts map[string]int
 }
 
 func (s *ownerScopedAccountRuntimeControlStub) Start(ctx context.Context, request app.AccountAgentRuntimeStart) (app.AccountAgentRuntime, bool, error) {
@@ -144,6 +145,10 @@ func (s *ownerScopedAccountRuntimeControlStub) Start(ctx context.Context, reques
 	runtime, replayed, err := s.accountRuntimeControlStub.Start(ctx, request)
 	if err == nil {
 		s.runtimes[request.ConversationID] = runtime
+		if s.startCounts == nil {
+			s.startCounts = make(map[string]int)
+		}
+		s.startCounts[request.ConversationID]++
 	}
 	return runtime, replayed, err
 }
@@ -186,6 +191,37 @@ func (s *ownerScopedAccountRuntimeControlStub) Get(_ context.Context, conversati
 	defer s.mu.Unlock()
 	runtime, found := s.runtimes[conversationID]
 	return runtime, found, nil
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) StopIdentity(ctx context.Context, conversationID string) (app.AccountAgentRuntimeStopIdentity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = s.runtimes[conversationID]
+	return s.accountRuntimeControlStub.StopIdentity(ctx, conversationID)
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) RequestStop(ctx context.Context, fence app.AccountAgentRuntimeFence) (app.AccountAgentRuntime, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = s.runtimes[fence.ConversationID]
+	runtime, err := s.accountRuntimeControlStub.RequestStop(ctx, fence)
+	if err != nil {
+		return app.AccountAgentRuntime{}, err
+	}
+	s.runtimes[fence.ConversationID] = s.runtime
+	return runtime, nil
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) ConfirmGuardianStopped(ctx context.Context, attestation app.AccountAgentRuntimeStopAttestation,
+	verifier app.AccountAgentRuntimeStopVerifier) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = s.runtimes[attestation.Fence.ConversationID]
+	if _, err := s.accountRuntimeControlStub.ConfirmGuardianStopped(ctx, attestation, verifier); err != nil {
+		return false, err
+	}
+	s.runtimes[attestation.Fence.ConversationID] = s.runtime
+	return false, nil
 }
 
 type accountRuntimeStopVerifierStub struct{}
@@ -245,6 +281,62 @@ type accountRuntimeSupervisorStub struct {
 	incomplete     bool
 	stopCalls      int
 	renewCalls     int
+}
+
+type blockingAccountRuntimeSupervisor struct {
+	*accountRuntimeSupervisorStub
+	mu           sync.Mutex
+	startGates   map[string]<-chan struct{}
+	renewGates   map[string]<-chan struct{}
+	stopGates    map[string]<-chan struct{}
+	startEntered chan string
+	renewEntered chan string
+	stopEntered  chan string
+}
+
+func (s *blockingAccountRuntimeSupervisor) wait(ctx context.Context, conversationID string,
+	gates map[string]<-chan struct{}, entered chan string) error {
+	s.mu.Lock()
+	gate := gates[conversationID]
+	s.mu.Unlock()
+	if gate == nil {
+		return nil
+	}
+	select {
+	case entered <- conversationID:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *blockingAccountRuntimeSupervisor) StartAccountRuntime(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	nonce []byte, expiresAt time.Time) (CloudDSHAccountRuntimeProcess, error) {
+	if err := s.wait(ctx, fence.ConversationID, s.startGates, s.startEntered); err != nil {
+		return CloudDSHAccountRuntimeProcess{}, err
+	}
+	return s.accountRuntimeSupervisorStub.StartAccountRuntime(ctx, fence, nonce, expiresAt)
+}
+
+func (s *blockingAccountRuntimeSupervisor) RenewAccountRuntime(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	nonceSHA256 string, expiresAt time.Time) error {
+	if err := s.wait(ctx, fence.ConversationID, s.renewGates, s.renewEntered); err != nil {
+		return err
+	}
+	return s.accountRuntimeSupervisorStub.RenewAccountRuntime(ctx, fence, nonceSHA256, expiresAt)
+}
+
+func (s *blockingAccountRuntimeSupervisor) RecoverAccountRuntimeStopped(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	nonceSHA256 string) (app.AccountAgentRuntimeStopAttestation, error) {
+	if err := s.wait(ctx, fence.ConversationID, s.stopGates, s.stopEntered); err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	return s.accountRuntimeSupervisorStub.RecoverAccountRuntimeStopped(ctx, fence, nonceSHA256)
 }
 
 func (s *accountRuntimeSupervisorStub) StartAccountRuntime(_ context.Context, fence app.AccountAgentRuntimeFence, _ []byte,
@@ -364,6 +456,290 @@ func TestAccountAgentRuntimeSessionsAreIsolatedByConversation(t *testing.T) {
 	_ = second.process.Output.Close()
 	_ = third.process.Input.Close()
 	_ = third.process.Output.Close()
+}
+
+func newOwnerScopedRuntimeManager(t *testing.T, supervisor CloudDSHAccountRuntimeSupervisor) (*CloudDSHAccountRuntimeManager, *ownerScopedAccountRuntimeControlStub) {
+	t.Helper()
+	control := &ownerScopedAccountRuntimeControlStub{accountRuntimeControlStub: &accountRuntimeControlStub{},
+		runtimes: make(map[string]app.AccountAgentRuntime)}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: control, Supervisor: supervisor, Guardian: &accountRuntimeGuardianStub{},
+		StopVerifier: accountRuntimeStopVerifierStub{}, TaskStopper: &accountRuntimeTaskStopperStub{},
+		LeaseOwner: "worker-runtime", MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager, control
+}
+
+type accountRuntimeAcquireResult struct {
+	session *cloudDSHAccountRuntimeSession
+	err     error
+}
+
+func waitAccountRuntimeEvent(t *testing.T, events <-chan string) string {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for account Runtime operation")
+		return ""
+	}
+}
+
+func TestAccountAgentRuntimeColdStartsDoNotBlockOtherConversations(t *testing.T) {
+	startGate := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStart := func() { releaseOnce.Do(func() { close(startGate) }) }
+	defer releaseStart()
+	supervisor := &blockingAccountRuntimeSupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{},
+		startGates: map[string]<-chan struct{}{"c1234567": startGate}, startEntered: make(chan string, 4)}
+	manager, control := newOwnerScopedRuntimeManager(t, supervisor)
+
+	first := make(chan accountRuntimeAcquireResult, 1)
+	go func() {
+		session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
+		first <- accountRuntimeAcquireResult{session: session, err: err}
+	}()
+	if got := waitAccountRuntimeEvent(t, supervisor.startEntered); got != "c1234567" {
+		t.Fatalf("blocked start conversation = %q", got)
+	}
+	second := make(chan accountRuntimeAcquireResult, 1)
+	go func() {
+		session, err := manager.Acquire(context.Background(), "u7654321", "c7654321")
+		second <- accountRuntimeAcquireResult{session: session, err: err}
+	}()
+	var secondResult accountRuntimeAcquireResult
+	select {
+	case secondResult = <-second:
+	case <-time.After(2 * time.Second):
+		t.Error("a blocked conversation startup prevented another conversation from becoming ready")
+	}
+	releaseStart()
+	firstResult := <-first
+	if firstResult.err != nil {
+		t.Fatalf("first conversation acquire: %v", firstResult.err)
+	}
+	if secondResult.session == nil {
+		secondResult = <-second
+	}
+	if secondResult.err != nil || secondResult.session == nil || firstResult.session == secondResult.session {
+		t.Fatalf("independent conversation Runtime was not created: first=%p second=%p err=%v",
+			firstResult.session, secondResult.session, secondResult.err)
+	}
+	control.mu.Lock()
+	startsFirst, startsSecond := control.startCounts["c1234567"], control.startCounts["c7654321"]
+	control.mu.Unlock()
+	if startsFirst != 1 || startsSecond != 1 {
+		t.Fatalf("Runtime starts first=%d second=%d, want 1/1", startsFirst, startsSecond)
+	}
+	for _, session := range []*cloudDSHAccountRuntimeSession{firstResult.session, secondResult.session} {
+		_ = session.process.Input.Close()
+		_ = session.process.Output.Close()
+	}
+}
+
+func TestAccountAgentRuntimeConcurrentAcquireSharesOneStartup(t *testing.T) {
+	supervisor := &blockingAccountRuntimeSupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}}
+	manager, control := newOwnerScopedRuntimeManager(t, supervisor)
+	start := make(chan struct{})
+	results := make(chan accountRuntimeAcquireResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
+			results <- accountRuntimeAcquireResult{session: session, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil || first.session == nil || first.session != second.session {
+		t.Fatalf("same-conversation acquire did not share Runtime: first=%p/%v second=%p/%v",
+			first.session, first.err, second.session, second.err)
+	}
+	control.mu.Lock()
+	starts := control.startCounts["c1234567"]
+	control.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("same conversation started %d Runtimes, want 1", starts)
+	}
+	_ = first.session.process.Input.Close()
+	_ = first.session.process.Output.Close()
+}
+
+func TestAccountAgentRuntimeRunsMultipleUsersAndConversationsConcurrently(t *testing.T) {
+	supervisor := &blockingAccountRuntimeSupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}}
+	manager, control := newOwnerScopedRuntimeManager(t, supervisor)
+	requests := []struct{ owner, conversation string }{
+		{owner: "u1234567", conversation: "c1111111"},
+		{owner: "u1234567", conversation: "c2222222"},
+		{owner: "u7654321", conversation: "c3333333"},
+		{owner: "u7654321", conversation: "c4444444"},
+	}
+	start := make(chan struct{})
+	type result struct {
+		conversation string
+		session      *cloudDSHAccountRuntimeSession
+		err          error
+	}
+	results := make(chan result, len(requests))
+	for _, request := range requests {
+		request := request
+		go func() {
+			<-start
+			session, err := manager.Acquire(context.Background(), request.owner, request.conversation)
+			results <- result{conversation: request.conversation, session: session, err: err}
+		}()
+	}
+	close(start)
+	seen := make(map[*cloudDSHAccountRuntimeSession]bool, len(requests))
+	for range requests {
+		value := <-results
+		if value.err != nil || value.session == nil || seen[value.session] {
+			t.Fatalf("concurrent conversation %s did not get an isolated Runtime: %p, %v", value.conversation, value.session, value.err)
+		}
+		seen[value.session] = true
+	}
+	manager.mu.Lock()
+	sessions := make(map[string]*cloudDSHAccountRuntimeSession, len(manager.sessions))
+	for conversation, session := range manager.sessions {
+		sessions[conversation] = session
+	}
+	manager.mu.Unlock()
+	control.mu.Lock()
+	starts := make(map[string]int, len(control.startCounts))
+	for conversation, count := range control.startCounts {
+		starts[conversation] = count
+	}
+	control.mu.Unlock()
+	for _, request := range requests {
+		session := sessions[request.conversation]
+		if starts[request.conversation] != 1 || session == nil || session.runtime.Fence.OwnerID != request.owner {
+			t.Fatalf("Runtime mapping for %s/%s was not isolated: starts=%d session=%p", request.owner, request.conversation,
+				starts[request.conversation], session)
+		}
+		_ = session.process.Input.Close()
+		_ = session.process.Output.Close()
+	}
+}
+
+func TestAccountAgentRuntimeRenewalDoesNotBlockOtherAcquire(t *testing.T) {
+	renewGate := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRenew := func() { releaseOnce.Do(func() { close(renewGate) }) }
+	defer releaseRenew()
+	supervisor := &blockingAccountRuntimeSupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{},
+		renewGates: map[string]<-chan struct{}{"c1234567": renewGate}, renewEntered: make(chan string, 4)}
+	manager, _ := newOwnerScopedRuntimeManager(t, supervisor)
+	first, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Acquire(context.Background(), "u7654321", "c7654321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = first.process.Input.Close()
+		_ = first.process.Output.Close()
+		_ = second.process.Input.Close()
+		_ = second.process.Output.Close()
+	}()
+	first.renewMu.Lock()
+	first.leaseExpiresAt = time.Now().Add(app.MaxAgentLease / 4)
+	first.renewMu.Unlock()
+
+	renewed := make(chan error, 1)
+	go func() { renewed <- manager.renewIdleSessions(context.Background()) }()
+	if got := waitAccountRuntimeEvent(t, supervisor.renewEntered); got != "c1234567" {
+		t.Fatalf("blocked renewal conversation = %q", got)
+	}
+	acquired := make(chan accountRuntimeAcquireResult, 1)
+	go func() {
+		session, err := manager.Acquire(context.Background(), "u7654321", "c7654321")
+		acquired <- accountRuntimeAcquireResult{session: session, err: err}
+	}()
+	var result accountRuntimeAcquireResult
+	select {
+	case result = <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Error("a blocked Runtime renewal prevented another conversation acquire")
+	}
+	releaseRenew()
+	if result.session == nil {
+		result = <-acquired
+	}
+	if result.err != nil || result.session != second {
+		t.Fatalf("other conversation acquire = %p/%v, want %p", result.session, result.err, second)
+	}
+	if err := <-renewed; err != nil {
+		t.Fatalf("idle Runtime renewal: %v", err)
+	}
+}
+
+func TestAccountAgentRuntimeStopRecoveryDoesNotBlockOtherAcquire(t *testing.T) {
+	stopGate := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStop := func() { releaseOnce.Do(func() { close(stopGate) }) }
+	defer releaseStop()
+	supervisor := &blockingAccountRuntimeSupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{},
+		stopGates: map[string]<-chan struct{}{"c1234567": stopGate}, stopEntered: make(chan string, 4)}
+	manager, control := newOwnerScopedRuntimeManager(t, supervisor)
+	first, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Acquire(context.Background(), "u7654321", "c7654321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = second.process.Input.Close()
+		_ = second.process.Output.Close()
+	}()
+	control.mu.Lock()
+	stopping := control.runtimes["c1234567"]
+	stopping.State = app.AccountAgentRuntimeStopping
+	control.runtimes["c1234567"] = stopping
+	control.candidates = []app.AccountAgentRuntimeStopIdentity{{
+		Fence: first.runtime.Fence, NonceSHA256: first.runtime.NonceSHA256, ExpiresAt: first.runtime.LeaseExpiresAt}}
+	control.mu.Unlock()
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- manager.reapStopCandidates(context.Background()) }()
+	if got := waitAccountRuntimeEvent(t, supervisor.stopEntered); got != "c1234567" {
+		t.Fatalf("blocked stop recovery conversation = %q", got)
+	}
+	acquired := make(chan accountRuntimeAcquireResult, 1)
+	go func() {
+		session, err := manager.Acquire(context.Background(), "u7654321", "c7654321")
+		acquired <- accountRuntimeAcquireResult{session: session, err: err}
+	}()
+	var result accountRuntimeAcquireResult
+	select {
+	case result = <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Error("a blocked Runtime stop recovery prevented another conversation acquire")
+	}
+	releaseStop()
+	if result.session == nil {
+		result = <-acquired
+	}
+	if result.err != nil || result.session != second {
+		t.Fatalf("other conversation acquire = %p/%v, want %p", result.session, result.err, second)
+	}
+	if err := <-stopped; err != nil {
+		t.Fatalf("Runtime stop recovery: %v", err)
+	}
+	manager.mu.Lock()
+	firstCached, secondCached := manager.sessions["c1234567"], manager.sessions["c7654321"]
+	manager.mu.Unlock()
+	if firstCached != nil || secondCached != second {
+		t.Fatalf("stop recovery session cache first=%p second=%p, want nil/%p", firstCached, secondCached, second)
+	}
+	_ = first.process.Output.Close()
 }
 
 type coordinatorRuntimeWriteCounter struct {

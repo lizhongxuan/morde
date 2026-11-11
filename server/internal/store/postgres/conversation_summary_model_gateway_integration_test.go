@@ -63,7 +63,7 @@ func summaryModelGateway(t *testing.T, gateway *app.ModelGatewayService) *app.Mo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.SetConversationSummarySealer(sealer); err != nil {
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
 		t.Fatal(err)
 	}
 	return gateway

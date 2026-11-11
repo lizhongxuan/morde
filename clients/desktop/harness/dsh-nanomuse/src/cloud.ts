@@ -30,7 +30,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isIP } from 'node:net'
 import { ApprovalDesk, appOf, type ApprovalScope, isOwnApp, checkForUpdate, compareVersions, DEVICE_GRANT_PREFIX, grantCovers, HoldDesk, modelFor, pickChatModel, pickHandsModel, REMOTE_CONTROL_GRANT_ID, scheduleRunIds, sharedConnectors, standingGrants, takesImages, UPDATE_RETRY_MS, updateCacheFresh, withGrant, type Grant, type Hold, type HoldTool, type PendingApproval, type StandingGrant, type UpdateInfo } from './desk.ts'
 import { arch, homedir, hostname, release, type, userInfo } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { Service, type Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -732,6 +732,18 @@ async function mordeRequest<T>(baseURL: string, route: string, init: RequestInit
   }
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new RelayError(502, 'bad_response', 'Morde server sent an invalid response')
   return body as T
+}
+
+const mordeHubFileFetchErrorCodes = new Map<string, string>([
+  ['cancelled', 'cancelled'], ['conflict', 'conflict'], ['source_changed', 'conflict'],
+  ['denied', 'denied'], ['failed', 'failed'], ['forbidden', 'not_allowed'], ['not_allowed', 'not_allowed'],
+  ['not_found', 'not_found'], ['offline', 'timeout'], ['permission_required', 'permission_required'],
+  ['quota_exceeded', 'quota_exceeded'], ['rate_limited', 'quota_exceeded'], ['timeout', 'timeout'],
+  ['too_large', 'too_large'], ['unauthenticated', 'permission_required'], ['unsupported', 'unsupported'],
+])
+
+function mordeHubFileFetchErrorCode(code: string): string {
+  return mordeHubFileFetchErrorCodes.get(code) ?? 'failed'
 }
 
 function mordeObjectSegment(value: string): string {
@@ -3412,6 +3424,12 @@ export default class NanomuseCloud extends Service {
         throw new HubError('not_allowed', 'The file retrieval Task context is invalid')
       }
       if (!state.fileRoot) throw new HubError('not_allowed', 'File access is not allowed on this computer')
+      const sourceDirectoryName = basename(state.fileRoot.directory)
+      if (!sourceDirectoryName || sourceDirectoryName === '.' || sourceDirectoryName === '..' ||
+        Buffer.byteLength(sourceDirectoryName, 'utf8') > 100 || sourceDirectoryName.includes('/') || sourceDirectoryName.includes('\\') ||
+        /\p{Cc}/u.test(sourceDirectoryName) || Buffer.from(sourceDirectoryName, 'utf8').toString('utf8') !== sourceDirectoryName) {
+        throw new HubError('not_allowed', 'The selected folder name is invalid')
+      }
 
       const snapshot = await mordeHubFileSnapshot(state.fileRoot, args.path, process.env, call.signal)
       let accessRecord: MordeHubFileAccessRecord = {
@@ -3447,7 +3465,7 @@ export default class NanomuseCloud extends Service {
         } catch (error: unknown) {
           if (error instanceof HubError) throw error
           if (call.signal.aborted) throw new HubError('cancelled', 'The file transfer was cancelled')
-          const code = error instanceof RelayError && /^[a-z_]{3,64}$/.test(error.code) ? error.code : 'failed'
+          const code = error instanceof RelayError ? mordeHubFileFetchErrorCode(error.code) : 'failed'
           throw new HubError(code, 'The file transfer could not be completed')
         }
       }
@@ -3455,6 +3473,7 @@ export default class NanomuseCloud extends Service {
       try {
         await this.recheckMordeHubTaskGrant('file.fetch', call.from)
         const manifest = await request('POST', '/manifest', {
+          source_directory_name: sourceDirectoryName,
           source_version: snapshot.version,
           source_sha256: snapshot.sha256,
           size_bytes: snapshot.size_bytes,

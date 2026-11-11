@@ -1,6 +1,11 @@
 import SwiftUI
 import UIKit
 
+private struct MIFTaskFileFetchPreview: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 enum MIFTaskPageRules {
     static func merge(current: [MordeTask], incoming: [MordeTask]) -> [MordeTask] {
         var merged: [MordeTask] = []
@@ -741,6 +746,11 @@ struct MIFTaskDetailView: View {
     @State private var detailGeneration = UUID()
     @State private var actionGeneration = UUID()
     @State private var clarificationAnswer = ""
+    @State private var fileFetchPreview: MIFTaskFileFetchPreview?
+    @State private var fileFetchToCancel: MordeTaskFileFetch?
+    @State private var fileFetchToDelete: MordeTaskFileFetch?
+    @State private var fileFetchActionError: String?
+    @State private var isPerformingFileFetchAction = false
     @FocusState private var isClarificationFocused: Bool
 
     private var taskSecondaryText: Color {
@@ -789,7 +799,7 @@ struct MIFTaskDetailView: View {
                         detailContent
                     }
                     .padding(.top, 2)
-                    .padding(.bottom, hasActionFooter ? 170 : 14)
+                    .padding(.bottom, 14)
                     .nmOnChange(of: task?.id) { _ in
                         guard scrollToActivity, task != nil else { return }
                         DispatchQueue.main.async {
@@ -803,7 +813,7 @@ struct MIFTaskDetailView: View {
                 .accessibilityIdentifier("morde.task.detailScroll")
             }
         }
-        .overlay(alignment: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if hasActionFooter, let task {
                 taskActions(task)
                     .padding(.bottom, 104)
@@ -827,9 +837,62 @@ struct MIFTaskDetailView: View {
             .disabled(isLoadingDetail || detailError != nil || store.actionInFlight)
             Button(AppLocalized("Back"), role: .cancel) {}
         }
+        .confirmationDialog(AppLocalized("Cancel this file request?"), isPresented: Binding(
+            get: { fileFetchToCancel != nil }, set: { if !$0 { fileFetchToCancel = nil } }),
+            titleVisibility: .visible) {
+            Button(AppLocalized("Cancel file request"), role: .destructive) {
+                guard let fetch = fileFetchToCancel else { return }
+                fileFetchToCancel = nil
+                Task { await cancelFileFetch(fetch) }
+            }
+            .accessibilityIdentifier("morde.task.fileFetch.confirmCancel")
+            Button(AppLocalized("Back"), role: .cancel) { fileFetchToCancel = nil }
+        } message: {
+            Text(fileFetchToCancel.map { String(format: AppLocalized("Cancel fetch for %@?"), $0.relative_path) } ?? "")
+        }
+        .confirmationDialog(AppLocalized("Delete retained file copy?"), isPresented: Binding(
+            get: { fileFetchToDelete != nil }, set: { if !$0 { fileFetchToDelete = nil } }),
+            titleVisibility: .visible) {
+            Button(AppLocalized("Delete cloud copy"), role: .destructive) {
+                guard let fetch = fileFetchToDelete else { return }
+                fileFetchToDelete = nil
+                Task { await deleteFileFetchCopy(fetch) }
+            }
+            .accessibilityIdentifier("morde.task.fileFetch.confirmDelete")
+            Button(AppLocalized("Back"), role: .cancel) { fileFetchToDelete = nil }
+        } message: {
+            Text(AppLocalized("The PC source file and Task history are unaffected."))
+        }
+        .sheet(item: $fileFetchPreview) { preview in
+            MordeWorkspaceQuickLook(url: preview.url)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("morde.task.fileFetch.preview")
+                .onDisappear { removeFileFetchPreview(preview) }
+        }
+        .onChange(of: store.scopeKey) { _ in
+            closeFileFetchPreview()
+            fileFetchToCancel = nil
+            fileFetchToDelete = nil
+            fileFetchActionError = nil
+        }
         .task(id: "\(store.scopeKey ?? "")-\(taskID)") {
             await loadDetail(scope: store.scopeKey, taskID: taskID)
         }
+        .task(id: "\(store.scopeKey ?? "")-\(taskID)-file-fetches") {
+            guard store.isSignedIn, let scope = store.scopeKey else { return }
+            while !Task.isCancelled, scope == store.scopeKey {
+                do { try await store.refreshFileFetches(taskID: taskID) }
+                catch { if Task.isCancelled { return } }
+                let taskFinished = ["completed", "failed", "cancelled"].contains(store.details[taskID]?.status ?? "")
+                let fetchInFlight = (store.fileFetches[taskID] ?? []).contains {
+                    !["completed", "cancelled", "failed"].contains($0.status)
+                }
+                if taskFinished && !fetchInFlight && store.fileFetchErrors[taskID] == nil { return }
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+        .onDisappear { closeFileFetchPreview() }
     }
 
     @ViewBuilder
@@ -851,6 +914,7 @@ struct MIFTaskDetailView: View {
             taskClarification(task)
             taskActivity(task)
             taskArtifacts(task)
+            taskFileFetches(task)
         } else if isLoadingDetail {
             ProgressView(AppLocalized("Loading tasks…"))
                 .frame(maxWidth: .infinity, minHeight: 150)
@@ -1354,6 +1418,278 @@ struct MIFTaskDetailView: View {
         }
     }
 
+    @ViewBuilder
+    private func taskFileFetches(_ task: MordeTask) -> some View {
+        if let fetches = store.fileFetches[task.id] {
+            MIFTaskSection(title: AppLocalized("PC file requests")) {
+                if store.fileFetchErrors[task.id] != nil {
+                    MIFTaskInlineError(message: AppLocalized("Unable to load PC file requests."))
+                }
+                if let fileFetchActionError {
+                    MIFTaskInlineError(message: fileFetchActionError)
+                        .accessibilityIdentifier("morde.task.fileFetch.actionError")
+                        .accessibilityElement(children: .combine)
+                }
+                if fetches.isEmpty {
+                    Text(AppLocalized("No PC file requests"))
+                        .font(.subheadline)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                } else {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(fetches.enumerated()), id: \.element.fetch_id) { index, fetch in
+                            if index > 0 { NanoMuseRowDivider() }
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(String(format: AppLocalized("Source device · %@"), fetch.source_device_name))
+                                    .font(.body.weight(.medium))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(sourceDeviceStatus(fetch))
+                                    .font(.subheadline)
+                                    .foregroundStyle(taskSecondaryText)
+                                Text(String(format: AppLocalized("Authorized directory · %@"), fetch.sourceDirectoryLabel))
+                                    .font(.subheadline)
+                                    .foregroundStyle(taskSecondaryText)
+                                    .accessibilityIdentifier("morde.task.fileFetch.directory.\(fetch.fetch_id)")
+                                Text(String(format: AppLocalized("Relative path · %@"), fetch.relative_path))
+                                    .font(.subheadline)
+                                    .foregroundStyle(taskSecondaryText)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityIdentifier("morde.task.fileFetch.path.\(fetch.fetch_id)")
+                                if let version = fetch.source_version {
+                                    Text(String(format: AppLocalized("Source snapshot %@"), String(version.prefix(12))))
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(taskSecondaryText)
+                                } else {
+                                    Text(AppLocalized("Source version pending"))
+                                        .font(.caption)
+                                        .foregroundStyle(taskSecondaryText)
+                                }
+                                Text(taskFileFetchStatus(fetch))
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(fetch.status == "failed" ? .orange : taskSecondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityIdentifier("morde.task.fileFetch.status.\(fetch.fetch_id)")
+                                if fetch.status == "failed" {
+                                    Text(taskFileFetchFailureReason(fetch))
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .accessibilityIdentifier("morde.task.fileFetch.failureReason.\(fetch.fetch_id)")
+                                }
+                                if let size = fetch.size_bytes {
+                                    Text(String(format: AppLocalized("File size · %@"), Self.fileSize(size)))
+                                        .font(.caption)
+                                        .foregroundStyle(taskSecondaryText)
+                                        .accessibilityIdentifier("morde.task.fileFetch.size.\(fetch.fetch_id)")
+                                    Text(String(format: AppLocalized("Transfer progress %@ of %@"),
+                                                Self.fileSize(fetch.confirmed_bytes), Self.fileSize(size)))
+                                        .font(.caption)
+                                        .foregroundStyle(taskSecondaryText)
+                                        .accessibilityIdentifier("morde.task.fileFetch.progress.\(fetch.fetch_id)")
+                                    ProgressView(value: Double(fetch.confirmed_bytes), total: Double(max(size, 1)))
+                                        .accessibilityLabel(AppLocalized("PC file transfer progress"))
+                                        .accessibilityIdentifier("morde.task.fileFetch.progressView.\(fetch.fetch_id)")
+                                } else {
+                                    Text(String(format: AppLocalized("Received so far · %@"), Self.fileSize(fetch.confirmed_bytes)))
+                                        .font(.caption)
+                                        .foregroundStyle(taskSecondaryText)
+                                }
+                                if let digest = fetch.source_sha256 {
+                                    Text(String(format: AppLocalized("SHA-256 · %@"), digest))
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(taskSecondaryText)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .accessibilityIdentifier("morde.task.fileFetch.sha256.\(fetch.fetch_id)")
+                                } else {
+                                    Text(AppLocalized("File hash pending"))
+                                        .font(.caption)
+                                        .foregroundStyle(taskSecondaryText)
+                                }
+                                Text(taskFileFetchParseStatus(fetch))
+                                    .font(.caption)
+                                    .foregroundStyle(taskSecondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityIdentifier("morde.task.fileFetch.parseStatus.\(fetch.fetch_id)")
+                                Text(taskFileFetchCopyStatus(fetch))
+                                    .font(.caption)
+                                    .foregroundStyle(taskSecondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityIdentifier("morde.task.fileFetch.copyStatus.\(fetch.fetch_id)")
+                                HStack(spacing: 10) {
+                                    if fetch.canOpen {
+                                        Button(AppLocalized("Open file")) { Task { await previewFileFetch(fetch, taskID: task.id) } }
+                                            .accessibilityIdentifier("morde.task.fileFetch.open.\(fetch.fetch_id)")
+                                    }
+                                    if fetch.canCancel {
+                                        Button(fetch.status == "cancelling" ? AppLocalized("Cancellation pending") : AppLocalized("Cancel file request")) {
+                                            fileFetchToCancel = fetch
+                                        }
+                                        .disabled(fetch.status == "cancelling" || isPerformingFileFetchAction || store.actionInFlight)
+                                        .accessibilityIdentifier("morde.task.fileFetch.cancel.\(fetch.fetch_id)")
+                                    }
+                                    if fetch.canDeleteCopy {
+                                        Button(AppLocalized("Delete cloud copy"), role: .destructive) { fileFetchToDelete = fetch }
+                                            .disabled(isPerformingFileFetchAction || store.actionInFlight)
+                                            .accessibilityIdentifier("morde.task.fileFetch.delete.\(fetch.fetch_id)")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 13)
+                        }
+                    }
+                }
+            }
+        } else if store.fileFetchErrors[task.id] != nil {
+            MIFTaskSection(title: AppLocalized("PC file requests")) {
+                MIFTaskInlineError(message: AppLocalized("Unable to load PC file requests."))
+                    .accessibilityIdentifier("morde.task.fileFetch.error")
+            }
+        }
+    }
+
+    private func taskFileFetchStatus(_ fetch: MordeTaskFileFetch) -> String {
+        switch fetch.status {
+        case "queued": return AppLocalized("Waiting to request file")
+        case "waiting_device": return AppLocalized("Waiting for PC to reconnect")
+        case "transferring": return AppLocalized("Receiving file from PC")
+        case "verifying": return AppLocalized("Verifying received file")
+        case "completed": return AppLocalized("File received")
+        case "cancelling": return AppLocalized("Cancellation pending")
+        case "cancelled": return AppLocalized("File request cancelled")
+        case "failed": return AppLocalized("File request failed")
+        default: return AppLocalized("File request status unknown")
+        }
+    }
+
+    private func taskFileFetchFailureReason(_ fetch: MordeTaskFileFetch) -> String {
+        switch fetch.failure_reason {
+        case "access_denied": AppLocalized("File access denied or revoked")
+        case "source_changed": AppLocalized("The source file changed during transfer")
+        case "file_unavailable": AppLocalized("The source file is unavailable")
+        case "limit_exceeded": AppLocalized("File size or storage limit exceeded")
+        case "unsupported": AppLocalized("This file type is not supported")
+        case "source_unavailable": AppLocalized("The source device or service is unavailable")
+        case "transfer_failed": AppLocalized("File transfer did not complete")
+        default: AppLocalized("A safe failure reason is unavailable")
+        }
+    }
+
+    private func sourceDeviceStatus(_ fetch: MordeTaskFileFetch) -> String {
+        if fetch.status == "waiting_device" || store.sourceDeviceOnline(installationID: fetch.source_installation_id) == false {
+            return AppLocalized("Source device offline")
+        }
+        return store.sourceDeviceOnline(installationID: fetch.source_installation_id) == true
+            ? AppLocalized("Source device online")
+            : AppLocalized("Device status unavailable")
+    }
+
+    private func taskFileFetchParseStatus(_ fetch: MordeTaskFileFetch) -> String {
+        switch fetch.parse_status {
+        case "extracted": return AppLocalized("Safe text was extracted for the task as untrusted data.")
+        case "raw_only": return AppLocalized("The file is stored, but its content was not read by the model.")
+        case "failed":
+            let reason = fetch.parse_error.map(taskFileFetchParseError) ?? AppLocalized("Content unavailable")
+            return String(format: AppLocalized("File transfer completed; content extraction failed: %@"), reason)
+        case "unavailable": return AppLocalized("File content is unavailable to the task.")
+        default: return AppLocalized("File content is being prepared.")
+        }
+    }
+
+    private func taskFileFetchParseError(_ error: String) -> String {
+        switch error {
+        case "invalid_encoding": return AppLocalized("Text encoding is invalid")
+        case "invalid_document": return AppLocalized("Document could not be parsed")
+        case "result_too_large": return AppLocalized("Extracted content is too large")
+        case "content_unavailable": return AppLocalized("Content unavailable")
+        case "integrity_failed": return AppLocalized("File integrity check failed")
+        default: return AppLocalized("Content unavailable")
+        }
+    }
+
+    private func taskFileFetchCopyStatus(_ fetch: MordeTaskFileFetch) -> String {
+        switch fetch.content_state {
+        case "retained":
+            guard let expiresAt = fetch.expires_at else { return AppLocalized("Cloud copy retained") }
+            return String(format: AppLocalized("Cloud copy retained until %@"), expiresAt)
+        case "deleted": return AppLocalized("Cloud copy deleted")
+        case "expired": return AppLocalized("Cloud copy expired")
+        default: return AppLocalized("No cloud copy available")
+        }
+    }
+
+    private static func fileSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func previewFileFetch(_ fetch: MordeTaskFileFetch, taskID: String) async {
+        let requestedScope = store.scopeKey
+        guard fetch.canOpen, let fileExtension = fetch.previewExtension,
+              fetch.isValid(for: taskID), let requestedScope,
+              requestedScope == loadedScopeKey, !isPerformingFileFetchAction, !store.actionInFlight else { return }
+        isPerformingFileFetchAction = true
+        defer { isPerformingFileFetchAction = false }
+        fileFetchActionError = nil
+        do {
+            let data = try await store.fileFetchContent(taskID: taskID, fetchID: fetch.fetch_id)
+            guard requestedScope == store.scopeKey, requestedScope == loadedScopeKey else { return }
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "morde-task-fetch-\(fetch.fetch_id)-\(UUID().uuidString).\(fileExtension)")
+            try data.write(to: url, options: .atomic)
+            guard requestedScope == store.scopeKey, requestedScope == loadedScopeKey else {
+                try? FileManager.default.removeItem(at: url)
+                return
+            }
+            fileFetchPreview = MIFTaskFileFetchPreview(url: url)
+        } catch {
+            guard requestedScope == store.scopeKey else { return }
+            let failure = error as NSError
+            fileFetchActionError = failure.domain == "MordeTaskFileFetchIntegrity"
+                ? AppLocalized("The downloaded file failed integrity verification.")
+                : AppLocalized("Could not open the file.")
+            try? await store.refreshFileFetches(taskID: taskID)
+        }
+    }
+
+    private func cancelFileFetch(_ fetch: MordeTaskFileFetch) async {
+        guard fetch.canCancel, !isPerformingFileFetchAction, !store.actionInFlight else { return }
+        isPerformingFileFetchAction = true
+        defer { isPerformingFileFetchAction = false }
+        fileFetchActionError = nil
+        do { try await store.cancelFileFetch(taskID: taskID, fetchID: fetch.fetch_id) }
+        catch {
+            fileFetchActionError = AppLocalized("Could not cancel the file request.")
+            try? await store.refreshFileFetches(taskID: taskID)
+        }
+    }
+
+    private func deleteFileFetchCopy(_ fetch: MordeTaskFileFetch) async {
+        guard fetch.canDeleteCopy, !isPerformingFileFetchAction, !store.actionInFlight else { return }
+        isPerformingFileFetchAction = true
+        defer { isPerformingFileFetchAction = false }
+        fileFetchActionError = nil
+        do { try await store.deleteFileFetchCopy(taskID: taskID, fetchID: fetch.fetch_id) }
+        catch {
+            fileFetchActionError = AppLocalized("Could not delete the cloud copy.")
+            try? await store.refreshFileFetches(taskID: taskID)
+        }
+    }
+
+    private func removeFileFetchPreview(_ preview: MIFTaskFileFetchPreview) {
+        try? FileManager.default.removeItem(at: preview.url)
+    }
+
+    private func closeFileFetchPreview() {
+        guard let preview = fileFetchPreview else { return }
+        fileFetchPreview = nil
+        removeFileFetchPreview(preview)
+    }
+
     private func loadDetail(scope: String?, taskID: String) async {
         let requestedTaskID = taskID
         let contextChanged = requestedScopeKey != scope || self.requestedTaskID != requestedTaskID
@@ -1580,7 +1916,7 @@ struct MIFTaskErrorState: View {
         .padding(16)
         .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .padding(.horizontal, 16)
-        .accessibilityElement(children: .contain)
+        .accessibilityElement(children: .combine)
         .accessibilityIdentifier("morde.task.loadError")
     }
 }
