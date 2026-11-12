@@ -15,9 +15,11 @@ import (
 	mordesync "morde-sync"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -52,20 +54,116 @@ FROM workspace_share_links WHERE id=$1 FOR UPDATE`, request.ShareID).Scan(
 	return nil
 }
 
+func verifyWorkspaceCopyHostSourceTx(ctx context.Context, tx pgx.Tx, request app.WorkspaceCopyReservationRequest) error {
+	if request.SourceHostID == "" {
+		return nil
+	}
+	var hostID string
+	if err := tx.QueryRow(ctx, `SELECT id FROM hosts WHERE id=$1 FOR UPDATE NOWAIT`, request.SourceHostID).Scan(&hostID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "host not found")
+		}
+		if isWorkspaceCopyNowaitError(err) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "source Host is changing; retry the copy")
+		}
+		return fmt.Errorf("lock source Host before Workspace copy: %w", err)
+	}
+	var ownerID, state, controlState, sandboxID, runtimeInstanceID string
+	var deleted bool
+	if err := tx.QueryRow(ctx, `SELECT owner_id,state,control_state,COALESCE(sandbox_id,''),COALESCE(runtime_instance_id,''),deleted_at IS NOT NULL
+FROM hosts WHERE id=$1`, request.SourceHostID).Scan(&ownerID, &state, &controlState, &sandboxID, &runtimeInstanceID, &deleted); err != nil {
+		return storeError("verify source Host before Workspace copy", "host", err)
+	}
+	if ownerID != request.SourceOwnerID || deleted {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if state != string(host.StateStopped) || controlState != string(host.ControlAI) || sandboxID != "" || runtimeInstanceID != "" {
+		return domain.NewError(domain.CodeWorkspaceBusy, "source Host must be safely stopped before copying")
+	}
+
+	rows, err := tx.Query(ctx, `SELECT owner_id,workspace_id,state,binding_version,desired_revision,applied_revision,sync_state,sync_conflicts
+FROM workspace_bindings WHERE host_id=$1 AND state <> 'detached' ORDER BY workspace_id FOR UPDATE NOWAIT`, request.SourceHostID)
+	if err != nil {
+		if isWorkspaceCopyNowaitError(err) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "source Host binding is changing; retry the copy")
+		}
+		return fmt.Errorf("lock source Host Workspace bindings before copy: %w", err)
+	}
+	defer rows.Close()
+	var count int
+	var bindingOwner, workspaceID, bindingState, syncState string
+	var bindingVersion, desiredRevision, appliedRevision int64
+	var conflicts []string
+	for rows.Next() {
+		count++
+		if err := rows.Scan(&bindingOwner, &workspaceID, &bindingState, &bindingVersion, &desiredRevision, &appliedRevision, &syncState, &conflicts); err != nil {
+			return fmt.Errorf("read source Host Workspace binding before copy: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if isWorkspaceCopyNowaitError(err) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "source Host binding is changing; retry the copy")
+		}
+		return fmt.Errorf("read source Host Workspace bindings before copy: %w", err)
+	}
+	rows.Close()
+	if count != 1 || bindingOwner != request.SourceOwnerID || workspaceID != request.SourceWorkspaceID ||
+		bindingState != string(workspace.BindingActive) || bindingVersion != request.SourceBindingVersion ||
+		desiredRevision != request.SourceRevision || appliedRevision != request.SourceRevision ||
+		syncState != string(workspace.BindingSyncHealthy) || len(conflicts) != 0 {
+		return domain.NewError(domain.CodeWorkspaceConflict, "source Host must have one healthy Workspace binding at the requested revision")
+	}
+	return nil
+}
+
+func isWorkspaceCopyNowaitError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
+}
+
+func tryLockWorkspaceMutationFenceForHostCopy(ctx context.Context, tx pgx.Tx, workspaceID string) error {
+	var acquired bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('morde:workspace-mutation:' || $1,0))`, workspaceID).Scan(&acquired); err != nil {
+		return fmt.Errorf("try Workspace mutation fence for Host copy: %w", err)
+	}
+	if !acquired {
+		return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is changing; retry the Host copy")
+	}
+	return nil
+}
+
+func lockWorkspaceForHostCopyNowait(ctx context.Context, tx pgx.Tx, workspaceID, exceptCopyReservationID string) error {
+	var lockedID string
+	if err := tx.QueryRow(ctx, `SELECT id FROM workspaces WHERE id=$1 FOR UPDATE NOWAIT`, workspaceID).Scan(&lockedID); err != nil {
+		if isWorkspaceCopyNowaitError(err) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is changing; retry the Host copy")
+		}
+		return storeError("lock Workspace for Host copy", "workspace", err)
+	}
+	return requireWorkspaceOwnershipTransferNotFrozenExceptCopy(ctx, tx, workspaceID, exceptCopyReservationID)
+}
+
 func (s *Store) CreateWorkspaceCopyReservation(ctx context.Context, request app.WorkspaceCopyReservationRequest) (workspace.CopyReservation, bool, error) {
 	if !domain.ValidUserID(request.SourceOwnerID) || !domain.ValidUserID(request.TargetOwnerID) ||
 		!domain.ValidWorkspaceID(request.SourceWorkspaceID) || !domain.ValidWorkspaceID(request.TargetWorkspaceID) ||
 		request.SourceWorkspaceID == request.TargetWorkspaceID || !domain.ValidPendingRequestID(request.ID) || request.TargetName == "" || len(request.TargetName) > 120 ||
 		request.ServiceInstanceID == "" || len(request.ServiceInstanceID) > 128 || request.SourceRevision < 0 || request.ReservedBytes < 0 ||
+		(request.SourceHostID == "") != (request.SourceBindingVersion == 0) ||
+		(request.SourceHostID != "" && (!domain.ValidHostID(request.SourceHostID) || request.SourceBindingVersion < 1)) ||
 		request.MaxOwnerBytes <= 0 || request.TargetQuotaBytes <= 0 || request.Idempotency.OwnerID != request.TargetOwnerID ||
-		request.Idempotency.ResourceID != request.SourceWorkspaceID {
+		(request.SourceHostID == "" && request.Idempotency.ResourceID != request.SourceWorkspaceID) ||
+		(request.SourceHostID != "" && request.Idempotency.ResourceID != request.SourceHostID) {
 		return workspace.CopyReservation{}, false, domain.InvalidArgument("workspace_copy", "Workspace copy reservation fields are invalid")
 	}
 	if request.ShareID == "" {
-		if request.SourceOwnerID != request.TargetOwnerID || request.ReadOnly || request.Idempotency.Operation != "workspace.copy" {
+		wantOperation := "workspace.copy"
+		if request.SourceHostID != "" {
+			wantOperation = "workspace.computer.copy"
+		}
+		if request.SourceOwnerID != request.TargetOwnerID || request.ReadOnly || request.Idempotency.Operation != wantOperation {
 			return workspace.CopyReservation{}, false, domain.InvalidArgument("workspace_copy", "ordinary Workspace copies must retain their owner")
 		}
-	} else if !domain.ValidPendingRequestID(request.ShareID) || request.SourceOwnerID == request.TargetOwnerID ||
+	} else if request.SourceHostID != "" || !domain.ValidPendingRequestID(request.ShareID) || request.SourceOwnerID == request.TargetOwnerID ||
 		request.Idempotency.Operation != "workspace.share.copy" {
 		return workspace.CopyReservation{}, false, domain.InvalidArgument("workspace_copy", "Workspace share copy ownership is invalid")
 	}
@@ -77,23 +175,50 @@ func (s *Store) CreateWorkspaceCopyReservation(ctx context.Context, request app.
 	var reservation workspace.CopyReservation
 	replayed := false
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		if err := lockWorkspaceMutationFence(ctx, tx, request.SourceWorkspaceID, true); err != nil {
-			return err
+		if request.SourceHostID == "" {
+			if err := lockWorkspaceMutationFence(ctx, tx, request.SourceWorkspaceID, true); err != nil {
+				return err
+			}
 		}
-		stored, replay, err := reserveIdempotency(ctx, tx, record, request.SourceWorkspaceID, request.ID)
+		resourceID := request.SourceWorkspaceID
+		if request.SourceHostID != "" {
+			resourceID = request.SourceHostID
+		}
+		stored, replay, err := reserveIdempotency(ctx, tx, record, resourceID, request.ID)
 		if err != nil {
 			return err
 		}
 		if replay {
-			if stored.ResourceID != request.SourceWorkspaceID {
+			if stored.ResourceID != resourceID {
 				return domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy key is bound to another source")
 			}
 			reservation, err = getWorkspaceCopyReservationTx(ctx, tx, stored.RelatedID)
 			if err != nil {
 				return err
 			}
+			if request.SourceHostID != "" {
+				if reservation.SourceOwnerID != request.SourceOwnerID || reservation.TargetOwnerID != request.TargetOwnerID ||
+					reservation.ShareID != "" || reservation.ReadOnly || reservation.SourceHostID != request.SourceHostID ||
+					reservation.SourceRevision != request.SourceRevision || reservation.ServiceInstanceID != request.ServiceInstanceID {
+					return domain.NewError(domain.CodeIdempotencyConflict, "Host copy reservation does not match the original request")
+				}
+				var storedName string
+				var storedQuota int64
+				var storedOwner string
+				if err := tx.QueryRow(ctx, `SELECT owner_id,name,quota_bytes FROM workspaces WHERE id=$1`, reservation.TargetWorkspaceID).
+					Scan(&storedOwner, &storedName, &storedQuota); err != nil || storedOwner != request.TargetOwnerID ||
+					storedName != request.TargetName || storedQuota != request.TargetQuotaBytes {
+					return domain.NewError(domain.CodeIdempotencyConflict, "Host copy target does not match the original request")
+				}
+				replayed = true
+				return nil
+			}
+			if reservation.SourceWorkspaceID != request.SourceWorkspaceID {
+				return domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy key is bound to another source")
+			}
 			if reservation.SourceOwnerID != request.SourceOwnerID || reservation.TargetOwnerID != request.TargetOwnerID ||
 				reservation.ShareID != request.ShareID || reservation.ReadOnly != request.ReadOnly ||
+				reservation.SourceHostID != request.SourceHostID || reservation.SourceBindingVersion != request.SourceBindingVersion ||
 				reservation.SourceWorkspaceID != request.SourceWorkspaceID || reservation.ServiceInstanceID != request.ServiceInstanceID ||
 				reservation.SourceRevision != request.SourceRevision || reservation.ReservedBytes != request.ReservedBytes {
 				return domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation does not match the original request")
@@ -116,9 +241,22 @@ func (s *Store) CreateWorkspaceCopyReservation(ctx context.Context, request app.
 		if err := verifyWorkspaceCopyShareClaimTx(ctx, tx, request, ""); err != nil {
 			return err
 		}
+		if request.SourceHostID != "" {
+			if err := verifyWorkspaceCopyHostSourceTx(ctx, tx, request); err != nil {
+				return err
+			}
+			if err := tryLockWorkspaceMutationFenceForHostCopy(ctx, tx, request.SourceWorkspaceID); err != nil {
+				return err
+			}
+			if err := lockWorkspaceForHostCopyNowait(ctx, tx, request.SourceWorkspaceID, ""); err != nil {
+				return err
+			}
+		}
 
-		if err := lockWorkspaceForSyncMutation(ctx, tx, request.SourceWorkspaceID); err != nil {
-			return err
+		if request.SourceHostID == "" {
+			if err := lockWorkspaceForSyncMutation(ctx, tx, request.SourceWorkspaceID); err != nil {
+				return err
+			}
 		}
 		var currentOwner, state string
 		var readOnly bool
@@ -154,7 +292,7 @@ SELECT 1 FROM workspace_volumes WHERE workspace_id=$1 AND owner_id=$2 AND provis
 		}
 		var blocked bool
 		if err := tx.QueryRow(ctx, `SELECT
-EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1 AND state <> 'detached') OR
+EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1 AND state <> 'detached' AND ($2='' OR host_id<>$2)) OR
 EXISTS (SELECT 1 FROM workspace_sync_sessions WHERE workspace_id=$1 AND state IN ('planned','transferring','verifying','applying')) OR
 EXISTS (SELECT 1 FROM tasks WHERE workspace_id=$1 AND status IN ('queued','running','waiting_user','pausing','cancelling')) OR
 EXISTS (SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')) OR
@@ -162,7 +300,8 @@ EXISTS (SELECT 1 FROM task_mcp_connector_operations o JOIN tasks t ON t.id=o.tas
   WHERE t.workspace_id=$1 AND o.status IN ('prepared','dispatched','unknown')) OR
 EXISTS (SELECT 1 FROM task_workspace_publish_receipts WHERE workspace_id=$1 AND state='pending') OR
 EXISTS (SELECT 1 FROM task_hub_operations o WHERE o.workspace_id=$1 AND o.action='file.put'
-		  AND o.status IN ('prepared','dispatched','unknown') AND o.sync_stage IN ('pending','local_applied','sync_pending'))`, request.SourceWorkspaceID).Scan(&blocked); err != nil {
+			AND o.status IN ('prepared','dispatched','unknown') AND o.sync_stage IN ('pending','local_applied','sync_pending'))`,
+			request.SourceWorkspaceID, request.SourceHostID).Scan(&blocked); err != nil {
 			return fmt.Errorf("check Workspace writers before copy: %w", err)
 		}
 		if blocked {
@@ -203,10 +342,11 @@ VALUES ($1,$2,$3,'copying',0,0,$4,$5)`, request.TargetWorkspaceID, request.Targe
 			return fmt.Errorf("register reserved Workspace copy volume: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO workspace_copy_reservations
-(id,owner_id,source_owner_id,target_owner_id,share_id,read_only,source_workspace_id,target_workspace_id,service_instance_id,source_revision,reserved_bytes,state)
-VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,$9,$10,$11,'reserved')`, request.ID, request.SourceOwnerID, request.SourceOwnerID,
-			request.TargetOwnerID, request.ShareID, request.ReadOnly, request.SourceWorkspaceID, request.TargetWorkspaceID, request.ServiceInstanceID,
-			request.SourceRevision, request.ReservedBytes); err != nil {
+(id,owner_id,source_owner_id,target_owner_id,share_id,source_host_id,source_binding_version,host_copy_pending,read_only,
+ source_workspace_id,target_workspace_id,service_instance_id,source_revision,reserved_bytes,state)
+VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),$7,$8,$9,$10,$11,$12,$13,$14,'reserved')`, request.ID, request.SourceOwnerID, request.SourceOwnerID,
+			request.TargetOwnerID, request.ShareID, request.SourceHostID, request.SourceBindingVersion, request.SourceHostID != "", request.ReadOnly,
+			request.SourceWorkspaceID, request.TargetWorkspaceID, request.ServiceInstanceID, request.SourceRevision, request.ReservedBytes); err != nil {
 			return fmt.Errorf("create Workspace copy reservation: %w", err)
 		}
 		if request.ShareID != "" {
@@ -218,6 +358,7 @@ WHERE id=$1 AND state='claiming' AND claimant_id=$3 AND target_workspace_id IS N
 		}
 		reservation = workspace.CopyReservation{
 			ID: request.ID, SourceOwnerID: request.SourceOwnerID, TargetOwnerID: request.TargetOwnerID, ShareID: request.ShareID,
+			SourceHostID: request.SourceHostID, SourceBindingVersion: request.SourceBindingVersion, HostCopyPending: request.SourceHostID != "",
 			SourceWorkspaceID: request.SourceWorkspaceID, TargetWorkspaceID: request.TargetWorkspaceID,
 			ServiceInstanceID: request.ServiceInstanceID, SourceRevision: request.SourceRevision, ReservedBytes: request.ReservedBytes,
 			ReadOnly: request.ReadOnly,
@@ -236,8 +377,9 @@ func (s *Store) GetWorkspaceCopyReservationByIdempotency(ctx context.Context, re
 	if err := validateIdempotency(record); err != nil {
 		return workspace.CopyReservation{}, false, err
 	}
-	if (record.Operation != "workspace.copy" && record.Operation != "workspace.share.copy") ||
-		!domain.ValidWorkspaceID(record.ResourceID) || name == "" || len(name) > 120 ||
+	if (record.Operation != "workspace.copy" && record.Operation != "workspace.computer.copy" && record.Operation != "workspace.share.copy") ||
+		(record.Operation == "workspace.computer.copy" && !domain.ValidHostID(record.ResourceID)) ||
+		(record.Operation != "workspace.computer.copy" && !domain.ValidWorkspaceID(record.ResourceID)) || name == "" || len(name) > 120 ||
 		strings.TrimSpace(serviceInstanceID) == "" || len(serviceInstanceID) > 128 || quotaBytes <= 0 {
 		return workspace.CopyReservation{}, false, domain.InvalidArgument("workspace_copy", "Workspace copy idempotency lookup is invalid")
 	}
@@ -257,15 +399,18 @@ func (s *Store) GetWorkspaceCopyReservationByIdempotency(ctx context.Context, re
 		}
 		var storedName string
 		var storedQuota int64
-		if reservation.TargetOwnerID != record.OwnerID || reservation.SourceWorkspaceID != record.ResourceID ||
-			reservation.ServiceInstanceID != serviceInstanceID {
+		if reservation.TargetOwnerID != record.OwnerID || reservation.ServiceInstanceID != serviceInstanceID {
 			return domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation does not match the original request")
 		}
-		if (record.Operation == "workspace.copy") != (reservation.ShareID == "") {
+		if record.Operation == "workspace.copy" && (reservation.ShareID != "" || reservation.SourceHostID != "") ||
+			record.Operation == "workspace.computer.copy" && (reservation.ShareID != "" || reservation.SourceHostID != record.ResourceID) ||
+			record.Operation == "workspace.share.copy" && (reservation.ShareID == "" || reservation.SourceHostID != "") ||
+			record.Operation != "workspace.computer.copy" && reservation.SourceWorkspaceID != record.ResourceID {
 			return domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation operation does not match the original request")
 		}
-		if err := tx.QueryRow(ctx, `SELECT name,quota_bytes FROM workspaces WHERE id=$1`, reservation.TargetWorkspaceID).
-			Scan(&storedName, &storedQuota); err != nil || storedName != name || storedQuota != quotaBytes {
+		var storedReadOnly bool
+		if err := tx.QueryRow(ctx, `SELECT name,quota_bytes,is_read_only FROM workspaces WHERE id=$1`, reservation.TargetWorkspaceID).
+			Scan(&storedName, &storedQuota, &storedReadOnly); err != nil || storedName != name || storedQuota != quotaBytes || storedReadOnly != reservation.ReadOnly {
 			return domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy target does not match the original request")
 		}
 		if reservation.ShareID != "" {
@@ -377,14 +522,97 @@ func (s *Store) GetWorkspaceCopyReservationByID(ctx context.Context, id string) 
 	if !domain.ValidPendingRequestID(id) {
 		return workspace.CopyReservation{}, domain.NewError(domain.CodeNotFound, "Workspace copy not found")
 	}
-	return s.getWorkspaceCopyReservation(ctx, `SELECT id,source_owner_id,target_owner_id,COALESCE(share_id,''),source_workspace_id,target_workspace_id,
-service_instance_id,source_revision,reserved_bytes,read_only,state,created_at,updated_at FROM workspace_copy_reservations WHERE id=$1`, id)
+	return s.getWorkspaceCopyReservation(ctx, `SELECT id,source_owner_id,target_owner_id,COALESCE(share_id,''),COALESCE(source_host_id,''),
+source_binding_version,host_copy_pending,source_workspace_id,target_workspace_id,service_instance_id,source_revision,reserved_bytes,
+read_only,state,created_at,updated_at FROM workspace_copy_reservations WHERE id=$1`, id)
+}
+
+// ValidateHostCopyReservationSource rechecks an unfinished Host copy under
+// the same Host -> binding -> Workspace order used when its source fence was
+// first reserved. It deliberately returns busy instead of waiting on a lock
+// cycle with writers that already hold the Workspace mutation fence.
+func (s *Store) ValidateHostCopyReservationSource(ctx context.Context, ownerID, reservationID string) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidPendingRequestID(reservationID) {
+		return domain.NewError(domain.CodeNotFound, "Host copy not found")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		var request app.WorkspaceCopyReservationRequest
+		var reservationState string
+		var shareID string
+		var pending, readOnly bool
+		if err := tx.QueryRow(ctx, `SELECT source_owner_id,target_owner_id,COALESCE(share_id,''),COALESCE(source_host_id,''),
+source_binding_version,host_copy_pending,source_workspace_id,source_revision,state,read_only
+FROM workspace_copy_reservations WHERE id=$1`, reservationID).Scan(
+			&request.SourceOwnerID, &request.TargetOwnerID, &shareID, &request.SourceHostID,
+			&request.SourceBindingVersion, &pending, &request.SourceWorkspaceID, &request.SourceRevision, &reservationState, &readOnly); err != nil {
+			return storeError("read Host copy reservation source fence", "Workspace copy", err)
+		}
+		request.ShareID = shareID
+		if request.SourceOwnerID != ownerID || request.TargetOwnerID != ownerID || request.SourceHostID == "" ||
+			request.ShareID != "" || !pending || readOnly ||
+			(reservationState != string(workspace.CopyReserved) && reservationState != string(workspace.Copying) && reservationState != string(workspace.CopyUnknown)) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Host copy source fence is no longer active")
+		}
+		if err := verifyWorkspaceCopyHostSourceTx(ctx, tx, request); err != nil {
+			return err
+		}
+		if err := tryLockWorkspaceMutationFenceForHostCopy(ctx, tx, request.SourceWorkspaceID); err != nil {
+			return err
+		}
+		if err := lockWorkspaceForHostCopyNowait(ctx, tx, request.SourceWorkspaceID, reservationID); err != nil {
+			return err
+		}
+		var workspaceOwner, state string
+		var revision int64
+		var deleted, workspaceReadOnly bool
+		if err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL,is_read_only
+FROM workspaces WHERE id=$1`, request.SourceWorkspaceID).Scan(&workspaceOwner, &state, &revision, &deleted, &workspaceReadOnly); err != nil {
+			return storeError("verify Workspace under Host copy source fence", "workspace", err)
+		}
+		if workspaceOwner != ownerID || deleted || workspaceReadOnly || state != string(workspace.StateReady) || revision != request.SourceRevision {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Host copy source Workspace changed from its reserved revision")
+		}
+		var desiredRevision, appliedRevision int64
+		if err := tx.QueryRow(ctx, `SELECT desired_revision,applied_revision FROM workspace_current_materializations WHERE workspace_id=$1`, request.SourceWorkspaceID).
+			Scan(&desiredRevision, &appliedRevision); err != nil || desiredRevision != revision || appliedRevision != revision {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace current revision is not confirmed")
+		}
+		var volumeReady bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_volumes WHERE workspace_id=$1 AND owner_id=$2 AND provisioned_owner_id=$2
+ AND state='ready' AND volume_name='workspace-' || $1
+)`, request.SourceWorkspaceID, ownerID).Scan(&volumeReady); err != nil {
+			return fmt.Errorf("check source Workspace volume while resuming Host copy: %w", err)
+		}
+		if !volumeReady {
+			return domain.NewError(domain.CodeWorkspaceUnavailable, "source Workspace volume is not ready for a complete copy")
+		}
+		var blocked bool
+		if err := tx.QueryRow(ctx, `SELECT
+EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1 AND state <> 'detached' AND host_id<>$2) OR
+EXISTS (SELECT 1 FROM workspace_sync_sessions WHERE workspace_id=$1 AND state IN ('planned','transferring','verifying','applying')) OR
+EXISTS (SELECT 1 FROM tasks WHERE workspace_id=$1 AND status IN ('queued','running','waiting_user','pausing','cancelling')) OR
+EXISTS (SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')) OR
+EXISTS (SELECT 1 FROM task_mcp_connector_operations o JOIN tasks t ON t.id=o.task_id
+  WHERE t.workspace_id=$1 AND o.status IN ('prepared','dispatched','unknown')) OR
+EXISTS (SELECT 1 FROM task_workspace_publish_receipts WHERE workspace_id=$1 AND state='pending') OR
+EXISTS (SELECT 1 FROM task_hub_operations o WHERE o.workspace_id=$1 AND o.action='file.put'
+  AND o.status IN ('prepared','dispatched','unknown') AND o.sync_stage IN ('pending','local_applied','sync_pending'))`,
+			request.SourceWorkspaceID, request.SourceHostID).Scan(&blocked); err != nil {
+			return fmt.Errorf("check Workspace writers while resuming Host copy: %w", err)
+		}
+		if blocked {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an in-flight writer; settle it before resuming the copy")
+		}
+		return ensureNoWorkspaceSyncReceive(ctx, tx, request.SourceWorkspaceID, "")
+	})
 }
 
 func (s *Store) getWorkspaceCopyReservation(ctx context.Context, query string, args ...any) (workspace.CopyReservation, error) {
 	var reservation workspace.CopyReservation
 	err := s.pool.QueryRow(ctx, query, args...).Scan(
-		&reservation.ID, &reservation.SourceOwnerID, &reservation.TargetOwnerID, &reservation.ShareID, &reservation.SourceWorkspaceID,
+		&reservation.ID, &reservation.SourceOwnerID, &reservation.TargetOwnerID, &reservation.ShareID, &reservation.SourceHostID,
+		&reservation.SourceBindingVersion, &reservation.HostCopyPending, &reservation.SourceWorkspaceID,
 		&reservation.TargetWorkspaceID, &reservation.ServiceInstanceID, &reservation.SourceRevision, &reservation.ReservedBytes,
 		&reservation.ReadOnly, &reservation.State, &reservation.CreatedAt, &reservation.UpdatedAt)
 	if err != nil {
@@ -519,7 +747,7 @@ WHERE owner_id=$1 AND operation='workspace.share.copy' AND key=$2 AND resource_i
 WHERE id=$1 AND state='copying' AND revision=0`, targetWorkspaceID); err != nil {
 			return fmt.Errorf("retire unused Workspace copy target: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE workspace_copy_reservations SET state='failed',updated_at=clock_timestamp() WHERE id=$1 AND state='reserved'`, id); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE workspace_copy_reservations SET state='failed',host_copy_pending=false,updated_at=clock_timestamp() WHERE id=$1 AND state='reserved'`, id); err != nil {
 			return fmt.Errorf("mark unused Workspace copy failed: %w", err)
 		}
 		return nil
@@ -935,9 +1163,11 @@ AND c.state IN ('reserved','copying','unknown')
 
 func getWorkspaceCopyReservationTx(ctx context.Context, tx pgx.Tx, id string) (workspace.CopyReservation, error) {
 	var reservation workspace.CopyReservation
-	err := tx.QueryRow(ctx, `SELECT id,source_owner_id,target_owner_id,COALESCE(share_id,''),source_workspace_id,target_workspace_id,
-service_instance_id,source_revision,reserved_bytes,read_only,state,created_at,updated_at FROM workspace_copy_reservations WHERE id=$1`, id).Scan(
-		&reservation.ID, &reservation.SourceOwnerID, &reservation.TargetOwnerID, &reservation.ShareID, &reservation.SourceWorkspaceID,
+	err := tx.QueryRow(ctx, `SELECT id,source_owner_id,target_owner_id,COALESCE(share_id,''),COALESCE(source_host_id,''),
+source_binding_version,host_copy_pending,source_workspace_id,target_workspace_id,service_instance_id,source_revision,reserved_bytes,
+read_only,state,created_at,updated_at FROM workspace_copy_reservations WHERE id=$1`, id).Scan(
+		&reservation.ID, &reservation.SourceOwnerID, &reservation.TargetOwnerID, &reservation.ShareID, &reservation.SourceHostID,
+		&reservation.SourceBindingVersion, &reservation.HostCopyPending, &reservation.SourceWorkspaceID,
 		&reservation.TargetWorkspaceID, &reservation.ServiceInstanceID, &reservation.SourceRevision, &reservation.ReservedBytes,
 		&reservation.ReadOnly, &reservation.State, &reservation.CreatedAt, &reservation.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

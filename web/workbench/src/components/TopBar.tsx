@@ -14,6 +14,7 @@ function formatRemaining(expiresAt: string | null, now: number): string {
 }
 
 type Props = {
+  embedded?: boolean;
   host: GatewayHost | null;
   renewing: boolean;
   onRenew: () => void;
@@ -35,6 +36,7 @@ const stateNames: Record<string, string> = {
 };
 
 export default function TopBar({
+  embedded = false,
   host,
   renewing,
   onRenew,
@@ -74,26 +76,26 @@ export default function TopBar({
               : control?.control_state === 'returning' ? '交还中' : '状态未知';
 
   return (
-    <header className="top-bar">
+    <header className={`top-bar${embedded ? ' top-bar-embedded' : ''}`}>
       <div className="host-summary">
-        <strong className="host-name">{host?.name || (host ? host.id : '正在读取主机…')}</strong>
-        <span className="host-state" data-state={host?.state || 'loading'}>
-          {host ? stateNames[host.state] || host.state : '连接中'}
-        </span>
-        <span className="host-expiry" aria-live="off">
-          {host ? formatRemaining(host.expires_at, now) : ''}
-        </span>
+        {!embedded && <>
+          <strong className="host-name">{host?.name || (host ? host.id : '正在读取主机…')}</strong>
+          <span className="host-state" data-state={host?.state || 'loading'}>
+            {host ? stateNames[host.state] || host.state : '连接中'}
+          </span>
+          <span className="host-expiry" aria-live="off">
+            {host ? formatRemaining(host.expires_at, now) : ''}
+          </span>
+        </>}
         <span className="control-state" data-state={control?.control_state || 'loading'} role="status">
           <span className="control-state-full">{controlLabel}</span>
           <span className="control-state-compact">{compactControlLabel}</span>
         </span>
-        {control && <span className="control-version">控制版本 {control.control_version}</span>}
         {control?.control_state === 'user' && <span className="control-lease">
           {control.control_lease_active
             ? `操作租约${control.control_lease_held_by_me ? '由你持有' : '有效'} · ${formatRemaining(control.control_lease_expires_at, now)}`
             : '当前没有有效操作租约'}
         </span>}
-        <p className="desktop-sharing-notice">桌面画面可能显示此电脑上的文件，获准查看桌面的成员也能看到。</p>
       </div>
       <div className="top-actions">
         {controlActionError && <span className="control-error" role="alert">{controlActionError}</span>}
@@ -103,9 +105,9 @@ export default function TopBar({
             {controlActionLabel}
           </button>
         )}
-        <button className="button host-renew-button" type="button" onClick={onRenew} disabled={!host || renewing}>
+        {!embedded && <button className="button host-renew-button" type="button" onClick={onRenew} disabled={!host || renewing}>
           {renewing ? '续期中…' : '续期'}
-        </button>
+        </button>}
       </div>
     </header>
   );

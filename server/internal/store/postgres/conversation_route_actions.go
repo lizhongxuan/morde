@@ -1072,12 +1072,12 @@ FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHAR
 			return domain.NewError(domain.CodeForbidden, "conversation route retry is not authorized")
 		}
 		var requestHash []byte
-		var state string
+		var state, sourceKind, resultReviewID string
 		var taskID *string
-		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,m.task_id FROM conversation_message_routes r
+		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,m.task_id,m.source_kind,COALESCE(r.request_metadata->>'result_review_id','') FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id AND m.owner_id=r.owner_id
 WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
-FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Scan(&requestHash, &state, &taskID)
+FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Scan(&requestHash, &state, &taskID, &sourceKind, &resultReviewID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "conversation message not found")
 		}
@@ -1115,13 +1115,34 @@ FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Sca
 		for _, scope := range principal.Scopes {
 			auth.Scopes = append(auth.Scopes, string(scope))
 		}
+		if sourceKind == "task_result_review" {
+			if !domain.ValidMessageID(resultReviewID) {
+				return domain.NewError(domain.CodeConflict, "task result review route is no longer retryable")
+			}
+			var authorizationVersion int64
+			err := tx.QueryRow(ctx, `UPDATE conversation_result_batches SET state='processing',retry_attempt=retry_attempt+1,updated_at=clock_timestamp()
+WHERE message_id=$1 AND trigger_message_id=$2 AND state='failed' AND retry_attempt<9223372036854775807
+RETURNING authorization_version`, resultReviewID, messageID).Scan(&authorizationVersion)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeConflict, "task result review route is no longer retryable")
+			}
+			if err != nil {
+				return fmt.Errorf("retry task result review batch: %w", err)
+			}
+			auth = task.Authorization{Kind: string(identity.KindSession), Version: authorizationVersion,
+				Scopes: []string{string(identity.ScopeTaskSubmit)}}
+		}
 		authorization, err := json.Marshal(auth)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='pending',failure_reason='',
-authorization_snapshot=$2::jsonb,available_after=clock_timestamp(),updated_at=clock_timestamp() WHERE message_id=$1`, messageID, authorization); err != nil {
+		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='pending',failure_reason='',
+authorization_snapshot=$2::jsonb,available_after=clock_timestamp(),updated_at=clock_timestamp() WHERE message_id=$1 AND state='failed'`, messageID, authorization)
+		if err != nil {
 			return fmt.Errorf("retry conversation route: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "conversation route changed before retry")
 		}
 		return recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: ownerID, ObjectType: "message",
 			ObjectID: messageID, Operation: "upsert", MutationID: idempotencyKey})

@@ -284,6 +284,42 @@ func TestWorkspaceSyncProgressIsPortalOnlyAndOmitsFileDetails(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncProjectProgressIsUnavailableBeforeProgressQuery(t *testing.T) {
+	service := &workspaceSyncServiceStub{}
+	devices := &workspaceSyncDeviceHTTPStub{}
+	deps := newServices().deps()
+	deps.WorkspaceSync = service
+	deps.WorkspaceSyncDevices = devices
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	project := workspaceSyncRequest(router, http.MethodGet,
+		"/api/workspaces/"+testWorkspaceID+"/sync-progress?folder_id=morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil, "", "", cookie)
+	if project.Code != http.StatusServiceUnavailable || service.progressCalls != 0 {
+		t.Fatalf("project progress = %d %s, store calls=%d; want unavailable before progress query", project.Code, project.Body, service.progressCalls)
+	}
+	root := workspaceSyncRequest(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/sync-progress", nil, "", "", cookie)
+	if root.Code != http.StatusOK || service.progressCalls != 1 {
+		t.Fatalf("legacy root progress = %d %s, store calls=%d", root.Code, root.Body, service.progressCalls)
+	}
+}
+
+func TestWorkspaceSyncSessionForwardsProjectFolderID(t *testing.T) {
+	service := &workspaceSyncServiceStub{}
+	router := newWorkspaceSyncRouter(t, service, Options{})
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	folderID := "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	body := []byte(`{"direction":"upload","policy":"compare_merge","folder_id":"` + folderID + `","files":[]}`)
+	response := workspaceSyncRequest(router, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/sync-sessions",
+		body, "application/json", "", cookie)
+	if response.Code != http.StatusCreated || service.createCalls != 1 || service.createCommand.FolderID != folderID {
+		t.Fatalf("project sync create = %d, folder_id=%q, calls=%d, body=%s",
+			response.Code, service.createCommand.FolderID, service.createCalls, response.Body)
+	}
+}
+
 func TestWorkspaceSyncSessionActionsAndBinaryBlocks(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	service := &workspaceSyncServiceStub{

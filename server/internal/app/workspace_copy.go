@@ -20,6 +20,8 @@ import (
 type WorkspaceCopyCommand struct {
 	Name                    string
 	ExpectedCurrentRevision int64
+	sourceHostID            string
+	sourceBindingVersion    int64
 }
 
 type WorkspaceCopyResult struct {
@@ -28,31 +30,35 @@ type WorkspaceCopyResult struct {
 	SourceRevision    int64               `json:"source_revision"`
 	State             workspace.CopyState `json:"state"`
 	Replayed          bool                `json:"replayed"`
+	reservationID     string
 }
 
 // WorkspaceCopyReservationRequest records source and destination ownership
 // independently. A non-empty ShareID is accepted only for a live claim by
 // TargetOwnerID and binds its target atomically with this reservation.
 type WorkspaceCopyReservationRequest struct {
-	ID                string
-	SourceOwnerID     string
-	TargetOwnerID     string
-	ShareID           string
-	SourceWorkspaceID string
-	TargetWorkspaceID string
-	TargetName        string
-	ServiceInstanceID string
-	SourceRevision    int64
-	ReservedBytes     int64
-	MaxOwnerBytes     int64
-	TargetQuotaBytes  int64
-	ReadOnly          bool
-	Idempotency       IdempotencyRecord
+	ID                   string
+	SourceOwnerID        string
+	TargetOwnerID        string
+	ShareID              string
+	SourceHostID         string
+	SourceBindingVersion int64
+	SourceWorkspaceID    string
+	TargetWorkspaceID    string
+	TargetName           string
+	ServiceInstanceID    string
+	SourceRevision       int64
+	ReservedBytes        int64
+	MaxOwnerBytes        int64
+	TargetQuotaBytes     int64
+	ReadOnly             bool
+	Idempotency          IdempotencyRecord
 }
 
 type WorkspaceCopyStore interface {
 	CreateWorkspaceCopyReservation(context.Context, WorkspaceCopyReservationRequest) (workspace.CopyReservation, bool, error)
 	GetWorkspaceCopyReservationByIdempotency(context.Context, IdempotencyRecord, string, string, int64) (workspace.CopyReservation, bool, error)
+	ValidateHostCopyReservationSource(context.Context, string, string) error
 	GetWorkspaceManifestPageForCopy(context.Context, string, string, int64, string, string, int32) (workspace.ManifestPage, error)
 	TryWorkspaceCopyLock(context.Context, string) (LeaderLock, bool, error)
 	SetWorkspaceCopyReservationState(context.Context, string, workspace.CopyState, workspace.CopyState) error
@@ -108,7 +114,63 @@ func (s *WorkspaceCopyService) SetCurrentMaterializer(materializer WorkspaceCopy
 
 func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Principal, sourceWorkspaceID string,
 	command WorkspaceCopyCommand, idempotencyKey string) (WorkspaceCopyResult, error) {
+	if command.sourceHostID != "" || command.sourceBindingVersion != 0 {
+		return WorkspaceCopyResult{}, domain.InvalidArgument("workspace_copy", "source Host is not supported for Workspace copy")
+	}
 	return s.copy(ctx, principal, principal.UserID, principal.UserID, "", false, sourceWorkspaceID, command, idempotencyKey)
+}
+
+// CopyFromHost copies the confirmed Workspace snapshot attached to a stopped
+// Host. The store rechecks the Host and binding under locks before reserving it.
+func (s *WorkspaceCopyService) CopyFromHost(ctx context.Context, principal identity.Principal, sourceHostID string,
+	sourceBindingVersion int64, sourceWorkspaceID string, command WorkspaceCopyCommand, idempotencyKey string) (WorkspaceCopyResult, error) {
+	if !domain.ValidHostID(sourceHostID) || sourceBindingVersion < 1 {
+		return WorkspaceCopyResult{}, domain.InvalidArgument("workspace_copy", "source Host binding is invalid")
+	}
+	command.sourceHostID = sourceHostID
+	command.sourceBindingVersion = sourceBindingVersion
+	return s.copy(ctx, principal, principal.UserID, principal.UserID, "", false, sourceWorkspaceID, command, idempotencyKey)
+}
+
+// ResumeOrReplayHostCopy resolves a Host-copy idempotency key before reading
+// the live source Host. This lets a completed request replay its original
+// target even if the source Host has since been started or rebound.
+func (s *WorkspaceCopyService) ResumeOrReplayHostCopy(ctx context.Context, principal identity.Principal, sourceHostID string,
+	command WorkspaceCopyCommand, idempotencyKey string) (WorkspaceCopyResult, bool, error) {
+	if s == nil || s.store == nil || principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) ||
+		!domain.ValidHostID(sourceHostID) || validateIdempotencyKey(idempotencyKey) != nil {
+		return WorkspaceCopyResult{}, false, domain.InvalidArgument("workspace_copy", "Host copy replay request is invalid")
+	}
+	command.Name = strings.TrimSpace(command.Name)
+	if command.Name == "" || utf8.RuneCountInString(command.Name) > 120 || !utf8.ValidString(command.Name) || command.ExpectedCurrentRevision < 0 {
+		return WorkspaceCopyResult{}, false, domain.InvalidArgument("workspace_copy", "Host copy replay request is invalid")
+	}
+	record, err := hostCopyIdempotencyRecord(principal.UserID, sourceHostID, command.Name, command.ExpectedCurrentRevision, idempotencyKey)
+	if err != nil {
+		return WorkspaceCopyResult{}, false, err
+	}
+	reservation, found, err := s.store.GetWorkspaceCopyReservationByIdempotency(ctx, record, command.Name, s.instanceID, s.workspaceQuotaBytes)
+	if err != nil || !found {
+		return WorkspaceCopyResult{}, found, err
+	}
+	if reservation.SourceHostID != sourceHostID || reservation.SourceOwnerID != principal.UserID || reservation.TargetOwnerID != principal.UserID ||
+		reservation.ShareID != "" || reservation.ReadOnly || reservation.SourceRevision != command.ExpectedCurrentRevision {
+		return WorkspaceCopyResult{}, false, domain.NewError(domain.CodeIdempotencyConflict, "Host copy reservation does not match the original request")
+	}
+	if reservation.State == workspace.CopyCompleted {
+		return workspaceCopyResult(reservation.SourceWorkspaceID, command.Name, reservation, true), true, nil
+	}
+	if reservation.State == workspace.CopyFailed {
+		return WorkspaceCopyResult{}, true, domain.NewError(domain.CodeWorkspaceConflict, "Host copy previously failed and must use a new idempotency key")
+	}
+	if err := s.store.ValidateHostCopyReservationSource(ctx, principal.UserID, reservation.ID); err != nil {
+		return WorkspaceCopyResult{}, true, err
+	}
+	command.sourceHostID = reservation.SourceHostID
+	command.sourceBindingVersion = reservation.SourceBindingVersion
+	result, err := s.copy(ctx, principal, principal.UserID, principal.UserID, "", false,
+		reservation.SourceWorkspaceID, command, idempotencyKey)
+	return result, true, err
 }
 
 // copyForWorkspaceShare creates a recipient-owned copy from the immutable
@@ -156,12 +218,18 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 	}
 	var err error
 	var requestHash []byte
-	if shareID == "" {
+	if shareID == "" && command.sourceHostID == "" {
 		requestHash, err = json.Marshal(struct {
 			SourceWorkspaceID string
 			Name              string
 			ExpectedRevision  int64
 		}{sourceWorkspaceID, command.Name, command.ExpectedCurrentRevision})
+	} else if shareID == "" {
+		requestHash, err = json.Marshal(struct {
+			SourceHostID     string
+			Name             string
+			ExpectedRevision int64
+		}{command.sourceHostID, command.Name, command.ExpectedCurrentRevision})
 	} else {
 		requestHash, err = json.Marshal(struct {
 			ShareID           string
@@ -178,11 +246,18 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 	}
 	digest := sha256.Sum256(requestHash)
 	operation := "workspace.copy"
+	if command.sourceHostID != "" {
+		operation = "workspace.computer.copy"
+	}
 	if shareID != "" {
 		operation = "workspace.share.copy"
 	}
+	resourceID := sourceWorkspaceID
+	if command.sourceHostID != "" {
+		resourceID = command.sourceHostID
+	}
 	record := IdempotencyRecord{OwnerID: targetOwnerID, Operation: operation, Key: idempotencyKey,
-		RequestHash: digest[:], ResourceID: sourceWorkspaceID}
+		RequestHash: digest[:], ResourceID: resourceID}
 	reservation, found, err := s.store.GetWorkspaceCopyReservationByIdempotency(ctx, record, command.Name, s.instanceID, s.workspaceQuotaBytes)
 	if err != nil {
 		return WorkspaceCopyResult{}, err
@@ -192,7 +267,7 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 		return WorkspaceCopyResult{}, domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation ownership does not match the original request")
 	}
 	if found && reservation.State == workspace.CopyCompleted {
-		return workspaceCopyResult(sourceWorkspaceID, command.Name, reservation, true), nil
+		return workspaceCopyResult(reservation.SourceWorkspaceID, command.Name, reservation, true), nil
 	}
 	if found && reservation.State == workspace.CopyFailed {
 		return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace copy previously failed and must use a new idempotency key")
@@ -206,6 +281,18 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 	if found {
 		if reservation.SourceRevision != command.ExpectedCurrentRevision {
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation does not match the requested revision")
+		}
+		if command.sourceHostID != "" {
+			if reservation.SourceHostID != command.sourceHostID {
+				return WorkspaceCopyResult{}, domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation does not match the source Host")
+			}
+			sourceWorkspaceID = reservation.SourceWorkspaceID
+			command.sourceBindingVersion = reservation.SourceBindingVersion
+			if err := s.store.ValidateHostCopyReservationSource(ctx, sourceOwnerID, reservation.ID); err != nil {
+				return WorkspaceCopyResult{}, err
+			}
+		} else if reservation.SourceHostID != "" || reservation.SourceBindingVersion != 0 {
+			return WorkspaceCopyResult{}, domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation does not match the original request")
 		}
 		lock, acquired, err := s.store.TryWorkspaceCopyLock(ctx, reservation.ID)
 		if err != nil {
@@ -267,6 +354,7 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 		}
 		reservation, replayed, err = s.store.CreateWorkspaceCopyReservation(ctx, WorkspaceCopyReservationRequest{
 			ID: reservationID, SourceOwnerID: sourceOwnerID, TargetOwnerID: targetOwnerID, ShareID: shareID,
+			SourceHostID: command.sourceHostID, SourceBindingVersion: command.sourceBindingVersion,
 			SourceWorkspaceID: sourceWorkspaceID, TargetWorkspaceID: targetWorkspaceID, TargetName: command.Name,
 			ServiceInstanceID: s.instanceID, SourceRevision: command.ExpectedCurrentRevision, ReservedBytes: reservedBytes,
 			MaxOwnerBytes: s.maxOwnerBytes, TargetQuotaBytes: s.workspaceQuotaBytes, ReadOnly: readOnly, Idempotency: record,
@@ -275,12 +363,26 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 			return WorkspaceCopyResult{}, err
 		}
 		if reservation.State == workspace.CopyCompleted {
-			return workspaceCopyResult(sourceWorkspaceID, command.Name, reservation, true), nil
+			return workspaceCopyResult(reservation.SourceWorkspaceID, command.Name, reservation, true), nil
 		}
 		if reservation.State == workspace.CopyFailed {
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace copy previously failed and must use a new idempotency key")
 		}
-		if replayed && reservation.State != workspace.CopyReserved {
+		if replayed {
+			if command.sourceHostID != "" {
+				sourceWorkspaceID = reservation.SourceWorkspaceID
+				command.sourceBindingVersion = reservation.SourceBindingVersion
+				if err := s.store.ValidateHostCopyReservationSource(ctx, sourceOwnerID, reservation.ID); err != nil {
+					return WorkspaceCopyResult{}, err
+				}
+				source, err = s.sync.authorize(ctx, sourcePrincipal, sourceWorkspaceID)
+				if err != nil {
+					return WorkspaceCopyResult{}, err
+				}
+				if source.Revision != reservation.SourceRevision || source.State != workspace.StateReady {
+					return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace copy source checkpoint changed")
+				}
+			}
 			lock, acquired, err := s.store.TryWorkspaceCopyLock(ctx, reservation.ID)
 			if err != nil {
 				return WorkspaceCopyResult{}, err
@@ -412,7 +514,22 @@ func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Prin
 		SourceWorkspaceID: sourceWorkspaceID,
 		Workspace:         DeviceWorkspaceInfo{ID: reservation.TargetWorkspaceID, Name: command.Name, Revision: 1, State: workspace.StateReady},
 		SourceRevision:    reservation.SourceRevision, State: workspace.CopyCompleted, Replayed: replayed,
+		reservationID: reservation.ID,
 	}, nil
+}
+
+func hostCopyIdempotencyRecord(ownerID, sourceHostID, name string, revision int64, key string) (IdempotencyRecord, error) {
+	body, err := json.Marshal(struct {
+		SourceHostID     string
+		Name             string
+		ExpectedRevision int64
+	}{sourceHostID, name, revision})
+	if err != nil {
+		return IdempotencyRecord{}, domain.NewError(domain.CodeInternal, "Host copy request cannot be encoded")
+	}
+	digest := sha256.Sum256(body)
+	return IdempotencyRecord{OwnerID: ownerID, Operation: "workspace.computer.copy", Key: key,
+		RequestHash: digest[:], ResourceID: sourceHostID}, nil
 }
 
 func workspaceCopyResult(sourceWorkspaceID, name string, reservation workspace.CopyReservation, replayed bool) WorkspaceCopyResult {
@@ -420,6 +537,7 @@ func workspaceCopyResult(sourceWorkspaceID, name string, reservation workspace.C
 		SourceWorkspaceID: sourceWorkspaceID,
 		Workspace:         DeviceWorkspaceInfo{ID: reservation.TargetWorkspaceID, Name: name, Revision: 1, State: workspace.StateReady},
 		SourceRevision:    reservation.SourceRevision, State: reservation.State, Replayed: replayed,
+		reservationID: reservation.ID,
 	}
 }
 

@@ -17,6 +17,7 @@ func (h *api) registerTaskFileFetchTransferRoutes(engine *gin.Engine, service Ta
 	engine.POST(base+"/manifest", h.checkOrigin, h.taskFileFetchManifest(service))
 	engine.PUT(base+"/chunks/:sequence", h.checkOrigin, h.taskFileFetchChunk(service))
 	engine.POST(base+"/commit", h.checkOrigin, h.taskFileFetchCommit(service))
+	engine.POST(base+"/abort", h.checkOrigin, h.abortTaskFileFetch(service))
 }
 
 func (h *api) registerTaskFileFetchOwnerRoutes(group *gin.RouterGroup, service TaskFileFetchEndpointService) {
@@ -119,6 +120,30 @@ func (h *api) taskFileFetchCommit(service TaskFileFetchEndpointService) gin.Hand
 		}
 		c.Header("Cache-Control", "no-store")
 		c.JSON(http.StatusOK, result)
+	}
+}
+
+func (h *api) abortTaskFileFetch(service TaskFileFetchEndpointService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !emptyTaskFileFetchQuery(c) || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("request", "file fetch abort request must not include a query string or body"))
+			return
+		}
+		ticket, ok := taskFileFetchTicket(c)
+		if !ok {
+			writeError(c, domain.NewError(domain.CodeNotFound, "file fetch not found"))
+			return
+		}
+		taskID, fetchID, ok := taskFileFetchIDs(c)
+		if !ok {
+			return
+		}
+		if err := service.AbortTaskFileFetch(c.Request.Context(), taskID, fetchID, ticket); err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Status(http.StatusNoContent)
 	}
 }
 
@@ -267,7 +292,7 @@ func taskFileFetchOwnerIDs(c *gin.Context) (string, string, bool) {
 
 func taskFileFetchSession(c *gin.Context) (identity.Principal, bool) {
 	principal, ok := principalFrom(c)
-	if !ok || principal.Kind != identity.KindSession || principal.ClientInstallationID != "" {
+	if !ok || principal.Kind != identity.KindSession {
 		writeError(c, domain.NewError(domain.CodeNotFound, "file fetch not found"))
 		return identity.Principal{}, false
 	}

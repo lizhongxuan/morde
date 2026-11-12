@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func ValidSyncFolderID(value string) bool {
@@ -63,12 +65,65 @@ type SyncDeviceChallenge struct {
 	ID                   string
 	OwnerID              string
 	WorkspaceID          string
+	FolderID             string
+	FolderKind           SyncFolderKind
+	RelativePath         string
 	ClientInstallationID string
 	DeviceID             string
 	CertificateDER       []byte
 	CertificateSHA256    []byte
 	Nonce                []byte
 	ExpiresAt            time.Time
+}
+
+type SyncFolderKind string
+
+const (
+	SyncFolderKindWorkspaceRoot SyncFolderKind = "workspace_root"
+	SyncFolderKindProject       SyncFolderKind = "project"
+)
+
+type SyncFolder struct {
+	OwnerID            string
+	WorkspaceID        string
+	FolderID           string
+	Kind               SyncFolderKind
+	ProjectName        string
+	RelativePath       string
+	State              string
+	LastUploadRevision *int64
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+func (folder SyncFolder) SyncAvailable() bool {
+	return folder.Kind == SyncFolderKindWorkspaceRoot
+}
+
+// ValidateSyncProjectFolderName accepts one portable directory name. It keeps
+// the submitted Unicode spelling; path normalization and collision checks are
+// performed again before project content is materialized.
+func ValidateSyncProjectFolderName(value string) error {
+	if value == "" || !utf8.ValidString(value) || strings.TrimSpace(value) != value || utf8.RuneCountInString(value) > 120 ||
+		value == "." || value == ".." || strings.HasSuffix(value, ".") || strings.HasSuffix(value, " ") ||
+		strings.ContainsAny(value, "/\\<>:\"|?*") {
+		return fmt.Errorf("project folder name is invalid")
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("project folder name is invalid")
+		}
+	}
+	baseName := strings.ToUpper(strings.SplitN(value, ".", 2)[0])
+	switch baseName {
+	case "CON", "PRN", "AUX", "NUL":
+		return fmt.Errorf("project folder name is reserved")
+	}
+	if len(baseName) == 4 && (strings.HasPrefix(baseName, "COM") || strings.HasPrefix(baseName, "LPT")) &&
+		baseName[3] >= '1' && baseName[3] <= '9' {
+		return fmt.Errorf("project folder name is reserved")
+	}
+	return nil
 }
 
 type SyncDeviceBindingState string
@@ -119,6 +174,8 @@ type SyncDeviceBinding struct {
 	DeviceID             string
 	CertificateSHA256    []byte
 	FolderID             string
+	FolderKind           SyncFolderKind
+	RelativePath         string
 	State                SyncDeviceBindingState
 	CreatedAt            time.Time
 	RevokedAt            *time.Time

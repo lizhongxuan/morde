@@ -152,12 +152,13 @@ func TestProjectConversationMessageIsAcceptedWithoutStartingTask(t *testing.T) {
 	tasks := &taskServiceStub{}
 	router := projectConversationAPIRouter(&principal, service, tasks)
 	got := projectConversationAPIRequest(router, http.MethodPost, "/api/projects/j1234567/conversations/c1234567/messages",
-		`{"client_message_id":"project-msg-0001","previous_client_message_id":"project-prev-0001","reference_task_id":"q1234567","model_id":"p1234567","content":"hello"}`, "project-msg-0001")
+		`{"client_message_id":"project-msg-0001","previous_client_message_id":"project-prev-0001","reference_task_id":"q1234567","change_task_target":true,"model_id":"p1234567","content":"hello"}`, "project-msg-0001")
 	var response acceptedProjectConversationMessageResponse
 	if err := json.Unmarshal(got.Body.Bytes(), &response); err != nil || got.Code != http.StatusAccepted ||
 		service.acceptCalls != 1 || service.projectID != "j1234567" || service.conversationID != "c1234567" ||
 		service.acceptCommand.ProjectID != "j1234567" || service.acceptCommand.ClientMessageID != "project-msg-0001" ||
 		service.acceptCommand.PreviousClientMessageID != "project-prev-0001" || service.acceptCommand.ReferenceTaskID != "q1234567" ||
+		!service.acceptCommand.ChangeTaskTarget ||
 		service.acceptCommand.ModelID != "p1234567" || service.acceptCommand.Content != "hello" ||
 		service.acceptCommand.ServiceInstanceID != "11111111-1111-4111-8111-111111111111" ||
 		service.acceptCommand.IdempotencyKey != "project-msg-0001" ||

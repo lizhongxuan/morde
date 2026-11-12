@@ -47,6 +47,7 @@ type Deps struct {
 	WorkspaceSyncDevices         WorkspaceSyncDeviceService
 	WorkspaceDiff                WorkspaceDiffService
 	WorkspaceCopies              WorkspaceCopyEndpointService
+	HostCopies                   HostCopyEndpointService
 	WorkspaceTransfers           WorkspaceOwnershipTransferService
 	WorkspaceShares              WorkspaceShareEndpointService
 	Sites                        SiteService
@@ -188,6 +189,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerAuth(group)
 	h.registerOnboarding(group)
 	h.registerHosts(group)
+	h.registerHostCopies(group, deps.HostCopies)
 	h.registerControl(group, deps.Control)
 	h.registerExecutionControl(group, deps.ExecutionControl)
 	h.registerConversations(group, deps.Conversations, deps.Tasks)
@@ -208,7 +210,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	}
 	h.registerTaskWorkbenchObservationTickets(group, deps.TaskObservationTickets)
 	h.registerResources(group)
-	h.registerWorkspaceSync(group, deps.WorkspaceSync)
+	h.registerWorkspaceSync(group, deps.WorkspaceSync, deps.WorkspaceSyncDevices)
 	h.registerWorkspaceSyncDeviceRoutes(group, deps.WorkspaceSyncDevices)
 	h.registerWorkspaceDiff(group, deps.WorkspaceDiff)
 	h.registerWorkspaceCopies(group, deps.WorkspaceCopies)

@@ -87,6 +87,7 @@ type conversationMessageRequest struct {
 	ReferenceTaskID         string             `json:"reference_task_id,omitempty"`
 	HostID                  string             `json:"host_id,omitempty"`
 	WorkspaceID             string             `json:"workspace_id,omitempty"`
+	ChangeTaskTarget        bool               `json:"change_task_target,omitempty"`
 	MCPConnectorIDs         []string           `json:"mcp_connector_ids,omitempty"`
 	ClientAttachmentIDs     []string           `json:"client_attachment_ids,omitempty"`
 	ApplicationID           string             `json:"application_id,omitempty"`
@@ -160,8 +161,9 @@ type conversationActiveTaskResponse struct {
 }
 
 type conversationActiveTaskPageResponse struct {
-	Items      []conversationActiveTaskResponse `json:"items"`
-	NextCursor *string                          `json:"next_cursor"`
+	Items        []conversationActiveTaskResponse `json:"items"`
+	NextCursor   *string                          `json:"next_cursor"`
+	PendingCount int64                            `json:"pending_count"`
 }
 
 func (h *api) registerConversations(group *gin.RouterGroup, conversations ConversationService, tasks TaskService) {
@@ -322,6 +324,7 @@ func (h *api) listConversations(service ConversationService) gin.HandlerFunc {
 		if !ok {
 			return
 		}
+		page.Search = c.Query("q")
 		result, err := service.List(c.Request.Context(), principal, page)
 		if err != nil {
 			writeError(c, err)
@@ -443,7 +446,12 @@ func (h *api) listConversationActiveTasks(service TaskService) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		result, err := service.ListConversationActiveTasks(c.Request.Context(), principal, "", id, page)
+		view := app.ConversationTaskView(c.DefaultQuery("view", string(app.ConversationTaskViewActive)))
+		if view != app.ConversationTaskViewActive && view != app.ConversationTaskViewRecent {
+			writeError(c, domain.InvalidArgument("view", "conversation task view is invalid"))
+			return
+		}
+		result, err := service.ListConversationTasks(c.Request.Context(), principal, "", id, view, page)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -453,7 +461,7 @@ func (h *api) listConversationActiveTasks(service TaskService) gin.HandlerFunc {
 }
 
 func writeConversationActiveTasks(c *gin.Context, page app.TaskPage) {
-	response := conversationActiveTaskPageResponse{Items: make([]conversationActiveTaskResponse, 0, len(page.Items)), NextCursor: cursorPointer(page.NextCursor)}
+	response := conversationActiveTaskPageResponse{Items: make([]conversationActiveTaskResponse, 0, len(page.Items)), NextCursor: cursorPointer(page.NextCursor), PendingCount: page.PendingCount}
 	for _, value := range page.Items {
 		summary, err := toTaskSummaryResponseWithK2(value, page.K2Projections[value.ID])
 		if err != nil {
@@ -505,7 +513,8 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 		message, replayed, err := service.AcceptConversationMessage(c.Request.Context(), principal, conversationID, app.AcceptConversationMessageCommand{
 			ServiceInstanceID: instanceID, ClientMessageID: request.ClientMessageID,
 			PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
-			HostID: request.HostID, WorkspaceID: request.WorkspaceID, MCPConnectorIDs: request.MCPConnectorIDs,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget,
+			MCPConnectorIDs:     request.MCPConnectorIDs,
 			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
 			ModelID: request.ModelID, Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router';
 import { AuthProvider } from './app/auth';
 import { AdminGuard, RouteGuard } from './app/RouteGuard';
 import { ToastProvider } from './app/toast';
@@ -36,15 +36,17 @@ import { AdminUserDetail } from './routes/admin/AdminUserDetail';
 import { AdminWorkspaces } from './routes/admin/AdminWorkspaces';
 import { AdminWorkspaceDetail } from './routes/admin/AdminWorkspaceDetail';
 import { AdminSettings } from './routes/admin/AdminSettings';
+import { RecoverablePageBoundary } from './app/PageErrorBoundary';
+import { RecoverableError } from './components/RecoverableError';
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true } } });
 
 function NotFound() {
-  return <main className="empty-card not-found"><h1>找不到这个页面</h1><p>地址可能已经失效，或内容已被移除。</p><Link className="button button-primary" to="/assistant">返回助手</Link></main>;
+  return <RecoverableError title="找不到这个页面" message="地址可能已经失效，或页面暂时无法访问。" />;
 }
 
 function AdminAccessDenied() {
-  return <main className="loading-page"><section className="empty-card"><h1>没有管理权限</h1><p>此账号不能查看管理后台数据。</p><a className="button button-primary" href="/">返回 PC 用户端</a></section></main>;
+  return <RecoverableError title="没有管理权限" message="此账号不能查看管理后台数据。" homePath="/" homeLabel="返回 PC 用户端" />;
 }
 
 function UserRoutes() {
@@ -56,7 +58,7 @@ function UserRoutes() {
     <Route element={<RouteGuard />}>
       <Route path="host-entry/:id" element={<HostEntry />} />
       <Route element={<PortalLayout />}>
-        <Route index element={<Navigate to="/hosts" replace />} />
+        <Route index element={<Navigate to="/assistant" replace />} />
         <Route path="assistant" element={<Assistant />} />
         <Route path="projects" element={<Projects />} />
         <Route path="personal" element={<PersonalData />} />
@@ -100,16 +102,14 @@ function AdminRoutes() {
         </Route>
       </Route>
     </Route>
-    <Route path="*" element={<main className="loading-page"><section className="empty-card"><h1>管理后台地址无效</h1><p>请从 Morde PC 用户端重新打开管理后台。</p><a className="button button-primary" href="/">返回用户端</a></section></main>} />
+    <Route path="*" element={<RecoverableError title="管理后台地址无效" message="地址可能已经失效。可以返回上一页，或回到管理后台首页。" homePath="/admin" homeLabel="返回管理后台" />} />
   </Routes>;
 }
 
 export default function App() {
   return <QueryClientProvider client={queryClient}>
     <ToastProvider>
-      <AuthProvider>
-        <BrowserRouter><UserRoutes /></BrowserRouter>
-      </AuthProvider>
+      <BrowserRouter><RecoverablePageBoundary homePath="/assistant" homeLabel="返回助手"><AuthProvider><UserRoutes /></AuthProvider></RecoverablePageBoundary></BrowserRouter>
     </ToastProvider>
   </QueryClientProvider>;
 }
@@ -117,9 +117,7 @@ export default function App() {
 export function AdminApp() {
   return <QueryClientProvider client={queryClient}>
     <ToastProvider>
-      <AuthProvider>
-        <BrowserRouter><AdminRoutes /></BrowserRouter>
-      </AuthProvider>
+      <BrowserRouter><RecoverablePageBoundary homePath="/admin" homeLabel="返回管理后台"><AuthProvider><AdminRoutes /></AuthProvider></RecoverablePageBoundary></BrowserRouter>
     </ToastProvider>
   </QueryClientProvider>;
 }

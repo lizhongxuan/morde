@@ -21,6 +21,8 @@ import (
 type syncServiceStore struct {
 	workspace                                workspace.Workspace
 	binding                                  workspace.Binding
+	projectFolders                           map[string]workspace.SyncFolder
+	projectUploadCreateReplays               map[string]syncCreateReplay
 	snapshots                                map[int64][]workspace.File
 	directorySnapshots                       map[int64][]workspace.Directory
 	emptyDirectorySnapshots                  map[int64][]string
@@ -45,11 +47,17 @@ type syncServiceStore struct {
 	syncHostRevoked                          bool
 	hostSessionAccessCalls                   int
 	revokeHostAfterAccess                    int
+	projectFolderAccessChecks                int
 	syncSessionRevoked                       bool
 	sessionAccessCalls                       int
 	revokeSessionAfterAccess                 int
 	syncDeviceRevoked                        bool
 	usageFinalizeCalls                       int
+}
+
+type syncCreateReplay struct {
+	requestHash []byte
+	sessionID   string
 }
 
 type syncServiceBlockLock struct {
@@ -70,7 +78,8 @@ func (lock syncServiceBlockLock) Release(context.Context) error {
 
 func newSyncServiceStore() *syncServiceStore {
 	return &syncServiceStore{
-		workspace: workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", Name: "test", State: workspace.StateReady, QuotaBytes: 1 << 30},
+		workspace:      workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", Name: "test", State: workspace.StateReady, QuotaBytes: 1 << 30},
+		projectFolders: map[string]workspace.SyncFolder{}, projectUploadCreateReplays: map[string]syncCreateReplay{},
 		snapshots: map[int64][]workspace.File{0: {}}, directorySnapshots: map[int64][]workspace.Directory{0: {}}, emptyDirectorySnapshots: map[int64][]string{0: {}},
 		sessions: map[string]workspace.SyncSession{}, commitReceipts: map[string]WorkspaceSyncCommitReceipt{},
 		blocks: map[string][]workspace.TransferBlock{}, changes: []workspace.Change{},
@@ -170,6 +179,23 @@ func (s *syncServiceStore) GetWorkspace(_ context.Context, id string) (workspace
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	return s.workspace, nil
+}
+
+func (s *syncServiceStore) GetWorkspaceSyncFolder(_ context.Context, principal identity.Principal, workspaceID, folderID string) (workspace.SyncFolder, error) {
+	folder, exists := s.projectFolders[folderID]
+	if !exists || principal.UserID != folder.OwnerID || workspaceID != folder.WorkspaceID {
+		return workspace.SyncFolder{}, domain.NewError(domain.CodeNotFound, "workspace sync folder not found")
+	}
+	return folder, nil
+}
+
+func (s *syncServiceStore) CheckWorkspaceSyncProjectFolderAccess(_ context.Context, principal identity.Principal, workspaceID, folderID string) error {
+	if s.syncDeviceRevoked || principal.Kind != identity.KindDevice || !principal.HasScope(identity.ScopeWorkspaceSync) || !principal.AllowsWorkspace(workspaceID) {
+		return domain.NewError(domain.CodeNotFound, "workspace sync folder not found")
+	}
+	s.projectFolderAccessChecks++
+	_, err := s.GetWorkspaceSyncFolder(context.Background(), principal, workspaceID, folderID)
+	return err
 }
 
 func (s *syncServiceStore) GetWorkspaceBinding(_ context.Context, hostID, workspaceID string) (workspace.Binding, error) {
@@ -340,7 +366,20 @@ func (s *syncServiceStore) GetWorkspaceChangePage(_ context.Context, _ string, r
 	return workspace.ChangePage{Items: items, NextCursor: workspace.EncodeChangeCursor(workspace.ChangeCursor{Revision: last.Revision, Path: last.Path})}, nil
 }
 
-func (s *syncServiceStore) CreateWorkspaceSyncSession(_ context.Context, session workspace.SyncSession, transfers []workspace.TransferBlock, _ []WorkspaceBlockReservation, _ int64, _ IdempotencyRecord) (workspace.SyncSession, bool, error) {
+func (s *syncServiceStore) CreateWorkspaceSyncSession(_ context.Context, session workspace.SyncSession, transfers []workspace.TransferBlock, _ []WorkspaceBlockReservation, _ int64, idempotency IdempotencyRecord) (workspace.SyncSession, bool, error) {
+	if session.FolderID != "" {
+		key := idempotency.OwnerID + "/" + idempotency.Operation + "/" + idempotency.Key
+		if saved, ok := s.projectUploadCreateReplays[key]; ok {
+			if !bytes.Equal(saved.requestHash, idempotency.RequestHash) {
+				return workspace.SyncSession{}, false, domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different project upload")
+			}
+			original, exists := s.sessions[saved.sessionID]
+			if !exists {
+				return workspace.SyncSession{}, false, domain.NewError(domain.CodeInternal, "saved project upload session is missing")
+			}
+			return original, true, nil
+		}
+	}
 	var manifestBytes int64
 	for _, file := range session.Files {
 		manifestBytes += file.SizeBytes
@@ -357,6 +396,10 @@ func (s *syncServiceStore) CreateWorkspaceSyncSession(_ context.Context, session
 	session.TransferBlocks = append([]workspace.TransferBlock(nil), transfers...)
 	s.sessions[session.ID] = session
 	s.blocks[session.ID] = append([]workspace.TransferBlock(nil), transfers...)
+	if session.FolderID != "" {
+		key := idempotency.OwnerID + "/" + idempotency.Operation + "/" + idempotency.Key
+		s.projectUploadCreateReplays[key] = syncCreateReplay{requestHash: append([]byte(nil), idempotency.RequestHash...), sessionID: session.ID}
+	}
 	return session, false, nil
 }
 

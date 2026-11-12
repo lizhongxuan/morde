@@ -27,6 +27,7 @@ const (
 
 var (
 	workspaceIDRE   = regexp.MustCompile(`^w[a-z0-9]{7}$`)
+	syncFolderIDRE  = regexp.MustCompile(`^morde-[a-f0-9]{32}$`)
 	sessionIDRE     = regexp.MustCompile(`^p[a-z0-9]{7}$`)
 	taskIDRE        = regexp.MustCompile(`^q[a-z0-9]{7}$`)
 	taskOperationRE = regexp.MustCompile(`^agent:[a-f0-9]{64}$`)
@@ -109,6 +110,7 @@ type syncParams struct {
 	BaseURL               string   `json:"base_url"`
 	BearerToken           string   `json:"bearer_token"`
 	WorkspaceID           string   `json:"workspace_id"`
+	FolderID              string   `json:"folder_id,omitempty"`
 	Directory             string   `json:"directory"`
 	Direction             string   `json:"direction"`
 	Policy                string   `json:"policy,omitempty"`
@@ -411,6 +413,10 @@ func (s *stdioServer) hubFileChunk(id json.RawMessage, rawParams json.RawMessage
 	}
 	chunk, err := client.ReadHubFileChunk(params.Directory, params.Identity, params.Path, params.Version, params.Offset, params.MaxBytes)
 	if err != nil {
+		if errors.Is(err, client.ErrHubFileChanged) {
+			_ = s.writeError(id, -32032, "selected file changed after snapshot")
+			return
+		}
 		_ = s.writeError(id, -32030, "selected file could not be verified")
 		return
 	}
@@ -748,7 +754,7 @@ func (s *stdioServer) startSync(id json.RawMessage, idKey string, rawParams json
 	go func() {
 		defer s.wg.Done()
 		result, syncErr := apiClient.Sync(ctx, client.SyncOptions{
-			WorkspaceID: params.WorkspaceID, Directory: params.Directory, Direction: params.Direction,
+			WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, Directory: params.Directory, Direction: params.Direction,
 			Policy: params.Policy,
 			Scope:  params.Scope, BaseRevision: params.BaseRevision, SessionID: params.SessionID,
 			TaskID: params.TaskID, TaskHubOperationKey: params.TaskHubOperationKey,
@@ -872,6 +878,10 @@ func validateSyncParams(value syncParams) error {
 	}
 	if value.BaseRevision != nil && *value.BaseRevision < 0 {
 		return errors.New("base_revision is invalid")
+	}
+	if value.FolderID != "" && (!syncFolderIDRE.MatchString(value.FolderID) || value.Direction != "upload" || value.Policy != "compare_merge" ||
+		value.BaseRevision == nil || *value.BaseRevision != 0 || len(value.Scope) != 0 || value.TaskID != "" || value.TaskHubOperationKey != "") {
+		return errors.New("project folder sync requires an unscoped compare-merge upload from revision zero")
 	}
 	if value.SessionID != "" && !sessionIDRE.MatchString(value.SessionID) {
 		return errors.New("session_id is invalid")

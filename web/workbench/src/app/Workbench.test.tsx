@@ -38,7 +38,10 @@ function mockWorkbenchApi() {
   vi.spyOn(gatewayApi, 'workspaces').mockResolvedValue({ items: [] });
 }
 
-afterEach(() => window.history.replaceState({}, '', '/'));
+afterEach(() => {
+  window.history.replaceState({}, '', '/');
+  Reflect.deleteProperty(document, 'referrer');
+});
 
 describe('Workbench MVP navigation', () => {
   beforeEach(mockWorkbenchApi);
@@ -86,6 +89,83 @@ describe('Workbench MVP navigation', () => {
     expect(gatewayApi.host).not.toHaveBeenCalled();
     expect(gatewayApi.control).not.toHaveBeenCalled();
     expect(gatewayApi.workspaces).toHaveBeenCalledOnce();
+  });
+
+  it('scopes embedded messages to the referrer, source and nonce, then refreshes control on resume', async () => {
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'n'.repeat(32)}`);
+    const controlQuery = vi.mocked(gatewayApi.control);
+    const postMessage = vi.spyOn(window, 'postMessage');
+    const { container } = render(<Workbench />);
+
+    const app = container.querySelector('main');
+    expect(app).not.toBeNull();
+    expect(app!).toHaveAttribute('inert');
+    await waitFor(() => expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'morde.workbench.embed', version: 1, type: 'ready', nonce: 'n'.repeat(32) }),
+      'https://portal.example.test',
+    ));
+    const init = (origin: string, source: MessageEventSource | null, nonce: string, visible: boolean) => window.dispatchEvent(new MessageEvent('message', {
+      origin, source,
+      data: { channel: 'morde.workbench.embed', version: 1, type: 'init', nonce, conversation_id: 'c1234567', visible },
+    }));
+
+    act(() => {
+      init('https://attacker.example', window, 'n'.repeat(32), false);
+      init('https://portal.example.test', null, 'n'.repeat(32), false);
+      init('https://portal.example.test', window, 'x'.repeat(32), false);
+    });
+    expect(app).toHaveAttribute('inert');
+
+    act(() => init('https://portal.example.test', window, 'n'.repeat(32), false));
+    expect(app!).toHaveAttribute('inert');
+    expect(app!).toHaveClass('is-embedded-hidden');
+    expect(controlQuery).toHaveBeenCalledOnce();
+
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: 'https://portal.example.test', source: window,
+      data: { channel: 'morde.workbench.embed', version: 1, type: 'visibility', nonce: 'n'.repeat(32), visible: true },
+    })));
+    await waitFor(() => expect(app!).not.toHaveAttribute('inert'));
+    expect(controlQuery).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Workspace' })).not.toBeInTheDocument();
+    expect([...container.querySelectorAll<HTMLButtonElement>('.tab-button')].map((button) => button.dataset.tab))
+      .toEqual(['browser', 'terminal', 'files', 'vscode']);
+  });
+
+  it('keeps renewing the current user lease while the embedded panel is hidden', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'h'.repeat(32)}`);
+    let completeResume: (value: GatewayControl) => void = () => undefined;
+    vi.mocked(gatewayApi.control).mockReset()
+      .mockResolvedValueOnce(userControl)
+      .mockImplementationOnce(() => new Promise((resolve) => { completeResume = resolve; }))
+      .mockResolvedValue(userControl);
+    const renewLease = vi.spyOn(gatewayApi, 'renewControlLease').mockResolvedValue(userControl);
+    const { container } = render(<Workbench />);
+
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const remoteFrame = container.querySelector<HTMLIFrameElement>('iframe[title="远程桌面"]');
+    expect(remoteFrame).not.toBeNull();
+    expect(new URL(remoteFrame!.src).searchParams.get('view_only')).toBe('true');
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: 'https://portal.example.test', source: window,
+      data: { channel: 'morde.workbench.embed', version: 1, type: 'init', nonce: 'h'.repeat(32), conversation_id: 'c1234567', visible: true },
+    })));
+    expect(new URL(remoteFrame!.src).searchParams.get('view_only')).toBe('true');
+    await act(async () => { completeResume(userControl); await Promise.resolve(); await Promise.resolve(); });
+    expect(new URL(remoteFrame!.src).searchParams.get('view_only')).toBe('false');
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: 'https://portal.example.test', source: window,
+      data: { channel: 'morde.workbench.embed', version: 1, type: 'visibility', nonce: 'h'.repeat(32), visible: false },
+    })));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+
+    expect(renewLease).toHaveBeenCalledWith(userControl.control_version);
+    expect(container.querySelector('main')).toHaveAttribute('inert');
+    expect(new URL(remoteFrame!.src).searchParams.get('view_only')).toBe('true');
   });
 
   it('renders Task observation without loading Host controls or Workspace APIs', async () => {

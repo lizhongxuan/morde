@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -237,8 +238,8 @@ func TestHubInspectionRejectsChangedFileAfterSnapshot(t *testing.T) {
 	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadHubFileChunk(selection.Directory, selection.Identity, "report.pdf", snapshot.Version, 0, 64); err == nil {
-		t.Fatal("ReadHubFileChunk accepted changed bytes with the old snapshot version")
+	if _, err := ReadHubFileChunk(selection.Directory, selection.Identity, "report.pdf", snapshot.Version, 0, 64); !errors.Is(err, ErrHubFileChanged) {
+		t.Fatalf("ReadHubFileChunk error = %v, want ErrHubFileChanged", err)
 	}
 }
 

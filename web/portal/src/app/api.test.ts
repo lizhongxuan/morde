@@ -171,14 +171,14 @@ describe('typed Portal API client', () => {
       }, { status: 201 });
     }));
 
-    expect((await portalApi.createHost({ workspace_ids: [] }, 'host-create-key-001')).id).toBe('h1234567');
+    expect((await portalApi.createHost({}, 'host-create-key-001')).id).toBe('h1234567');
     const request = requests[0]!;
     expect([request.method, new URL(request.url).pathname]).toEqual(['POST', '/api/hosts']);
     expect(request.headers.get('X-Request-Id')).toBeTruthy();
     expect(request.headers.get('Content-Type')).toContain('application/json');
     expect(request.headers.get('Idempotency-Key')).toBe('host-create-key-001');
     expect(request.credentials).toBe('include');
-    expect(await request.json()).toEqual({ workspace_ids: [] });
+    expect(await request.json()).toEqual({});
   });
 
   it('lists only record metadata and requests owner-scoped record deletion', async () => {
@@ -462,8 +462,8 @@ describe('typed Portal API client', () => {
       return Response.json({ id: 'h1234567' }, { status: 201 });
     }));
 
-    await expect(portalApi.createHost({ workspace_ids: [] }, 'host-create-retry-001')).rejects.toThrow('主机已创建，但响应丢失');
-    await expect(portalApi.createHost({ workspace_ids: [] }, 'host-create-retry-001')).resolves.toMatchObject({ id: 'h1234567' });
+    await expect(portalApi.createHost({}, 'host-create-retry-001')).rejects.toThrow('主机已创建，但响应丢失');
+    await expect(portalApi.createHost({}, 'host-create-retry-001')).resolves.toMatchObject({ id: 'h1234567' });
     expect(keys).toEqual(['host-create-retry-001', 'host-create-retry-001']);
   });
 

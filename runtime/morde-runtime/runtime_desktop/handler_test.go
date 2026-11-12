@@ -26,6 +26,7 @@ type fakeBackend struct {
 	windowsAfterActivate *[]window
 	activated            string
 	lastClick            [4]any
+	clickCalls           [][4]any
 	lastTarget           string
 	text                 string
 	key                  string
@@ -82,6 +83,7 @@ func (b *fakeBackend) activate(_ context.Context, id string) error {
 func (b *fakeBackend) click(ctx context.Context, id string, x, y int, button string) error {
 	b.mu.Lock()
 	b.lastClick = [4]any{id, x, y, button}
+	b.clickCalls = append(b.clickCalls, b.lastClick)
 	called := b.clickCalled
 	block := b.blockClick
 	b.mu.Unlock()
@@ -616,6 +618,91 @@ func TestConcurrentCancellationWaitsForInputProcessToStop(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Stop did not wait for the action to finish")
+	}
+}
+
+func TestTakeoverCancelsQueuedDesktopInputAcrossTasks(t *testing.T) {
+	backend := &fakeBackend{size: displaySize{width: 10, height: 10}, image: testJPEG(t, 10, 10),
+		windows:    []window{{ID: "0x2a", X: 0, Y: 0, Width: 10, Height: 10, Active: true}},
+		blockClick: true, clickCalled: make(chan struct{}, 2)}
+	controller := newTestController(t, backend)
+	defer controller.Close()
+	firstTask, secondTask := "q0000001", "q0000002"
+	firstToken := screenshotTokenForTask(t, controller, firstTask)
+	secondToken := screenshotTokenForTask(t, controller, secondTask)
+	handler := findHandler(t, controller, "desktop.input", "click")
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	secondContext, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	firstRequest := contract.ExecuteRequest{OperationID: "o0000001", TaskID: firstTask, Capability: "desktop.input", Action: "click",
+		Arguments: json.RawMessage(clickJSON(t, "0x2a", 1, 2, firstToken))}
+	secondRequest := contract.ExecuteRequest{OperationID: "o0000002", TaskID: secondTask, Capability: "desktop.input", Action: "click",
+		Arguments: json.RawMessage(clickJSON(t, "0x2a", 3, 4, secondToken))}
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := handler.Execute(firstContext, firstRequest); firstDone <- err }()
+	select {
+	case <-backend.clickCalled:
+	case <-time.After(time.Second):
+		t.Fatal("first Task did not enter desktop input")
+	}
+	go func() { _, err := handler.Execute(secondContext, secondRequest); secondDone <- err }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		controller.mu.Lock()
+		_, queued := controller.active[secondRequest.OperationID]
+		controller.mu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second Task did not queue on the shared desktop controller")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	backend.mu.Lock()
+	started := len(backend.clickCalls)
+	backend.mu.Unlock()
+	if started != 1 {
+		t.Fatalf("concurrent desktop inputs started before takeover: %d", started)
+	}
+	firstStop, secondStop := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := handler.Stop(context.Background(), contract.Operation{OperationID: firstRequest.OperationID, TaskID: firstTask,
+			Capability: firstRequest.Capability, Action: firstRequest.Action})
+		firstStop <- err
+	}()
+	go func() {
+		_, err := handler.Stop(context.Background(), contract.Operation{OperationID: secondRequest.OperationID, TaskID: secondTask,
+			Capability: secondRequest.Capability, Action: secondRequest.Action})
+		secondStop <- err
+	}()
+	cancelSecond()
+	cancelFirst()
+	for name, done := range map[string]<-chan error{"first Task": firstDone, "second Task": secondDone} {
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s input error = %v, want cancellation", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s input did not stop", name)
+		}
+	}
+	for name, stopped := range map[string]<-chan error{"first Task": firstStop, "second Task": secondStop} {
+		select {
+		case err := <-stopped:
+			if err != nil {
+				t.Fatalf("%s Stop failed: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s Stop did not confirm completion", name)
+		}
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.clickCalls) != 1 || backend.clickCalls[0][1] != 1 || backend.clickCalls[0][2] != 2 {
+		t.Fatalf("desktop inputs after takeover = %#v; want only the active Task's click", backend.clickCalls)
 	}
 }
 

@@ -30,7 +30,7 @@ async function mount(api, confirm = () => false) {
     getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
     createElement(tagName) { return new Element(tagName); },
   };
-  for (const id of ['origin', 'name', 'password', 'submit', 'web', 'account-settings']) document.getElementById(id);
+  for (const id of ['origin', 'name', 'password', 'submit']) document.getElementById(id);
   let uuid = 0;
   const source = await readFile(new URL('../resources/morde.js', import.meta.url), 'utf8');
   vm.runInNewContext(source, { window: { morde: api, confirm }, document, crypto: { randomUUID: () => `retry-${++uuid}` } }, { filename: 'morde.js' });
@@ -66,20 +66,20 @@ test('login UI sends credentials to the main process and retry generates no rend
   assert.equal(elements.has('user-code'), false);
 });
 
-test('local synchronization appears only on request and public pages take the entered origin', async () => {
-  const calls = [];
+test('local sync content follows main-process view state and public pages use the entered origin', async () => {
   let current = { authenticated: true, origin: 'https://portal.example', storageReady: true, mappings: [], view: 'web' };
+  let notifyState;
+  const calls = [];
   const api = {
     state: async () => current,
-    showSync: async () => { current = { ...current, view: 'sync' }; },
     workspaces: async () => ({ items: [] }),
     publicPage: async (...args) => calls.push(args),
-    onState() {}, onSync() {},
+    onState: (listener) => { notifyState = listener; }, onSync() {},
   };
   const elements = await mount(api);
   assert.equal(elements.get('sync-page').hidden, true);
-  elements.get('local-sync').onclick();
-  await new Promise((resolve) => setImmediate(resolve));
+  current = { ...current, view: 'sync' };
+  notifyState(current);
   assert.equal(elements.get('sync-page').hidden, false);
   elements.get('origin').value = 'https://portal.example';
   elements.get('register').onclick();
@@ -87,18 +87,63 @@ test('local synchronization appears only on request and public pages take the en
   assert.deepEqual(calls[0], ['register', 'https://portal.example']);
 });
 
-test('desktop account shortcut opens Morde account settings in the authenticated Portal view', async () => {
-  let accountOpens = 0;
-  const current = { authenticated: true, accountName: 'user', origin: 'https://portal.example', storageReady: true, mappings: [], view: 'web' };
+test('project uploader reports cloud confirmation separately from Host application', async () => {
+  const current = {
+    authenticated: true, storageReady: true, view: 'sync', syncState: 'idle', syncRecovery: null,
+    projectMappings: [],
+  };
+  const calls = [];
+  let uploadCount = 0;
   const elements = await mount({
     state: async () => current,
-    showAccount: async () => { accountOpens++; },
+    projectUploadTargets: async () => [{
+      hostId: 'h1234567', hostName: '关机电脑', hostState: 'stopped', workspaceId: 'w1234567',
+      workspaceName: '工作区', folders: [],
+    }],
+    selectProjectDirectory: async (...args) => {
+      calls.push(['select', ...args]);
+      return { selectionID: '123e4567-e89b-42d3-a456-426614174000', hostId: 'h1234567',
+        workspaceId: 'w1234567', projectName: 'demo', directoryName: 'demo' };
+    },
+    uploadProject: async (...args) => {
+      calls.push(['upload', ...args]);
+      uploadCount++;
+      return uploadCount === 1
+        ? { session: { state: 'conflict' }, cloudStatus: 'pending', conflicts: [{ path: 'cloud-existing.txt' }] }
+        : { session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'pending_apply', conflicts: [] };
+    },
+    workspaces: async () => ({ items: [] }),
     onState() {}, onSync() {},
   });
-  assert.equal(elements.get('account').textContent, 'user · https://portal.example');
-  elements.get('account-settings').onclick();
+  for (let attempt = 0; attempt < 4; attempt++) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [], 'rendering the uploader does not start an upload');
+  let controls = flatten(elements.get('project-upload-content').childNodes);
+  controls.find((node) => node.textContent === '选择本机项目文件夹').onclick();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(accountOpens, 1);
+  assert.deepEqual(calls, [['select', 'h1234567', 'w1234567']], 'selecting a local folder only saves its mapping');
+  controls = flatten(elements.get('project-upload-content').childNodes);
+  controls.find((node) => node.textContent === '单向上传到云端电脑').onclick();
+  for (let attempt = 0; attempt < 4; attempt++) await new Promise((resolve) => setImmediate(resolve));
+  assert.match(textOf(elements.get('project-upload-content')), /发现冲突；本次上传未提交/);
+  controls = flatten(elements.get('project-upload-content').childNodes);
+  const retry = controls.find((node) => node.textContent === '单向上传到云端电脑');
+  assert.equal(retry.disabled, false);
+  retry.onclick();
+  for (let attempt = 0; attempt < 4; attempt++) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [
+    ['select', 'h1234567', 'w1234567'],
+    ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
+    ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
+  ]);
+  assert.match(textOf(elements.get('project-upload-content')), /云端已确认；电脑待应用/);
+  assert.match(textOf(elements.get('project-upload-content')), /关机电脑不会自动启动/);
+  controls = flatten(elements.get('project-upload-content').childNodes);
+  assert.equal(controls.find((node) => node.textContent === '单向上传到云端电脑').disabled, false);
+});
+
+test('desktop shell leaves Portal navigation unobstructed by its own header', async () => {
+  const html = await readFile(new URL('../resources/morde.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /<header\b|id="(?:account|navigation|web|account-settings|local-sync|logout)"/);
 });
 
 test('workspace controls keep the fixed local-node switch and expose scoped one-shot sync and handoff actions', async () => {
@@ -177,7 +222,7 @@ test('live sync UI fails closed when the service capability is disabled', async 
     onLiveSync() {}, onState() {}, onSync() {},
   });
   const liveCard = flatten(elements.get('workspaces').childNodes).find((node) => node.tagName === 'section' && node.childNodes[0]?.textContent === '旧版实时同步（本机）');
-  const start = flatten([liveCard]).find((node) => node.textContent === '启动旧版实时同步');
+  const start = flatten([liveCard]).find((node) => node.textContent === '启动兼容版实时同步');
   assert.equal(start.disabled, true);
   assert.match(textOf(liveCard), /能力未开放/);
   start.onclick();
@@ -202,16 +247,16 @@ test('live sync UI keeps status and events scoped to each Workspace and requires
     stopLiveSync: async (...args) => calls.push(['stop', ...args]),
     onLiveSync: (handler) => { onLiveSync = handler; }, onState() {}, onSync() {},
   });
-  const workspaceCard = (name) => elements.get('workspaces').childNodes.find((node) => node.className === 'card' && node.childNodes[0]?.textContent.startsWith(name));
+  const workspaceCard = (name) => elements.get('workspaces').childNodes.find((node) => node.className === 'card' && node.childNodes[0]?.textContent.startsWith(`电脑文件 · ${name}`));
   const alpha = workspaceCard('Alpha');
   const beta = workspaceCard('Beta');
   const alphaLive = flatten([alpha]).find((node) => node.tagName === 'section' && node.childNodes[0]?.textContent === '旧版实时同步（本机）');
   const betaLive = flatten([beta]).find((node) => node.tagName === 'section' && node.childNodes[0]?.textContent === '旧版实时同步（本机）');
   assert.equal(flatten([alphaLive]).find((node) => node.tagName === 'textarea').value, 'src');
   assert.equal(flatten([alphaLive]).find((node) => node.tagName === 'input' && node.type === 'number').value, '45');
-  assert.equal(flatten([betaLive]).find((node) => node.textContent === '停止旧版实时同步').disabled, false);
+  assert.equal(flatten([betaLive]).find((node) => node.textContent === '停止兼容版实时同步').disabled, false);
 
-  flatten([alphaLive]).find((node) => node.textContent === '启动旧版实时同步').onclick();
+  flatten([alphaLive]).find((node) => node.textContent === '启动兼容版实时同步').onclick();
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(plain(calls[0]), ['start', 'w1234567', ['src'], 45, false]);
@@ -224,7 +269,7 @@ test('live sync UI keeps status and events scoped to each Workspace and requires
 
   const refreshedBeta = workspaceCard('Beta');
   const refreshedBetaLive = flatten([refreshedBeta]).find((node) => node.tagName === 'section' && node.childNodes[0]?.textContent === '旧版实时同步（本机）');
-  flatten([refreshedBetaLive]).find((node) => node.textContent === '停止旧版实时同步').onclick();
+  flatten([refreshedBetaLive]).find((node) => node.textContent === '停止兼容版实时同步').onclick();
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(plain(calls[1]), ['stop', 'w7654321']);
@@ -244,7 +289,7 @@ test('live sync recovery remains manual and uses its saved scope and interval', 
   });
   const liveCard = flatten(elements.get('workspaces').childNodes).find((node) => node.tagName === 'section' && node.childNodes[0]?.textContent === '旧版实时同步（本机）');
   const controls = flatten([liveCard]);
-  const start = controls.find((node) => node.textContent === '确认并恢复旧版实时同步');
+  const start = controls.find((node) => node.textContent === '确认并恢复兼容版实时同步');
   const confirmation = controls.find((node) => node.tagName === 'input' && node.type === 'checkbox');
   assert.equal(start.disabled, true);
   assert.equal(calls.length, 0, 'mounting a recovered Workspace must never resume sync automatically');
@@ -376,7 +421,7 @@ test('confirmed handoff uses the dedicated mode and only reports a verified revi
   assert.deepEqual(plain(calls), [['w1234567', 'handoff_checkpoint', [], true, 'desktop']]);
   assert.match(elements.get('message').textContent, /版本 21/);
   assert.match(textOf(elements.get('workspaces')), /交接检查点已核验（版本 21）/);
-  assert.match(textOf(elements.get('workspaces')), /云端 Workspace → 此电脑 · 已核验 · 版本 21/);
+  assert.match(textOf(elements.get('workspaces')), /云端文件 → 此电脑 · 已核验 · 版本 21/);
   assert.match(textOf(elements.get('workspaces')), /不会启动远端工作进程或绑定 Host/);
 });
 
@@ -538,12 +583,12 @@ test('a running sync remains stoppable while Workspace loading times out', async
     onState() {}, onSync() {},
   });
   let root = elements.get('workspaces');
-  assert.equal(root.childNodes[0].textContent, '正在读取 Workspace…');
+  assert.equal(root.childNodes[0].textContent, '正在读取云端文件目录…');
   assert.equal(root.childNodes.find((node) => node.textContent === '停止同步').disabled, false);
   rejectWorkspaces(new Error('timeout'));
   await new Promise((resolve) => setImmediate(resolve));
   root = elements.get('workspaces');
-  assert.match(root.childNodes[0].textContent, /云端 Workspace 当前不可读取/);
+  assert.match(root.childNodes[0].textContent, /云端文件目录当前不可读取/);
   root.childNodes.find((node) => node.textContent === '停止同步').onclick();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(stopCount, 1);
@@ -583,7 +628,7 @@ test('offline Workspace loading keeps a local safety-copy section and renders un
   await new Promise((resolve) => setImmediate(resolve));
   const root = elements.get('workspaces');
   const all = flatten(root.childNodes);
-  assert.match(all.map((node) => node.textContent).join(' '), /云端 Workspace 当前不可读取/);
+  assert.match(all.map((node) => node.textContent).join(' '), /云端文件目录当前不可读取/);
   assert.ok(all.some((node) => node.textContent === maliciousPath));
   assert.ok(all.some((node) => node.textContent.includes('额外占用 2.0 KB')));
   assert.equal(all.some((node) => node.tagName === 'img'), false);
@@ -612,7 +657,7 @@ test('cancelled restore and deletion confirmations never call the local IPC brid
   assert.match(confirmations[0], /目标路径必须为空/);
   assert.match(confirmations[0], /归档副本仍会保留/);
   assert.match(confirmations[1], /private notes\.txt.*2\.0 KB/);
-  assert.match(confirmations[1], /仅删除这份本机副本，无法恢复，不影响云端 Workspace/);
+  assert.match(confirmations[1], /仅删除这份本机副本，无法恢复，不影响云端文件/);
 });
 
 test('confirmed restore and delete invoke only the selected local safety-copy actions', async () => {

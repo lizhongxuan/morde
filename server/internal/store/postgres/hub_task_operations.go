@@ -898,7 +898,7 @@ func validTaskHubOperationState(value app.TaskHubOperation) bool {
 		return false
 	}
 	if value.Action != hub.ActionFilePut {
-		return (value.Action == hub.ActionFileFetch && value.TaskRevision > 0 || value.Action != hub.ActionFileFetch && value.TaskRevision == 0) &&
+		return (value.Action == hub.ActionFileFetch && value.TaskRevision >= 0 || value.Action != hub.ActionFileFetch && value.TaskRevision == 0) &&
 			value.WorkspaceID == "" && value.WorkspacePath == "" && value.WorkspaceSizeBytes == 0 && value.WorkspaceSHA256 == "" &&
 			value.SourceCheckpointRevision == 0 && len(value.LocalReceiptHash) == 0 && value.SyncStage == "" && value.SyncSessionID == "" &&
 			value.SyncRevision == 0 && (len(value.ResultHash) == 0 || len(value.ResultHash) == 32)

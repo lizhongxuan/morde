@@ -35,4 +35,13 @@ describe('readK2TaskProjection', () => {
       child_jobs: [], result_review: null,
     })).toEqual({ kind: 'invalid' });
   });
+
+  it('accepts missing or null review retry IDs for older snapshots and rejects malformed IDs', () => {
+    const review = { state: 'failed', source_task_id: 'q1234567', source_task_revision: 1,
+      source_event_sequence: 2, reply_message_id: null };
+    const task = { dependencies: [], child_jobs: [], result_review: review };
+    expect(readK2TaskProjection(task).kind).toBe('available');
+    expect(readK2TaskProjection({ ...task, result_review: { ...review, trigger_message_id: null } }).kind).toBe('available');
+    expect(readK2TaskProjection({ ...task, result_review: { ...review, trigger_message_id: 12 } })).toEqual({ kind: 'invalid' });
+  });
 });

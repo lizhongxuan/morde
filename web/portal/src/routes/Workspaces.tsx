@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
+import { Link, useSearchParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { components } from '../api/schema';
 import { enterHostInNewTab, errorDetails, newIdempotencyKey, portalApi } from '../app/api';
@@ -19,15 +20,15 @@ type WorkspaceRevisionDiff = components['schemas']['WorkspaceDiff'];
 type WorkspaceRestoreRecovery = { pending: PendingWorkspaceRestore | null; invalid: boolean };
 const revisionDiffPageSize = 50;
 const restorePhaseLabel: Record<PendingWorkspaceRestore['phase'], string> = {
-  unbind: '解绑 Workspace',
-  wait_detached: '等待服务端确认解绑',
-  release_host: '释放 Host 计算资源',
-  wait_stopped: '等待 Host 停止',
-  restore_workspace: '恢复 Workspace revision',
-  wait_projection: '等待 Workspace projection',
-  bind_workspace: '将 Workspace 绑定回 Host',
-  restore_host: '恢复 Host',
-  wait_running: '等待 Host 应用新 revision',
+  unbind: '解除电脑文件关联',
+  wait_detached: '等待确认电脑文件已解除关联',
+  release_host: '释放电脑运行资源',
+  wait_stopped: '等待电脑停止',
+  restore_workspace: '恢复云端文件版本',
+  wait_projection: '等待云端文件准备',
+  bind_workspace: '重新关联云端电脑',
+  restore_host: '恢复云端电脑',
+  wait_running: '等待电脑应用新文件版本',
 };
 const workspaceStateLabel: Record<Workspace['state'], string> = { ready: '服务端已保存', deleting: '删除中', deleted: '已删除' };
 const bindingStateLabel: Record<Binding['state'], string> = {
@@ -108,11 +109,12 @@ export function Workspaces() {
   const client = useQueryClient();
   const { user } = useAuth();
   const { notify } = useToast();
+  const [searchParams] = useSearchParams();
+  const computerID = searchParams.get('host') ?? '';
   const [selected, setSelected] = useState<Workspace | null>(null);
   const [selectedBinding, setSelectedBinding] = useState<{ host: Host; binding: Binding } | null>(null);
   const [restored] = useState(() => readPendingWorkspaceCreate(user?.id));
   const [name, setName] = useState(restored.pending?.name ?? '');
-  const [showCreate, setShowCreate] = useState(false);
   const [validationError, setValidationError] = useState('');
   const pendingWorkspaceCreate = useRef<PendingWorkspaceCreate | null>(restored.pending);
   const [recoveryPending, setRecoveryPending] = useState(!!restored.pending);
@@ -146,8 +148,11 @@ export function Workspaces() {
         || host.workspaces.some((binding) => binding.state === 'preparing' || binding.state === 'unbinding'
           || (binding.state === 'active' && binding.applied_revision !== binding.desired_revision))) ? 3000 : false,
   });
-  const revisionWorkspace = query.data?.items.find((item) => item.id === revisionWorkspaceID) ?? null;
-  const transferWorkspace = query.data?.items.find((item) => item.id === transferWorkspaceID) ?? null;
+  const computer = computerID ? hosts.data?.items.find((host) => host.id === computerID && host.owner_id === user?.id) : undefined;
+  const computerWorkspaceIDs = new Set(computer?.workspaces.filter((binding) => binding.state !== 'detached').map((binding) => binding.workspace.id) ?? []);
+  const visibleWorkspaces = (query.data?.items ?? []).filter((item) => !computerID || computerWorkspaceIDs.has(item.id));
+  const revisionWorkspace = visibleWorkspaces.find((item) => item.id === revisionWorkspaceID) ?? null;
+  const transferWorkspace = visibleWorkspaces.find((item) => item.id === transferWorkspaceID) ?? null;
   const transferHost = transferWorkspace
     ? hosts.data?.items.find((host) => host.workspaces.some((binding) => binding.workspace.id === transferWorkspace.id && binding.state !== 'detached'))
     : undefined;
@@ -198,14 +203,13 @@ export function Workspaces() {
   ]);
   const create = useMutation({
     mutationFn: (request: { name: string; idempotencyKey: string }) => portalApi.createWorkspace({ name: request.name }, request.idempotencyKey),
-    onSuccess: async (_workspace, request) => {
+        onSuccess: async (_workspace, request) => {
       if (user) {
         try { localStorage.removeItem(pendingCreateKey(user.id)); } catch { /* Replaying the same key remains safe if local cleanup fails. */ }
       }
       if (pendingWorkspaceCreate.current?.idempotencyKey === request.idempotencyKey) pendingWorkspaceCreate.current = null;
       setRecoveryPending(false);
       setRecoveryError(false);
-      setShowCreate(false);
       setName('');
       setValidationError('');
       await client.invalidateQueries({ queryKey: ['workspaces'] });
@@ -223,9 +227,9 @@ export function Workspaces() {
       expected_binding_version: host.workspaces.find((binding) => binding.workspace.id === workspace.id)?.binding_version ?? 0,
     }),
     onSuccess: async (binding, request) => {
-      if (binding.state === 'failed') notify('服务端报告工作区未能应用到主机，请检查绑定状态。', 'error');
-      else if (binding.state === 'active' && binding.applied_revision === binding.desired_revision) notify('服务端已确认工作区应用到主机。', 'success');
-      else notify('服务端已接受绑定，正在等待主机应用工作区。', 'success');
+      if (binding.state === 'failed') notify('云端文件未能应用到电脑，请检查电脑文件状态。', 'error');
+      else if (binding.state === 'active' && binding.applied_revision === binding.desired_revision) notify('服务端已确认云端文件应用到电脑。', 'success');
+      else notify('服务端已接受关联，正在等待电脑应用云端文件。', 'success');
       setHostTargets((current) => current[request.workspace.id] === request.host.id
         ? { ...current, [request.workspace.id]: '' } : current);
       await refreshWorkspaceState();
@@ -240,7 +244,7 @@ export function Workspaces() {
     onSuccess: async (binding) => {
       setSelectedBinding(null);
       await refreshWorkspaceState();
-      notify(binding.state === 'unbinding' ? '已提交解绑，服务端正在等待操作完成并校验工作区。' : '工作区已解绑，服务端数据和主机磁盘副本均已保留。', 'success');
+      notify(binding.state === 'unbinding' ? '已提交解除关联，服务端正在等待操作完成并校验文件。' : '已解除关联，服务端文件和电脑磁盘副本均已保留。', 'success');
     },
     onError: async (error) => {
       setSelectedBinding(null);
@@ -252,7 +256,7 @@ export function Workspaces() {
     mutationFn: ({ host, binding }: { host: Host; binding: Binding }) => portalApi.retryHostWorkspaceSync(host.id, binding.workspace.id, binding.binding_version),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ['hosts'] });
-      notify('已提交 Host 工作区同步重试。', 'success');
+      notify('已提交电脑文件同步重试。', 'success');
     },
     onError: async (error) => {
       await client.invalidateQueries({ queryKey: ['hosts'] });
@@ -291,9 +295,9 @@ export function Workspaces() {
       setRevisionDiffPage(0);
       await refreshWorkspaceState();
       notify(import.meta.env.VITE_MOCK_API === '1'
-        ? '本地演示已模拟完成安全恢复流程；没有写入真实 Workspace。'
-        : 'Workspace 已恢复为 revision v' + String(restoredRevision) + (operation.hostID
-          ? '，Host 与新版本应用状态均已确认。' : '，新版本 projection 已确认。'), 'success');
+        ? '本地演示已模拟完成安全恢复流程；没有写入真实云端文件。'
+        : '云端文件已恢复为版本 v' + String(restoredRevision) + (operation.hostID
+          ? '，云端电脑与新版本应用状态均已确认。' : '，新版本文件已确认。'), 'success');
     } catch (error) {
       setRestoreWorkflowError(errorDetails(error).message);
       await refreshWorkspaceState();
@@ -431,7 +435,6 @@ export function Workspaces() {
       pendingWorkspaceCreate.current = null;
       setRecoveryPending(false);
       setRecoveryError(false);
-      setShowCreate(true);
       setName('');
       create.reset();
     } catch {
@@ -444,13 +447,14 @@ export function Workspaces() {
   };
 
   return <section>
-    {import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-info" role="status">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实 Workspace。</p>}
+    {import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-info" role="status">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实云端文件。</p>}
+    {computerID && hosts.isSuccess && !computer && <p className="notice notice-warning" role="status">无法确认这台云端电脑的文件访问权限。</p>}
     {restoreRecovery.invalid && <div className="notice notice-warning" role="alert">
-      <p>本机 Workspace 恢复记录无法读取。请先在 Host 和 Workspace 列表核对服务端状态，不能直接开始另一项恢复。</p>
+      <p>本机文件恢复记录无法读取。请先在云端电脑列表核对状态，不能直接开始另一项恢复。</p>
       <button type="button" className="button button-secondary" disabled={restoreWorkflowBusy} onClick={abandonWorkspaceRestoreRecord}>我已核对服务端状态，清除损坏记录</button>
     </div>}
     {restoreRecovery.pending && <div className="notice notice-warning" role="status">
-      <p>Workspace 安全恢复在“{restorePhaseLabel[restoreRecovery.pending.phase]}”阶段待核对。继续前请再次确认所有外部写入者仍已停止；系统会先读取服务端状态，再复用原幂等键。</p>
+      <p>云端文件安全恢复在“{restorePhaseLabel[restoreRecovery.pending.phase]}”阶段待核对。继续前请再次确认所有外部写入者仍已停止；系统会先读取服务端状态，再复用原幂等键。</p>
       {restoreWorkflowError && <p className="form-error" role="alert">{restoreWorkflowError}</p>}
       <button type="button" className="button button-secondary" disabled={restoreWorkflowBusy} onClick={() => {
         setWritersStoppedConfirmed(false);
@@ -458,19 +462,19 @@ export function Workspaces() {
       }}>{restoreWorkflowBusy ? '正在核对并恢复…' : '核对状态并继续恢复'}</button>
     </div>}
     <section className="design-panel" aria-labelledby="workspace-list-title">
-    <div className="design-panel-header"><div><h2 id="workspace-list-title">我的工作区</h2><p>工作区独立保存，删除电脑不会删除工作区数据。</p></div><button type="button" className="button button-primary" aria-expanded={showCreate || recoveryPending || recoveryError} disabled={recoveryPending || recoveryError || create.isPending} onClick={() => setShowCreate((open) => !open)}>{showCreate || recoveryPending || recoveryError ? '收起' : '＋ 创建工作区'}</button></div>
-    {(showCreate || recoveryPending || recoveryError) && <form className="form-card form-stack workspace-create-form" aria-label="创建独立工作区" onSubmit={createWorkspace}>
-      <h2>创建工作区</h2>
+      <div className="design-panel-header"><div><h2 id="workspace-list-title">{computer ? `${computer.name || '云端电脑'} · 文件与版本` : '云端文件与版本'}</h2><p>{computer ? '查看这台电脑已保存的文件和历史版本；手动单向同步入口尚未开放。' : '以下为历史文件；新建和使用文件请从云端电脑入口开始。'}</p></div>{!computerID && !recoveryPending && !recoveryError && <Link className="button button-primary" to="/hosts/new">＋ 创建云端电脑</Link>}</div>
+    {!computerID && (recoveryPending || recoveryError) && <form className="form-card form-stack workspace-create-form" aria-label="恢复历史文件空间创建" onSubmit={createWorkspace}>
+      <h2>恢复历史文件创建请求</h2>
       {create.isError && <p className="form-error" role="alert">创建失败：{errorDetails(create.error).message}</p>}
       {validationError && <p className="form-error" role="alert">{validationError}</p>}
       {recoveryError && <div className="notice notice-warning" role="alert">无法读取本机上次创建记录。为避免重复创建，请先在工作区列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></div>}
-      {recoveryPending && !create.isPending && !recoveryError && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会使用相同请求编号；若已在工作区列表确认结果，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}
-      <label htmlFor="workspace-name">工作区名称</label>
+      {recoveryPending && !create.isPending && !recoveryError && <div className="notice notice-warning" role="status">上次历史文件创建结果尚未确认。继续会使用相同请求编号；若已在列表核实结果，可清除这条旧请求记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除旧请求</button></div>}
+      <label htmlFor="workspace-name">历史文件名称</label>
       <input id="workspace-name" required maxLength={100} value={name} disabled={create.isPending || recoveryPending || recoveryError} onChange={(event) => { setName(event.target.value); create.reset(); setValidationError(''); }} placeholder="例如：产品项目" />
       <div className="form-actions"><button type="submit" className="button button-primary" disabled={create.isPending || recoveryError}>{create.isPending ? '正在创建…' : recoveryPending ? '继续上次创建' : '创建工作区'}</button></div>
     </form>}
-    {query.isPending ? <div className="loading-card">正在加载工作区…</div> : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div> : !query.data?.items.length ? <div className="empty-card"><h2>还没有工作区</h2><p>也可以在创建主机时新建工作区，或选择已有工作区。</p></div> : <div className="table-wrap"><table className="workspace-table"><thead><tr><th>名称</th><th>状态</th><th>已用 / 配额</th><th>版本</th><th>绑定主机</th><th>电脑状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
-      {query.data.items.map((item) => {
+    {query.isPending ? <div className="loading-card">正在加载云端文件…</div> : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div> : !visibleWorkspaces.length ? <div className="empty-card"><h2>{computer ? '这台电脑暂无关联文件' : '还没有云端文件'}</h2><p>{computer ? '旧电脑的数据可以从电脑管理入口核对后再关联。' : '创建云端电脑后，文件会与电脑一同管理。'}</p></div> : <div className="table-wrap"><table className="workspace-table"><thead><tr><th>名称</th><th>状态</th><th>已用 / 配额</th><th>版本</th><th>所属电脑</th><th>电脑状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
+      {visibleWorkspaces.map((item) => {
         const bindings = hosts.data?.items.flatMap((host) => host.workspaces
           .filter((binding) => binding.workspace.id === item.id && binding.state !== 'detached')
           .map((binding) => ({ host, binding }))) ?? [];
@@ -491,11 +495,11 @@ export function Workspaces() {
               {waitingForHost ? <small>{host.state_reason === 'restore_unknown' ? '电脑恢复状态待核实，工作区尚未挂载。' : '电脑创建中，工作区等待挂载。'}</small> : <>
               <small>{host.owner_id !== user?.id ? '主机应用状态不可见' : `应用：${bindingStateLabel[binding.state] || binding.state}`}</small>
               <small>同步：{workspaceSyncLabel(item, host, binding)}</small>
-              {binding.sync_state === 'conflict' && <div className="workspace-host-sync-conflict notice notice-warning" role="status">
-                <strong>Host 工作区同步冲突</strong>
+            {binding.sync_state === 'conflict' && <div className="workspace-host-sync-conflict notice notice-warning" role="status">
+                <strong>云端电脑文件冲突</strong>
                 {conflicts.slice(0, 5).map((path, index) => <small key={`${path}-${index}`}>{path}</small>)}
                 {conflicts.length > 5 && <small>另有 {conflicts.length - 5} 个冲突路径未展开</small>}
-                {host.owner_id === user?.id && <button type="button" className="button button-secondary button-small" aria-label={`重试 Host 同步 ${item.name || item.id} 到 ${host.name || host.id}`} disabled={retryHostSync.isPending} onClick={() => retryHostSync.mutate({ host, binding })}>{retryHostSync.isPending ? '正在重试…' : '重试同步'}</button>}
+                {host.owner_id === user?.id && <button type="button" className="button button-secondary button-small" aria-label={`重试电脑文件同步 ${item.name || item.id} 到 ${host.name || host.id}`} disabled={retryHostSync.isPending} onClick={() => retryHostSync.mutate({ host, binding })}>{retryHostSync.isPending ? '正在重试…' : '重试同步'}</button>}
               </div>}
               <small>{host.owner_id !== user?.id ? '项目：状态不可见' : `项目：${workspaceProjectLabel(item, host, binding)}`}</small>
               </>}
@@ -503,15 +507,15 @@ export function Workspaces() {
           }) : '—'}</td>
           <td><span className="workspace-cell-label">更新时间</span>{formatDate(item.updated_at)}</td>
           <td><span className="workspace-cell-label">操作</span><div className="workspace-actions">
-            <button type="button" className="button button-secondary button-small" aria-label={`查看设备同步进度 ${item.name || item.id}`} onClick={() => {
+            {!computerID && <button type="button" className="button button-secondary button-small" aria-label={`查看设备同步进度 ${item.name || item.id}`} onClick={() => {
               if (progressWorkspaceID === item.id) void deviceProgress.refetch();
               else setProgressWorkspaceID(item.id);
-            }}>设备进度</button>
-            {item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`比较工作区版本 ${item.name || item.id}`} disabled={revisionCompareLoading || item.revision === 0} title={item.revision === 0 ? '当前只有初始版本，暂无可比较的历史版本' : undefined} onClick={() => openRevisionDiff(item)}>版本差异</button>}
-            {item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`预演复制与移交 ${item.name || item.id}`} onClick={() => setTransferWorkspaceID(item.id)}>复制/移交演示</button>}
-            {bindings.filter(({ host }) => host.owner_id === user?.id).map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={host.id} aria-label={`打开主机 ${host.name || host.id}`} disabled={!canOpenWorkspaceHost(item, host, binding)} title={!canOpenWorkspaceHost(item, host, binding) ? 'Host Runtime 在线且工作区当前版本已应用后才能打开' : undefined} onClick={() => void openHost(host)}>打开主机</button>)}
-            {bindings.filter(({ host, binding }) => host.owner_id === user?.id && host.state === 'running' && binding.state !== 'unbinding').map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={`unbind-${host.id}`} aria-label={`解绑工作区 ${item.name || item.id} 与主机 ${host.name || host.id}`} disabled={unbind.isPending} onClick={() => setSelectedBinding({ host, binding })}>解绑</button>)}
-            {item.state === 'ready' && <div className="workspace-bind-actions">
+            }}>设备进度</button>}
+            {item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`比较云端文件版本 ${item.name || item.id}`} disabled={revisionCompareLoading || item.revision === 0} title={item.revision === 0 ? '当前只有初始版本，暂无可比较的历史版本' : undefined} onClick={() => openRevisionDiff(item)}>版本差异</button>}
+            {!computerID && item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`预演复制与移交 ${item.name || item.id}`} onClick={() => setTransferWorkspaceID(item.id)}>复制/移交演示</button>}
+            {bindings.filter(({ host }) => host.owner_id === user?.id).map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={host.id} aria-label={`打开云端电脑 ${host.name || host.id}`} disabled={!canOpenWorkspaceHost(item, host, binding)} title={!canOpenWorkspaceHost(item, host, binding) ? '云端电脑运行环境在线且当前文件版本已应用后才能打开' : undefined} onClick={() => void openHost(host)}>打开电脑</button>)}
+            {!computerID && bindings.filter(({ host, binding }) => host.owner_id === user?.id && host.state === 'running' && binding.state !== 'unbinding').map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={`unbind-${host.id}`} aria-label={`解除云端文件与电脑 ${host.name || host.id} 的关联`} disabled={unbind.isPending} onClick={() => setSelectedBinding({ host, binding })}>解除关联</button>)}
+            {!computerID && item.state === 'ready' && <div className="workspace-bind-actions">
               {hosts.isPending ? <small className="muted">正在读取主机…</small> : hosts.isError ? <small className="muted">主机状态不可用，暂不能绑定</small> : availableHosts.length ? <>
                 <label className="sr-only" htmlFor={`workspace-host-${item.id}`}>选择绑定主机</label>
                 <select id={`workspace-host-${item.id}`} aria-label={`工作区 ${item.name || item.id} 的绑定主机`} value={selectedHostID} onChange={(event) => setHostTargets((current) => ({ ...current, [item.id]: event.target.value }))}>
@@ -520,7 +524,7 @@ export function Workspaces() {
                 <button type="button" className="button button-secondary button-small" disabled={!selectedHost || bind.isPending} onClick={() => selectedHost && bind.mutate({ host: selectedHost, workspace: item })}>{bind.isPending && bind.variables?.workspace.id === item.id ? '绑定中…' : '绑定'}</button>
               </> : <small className="muted">暂无未绑定工作区的运行中主机</small>}
             </div>}
-            <button type="button" className="button button-danger-quiet button-small" aria-label={`删除工作区 ${item.name || item.id}`} disabled={!canDelete || remove.isPending} title={!canDelete ? '工作区仍有主机绑定，或绑定状态尚未确认' : undefined} onClick={() => setSelected(item)}>删除</button>
+            {!computerID && <button type="button" className="button button-danger-quiet button-small" aria-label={`删除工作区 ${item.name || item.id}`} disabled={!canDelete || remove.isPending} title={!canDelete ? '文件仍有关联电脑，或状态尚未确认' : undefined} onClick={() => setSelected(item)}>删除</button>}
           </div></td>
         </tr>;
       })}
@@ -575,7 +579,7 @@ export function Workspaces() {
       </div>}
     </section>}
     {restoreConfirmationOpen && restoreRecovery.pending && <ConfirmDialog
-      title="继续 Workspace 安全恢复"
+      title="继续云端文件安全恢复"
       description={'流程当前停在“' + restorePhaseLabel[restoreRecovery.pending.phase] + '”。继续前请确认外部写入者仍已停止。系统会先核对服务端状态，只有确认前置步骤后才执行下一步。'}
       confirmLabel="核对状态并继续"
       danger
@@ -586,24 +590,24 @@ export function Workspaces() {
     >
       <label className="checkbox-row">
         <input type="checkbox" checked={writersStoppedConfirmed} onChange={(event) => setWritersStoppedConfirmed(event.target.checked)} />
-        我已关闭可能写入此 Workspace 的 AI 工具、IDE、PTY 和其他应用，并会在恢复流程完成前保持关闭。
+        我已关闭可能修改这些云端文件的 AI 工具、IDE、PTY 和其他应用，并会在恢复流程完成前保持关闭。
       </label>
       {restoreWorkflowError && <p className="form-error" role="alert">{restoreWorkflowError}</p>}
     </ConfirmDialog>}
     {restoreConfirmationOpen && !restoreRecovery.pending && revisionWorkspace && revisionDiff && <ConfirmDialog
-      title="恢复 Workspace 差异"
+      title="恢复云端文件版本"
       description={`将从 v${revisionDiff.from_revision} 恢复 ${workspaceDiffRestorePaths(revisionDiff.changes).length} 个路径，并以当前 v${revisionWorkspace.revision} 为条件创建新 revision。服务端会在主机解绑且没有在途写入时执行。`}
-      confirmLabel={revisionBoundHost ? '解绑、恢复并重启 Host' : '恢复并创建新版本'}
+      confirmLabel={revisionBoundHost ? '解除关联、恢复文件并重启电脑' : '恢复文件并创建新版本'}
       danger
       busy={restoreWorkflowBusy}
       confirmDisabled={!writersStoppedConfirmed}
       onClose={() => { setRestoreConfirmationOpen(false); setWritersStoppedConfirmed(false); }}
       onConfirm={confirmWorkspaceRestore}
     >
-      <p>系统不能检测所有外部写入者。Host 流程会先解绑并等待服务端确认，再释放计算资源、恢复 Workspace、重绑并恢复 Host；释放时可能终止终端进程。任一步状态未知都会暂停，不会继续。</p>
+      <p>系统不能检测所有外部写入者。电脑流程会先解除关联并等待服务端确认，再释放计算资源、恢复云端文件、重新关联并恢复电脑；释放时可能终止终端进程。任一步状态未知都会暂停，不会继续。</p>
       <label className="checkbox-row">
         <input type="checkbox" checked={writersStoppedConfirmed} onChange={(event) => setWritersStoppedConfirmed(event.target.checked)} />
-        我已关闭可能写入此 Workspace 的 AI 工具、IDE、PTY 和其他应用，并会在恢复流程完成前保持关闭。
+        我已关闭可能修改这些云端文件的 AI 工具、IDE、PTY 和其他应用，并会在恢复流程完成前保持关闭。
       </label>
       <details><summary>查看本次恢复的路径</summary><ul>{workspaceDiffRestorePaths(revisionDiff.changes).map((path) => <li className="mono" key={path}>{path}</li>)}</ul></details>
       {restoreWorkflowError && <p className="form-error" role="alert">{restoreWorkflowError}</p>}
@@ -624,7 +628,7 @@ export function Workspaces() {
       }} ownerLabel={user?.name ?? '当前所有者'} />
     </section>}
     {progressWorkspaceID && <section className="notice notice-info" aria-live="polite">
-      <div className="host-card-heading"><h2>设备同步进度 · {query.data?.items.find((item) => item.id === progressWorkspaceID)?.name || progressWorkspaceID}</h2><button type="button" className="button button-secondary button-small" aria-label="关闭设备同步进度" onClick={() => setProgressWorkspaceID('')}>关闭</button></div>
+      <div className="host-card-heading"><h2>设备同步进度 · {visibleWorkspaces.find((item) => item.id === progressWorkspaceID)?.name || progressWorkspaceID}</h2><button type="button" className="button button-secondary button-small" aria-label="关闭设备同步进度" onClick={() => setProgressWorkspaceID('')}>关闭</button></div>
       {deviceProgress.isPending ? <p>正在读取同步状态…</p> : deviceProgress.isError ? <p role="alert">读取失败：{errorDetails(deviceProgress.error).message} <button type="button" className="button button-secondary button-small" onClick={() => void deviceProgress.refetch()}>重试</button></p> : !deviceProgress.data.items.length ? <p>当前没有设备正在同步。设备连接后，仍可能有待同步的文件。</p> : deviceProgress.data.items.map((item) => <div className="workspace-host-status" key={item.session_id}>
         <strong>设备 {item.device_id} · {syncDirectionLabel[item.direction]} · {syncStateLabel[item.state]}</strong>
         <small>阶段：{syncStageLabel[item.stage]}</small>
@@ -654,16 +658,16 @@ function workspaceSyncLabel(workspace: Workspace, host: Host, binding: Binding) 
   if (binding.state === 'failed') return '同步失败';
   if (binding.state === 'detached') return '未绑定';
   if (host.workspace_runtime_online !== true) {
-    if (binding.state === 'preparing') return `Host Runtime 未在线确认 · 等待应用 v${binding.desired_revision}`;
-    if (binding.state === 'unbinding') return 'Host Runtime 未在线确认 · 等待解绑';
+    if (binding.state === 'preparing') return `电脑运行环境未在线确认 · 等待应用 v${binding.desired_revision}`;
+    if (binding.state === 'unbinding') return '电脑运行环境未在线确认 · 等待解除关联';
     return binding.applied_revision >= 0
-      ? `Host Runtime 未在线确认 · 最近确认 v${binding.applied_revision}`
-      : 'Host Runtime 未在线确认 · 尚无应用确认';
+      ? `电脑运行环境未在线确认 · 最近确认 v${binding.applied_revision}`
+      : '电脑运行环境未在线确认 · 尚无应用确认';
   }
   if (binding.state === 'preparing') return `正在应用 v${binding.desired_revision}`;
   if (binding.state === 'unbinding') return '正在解绑';
   if (binding.applied_revision !== binding.desired_revision) return `同步中 v${binding.applied_revision}/${binding.desired_revision}`;
-  if (binding.applied_revision !== workspace.revision) return `待同步：主机 v${binding.applied_revision} / 工作区 v${workspace.revision}`;
+  if (binding.applied_revision !== workspace.revision) return `待应用：电脑 v${binding.applied_revision} / 文件 v${workspace.revision}`;
   return `已同步 v${binding.applied_revision}`;
 }
 
@@ -675,9 +679,9 @@ function canOpenWorkspaceHost(workspace: Workspace, host: Host, binding: Binding
 
 function workspaceProjectLabel(workspace: Workspace, host: Host, binding: Binding) {
   if (canOpenWorkspaceHost(workspace, host, binding)) return '文件已就绪';
-  if (binding.state === 'preparing') return '等待主机应用';
-  if (binding.state === 'failed') return '主机应用失败';
+  if (binding.state === 'preparing') return '等待电脑应用文件';
+  if (binding.state === 'failed') return '电脑应用文件失败';
   if (binding.state === 'unbinding') return '正在解绑';
-  if (host.state !== 'running') return '等待主机运行';
-  return '等待文件同步';
+  if (host.state !== 'running') return '等待电脑运行';
+  return '等待电脑应用文件';
 }

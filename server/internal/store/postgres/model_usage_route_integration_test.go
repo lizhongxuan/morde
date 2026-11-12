@@ -26,6 +26,17 @@ type routeModelClientTest struct {
 	reply   string
 }
 
+func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
+	value := app.ConversationRouteContext{ResultReview: &app.ConversationTaskResultReview{}}
+	if phase := conversationRouteModelPhase(value); phase != "normal" {
+		t.Fatalf("initial result review phase = %q, want normal", phase)
+	}
+	value.ResultReview.RetryAttempt = 2
+	if phase := conversationRouteModelPhase(value); phase != "result_review_2" {
+		t.Fatalf("retried result review phase = %q, want result_review_2", phase)
+	}
+}
+
 func (c *routeModelClientTest) Complete(ctx context.Context, request app.ModelRequest) (app.ModelResponse, error) {
 	count := c.calls.Add(1)
 	if len(request.Tools) != 0 {

@@ -99,6 +99,7 @@ export function outboxReceiptRequest(message: PendingConversationMessage): compo
     ...(source.model_id ? { model_id: source.model_id } : {}),
     ...(source.host_id ? { host_id: source.host_id } : {}),
     ...(source.workspace_id ? { workspace_id: source.workspace_id } : {}),
+    ...(source.change_task_target ? { change_task_target: true } : {}),
     ...(source.application_id ? { application_id: source.application_id } : {}),
     ...(source.mcp_connector_ids ? { mcp_connector_ids: source.mcp_connector_ids } : {}),
     ...(clientAttachmentIDs.length ? { client_attachment_ids: clientAttachmentIDs } : {}),

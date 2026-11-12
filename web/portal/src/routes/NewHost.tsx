@@ -5,10 +5,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError } from '../api/client';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
-import { formatBytes } from '../app/format';
 import { useToast } from '../app/toast';
 
-type HostCreateInput = { name?: string; workspace_mode: 'new' | 'existing'; workspace_ids: string[] };
+type HostCreateInput = { name?: string; workspace_mode: 'new' | 'existing' | 'automatic'; workspace_ids: string[] };
 type PendingHostCreate = {
   version: 1;
   fingerprint: string;
@@ -29,10 +28,10 @@ function isPendingHostCreate(value: unknown): value is PendingHostCreate {
   const validKey = (key: unknown) => typeof key === 'string' && /^[A-Za-z0-9._~-]{8,128}$/.test(key);
   return pending.version === 1 && !!input && typeof input === 'object' &&
     (input.name === undefined || typeof input.name === 'string') &&
-    (input.workspace_mode === 'new' || input.workspace_mode === 'existing') &&
+    (input.workspace_mode === 'new' || input.workspace_mode === 'existing' || input.workspace_mode === 'automatic') &&
     Array.isArray(input.workspace_ids) && input.workspace_ids.every((id) => typeof id === 'string') &&
     pending.fingerprint === JSON.stringify(input) && validKey(pending.hostIdempotencyKey) &&
-    (input.workspace_mode === 'existing' || validKey(pending.workspaceIdempotencyKey)) &&
+    (input.workspace_mode !== 'new' || validKey(pending.workspaceIdempotencyKey)) &&
     (pending.workspaceID === undefined || typeof pending.workspaceID === 'string');
 }
 
@@ -54,20 +53,18 @@ export function NewHost() {
   const { user } = useAuth();
   const { notify } = useToast();
   const hosts = useQuery({ queryKey: ['hosts'], queryFn: portalApi.hosts });
-  const workspaces = useQuery({ queryKey: ['workspaces'], queryFn: portalApi.workspaces });
   const [restored] = useState(() => readPendingHostCreate(user?.id));
   const [name, setName] = useState(restored.pending?.input.name ?? '');
-  const [workspaceMode, setWorkspaceMode] = useState<'new' | 'existing'>(restored.pending?.input.workspace_mode ?? 'new');
-  const [workspaceIds, setWorkspaceIds] = useState<string[]>(restored.pending?.input.workspace_ids ?? []);
   const pendingCreate = useRef<PendingHostCreate | null>(restored.pending);
   const [recoveryPending, setRecoveryPending] = useState(!!restored.pending);
   const [recoveryError, setRecoveryError] = useState(restored.invalid);
-  const readyWorkspaces = workspaces.data?.items.filter((workspace) => workspace.state === 'ready') ?? [];
-  const selectedWorkspaceReady = workspaceIds.length === 1 && readyWorkspaces.some((workspace) => workspace.id === workspaceIds[0]);
 
   const create = useMutation({
     mutationFn: async (pending: PendingHostCreate) => {
       const input = pending.input;
+      if (input.workspace_mode === 'automatic') {
+        return portalApi.createHost({ ...(input.name ? { name: input.name } : {}) }, pending.hostIdempotencyKey);
+      }
       let workspaceIDs = input.workspace_ids;
       if (input.workspace_mode === 'new') {
         let workspaceID = pending.workspaceID;
@@ -89,7 +86,7 @@ export function NewHost() {
       setRecoveryPending(false);
       void client.invalidateQueries({ queryKey: ['hosts'] });
       void client.invalidateQueries({ queryKey: ['workspaces'] });
-      notify('主机创建已提交，正在等待启动。', 'success');
+      notify('云端电脑创建已提交，正在等待启动。', 'success');
       navigate('/hosts', { replace: true });
     },
     onError: (error) => {
@@ -106,8 +103,7 @@ export function NewHost() {
       create.mutate(pendingCreate.current);
       return;
     }
-    if (workspaceMode === 'existing' && !selectedWorkspaceReady) return;
-    const input = { ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: workspaceMode, workspace_ids: workspaceMode === 'existing' ? workspaceIds.slice(0, 1) : [] };
+    const input = { ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: 'automatic' as const, workspace_ids: [] as string[] };
     const fingerprint = JSON.stringify(input);
     if (!pendingCreate.current || pendingCreate.current.fingerprint !== fingerprint) {
       pendingCreate.current = {
@@ -115,7 +111,6 @@ export function NewHost() {
         fingerprint,
         input,
         hostIdempotencyKey: newIdempotencyKey(),
-        ...(input.workspace_mode === 'new' ? { workspaceIdempotencyKey: newIdempotencyKey() } : {}),
       };
     }
     try {
@@ -131,7 +126,6 @@ export function NewHost() {
     if (!user) return;
     try {
       localStorage.removeItem(pendingCreateKey(user.id));
-      if ((pendingCreate.current?.input.workspace_ids.length ?? 0) > 1) setWorkspaceIds([]);
       pendingCreate.current = null;
       setRecoveryPending(false);
       setRecoveryError(false);
@@ -142,26 +136,17 @@ export function NewHost() {
 
   if (hosts.isPending) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
   if (hosts.isError) return <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>;
-  if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <div className="notice notice-warning" role="alert">达到云端电脑上限,无法再创建</div>;
+  if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <div className="notice notice-warning" role="alert">已达到云端电脑数量上限</div>;
   return <section>
     {recoveryError && <div className="notice notice-warning" role="alert">无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></div>}
     <form className="form-card form-stack" onSubmit={submit}>
       <div className="design-panel-header"><div><h2>基本配置</h2><p>使用管理员为你设置的规格。</p></div><Link className="button button-secondary" to="/hosts">← 返回云端电脑</Link></div>
       {recoveryPending && !create.isPending && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会用相同请求编号核对结果；若已在主机列表确认，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}
-      <p className="notice notice-info">默认工作和下载目录位于 <code>/home/gem/workspace</code>。在应用中手动保存到 Workspace 以外的数据属于容器临时数据；旧电脑数据是否迁移需单独核对。</p>
-      <label htmlFor="host-name">主机名称 <span className="muted">（可选）</span></label>
+      <p className="notice notice-info">默认工作和下载目录位于 <code>/home/gem/workspace</code>。建议将需要保留的文件保存到此目录。</p>
+      <label htmlFor="host-name">云端电脑名称 <span className="muted">（可选）</span></label>
       <input id="host-name" value={name} maxLength={100} disabled={recoveryPending || recoveryError} onChange={(event) => setName(event.target.value)} placeholder="例如：数据分析" />
-      <fieldset className="fieldset"><legend>工作目录</legend>
-        <label className="radio-row"><input type="radio" name="workspace-mode" value="new" checked={workspaceMode === 'new'} disabled={recoveryPending || recoveryError} onChange={() => setWorkspaceMode('new')} />创建新的独立工作区</label>
-        <label className="radio-row"><input type="radio" name="workspace-mode" value="existing" checked={workspaceMode === 'existing'} onChange={() => setWorkspaceMode('existing')} disabled={recoveryPending || recoveryError || workspaces.isPending || workspaces.isError} />绑定已有工作区</label>
-        {workspaceMode === 'existing' && <div className="form-stack"><span>选择一个要绑定的工作区</span>{readyWorkspaces.map((workspace) => <label className="radio-row" key={workspace.id}><input type="radio" name="host-workspace" value={workspace.id} checked={workspaceIds.includes(workspace.id)} disabled={recoveryPending || recoveryError} onChange={() => setWorkspaceIds([workspace.id])} />{workspace.name || workspace.id} · {formatBytes(workspace.used_bytes)} · 版本 {workspace.revision}</label>)}</div>}
-        {workspaces.isPending && <p className="muted" role="status">正在加载工作目录…</p>}
-        {workspaces.isError && <div className="error-card" role="alert">{errorDetails(workspaces.error).message}<button type="button" className="button button-secondary" onClick={() => void workspaces.refetch()}>重试</button></div>}
-        {workspaceMode === 'existing' && !workspaces.isPending && !workspaces.isError && !readyWorkspaces.length && <p className="muted">目前没有可用的工作区。</p>}
-        {workspaceMode === 'existing' && workspaceIds.length === 1 && !selectedWorkspaceReady && <p className="notice notice-warning" role="status">所选工作区当前不可用；请选择一个已就绪的工作区。</p>}
-      </fieldset>
-      <div className="notice notice-info">新工作区会先独立保存，再绑定到主机；删除主机时工作区内容仍会保留。</div>
-      <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryError || (!recoveryPending && workspaceMode === 'existing' && !selectedWorkspaceReady)}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建主机'}</button></div>
+      <p className="muted">电脑会自动准备文件空间；你不需要单独选择工作区。</p>
+      <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryError}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建云端电脑'}</button></div>
     </form>
   </section>;
 }

@@ -47,6 +47,10 @@ func (h *api) capabilities(c *gin.Context) {
 	if h.deps.PersonalData != nil && h.deps.PersonalSync != nil && clientVerifier {
 		features = append(features, "personal_sync")
 	}
+	if syncService, ok := h.deps.WorkspaceSync.(interface{ ProjectUploadEnabled() bool }); ok &&
+		syncService.ProjectUploadEnabled() && clientVerifier {
+		features = append(features, "workspace_sync", "project_upload")
+	}
 	if h.deps.ModelGateway != nil && clientVerifier {
 		features = append(features, "model_gateway")
 	}

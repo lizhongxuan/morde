@@ -75,17 +75,19 @@ func (q *Queries) GetMessage(ctx context.Context, arg GetMessageParams) (Convers
 
 const listConversations = `-- name: ListConversations :many
 SELECT id, owner_id, host_id, title, created_at, updated_at, model_id, source_kind, message_seq, archived_at, project_id FROM conversations
-WHERE owner_id = $1
+WHERE owner_id = $1 AND project_id IS NULL
   AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
-  AND ($3::timestamptz IS NULL OR updated_at < $3::timestamptz OR (updated_at = $3::timestamptz AND id < $4))
+  AND ($3::text = '' OR strpos(lower(title), lower($3)) > 0)
+  AND ($4::timestamptz IS NULL OR updated_at < $4::timestamptz OR (updated_at = $4::timestamptz AND id < $5))
 ORDER BY updated_at DESC, id DESC
-LIMIT $5
+LIMIT $6
 `
 
 type ListConversationsParams struct {
 	OwnerID string             `json:"owner_id"`
 	Column2 []string           `json:"column_2"`
-	Column3 pgtype.Timestamptz `json:"column_3"`
+	Column3 string             `json:"column_3"`
+	Column4 pgtype.Timestamptz `json:"column_4"`
 	ID      string             `json:"id"`
 	Limit   int32              `json:"limit"`
 }
@@ -95,6 +97,7 @@ func (q *Queries) ListConversations(ctx context.Context, arg ListConversationsPa
 		arg.OwnerID,
 		arg.Column2,
 		arg.Column3,
+		arg.Column4,
 		arg.ID,
 		arg.Limit,
 	)

@@ -192,6 +192,25 @@ func run() error {
 			}
 		}()
 	}
+	if browserLedger != nil {
+		var browserErr error
+		browser, browserErr = runtimebrowser.NewHandlers(runtimebrowser.Options{
+			StoreDir: storePath, ExpectedOwnerUID: 0, Store: browserLedger, Endpoint: os.Getenv("MORDE_BROWSER_CDP_ENDPOINT"),
+		})
+		if browserErr != nil {
+			if errors.Is(browserErr, runtimebrowser.ErrOperationLedgerUnavailable) ||
+				errors.Is(browserErr, operationstore.ErrStoreUnhealthy) || errors.Is(browserErr, operationstore.ErrStoreClosed) {
+				return errors.New("runtime browser operation ledger reconciliation failed")
+			}
+			_ = browserLedger.Close()
+			browserLedger = nil
+			// Browser tools are advertised only after an isolated-context CDP probe
+			// proves they cannot attach to or close a user's default-profile tabs.
+			_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: browser capabilities unavailable")
+		} else {
+			handlers = append(handlers, browser.Handlers()...)
+		}
+	}
 	var manager *runtimecore.Manager
 	managerClosed := false
 	shutdownAttempted := false
@@ -218,25 +237,6 @@ func run() error {
 	})
 	if err != nil {
 		return errors.New("runtime operation store unavailable")
-	}
-	if browserLedger != nil {
-		var browserErr error
-		browser, browserErr = runtimebrowser.NewHandlers(runtimebrowser.Options{
-			StoreDir: storePath, ExpectedOwnerUID: 0, Store: browserLedger, Endpoint: os.Getenv("MORDE_BROWSER_CDP_ENDPOINT"),
-		})
-		if browserErr != nil {
-			if errors.Is(browserErr, runtimebrowser.ErrOperationLedgerUnavailable) ||
-				errors.Is(browserErr, operationstore.ErrStoreUnhealthy) || errors.Is(browserErr, operationstore.ErrStoreClosed) {
-				return errors.New("runtime browser operation ledger reconciliation failed")
-			}
-			_ = browserLedger.Close()
-			browserLedger = nil
-			// Browser tools are advertised only after an isolated-context CDP probe
-			// proves they cannot attach to or close a user's default-profile tabs.
-			_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: browser capabilities unavailable")
-		} else if err := manager.RegisterHandlers(browser.Handlers()); err != nil {
-			return errors.New("runtime browser capabilities could not be installed")
-		}
 	}
 	currentCapabilities, err := manager.Capabilities(contract.CapabilitiesRequest{
 		ProtocolVersion: contract.ProtocolVersion, HostID: hostID, RuntimeGeneration: generation,

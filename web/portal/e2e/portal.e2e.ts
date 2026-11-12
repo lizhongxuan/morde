@@ -66,7 +66,7 @@ test.describe("portal mock flow", () => {
     const createLink = page.getByRole("link", { name: "创建电脑" });
     await createLink.focus();
     await page.keyboard.press("Enter");
-    const hostName = page.getByLabel(/主机名称/);
+    const hostName = page.getByLabel(/云端电脑名称/);
     await hostName.focus();
     await page.keyboard.type("Playwright 本地验收");
     const createRequestPromise = page.waitForRequest((request) =>
@@ -83,7 +83,7 @@ test.describe("portal mock flow", () => {
         true,
       );
     });
-    const createHost = page.getByRole("button", { name: "创建主机" });
+    const createHost = page.getByRole("button", { name: "创建云端电脑" });
     await createHost.focus();
     await page.keyboard.press("Enter");
     const createRequest = await createRequestPromise;
@@ -92,7 +92,7 @@ test.describe("portal mock flow", () => {
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
 
     const popupPromise = page.waitForEvent("popup");
-    const enter = host.getByRole("button", { name: "查看主机 Playwright 本地验收" });
+    const enter = host.getByRole("button", { name: "查看云端电脑 Playwright 本地验收" });
     await enter.focus();
     await page.keyboard.press("Enter");
     const popup = await popupPromise;
@@ -103,16 +103,57 @@ test.describe("portal mock flow", () => {
     );
     expect(postCreateClicks).toBeLessThanOrEqual(3);
 
-    const deleteHost = host.getByRole("button", { name: "删除主机 Playwright 本地验收" });
+    const deleteHost = host.getByRole("button", { name: "删除云端电脑 Playwright 本地验收" });
     await deleteHost.focus();
     await page.keyboard.press("Enter");
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByRole("button", { name: "关闭" })).toBeFocused();
     await page.keyboard.press("Shift+Tab");
-    await expect(dialog.getByRole("button", { name: "删除主机" })).toBeFocused();
+    await expect(dialog.getByRole("button", { name: "删除电脑" })).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(host).toHaveCount(0, { timeout: 10_000 });
     await popup.close();
+  });
+
+  test("copies a stopped computer from its confirmed cloud files", async ({ page }) => {
+    await page.goto("/");
+    await page.getByLabel("用户名").fill("demo");
+    await page.getByLabel("密码").fill("demo");
+    await page.getByRole("button", { name: "登录" }).click();
+    await page.getByRole("link", { name: "云端电脑", exact: true }).click();
+
+    const quotaStatus = await page.evaluate(async () => (await fetch('/api/admin/users/u1a2b3c4', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_status: 'approved', quota: { hosts: 3, cpu_milli: 4000, mem_mib: 8192 } }),
+    })).status);
+    expect(quotaStatus).toBe(200);
+    await page.reload();
+
+    const sourceName = "复制验收源电脑";
+    await page.getByRole("link", { name: "创建电脑" }).click();
+    await page.getByLabel("云端电脑名称").fill(sourceName);
+    await page.getByRole("button", { name: "创建云端电脑" }).click();
+    const source = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: sourceName, exact: true }) });
+    await expect(source.getByText("运行中")).toBeVisible({ timeout: 10_000 });
+
+    await source.getByRole("button", { name: `释放运行资源 ${sourceName}` }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "释放运行资源" }).click();
+    const copyButton = source.getByRole("button", { name: `复制云端电脑 ${sourceName}` });
+    await expect(copyButton).toBeEnabled({ timeout: 10_000 });
+    await copyButton.click();
+
+    const copyName = "复制验收结果电脑";
+    const dialog = page.getByRole("dialog", { name: `复制云端电脑 ${sourceName}` });
+    await expect(dialog.getByText(/隐藏文件、配置和密钥/)).toBeVisible();
+    await dialog.getByLabel("新电脑名称").fill(copyName);
+    const copyRequestPromise = page.waitForRequest((request) =>
+      request.method() === "POST" && new URL(request.url()).pathname.endsWith("/copies"),
+    );
+    await dialog.getByRole("button", { name: "创建副本" }).click();
+    const copyRequest = await copyRequestPromise;
+    expect(copyRequest.headers()["idempotency-key"]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
+    expect(copyRequest.postDataJSON()).toMatchObject({ name: copyName, expected_current_revision: 2 });
+    await expect(page.locator(".host-card").filter({ has: page.getByRole("heading", { name: copyName, exact: true }) })).toBeVisible();
   });
 
   test("creates and revokes an API Key through the contracted endpoint", async ({ page }) => {
@@ -125,8 +166,8 @@ test.describe("portal mock flow", () => {
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
-    await page.getByRole("link", { name: "AI 助手", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
+    await page.getByRole("link", { name: "对话", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
     await page.getByRole("link", { name: "API Key", exact: true }).click();
     await page.getByRole("button", { name: "＋ 创建 API Key" }).click();
     await page.getByLabel("名称").fill("门户吊销验收");
@@ -153,8 +194,8 @@ test.describe("portal mock flow", () => {
     await page.getByLabel("用户名").fill("member");
     await page.getByLabel("密码").fill("member");
     await page.getByRole("button", { name: "登录" }).click();
-    await page.getByRole("link", { name: "AI 助手", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
+    await page.getByRole("link", { name: "对话", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
     await expect(page.getByRole("link", { name: "管理后台" })).toHaveCount(0);
     await page.goto("/admin/users");
     await expect(page.getByRole("heading", { name: "没有管理权限" })).toBeVisible();
@@ -190,13 +231,13 @@ test("real single-host flow creates, uses, and cleans up only its own host", asy
   await page.getByLabel("用户名").fill(process.env.CH_USERNAME!);
   await page.getByLabel("密码").fill(process.env.CH_PASSWORD!);
   await page.getByRole("button", { name: "登录" }).click();
-  await page.getByRole("link", { name: "AI 助手", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
+  await page.getByRole("link", { name: "对话", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
 
   try {
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
     await page.getByRole("link", { name: "创建电脑" }).click();
-    await page.getByLabel(/主机名称/).fill(hostName);
+    await page.getByLabel(/云端电脑名称/).fill(hostName);
     const createResponsePromise = page.waitForResponse(
       (response) => {
         const request = response.request();
@@ -207,7 +248,7 @@ test("real single-host flow creates, uses, and cleans up only its own host", asy
         );
       },
     );
-    await page.getByRole("button", { name: "创建主机" }).click();
+    await page.getByRole("button", { name: "创建云端电脑" }).click();
     const createResponse = await createResponsePromise;
     if (createResponse.status() === 201) {
       const createdHost = (await createResponse.json()) as { id?: unknown };
@@ -227,7 +268,7 @@ test("real single-host flow creates, uses, and cleans up only its own host", asy
     }
 
     const popupPromise = page.waitForEvent("popup");
-    await host.getByRole("button", { name: "查看主机 " + hostName }).click();
+    await host.getByRole("button", { name: "查看云端电脑 " + hostName }).click();
     const popup = await popupPromise;
     await expect(popup.getByRole("navigation", { name: "工作台功能" })).toBeVisible({
       timeout: 120_000,

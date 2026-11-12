@@ -583,7 +583,7 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 		persisted.RuntimeLeaseVersion < 1 || persisted.RuntimeInstanceID == "" ||
 		persisted.TaskID != request.Task.ID || persisted.Key != request.OperationKey || persisted.HostID != request.Task.HostID ||
 		persisted.WorkspaceID != expectedWorkspaceID || !sameTaskInputRevision(persisted.InputRevision, request.Task.InputRevision) ||
-		!sameTaskInputRevision(persisted.WorkspaceCheckpointRevision, request.Task.WorkspaceCheckpointRevision) ||
+		!operationWorkspaceCheckpointMatches(persisted, request.Task) ||
 		(persisted.WorkspaceID != "" && persisted.BindingVersion < 1) ||
 		(persisted.WorkspaceID == "" && persisted.BindingVersion != 0) ||
 		!leaseMatches || (persisted.Status != task.OperationUnknown && !terminal) {
@@ -599,7 +599,7 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 	}
 	currentWorkspaceID, workspaceErr := runtimeToolOperationWorkspaceID(mapping, request.Arguments, current)
 	if workspaceErr != nil || currentWorkspaceID != persisted.WorkspaceID || !sameTaskInputRevision(current.InputRevision, persisted.InputRevision) ||
-		!sameTaskInputRevision(current.WorkspaceCheckpointRevision, persisted.WorkspaceCheckpointRevision) ||
+		!operationWorkspaceCheckpointMatches(persisted, current) ||
 		(persisted.WorkspaceID != "" && (current.WorkspaceID != persisted.WorkspaceID || current.InputRevision == nil || *current.InputRevision < 0)) {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
@@ -2580,6 +2580,20 @@ func sameTaskInputRevision(a, b *int64) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+func operationWorkspaceCheckpointMatches(operation task.Operation, current task.Task) bool {
+	if sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) {
+		return true
+	}
+	if operation.Status != task.OperationSucceeded && operation.Status != task.OperationFailed {
+		return false
+	}
+	if operation.WorkspaceID == "" || operation.WorkspaceID != current.WorkspaceID || operation.WorkspaceCheckpointRevision == nil || current.WorkspaceCheckpointRevision == nil {
+		return false
+	}
+	// A terminal Host result can be replayed after its Task publishes Workspace output; recovery only reads the saved result.
+	return *current.WorkspaceCheckpointRevision > *operation.WorkspaceCheckpointRevision
 }
 
 func runtimeToolExecutionArguments(mapping runtimeToolMapping, raw json.RawMessage) (json.RawMessage, error) {

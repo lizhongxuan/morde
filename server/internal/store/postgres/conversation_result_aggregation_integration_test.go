@@ -299,6 +299,80 @@ JOIN conversation_message_routes route ON route.message_id=batch.trigger_message
 	}
 }
 
+func TestConversationResultReviewRetryRestoresFailedBatch(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx := context.Background()
+	taskResult := f.createTask(t, f.ownerID, "retry result review")
+	otherTask := f.createTask(t, f.ownerID, "stop blocking result review")
+	if !f.complete(t, &taskResult, "review after retry") {
+		t.Fatal("task result was not queued")
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET status='failed' WHERE id=$1`, otherTask.ID); err != nil {
+		t.Fatalf("stop remaining task before result review: %v", err)
+	}
+	if count, err := f.store.QueueReadyConversationResultReviews(ctx, 10); err != nil || count != 1 {
+		t.Fatalf("result review was not queued: count=%d err=%v", count, err)
+	}
+	instanceID, err := f.store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, found, err := f.store.ClaimConversationRoute(ctx, "result-review-retry-test", time.Minute)
+	if err != nil || !found || claim.Input.ResultReviewID == "" {
+		t.Fatalf("claim hidden result review route: found=%t input=%#v err=%v", found, claim.Input, err)
+	}
+	if err := f.store.FailConversationRoute(ctx, claim, "routing_context_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: f.ownerID, Kind: identity.KindSession, TokenID: testSessionTokenID(f.ownerID)}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID, instanceID, "review-retry-key-001"); err != nil {
+		t.Fatalf("retry failed result review: %v", err)
+	}
+	var batchState, routeState string
+	var triggerID string
+	var retryAttempt int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT batch.state,route.state,batch.trigger_message_id,batch.retry_attempt
+FROM conversation_result_batches batch JOIN conversation_message_routes route ON route.message_id=batch.trigger_message_id
+WHERE batch.message_id=$1`, claim.Input.ResultReviewID).Scan(&batchState, &routeState, &triggerID, &retryAttempt); err != nil ||
+		batchState != "processing" || routeState != "pending" || triggerID != claim.Message.ID || retryAttempt != 1 {
+		t.Fatalf("retried review state = batch %q route %q trigger %q attempt %d err=%v", batchState, routeState, triggerID, retryAttempt, err)
+	}
+	secondClaim, found, err := f.store.ClaimConversationRoute(ctx, "result-review-second-retry-test", time.Minute)
+	if err != nil || !found || secondClaim.Message.ID != triggerID {
+		t.Fatalf("claim retried hidden result review route: found=%t message=%q err=%v", found, secondClaim.Message.ID, err)
+	}
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, secondClaim)
+	if err != nil || conversationRouteModelPhase(snapshot.Context) != "result_review_1" {
+		t.Fatalf("first retry model phase = %q err=%v", conversationRouteModelPhase(snapshot.Context), err)
+	}
+	if err := f.store.FailConversationRoute(ctx, secondClaim, "routing_context_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, secondClaim.Message.ID, instanceID, "review-retry-key-002"); err != nil {
+		t.Fatalf("retry failed result review again: %v", err)
+	}
+	thirdClaim, found, err := f.store.ClaimConversationRoute(ctx, "result-review-third-retry-test", time.Minute)
+	if err != nil || !found || thirdClaim.Message.ID != triggerID {
+		t.Fatalf("claim second retried result review route: found=%t message=%q err=%v", found, thirdClaim.Message.ID, err)
+	}
+	snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, thirdClaim)
+	if err != nil || conversationRouteModelPhase(snapshot.Context) != "result_review_2" {
+		t.Fatalf("second retry model phase = %q err=%v", conversationRouteModelPhase(snapshot.Context), err)
+	}
+	if err := f.store.ReleaseConversationRoute(ctx, thirdClaim); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextReview(t)
+	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_result_batches WHERE message_id=$1`, claim.Input.ResultReviewID).Scan(&batchState); err != nil || batchState != "published" {
+		t.Fatalf("retried result review batch state = %q err=%v", batchState, err)
+	}
+	var routes, batches int
+	if err := f.store.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM conversation_message_routes WHERE request_metadata->>'result_review_id'=$1),
+(SELECT count(*) FROM conversation_result_batches WHERE owner_id=$2)`, claim.Input.ResultReviewID, f.ownerID).Scan(&routes, &batches); err != nil || routes != 1 || batches != 1 {
+		t.Fatalf("retry duplicated review identity: routes=%d batches=%d err=%v", routes, batches, err)
+	}
+}
+
 func TestConversationResultAggregationRecoversDeadlineAndSupersedesOldRevision(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()

@@ -174,11 +174,26 @@ func TestHostServiceCreateExistingWorkspaceChecksOwnerAndState(t *testing.T) {
 	}
 }
 
-func TestHostServiceCreateRequiresExactlyOneAuthorizedWorkspace(t *testing.T) {
+func TestHostServiceCreateAllowsSessionDefaultAndRequiresExplicitAuthorizedWorkspaceOtherwise(t *testing.T) {
 	service, deps := newHostServiceTest(t)
+	autoCommand := CreateHostCommand{Name: "automatic", IdempotencyKey: "auto-host-create-01"}
+	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), autoCommand)
+	if err != nil || len(created.Workspaces) != 1 || deps.defaultWorkspace.calls != 1 {
+		t.Fatalf("Create() with Portal Session default = %#v, Workspace calls=%d, err=%v", created, deps.defaultWorkspace.calls, err)
+	}
+	params := deps.hosts.createParams
+	if params == nil || len(params.WorkspaceIDs) != 1 || params.WorkspaceIDs[0] != created.Workspaces[0].Workspace.ID {
+		t.Fatalf("automatic Workspace was not bound in Host create: %#v / %#v", created.Workspaces, params)
+	}
+	replayed, err := service.Create(context.Background(), hostServiceTestPrincipal(), autoCommand)
+	if err != nil || replayed.ID != created.ID || deps.defaultWorkspace.calls != 1 || deps.hosts.createCalls != 1 {
+		t.Fatalf("automatic Workspace idempotency replay = %#v, Workspace calls=%d, Host creates=%d, err=%v", replayed, deps.defaultWorkspace.calls, deps.hosts.createCalls, err)
+	}
 	command := hostServiceTestCreateCommand(deps, "")
-	if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("Create() without workspace error = %v, want invalid argument", err)
+	empty := command
+	empty.WorkspaceIDs = []string{}
+	if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), empty); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Create() with explicit empty Workspace list error = %v, want invalid argument", err)
 	}
 	multiple := command
 	multiple.WorkspaceIDs = []string{"w1234567", "w7654321"}
@@ -189,11 +204,50 @@ func TestHostServiceCreateRequiresExactlyOneAuthorizedWorkspace(t *testing.T) {
 		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey,
 		TokenID: "t1234567", HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeHostCreate},
 	}
+	if _, err := service.Create(context.Background(), apiKey, CreateHostCommand{}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("Create() with API key and omitted Workspace error = %v, want forbidden", err)
+	}
 	if _, err := service.Create(context.Background(), apiKey, command); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("Create() with API key without Workspace authorization error = %v, want forbidden", err)
 	}
-	if deps.hosts.createCalls != 0 {
-		t.Fatalf("invalid creates reached HostStore %d times", deps.hosts.createCalls)
+	if deps.hosts.createCalls != 1 {
+		t.Fatalf("invalid creates reached HostStore unexpectedly: %d calls", deps.hosts.createCalls)
+	}
+}
+
+func TestHostServiceCreateSerializesAutomaticWorkspaceSelection(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	command := CreateHostCommand{Name: "automatic", IdempotencyKey: "auto-host-create-concurrent-01"}
+	results := make(chan host.Host, 2)
+	errors := make(chan error, 2)
+	var wait sync.WaitGroup
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			created, err := service.Create(context.Background(), hostServiceTestPrincipal(), command)
+			results <- created
+			errors <- err
+		}()
+	}
+	wait.Wait()
+	close(results)
+	close(errors)
+	var first host.Host
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("concurrent Create() error = %v", err)
+		}
+	}
+	for created := range results {
+		if first.ID == "" {
+			first = created
+		} else if created.ID != first.ID || testHostWorkspaceID(created) != testHostWorkspaceID(first) {
+			t.Fatalf("concurrent automatic creates returned different identities: %#v and %#v", first, created)
+		}
+	}
+	if deps.defaultWorkspace.calls != 1 || deps.hosts.createCalls != 1 {
+		t.Fatalf("Workspace provider/Host create calls = %d/%d, want one each", deps.defaultWorkspace.calls, deps.hosts.createCalls)
 	}
 }
 
@@ -532,7 +586,9 @@ func TestHostServiceBindAndUnbindWorkspaceAreIdempotent(t *testing.T) {
 	value.Workspaces = nil
 	deps.hosts.addHost(value)
 	ws := workspace.Workspace{ID: "w7654321", OwnerID: value.OwnerID, Name: "code", State: workspace.StateReady, Revision: 5}
+	other := workspace.Workspace{ID: "w8765432", OwnerID: value.OwnerID, Name: "other", State: workspace.StateReady, Revision: 0}
 	deps.workspaces.add(ws)
+	deps.workspaces.add(other)
 	revision := int64(5)
 
 	bound, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, &revision, 0, "bind-workspace-01")
@@ -568,6 +624,9 @@ func TestHostServiceBindAndUnbindWorkspaceAreIdempotent(t *testing.T) {
 	rebound, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, &revision, detached.BindingVersion, "bind-workspace-02")
 	if err != nil || rebound.State != workspace.BindingPreparing {
 		t.Fatalf("rebind after verified detach = %#v, %v", rebound, err)
+	}
+	if _, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, other.ID, nil, 0, "bind-workspace-03"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("rebinding Host to a different Workspace error = %v, want workspace conflict", err)
 	}
 	if _, err := service.UnbindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, active.BindingVersion, true, "unbind-workspace-01"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("replay stale unbind after rebind error = %v", err)
@@ -1368,6 +1427,7 @@ func mustCredentialSecret(t *testing.T, value string) string {
 
 type hostServiceTestHostStore struct {
 	mu                  sync.Mutex
+	defaultCreationMu   sync.Mutex
 	values              map[string]host.Host
 	idempotency         map[string]IdempotencyRecord
 	workspaces          *hostServiceTestWorkspaceStore
@@ -1404,7 +1464,12 @@ func (s *hostServiceTestHostStore) GetDefaultHostForOwner(_ context.Context, own
 }
 
 func (s *hostServiceTestHostStore) AcquireDefaultHostLock(context.Context, string) (func() error, error) {
-	return func() error { return nil }, nil
+	s.defaultCreationMu.Lock()
+	var once sync.Once
+	return func() error {
+		once.Do(s.defaultCreationMu.Unlock)
+		return nil
+	}, nil
 }
 
 func (s *hostServiceTestHostStore) RecordHostReplicaHeartbeat(_ context.Context, hostID string, generation int64) error {

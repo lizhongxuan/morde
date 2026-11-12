@@ -305,12 +305,14 @@ FROM conversation_messages m WHERE m.task_id=$1 AND m.owner_id=$2 AND m.role='us
 				}
 				return err
 			}
-			if revision.claim.Input.HostID != "" && revision.claim.Input.HostID != hostSelected {
-				hostSelected = revision.claim.Input.HostID
-				workspaceSelected = stored.WorkspaceID.Valid
-			}
-			if revision.claim.Input.WorkspaceID != "" {
-				workspaceSelected = true
+			if revision.claim.Input.ChangeTaskTarget {
+				if revision.claim.Input.HostID != "" && revision.claim.Input.HostID != hostSelected {
+					hostSelected = revision.claim.Input.HostID
+					workspaceSelected = stored.WorkspaceID.Valid
+				}
+				if revision.claim.Input.WorkspaceID != "" {
+					workspaceSelected = true
+				}
 			}
 			if directive, specified := app.RoutedFileDeliveryDirective(revision.claim.Message.Content, workspaceSelected); specified {
 				fileIntent = directive

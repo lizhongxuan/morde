@@ -870,7 +870,17 @@ final class MordeLoginStateStore {
               components.user == nil, components.password == nil else { return nil }
         let secure = scheme == "https"
 #if DEBUG
-        let localHTTP = scheme == "http" && ["localhost", "127.0.0.1", "[::1]"].contains(host)
+        let loopbackHTTP = scheme == "http" && ["localhost", "127.0.0.1", "[::1]"].contains(host)
+        let arguments = ProcessInfo.processInfo.arguments
+        let fixtureOriginIndex = arguments.firstIndex(of: "-morde.portalMessageTransportFailureOrigin")
+        let fixtureOrigin = fixtureOriginIndex.flatMap { index in
+            arguments.indices.contains(index + 1) ? URLComponents(string: arguments[index + 1]) : nil
+        }
+        let fixtureHTTP = arguments.contains("-morde.portalMessageTransportFailureFixture") &&
+            scheme == "http" && fixtureOrigin?.scheme?.lowercased() == scheme &&
+            fixtureOrigin?.host?.lowercased() == host && fixtureOrigin?.port == components.port &&
+            fixtureOrigin?.path.isEmpty == true && fixtureOrigin?.query == nil && fixtureOrigin?.fragment == nil
+        let localHTTP = loopbackHTTP || fixtureHTTP
 #else
         let localHTTP = false
 #endif
@@ -1728,7 +1738,7 @@ enum MordeTaskStatusPresentation {
         case "等你审批": return "Waiting for approval"
         case "等待你补充信息": return "Waiting for your input"
         case "等待电脑同步": return "Waiting for computer sync"
-        case "工作区已变化，等待确认": return "Workspace changed; awaiting confirmation"
+        case "电脑文件已变化，等待确认": return "Workspace changed; awaiting confirmation"
         case "电脑焦点已变化，等待确认": return "Computer focus changed; awaiting confirmation"
         case "操作结果待核对": return "Operation result needs review"
         case "当前操作不受支持，等待处理": return "Operation not supported; action needed"
@@ -1737,11 +1747,11 @@ enum MordeTaskStatusPresentation {
         case "等待任务额度处理": return "Waiting for task quota"
         case "需要选择电脑才能继续任务": return "Choose a computer to continue this task"
         case "所需云端电脑暂不可用": return "Required cloud computer is unavailable"
-        case "所需工作区暂不可用": return "Required workspace is unavailable"
+        case "所需电脑文件暂不可用": return "Required workspace is unavailable"
         case "电脑操作结果待核对": return "Computer operation result needs review"
         case "任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。":
             return "Task is bound to another cloud computer; start a new task for the new target."
-        case "任务已绑定其他工作区，无法安全切换；请为新目标另发起任务。":
+        case "任务所用电脑文件已变化，无法安全切换；请为新目标另发起任务。":
             return "Task is bound to another workspace; start a new task for the new target."
         case "原项目权限/上下文变化，未安全恢复，请重新发送。":
             return "原项目权限/上下文变化，未安全恢复，请重新发送。"
@@ -1778,7 +1788,7 @@ enum MordeTaskStatusPresentation {
             if waitingReason == "clarification_required" { return "等待你补充信息" }
             switch waitingReason {
             case "workspace_host_sync": return "等待电脑同步"
-            case "workspace_input_changed": return "工作区已变化，等待确认"
+            case "workspace_input_changed": return "电脑文件已变化，等待确认"
             case "desktop_focus_changed": return "电脑焦点已变化，等待确认"
             case "mcp_result_unknown", "dsh_recovery_unresolved": return "操作结果待核对"
             case "mcp_result_unsupported": return "当前操作不受支持，等待处理"
@@ -1788,10 +1798,10 @@ enum MordeTaskStatusPresentation {
             case "model_context_limit": return "消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。"
             case "computer_target_missing": return "需要选择电脑才能继续任务"
             case "computer_unavailable": return "所需云端电脑暂不可用"
-            case "workspace_unavailable": return "所需工作区暂不可用"
+            case "workspace_unavailable": return "所需电脑文件暂不可用"
             case "target_result_unknown": return "电脑操作结果待核对"
             case "computer_target_changed": return "任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。"
-            case "workspace_target_changed": return "任务已绑定其他工作区，无法安全切换；请为新目标另发起任务。"
+            case "workspace_target_changed": return "任务所用电脑文件已变化，无法安全切换；请为新目标另发起任务。"
             case "project_recovery_unavailable": return "原项目权限/上下文变化，未安全恢复，请重新发送。"
             default: break
             }

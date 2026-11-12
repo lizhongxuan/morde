@@ -351,6 +351,7 @@ type ConversationResultBatch struct {
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	AuthorizationVersion int64              `json:"authorization_version"`
 	TriggerMessageID     pgtype.Text        `json:"trigger_message_id"`
+	RetryAttempt         int64              `json:"retry_attempt"`
 }
 
 type ConversationResultSource struct {
@@ -2157,20 +2158,23 @@ type WorkspaceChange struct {
 }
 
 type WorkspaceCopyReservation struct {
-	ID                string             `json:"id"`
-	OwnerID           string             `json:"owner_id"`
-	SourceWorkspaceID string             `json:"source_workspace_id"`
-	TargetWorkspaceID string             `json:"target_workspace_id"`
-	ServiceInstanceID string             `json:"service_instance_id"`
-	SourceRevision    int64              `json:"source_revision"`
-	ReservedBytes     int64              `json:"reserved_bytes"`
-	State             string             `json:"state"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	SourceOwnerID     string             `json:"source_owner_id"`
-	TargetOwnerID     string             `json:"target_owner_id"`
-	ShareID           pgtype.Text        `json:"share_id"`
-	ReadOnly          bool               `json:"read_only"`
+	ID                   string             `json:"id"`
+	OwnerID              string             `json:"owner_id"`
+	SourceWorkspaceID    string             `json:"source_workspace_id"`
+	TargetWorkspaceID    string             `json:"target_workspace_id"`
+	ServiceInstanceID    string             `json:"service_instance_id"`
+	SourceRevision       int64              `json:"source_revision"`
+	ReservedBytes        int64              `json:"reserved_bytes"`
+	State                string             `json:"state"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	SourceOwnerID        string             `json:"source_owner_id"`
+	TargetOwnerID        string             `json:"target_owner_id"`
+	ShareID              pgtype.Text        `json:"share_id"`
+	ReadOnly             bool               `json:"read_only"`
+	SourceHostID         pgtype.Text        `json:"source_host_id"`
+	SourceBindingVersion int64              `json:"source_binding_version"`
+	HostCopyPending      bool               `json:"host_copy_pending"`
 }
 
 type WorkspaceCurrentMaterialization struct {
@@ -2314,6 +2318,7 @@ type WorkspaceSyncDeviceBinding struct {
 	State                string             `json:"state"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+	FolderID             string             `json:"folder_id"`
 }
 
 type WorkspaceSyncDeviceChallenge struct {
@@ -2327,6 +2332,9 @@ type WorkspaceSyncDeviceChallenge struct {
 	Nonce                []byte             `json:"nonce"`
 	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	FolderID             pgtype.Text        `json:"folder_id"`
+	FolderKind           string             `json:"folder_kind"`
+	RelativePath         string             `json:"relative_path"`
 }
 
 type WorkspaceSyncDeviceIdentity struct {
@@ -2346,15 +2354,31 @@ type WorkspaceSyncDeviceRegistrationRequest struct {
 	RequestHash        []byte             `json:"request_hash"`
 	BindingID          string             `json:"binding_id"`
 	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	FolderID           string             `json:"folder_id"`
 }
 
 type WorkspaceSyncFolder struct {
-	WorkspaceID string             `json:"workspace_id"`
-	OwnerID     string             `json:"owner_id"`
-	FolderID    string             `json:"folder_id"`
-	State       string             `json:"state"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	WorkspaceID        string             `json:"workspace_id"`
+	OwnerID            string             `json:"owner_id"`
+	FolderID           string             `json:"folder_id"`
+	State              string             `json:"state"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	FolderKind         string             `json:"folder_kind"`
+	ProjectName        pgtype.Text        `json:"project_name"`
+	RelativePath       string             `json:"relative_path"`
+	ProjectNameFolded  pgtype.Text        `json:"project_name_folded"`
+	LastUploadRevision pgtype.Int8        `json:"last_upload_revision"`
+}
+
+type WorkspaceSyncFolderRegistrationRequest struct {
+	OwnerID            string             `json:"owner_id"`
+	HostID             string             `json:"host_id"`
+	WorkspaceID        string             `json:"workspace_id"`
+	IdempotencyKeyHash []byte             `json:"idempotency_key_hash"`
+	RequestHash        []byte             `json:"request_hash"`
+	FolderID           string             `json:"folder_id"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 }
 
 type WorkspaceSyncNodeRevision struct {
@@ -2391,6 +2415,7 @@ type WorkspaceSyncReceiveQuotaRejection struct {
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	BaseFileModTimeNs      pgtype.Int8        `json:"base_file_mod_time_ns"`
+	FolderID               string             `json:"folder_id"`
 }
 
 type WorkspaceSyncReceiveReservation struct {
@@ -2413,6 +2438,7 @@ type WorkspaceSyncReceiveReservation struct {
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	BaseEmptyDirectoryPath pgtype.Text        `json:"base_empty_directory_path"`
+	FolderID               string             `json:"folder_id"`
 }
 
 type WorkspaceSyncSession struct {
@@ -2448,6 +2474,8 @@ type WorkspaceSyncSession struct {
 	DownloadDeletedDirectories []string           `json:"download_deleted_directories"`
 	TaskID                     pgtype.Text        `json:"task_id"`
 	TaskHubOperationKey        pgtype.Text        `json:"task_hub_operation_key"`
+	FolderID                   pgtype.Text        `json:"folder_id"`
+	FolderBaselineRevision     pgtype.Int8        `json:"folder_baseline_revision"`
 }
 
 type WorkspaceSyncSessionBlock struct {

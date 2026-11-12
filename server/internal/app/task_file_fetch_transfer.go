@@ -71,6 +71,7 @@ type TaskFileFetchDataStore interface {
 	AcceptTaskFileFetchManifest(context.Context, string, string, []byte, TaskFileFetchManifestRequest) (TaskFileFetchManifestReceipt, error)
 	PutTaskFileFetchChunk(context.Context, string, string, []byte, int32, string, []byte) (TaskFileFetchChunkReceipt, error)
 	CommitTaskFileFetch(context.Context, string, string, []byte, TaskFileFetchCommitRequest, string) (TaskFileFetchCommitReceipt, error)
+	AbortTaskFileFetch(context.Context, string, string, []byte) error
 	CancelTaskFileFetch(context.Context, string, string, string) (TaskFileFetch, error)
 	ListTaskFileFetches(context.Context, string, string) ([]TaskFileFetch, error)
 	OpenTaskFileFetchContent(context.Context, string, string, string) (io.ReadCloser, TaskFileFetch, error)
@@ -145,6 +146,21 @@ func (s *TaskService) CommitTaskFileFetch(ctx context.Context, taskID, fetchID, 
 	return store.CommitTaskFileFetch(ctx, taskID, fetchID, ticketHash, request, contentID)
 }
 
+func (s *TaskService) AbortTaskFileFetch(ctx context.Context, taskID, fetchID, ticket string) error {
+	store, ok := s.store.(TaskFileFetchDataStore)
+	if !ok || store == nil {
+		return domain.NewError(domain.CodeUnsupported, "Task file fetch transfer storage is unavailable")
+	}
+	ticketHash, err := hashTaskFileFetchTicket(ticket)
+	if err != nil {
+		return err
+	}
+	if !domain.ValidTaskID(taskID) || !domain.ValidOperationID(fetchID) {
+		return domain.InvalidArgument("file_fetch", "Task file fetch identity is invalid")
+	}
+	return store.AbortTaskFileFetch(ctx, taskID, fetchID, ticketHash)
+}
+
 func (s *TaskService) CancelTaskFileFetch(ctx context.Context, principal identity.Principal, taskID, fetchID string) (TaskFileFetch, error) {
 	store, err := s.taskFileFetchOwnerStore(ctx, principal, taskID, fetchID)
 	if err != nil {
@@ -161,8 +177,8 @@ func (s *TaskService) CancelTaskFileFetch(ctx context.Context, principal identit
 }
 
 func (s *TaskService) ListTaskFileFetches(ctx context.Context, principal identity.Principal, taskID string) ([]TaskFileFetch, error) {
-	if principal.Kind != identity.KindSession || principal.ClientInstallationID != "" {
-		return nil, domain.NewError(domain.CodeNotFound, "file fetch not found")
+	if err := s.authorizeTaskFileFetchOwnerSession(ctx, principal); err != nil {
+		return nil, err
 	}
 	details, err := s.Get(ctx, principal, taskID)
 	if err != nil || details.Task.OwnerID != principal.UserID {
@@ -241,8 +257,8 @@ func (s *TaskService) CleanupExpiredTaskFileFetches(ctx context.Context, now tim
 }
 
 func (s *TaskService) taskFileFetchOwnerStore(ctx context.Context, principal identity.Principal, taskID, fetchID string) (TaskFileFetchDataStore, error) {
-	if principal.Kind != identity.KindSession || principal.ClientInstallationID != "" {
-		return nil, domain.NewError(domain.CodeNotFound, "file fetch not found")
+	if err := s.authorizeTaskFileFetchOwnerSession(ctx, principal); err != nil {
+		return nil, err
 	}
 	if !domain.ValidOperationID(fetchID) {
 		return nil, domain.NewError(domain.CodeNotFound, "file fetch not found")
@@ -259,6 +275,27 @@ func (s *TaskService) taskFileFetchOwnerStore(ctx context.Context, principal ide
 		return nil, domain.NewError(domain.CodeUnsupported, "Task file fetch transfer storage is unavailable")
 	}
 	return store, nil
+}
+
+func (s *TaskService) authorizeTaskFileFetchOwnerSession(ctx context.Context, principal identity.Principal) error {
+	if principal.Kind != identity.KindSession {
+		return domain.NewError(domain.CodeNotFound, "file fetch not found")
+	}
+	if principal.ClientInstallationID == "" {
+		return nil
+	}
+	authorizer, ok := s.store.(TaskFileFetchOwnerSessionAuthorizer)
+	if !ok {
+		return domain.NewError(domain.CodeUnsupported, "Task file fetch session authorization is unavailable")
+	}
+	allowed, err := authorizer.IsDesktopClientWebSession(ctx, principal.UserID, principal.ClientInstallationID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return domain.NewError(domain.CodeNotFound, "file fetch not found")
+	}
+	return nil
 }
 
 func hashTaskFileFetchTicket(ticket string) ([]byte, error) {

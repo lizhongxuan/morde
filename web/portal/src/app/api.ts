@@ -72,6 +72,9 @@ export const portalApi = {
   createHost: async (body: components['schemas']['CreateHostRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/hosts', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
+  copyHost: async (id: string, body: components['schemas']['HostCopyRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/hosts/{id}/copies', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
   enterHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/enter', { params: { path: { id } } })),
   hostControl: async (id: string) => unwrapApiResponse(await api.GET('/api/hosts/{id}/control', { params: { path: { id } } })),
   hostControlAction: async (id: string, body: components['schemas']['ControlActionRequest']) => unwrapApiResponse(await api.POST('/api/hosts/{id}/control/actions', { params: { path: { id } }, body })),

@@ -170,13 +170,22 @@ func TestFileFetchArgumentsAndReceiptAreBoundedAndCredentialSafe(t *testing.T) {
 	if err := ValidateTaskActionArgs(ActionFileFetch, raw); err != nil {
 		t.Fatalf("valid file.fetch arguments: %v", err)
 	}
+	zeroRevisionArgs := args
+	zeroRevisionArgs.TaskRevision = 0
+	zeroRevisionRaw, err := json.Marshal(zeroRevisionArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateTaskActionArgs(ActionFileFetch, zeroRevisionRaw); err != nil {
+		t.Fatalf("initial Task revision is valid for file.fetch: %v", err)
+	}
 	for name, changed := range map[string]FileFetchArgs{
-		"invalid fetch ID": {FetchID: "bad", Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
-		"absolute path":    {FetchID: args.FetchID, Path: "/private/file.pdf", TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
-		"missing revision": {FetchID: args.FetchID, Path: args.Path, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
-		"padded ticket":    {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket + "=", TicketExpiresAt: expiresAt},
-		"expired ticket":   {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: time.Now().UTC().Add(-time.Second)},
-		"ticket too long":  {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: time.Now().UTC().Add(6 * time.Minute)},
+		"invalid fetch ID":  {FetchID: "bad", Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
+		"absolute path":     {FetchID: args.FetchID, Path: "/private/file.pdf", TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
+		"negative revision": {FetchID: args.FetchID, Path: args.Path, TaskRevision: -1, Ticket: args.Ticket, TicketExpiresAt: expiresAt},
+		"padded ticket":     {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket + "=", TicketExpiresAt: expiresAt},
+		"expired ticket":    {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: time.Now().UTC().Add(-time.Second)},
+		"ticket too long":   {FetchID: args.FetchID, Path: args.Path, TaskRevision: args.TaskRevision, Ticket: args.Ticket, TicketExpiresAt: time.Now().UTC().Add(6 * time.Minute)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			encoded, err := json.Marshal(changed)
@@ -200,6 +209,17 @@ func TestFileFetchArgumentsAndReceiptAreBoundedAndCredentialSafe(t *testing.T) {
 	ok := true
 	if err := ValidateActionResult(ActionFileFetch, Frame{Type: "result", ID: "call-file-fetch", OK: &ok, Body: receipt}); err != nil {
 		t.Fatalf("valid file.fetch commit receipt: %v", err)
+	}
+	zeroRevisionReceipt, err := json.Marshal(FileFetchReceipt{
+		FetchID: args.FetchID, TaskRevision: 0, Status: "completed", TargetGrantVersion: 9,
+		SourceVersion: string(bytes.Repeat([]byte{'a'}, 64)), SourceSHA256: string(bytes.Repeat([]byte{'b'}, 64)),
+		SizeBytes: 4096, ContentID: "o7654321", ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateActionResult(ActionFileFetch, Frame{Type: "result", ID: "call-file-fetch", OK: &ok, Body: zeroRevisionReceipt}); err != nil {
+		t.Fatalf("initial Task revision receipt is valid: %v", err)
 	}
 	unsafeReceipt := append(bytes.TrimSuffix(receipt, []byte("}")), []byte(`,"ticket":"secret"}`)...)
 	if err := ValidateActionResult(ActionFileFetch, Frame{Type: "result", ID: "call-file-fetch", OK: &ok, Body: unsafeReceipt}); err == nil {

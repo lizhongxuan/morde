@@ -65,7 +65,8 @@ type ConversationRouteContext struct {
 }
 
 type ConversationTaskResultReview struct {
-	Sources []ConversationTaskResultSource
+	RetryAttempt int64
+	Sources      []ConversationTaskResultSource
 }
 
 type ConversationTaskResultSource struct {
@@ -125,7 +126,7 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		previousSequence = item.Sequence
 	}
 	if value.ResultReview != nil {
-		if len(value.ResultReview.Sources) == 0 || len(value.ResultReview.Sources) > 64 {
+		if value.ResultReview.RetryAttempt < 0 || len(value.ResultReview.Sources) == 0 || len(value.ResultReview.Sources) > 64 {
 			return ModelRequest{}, domain.InvalidArgument("route_context", "result review sources are invalid")
 		}
 		var resultBytes int

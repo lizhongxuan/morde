@@ -29,6 +29,7 @@ type TaskService interface {
 	RetryConversationMessageProcessing(context.Context, identity.Principal, string, string, string, string, string) error
 	List(context.Context, identity.Principal, app.TaskListRequest) (app.TaskPage, error)
 	ListConversationActiveTasks(context.Context, identity.Principal, string, string, app.PageRequest) (app.TaskPage, error)
+	ListConversationTasks(context.Context, identity.Principal, string, string, app.ConversationTaskView, app.PageRequest) (app.TaskPage, error)
 	Get(context.Context, identity.Principal, string) (app.TaskDetails, error)
 	RequestAction(context.Context, identity.Principal, string, task.Action, task.Status, string) (app.TaskActionResult, error)
 	RetryBatchItem(context.Context, identity.Principal, string, string, string) error
@@ -111,6 +112,7 @@ type taskResultReviewResponse struct {
 	SourceTaskID        string  `json:"source_task_id"`
 	SourceTaskRevision  int64   `json:"source_task_revision"`
 	SourceEventSequence int64   `json:"source_event_sequence"`
+	TriggerMessageID    *string `json:"trigger_message_id"`
 	ReplyMessageID      *string `json:"reply_message_id"`
 }
 
@@ -758,7 +760,7 @@ func toTaskFileFetchResponse(value app.TaskFileFetch) (taskFileFetchResponse, er
 	if !domain.ValidOperationID(value.ID) || !domain.ValidTaskID(value.TaskID) || !domain.ValidClientInstallationID(value.SourceInstallationID) ||
 		!validTaskText(value.SourceDeviceName, 100) || (value.SourceDirectoryName != "" && !app.ValidTaskFileFetchDirectoryName(value.SourceDirectoryName)) ||
 		value.TargetGrantVersion < 1 || value.TaskAuthorizationVersion < 1 ||
-		value.TaskRevision < 1 || !validTaskText(value.RelativePath, 1024) || !task.ValidFileFetchStatus(value.Status) ||
+		value.TaskRevision < 0 || !validTaskText(value.RelativePath, 1024) || !task.ValidFileFetchStatus(value.Status) ||
 		(value.FailureReason != "" && (value.Status != task.FileFetchFailed || !task.ValidFileFetchFailureReason(value.FailureReason))) ||
 		!task.ValidFileFetchContentState(value.ContentState) ||
 		!task.ValidFileFetchParseStatus(value.ParseStatus) || !app.ValidTaskFileFetchParseResult(value.ParseStatus, value.ParseError) ||
@@ -844,12 +846,14 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 	}
 	if review := projection.ResultReview; review != nil {
 		if !validTaskResultReviewState(review.State) || !domain.ValidTaskID(review.SourceTaskID) || review.SourceTaskRevision < 0 ||
-			review.SourceEventSequence < 1 || (review.ReplyMessageID != nil && !domain.ValidMessageID(*review.ReplyMessageID)) {
+			review.SourceEventSequence < 1 || (review.TriggerMessageID != nil && !domain.ValidMessageID(*review.TriggerMessageID)) ||
+			(review.ReplyMessageID != nil && !domain.ValidMessageID(*review.ReplyMessageID)) {
 			return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.ResultReview = &taskResultReviewResponse{
 			State: review.State, SourceTaskID: review.SourceTaskID, SourceTaskRevision: review.SourceTaskRevision,
-			SourceEventSequence: review.SourceEventSequence, ReplyMessageID: review.ReplyMessageID,
+			SourceEventSequence: review.SourceEventSequence, TriggerMessageID: review.TriggerMessageID,
+			ReplyMessageID: review.ReplyMessageID,
 		}
 	}
 	return response, nil

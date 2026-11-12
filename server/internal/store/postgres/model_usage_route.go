@@ -198,6 +198,9 @@ WHERE m.id=$1 FOR SHARE OF m`, item.MessageID, claim.Message.ConversationID, cla
 }
 
 func conversationRouteModelPhase(value app.ConversationRouteContext) string {
+	if value.ResultReview != nil && value.ResultReview.RetryAttempt > 0 {
+		return fmt.Sprintf("result_review_%d", value.ResultReview.RetryAttempt)
+	}
 	if value.PreviousMissing {
 		return "missing_predecessor"
 	}

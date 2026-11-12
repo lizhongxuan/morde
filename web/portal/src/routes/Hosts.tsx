@@ -38,7 +38,7 @@ const sharingPermissionLabels: Record<HostMemberPermission, string> = {
   'desktop:control': '操作桌面',
   'terminal:control': '终端操作',
   'mcp:control': 'MCP 操作',
-  'workspace:file:read': '读取工作区文件',
+  'workspace:file:read': '读取云端电脑文件',
 };
 const hostReasonLabel: Record<string, string> = {
   user_release: '正在释放计算资源',
@@ -70,6 +70,7 @@ export function Hosts() {
   const atLimit = !!user && (hosts.data?.items.length ?? 0) >= user.quota.hosts;
   const [deleting, setDeleting] = useState<Host | null>(null);
   const [lifecycleAction, setLifecycleAction] = useState<{ host: Host; action: 'release' | 'restore' } | null>(null);
+  const [copyDialog, setCopyDialog] = useState<{ host: Host; name: string; idempotencyKey: string } | null>(null);
   const update = useMutation({
     mutationFn: async ({ action, host }: { action: 'renew' | 'delete' | 'release' | 'restore'; host: Host }) => {
       if (action === 'renew') return portalApi.renewHost(host.id);
@@ -110,6 +111,28 @@ export function Hosts() {
       notify(errorDetails(error).message, 'error');
     },
   });
+  const copyHost = useMutation({
+    mutationFn: ({ host, name, idempotencyKey }: { host: Host; name: string; idempotencyKey: string }) => {
+      const binding = host.workspaces.find((item) => item.state !== 'detached');
+      if (!binding) throw new Error('找不到可复制的云端文件版本。');
+      return portalApi.copyHost(host.id, { name: name.trim(), expected_current_revision: binding.workspace.revision }, idempotencyKey);
+    },
+    onSuccess: async (result) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['hosts'] }),
+        queryClient.invalidateQueries({ queryKey: ['workspaces'] }),
+      ]);
+      notify(`已创建云端电脑“${result.host.name || result.host.id}”。`, 'success');
+      setCopyDialog(null);
+    },
+    onError: async (error) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['hosts'] }),
+        queryClient.invalidateQueries({ queryKey: ['workspaces'] }),
+      ]);
+      notify(`${errorDetails(error).message} 若结果不确定，请保持名称不变并在此窗口重试。`, 'error');
+    },
+  });
   const enter = async (host: Host) => {
     try { await enterHostInNewTab(host.id); }
     catch (error) { notify(errorDetails(error).message, 'error'); }
@@ -123,7 +146,7 @@ export function Hosts() {
 
   return <section>
     <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
-    <div className="design-panel-header"><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑和工作区。</p></div><div className="inline-actions"><Link className="button button-secondary" to="/workspaces">工作区</Link>{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></div>
+    <div className="design-panel-header"><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑、文件和运行状态。</p></div><div className="inline-actions">{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></div>
     {hosts.isPending ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError ? <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div> : !hosts.data?.items.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <div className="host-list">
       {hosts.data.items.map((host) => {
         const ownsHost = host.owner_id === user?.id;
@@ -137,11 +160,15 @@ export function Hosts() {
         const bindableWorkspaces = workspaces.data?.items.filter((workspace) => workspace.state === 'ready'
           && !hosts.data.items.some((other) => other.id !== host.id && other.workspaces.some((binding) => binding.workspace.id === workspace.id && binding.state !== 'detached'))) ?? [];
         const canBindWorkspace = ownsHost && host.state === 'stopped' && !host.workspaces.some((binding) => binding.state !== 'detached');
+        const copyReason = atLimit ? '已达到云端电脑数量上限。'
+          : host.state !== 'stopped' ? '请先停止源电脑。'
+            : host.control_state !== 'ai' ? '请先将电脑控制权交还给云端 AI。'
+              : !workspaceReady ? '源电脑文件尚未全部确认或仍有冲突。' : undefined;
         return <HostCard key={host.id} host={host} busy={update.isPending && update.variables?.host.id === host.id}
           canEnter={ownsHost && workspaceReady}
           enterReason={!ownsHost ? '仅主机所有者可以进入工作环境。' : blockedBinding
-            ? 'Workspace 正在准备、同步或存在冲突；打开和移交操作暂不可用。'
-            : !workspaceReady ? '请先绑定恰好一个已就绪的工作区，再打开这台主机。' : undefined}
+            ? '云端电脑的文件正在准备、同步或存在冲突；打开和移交操作暂不可用。'
+            : !workspaceReady ? '请先关联并准备好这台电脑的文件，再打开电脑。' : undefined}
           workspaceRestorable={workspaceRestorable}
           canBindWorkspace={canBindWorkspace}
           bindableWorkspaces={bindableWorkspaces}
@@ -149,6 +176,9 @@ export function Hosts() {
           bindWorkspacesError={workspaces.isError ? errorDetails(workspaces.error).message : undefined}
           bindPending={bindWorkspace.isPending && bindWorkspace.variables?.host.id === host.id}
           onBindWorkspace={(workspace) => bindWorkspace.mutate({ host, workspace })}
+          canShowCopy={ownsHost} canCopy={ownsHost && !copyReason} copyReason={ownsHost ? copyReason : undefined}
+          copyPending={copyHost.isPending && copyHost.variables?.host.id === host.id}
+          onCopy={() => setCopyDialog({ host, name: `${(host.name || '云端电脑').slice(0, 96)} 副本`, idempotencyKey: newIdempotencyKey() })}
           onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ action: 'restore', host })} onDelete={() => setDeleting(host)} />;
       })}
     </div>}
@@ -168,7 +198,7 @@ export function Hosts() {
               <div className="host-actions">
                 {canViewDesktop && <button type="button" className="button button-primary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'desktop')}>{host.state === 'running' ? '查看桌面' : '主机运行后可查看'}</button>}
                 {canControlTerminal && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'terminal')}>{host.state === 'running' ? '打开终端' : '主机运行后可打开终端'}</button>}
-                {canReadWorkspace && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'workspace')}>{host.state === 'running' ? '查看工作区' : '主机运行后可查看工作区'}</button>}
+                {canReadWorkspace && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'workspace')}>{host.state === 'running' ? '查看电脑文件' : '电脑运行后可查看文件'}</button>}
                 {host.permissions.includes('mcp:control') && <Link className="button button-secondary" to="/apikeys">配置 MCP API Key</Link>}
               </div>
               {canViewDesktop && host.state === 'running' && <HostControlPanel
@@ -179,7 +209,20 @@ export function Hosts() {
             </article>;
             })}</div>}
     </div>
-    {deleting && <ConfirmDialog title={`删除主机 ${deleting.name || deleting.id}`} description="删除后无法恢复。云端电脑的运行环境和专属资料卷会被删除，正在运行的终端命令及服务会中止。绑定的独立工作区会自动解绑并保留在服务端，不随主机删除。" confirmLabel="删除主机" danger busy={update.isPending} onClose={() => setDeleting(null)} onConfirm={() => update.mutate({ action: 'delete', host: deleting })} />}
+    {deleting && <ConfirmDialog title={`删除云端电脑 ${deleting.name || deleting.id}`} description="删除后无法恢复。云端电脑的运行环境和专属资料卷会被删除，正在运行的终端命令及服务会中止。关联的云端文件会自动解除关联并保留在服务端，不随电脑删除。" confirmLabel="删除电脑" danger busy={update.isPending} onClose={() => setDeleting(null)} onConfirm={() => update.mutate({ action: 'delete', host: deleting })} />}
+    {copyDialog && <ConfirmDialog
+      title={`复制云端电脑 ${copyDialog.host.name || copyDialog.host.id}`}
+      description={`将复制已确认的云端文件版本；其中可能包含隐藏文件、配置和密钥。新电脑拥有独立文件空间，源电脑保持不变。运行环境、应用状态、平台凭据、任务和本机同步关联不会复制。`}
+      confirmLabel="创建副本"
+      busy={copyHost.isPending}
+      confirmDisabled={!copyDialog.name.trim()}
+      onClose={() => setCopyDialog(null)}
+      onConfirm={() => copyHost.mutate(copyDialog)}
+    >
+      <label htmlFor="host-copy-name">新电脑名称</label>
+      <input id="host-copy-name" value={copyDialog.name} maxLength={100} onChange={(event) => setCopyDialog({ ...copyDialog, name: event.target.value })} />
+      <p className="muted">提交后如需重试，请保留相同名称；本次操作会继续使用同一个幂等键。</p>
+    </ConfirmDialog>}
     {lifecycleAction && <ConfirmDialog
       title={lifecycleAction.action === 'release' ? `释放主机 ${lifecycleAction.host.name || lifecycleAction.host.id} 的运行资源` : `恢复主机 ${lifecycleAction.host.name || lifecycleAction.host.id}`}
       description={lifecycleAction.action === 'release'
@@ -193,14 +236,15 @@ export function Hosts() {
   </section>;
 }
 
-function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canBindWorkspace, bindableWorkspaces, bindWorkspacesLoading, bindWorkspacesError, bindPending, onBindWorkspace, onEnter, onRenew, onRelease, onRestore, onDelete }: {
+function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canBindWorkspace, bindableWorkspaces, bindWorkspacesLoading, bindWorkspacesError, bindPending, canShowCopy, canCopy, copyReason, copyPending, onBindWorkspace, onCopy, onEnter, onRenew, onRelease, onRestore, onDelete }: {
   host: Host; busy: boolean; canEnter: boolean; enterReason?: string; workspaceRestorable: boolean; canBindWorkspace: boolean;
-  bindableWorkspaces: Workspace[]; bindWorkspacesLoading: boolean; bindWorkspacesError?: string; bindPending: boolean;
-  onBindWorkspace: (workspace: Workspace) => void; onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
+  bindableWorkspaces: Workspace[]; bindWorkspacesLoading: boolean; bindWorkspacesError?: string; bindPending: boolean; canShowCopy: boolean; canCopy: boolean; copyReason?: string; copyPending: boolean;
+  onBindWorkspace: (workspace: Workspace) => void; onCopy: () => void; onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
 }) {
   const [workspaceID, setWorkspaceID] = useState('');
   const name = host.name || host.id;
   const enterHelpID = `host-enter-help-${host.id}`;
+  const copyHelpID = `host-copy-help-${host.id}`;
   const hasWorkspaceBinding = host.workspaces.some((binding) => binding.state !== 'detached');
   const selectedWorkspace = bindableWorkspaces.find((workspace) => workspace.id === workspaceID);
   return <article className="host-card" id={`host-${host.id}`}>
@@ -208,37 +252,39 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
     <div className="host-facts">
       <div><span>规格</span><strong>{formatCpu(host.resources?.cpu_limit_milli)} / {formatMemory(host.resources?.mem_limit_mib)}</strong></div>
       <div><span>到期时间</span><strong>{formatDate(host.expires_at)}</strong></div>
-      <div><span>工作区</span><strong>{host.workspaces.length ? host.workspaces.map((binding) => binding.workspace.name || binding.workspace.id).join('、') : '无'}</strong>
+      <div><span>云端文件</span><strong>{host.workspaces.length ? host.workspaces.map((binding) => binding.workspace.name || binding.workspace.id).join('、') : '暂无文件空间'}</strong>
         {host.workspaces.map((binding) => <small className="table-sub" key={binding.workspace.id}>{binding.sync_state === 'conflict' || binding.sync_conflicts.length
-          ? '同步冲突（打开、恢复和移交已锁定）'
+          ? '文件同步冲突（打开、恢复和移交已锁定）'
           : binding.state === 'active' && binding.applied_revision === binding.desired_revision ? `已应用 v${binding.applied_revision}`
-            : binding.state === 'preparing' ? `正在应用 v${binding.desired_revision}`
-              : binding.state === 'unbinding' ? '正在解绑（操作已锁定）'
-                : binding.state === 'failed' ? '应用失败（操作已锁定）' : binding.state}</small>)}
+            : binding.state === 'preparing' ? `正在准备文件 v${binding.desired_revision}`
+              : binding.state === 'unbinding' ? '正在解除关联（操作已锁定）'
+                : binding.state === 'failed' ? '准备失败（操作已锁定）' : binding.state}</small>)}
+        <small className="table-sub">旧数据迁移状态未知</small>
       </div>
       <div><span>运行状态</span><strong>{hostReasonLabel[host.state_reason] || host.state_reason || (host.state === 'running' ? '运行正常' : host.state === 'stopped' ? '可恢复' : '等待状态更新')}</strong></div>
-      <div><span>默认工作/下载目录</span><strong>/home/gem/workspace</strong></div>
-      <div><span>旧容器数据迁移</span><strong>状态未知</strong><small className="table-sub">当前服务未提供迁移状态，不能据此确认旧数据已进入 Workspace。</small></div>
     </div>
     <div className="host-actions">
-      <button type="button" className="button button-primary" onClick={onEnter} disabled={!canEnter || host.state !== 'running' || busy || host.control_state === 'taking_over' || host.control_state === 'returning'} aria-label={`${host.control_state === 'user' ? '操作' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看'}主机 ${name}`} aria-describedby={!canEnter ? enterHelpID : undefined}>{host.control_state === 'user' ? '操作电脑' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看电脑'}</button>
-      {!canEnter && <span className="muted" id={enterHelpID}>{enterReason}{enterReason?.startsWith('请先') && <> <Link to="/workspaces">管理工作区</Link></>}</span>}
+      <Link className="button button-secondary" to={`/workspaces?host=${encodeURIComponent(host.id)}`}>文件与版本</Link>
+      <button type="button" className="button button-primary" onClick={onEnter} disabled={!canEnter || host.state !== 'running' || busy || host.control_state === 'taking_over' || host.control_state === 'returning'} aria-label={`${host.control_state === 'user' ? '操作' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看'}云端电脑 ${name}`} aria-describedby={!canEnter ? enterHelpID : undefined}>{host.control_state === 'user' ? '操作电脑' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看电脑'}</button>
+      {!canEnter && <span className="muted" id={enterHelpID}>{enterReason}{enterReason?.startsWith('请先') && <> <Link to={`/workspaces?host=${encodeURIComponent(host.id)}`}>管理电脑文件</Link></>}</span>}
       <button type="button" className="button button-secondary" onClick={onRenew} disabled={host.state !== 'running' || busy} aria-label={`续期主机 ${name}`}>续期</button>
       {host.state === 'running' && <button type="button" className="button button-secondary" onClick={onRelease} disabled={busy} aria-label={`释放运行资源 ${name}`}>释放运行资源</button>}
-      {host.state === 'stopped' && <button type="button" className="button button-primary" onClick={onRestore} disabled={busy || !workspaceRestorable} aria-label={`恢复主机 ${name}`} title={!workspaceRestorable ? '恢复前需要选择一个就绪工作区' : undefined}>恢复</button>}
-      {host.state === 'stopped' && !workspaceRestorable && <span className="muted" role="status">恢复前需绑定并准备好一个工作区。<Link to="/workspaces">查看工作区</Link></span>}
-      <button type="button" className="button button-danger-quiet" onClick={onDelete} disabled={host.state === 'deleting' || host.state === 'creating' || host.state === 'stopping' || busy} aria-label={`删除主机 ${name}`}>删除</button>
+      {host.state === 'stopped' && <button type="button" className="button button-primary" onClick={onRestore} disabled={busy || !workspaceRestorable} aria-label={`恢复云端电脑 ${name}`} title={!workspaceRestorable ? '恢复前需要关联并准备好云端文件' : undefined}>恢复</button>}
+      {host.state === 'stopped' && !workspaceRestorable && <span className="muted" role="status">恢复前需准备好云端文件。<Link to={`/workspaces?host=${encodeURIComponent(host.id)}`}>查看电脑文件</Link></span>}
+      {canShowCopy && <button type="button" className="button button-secondary" onClick={onCopy} disabled={!canCopy || copyPending} aria-label={`复制云端电脑 ${name}`} aria-describedby={copyReason ? copyHelpID : undefined}>复制电脑</button>}
+      {copyReason && <span className="muted" id={copyHelpID}>{copyReason}</span>}
+      <button type="button" className="button button-danger-quiet" onClick={onDelete} disabled={host.state === 'deleting' || host.state === 'creating' || host.state === 'stopping' || busy} aria-label={`删除云端电脑 ${name}`}>删除</button>
     </div>
     {canBindWorkspace && !hasWorkspaceBinding && <form onSubmit={(event) => { event.preventDefault(); if (selectedWorkspace) onBindWorkspace(selectedWorkspace); }} className="host-workspace-bind">
-      <label htmlFor={`bind-workspace-${host.id}`}>恢复前选择一个工作区</label>
+      <label htmlFor={`bind-workspace-${host.id}`}>恢复前关联已有云端文件</label>
       <select id={`bind-workspace-${host.id}`} value={workspaceID} onChange={(event) => setWorkspaceID(event.target.value)} disabled={bindWorkspacesLoading || bindPending}>
-        <option value="">选择已就绪的工作区</option>
+        <option value="">选择已保存的文件</option>
         {bindableWorkspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · v{workspace.revision}</option>)}
       </select>
-      <button type="submit" className="button button-secondary" disabled={!selectedWorkspace || bindPending}>{bindPending ? '绑定中…' : '绑定所选工作区'}</button>
-      {bindWorkspacesLoading && <span className="muted" role="status">正在读取可用工作区…</span>}
-      {bindWorkspacesError && <span className="panel-error" role="alert">无法读取工作区：{bindWorkspacesError}</span>}
-      {!bindWorkspacesLoading && !bindWorkspacesError && !bindableWorkspaces.length && <span className="muted">没有可绑定的已就绪工作区。<Link to="/workspaces">创建工作区</Link></span>}
+      <button type="submit" className="button button-secondary" disabled={!selectedWorkspace || bindPending}>{bindPending ? '关联中…' : '关联所选文件'}</button>
+      {bindWorkspacesLoading && <span className="muted" role="status">正在读取可关联的文件…</span>}
+      {bindWorkspacesError && <span className="panel-error" role="alert">无法读取文件：{bindWorkspacesError}</span>}
+      {!bindWorkspacesLoading && !bindWorkspacesError && !bindableWorkspaces.length && <span className="muted">没有可关联的已保存文件。</span>}
     </form>}
     {canEnter && <HostMemberManager hostId={host.id} />}
     {canEnter && host.state === 'running' && <HostControlPanel host={host} canControl canReleaseAnyLease />}

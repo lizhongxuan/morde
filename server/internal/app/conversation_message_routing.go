@@ -23,6 +23,7 @@ type AcceptConversationMessageCommand struct {
 	ModelID                 string
 	HostID                  string
 	WorkspaceID             string
+	ChangeTaskTarget        bool
 	ApplicationID           string
 	MCPConnectorIDs         []string
 	ClientAttachmentIDs     []string
@@ -39,6 +40,7 @@ type ConversationRoutingInput struct {
 	ModelID                 string      `json:"model_id,omitempty"`
 	HostID                  string      `json:"host_id,omitempty"`
 	WorkspaceID             string      `json:"workspace_id,omitempty"`
+	ChangeTaskTarget        bool        `json:"change_task_target,omitempty"`
 	ApplicationID           string      `json:"application_id,omitempty"`
 	MCPConnectorIDs         []string    `json:"mcp_connector_ids,omitempty"`
 	ClientAttachmentIDs     []string    `json:"client_attachment_ids,omitempty"`
@@ -136,7 +138,8 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 	input := ConversationRoutingInput{
 		ProjectID: command.ProjectID, PreviousClientMessageID: command.PreviousClientMessageID,
 		ReferenceTaskID: command.ReferenceTaskID, ModelID: command.ModelID, HostID: command.HostID,
-		WorkspaceID: command.WorkspaceID, ApplicationID: command.ApplicationID, MCPConnectorIDs: connectors,
+		WorkspaceID: command.WorkspaceID, ChangeTaskTarget: command.ChangeTaskTarget,
+		ApplicationID: command.ApplicationID, MCPConnectorIDs: connectors,
 		ClientAttachmentIDs: append([]string(nil), command.ClientAttachmentIDs...), Budget: budget,
 	}
 	return ConversationMessageReceipt{

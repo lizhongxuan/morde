@@ -648,7 +648,7 @@ paths:
       tags: [Hosts]
       operationId: createHost
       summary: Create a host
-      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host must bind exactly one owned, ready Workspace using workspace_ids; the same ownership and availability checks apply to Portal Sessions, API keys, and internal creation paths. Reuse the Idempotency-Key only to retry the exact normalized request.
+      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host binds exactly one owned, ready Workspace. Portal Sessions may omit workspace_ids to let the server select an available Workspace; API keys and Client credentials must provide one authorized Workspace ID. Reuse the Idempotency-Key only to retry the exact normalized request.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -664,6 +664,7 @@ paths:
               schema: { $ref: '#/components/schemas/Host' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/RequestTooLarge' }
@@ -701,6 +702,40 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/hosts/{id}/copies:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    post:
+      tags: [Hosts]
+      operationId: copyHost
+      summary: Create an independent Host from a stopped Host
+      description: Portal owner sessions only. The source must be safely stopped and have exactly one healthy Workspace binding at the requested confirmed revision, with no unresolved conflicts or in-flight writers. Morde copies that Workspace revision and atomically creates a new Host bound to the copy. The new Host receives fresh runtime identity and credentials; source runtime/profile/apps, tasks, credentials, and sync device/folder associations are not copied. Ambiguous metadata or copy outcomes fail closed and preserve the reservation for idempotent recovery.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HostCopyRequest' }
+      responses:
+        '201':
+          description: New Host and its independent copied Workspace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostCopyResult' }
+        '200':
+          description: Completed Host copy returned for an idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostCopyResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
         default: { $ref: '#/components/responses/Error' }
   /api/hosts/{id}/usage:
     parameters:
@@ -1636,7 +1671,10 @@ paths:
       description: Portal Session only. Only the current owner can request transfer to an approved account. The request freezes Workspace changes until it is accepted or cancelled. The current Workspace ID, revision history, current tree, and volume are retained; no file bytes are sent. Transfers are refused while a Host binding, Task write, synchronization operation, publish, project or Site reference, registered device, or unsupported legacy volume exists.
       security: [{ portalSession: [] }]
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
       requestBody:
         required: true
         content:
@@ -2024,9 +2062,14 @@ paths:
       tags: [Workspaces]
       operationId: listDeviceWorkspaceSyncProgress
       summary: Read active desktop synchronization progress
-      description: Portal sessions only. Returns the current Workspace revision, committed logical bytes, configured quota, remaining committed capacity, quota admission state, and only the latest active session for each currently authorized device. Quota state is available below the limit, full at the limit, and over_quota above it; shrinking and deletion remain allowed when full or over quota. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted. Usage is based on committed explicit sync revisions and is not yet a ledger for direct Syncthing writes.
+      description: Portal sessions only. Returns the current Workspace revision, committed logical bytes, configured quota, remaining committed capacity, quota admission state, and only the latest active session for each currently authorized device. Optional folder_id selects a registered folder. Project folders do not enter Syncthing desired state, so this endpoint has no project peer progress; use the project's sync session for manual upload status. Quota state is available below the limit, full at the limit, and over_quota above it; shrinking and deletion remain allowed when full or over quota. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted. Usage is based on committed explicit sync revisions and is not yet a ledger for direct Syncthing writes.
       security:
         - portalSession: []
+      parameters:
+        - name: folder_id
+          in: query
+          required: false
+          schema: { type: string, pattern: '^morde-[a-f0-9]{32}$' }
       responses:
         '200':
           description: Active progress summaries for authorized devices
@@ -2044,7 +2087,7 @@ paths:
       tags: [Workspaces]
       operationId: createWorkspaceSyncDeviceChallenge
       summary: Start a Syncthing device registration proof
-      description: Desktop client credential only. The certificate is public DER encoded as base64; the service derives and verifies its Syncthing Device ID, then returns a five-minute signing payload bound to this Workspace and installation. Sign the decoded signing_payload bytes with the certificate private key. At most eight challenges may be outstanding per installation. This endpoint does not enable synchronization; the folder remains pending until a server node is provisioned.
+      description: Desktop client credential only. The certificate is public DER encoded as base64; the service derives and verifies its Syncthing Device ID, then returns a five-minute signing payload bound to this Workspace, installation, and optional registered project folder and relative path. Omitting folder_id preserves the legacy Workspace-root proof. Sign the decoded signing_payload bytes with the certificate private key. At most eight challenges may be outstanding per installation. Project uploads use the installation-bound sync credential and folder_id directly; this Syncthing proof does not configure or enable project folder synchronization.
       security:
         - clientCredential: []
       requestBody:
@@ -2094,7 +2137,7 @@ paths:
       tags: [Workspaces]
       operationId: registerWorkspaceSyncDevice
       summary: Register a proven Syncthing device for a Workspace
-      description: Desktop client credential only. The proof is single-use, bound to the current installation, and idempotent by key. Success returns the authorized server node ID and pinned private relay URI after the node config is applied.
+      description: Desktop client credential only. The proof is single-use, bound to the current installation and optional folder_id, and idempotent by key. Omitting folder_id preserves the legacy Workspace-root registration. Project-folder Syncthing registration returns workspace_unavailable before consuming the challenge or changing device/node state; manual project uploads do not use this endpoint. Root registration returns the authorized server node ID and pinned private relay URI after the node config is applied.
       security:
         - clientCredential: []
       parameters:
@@ -2144,7 +2187,7 @@ paths:
       tags: [Workspaces]
       operationId: createWorkspaceSyncSession
       summary: Plan an upload, missing-only download, merge, or live synchronization batch
-      description: The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
+      description: The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion. Requests with folder_id are explicit PC-to-cloud project uploads; only the owning Portal Session or an installation-bound Sync credential (chd_) is authorized. Platform API keys and restricted Client credentials are rejected for project uploads. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
       security:
         - portalSession: []
         - bearerToken: []
@@ -2406,6 +2449,56 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/WorkspaceBinding' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/hosts/{id}/sync-folders:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    get:
+      tags: [Hosts]
+      operationId: listHostWorkspaceSyncFolders
+      summary: List sync folders registered for a cloud computer
+      description: Portal Session only. Returns folder identities and server-owned relative paths for the Host's active Workspace binding. Project folders remain outside Syncthing desired state and report sync_available=false; they are available as targets for explicit PC-to-cloud sync sessions using folder_id. A registered project folder and the legacy Workspace-root folder are mutually exclusive during this compatibility phase.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Registered sync folders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkspaceSyncFolder' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Hosts]
+      operationId: registerHostWorkspaceSyncFolder
+      summary: Register a project folder for a cloud computer
+      description: Portal Session only. The server derives Workspace ownership and the relative path project/{project_name}; callers cannot set a server path. Names are normalized to Unicode NFC and must be one portable path segment. Idempotency-Key protects retries. A Workspace with an existing legacy root mapping cannot register a project folder. Registration stores metadata only; manual project uploads use the existing chunk/session API and do not create a Syncthing project binding.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkspaceSyncFolderRequest' }
+      responses:
+        '201':
+          description: Registered project folder metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceSyncFolder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
@@ -2953,23 +3046,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/MainConversation' }
         default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Tasks]
-      operationId: ensureMainConversation
-      summary: Idempotently initialize the current user's main conversation
-      description: Creates and binds a conversation only when no usable personal history candidate exists; ambiguous legacy history returns selection_required without modifying or merging it.
-      security: [{ portalSession: [] }, { clientCredential: [] }]
-      parameters:
-        - { $ref: '#/components/parameters/IdempotencyKey' }
-      responses:
-        '200':
-          description: Main conversation selection state
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/MainConversation' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
     put:
       tags: [Tasks]
       operationId: setMainConversation
@@ -2990,6 +3066,24 @@ paths:
               schema: { $ref: '#/components/schemas/MainConversation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/main-conversation/ensure:
+    post:
+      tags: [Tasks]
+      operationId: ensureMainConversation
+      summary: Idempotently initialize the current user's main conversation
+      description: Creates and binds a conversation only when no usable personal history candidate exists; ambiguous legacy history returns selection_required without modifying or merging it.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200':
+          description: Main conversation selection state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MainConversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/projects:
@@ -3477,7 +3571,7 @@ paths:
         - { $ref: '#/components/parameters/PageCursor' }
       responses:
         '200':
-          description: Active task page and task event cursors
+          description: Task page for the selected active or recent view, with task event cursors and a pending count.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ConversationActiveTaskPage' }
@@ -3518,7 +3612,7 @@ paths:
       tags: [Projects]
       operationId: acceptProjectConversationMessage
       summary: Accept a message in a shared project conversation
-      description: Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. The Idempotency-Key must equal client_message_id.
+      description: Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. Set change_task_target=true only when an instruction explicitly changes the target of a referenced Task; otherwise host_id, workspace_id, and application_id are selection hints for new work and do not retarget that Task. The Idempotency-Key must equal client_message_id.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -4501,6 +4595,11 @@ paths:
       summary: List the current user's cloud task conversations
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive literal search over conversation titles across the caller's authorized conversation set.
+          schema: { type: string, maxLength: 120 }
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
       responses:
@@ -4565,10 +4664,15 @@ paths:
         schema: { $ref: '#/components/schemas/ConversationId' }
     get:
       tags: [Tasks]
-      operationId: listConversationActiveTasks
-      summary: List visible active tasks in this conversation
+      operationId: listConversationTasks
+      summary: List active or recently finished tasks in this conversation
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - name: view
+          in: query
+          required: false
+          description: Task status view. Defaults to active.
+          schema: { type: string, enum: [active, recent], default: active }
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
       responses:
@@ -4612,7 +4716,7 @@ paths:
       tags: [Tasks]
       operationId: acceptConversationMessage
       summary: Accept a message in a personal conversation
-      description: Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The Idempotency-Key must equal client_message_id.
+      description: Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. Set change_task_target=true only when an instruction explicitly changes the target of a referenced Task; otherwise host_id, workspace_id, and application_id are selection hints for new work and do not retarget that Task. The Idempotency-Key must equal client_message_id.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -4996,6 +5100,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TaskFileFetchCommitReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/file-fetches/{fetch_id}/abort:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: fetch_id, in: path, required: true, schema: { $ref: '#/components/schemas/OperationId' } }
+    post:
+      tags: [Tasks]
+      operationId: abortTaskFileFetch
+      summary: Revoke a PC file fetch after local authorization changes
+      description: PC file-fetch ticket only. Serializes with commit; unfinished transfers fail closed and discard all staging bytes, while a committed copy remains retained under the existing owner policy. Repeated aborts are safe.
+      security: [{ fileFetchTicket: [] }]
+      responses:
+        '204': { description: Staging cleared or the fetch was already terminal }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
@@ -9055,6 +9174,33 @@ components:
         source_revision: { type: integer, format: int64, minimum: 0 }
         state: { type: string, enum: [completed] }
         replayed: { type: boolean }
+    HostCopyRequest:
+      type: object
+      additionalProperties: false
+      required: [name, expected_current_revision]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+    HostCopyResult:
+      type: object
+      additionalProperties: false
+      required: [source_host_id, source_workspace_id, host, workspace, source_revision, state, replayed]
+      properties:
+        source_host_id: { $ref: '#/components/schemas/HostId' }
+        source_workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        host: { $ref: '#/components/schemas/Host' }
+        workspace:
+          type: object
+          additionalProperties: false
+          required: [id, name, revision, state]
+          properties:
+            id: { $ref: '#/components/schemas/WorkspaceId' }
+            name: { type: string }
+            revision: { type: integer, format: int64, minimum: 1 }
+            state: { type: string, enum: [ready] }
+        source_revision: { type: integer, format: int64, minimum: 0 }
+        state: { type: string, enum: [completed] }
+        replayed: { type: boolean }
     WorkspaceFileOperationRequest:
       type: object
       additionalProperties: false
@@ -9104,6 +9250,7 @@ components:
       type: object
       required: [direction, policy, base_revision, files]
       properties:
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$', description: Optional registered project folder for an explicit PC-to-cloud upload. When present the client sends paths relative to its selected local folder, with base_revision 0, no scope or delete lists; the server derives the cloud project path and delete set from the saved successful upload baseline. This does not register or enable a Syncthing project folder. }
         direction: { type: string, enum: [upload, download, bidirectional] }
         policy: { type: string, enum: [fill_missing, compare_merge, live] }
         base_revision: { type: integer, format: int64, minimum: 0, description: For Host replica downloads and bidirectional sync, this must not exceed the Host binding's applied_revision. }
@@ -9243,15 +9390,19 @@ components:
       type: object
       required: [device_id, certificate_der]
       properties:
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$', description: Omit for the legacy Workspace-root folder; project proofs bind this registered folder ID and its server-owned relative path. }
         device_id: { type: string, minLength: 63, maxLength: 63 }
         certificate_der: { type: string, format: byte, description: Base64-encoded public X.509 certificate DER; private keys are never accepted. }
       additionalProperties: false
     WorkspaceSyncDeviceChallenge:
       type: object
-      required: [id, device_id, nonce, signing_payload, expires_at]
+      required: [id, device_id, folder_kind, relative_path, nonce, signing_payload, expires_at]
       properties:
         id: { type: string, pattern: '^n[a-z0-9]{7}$' }
         device_id: { type: string, minLength: 63, maxLength: 63 }
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$', description: Omitted for the legacy Workspace-root proof. }
+        folder_kind: { type: string, enum: [workspace_root, project] }
+        relative_path: { type: string, description: Server-owned sync target relative to the cloud computer's workspace root; '.' for the legacy root. }
         nonce: { type: string, format: byte }
         signing_payload: { type: string, format: byte, description: Base64-encoded bytes that the device private key must sign. }
         expires_at: { type: string, format: date-time }
@@ -9260,23 +9411,47 @@ components:
       type: object
       required: [challenge_id, signature]
       properties:
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$', description: Must match the folder ID returned by the signed challenge; omit for a legacy root registration. }
         challenge_id: { type: string, pattern: '^n[a-z0-9]{7}$' }
         signature: { type: string, format: byte, description: Base64-encoded signature over the decoded signing_payload bytes. }
       additionalProperties: false
     WorkspaceSyncDeviceBinding:
       type: object
-      required: [id, workspace_id, client_installation_id, device_id, folder_id, state, created_at]
+      required: [id, workspace_id, client_installation_id, device_id, folder_id, folder_kind, relative_path, sync_available, state, created_at]
       properties:
         id: { type: string, pattern: '^d[a-z0-9]{7}$' }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
         client_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
         device_id: { type: string, minLength: 63, maxLength: 63 }
         folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$' }
+        folder_kind: { type: string, enum: [workspace_root, project] }
+        relative_path: { type: string, description: Server-owned target relative to the cloud computer's workspace root. }
+        sync_available: { type: boolean, description: False for project folders until their node path and receive pipeline are supported. }
         server_device_id: { type: string, minLength: 63, maxLength: 63, description: Returned only by registration; certificate identity of the server Syncthing node. }
         relay_address: { type: string, format: uri, description: Returned only by registration; static Morde relay URI pinned to the relay certificate ID. }
         state: { type: string, enum: [pending_node, active, revoking, revoked] }
         created_at: { type: string, format: date-time }
         revoked_at: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+    CreateWorkspaceSyncFolderRequest:
+      type: object
+      required: [project_name]
+      properties:
+        project_name: { type: string, minLength: 1, maxLength: 120, description: One portable directory segment; the server normalizes it to Unicode NFC. }
+      additionalProperties: false
+    WorkspaceSyncFolder:
+      type: object
+      required: [folder_id, workspace_id, folder_kind, relative_path, state, sync_available, created_at, updated_at]
+      properties:
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        folder_kind: { type: string, enum: [workspace_root, project] }
+        project_name: { type: string }
+        relative_path: { type: string, description: Server-owned path relative to the cloud computer's workspace root. }
+        state: { type: string, enum: [pending_node, active, revoked] }
+        sync_available: { type: boolean, description: Whether this folder is configured for the managed Syncthing node. Project folders remain false; manual folder-scoped uploads use CreateSyncSession with folder_id. }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
       additionalProperties: false
     SyncSession:
       type: object
@@ -9284,6 +9459,7 @@ components:
       properties:
         id: { type: string, pattern: '^p[a-z0-9]{7}$' }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$', description: Present for a manual project upload; the server-owned scope is the registered project folder. }
         direction: { type: string, enum: [upload, download, bidirectional] }
         policy: { type: string, enum: [fill_missing, compare_merge, live] }
         state: { type: string, enum: [planned, transferring, verifying, applying, completed, conflict, cancelled, failed, expired] }
@@ -10040,11 +10216,11 @@ components:
         password: { type: string, minLength: 1, writeOnly: true }
     CreateHostRequest:
       type: object
-      required: [workspace_ids]
       properties:
         name: { type: string }
         workspace_ids:
           type: array
+          description: Required for API keys and Client credentials. Portal Sessions may omit it for server-side Workspace selection.
           minItems: 1
           maxItems: 1
           uniqueItems: true
@@ -10678,6 +10854,7 @@ components:
         reference_task_id: { $ref: '#/components/schemas/TaskId' }
         host_id: { $ref: '#/components/schemas/HostId' }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        change_task_target: { type: boolean, description: Explicitly apply the supplied host_id, workspace_id, and application_id as changes to the referenced Task target. Omission means false, so changing the composer selection does not retarget existing work. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, maxLength: 256, description: Optional routing hint; a server default may be selected asynchronously. }
         content: { type: string, maxLength: 32768 }
@@ -10774,6 +10951,7 @@ components:
         reference_task_id: { $ref: '#/components/schemas/TaskId' }
         host_id: { $ref: '#/components/schemas/HostId' }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        change_task_target: { type: boolean, description: Explicitly apply the supplied host_id, workspace_id, and application_id as changes to the referenced Task target. Omission means false, so changing the composer selection does not retarget existing work. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
         mcp_connector_ids: { type: array, maxItems: 16, uniqueItems: true, items: { $ref: '#/components/schemas/MCPConnectorId' } }
@@ -10856,6 +11034,7 @@ components:
         source_task_id: { $ref: '#/components/schemas/TaskId' }
         source_task_revision: { type: integer, format: int64, minimum: 0 }
         source_event_sequence: { type: integer, format: int64, minimum: 1 }
+        trigger_message_id: { oneOf: [{ $ref: '#/components/schemas/MessageId' }, { type: 'null' }] }
         reply_message_id: { oneOf: [{ $ref: '#/components/schemas/MessageId' }, { type: 'null' }] }
     TaskSummary:
       type: object
@@ -11129,10 +11308,11 @@ components:
             event_sequence: { type: integer, format: int64, minimum: 0 }
     ConversationActiveTaskPage:
       type: object
-      required: [items, next_cursor]
+      required: [items, next_cursor, pending_count]
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/ConversationActiveTask' } }
         next_cursor: { type: [string, 'null'] }
+        pending_count: { type: integer, format: int64, minimum: 0, description: Number of visible tasks in this conversation awaiting the current user. }
     SubmitTaskRequest:
       type: object
       description: Text-only Task input. No image, video or audio attachment field is accepted. If task_media_generation is advertised, the server may generate image, video or speech outputs through verified media-capable connections; uploaded media and cloud speech recognition remain unavailable.

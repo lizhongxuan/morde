@@ -64,7 +64,7 @@ async function signedInPage(
   await page.getByLabel("用户名").fill(user.name);
   await page.getByLabel("密码").fill("local-only");
   await page.getByRole("button", { name: "登录" }).click();
-  await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
   await page.getByRole("link", { name: "云端电脑", exact: true }).click();
   await expect(page.getByRole("heading", { name: "云端电脑", exact: true })).toBeVisible();
   return { context, page };
@@ -79,25 +79,14 @@ async function closeAlert(page: Page, text: string) {
 test.describe("Portal visible error mock flows", () => {
   test.skip(process.env.CH_REAL_E2E === "1", "mock scenario is disabled for a real-host run");
 
-  test("[mock] shows quota, capacity, and workspace busy errors when creating a host", async ({ browser }) => {
-    const createBodies: Array<{ workspace_ids: string[] }> = [];
-    let createdWorkspace = 0;
+  test("[mock] shows quota, capacity, and workspace busy errors when creating a computer", async ({ browser }) => {
+    const createBodies: Record<string, unknown>[] = [];
     const failures = [
       apiError("quota_exceeded", "主机数已达上限 3", 409),
       apiError("capacity_exceeded", "集群容量已满", 409),
       apiError("workspace_busy", "工作目录已挂载", 409),
     ];
     const { context, page } = await signedInPage(browser, async (context) => {
-      await context.route("**/api/templates", (route) => route.fulfill(json({ items: [template] })));
-      await context.route("**/api/workspaces", (route) => {
-        if (route.request().method() === "GET") return route.fulfill(json({ items: [detachedWorkspace] }));
-        createdWorkspace += 1;
-        return route.fulfill(json({
-          ...detachedWorkspace,
-          id: `wcreated${createdWorkspace}`,
-          name: route.request().postDataJSON().name,
-        }, 201));
-      });
       await context.route("**/api/hosts", async (route) => {
         if (route.request().method() === "GET") return route.fulfill(json({ items: [] }));
         createBodies.push(route.request().postDataJSON());
@@ -106,22 +95,15 @@ test.describe("Portal visible error mock flows", () => {
     });
     try {
       await page.getByRole("link", { name: "创建电脑" }).click();
-      await page.getByRole("button", { name: "创建主机" }).click();
+      await page.getByRole("button", { name: "创建云端电脑" }).click();
       await closeAlert(page, "额度不足或尚未配置，请检查相关额度");
 
-      await page.getByRole("button", { name: "创建主机" }).click();
+      await page.getByRole("button", { name: "创建云端电脑" }).click();
       await closeAlert(page, "当前资源容量不足");
 
-      await page.getByRole("radio", { name: "绑定已有工作区" }).check();
-      await page.getByRole("radio", { name: /本地工作目录/ }).check();
-      await page.getByRole("button", { name: "创建主机" }).click();
+      await page.getByRole("button", { name: "创建云端电脑" }).click();
       await closeAlert(page, "工作目录正在被其他主机使用");
-      expect(createBodies.map((body) => body.workspace_ids)).toEqual([
-        ["wcreated1"],
-        // Retries after a known Host rejection keep the already-created Workspace.
-        ["wcreated1"],
-        [detachedWorkspace.id],
-      ]);
+      expect(createBodies).toEqual([{}, {}, {}]);
     } finally {
       await context.close();
     }
@@ -152,7 +134,9 @@ test.describe("Portal visible error mock flows", () => {
       });
     });
     try {
-      await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
+      await context.unroute("**/api/me");
+      await context.route("**/api/me", (route) => route.fulfill(json(user)));
+      await page.goto(`${portalUrl}/workspaces`);
       const workspace = page.getByRole("row").filter({ hasText: detachedWorkspace.id });
       await workspace.getByRole("button", { name: `删除工作区 ${detachedWorkspace.name}` }).click();
       await page.getByRole("dialog", { name: "删除工作区" }).getByRole("button", { name: "删除工作区" }).click();

@@ -30,18 +30,18 @@ type WorkspaceSyncReceiveRequest struct {
 }
 
 type WorkspaceSyncReceiveReservation struct {
-	ID, OwnerID, WorkspaceID, OperationID string
-	Path                                  string
-	Operation                             WorkspaceSyncReceiveOperation
-	TargetBytes, BaseRevision             int64
-	BaseFileSize                          *int64
-	BaseFileSHA256                        *string
-	BaseDirectoryPath                     *string
-	State                                 string
-	ResultRevision                        *int64
-	ResultSHA256                          *string
-	ResultMode                            *uint32
-	RequestHash                           []byte
+	ID, OwnerID, WorkspaceID, FolderID, OperationID string
+	Path                                            string
+	Operation                                       WorkspaceSyncReceiveOperation
+	TargetBytes, BaseRevision                       int64
+	BaseFileSize                                    *int64
+	BaseFileSHA256                                  *string
+	BaseDirectoryPath                               *string
+	State                                           string
+	ResultRevision                                  *int64
+	ResultSHA256                                    *string
+	ResultMode                                      *uint32
+	RequestHash                                     []byte
 }
 
 type WorkspaceSyncReceiveReceipt struct {

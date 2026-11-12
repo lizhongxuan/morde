@@ -28,6 +28,9 @@ WHERE id = $1 AND state = 'creating' AND create_attempted_at IS NULL
     SELECT 1 FROM workspace_bindings wb
     JOIN workspace_copy_reservations c ON c.source_workspace_id=wb.workspace_id
     WHERE wb.host_id=hosts.id AND wb.state <> 'detached' AND c.state IN ('reserved','copying','unknown')
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workspace_copy_reservations c WHERE c.source_host_id=hosts.id AND c.host_copy_pending
   )`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark host create attempt: %w", err)
@@ -40,6 +43,8 @@ WHERE id = $1 AND state = 'creating' AND create_attempted_at IS NULL
 SELECT 1 FROM workspace_bindings wb
 JOIN workspace_copy_reservations c ON c.source_workspace_id=wb.workspace_id
 WHERE wb.host_id=$1 AND wb.state <> 'detached' AND c.state IN ('reserved','copying','unknown')
+) OR EXISTS (
+SELECT 1 FROM workspace_copy_reservations c WHERE c.source_host_id=$1 AND c.host_copy_pending
 )`, hostID).Scan(&copyFrozen); err != nil {
 		return fmt.Errorf("check Workspace copy before Host create attempt: %w", err)
 	}
@@ -477,6 +482,15 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 		}
 		if err := lockHost(ctx, tx, params.HostID); err != nil {
 			return err
+		}
+		var hostCopyPending bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_copy_reservations WHERE source_host_id=$1 AND host_copy_pending
+)`, params.HostID).Scan(&hostCopyPending); err != nil {
+			return fmt.Errorf("check pending Host copy before restore: %w", err)
+		}
+		if hostCopyPending {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Host copy must finish before restoring the source Host")
 		}
 		queries := sqlcgen.New(tx)
 		row, err := queries.GetHost(ctx, params.HostID)

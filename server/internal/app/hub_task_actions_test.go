@@ -16,7 +16,7 @@ func TestHubTaskCallBindsTaskAuthorizationAndOperationToTarget(t *testing.T) {
 	_ = target.next(t, "devices")
 	taskContext := &hub.TaskContext{
 		TaskID: "q1234567", AuthorizationVersion: 3, TargetGrantVersion: 5,
-		OperationID: "o1234567", TaskRevision: 7,
+		OperationID: "o1234567", TaskRevision: 0,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -42,7 +42,7 @@ func TestHubTaskCallBindsTaskAuthorizationAndOperationToTarget(t *testing.T) {
 		t.Fatalf("task Hub call context = %#v", call)
 	}
 	receipt, err := json.Marshal(hub.FileFetchReceipt{
-		FetchID: "o1234567", TaskRevision: 7, Status: "completed", TargetGrantVersion: 5,
+		FetchID: "o1234567", TaskRevision: 0, Status: "completed", TargetGrantVersion: 5,
 		SourceVersion: strings.Repeat("a", 64), SourceSHA256: strings.Repeat("b", 64), SizeBytes: 10,
 		ContentID: "o1234568", ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
 	})

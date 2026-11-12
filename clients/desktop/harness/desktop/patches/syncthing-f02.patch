@@ -36,8 +36,8 @@ index a08a7ea48..1928398f0 100644
  	SendXattrs              bool                        `json:"sendXattrs" xml:"sendXattrs"`
  	BlockIndexing           bool                        `json:"blockIndexing" xml:"blockIndexing" default:"true"`
 +	MordeMaxSingleFileBytes int64                       `json:"mordeMaxSingleFileBytes" xml:"mordeMaxSingleFileBytes"`
-+	MordeQuotaSocket        string                      `json:"mordeQuotaSocket" xml:"mordeQuotaSocket,omitempty" restart:"true"`
-+	MordeWorkspaceID        string                      `json:"mordeWorkspaceId" xml:"mordeWorkspaceId,omitempty" restart:"true"`
++	MordeQuotaSocket        string                      `json:"mordeQuotaSocket" xml:"mordeQuotaSocket,omitempty"`
++	MordeWorkspaceID        string                      `json:"mordeWorkspaceId" xml:"mordeWorkspaceId,omitempty"`
  	XattrFilter             XattrFilter                 `json:"xattrFilter" xml:"xattrFilter"`
  	// Legacy deprecated
  	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.

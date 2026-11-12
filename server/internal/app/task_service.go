@@ -455,8 +455,16 @@ func retainTaskK2Projections(page *TaskPage) {
 
 // ListConversationActiveTasks returns only tasks visible to this caller in the selected conversation.
 func (s *TaskService) ListConversationActiveTasks(ctx context.Context, principal identity.Principal, projectID, conversationID string, page PageRequest) (TaskPage, error) {
+	return s.ListConversationTasks(ctx, principal, projectID, conversationID, ConversationTaskViewActive, page)
+}
+
+// ListConversationTasks returns one status view and a count of visible tasks awaiting the caller.
+func (s *TaskService) ListConversationTasks(ctx context.Context, principal identity.Principal, projectID, conversationID string, view ConversationTaskView, page PageRequest) (TaskPage, error) {
 	if err := validateTaskPrincipal(principal); err != nil {
 		return TaskPage{}, err
+	}
+	if view != ConversationTaskViewActive && view != ConversationTaskViewRecent {
+		return TaskPage{}, domain.InvalidArgument("view", "conversation task view is invalid")
 	}
 	if !domain.ValidConversationID(conversationID) {
 		return TaskPage{}, domain.NewError(domain.CodeNotFound, "conversation not found")
@@ -484,12 +492,32 @@ func (s *TaskService) ListConversationActiveTasks(ctx context.Context, principal
 	if err != nil {
 		return TaskPage{}, err
 	}
-	result, err := s.store.ListConversationActiveTasks(ctx, principal.UserID, projectID, conversationID, hostIDs, page)
+	result, err := s.store.ListConversationTasks(ctx, principal.UserID, projectID, conversationID, hostIDs, view, page)
 	if err != nil {
 		return TaskPage{}, err
 	}
+	for hostID, count := range result.PendingCountsByHostID {
+		if hostID == "" {
+			result.PendingCount += count
+			continue
+		}
+		if _, err := authorizeTaskHost(ctx, s.authorizer, principal, hostID, taskReadScope); err != nil {
+			switch domain.CodeOf(err) {
+			case domain.CodeNotFound, domain.CodeForbidden:
+				continue
+			default:
+				return TaskPage{}, err
+			}
+		}
+		result.PendingCount += count
+	}
+	result.PendingCountsByHostID = nil
 	visible := make([]task.Task, 0, len(result.Items))
 	for _, item := range result.Items {
+		if item.HostID == "" {
+			visible = append(visible, item)
+			continue
+		}
 		if _, err := s.authorizeTask(ctx, principal, item.HostID, taskReadScope); err != nil {
 			switch domain.CodeOf(err) {
 			case domain.CodeNotFound, domain.CodeForbidden:

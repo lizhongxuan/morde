@@ -12,9 +12,13 @@ import FileManager from '../components/FileManager';
 import TopBar from '../components/TopBar';
 import TaskObservation from '../components/TaskObservation';
 import WorkspaceBrowser from '../components/WorkspaceBrowser';
+import { returnToPreviousPage } from './navigation';
 
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
 type MobileMenu = 'browser' | 'terminal' | 'files' | null;
+type EmbedContext = { origin: string; nonce: string };
+const embedChannel = 'morde.workbench.embed';
+const embedProtocolVersion = 1;
 const primaryTabs: { id: Tab; label: string }[] = [
   { id: 'browser', label: '桌面' },
   { id: 'terminal', label: '终端' },
@@ -22,6 +26,25 @@ const primaryTabs: { id: Tab; label: string }[] = [
   { id: 'files', label: '主机文件' },
   { id: 'vscode', label: 'VS Code' },
 ];
+
+function parseEmbedContext(search: string, referrer: string): EmbedContext | null {
+  const query = new URLSearchParams(search);
+  const nonce = query.get('embed_nonce') ?? '';
+  if (query.get('embed') !== '1' || !/^[\w-]{24,128}$/.test(nonce)) return null;
+  try {
+    const origin = new URL(referrer).origin;
+    if (!origin || (new URL(origin).protocol !== 'https:' && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))) return null;
+    return { origin, nonce };
+  } catch {
+    return null;
+  }
+}
+
+function embedMessageMatches(value: unknown, context: EmbedContext): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object') return false;
+  const message = value as Record<string, unknown>;
+  return message.channel === embedChannel && message.version === embedProtocolVersion && message.nonce === context.nonce;
+}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试';
@@ -41,11 +64,14 @@ function controlActionCompleted(control: GatewayControl, action: GatewayControlA
 
 export default function Workbench() {
   const query = new URLSearchParams(window.location.search);
+  const [embedContext] = useState(() => parseEmbedContext(window.location.search, document.referrer));
+  const embedded = embedContext !== null;
   const taskObservationOnly = query.has('task_id');
   const taskObservationID = query.get('task_id') ?? '';
   const workspaceOnly = query.get('tab') === 'workspace';
   const hostSessionOnly = workspaceOnly || taskObservationOnly;
   const [host, setHost] = useState<GatewayHost | null>(null);
+  const hostID = host?.id ?? null;
   const [control, setControl] = useState<GatewayControl | null>(null);
   const [controlLoading, setControlLoading] = useState(!hostSessionOnly);
   const [controlError, setControlError] = useState('');
@@ -53,6 +79,9 @@ export default function Workbench() {
   const [controlActionPending, setControlActionPending] = useState(false);
   const [controlRequest, setControlRequest] = useState<GatewayControlRequest | null>(null);
   const [pageError, setPageError] = useState('');
+  const [pageRetry, setPageRetry] = useState(0);
+  const [embedVisible, setEmbedVisible] = useState(!embedded);
+  const [embedConversationID, setEmbedConversationID] = useState<string | null>(null);
   const [active, setActive] = useState<Tab>(() => hostSessionOnly ? 'workspace' : 'browser');
   const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(hostSessionOnly ? ['workspace'] : ['browser']));
   const [browserStatus, setBrowserStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'failed'>('connecting');
@@ -73,6 +102,8 @@ export default function Workbench() {
   const browserConnectTimeoutRef = useRef<number | undefined>(undefined);
   const browserConnectedRef = useRef(false);
   const controlRequestRef = useRef<GatewayControlRequest | null>(null);
+  const embedInitializedRef = useRef(false);
+  const embedVisibleRef = useRef(!embedded);
   const leaseRenewalRef = useRef(false);
   const terminalRequestRef = useRef(false);
   const terminalReplacementRef = useRef(false);
@@ -95,6 +126,62 @@ export default function Workbench() {
     }
   }, []);
 
+  const reloadControl = useCallback(async () => {
+    setControlLoading(true);
+    try {
+      applyControl(await gatewayApi.control());
+    } catch (error) {
+      setControlError(messageOf(error));
+    } finally {
+      setControlLoading(false);
+    }
+  }, [applyControl]);
+
+  useEffect(() => {
+    if (!embedContext) return;
+    const send = (type: 'ready' | 'state', details: Record<string, unknown> = {}) => {
+      window.parent.postMessage({ channel: embedChannel, version: embedProtocolVersion, type, nonce: embedContext.nonce, ...details }, embedContext.origin);
+    };
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== window.parent || event.origin !== embedContext.origin || !embedMessageMatches(event.data, embedContext)) return;
+      const message = event.data;
+      if (message.type === 'init' && typeof message.visible === 'boolean' &&
+        typeof message.conversation_id === 'string' && /^[\w-]{8,128}$/.test(message.conversation_id)) {
+        embedInitializedRef.current = true;
+        setEmbedConversationID(message.conversation_id);
+        embedVisibleRef.current = message.visible;
+        setEmbedVisible(message.visible);
+        if (message.visible) void reloadControl();
+      } else if (message.type === 'visibility' && embedInitializedRef.current && typeof message.visible === 'boolean') {
+        const wasVisible = embedVisibleRef.current;
+        embedVisibleRef.current = message.visible;
+        setEmbedVisible(message.visible);
+        if (message.visible && !wasVisible) void reloadControl();
+      }
+    };
+    window.addEventListener('message', onMessage);
+    send('ready');
+    return () => window.removeEventListener('message', onMessage);
+  }, [embedContext, reloadControl]);
+
+  useEffect(() => {
+    if (!embedContext) return;
+    window.parent.postMessage({
+      channel: embedChannel,
+      version: embedProtocolVersion,
+      type: 'state',
+      nonce: embedContext.nonce,
+      conversation_id: embedConversationID,
+      host_id: hostID,
+      workbench_ready: !pageError && (hostSessionOnly || (hostID !== null && !controlLoading)),
+      remote_desktop: browserStatus,
+      control_state: control?.control_state ?? 'unknown',
+      control_lease_active: control?.control_lease_active ?? false,
+      control_lease_held_by_me: control?.control_lease_held_by_me ?? false,
+    }, embedContext.origin);
+  }, [browserStatus, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_state,
+    controlLoading, embedContext, embedConversationID, hostID, hostSessionOnly, pageError]);
+
   useEffect(() => {
     if (hostSessionOnly) return;
     let current = true;
@@ -108,7 +195,7 @@ export default function Workbench() {
     return () => {
       current = false;
     };
-  }, [applyControl, hostSessionOnly]);
+  }, [applyControl, hostSessionOnly, pageRetry]);
 
   useEffect(() => {
     if (hostSessionOnly) return;
@@ -328,6 +415,10 @@ export default function Workbench() {
       clearSuppressedTabClick();
       return;
     }
+    if (embedded && tab === 'files') {
+      setMobileMenu((current) => current === 'files' ? null : 'files');
+      return;
+    }
     setMobileMenu(null);
     selectTab(tab);
   }
@@ -511,17 +602,6 @@ export default function Workbench() {
     }
   }
 
-  async function reloadControl() {
-    setControlLoading(true);
-    try {
-      applyControl(await gatewayApi.control());
-    } catch (error) {
-      setControlError(messageOf(error));
-    } finally {
-      setControlLoading(false);
-    }
-  }
-
   const failedTransition = control?.active_transition?.failure_reason ? control.active_transition : null;
   const vscodeAvailable = !controlLoading && !controlError && leaseHeldByMe && !controlActionPending;
   const browserViewOnly = controlLoading || !!controlError || !leaseHeldByMe;
@@ -538,17 +618,21 @@ export default function Workbench() {
         : leaseHeldByMe ? '交回 AI' : '';
   const mobileControlStatus = controlError ? '控制不可用'
     : controlLoading && !control ? '正在连接'
-      : control?.control_state === 'ai' ? 'Codex 正在操作'
+      : control?.control_state === 'ai' ? 'AI 控制中'
         : leaseHeldByMe ? '你正在操作'
           : control?.control_state === 'user' ? '他人正在操作'
             : control?.control_state === 'taking_over' ? '正在接管'
               : control?.control_state === 'returning' ? '正在交还' : '控制状态未知';
   const visibleActive = active === 'vscode' && !vscodeAvailable ? 'browser' : active;
-  const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace') : primaryTabs;
+  const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace')
+    : embedded ? primaryTabs.filter((tab) => tab.id !== 'workspace') : primaryTabs;
   if (taskObservationOnly) return <TaskObservation key={taskObservationID} taskID={taskObservationID} />;
   return (
-    <main className={`workbench-app${workspaceOnly ? ' is-workspace-only' : ''}`}>
+    <main className={`workbench-app${workspaceOnly ? ' is-workspace-only' : ''}${embedded ? ' is-embedded' : ''}${embedded && !embedVisible ? ' is-embedded-hidden' : ''}`}
+      aria-hidden={embedded && !embedVisible ? true : undefined}
+      inert={embedded && !embedVisible}>
       {!workspaceOnly && <TopBar
+        embedded={embedded}
         host={host}
         renewing={renewing}
         onRenew={renew}
@@ -563,10 +647,17 @@ export default function Workbench() {
       />}
       {notice && <p className={`notice${noticeKind === 'error' ? ' notice-error' : ''}`} role={noticeKind === 'error' ? 'alert' : 'status'}>{notice}</p>}
       {pageError ? (
-        <section className="page-message" role="alert">
+        <section className="page-message page-error" role="alert">
+          <span className="page-error-mark" aria-hidden="true">!</span>
           <h1>工作台暂时无法加载</h1>
-          <p>{pageError}</p>
-          <button className="button" onClick={() => window.location.reload()}>重新加载</button>
+          <p>服务或工作电脑暂时无法连接。请返回上一页，或重试当前页面。</p>
+          <div className="page-error-actions">
+            <button className="button button-secondary" type="button" onClick={returnToPreviousPage}>返回上一页</button>
+            <button className="button" type="button" onClick={() => {
+              setPageError('');
+              setPageRetry((attempt) => attempt + 1);
+            }}>重试</button>
+          </div>
         </section>
       ) : (
         <>
@@ -582,7 +673,7 @@ export default function Workbench() {
                   type="button"
                   aria-current={visibleActive === tab.id || (tab.id === 'files' && visibleActive === 'workspace') ? 'page' : undefined}
                   disabled={tab.id === 'vscode' && !vscodeAvailable}
-                  title={tab.id === 'vscode' && !vscodeAvailable ? '请先接管电脑' : undefined}
+                  title={embedded ? tab.label : tab.id === 'vscode' && !vscodeAvailable ? '请先接管电脑' : undefined}
                   aria-label={tab.id === 'browser' ? '浏览器' : tab.id === 'files' ? '文件' : tab.label}
                   aria-description={tab.id === 'browser' ? '长按打开窗口操作' : tab.id === 'terminal' ? '长按打开终端操作' : tab.id === 'files' ? '长按打开更多功能' : undefined}
                   aria-haspopup={tab.id === 'browser' || tab.id === 'terminal' || tab.id === 'files' ? 'menu' : undefined}
@@ -607,6 +698,8 @@ export default function Workbench() {
                       <svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.5" /><path d="m7 9.5 3 2.5-3 2.5M12.5 15.5H17" /></svg>
                     ) : tab.id === 'files' ? (
                       <svg viewBox="0 0 24 24"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9v8.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5Z" /></svg>
+                    ) : tab.id === 'vscode' ? (
+                      <svg viewBox="0 0 24 24"><path d="M8.5 8.5 4.5 12l4 3.5M15.5 8.5l4 3.5-4 3.5M13.5 5.5l-3 13" /></svg>
                     ) : null}
                   </span>
                   <span className="tab-label-desktop">{tab.label}</span>
@@ -640,7 +733,7 @@ export default function Workbench() {
               </div>
             )}
             {mobileMenu && !workspaceOnly && (
-              <div className="mobile-context-menu" role="menu" aria-label={mobileMenu === 'browser' ? '窗口操作' : mobileMenu === 'terminal' ? '终端操作' : '更多功能'} onKeyDown={(event) => {
+              <div className="mobile-context-menu" role="menu" aria-label={mobileMenu === 'browser' ? '窗口操作' : mobileMenu === 'terminal' ? '终端操作' : embedded ? '文件视图' : '更多功能'} onKeyDown={(event) => {
                 if (event.key === 'Escape') setMobileMenu(null);
               }}>
                 {mobileMenu === 'browser' ? (
@@ -657,7 +750,7 @@ export default function Workbench() {
                   <>
                     <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('workspace'))}>Workspace</button>
                     <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('files'))}>主机文件</button>
-                    <button type="button" role="menuitem" disabled={!vscodeAvailable} onClick={() => runMobileMenuAction(() => selectTab('vscode'))}>VS Code</button>
+                    {!embedded && <button type="button" role="menuitem" disabled={!vscodeAvailable} onClick={() => runMobileMenuAction(() => selectTab('vscode'))}>VS Code</button>}
                   </>
                 )}
               </div>
@@ -687,7 +780,7 @@ export default function Workbench() {
                   key={browserReconnect}
                   ref={browserFrameRef}
                   title="远程桌面"
-                  src={`/vnc/index.html?autoconnect=true&reconnect=true&resize=scale&view_only=${browserViewOnly}`}
+                  src={`/vnc/index.html?autoconnect=true&reconnect=true&resize=scale&view_only=${browserViewOnly || (embedded && !embedVisible)}`}
                   onLoad={browserFrameLoaded}
                 />
                 {showWindowHelp && (

@@ -8,6 +8,12 @@ const liveSyncPending = new Set();
 const liveSyncStates = new Set(['idle', 'stopped', 'starting', 'running', 'watching', 'scanning', 'transferring', 'reconnecting', 'syncing', 'stopping', 'active', 'persisted_uncertain', 'conflict', 'failed', 'error', 'unknown', 'unavailable', 'disabled', 'closed', 'not_supported']);
 let syncOperation = null;
 let syncStatusPanel = null;
+let projectUploadProgress = null;
+let projectUploadBusy = false;
+let projectSelection = null;
+let selectedProjectTargetKey = '';
+let projectUploadResult = null;
+let projectUploadError = '';
 
 function message(value, error = false) {
   $('message').textContent = value;
@@ -92,10 +98,10 @@ function liveSyncBlockedReasons(workspace, mapping, value) {
   const closedMessage = typeof value?.message === 'string' && /未开放|不可用|\bclosed\b|\bdisabled\b|not[_ -]?supported/i.test(value.message);
   const capabilityClosed = !hasLiveSyncCapability() || !value || value.capability !== 'enabled' || ['unavailable', 'disabled', 'closed', 'not_supported'].includes(value.state) || closedMessage;
   if (capabilityClosed) reasons.push('此版本未开放旧版实时同步能力；相关操作失败关闭。');
-  if (workspace.state !== 'ready') reasons.push('Workspace 尚未就绪。');
-  if (!mapping) reasons.push('尚未选择本机 Workspace 目录。');
+  if (workspace.state !== 'ready') reasons.push('云端文件目录尚未就绪。');
+  if (!mapping) reasons.push('尚未选择本机文件夹。');
   const binding = state.workspaceSync?.bindings?.[workspace.id];
-  if (binding && binding.state !== 'revoked') reasons.push('此 Workspace 存在 Syncthing 绑定。');
+  if (binding && binding.state !== 'revoked') reasons.push('此电脑文件目录存在 Syncthing 绑定。');
   if (state.syncCheckpoint) reasons.push('存在待处理的单次同步恢复点。');
   if (state.syncRecovery?.state === 'unknown' || syncOperation?.status === 'unknown') reasons.push('当前同步恢复状态未确认。');
   if (syncOperation?.status === 'conflict' || state.syncRecovery?.state === 'conflict'
@@ -164,7 +170,7 @@ function renderLiveSync(workspace, mapping, parent) {
   if (conflicts.length) {
     const list = text('ul', '');
     for (const conflict of conflicts.slice(0, 8)) list.append(text('li', relativeConflictPath(conflict)));
-    section.append(text('strong', `发现冲突 ${conflicts.length} 项（仅显示 Workspace 相对路径）`), list);
+    section.append(text('strong', `发现冲突 ${conflicts.length} 项（仅显示文件相对路径）`), list);
     if (conflicts.length > 8) section.append(text('small', `另有 ${conflicts.length - 8} 项`));
   }
 
@@ -206,12 +212,12 @@ function renderLiveSync(workspace, mapping, parent) {
   }
 
   if (running) {
-    const stop = button('停止旧版实时同步', () => stopLiveSync(workspace.id));
+    const stop = button('停止兼容版实时同步', () => stopLiveSync(workspace.id));
     stop.disabled = !hasLiveSyncCapability() || liveSyncPending.has(workspace.id);
     section.append(stop);
   } else {
     const canStart = startable && blockedReasons.length === 0 && (!recoveryRequired || settings.confirmRecovery === true);
-    startButton = button(recoveryRequired ? '确认并恢复旧版实时同步' : '启动旧版实时同步', () => startLiveSync(workspace.id, workspace, mapping));
+    startButton = button(recoveryRequired ? '确认并恢复兼容版实时同步' : '启动兼容版实时同步', () => startLiveSync(workspace.id, workspace, mapping));
     const validInterval = Number.isInteger(settings.rescanSeconds) && settings.rescanSeconds >= 5 && settings.rescanSeconds <= 3600;
     startButton.disabled = !canStart || !validInterval;
     section.append(startButton);
@@ -247,7 +253,7 @@ async function startLiveSync(workspaceId, workspace, mapping) {
   }
   const scope = parseScope(settings.scope);
   if (scope.some((path) => !normalizedRelativePath(path))) {
-    message('同步范围只能使用 Workspace 内的相对路径。', true);
+    message('同步范围只能使用云端目录内的相对路径。', true);
     return;
   }
   if (!hasLiveSyncCapability()) { message('此版本未开放旧版实时同步能力；操作失败关闭。', true); return; }
@@ -287,7 +293,7 @@ function renderSyncStatus(panel) {
     panel.replaceChildren();
     return;
   }
-  const title = operation.status === 'running' ? '正在执行 Workspace 同步…'
+  const title = operation.status === 'running' ? '正在执行文件同步…'
     : operation.status === 'completed' ? operation.message
       : operation.status === 'conflict' ? '发现冲突，结果未完成'
         : operation.status === 'cancelled' ? '同步已停止，恢复点已保留'
@@ -359,7 +365,7 @@ function renderWorkspaceSync(workspace, mapping, parent, running, checkpoint) {
   scope.disabled = blocked;
   scope.oninput = () => { settings.scope = scope.value; clearQuiesced(); };
   scopeLabel.append(scope);
-  section.append(scopeLabel, text('p', '留空表示整个 Workspace；下载和双向同步只补齐缺失文件，不传播删除。', 'muted'));
+  section.append(scopeLabel, text('p', '留空表示整个云端文件目录；同步方向和删除规则按此兼容入口的原有模式执行。', 'muted'));
 
   const start = button('开始同步', () => runWorkspaceSync(workspaceId, settings.mode, parseScope(settings.scope), false));
   start.disabled = blocked;
@@ -388,11 +394,11 @@ function renderWorkspaceSync(workspace, mapping, parent, running, checkpoint) {
     if (handoff) handoff.disabled = running || recoveryPending() || nodeUnknown || bindingEnabled || !mapping || workspace.state !== 'ready' || !settings.quiesced;
     if (resumeHandoff) resumeHandoff.disabled = running || nodeUnknown || bindingEnabled || !settings.quiesced || !mapping;
   };
-  handoffLabel.append(confirmed, text('span', '我已人工暂停此 Workspace 的 AI、IDE 和构建写入，并确认其实时同步已暂停'));
+  handoffLabel.append(confirmed, text('span', '我已人工暂停此电脑上的 AI、IDE 和构建写入，并确认关联的实时同步已暂停'));
   section.append(handoffLabel);
   const handoffTargetLabel = text('label', '交接后的继续位置（本机记录）');
   const handoffTarget = document.createElement('select');
-  for (const [value, label] of [['cloud_workspace', '云端 Workspace'], ['desktop', '此电脑']]) {
+  for (const [value, label] of [['cloud_workspace', '云端文件'], ['desktop', '此电脑']]) {
     const option = text('option', label);
     option.value = value;
     handoffTarget.append(option);
@@ -411,7 +417,7 @@ function renderWorkspaceSync(workspace, mapping, parent, running, checkpoint) {
   const handoffRecord = state.handoff?.workspaceId === workspaceId ? state.handoff : null;
   if (handoffRecord) {
     const phases = { checking: '核验中', needs_review: '需要检查', verified: '已核验' };
-    const targets = { desktop: '此电脑', cloud_workspace: '云端 Workspace' };
+    const targets = { desktop: '此电脑', cloud_workspace: '云端文件' };
     section.append(text('p', `本机交接记录：${targets[handoffRecord.source]} → ${targets[handoffRecord.target]} · ${phases[handoffRecord.phase] || handoffRecord.phase}${Number.isSafeInteger(handoffRecord.revision) ? ` · 版本 ${handoffRecord.revision}` : ''}。目标仅作记录，不会启动远端工作进程或绑定 Host。`, 'muted'));
   }
   if (state.syncRecovery?.workspaceId === workspaceId && state.syncRecovery.state === 'unknown') {
@@ -427,7 +433,7 @@ function renderWorkspaceSync(workspace, mapping, parent, running, checkpoint) {
   section.append(panel);
   if (syncOperation?.workspaceId === workspaceId) syncStatusPanel = panel;
   renderSyncStatus(panel);
-  if (bindingEnabled) section.append(text('p', '请先暂停此 Workspace 的实时同步，再运行单次同步或交接核验。', 'error'));
+  if (bindingEnabled) section.append(text('p', '请先暂停此目录的实时同步，再运行单次同步或交接核验。', 'error'));
   if (nodeUnknown) section.append(text('p', '固定同步节点状态未知；同步操作已禁用。', 'error'));
   parent.append(section);
 }
@@ -445,7 +451,7 @@ async function runWorkspaceSync(workspaceId, mode, scope, confirmedQuiesced) {
     ? checkpoint.handoffTarget || 'cloud_workspace'
     : settings.handoffTarget;
   if (mode === 'handoff_checkpoint' && (confirmedQuiesced !== true || !settings.quiesced || workspaceSyncEnabled(workspaceId))) {
-    message('交接核验需要勾选人工停写确认，并先暂停此 Workspace 的实时同步。', true);
+    message('交接核验需要勾选人工停写确认，并先暂停关联的实时同步。', true);
     return;
   }
   syncOperation = { workspaceId, mode, status: 'running', progress: null, conflicts: [], message: '' };
@@ -487,7 +493,7 @@ async function stopWorkspaceSync() {
   message(syncOperation?.message || (stopped ? '同步已停止；恢复点已保留。' : '同步停止未确认，恢复点已保留'), !stopped);
 }
 async function discardSyncCheckpoint() {
-  if (!window.confirm('明确放弃此 Workspace 同步恢复点？放弃后不能从该检查点继续。')) return;
+  if (!window.confirm('明确放弃此文件同步恢复点？放弃后不能从该检查点继续。')) return;
   await api.discardSync();
   const updated = await api.state();
   renderState(updated);
@@ -518,7 +524,7 @@ async function refreshPreservedSection(mapping, panel, expectedState) {
   const total = copies.reduce((sum, file) => sum + (Number.isSafeInteger(file?.size) && file.size >= 0 ? file.size : 0), 0);
   panel.replaceChildren(heading, text('p', `共 ${copies.length} 份 · 额外占用 ${formatBytes(total)}`, 'muted'));
   if (!copies.length) {
-    panel.append(text('p', '此 Workspace 暂无本机安全副本。', 'muted'));
+    panel.append(text('p', '此云端文件目录暂无本机安全副本。', 'muted'));
     return;
   }
   for (const file of copies) {
@@ -526,14 +532,14 @@ async function refreshPreservedSection(mapping, panel, expectedState) {
     row.append(text('strong', file.path));
     row.append(text('p', `${displayTime(file.created_at)} · ${formatBytes(file.size)}`, 'muted'));
     row.append(button('恢复到本机', async () => {
-      const prompt = `将“${file.path}”恢复到 Workspace。目标路径必须为空；恢复后归档副本仍会保留。确认继续？`;
+      const prompt = `将“${file.path}”恢复到云端文件目录。目标路径必须为空；恢复后归档副本仍会保留。确认继续？`;
       if (!window.confirm(prompt)) return;
       await api.restorePreserved(mapping.workspaceId, file.id);
       message(`已恢复本机文件：${file.path}`);
       await refreshPreservedSection(mapping, panel, expectedState);
     }));
     row.append(button('删除此副本', async () => {
-      const prompt = `确定删除本机安全副本“${file.path}”（${formatBytes(file.size)}）？此操作仅删除这份本机副本，无法恢复，不影响云端 Workspace。`;
+      const prompt = `确定删除本机安全副本“${file.path}”（${formatBytes(file.size)}）？此操作仅删除这份本机副本，无法恢复，不影响云端文件。`;
       if (!window.confirm(prompt)) return;
       await api.deletePreserved(mapping.workspaceId, file.id);
       message(`已删除本机安全副本：${file.path}`);
@@ -543,13 +549,13 @@ async function refreshPreservedSection(mapping, panel, expectedState) {
   }
 }
 function renderOfflinePreserved(root, current) {
-  root.replaceChildren(text('p', '云端 Workspace 当前不可读取。下面的安全副本来自本机已保存的 Workspace mapping；查看和恢复只使用本机数据。', 'error'));
+  root.replaceChildren(text('p', '云端文件目录当前不可读取。下面的安全副本来自本机已保存的文件夹映射；查看和恢复只使用本机数据。', 'error'));
   if (current.syncState === 'running') root.append(text('p', '本机同步正在运行。', 'muted'), stopSyncButton());
   const localMappings = Array.isArray(current.mappings) ? current.mappings : [];
-  if (!localMappings.length) root.append(text('p', '此账号尚未保存本机 Workspace 目录。'));
+  if (!localMappings.length) root.append(text('p', '此账号尚未保存本机文件夹。'));
   for (const mapping of localMappings) {
     const card = text('div', '', 'card');
-    card.append(text('strong', `Workspace ${mapping.workspaceId}`));
+    card.append(text('strong', `云端文件 ${mapping.workspaceId}`));
     renderPreservedSection(mapping, card, current);
     root.append(card);
   }
@@ -563,14 +569,181 @@ function stopSyncButton() {
 function renderState(value) {
   state = value;
   $('login').hidden = value.authenticated;
-  $('navigation').hidden = !value.authenticated;
   $('sync-page').hidden = !value.authenticated || value.view !== 'sync';
-  $('account').textContent = value.authenticated ? `${value.accountName || ''} · ${value.origin}` : '';
   $('expiry-warning').hidden = !value.expiresSoon;
   if (!value.authenticated) {
     if (value.origin && !$('origin').value) $('origin').value = value.origin;
     if (!value.storageReady) message('系统安全存储不可用，请解锁 Keychain、GNOME Keyring 或 KDE Wallet。', true);
-  } else if (value.view === 'sync') void renderWorkspaces();
+  } else if (value.view === 'sync') {
+    void renderProjectUpload(value);
+    void renderWorkspaces();
+  }
+}
+
+function projectTargetKey(target) { return target.hostId + '/' + target.workspaceId; }
+function projectCheckpointMatches(checkpoint, selection) {
+  return checkpoint?.mode === 'project_upload' && selection &&
+    checkpoint.projectSelectionID === selection.selectionID && checkpoint.workspaceId === selection.workspaceId &&
+    checkpoint.hostId === selection.hostId && checkpoint.folderId === selection.folderId &&
+    checkpoint.projectName === selection.projectName;
+}
+function projectStatusText(result) {
+  if (!result || result.cancelled) return '已取消；没有开始上传。';
+  if (result.session?.state === 'completed' && result.cloudStatus === 'confirmed') {
+    if (result.hostStatus === 'applied') {
+      return '云端已确认；电脑已应用 revision ' + (result.appliedRevision ?? result.desiredRevision ?? '未知') + '。';
+    }
+    const revision = Number.isSafeInteger(result.desiredRevision)
+      ? '（电脑 applied ' + result.appliedRevision + ' / desired ' + result.desiredRevision + '）' : '';
+    return '云端已确认；电脑待应用或待核验' + revision + '。关机电脑不会自动启动。';
+  }
+  const messages = {
+    running: '上传仍在处理中，恢复点已保留。',
+    conflict: '发现冲突；本次上传未提交。',
+    failed: '上传失败；云端未确认完成。',
+    cancelled: '上传已取消；云端未确认完成。',
+    expired: '上传会话已过期；云端未确认完成。',
+    completed: '会话结束，但存在冲突或结果未确认。',
+  };
+  return messages[result.session?.state] || '上传状态待确认。';
+}
+async function startProjectUpload(selection, projectName, statusElement, uploadButton) {
+  if (!selection) { message('先选择本机项目文件夹。', true); return; }
+  projectUploadBusy = true;
+  projectUploadResult = null;
+  projectUploadError = '';
+  if (uploadButton) uploadButton.disabled = true;
+  if (statusElement) statusElement.replaceChildren(text('p', '正在准备单向上传…', 'muted'));
+  try {
+    const result = await api.uploadProject(selection.selectionID, projectName);
+    projectUploadResult = result;
+    if (statusElement) statusElement.replaceChildren(text('p', projectStatusText(result), result?.hostStatus === 'applied' ? 'success' : result?.session?.state === 'completed' ? 'muted' : 'error'));
+    if (Array.isArray(result?.conflicts) && result.conflicts.length) {
+      const list = text('ul', '');
+      for (const conflict of result.conflicts.slice(0, 8)) list.append(text('li', relativeConflictPath(conflict)));
+      statusElement?.append(text('strong', '发现冲突 ' + result.conflicts.length + ' 项'), list);
+    }
+    const nextState = await api.state();
+    if (nextState?.authenticated && nextState.view === 'sync') {
+      projectSelection = nextState.projectMappings?.find((item) => item.selectionID === selection.selectionID) || selection;
+      renderState(nextState);
+    }
+  } catch (error) {
+    projectUploadError = errorMessage(error);
+    if (statusElement) statusElement.replaceChildren(text('p', errorMessage(error), 'error'));
+    else message(errorMessage(error), true);
+    try {
+      const nextState = await api.state();
+      if (nextState?.authenticated && nextState.view === 'sync') {
+        state = nextState;
+        projectSelection = nextState.projectMappings?.find((item) => item.selectionID === selection.selectionID) || selection;
+      }
+    } catch {}
+  } finally {
+    projectUploadBusy = false;
+    if (uploadButton) uploadButton.disabled = false;
+    if (state?.authenticated && state.view === 'sync') void renderProjectUpload(state);
+  }
+}
+async function renderProjectUpload(current = state) {
+  const root = $('project-upload-content');
+  if (!root || !current?.authenticated || current.view !== 'sync') return;
+  const panel = text('div', '', 'project-upload-controls');
+  root.replaceChildren(text('p', '正在检查项目上传能力…', 'muted'));
+  let targets;
+  try { targets = await api.projectUploadTargets(); }
+  catch (error) {
+    if (state !== current) return;
+    const unavailable = text('p', errorMessage(error), 'muted');
+    unavailable.setAttribute?.('role', 'status');
+    root.replaceChildren(unavailable);
+    if (current.syncCheckpoint?.mode === 'project_upload') {
+      root.append(text('p', '项目上传恢复点仍待处理：' + (current.syncCheckpoint.projectName || current.syncCheckpoint.workspaceId) + '。能力重新开放后可恢复，或在下方明确放弃。', 'error'));
+    }
+    return;
+  }
+  if (state !== current) return;
+  targets = Array.isArray(targets) ? targets : [];
+  const targetSelect = document.createElement('select');
+  targetSelect.setAttribute?.('aria-label', '选择云端电脑');
+  const targetOptions = targets.map((target) => ({ value: projectTargetKey(target), target }));
+  for (const { value, target } of targetOptions) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = target.hostName + ' · ' + target.workspaceName + (target.hostState === 'stopped' ? '（已关机）' : '');
+    targetSelect.append(option);
+  }
+  if (targetOptions.length) {
+    const selectionID = projectSelection?.selectionID || current.syncCheckpoint?.projectSelectionID;
+    const savedSelection = current.projectMappings?.find((item) => item.selectionID === selectionID);
+    if (savedSelection) projectSelection = savedSelection;
+    const preferred = selectedProjectTargetKey || (savedSelection ? savedSelection.hostId + '/' + savedSelection.workspaceId : '');
+    targetSelect.value = targetOptions.find(({ value }) => value === preferred)?.value || targetOptions[0].value;
+    selectedProjectTargetKey = targetSelect.value;
+  }
+  targetSelect.onchange = () => {
+    selectedProjectTargetKey = targetSelect.value;
+    projectUploadResult = null;
+    projectUploadError = '';
+    void renderProjectUpload(current);
+  };
+  panel.append(text('label', '云端电脑'), targetSelect);
+  const target = targetOptions.find(({ value }) => value === targetSelect.value)?.target;
+  if (!targetOptions.length) panel.append(text('p', '没有可用的自有云端电脑或已就绪工作区。', 'muted'));
+  if (target?.blockedMessage) panel.append(text('p', target.blockedMessage, 'error'));
+  if (target?.folders?.length) {
+    const existing = target.folders.map((folder) => folder.relativePath + '（' + folder.state + '）').join('、');
+    panel.append(text('p', '已有项目目录：' + existing, 'muted'));
+  }
+  if (target && !target.blockedMessage) {
+    const chosen = button('选择本机项目文件夹', async () => {
+      const result = await api.selectProjectDirectory(target.hostId, target.workspaceId);
+      if (!result) return;
+      projectSelection = result;
+      projectUploadResult = null;
+      projectUploadError = '';
+      projectName.value = result.projectName;
+      selectedProjectTargetKey = projectTargetKey(target);
+      selectionLabel.textContent = '本机目录：' + result.directoryName;
+      upload.disabled = Boolean(state?.syncCheckpoint && !projectCheckpointMatches(state.syncCheckpoint, projectSelection));
+    });
+    const nameLabel = text('label', '云端项目名');
+    const projectName = document.createElement('input');
+    projectName.type = 'text';
+    projectName.maxLength = 120;
+    projectName.value = projectSelection?.hostId === target.hostId && projectSelection?.workspaceId === target.workspaceId
+      ? projectSelection.projectName : '';
+    projectName.placeholder = '默认使用本机文件夹名';
+    nameLabel.append(projectName);
+    const selectionLabel = text('p', projectSelection?.hostId === target.hostId && projectSelection?.workspaceId === target.workspaceId
+      ? '本机目录：' + projectSelection.directoryName : '尚未选择本机目录', 'muted');
+    const statusElement = text('div', '', 'sync-status');
+    projectUploadProgress = text('p', '', 'muted');
+    statusElement.append(projectUploadProgress);
+    if (projectUploadError) statusElement.append(text('p', projectUploadError, 'error'));
+    if (projectUploadResult) {
+      statusElement.append(text('p', projectStatusText(projectUploadResult), projectUploadResult?.hostStatus === 'applied' ? 'success' : projectUploadResult?.session?.state === 'completed' ? 'muted' : 'error'));
+      if (Array.isArray(projectUploadResult?.conflicts) && projectUploadResult.conflicts.length) {
+        const list = text('ul', '');
+        for (const conflict of projectUploadResult.conflicts.slice(0, 8)) list.append(text('li', relativeConflictPath(conflict)));
+        statusElement.append(text('strong', '发现冲突 ' + projectUploadResult.conflicts.length + ' 项'), list);
+      }
+    }
+    const checkpoint = current.syncCheckpoint;
+    const matchingCheckpoint = projectCheckpointMatches(checkpoint, projectSelection);
+    const upload = button(matchingCheckpoint ? '恢复项目上传' : '单向上传到云端电脑', () => startProjectUpload(projectSelection, projectName.value, statusElement, upload));
+    upload.disabled = projectUploadBusy || current.syncState === 'running' || current.syncRecovery?.state === 'unknown' ||
+      Boolean(checkpoint && !matchingCheckpoint) || !projectSelection ||
+      projectSelection.hostId !== target.hostId || projectSelection.workspaceId !== target.workspaceId;
+    panel.append(chosen, nameLabel, selectionLabel, upload, statusElement);
+    if (matchingCheckpoint) panel.append(text('p', '检测到未确认的上传恢复点；恢复会使用同一云端目录和本机文件夹身份。', 'muted'));
+  } else if (current.syncCheckpoint?.mode === 'project_upload') {
+    panel.append(text('p', '存在项目上传恢复点；当前目标不可用，恢复点已保留。', 'error'));
+  }
+  if (current.syncCheckpoint && current.syncCheckpoint.mode !== 'project_upload') {
+    panel.append(text('p', '另一个同步恢复点尚未处理；项目上传已暂停。', 'muted'));
+  }
+  root.replaceChildren(panel);
 }
 
 async function renderWorkspaces() {
@@ -578,7 +751,7 @@ async function renderWorkspaces() {
   const current = state;
   if (state.profileError) { root.replaceChildren(text('p', state.profileError, 'error')); return; }
   const nodeState = state.workspaceSync?.nodeState || 'stopped';
-  const status = text('p', '正在读取 Workspace…', 'muted');
+  const status = text('p', '正在读取云端文件目录…', 'muted');
   root.replaceChildren(status);
   if (state.syncState === 'running') root.append(text('p', '本机同步正在运行。', 'muted'), stopSyncButton());
   let data;
@@ -602,7 +775,7 @@ async function renderWorkspaces() {
     const warning = text('div', '', 'card');
     const recoveryMessage = state.syncRecovery?.state === 'unknown'
       ? `${state.syncRecovery.message || '同步恢复状态未知。'} 请检查本机状态后再处理恢复点。`
-      : `上次 ${state.syncCheckpoint.workspaceId} 的 ${state.syncCheckpoint.mode} 尚待恢复。只能在原 Workspace、模式和目录身份下继续；也可以明确放弃恢复点。`;
+      : `上次 ${state.syncCheckpoint.workspaceId} 的 ${state.syncCheckpoint.mode} 尚待恢复。只能在原云端文件目录、模式和本机目录身份下继续；也可以明确放弃恢复点。`;
     warning.append(text('p', recoveryMessage, 'error'));
     warning.append(button('明确放弃恢复点', discardSyncCheckpoint));
     root.append(warning);
@@ -617,7 +790,7 @@ async function renderWorkspaces() {
     const liveBusy = liveSyncRunning(live);
     const liveRecoveryUncertain = live?.state === 'persisted_uncertain' || live?.recoveryRequired === true;
     const liveConflict = live?.state === 'conflict' || liveSyncConflictCount(live) > 0;
-    card.append(text('strong', `${workspace.name || workspace.id} · ${workspace.state || ''}`));
+    card.append(text('strong', `电脑文件 · ${workspace.name || workspace.id} · ${workspace.state || ''}`));
     card.append(text('p', mapping?.directoryName || '尚未选择本机目录', 'muted'));
     if (workspace.state === 'ready') {
       const choose = button('选择目录', async () => { await api.chooseDirectory(workspace.id); renderState(await api.state()); });
@@ -632,7 +805,7 @@ async function renderWorkspaces() {
         card.append(toggle);
         if (binding?.state === 'pending_node') card.append(text('p', '设备已登记，正在等待云端节点就绪。', 'muted'));
         else if (binding?.state === 'revoking' || binding?.state === 'revoked') card.append(text('p', '此设备绑定已撤销或正在撤销。', 'error'));
-        else if (binding?.enabled) card.append(text('p', '本机开关已启用；请以 Workspace 状态确认同步进度。', 'muted'));
+        else if (binding?.enabled) card.append(text('p', '本机开关已启用；请以云端文件状态确认同步进度。', 'muted'));
         if (binding?.enabled && binding.state === 'active' && nodeState === 'running') {
           const status = text('div', '', 'sync-status');
           const refreshStatus = button('刷新本机同步状态', async () => {
@@ -653,12 +826,12 @@ async function renderWorkspaces() {
         }
         renderWorkspaceSync(workspace, mapping, card, running || operationActive() || liveBusy || liveRecoveryUncertain || liveConflict, state.syncCheckpoint);
       }
-    } else card.append(text('p', '此 Workspace 当前不可同步。', 'muted'));
+    } else card.append(text('p', '此云端文件目录当前不可同步。', 'muted'));
     renderLiveSync(workspace, mapping, card);
     if (mapping) renderPreservedSection(mapping, card, current);
     root.append(card);
   }
-  if (!workspaces.length) root.append(text('p', '暂无 Workspace。'));
+  if (!workspaces.length) root.append(text('p', '暂无可用的云端文件目录。'));
   root.append(text('p', '本机安全副本和固定同步节点仍按各自控制项管理；单次同步只在你明确启动后运行。启用文件同步不会自动授权 Task 读取这些文件。', 'muted'));
 }
 
@@ -675,10 +848,6 @@ $('login-form').onsubmit = (event) => {
 };
 $('register').onclick = () => void run(() => api.publicPage('register', $('origin').value.trim()));
 $('download').onclick = () => void run(() => api.publicPage('download', $('origin').value.trim()));
-$('web').onclick = () => void run(async () => { await api.showWeb(); renderState(await api.state()); });
-$('account-settings').onclick = () => void run(async () => { await api.showAccount(); renderState(await api.state()); });
-$('local-sync').onclick = () => void run(async () => { await api.showSync(); renderState(await api.state()); });
-$('logout').onclick = () => void run(async () => { const warning = await api.logout(); renderState(await api.state()); if (warning) message(warning, true); });
 api.onState(renderState);
 if (typeof api.onLiveSync === 'function') api.onLiveSync((value) => {
   const workspaceId = value?.workspaceId;
@@ -701,6 +870,9 @@ api.onSync((value) => {
     syncOperation = { workspaceId, mode: value.mode || state?.syncCheckpoint?.mode, status: value.state === 'running' ? 'running' : 'unknown', progress: value.progress || null, conflicts: [], message: value.message || '' };
   }
   message(value.message || `同步：${value.state}${value.progress?.stage ? ` · ${value.progress.stage}` : ''}`, value.state === 'offline' || value.state === 'shutdown_unknown');
+  if (state?.syncCheckpoint?.mode === 'project_upload' && projectUploadProgress) {
+    projectUploadProgress.textContent = syncProgressText(value.progress) || (value.state === 'running' ? '项目正在同步。' : value.message || '项目上传状态正在核验。');
+  }
   if (value.state === 'running' && state?.view === 'sync' && state.syncState !== 'running') {
     state.syncState = 'running';
     void renderWorkspaces();

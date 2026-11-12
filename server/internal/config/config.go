@@ -138,6 +138,7 @@ type WorkspaceStorage struct {
 
 type WorkspaceSyncNode struct {
 	Enabled               bool     `yaml:"enabled"`
+	ProjectUploadEnabled  bool     `yaml:"project_upload_enabled"`
 	DataRoot              string   `yaml:"data_root"`
 	ImageDigest           string   `yaml:"image_digest"`
 	RelayImageDigest      string   `yaml:"relay_image_digest"`

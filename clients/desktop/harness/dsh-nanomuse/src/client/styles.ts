@@ -219,6 +219,8 @@ html[data-nm-platform='darwin']:not([data-nm-fullscreen]) .nm-col-top { height: 
 .nm-chats-search input::-webkit-search-cancel-button { -webkit-appearance: none; }
 .nm-chats-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 1px; }
 .nm-chats-section { display: flex; align-items: center; justify-content: space-between; padding: 14px 4px 4px 10px; font-size: 13px; color: var(--dsw-alias-label-tertiary); }
+.nm-chats-add.nm-icon-btn { width: 20px; height: 20px; border-radius: 6px; }
+.nm-chats-add.nm-icon-btn:focus-visible { outline: 2px solid var(--nm-accent); outline-offset: 1px; }
 .nm-chats-empty { padding: 6px 10px; font-size: 12.5px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
 .nm-chat-row { position: relative; display: flex; align-items: center; border-radius: 9px; min-height: 34px; }
 .nm-chat-row:hover { background: var(--nm-hover); }

@@ -311,7 +311,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .conversation-group { position: relative; margin-top: 8px; }
 .conversation-group-details > summary { padding: 9px 42px 9px 10px; border-radius: 8px; color: var(--muted); cursor: pointer; font-size: .88rem; }
 .conversation-group-details > summary:hover { background: #f5f8fc; }
-.morde-page .assistant-sidebar .conversation-new { position: absolute; top: 9px; right: 8px; width: 18px; min-width: 18px; height: 18px; min-height: 18px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; color: #8390a4; background: transparent; font-size: 12px; line-height: 1; }
+.morde-page .assistant-sidebar .conversation-new { position: absolute; top: 3px; right: 5px; width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; color: #7b899e; background: radial-gradient(circle, #fff 0 5px, #e2e8f1 5px 6px, transparent 6.5px); font-size: 10px; font-weight: 600; line-height: 1; }
+.morde-page .assistant-sidebar .conversation-new:hover:not(:disabled) { color: #0969e6; background: radial-gradient(circle, #f4f7ff 0 5px, #cbd8f3 5px 6px, transparent 6.5px); }
 .conversation-more { width: 100%; margin-top: 8px; }
 .conversation-row { display: grid; grid-template-columns: minmax(0, 1fr); }
 .conversation-item { width: 100%; padding: 11px 10px; display: grid; gap: 6px; border: 1px solid transparent; border-radius: 8px; color: var(--ink); background: transparent; cursor: pointer; text-align: left; }
@@ -998,11 +999,11 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 
 /* moder conversation layout */
 .morde-shell:has(.assistant-page) { background: #fff; }
-.morde-shell:has(.assistant-page) .morde-brand-mark, .assistant-logo {
+.morde-brand-mark, .assistant-logo {
   flex: none; border: 1px solid #e7edf7; background: #fff url('./assets/morde-logo.png') center / contain no-repeat;
   box-shadow: 0 4px 12px rgb(22 109 226 / 7%); color: transparent;
 }
-.morde-shell:has(.assistant-page) .morde-brand-mark { width: 38px; height: 38px; border-radius: 13px; }
+.morde-brand-mark { width: 38px; height: 38px; border-radius: 13px; }
 .morde-shell:has(.assistant-page) .morde-nav-link.active { color: #0969e6; background: #edf5ff; }
 .morde-shell:has(.assistant-page) .morde-nav-link.active::after { background: #1474f5; }
 .morde-shell:has(.assistant-page) .morde-topbar { height: 64px; min-height: 64px; padding-inline: 26px; background: #fff; }
@@ -1086,11 +1087,11 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:has(.assistant-page) { grid-template-columns: 208px minmax(0, 1fr); }
 }
 @media (min-width: 1281px) {
-  .assistant-page .assistant-layout-with-task-panel { grid-template-columns: 232px minmax(0, 1fr) 282px; }
+  .assistant-page .assistant-layout-with-task-panel { grid-template-columns: 232px minmax(0, 1fr) clamp(320px, 25vw, 360px); }
   .assistant-page .assistant-task-panel { position: static; grid-column: 3; grid-row: 1; width: auto; border: 0; border-left: 1px solid #e9edf3; border-radius: 0; box-shadow: none; }
 }
 @media (max-width: 1280px) {
-  .assistant-page .task-panel-list { padding-bottom: max(200px, 35dvh); }
+  .assistant-page .task-panel-list { padding-bottom: max(160px, 24dvh); }
 }
 @media (max-width: 900px) {
   .assistant-tool-menu .assistant-tool-connectors { position: static; min-width: 0; box-shadow: none; }
@@ -1123,5 +1124,207 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .assistant-page .assistant-composer form { padding: 8px; }
   .assistant-page .assistant-composer textarea { height: 32px; min-height: 32px; }
 }
+
+.assistant-history-content { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow-y: auto; }
+.assistant-page .conversation-row-main .conversation-item { padding-right: 86px; }
+.morde-page .host-card { padding: 9px 12px; }
+.morde-page .host-card-heading { align-items: center; }
+.morde-page .host-card-heading h2 { margin-bottom: 2px; font-size: 12px; }
+.morde-page .host-card-heading p { font-size: 10px; line-height: 1.35; }
+.morde-page .host-facts { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 6px 12px; margin: 8px 0; }
+.morde-page .host-facts div { gap: 2px; }
+.morde-page .host-facts span { font-size: 10px; }
+.morde-page .host-facts strong { font-size: 11px; line-height: 1.35; }
+.morde-page .host-facts .table-sub { margin-top: 2px; font-size: 10px; line-height: 1.35; }
+.morde-page .host-actions { gap: 5px; padding-top: 8px; }
+@media (min-width: 761px) {
+  .morde-page .host-actions .button { min-height: 27px; padding: 4px 8px; font-size: 11px; }
+}
+@media (max-width: 620px) {
+  .assistant-history-content { display: block; overflow: visible; }
+  .morde-page .host-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.loading-page > .recoverable-error { width: min(560px, calc(100% - 32px)); margin: 0; padding: clamp(28px, 5vw, 48px); }
+.recoverable-error-mark { width: 48px; height: 48px; margin: 0 auto 18px; display: grid; place-items: center; border: 1px solid #f1c9c5; border-radius: 50%; color: var(--danger); background: #fff4f2; font-size: 24px; font-weight: 750; }
+.recoverable-error h1 { margin-bottom: 10px; }
+.recoverable-error p { max-width: 420px; margin: 0 auto 24px; line-height: 1.65; }
+.recoverable-error-actions { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; }
+@media (min-width: 1001px) and (max-width: 1280px) {
+  .assistant-page .assistant-layout-with-task-panel { grid-template-columns: clamp(145px, 16vw, 232px) minmax(0, 1fr) clamp(280px, 24vw, 320px); }
+  .assistant-page .assistant-task-panel { position: static; grid-column: 3; grid-row: 1; width: auto; border: 0; border-left: 1px solid #e9edf3; border-radius: 0; box-shadow: none; }
+  .assistant-page .task-panel-list { padding-bottom: 19px; }
+}
+@media (min-width: 621px) and (max-width: 1000px) {
+  .assistant-page .assistant-layout-with-task-panel { grid-template-columns: clamp(145px, 20vw, 200px) minmax(0, 1fr); }
+  .assistant-page .assistant-layout-with-task-panel .assistant-task-panel { position: absolute; z-index: 30; inset: 0 0 0 auto; width: min(360px, calc(100% - 12px)); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 36px rgb(20 40 65 / 18%); }
+  .assistant-page .assistant-layout-with-task-panel .task-panel-list { padding-bottom: max(160px, 24dvh); }
+}
 @media (hover: none) { .assistant-reply-time { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .assistant-reply-time { transition: none; } }
+
+.assistant-page .task-panel-list[hidden] { display: none; }
+.assistant-page .task-panel-filters { display: flex; gap: 6px; }
+.assistant-page .task-panel-filters button { min-height: 30px; padding: 5px 10px; border: 1px solid transparent; border-radius: 8px; color: #718096; background: transparent; font-size: 12px; cursor: pointer; }
+.assistant-page .task-panel-filters button.is-selected { border-color: #dbe9ff; color: #0969e6; background: #edf5ff; font-weight: 650; }
+.assistant-page .task-panel-filters button:disabled { opacity: .5; cursor: not-allowed; }
+.assistant-page .task-panel-heading > div:first-child > span { font-size: 12px; }
+.assistant-page .task-panel-group { min-width: 0; display: grid; gap: 8px; }
+.assistant-page .task-panel-group > h3,
+.assistant-page .task-panel-group-recent > summary { min-width: 0; margin: 4px 0 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #63738b; font-size: 13px; font-weight: 700; }
+.assistant-page .task-panel-group > h3 span,
+.assistant-page .task-panel-group-recent > summary span { color: #96a2b2; font-size: 12px; font-weight: 500; }
+.assistant-page .task-panel-group-recent > summary { padding: 4px 0; cursor: pointer; }
+.assistant-page .task-panel-cards { min-width: 0; display: grid; gap: 8px; }
+.assistant-page .task-activity-card { min-width: 0; border: 1px solid #e6ebf2; border-radius: 10px; background: #fff; }
+.assistant-page .task-activity-card-button { width: 100%; min-width: 0; padding: 12px; display: grid; gap: 7px; border: 0; border-radius: inherit; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.assistant-page .task-activity-card-button:hover { background: #f8faff; }
+.assistant-page .task-activity-card-button:focus-visible { outline: 2px solid #8eb5ff; outline-offset: 2px; }
+.assistant-page .task-activity-card-title { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.assistant-page .task-activity-card-title > strong { min-width: 0; display: -webkit-box; overflow: hidden; color: #29384f; font-size: 14px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.assistant-page .task-activity-status { flex: 0 0 auto; padding: 3px 7px; border-radius: 999px; color: #47627f; background: #edf3fa; font-size: 12px; line-height: 1.35; }
+.assistant-page .task-activity-status.status-waiting_user { color: #966015; background: #fff5e2; }
+.assistant-page .task-activity-status.status-failed { color: #a8322a; background: #fff0ee; }
+.assistant-page .task-activity-status.status-completed { color: #39754f; background: #eaf6ee; }
+.assistant-page .task-activity-card-subtitle { min-width: 0; display: -webkit-box; overflow: hidden; color: #748298; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.assistant-page .task-activity-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #0969e6; font-size: 12px; font-weight: 600; }
+.assistant-page .task-activity-card-footer small { overflow: hidden; color: #98a4b4; font-size: 12px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.assistant-page .task-panel-detail-nav { margin: 0 0 4px; }
+.assistant-page .task-panel-detail .task-activity { width: 100%; max-width: none; padding: 0; display: grid; gap: 14px; border: 0; border-radius: 0; background: transparent; }
+.assistant-page .task-panel-detail .task-activity-heading { align-items: flex-start; gap: 8px; }
+.assistant-page .task-panel-detail .task-activity-heading strong { display: block; color: #29384f; font-size: 16px; line-height: 1.4; overflow-wrap: anywhere; }
+.assistant-page .task-panel-detail .task-activity-heading small { display: block; margin-top: 5px; color: #8794a8; font-size: 12px; line-height: 1.4; }
+.assistant-page .task-panel-detail .task-activity-heading > span { max-width: 42%; text-align: right; }
+.assistant-page .task-current-progress { padding: 0 0 12px; border-bottom: 1px solid #edf0f4; }
+.assistant-page .task-current-progress h3,
+.assistant-page .task-panel-detail .task-activity-k2 h3 { margin: 0 0 5px; color: #60728b; font-size: 13px; }
+.assistant-page .task-current-progress p { margin: 0; color: #29384f; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
+.assistant-page .task-current-progress p + p { margin-top: 5px; }
+.assistant-page .task-detail-attention { margin: 0 !important; padding: 12px; border-radius: 9px; }
+.assistant-page .task-detail-attention h3 { margin: 0 0 7px; font-size: 14px; }
+.assistant-page .task-detail-attention p { margin: 4px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.assistant-page .task-detail-attention textarea { width: 100%; min-height: 72px; margin: 5px 0 8px; }
+.assistant-page .task-activity-file-fetches { padding: 0 !important; border: 0 !important; background: transparent !important; }
+.assistant-page .task-activity-file-fetches > p { margin: 0; color: #75839a; font-size: 12px; line-height: 1.5; }
+.assistant-page .task-activity-file-fetches li { padding: 10px 0; border-top: 1px solid #edf0f4; }
+.assistant-page .task-activity-file-fetches li > span { display: grid; gap: 3px; }
+.assistant-page .task-activity-file-fetches li strong { overflow-wrap: anywhere; font-size: 13px; }
+.assistant-page .task-activity-file-fetches li small { font-size: 12px; }
+.assistant-page .task-file-fetch-error { margin: 0; }
+.assistant-page .task-panel-detail .task-activity-k2 { padding: 0; border: 0; background: transparent; }
+.assistant-page .task-panel-detail .task-activity-artifacts li { gap: 3px; }
+.assistant-page .task-panel-detail .task-activity-artifacts li strong { font-size: 13px; }
+.assistant-page .task-panel-detail .task-activity-artifacts li small { color: #7f8da2; font-size: 12px; overflow-wrap: anywhere; }
+.assistant-page .task-detail-work > summary,
+.assistant-page .task-detail-diagnostics > summary { color: #536780; font-size: 13px; font-weight: 650; cursor: pointer; }
+.assistant-page .task-detail-diagnostics { padding-top: 10px; border-top: 1px solid #edf0f4; }
+.assistant-page .task-detail-diagnostics > p,
+.assistant-page .task-detail-diagnostics > ul { color: #7f8da2; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.assistant-page .task-panel-detail .task-activity-actions { margin: 0; }
+
+/* PC portal uses one full-width control bar above the app rail and page sidebar. */
+.morde-shell:not(.morde-admin-shell) {
+  --pc-app-rail-width: 224px;
+  --pc-page-sidebar-width: 0px;
+  width: 100%; height: 100dvh; min-height: 0; overflow: hidden;
+  display: grid;
+  grid-template-columns: var(--pc-app-rail-width) var(--pc-page-sidebar-width) minmax(0, 1fr);
+  grid-template-rows: 58px minmax(0, 1fr); background: #fff;
+}
+.morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: 248px; }
+.morde-shell:not(.morde-admin-shell) > .morde-sidebar { grid-column: 1; grid-row: 2; position: relative; top: auto; height: auto; min-height: 0; padding: 14px 10px; overflow: hidden; border-right: 1px solid var(--line); border-bottom: 0; }
+.morde-shell:not(.morde-admin-shell) > .morde-main { grid-column: 3; grid-row: 2; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.morde-shell:not(.morde-admin-shell) > .morde-topbar { grid-column: 1 / -1; grid-row: 1; position: relative; top: auto; min-height: 58px; height: 58px; padding: 0 16px; background: #fff; backdrop-filter: none; }
+.morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page { width: 100%; max-width: none; min-height: 0; flex: 1 1 auto; margin: 0; padding: 18px 24px 24px; overflow: auto; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand { flex: 0 0 auto; justify-content: flex-start; padding: 0 5px 17px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand-mark { width: 38px; height: 38px; border-radius: 12px; background-image: url('./assets/morde-logo.png'); background-size: contain; background-position: center; background-color: #fff; color: transparent; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-navigation { min-height: 0; overflow: auto; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-heading { display: block; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link { min-height: 38px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link.active { color: #0969e6; background: #edf5ff; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link.active::after { background: #1474f5; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar-bottom { padding-top: 10px; }
+.morde-profile-logout { min-width: 29px; padding-inline: 7px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+.morde-profile-logout .morde-icon { width: 13px; height: 13px; }
+.page-navigation { min-width: 0; min-height: 0; grid-column: 2; grid-row: 2; padding: 17px 11px; overflow: auto; border-right: 1px solid var(--line); background: #fff; }
+.page-navigation nav { display: grid; gap: 3px; }
+.page-navigation-link { min-width: 0; min-height: 38px; padding: 8px 10px; display: flex; align-items: center; gap: 10px; border-radius: 8px; color: #69778d; font-size: 12px; font-weight: 600; text-decoration: none; }
+.page-navigation-link .morde-icon { width: 16px; height: 16px; color: #8390a4; }
+.page-navigation-link:hover { color: #27354c; background: #f5f7fa; }
+.page-navigation-link.active { color: #0969e6; background: #edf5ff; }
+.page-navigation-link.active .morde-icon { color: #1474f5; }
+.morde-top-navigation { min-width: 0; display: flex; align-items: center; gap: 5px; }
+.morde-top-control { width: 31px; height: 31px; display: grid; place-items: center; border: 0; border-radius: 7px; color: #64738a; background: transparent; cursor: pointer; }
+.morde-top-control:hover:not(:disabled) { color: #0969e6; background: #f3f7fd; }
+.morde-top-control:disabled { color: #c3cbd6; cursor: default; }
+.morde-top-control .morde-icon { width: 17px; height: 17px; }
+.morde-top-divider { width: 1px; height: 21px; margin: 0 3px; background: var(--line); }
+.morde-shell:not(.morde-admin-shell) .morde-top-actions { margin-left: auto; }
+.morde-shell:not(.morde-admin-shell) .morde-page .page-heading { justify-content: space-between; align-items: flex-start; margin-bottom: 18px; }
+.morde-shell:not(.morde-admin-shell):has(> .assistant-page),
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) { grid-template-columns: var(--pc-app-rail-width) 0 minmax(0, 1fr); }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) > .morde-main > .morde-page { height: 100%; padding: 0; overflow: hidden; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) > .morde-sidebar { overflow: hidden; }
+@media (max-width: 900px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 64px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: 220px; }
+  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page { padding-inline: 18px; }
+}
+@media (max-width: 620px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 52px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: 176px; }
+  .morde-shell:not(.morde-admin-shell) > .morde-topbar { padding-inline: 8px; }
+  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page { padding: 12px 10px; }
+  .morde-shell:not(.morde-admin-shell) .morde-top-actions { gap: 6px; }
+  .morde-shell:not(.morde-admin-shell) .morde-top-actions > a:first-child,
+  .morde-shell:not(.morde-admin-shell) .morde-top-user { display: none; }
+  .page-navigation { padding-inline: 6px; }
+  .page-navigation-link { padding-inline: 7px; gap: 6px; font-size: 11px; }
+}
+
+/* Keep the Codex-style app rail narrow; the collapsible context sidebar sits beside it. */
+.morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 56px; --pc-page-sidebar-width: 0px; --pc-context-sidebar-width: 248px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-page-sidebar-width: 0px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed { --pc-page-sidebar-width: 0px; }
+.morde-shell:not(.morde-admin-shell) > .morde-sidebar { padding: 12px 6px; align-items: center; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand { justify-content: center; padding: 0 0 16px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand > span:last-child,
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-heading,
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link > span,
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-profile > span:nth-child(2) { display: none; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-navigation { width: 100%; gap: 6px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link { width: 42px; min-height: 42px; margin-inline: auto; padding: 0; justify-content: center; border-radius: 11px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link .morde-icon { width: 18px; height: 18px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-sidebar-bottom { width: 100%; padding-top: 9px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-sidebar-bottom > .morde-nav-link { width: 42px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-profile { padding: 10px 0 0; flex-direction: column; gap: 7px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-profile-logout { width: 36px; min-height: 34px; padding: 0; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-profile-logout > span { display: none; }
+.morde-shell:not(.morde-admin-shell) .page-navigation { padding: 24px 14px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed .morde-top-control[aria-controls="context-sidebar"] .morde-icon { transform: scaleX(-1); }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed .page-navigation { display: none; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed > .morde-main { grid-column: 2 / -1; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-context-sidebar-width: 248px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout { grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr); }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr) clamp(320px, 25vw, 360px); }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout { grid-template-columns: minmax(0, 1fr); }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-sidebar { display: none; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr) clamp(320px, 25vw, 360px); }
+@media (min-width: 621px) and (max-width: 1000px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 52px; --pc-context-sidebar-width: 220px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }
+  .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 620px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 48px; --pc-context-sidebar-width: 176px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }
+  .morde-shell:not(.morde-admin-shell) > .morde-sidebar { padding-inline: 3px; }
+  .morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand-mark,
+  .morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link { width: 38px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed > .morde-main { grid-column: 2 / -1; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout,
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout,
+  .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-rows: minmax(0, 1fr); }
+  .morde-shell:not(.morde-admin-shell) > .morde-topbar { padding-inline: 6px; }
+}

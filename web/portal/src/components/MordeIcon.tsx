@@ -1,4 +1,7 @@
 const paths = {
+  back: 'm15 18-6-6 6-6M9 12h11',
+  forward: 'm9 18 6-6-6-6m6 6H4',
+  logout: 'M10 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h5m4-4 4-4-4-4m4 4H9',
   grid: 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z',
   monitor: 'M5 5h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2ZM8 21h8m-4-3v3',
   spark: 'm12 3 2 6 6 3-6 2-2 7-2-7-6-2 6-3 2-6Zm7 0v3m-1.5-1.5h3',

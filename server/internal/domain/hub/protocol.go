@@ -287,7 +287,7 @@ func ValidateTaskActionArgs(action string, raw json.RawMessage) error {
 	case ActionFileFetch:
 		var args FileFetchArgs
 		if err := decodeArgs(raw, &args); err != nil || !domain.ValidOperationID(args.FetchID) || !validRelativePath(args.Path) ||
-			args.TaskRevision < 1 || !validFetchTicket(args.Ticket) || args.TicketExpiresAt.IsZero() ||
+			args.TaskRevision < 0 || !validFetchTicket(args.Ticket) || args.TicketExpiresAt.IsZero() ||
 			!args.TicketExpiresAt.After(time.Now()) || args.TicketExpiresAt.After(time.Now().Add(5*time.Minute+time.Second)) {
 			return ProtocolError{Code: "invalid_argument", Message: "file.fetch requires an authorized relative path and short-lived ticket"}
 		}
@@ -330,7 +330,7 @@ func ValidateActionResult(action string, frame Frame) error {
 		if action == ActionCommand && frame.Error == "timeout" {
 			return ProtocolError{Code: "unknown_result", Message: "command timed out before stop was confirmed"}
 		}
-		if !validResultError(frame.Error) && !(action == ActionFileFetch && validFileFetchResultError(frame.Error)) {
+		if !validResultError(frame.Error) && (action != ActionFileFetch || !validFileFetchResultError(frame.Error)) {
 			return ProtocolError{Code: "bad_result", Message: "result error code is not allowed"}
 		}
 		return nil
@@ -452,7 +452,7 @@ func ValidateActionResult(action string, frame Frame) error {
 	case ActionFileFetch:
 		var receipt FileFetchReceipt
 		if err := decodeArgs(frame.Body, &receipt); err != nil || !domain.ValidOperationID(receipt.FetchID) ||
-			receipt.TaskRevision < 1 || receipt.Status != "completed" || receipt.TargetGrantVersion < 1 ||
+			receipt.TaskRevision < 0 || receipt.Status != "completed" || receipt.TargetGrantVersion < 1 ||
 			!validSHA256(receipt.SourceVersion) || !validSHA256(receipt.SourceSHA256) || receipt.SizeBytes < 1 ||
 			receipt.SizeBytes > 16<<20 || !domain.ValidOperationID(receipt.ContentID) || receipt.ExpiresAt.IsZero() || !receipt.ExpiresAt.After(time.Now()) {
 			return ProtocolError{Code: "bad_result", Message: "file.fetch result must match a completed server receipt without exposing credentials"}

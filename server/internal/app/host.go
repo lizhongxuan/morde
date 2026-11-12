@@ -120,6 +120,11 @@ func (s *hostService) BindWorkspace(ctx context.Context, principal identity.Prin
 	if err != nil {
 		return workspace.Binding{}, err
 	}
+	for _, binding := range bindings {
+		if binding.Workspace.ID != workspaceID {
+			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host Workspace identity cannot be changed")
+		}
+	}
 	var currentBindings []workspace.Binding
 	for _, binding := range bindings {
 		if binding.State != workspace.BindingDetached {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -13,10 +14,13 @@ import (
 
 type deferredBrokerTestStore struct {
 	*cloudDSHBrokerTaskStore
-	target    DeferredTaskTarget
-	loadCalls int
-	bindCalls int
-	bindErr   error
+	target         DeferredTaskTarget
+	resolvedTarget DeferredTaskTarget
+	resolveErr     error
+	resolveCalls   int
+	loadCalls      int
+	bindCalls      int
+	bindErr        error
 }
 
 type deferredWorkspaceBrokerTestStore struct {
@@ -101,6 +105,19 @@ func (s *deferredWorkspaceBrokerTestStore) BindDeferredTaskWorkspace(_ context.C
 func (s *deferredBrokerTestStore) LoadDeferredTaskTarget(context.Context, task.Task) (DeferredTaskTarget, bool, error) {
 	s.loadCalls++
 	return s.target, true, nil
+}
+
+func (s *deferredBrokerTestStore) ResolveDeferredTaskWorkspace(_ context.Context, _ task.Task,
+	target DeferredTaskTarget) (DeferredTaskTarget, bool, error) {
+	s.resolveCalls++
+	if s.resolveErr != nil {
+		return DeferredTaskTarget{}, false, s.resolveErr
+	}
+	resolved := s.resolvedTarget
+	if resolved.HostID == "" {
+		resolved.HostID = target.HostID
+	}
+	return resolved, resolved.WorkspaceID != "", nil
 }
 
 func (s *deferredBrokerTestStore) BindDeferredTaskTarget(_ context.Context, _ task.Task, selected DeferredTaskTarget, revision *int64, digest []byte) (task.Task, error) {
@@ -234,13 +251,110 @@ func TestDeferredComputerBindsAndRunsOneAuthorizedToolCall(t *testing.T) {
 	}
 	call := ModelToolCall{CallID: "deferred-list-once", Name: runtimeToolWindowList, Arguments: `{}`}
 	result, err := broker.Execute(context.Background(), claimed, call)
-	if err != nil || result.Status != AgentToolSucceeded || store.bindCalls != 1 || fixture.handlers["window.list"].calls.Load() != 1 {
+	if err != nil || result.Status != AgentToolSucceeded || store.bindCalls != 1 || store.resolveCalls != 0 || fixture.handlers["window.list"].calls.Load() != 1 {
 		t.Fatalf("selected computer did not execute: result=%+v bindings=%d err=%v", result, store.bindCalls, err)
 	}
 	replayed, err := broker.Reconcile(context.Background(), claimed, call, &result.Output)
 	if err != nil || replayed.Status != AgentToolSucceeded || fixture.handlers["window.list"].calls.Load() != 1 {
 		t.Fatalf("computer call was replayed: result=%+v err=%v calls=%d", replayed, err, fixture.handlers["window.list"].calls.Load())
 	}
+}
+
+func TestDeferredFileToolResolvesWorkspaceAndInjectsServerTarget(t *testing.T) {
+	fixture, base, broker, workspaceStore, original := newCloudDSHT08WorkspaceBroker(t)
+	deferred := &deferredWorkspaceBrokerTestStore{deferredBrokerTestStore: &deferredBrokerTestStore{
+		cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{HostID: "h1234567"},
+		resolvedTarget: DeferredTaskTarget{HostID: "h1234567", WorkspaceID: original.WorkspaceID, WorkspaceBindingVersion: 7},
+	}, workspaceStore: workspaceStore}
+	fixture.executor.store, broker.store = deferred, deferred
+	base.details.Task.HostID, base.details.Task.WorkspaceID = "", ""
+	base.details.Task.Authorization.Kind = string(identity.KindSession)
+	base.details.Task.Authorization.Kind = string(identity.KindSession)
+	base.details.Task.Authorization.Scopes = []string{string(identity.ScopeComputerObserve)}
+	base.details.Task.InputRevision, base.details.Task.WorkspaceCheckpointRevision = nil, nil
+	claimed := base.details.Task
+
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil || deferred.resolveCalls != 0 || deferred.workspaceReads != 0 {
+		t.Fatalf("Workspace was resolved before a file tool call: definitions=%+v resolve=%d reads=%d err=%v",
+			definitions, deferred.resolveCalls, deferred.workspaceReads, err)
+	}
+	var fileRead *AgentToolDefinition
+	for index := range definitions {
+		if definitions[index].Name == runtimeToolFileRead {
+			fileRead = &definitions[index]
+			break
+		}
+	}
+	if fileRead == nil {
+		t.Fatal("authorized file_read tool was not offered")
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(fileRead.Parameters, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := schema.Properties["workspace_id"]; exists || containsString(schema.Required, "workspace_id") {
+		t.Fatalf("file_read still lets the model choose a Workspace: %s", fileRead.Parameters)
+	}
+
+	mapping, ok := runtimeToolMappingByName(runtimeToolFileRead)
+	if !ok {
+		t.Fatal("file_read mapping is missing")
+	}
+	call := ModelToolCall{CallID: "deferred-file-read", Name: runtimeToolFileRead,
+		Arguments: `{"workspace_id":"w7654321","path":"README.md"}`}
+	bound, resolvedCall, reason, err := broker.bindDeferredRuntimeTarget(context.Background(), claimed, deferred.target, mapping, call)
+	if err != nil || reason != "" || bound.HostID != deferred.target.HostID || bound.WorkspaceID != original.WorkspaceID ||
+		deferred.resolveCalls != 1 || deferred.workspaceReads == 0 || deferred.bindCalls != 1 {
+		t.Fatalf("deferred Workspace binding failed: task=%+v call=%+v reason=%q resolve=%d reads=%d binds=%d err=%v",
+			bound, resolvedCall, reason, deferred.resolveCalls, deferred.workspaceReads, deferred.bindCalls, err)
+	}
+	var arguments map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(resolvedCall.Arguments), &arguments); err != nil {
+		t.Fatal(err)
+	}
+	var injectedWorkspaceID string
+	if err := json.Unmarshal(arguments["workspace_id"], &injectedWorkspaceID); err != nil || injectedWorkspaceID != original.WorkspaceID {
+		t.Fatalf("server did not replace model Workspace ID: arguments=%s decoded=%q err=%v", resolvedCall.Arguments, injectedWorkspaceID, err)
+	}
+	refreshed, _, found, err := broker.refreshDeferredTask(context.Background(), claimed)
+	if err != nil || !found || refreshed.HostID != deferred.target.HostID || refreshed.WorkspaceID != original.WorkspaceID {
+		t.Fatalf("server-resolved target was rejected on the next turn: task=%+v found=%t err=%v", refreshed, found, err)
+	}
+}
+
+func TestDeferredProjectFileToolRequiresExplicitWorkspace(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	base := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	deferred := &deferredBrokerTestStore{cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{HostID: "h1234567"}}
+	fixture.executor.store = deferred
+	deferred.details.Task.ProjectID = "j1234567"
+	deferred.details.Task.HostID, deferred.details.Task.WorkspaceID = "", ""
+	deferred.details.Task.InputRevision, deferred.details.Task.WorkspaceCheckpointRevision = nil, nil
+	claimed := deferred.details.Task
+	broker, err := NewCloudDSHToolBroker(deferred, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapping, _ := runtimeToolMappingByName(runtimeToolFileRead)
+	bound, _, reason, err := broker.bindDeferredRuntimeTarget(context.Background(), claimed, deferred.target, mapping,
+		ModelToolCall{CallID: "project-file-read", Name: runtimeToolFileRead, Arguments: `{"path":"README.md"}`})
+	if err != nil || reason != "workspace_unavailable" || deferred.resolveCalls != 0 || deferred.bindCalls != 0 || bound.ID != "" {
+		t.Fatalf("project Workspace was derived from Host: task=%+v reason=%q resolver_calls=%d binds=%d err=%v",
+			bound, reason, deferred.resolveCalls, deferred.bindCalls, err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDeferredComputerExplainsChangedBoundTarget(t *testing.T) {

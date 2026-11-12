@@ -168,6 +168,64 @@ test('web renewal and logout only use the fixed Client bearer routes', async () 
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('project upload is gated by both advertised sync features', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return json(String(url).endsWith('/api/capabilities')
+      ? { ...capabilities, supported_features: [...capabilities.supported_features, 'workspace_sync'] }
+      : {});
+  };
+  try {
+    const api = new MordeAPI(() => credentials);
+    await assert.rejects(() => api.requireProjectUploadCapability(), /尚未开放云端电脑项目上传/);
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      return json({ ...capabilities, supported_features: [...capabilities.supported_features, 'workspace_sync', 'project_upload'] });
+    };
+    await api.requireProjectUploadCapability();
+    assert.deepEqual(calls, [
+      'https://portal.example/api/capabilities',
+      'https://portal.example/api/capabilities',
+    ]);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('project folder registration uses a Portal cookie and sends metadata only', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const folder = {
+    folder_id: 'morde-0123456789abcdef0123456789abcdef', workspace_id: 'w1234567',
+    folder_kind: 'project', project_name: 'demo', relative_path: 'project/demo',
+    state: 'pending_node', sync_available: false,
+  };
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return json(String(url).endsWith('/sync-folders') && options.method === 'POST' ? folder : { items: [folder] }, options.method === 'POST' ? 201 : 200);
+  };
+  try {
+    const api = new MordeAPI(() => credentials);
+    const session = { credential: 'portal-cookie-secret', expiresAt: future };
+    const listed = await api.hostProjectFolders('h1234567', session);
+    const registered = await api.registerHostProjectFolder('h1234567', 'demo', session, 'registration-key');
+    assert.equal(listed[0].folderID, folder.folder_id);
+    assert.equal(registered.relativePath, 'project/demo');
+    assert.equal(calls[0].options.headers.cookie, 'ch_portal=portal-cookie-secret');
+    assert.equal(calls[0].options.headers.authorization, undefined);
+    assert.equal(calls[1].options.headers['Idempotency-Key'], 'registration-key');
+    assert.deepEqual(JSON.parse(calls[1].options.body), { project_name: 'demo' });
+    assert.equal(JSON.stringify(calls).includes('file'), false);
+    await assert.rejects(() => api.registerHostProjectFolder('../bad', 'demo', session, 'key'), /Invalid host ID/);
+    await assert.rejects(() => api.registerHostProjectFolder('h1234567', '../bad', session, 'key'), /Invalid Morde project folder registration request/);
+    folder.relative_path = 'project/../outside';
+    await assert.rejects(() => api.hostProjectFolders('h1234567', session), /Invalid Morde project folder path/);
+    folder.relative_path = 'project/demo';
+    folder.folder_id = 'invalid-folder-id';
+    await assert.rejects(() => api.hostProjectFolders('h1234567', session), /Invalid Morde project folder response/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('invalid login responses and expired Client credentials fail closed', async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

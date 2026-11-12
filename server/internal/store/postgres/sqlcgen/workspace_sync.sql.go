@@ -63,7 +63,7 @@ const cancelWorkspaceSyncSession = `-- name: CancelWorkspaceSyncSession :one
 UPDATE workspace_sync_sessions
 SET state='cancelled', stage='complete', updated_at=now()
 WHERE workspace_id=$1 AND id=$2 AND state IN ('planned','transferring','verifying','applying')
-RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key
+RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key, folder_id, folder_baseline_revision
 `
 
 type CancelWorkspaceSyncSessionParams struct {
@@ -107,6 +107,8 @@ func (q *Queries) CancelWorkspaceSyncSession(ctx context.Context, arg CancelWork
 		&i.DownloadDeletedDirectories,
 		&i.TaskID,
 		&i.TaskHubOperationKey,
+		&i.FolderID,
+		&i.FolderBaselineRevision,
 	)
 	return i, err
 }
@@ -178,12 +180,12 @@ INSERT INTO workspace_sync_sessions (
   files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths,
   download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories,
   deleted_directories, upload_deleted_directories, download_deleted_directories, ack_cursor, conflicts,
-  task_id, task_hub_operation_key
+  task_id, task_hub_operation_key, folder_id, folder_baseline_revision
 )
 VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32
 )
-RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key
+RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key, folder_id, folder_baseline_revision
 `
 
 type CreateWorkspaceSyncSessionParams struct {
@@ -217,6 +219,8 @@ type CreateWorkspaceSyncSessionParams struct {
 	Conflicts                  []byte      `json:"conflicts"`
 	TaskID                     pgtype.Text `json:"task_id"`
 	TaskHubOperationKey        pgtype.Text `json:"task_hub_operation_key"`
+	FolderID                   pgtype.Text `json:"folder_id"`
+	FolderBaselineRevision     pgtype.Int8 `json:"folder_baseline_revision"`
 }
 
 func (q *Queries) CreateWorkspaceSyncSession(ctx context.Context, arg CreateWorkspaceSyncSessionParams) (WorkspaceSyncSession, error) {
@@ -251,6 +255,8 @@ func (q *Queries) CreateWorkspaceSyncSession(ctx context.Context, arg CreateWork
 		arg.Conflicts,
 		arg.TaskID,
 		arg.TaskHubOperationKey,
+		arg.FolderID,
+		arg.FolderBaselineRevision,
 	)
 	var i WorkspaceSyncSession
 	err := row.Scan(
@@ -286,6 +292,8 @@ func (q *Queries) CreateWorkspaceSyncSession(ctx context.Context, arg CreateWork
 		&i.DownloadDeletedDirectories,
 		&i.TaskID,
 		&i.TaskHubOperationKey,
+		&i.FolderID,
+		&i.FolderBaselineRevision,
 	)
 	return i, err
 }
@@ -467,7 +475,7 @@ func (q *Queries) GetWorkspaceSyncCursor(ctx context.Context, arg GetWorkspaceSy
 }
 
 const getWorkspaceSyncSession = `-- name: GetWorkspaceSyncSession :one
-SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2
+SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key, folder_id, folder_baseline_revision FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2
 `
 
 type GetWorkspaceSyncSessionParams struct {
@@ -511,6 +519,8 @@ func (q *Queries) GetWorkspaceSyncSession(ctx context.Context, arg GetWorkspaceS
 		&i.DownloadDeletedDirectories,
 		&i.TaskID,
 		&i.TaskHubOperationKey,
+		&i.FolderID,
+		&i.FolderBaselineRevision,
 	)
 	return i, err
 }
@@ -1262,7 +1272,7 @@ func (q *Queries) ListWorkspaceSyncTransferBlocks(ctx context.Context, arg ListW
 }
 
 const lockWorkspaceSyncSession = `-- name: LockWorkspaceSyncSession :one
-SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE
+SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories, task_id, task_hub_operation_key, folder_id, folder_baseline_revision FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE
 `
 
 type LockWorkspaceSyncSessionParams struct {
@@ -1306,6 +1316,8 @@ func (q *Queries) LockWorkspaceSyncSession(ctx context.Context, arg LockWorkspac
 		&i.DownloadDeletedDirectories,
 		&i.TaskID,
 		&i.TaskHubOperationKey,
+		&i.FolderID,
+		&i.FolderBaselineRevision,
 	)
 	return i, err
 }

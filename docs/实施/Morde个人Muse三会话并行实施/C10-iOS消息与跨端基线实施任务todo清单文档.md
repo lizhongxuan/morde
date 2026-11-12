@@ -43,3 +43,13 @@ clients/nanoMuse/android/src/ios/ 内现有 Morde 工程、实际聊天调用、
 
 C10-T1/T2/T3 均已完成；signed 选定模型 UI、G1 本地 Portal App-close / 重启 / 跨端对账验收均通过，可继续处理后续依赖任务。runtime 与 Keychain 阻塞已解除。未具备真机条件不影响本次模拟器验收，但不宣称真机已验收。只汇报本地位置、版本、验证及未完成项；不得外发文件。已有实现通过本任务验证可直接复用，不为勾选任务而重写。
 
+## 补充：PC 自然对话分流验证（2026-11-11）
+
+本节记录此次 PC 端实测，不改变 C10-T1/T2/T3 的 iOS 验收状态。
+
+- [x] 在本机 B40 Portal 发送“讲个笑话”和“现在几点？”。两条普通消息都停在“已受理，等待处理”，没有任务，也没有模型调用记录；路由租约持续重试。临时添加的测试账号模型预算未改变结果，验证后已删除。
+- [x] 修复源码：分类阶段遇到 `CodeConflict` 时不再无限延后，改为记录 `routing_context_unavailable`；PC 对话已有“重试处理”入口。缺失前序消息的安全恢复规则未改。
+- [x] PostgreSQL 集成验证 `TestRouteModelDirectReplySettlesReplaysAndAppliesOnce`、`TestDSHCoordinatorDirectReplyUsesNoToolsModelAndAppliesOnce` 通过：DSH 的直接回复写入一条助手消息、不建 Task、重放不重复调用；Worker 的直接回复与冲突处理单测通过。集成使用本机临时数据库和合成模型，没有调用外部模型服务。
+- `现在几点？` 属于直接回复，不应创建 Task；当前分类提示没有可信实时钟表或客户端时区信息，并要求模型不得编造，因此只能如实说明无法确认实时当地时间。
+- [ ] B40 浏览器端需在本地测试服务重建后复验。当前运行的 `/opt/c20-e2e/bin/portal-v2` 是独立于工作区源码的二进制；本次按本机“不得外发文件”约束没有替换或重启它，因此浏览器里两条既有测试消息仍代表旧服务行为，不能算源码修复后的实机通过。
+

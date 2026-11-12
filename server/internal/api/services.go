@@ -54,14 +54,18 @@ type TaskFileFetchEndpointService interface {
 	ManifestTaskFileFetch(context.Context, string, string, string, app.TaskFileFetchManifestRequest) (app.TaskFileFetchManifestReceipt, error)
 	PutTaskFileFetchChunk(context.Context, string, string, string, int32, string, io.Reader) (app.TaskFileFetchChunkReceipt, error)
 	CommitTaskFileFetch(context.Context, string, string, string, app.TaskFileFetchCommitRequest) (app.TaskFileFetchCommitReceipt, error)
+	AbortTaskFileFetch(context.Context, string, string, string) error
 	CancelTaskFileFetch(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
 	OpenTaskFileFetchContent(context.Context, identity.Principal, string, string) (app.TaskFileFetchContent, error)
 	DeleteTaskFileFetchContent(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
 }
 
 type WorkspaceSyncDeviceService interface {
-	CreateChallenge(context.Context, identity.Principal, string, string, []byte) (app.WorkspaceSyncDeviceChallengeResult, error)
-	Register(context.Context, identity.Principal, string, string, string, []byte) (app.WorkspaceSyncDeviceRegistration, error)
+	CreateFolder(context.Context, identity.Principal, string, string, string) (workspace.SyncFolder, error)
+	ListFolders(context.Context, identity.Principal, string) ([]workspace.SyncFolder, error)
+	GetFolder(context.Context, identity.Principal, string, string) (workspace.SyncFolder, error)
+	CreateChallenge(context.Context, identity.Principal, string, string, string, []byte) (app.WorkspaceSyncDeviceChallengeResult, error)
+	Register(context.Context, identity.Principal, string, string, string, string, []byte) (app.WorkspaceSyncDeviceRegistration, error)
 	List(context.Context, identity.Principal, string) ([]workspace.SyncDeviceBinding, error)
 	Revoke(context.Context, identity.Principal, string, string) error
 }

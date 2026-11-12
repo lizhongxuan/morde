@@ -50,6 +50,10 @@ func lockWorkspaceMutationFence(ctx context.Context, tx pgx.Tx, workspaceID stri
 }
 
 func requireWorkspaceOwnershipTransferNotFrozen(ctx context.Context, tx pgx.Tx, workspaceID string) error {
+	return requireWorkspaceOwnershipTransferNotFrozenExceptCopy(ctx, tx, workspaceID, "")
+}
+
+func requireWorkspaceOwnershipTransferNotFrozenExceptCopy(ctx context.Context, tx pgx.Tx, workspaceID, exceptCopyReservationID string) error {
 	var frozen bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
 SELECT 1 FROM workspace_ownership_transfers
@@ -62,8 +66,10 @@ WHERE workspace_id=$1 AND state IN ('pending','accepting','unknown')
 	}
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
 SELECT 1 FROM workspace_copy_reservations
-WHERE (source_workspace_id=$1 OR target_workspace_id=$1) AND state IN ('reserved','copying','unknown')
-)`, workspaceID).Scan(&frozen); err != nil {
+WHERE (source_workspace_id=$1 OR target_workspace_id=$1)
+  AND (state IN ('reserved','copying','unknown') OR host_copy_pending)
+  AND ($2='' OR id<>$2)
+)`, workspaceID, exceptCopyReservationID).Scan(&frozen); err != nil {
 		return fmt.Errorf("check Workspace copy freeze: %w", err)
 	}
 	if frozen {

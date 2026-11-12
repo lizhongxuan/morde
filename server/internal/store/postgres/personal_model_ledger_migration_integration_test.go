@@ -9,6 +9,7 @@ import (
 func TestPersonalModelLedgerMigrationPreservesHistoricalAttribution(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
+	owner := createTestUser(t, store, 1, 1000, 2048)
 	provider, closeProvider, err := newMigrationProvider(store.pool)
 	if err != nil {
 		t.Fatal(err)
@@ -17,7 +18,6 @@ func TestPersonalModelLedgerMigrationPreservesHistoricalAttribution(t *testing.T
 	if _, err := provider.DownTo(ctx, 134); err != nil {
 		t.Fatal(err)
 	}
-	owner := createTestUser(t, store, 1, 1000, 2048)
 	if _, err := store.pool.Exec(ctx, `INSERT INTO model_connections(id,owner_id,name,base_url,model_name,api_key_cipher)
 VALUES ('p1234567',$1,'personal','https://model.example/v1','test-model',decode(repeat('01',29),'hex')),
 ('p7654321',NULL,'platform','https://model.example/v1','test-model',decode(repeat('01',29),'hex')),

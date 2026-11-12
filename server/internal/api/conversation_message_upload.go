@@ -25,6 +25,7 @@ type initializeMessageUploadRequest struct {
 	ReferenceTaskID         string             `json:"reference_task_id"`
 	HostID                  string             `json:"host_id"`
 	WorkspaceID             string             `json:"workspace_id"`
+	ChangeTaskTarget        bool               `json:"change_task_target,omitempty"`
 	MCPConnectorIDs         []string           `json:"mcp_connector_ids"`
 	ClientAttachmentIDs     []string           `json:"client_attachment_ids"`
 	ApplicationID           string             `json:"application_id"`
@@ -149,7 +150,7 @@ func registerConversationMessageUploads(group *gin.RouterGroup, service TaskServ
 				app.InitializeConversationMessageUploadCommand{AcceptConversationMessageCommand: app.AcceptConversationMessageCommand{
 					ProjectID: scope.ProjectID, ServiceInstanceID: scope.InstanceID, ClientMessageID: scope.ClientID, IdempotencyKey: key,
 					PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
-					HostID: request.HostID, WorkspaceID: request.WorkspaceID, MCPConnectorIDs: request.MCPConnectorIDs,
+					HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget, MCPConnectorIDs: request.MCPConnectorIDs,
 					ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID, ModelID: request.ModelID, Budget: budget,
 				}, TotalBytes: request.TotalBytes, TotalChunks: request.TotalChunks, SHA256: request.SHA256})
 			if err != nil {

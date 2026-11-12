@@ -82,37 +82,219 @@ func deferredTargetFixture(t *testing.T, withWorkspace bool) (*Store, *app.Agent
 	return f.store, service, lease.Fence, details.Task, target
 }
 
-func TestDeferredTargetUsesLatestAppliedRevisionIntent(t *testing.T) {
-	store, _, _, claimed, target := deferredTargetFixture(t, true)
-	ctx := context.Background()
-	instanceID, err := store.ServiceInstanceID(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	clientID := "revision-target-message-001"
-	messageID := mustID(t, domain.NewMessageID)
-	hash := sha256.Sum256([]byte(clientID))
-	message, _, err := store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
-		Message: conversation.Message{ID: messageID, OwnerID: claimed.OwnerID, ActorID: claimed.InitiatorID,
-			ConversationID: claimed.ConversationID, Role: conversation.RoleUser, Content: "Use a different computer"},
-		ServiceInstanceID: instanceID, ClientID: clientID, RequestHash: hash[:], Authorization: claimed.Authorization,
-		Input: app.ConversationRoutingInput{HostID: "h7654321", Budget: claimed.Budget},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.pool.Exec(ctx, `INSERT INTO task_revision_intents
+func TestDeferredTargetChangesOnlyForExplicitRevisionIntent(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		changeTaskTarget bool
+	}{
+		{name: "default selection"},
+		{name: "explicit change", changeTaskTarget: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, _, _, claimed, originalTarget := deferredTargetFixture(t, true)
+			ctx := context.Background()
+			instanceID, err := store.ServiceInstanceID(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clientID := "revision-target-message-001"
+			messageID := mustID(t, domain.NewMessageID)
+			hash := sha256.Sum256([]byte(clientID))
+			message, _, err := store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
+				Message: conversation.Message{ID: messageID, OwnerID: claimed.OwnerID, ActorID: claimed.InitiatorID,
+					ConversationID: claimed.ConversationID, Role: conversation.RoleUser, Content: "Use a different computer"},
+				ServiceInstanceID: instanceID, ClientID: clientID, RequestHash: hash[:], Authorization: claimed.Authorization,
+				Input: app.ConversationRoutingInput{HostID: "h7654321", WorkspaceID: "w7654321", ApplicationID: "wechat",
+					ChangeTaskTarget: test.changeTaskTarget, Budget: claimed.Budget},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.pool.Exec(ctx, `INSERT INTO task_revision_intents
 (message_id,task_id,owner_id,initiator_id,conversation_id,message_sequence,expected_revision,state)
 VALUES ($1,$2,$3,$4,$5,$6,0,'applied')`, message.ID, claimed.ID, claimed.OwnerID, claimed.InitiatorID,
-		claimed.ConversationID, message.Sequence); err != nil {
+				claimed.ConversationID, message.Sequence); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1 WHERE id=$1`, claimed.ID); err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := store.LoadDeferredTaskTarget(ctx, claimed)
+			wantHostID, wantWorkspaceID, wantApplicationID := originalTarget.HostID, originalTarget.WorkspaceID, ""
+			if test.changeTaskTarget {
+				wantHostID, wantWorkspaceID, wantApplicationID = "h7654321", "w7654321", "wechat"
+			}
+			if err != nil || !found || got.HostID != wantHostID || got.WorkspaceID != wantWorkspaceID || got.ApplicationID != wantApplicationID {
+				t.Fatalf("revised selection = %+v found=%t err=%v; want host=%q workspace=%q application=%q",
+					got, found, err, wantHostID, wantWorkspaceID, wantApplicationID)
+			}
+		})
+	}
+}
+
+func removeDeferredIntentWorkspace(t *testing.T, store *Store, taskID string) {
+	t.Helper()
+	result, err := store.pool.Exec(context.Background(), `UPDATE conversation_message_routes
+SET request_metadata=request_metadata-'workspace_id'
+WHERE message_id=(SELECT id FROM conversation_messages WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1)`, taskID)
+	if err != nil || result.RowsAffected() != 1 {
+		t.Fatalf("remove explicit Workspace from deferred intent: rows=%d err=%v", result.RowsAffected(), err)
+	}
+}
+
+func TestDeferredTaskWorkspaceResolvesFromHostOnlyIntentAndRechecksBinding(t *testing.T) {
+	store, _, _, claimed, original := deferredTargetFixture(t, true)
+	ctx := context.Background()
+	removeDeferredIntentWorkspace(t, store, claimed.ID)
+
+	intent, found, err := store.LoadDeferredTaskTarget(ctx, claimed)
+	if err != nil || !found || intent.HostID != original.HostID || intent.WorkspaceID != "" {
+		t.Fatalf("Host-only intent lookup probed Workspace: target=%+v found=%t err=%v", intent, found, err)
+	}
+	resolved, found, err := store.ResolveDeferredTaskWorkspace(ctx, claimed, intent)
+	if err != nil || !found || resolved.HostID != original.HostID || resolved.WorkspaceID != original.WorkspaceID ||
+		resolved.WorkspaceBindingVersion < 1 {
+		t.Fatalf("resolve Host Workspace: target=%+v found=%t err=%v", resolved, found, err)
+	}
+
+	value, err := store.GetWorkspace(ctx, resolved.WorkspaceID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1 WHERE id=$1`, claimed.ID); err != nil {
+	page, err := store.GetWorkspaceManifestPageForOwner(ctx, claimed.InitiatorID, value.ID, value.Revision, "", "", 100)
+	if err != nil {
 		t.Fatal(err)
 	}
-	got, found, err := store.LoadDeferredTaskTarget(ctx, claimed)
-	if err != nil || !found || got.HostID != "h7654321" || got.WorkspaceID != "" || got.HostID == target.HostID {
-		t.Fatalf("revised selection was not used safely: target=%+v found=%t err=%v", got, found, err)
+	digestHex, err := workspace.ManifestTreeWithMetadataSHA256(page.Files, page.EmptyDirectories, page.Directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hex.DecodeString(digestHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := store.BindDeferredTaskTarget(ctx, claimed, resolved, &value.Revision, digest)
+	if err != nil || bound.HostID != original.HostID || bound.WorkspaceID != original.WorkspaceID {
+		t.Fatalf("bind resolved Host Workspace: task=%+v err=%v", bound, err)
+	}
+}
+
+func TestDeferredTaskWorkspaceBindingChangeBetweenResolveAndBindIsRejected(t *testing.T) {
+	store, _, _, claimed, original := deferredTargetFixture(t, true)
+	ctx := context.Background()
+	removeDeferredIntentWorkspace(t, store, claimed.ID)
+	intent, found, err := store.LoadDeferredTaskTarget(ctx, claimed)
+	if err != nil || !found {
+		t.Fatalf("load Host-only intent: found=%t err=%v", found, err)
+	}
+	resolved, found, err := store.ResolveDeferredTaskWorkspace(ctx, claimed, intent)
+	if err != nil || !found {
+		t.Fatalf("resolve Host Workspace: target=%+v found=%t err=%v", resolved, found, err)
+	}
+	value, err := store.GetWorkspace(ctx, resolved.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.GetWorkspaceManifestPageForOwner(ctx, claimed.InitiatorID, value.ID, value.Revision, "", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestHex, err := workspace.ManifestTreeWithMetadataSHA256(page.Files, page.EmptyDirectories, page.Directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hex.DecodeString(digestHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET binding_version=binding_version+1 WHERE host_id=$1 AND workspace_id=$2`,
+		original.HostID, original.WorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindDeferredTaskTarget(ctx, claimed, resolved, &value.Revision, digest); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("stale Host Workspace binding version was accepted: %v", err)
+	}
+	details, err := store.GetTask(ctx, claimed.ID, claimed.OwnerID)
+	if err != nil || details.Task.HostID != "" || details.Task.WorkspaceID != "" {
+		t.Fatalf("Task target changed after stale binding check: task=%+v err=%v", details.Task, err)
+	}
+}
+
+func TestDeferredTaskWorkspaceResolutionFailsClosedForBadBindings(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		withWorkspace bool
+		mutate        func(*testing.T, *Store, task.Task, app.DeferredTaskTarget)
+	}{
+		{name: "missing binding"},
+		{name: "multiple non-detached bindings", withWorkspace: true, mutate: func(t *testing.T, store *Store, claimed task.Task, target app.DeferredTaskTarget) {
+			ctx := context.Background()
+			extra := createTestWorkspace(t, ctx, store, claimed.InitiatorID, "legacy-extra-host-workspace")
+			if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_bindings
+(id,owner_id,host_id,workspace_id,directory_name,state,binding_version,desired_revision,applied_revision,sync_state)
+VALUES ($1,$2,$3,$4,$4,'active',1,$5,$5,'healthy')`, bindingID(target.HostID, extra.ID), claimed.InitiatorID,
+				target.HostID, extra.ID, extra.Revision); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "failed binding", withWorkspace: true, mutate: func(t *testing.T, store *Store, _ task.Task, target app.DeferredTaskTarget) {
+			if _, err := store.pool.Exec(context.Background(), `UPDATE workspace_bindings SET state='failed' WHERE host_id=$1`, target.HostID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unhealthy binding", withWorkspace: true, mutate: func(t *testing.T, store *Store, _ task.Task, target app.DeferredTaskTarget) {
+			if _, err := store.pool.Exec(context.Background(), `UPDATE workspace_bindings SET sync_state='conflict' WHERE host_id=$1`, target.HostID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "stale applied revision", withWorkspace: true, mutate: func(t *testing.T, store *Store, _ task.Task, target app.DeferredTaskTarget) {
+			if _, err := store.pool.Exec(context.Background(), `UPDATE workspace_bindings SET desired_revision=desired_revision+1 WHERE host_id=$1`, target.HostID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, _, _, claimed, target := deferredTargetFixture(t, test.withWorkspace)
+			removeDeferredIntentWorkspace(t, store, claimed.ID)
+			if test.mutate != nil {
+				test.mutate(t, store, claimed, target)
+			}
+			intent, found, err := store.LoadDeferredTaskTarget(context.Background(), claimed)
+			if err != nil || !found || intent.WorkspaceID != "" {
+				t.Fatalf("Host-only intent lookup failed early: target=%+v found=%t err=%v", intent, found, err)
+			}
+			resolved, found, err := store.ResolveDeferredTaskWorkspace(context.Background(), claimed, intent)
+			if err == nil || found || resolved.WorkspaceID != "" {
+				t.Fatalf("bad Host Workspace binding resolved: target=%+v found=%t err=%v", resolved, found, err)
+			}
+		})
+	}
+}
+
+func TestDeferredSharedHostControlDoesNotGrantWorkspaceResolution(t *testing.T) {
+	store, _, _, claimed, _ := deferredTargetFixture(t, false)
+	ctx := context.Background()
+	hostOwner := createPreRetirementTestUser(t, store, 4, 2000, 4096)
+	workspaceValue := createTestWorkspace(t, ctx, store, hostOwner.ID, "shared-host-workspace")
+	shared, binding := createRunningControlHostForWorkspace(t, ctx, store, hostOwner.ID, workspaceValue, host.ControlAI, 0)
+	if _, err := store.TransitionWorkspaceBinding(ctx, shared.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertHostMember(ctx, host.Member{HostID: shared.ID, OwnerID: hostOwner.ID, UserID: claimed.InitiatorID,
+		Permissions: []host.Permission{host.PermissionDesktopControl}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET request_metadata=jsonb_set(request_metadata,'{host_id}',to_jsonb($2::text))
+WHERE message_id=(SELECT id FROM conversation_messages WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1)`, claimed.ID, shared.ID); err != nil {
+		t.Fatal(err)
+	}
+	intent, found, err := store.LoadDeferredTaskTarget(ctx, claimed)
+	if err != nil || !found || intent.HostID != shared.ID || intent.WorkspaceID != "" {
+		t.Fatalf("load shared Host-only intent: target=%+v found=%t err=%v", intent, found, err)
+	}
+	if _, found, err := store.ResolveDeferredTaskWorkspace(ctx, claimed, intent); err == nil || found {
+		t.Fatalf("desktop-control permission granted another user's Workspace: found=%t err=%v", found, err)
 	}
 }
 
@@ -188,7 +370,7 @@ func TestDeferredTargetSelectionUsesTaskCredentialOnlyWhenToolRuns(t *testing.T)
 			Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: claimed.OwnerID, ActorID: claimed.InitiatorID,
 				ConversationID: claimed.ConversationID, Role: conversation.RoleUser, Content: "Use this selected computer"},
 			ServiceInstanceID: instanceID, ClientID: clientID, RequestHash: digest[:], Authorization: authorization,
-			Input: app.ConversationRoutingInput{HostID: target.HostID, Budget: claimed.Budget},
+			Input: app.ConversationRoutingInput{HostID: target.HostID, ChangeTaskTarget: true, Budget: claimed.Budget},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -339,6 +521,76 @@ func TestDeferredWorkspaceBindsOnlyMatchingCurrentSnapshot(t *testing.T) {
 	wrong.WorkspaceID = "w7654321"
 	if _, err := store.BindDeferredTaskTarget(ctx, claimed, wrong, &revision, digest); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("unselected Workspace was accepted: %v", err)
+	}
+}
+
+func TestDeferredWorkspaceRebindFollowsTaskCheckpointAfterWrite(t *testing.T) {
+	store, _, _, claimed, target := deferredTargetFixture(t, true)
+	ctx := context.Background()
+	value, err := store.GetWorkspace(ctx, target.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.GetWorkspaceManifestPageForOwner(ctx, claimed.InitiatorID, target.WorkspaceID, value.Revision, "", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestHex, err := workspace.ManifestTreeWithMetadataSHA256(page.Files, page.EmptyDirectories, page.Directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hex.DecodeString(digestHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := store.BindDeferredTaskTarget(ctx, claimed, target, &value.Revision, digest)
+	if err != nil {
+		t.Fatalf("bind initial Workspace snapshot: %v", err)
+	}
+
+	checkpoint := value.Revision + 1
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revisions (workspace_id,revision,file_count,total_bytes,directory_count)
+SELECT workspace_id,$2,file_count,total_bytes,directory_count FROM workspace_revisions WHERE workspace_id=$1 AND revision=$3`,
+		target.WorkspaceID, checkpoint, value.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET revision=$2,updated_at=clock_timestamp() WHERE id=$1`,
+		target.WorkspaceID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET desired_revision=$3,applied_revision=$3,sync_state='healthy'
+WHERE host_id=$1 AND workspace_id=$2`, target.HostID, target.WorkspaceID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET workspace_checkpoint_revision=$2 WHERE id=$1`, bound.ID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.GetTask(ctx, bound.ID, bound.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Task.ConversationContext = bound.ConversationContext
+	rebound, err := store.BindDeferredTaskTarget(ctx, current.Task, target, bound.InputRevision, bound.ContextDigest)
+	if err != nil || rebound.WorkspaceCheckpointRevision == nil || *rebound.WorkspaceCheckpointRevision != checkpoint {
+		t.Fatalf("same task could not rebind after its committed Workspace write: task=%+v err=%v", rebound, err)
+	}
+
+	externalRevision := checkpoint + 1
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revisions (workspace_id,revision,file_count,total_bytes,directory_count)
+SELECT workspace_id,$2,file_count,total_bytes,directory_count FROM workspace_revisions WHERE workspace_id=$1 AND revision=$3`,
+		target.WorkspaceID, externalRevision, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET revision=$2,updated_at=clock_timestamp() WHERE id=$1`,
+		target.WorkspaceID, externalRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET desired_revision=$3,applied_revision=$3,sync_state='healthy'
+WHERE host_id=$1 AND workspace_id=$2`, target.HostID, target.WorkspaceID, externalRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindDeferredTaskTarget(ctx, rebound, target, bound.InputRevision, bound.ContextDigest); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("Task accepted a Workspace revision changed outside its checkpoint: %v", err)
 	}
 }
 

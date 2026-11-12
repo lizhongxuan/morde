@@ -24,10 +24,10 @@ func (r *RuntimeControl) StopTaskOperation(ctx context.Context, claimed task.Tas
 		return "", "", false, err
 	}
 	defer session.Close()
-	if session.Fence.HostID != operation.HostID || session.Fence.RuntimeGeneration != operation.RuntimeGeneration ||
-		session.Fence.RuntimeInstanceID != operation.RuntimeInstanceID {
-		return "", "", false, domain.NewError(domain.CodeInvalidState, "task operation runtime instance changed")
+	if session.Fence.HostID != operation.HostID || session.Fence.RuntimeGeneration != operation.RuntimeGeneration {
+		return "", "", false, domain.NewError(domain.CodeInvalidState, "task operation belongs to a different Host generation")
 	}
+	// The current runtime can reconcile a prior process's operation from its persistent ledger.
 	value, err := session.CancelOperation(ctx, operation.ID)
 	if err != nil {
 		if isRuntimeOperationNotFound(err) {

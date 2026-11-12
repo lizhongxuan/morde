@@ -21,7 +21,11 @@ const (
 	maxHubInspectPath       = 1024
 )
 
-var errHubInspect = errors.New("selected directory inspection failed")
+var (
+	errHubInspect = errors.New("selected directory inspection failed")
+	// ErrHubFileChanged indicates the file no longer matches its authorized snapshot version.
+	ErrHubFileChanged = errors.New("selected file changed after snapshot")
+)
 
 type HubRootSelection struct {
 	Directory string `json:"directory"`
@@ -261,7 +265,7 @@ func ReadHubFileChunk(directory, identity, relative, version string, offset int6
 	sha := hex.EncodeToString(digest)
 	actualVersion := hubFileSnapshotVersion(identity, relative, file.info, sha)
 	if subtle.ConstantTimeCompare([]byte(actualVersion), []byte(version)) != 1 {
-		return HubFileChunk{}, errHubInspect
+		return HubFileChunk{}, ErrHubFileChanged
 	}
 	chunkDigest := sha256.Sum256(data)
 	return HubFileChunk{Path: relative, Offset: offset, Version: actualVersion, SHA256: hex.EncodeToString(chunkDigest[:]), Data: data}, nil

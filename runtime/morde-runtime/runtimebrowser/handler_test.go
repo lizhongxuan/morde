@@ -210,6 +210,177 @@ func TestStopFailsClosedAcrossCDPDisconnectAndReconnect(t *testing.T) {
 	assertTargetPresent(t, state, "user-tab-1", "")
 }
 
+func TestStopConfirmsClosedContextAfterEffectMayHaveRun(t *testing.T) {
+	controller, state := newTestController(t)
+	defer controller.Close()
+	if _, err := executeBrowser(t, controller, "q0000001", "o0000022", "open_tab", `{"url":"https://example.test/a"}`); err != nil {
+		t.Fatal(err)
+	}
+	binding, ok := controller.registry.operation("o0000022")
+	if !ok || !binding.Completed || !binding.EffectMayHaveRun || binding.ContextID == "" {
+		t.Fatalf("completed browser operation binding = %+v, exists=%v", binding, ok)
+	}
+	stop, err := handlerFor(controller, capabilityBrowserActions, "open_tab").Stop(context.Background(), contract.Operation{
+		OperationID: "o0000022", TaskID: "q0000001", Capability: capabilityBrowserActions, Action: "open_tab",
+	})
+	if err != nil || !stop.VerifiedStopped {
+		t.Fatalf("Stop result=%+v err=%v, want context closure to confirm the task stopped", stop, err)
+	}
+	if hasContext(state, binding.ContextID) {
+		t.Fatalf("task context %q remains after verified Stop", binding.ContextID)
+	}
+	assertTargetPresent(t, state, "user-tab-1", "")
+}
+
+func TestQuiesceWaitsForDispatchedBrowserTypeBeforeHumanControl(t *testing.T) {
+	controller, state := newTestController(t)
+	t.Cleanup(func() { _ = controller.Close() })
+	result, err := executeBrowser(t, controller, "q0000001", "o0000200", "open_tab", `{"url":"https://example.test/a"}`)
+	if err != nil {
+		t.Fatalf("open task tab: %v", err)
+	}
+	var tab struct {
+		TargetID string `json:"target_id"`
+	}
+	if err := json.Unmarshal(result, &tab); err != nil || tab.TargetID == "" {
+		t.Fatalf("open tab result=%s err=%v", result, err)
+	}
+	state.mu.Lock()
+	state.blockNextInsertText = true
+	state.insertTextEntered = make(chan string, 1)
+	state.allowInsertText = make(chan struct{})
+	state.disposeStarted = make(chan string, 1)
+	releaseInput := state.allowInsertText
+	state.mu.Unlock()
+	defer func() {
+		select {
+		case <-releaseInput:
+		default:
+			close(releaseInput)
+		}
+	}()
+
+	storeDir := t.TempDir()
+	if err := os.Chmod(storeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := runtimecore.Open(runtimecore.Options{
+		StoreDir: storeDir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: "h0000001", Generation: 1,
+		ProtocolVersion: contract.ProtocolVersion, Handlers: controller.Handlers(),
+	})
+	if err != nil {
+		t.Fatalf("open runtime manager: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Errorf("close runtime manager: %v", err)
+		}
+	})
+	capabilities, err := manager.Capabilities(contract.CapabilitiesRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostID: "h0000001", RuntimeGeneration: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := contract.HostFence{
+		HostID: capabilities.HostID, RuntimeGeneration: capabilities.RuntimeGeneration,
+		RuntimeInstanceID: capabilities.RuntimeInstanceID, ControlVersion: capabilities.ControlVersion,
+	}
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, Mode: contract.ModeAI,
+	}); err != nil {
+		t.Fatalf("enable AI control: %v", err)
+	}
+	if _, err := manager.SetTaskLease("q0000001", contract.SetTaskLeaseRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, LeaseVersion: 1,
+		ExpiresAt: time.Now().UTC().Add(20 * time.Second),
+	}); err != nil {
+		t.Fatalf("set task lease: %v", err)
+	}
+	request := contract.ExecuteRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, TaskID: "q0000001", OperationID: "o0000201",
+		LeaseVersion: 1, Capability: capabilityBrowserActions, Action: "type",
+		Arguments: json.RawMessage(`{"target_id":"` + tab.TargetID + `","role":"textbox","name":"B40 approval probe","text":"B40-TAKEOVER-FENCE"}`),
+	}
+	operation, err := manager.Submit(context.Background(), request)
+	if err != nil || operation.Status != contract.OperationRunning {
+		t.Fatalf("submit browser type operation=%+v err=%v", operation, err)
+	}
+	select {
+	case got := <-state.insertTextEntered:
+		if got != "B40-TAKEOVER-FENCE" {
+			t.Fatalf("dispatched text=%q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("browser type did not reach Input.insertText")
+	}
+
+	blockedFence := fence
+	blockedFence.ControlVersion++
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: blockedFence, Mode: contract.ModeBlocked,
+	}); err != nil {
+		t.Fatalf("block AI control: %v", err)
+	}
+	type quiesceResult struct {
+		response contract.QuiesceResponse
+		err      error
+	}
+	quiesced := make(chan quiesceResult, 1)
+	go func() {
+		response, quiesceErr := manager.Quiesce(context.Background(), contract.QuiesceRequest{
+			ProtocolVersion: contract.ProtocolVersion, HostFence: blockedFence,
+			TargetControlVersion: blockedFence.ControlVersion + 1, TaskIDs: []string{"q0000001"},
+		})
+		quiesced <- quiesceResult{response: response, err: quiesceErr}
+	}()
+	select {
+	case contextID := <-state.disposeStarted:
+		if contextID == "" || hasContext(state, contextID) {
+			t.Fatalf("task browser context %q was not disposed", contextID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Quiesce did not stop the task browser context")
+	}
+	select {
+	case result := <-quiesced:
+		t.Fatalf("Quiesce returned before dispatched CDP input finished: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseInput)
+
+	var drained quiesceResult
+	select {
+	case drained = <-quiesced:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Quiesce did not finish after the dispatched CDP input returned")
+	}
+	if drained.err != nil || drained.response.Status != contract.QuiesceDrained || drained.response.DrainedReceipt == nil {
+		t.Fatalf("Quiesce response=%+v err=%v, want drained receipt", drained.response, drained.err)
+	}
+	operation, err = manager.QueryOperation(contract.ProtocolVersion, request.OperationID, contract.OperationQuery{
+		HostFence: blockedFence, TaskID: request.TaskID, LeaseVersion: request.LeaseVersion,
+	})
+	if err != nil || operation.Status != contract.OperationCancelled {
+		t.Fatalf("browser type operation after Quiesce=%+v err=%v, want cancelled", operation, err)
+	}
+	state.mu.Lock()
+	dispatchedText := state.dispatchedText
+	state.mu.Unlock()
+	if dispatchedText != "B40-TAKEOVER-FENCE" {
+		t.Fatalf("dispatched page input=%q, want preserved uncertain side effect", dispatchedText)
+	}
+	humanFence := blockedFence
+	humanFence.ControlVersion++
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: humanFence,
+		Mode: contract.ModeHuman, DrainedReceipt: drained.response.DrainedReceipt,
+	}); err != nil {
+		t.Fatalf("Human control with drained receipt: %v", err)
+	}
+	assertTargetPresent(t, state, "user-tab-1", "")
+}
+
 func TestRestartReconcilesOwnedContextButLeavesOperationUncertain(t *testing.T) {
 	controller, state, storeDir := newTestControllerWithStore(t)
 	result, err := executeBrowser(t, controller, "q0000001", "o0000030", "open_tab", `{"url":"https://example.test/a"}`)
@@ -309,6 +480,56 @@ func TestBrowserScreenshotInputLimitFitsCDPMessage(t *testing.T) {
 			encodedBytes, maxBrowserScreenshotMessageReserveBytes, maxCDPMessageBytes)
 	}
 }
+
+func TestTypeIntoElementFocusesResolvedElementAndDispatchesText(t *testing.T) {
+	target := &typeProbeTarget{}
+	dispatched := false
+	if err := typeIntoElement(context.Background(), target, "textbox", "B40 approval probe", "B40-APPROVED-INPUT", func() error {
+		dispatched = true
+		return nil
+	}); err != nil {
+		t.Fatalf("type into accessible textbox: %v", err)
+	}
+	if !target.focused || !dispatched || target.text != "B40-APPROVED-INPUT" {
+		t.Fatalf("focused=%v dispatched=%v text=%q", target.focused, dispatched, target.text)
+	}
+}
+
+type typeProbeTarget struct {
+	focused bool
+	text    string
+}
+
+func (t *typeProbeTarget) Call(_ context.Context, method string, params any, result any) error {
+	switch method {
+	case "Runtime.evaluate":
+		return assignFakeResult(result, map[string]any{"result": map[string]any{"objectId": "query-result"}})
+	case "Runtime.getProperties":
+		return assignFakeResult(result, map[string]any{"result": []any{
+			map[string]any{"name": "count", "value": map[string]any{"value": 1}},
+			map[string]any{"name": "element", "value": map[string]any{"objectId": "element-result"}},
+		}})
+	case "Runtime.callFunctionOn":
+		request := params.(map[string]any)
+		if request["objectId"] != "element-result" || !strings.Contains(request["functionDeclaration"].(string), "this.focus()") {
+			return errors.New("unexpected focus request")
+		}
+		t.focused = true
+		return nil
+	case "Input.insertText":
+		if !t.focused {
+			return errors.New("element was not focused")
+		}
+		t.text = params.(map[string]any)["text"].(string)
+		return nil
+	case "Runtime.releaseObject":
+		return nil
+	default:
+		return errors.New("unexpected CDP method: " + method)
+	}
+}
+
+func (*typeProbeTarget) Close() error { return nil }
 
 func TestFieldObservationReturnsOnlyBoundedFingerprint(t *testing.T) {
 	controller, state := newTestController(t)
@@ -481,6 +702,12 @@ type fakeBrowserState struct {
 
 	blockNextCreateTarget bool
 	createTargetEntered   chan string
+	blockNextInsertText   bool
+	insertTextEntered     chan string
+	allowInsertText       chan struct{}
+	disposeStarted        chan string
+	inputFocused          bool
+	dispatchedText        string
 	observeText           string
 	observeValue          string
 	observeCount          int
@@ -553,7 +780,11 @@ func (c *fakeBrowserConnection) DisposeBrowserContext(ctx context.Context, conte
 	}
 	c.state.mu.Lock()
 	deleteContext(c.state, contextID)
+	disposeStarted := c.state.disposeStarted
 	c.state.mu.Unlock()
+	if disposeStarted != nil {
+		disposeStarted <- contextID
+	}
 	return nil
 }
 
@@ -695,6 +926,10 @@ func (t *fakeTargetConnection) Call(ctx context.Context, method string, params a
 	case "Runtime.evaluate":
 		args := params.(map[string]any)
 		expression := args["expression"].(string)
+		if strings.Contains(expression, "const wantedRole=") {
+			t.connection.state.mu.Unlock()
+			return assignFakeResult(result, map[string]any{"result": map[string]any{"objectId": "query-result"}})
+		}
 		var value any
 		if expression == "document.title" {
 			value = target.Title
@@ -714,6 +949,39 @@ func (t *fakeTargetConnection) Call(ctx context.Context, method string, params a
 		}
 		t.connection.state.mu.Unlock()
 		return assignFakeResult(result, map[string]any{"result": map[string]any{"value": value}})
+	case "Runtime.getProperties":
+		t.connection.state.mu.Unlock()
+		return assignFakeResult(result, map[string]any{"result": []any{
+			map[string]any{"name": "count", "value": map[string]any{"value": 1}},
+			map[string]any{"name": "element", "value": map[string]any{"objectId": "input-element"}},
+		}})
+	case "Runtime.callFunctionOn":
+		request := params.(map[string]any)
+		if request["objectId"] != "input-element" || !strings.Contains(request["functionDeclaration"].(string), "this.focus()") {
+			t.connection.state.mu.Unlock()
+			return errors.New("unexpected fake browser focus request")
+		}
+		t.connection.state.inputFocused = true
+		t.connection.state.mu.Unlock()
+		return nil
+	case "Input.insertText":
+		if !t.connection.state.inputFocused {
+			t.connection.state.mu.Unlock()
+			return errors.New("fake browser input was not focused")
+		}
+		text := params.(map[string]any)["text"].(string)
+		t.connection.state.dispatchedText = text
+		block := t.connection.state.blockNextInsertText
+		if block {
+			t.connection.state.blockNextInsertText = false
+			entered, release := t.connection.state.insertTextEntered, t.connection.state.allowInsertText
+			t.connection.state.mu.Unlock()
+			entered <- text
+			<-release
+			return nil
+		}
+		t.connection.state.mu.Unlock()
+		return nil
 	case "Page.captureScreenshot":
 		jpegData := append([]byte(nil), t.connection.state.screenshotData...)
 		t.connection.state.mu.Unlock()

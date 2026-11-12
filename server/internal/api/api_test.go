@@ -393,6 +393,31 @@ func TestHostCreateMapsDTOAndDoesNotExposeCredentialMaterial(t *testing.T) {
 	}
 }
 
+func TestHostCreateLetsPortalSessionOmitWorkspaceIDs(t *testing.T) {
+	services := newServices()
+	router := newRouter(t, services, Options{})
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	response := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/hosts", `{"name":"work"}`,
+		cookie, "https://portal.example.test", "Idempotency-Key", "route-host-create-auto-01")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	if services.hosts.principal.Kind != identity.KindSession || services.hosts.created.WorkspaceIDs != nil {
+		t.Fatalf("create principal/command = %#v / %#v", services.hosts.principal, services.hosts.created)
+	}
+}
+
+func TestHostCreateDoesNotAllowAPIKeyToOmitWorkspaceIDs(t *testing.T) {
+	services := newServices()
+	router := newRouter(t, services, Options{})
+	response := requestWithHeader(router, http.MethodPost, "/api/hosts", `{"name":"work"}`,
+		"Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-host-create-no-auto-01")
+	assertError(t, response, http.StatusForbidden, "forbidden")
+	if services.hosts.created.IdempotencyKey != "" {
+		t.Fatalf("Host service was called for an unauthorized automatic Workspace request: %#v", services.hosts.created)
+	}
+}
+
 func TestHostCreateRequiresOneValidIdempotencyKey(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
@@ -710,8 +735,8 @@ func TestHostValidationAndServiceErrors(t *testing.T) {
 	checks := []struct {
 		method, path, body string
 	}{
-		{http.MethodPost, "/api/hosts", `{}`},
 		{http.MethodPost, "/api/hosts", `{"workspace_ids":[]}`},
+		{http.MethodPost, "/api/hosts", `{"workspace_ids":null}`},
 		{http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567","w7654321"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["bad"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["w1234567","w1234567"]}`},
@@ -1739,17 +1764,44 @@ type workspaceSyncDeviceHTTPStub struct {
 	certificateDER []byte
 	challengeCalls int
 	registerCalls  int
+	folderCreates  int
+	folderLists    int
 	listCalls      int
 	revokeCalls    int
 }
 
-func (s *workspaceSyncDeviceHTTPStub) CreateChallenge(_ context.Context, principal identity.Principal, workspaceID, deviceID string, certificateDER []byte) (app.WorkspaceSyncDeviceChallengeResult, error) {
-	s.principal, s.workspaceID, s.deviceID, s.certificateDER = principal, workspaceID, deviceID, certificateDER
-	s.challengeCalls++
-	return app.WorkspaceSyncDeviceChallengeResult{ID: "n1234567", DeviceID: deviceID, Nonce: []byte("nonce"), SigningPayload: []byte("sign this"), ExpiresAt: time.Now().Add(time.Minute)}, nil
+func (s *workspaceSyncDeviceHTTPStub) CreateFolder(_ context.Context, principal identity.Principal, hostID, projectName, idempotencyKey string) (workspace.SyncFolder, error) {
+	s.principal = principal
+	s.folderCreates++
+	return workspace.SyncFolder{OwnerID: principal.UserID, WorkspaceID: testWorkspaceID, FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Kind: workspace.SyncFolderKindProject, ProjectName: projectName, RelativePath: "project/" + projectName, State: "pending_node"}, nil
 }
 
-func (s *workspaceSyncDeviceHTTPStub) Register(_ context.Context, principal identity.Principal, workspaceID, challengeID, idempotencyKey string, signature []byte) (app.WorkspaceSyncDeviceRegistration, error) {
+func (s *workspaceSyncDeviceHTTPStub) ListFolders(_ context.Context, principal identity.Principal, hostID string) ([]workspace.SyncFolder, error) {
+	s.principal = principal
+	s.folderLists++
+	return []workspace.SyncFolder{{OwnerID: principal.UserID, WorkspaceID: testWorkspaceID, FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Kind: workspace.SyncFolderKindProject, ProjectName: "demo", RelativePath: "project/demo", State: "pending_node"}}, nil
+}
+
+func (s *workspaceSyncDeviceHTTPStub) GetFolder(_ context.Context, principal identity.Principal, workspaceID, folderID string) (workspace.SyncFolder, error) {
+	s.principal = principal
+	return workspace.SyncFolder{OwnerID: principal.UserID, WorkspaceID: workspaceID, FolderID: folderID, Kind: workspace.SyncFolderKindProject,
+		ProjectName: "demo", RelativePath: "project/demo", State: "pending_node"}, nil
+}
+
+func (s *workspaceSyncDeviceHTTPStub) CreateChallenge(_ context.Context, principal identity.Principal, workspaceID, folderID, deviceID string, certificateDER []byte) (app.WorkspaceSyncDeviceChallengeResult, error) {
+	s.principal, s.workspaceID, s.deviceID, s.certificateDER = principal, workspaceID, deviceID, certificateDER
+	s.challengeCalls++
+	kind, path := workspace.SyncFolderKindWorkspaceRoot, "."
+	if folderID != "" {
+		kind, path = workspace.SyncFolderKindProject, "project/demo"
+	}
+	return app.WorkspaceSyncDeviceChallengeResult{ID: "n1234567", DeviceID: deviceID, FolderID: folderID,
+		FolderKind: kind, RelativePath: path, Nonce: []byte("nonce"), SigningPayload: []byte("sign this"), ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
+func (s *workspaceSyncDeviceHTTPStub) Register(_ context.Context, principal identity.Principal, workspaceID, folderID, challengeID, idempotencyKey string, signature []byte) (app.WorkspaceSyncDeviceRegistration, error) {
 	s.principal, s.workspaceID = principal, workspaceID
 	s.registerCalls++
 	if challengeID != "n1234567" || idempotencyKey != "sync-device-key-001" || string(signature) != "signature" {
@@ -1757,7 +1809,7 @@ func (s *workspaceSyncDeviceHTTPStub) Register(_ context.Context, principal iden
 	}
 	return app.WorkspaceSyncDeviceRegistration{Binding: workspace.SyncDeviceBinding{ID: "d1234567", WorkspaceID: workspaceID, ClientInstallationID: principal.ClientInstallationID,
 		DeviceID: "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA", FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		State: workspace.SyncDeviceBindingActive, CreatedAt: time.Now().UTC()}, Node: workspace.SyncNodeConnection{
+		FolderKind: workspace.SyncFolderKindWorkspaceRoot, RelativePath: ".", State: workspace.SyncDeviceBindingActive, CreatedAt: time.Now().UTC()}, Node: workspace.SyncNodeConnection{
 		DeviceID:     "BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB",
 		RelayAddress: "relay://relay.example.test:22067/?id=CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC"}}, nil
 }
@@ -1818,6 +1870,18 @@ func TestWorkspaceSyncDeviceHTTPContractUsesClientProofAndPortalRevocation(t *te
 	if listResponse.Code != http.StatusOK || deviceService.listCalls != 1 || deviceService.principal.Kind != identity.KindSession ||
 		!strings.Contains(listResponse.Body.String(), `"state":"pending_node"`) {
 		t.Fatalf("list sync devices = %d %s, calls=%d principal=%#v", listResponse.Code, listResponse.Body, deviceService.listCalls, deviceService.principal)
+	}
+	folderResponse := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/hosts/"+testHostID+"/sync-folders",
+		`{"project_name":"demo"}`, &http.Cookie{Name: portalCookieName, Value: portalCredential}, "https://portal.example.test", "Idempotency-Key", "sync-folder-key-001")
+	if folderResponse.Code != http.StatusCreated || deviceService.folderCreates != 1 || deviceService.principal.Kind != identity.KindSession ||
+		!strings.Contains(folderResponse.Body.String(), `"relative_path":"project/demo"`) ||
+		!strings.Contains(folderResponse.Body.String(), `"sync_available":false`) {
+		t.Fatalf("create project sync folder = %d %s, calls=%d principal=%#v", folderResponse.Code, folderResponse.Body, deviceService.folderCreates, deviceService.principal)
+	}
+	folderListResponse := requestWithCookie(router, http.MethodGet, "/api/hosts/"+testHostID+"/sync-folders",
+		&http.Cookie{Name: portalCookieName, Value: portalCredential}, "https://portal.example.test")
+	if folderListResponse.Code != http.StatusOK || deviceService.folderLists != 1 || !strings.Contains(folderListResponse.Body.String(), `"folder_kind":"project"`) {
+		t.Fatalf("list project sync folders = %d %s, calls=%d", folderListResponse.Code, folderListResponse.Body, deviceService.folderLists)
 	}
 	revokeResponse := requestWithCookie(router, http.MethodDelete, "/api/workspaces/"+testWorkspaceID+"/sync-devices/d1234567",
 		&http.Cookie{Name: portalCookieName, Value: portalCredential}, "https://portal.example.test")

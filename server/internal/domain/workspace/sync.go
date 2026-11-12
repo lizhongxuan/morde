@@ -321,6 +321,7 @@ type CreateSyncSession struct {
 	Direction           SyncDirection `json:"direction"`
 	Policy              SyncPolicy    `json:"policy"`
 	BaseRevision        int64         `json:"base_revision"`
+	FolderID            string        `json:"folder_id,omitempty"`
 	TaskID              string        `json:"task_id,omitempty"`
 	TaskHubOperationKey string        `json:"task_hub_operation_key,omitempty"`
 	Scope               []string      `json:"scope,omitempty"`
@@ -425,6 +426,7 @@ func ValidateDownloadAction(value DownloadAction) error {
 type SyncSession struct {
 	ID                         string           `json:"id"`
 	WorkspaceID                string           `json:"workspace_id"`
+	FolderID                   string           `json:"folder_id,omitempty"`
 	OwnerID                    string           `json:"-"`
 	ReplicaID                  string           `json:"-"`
 	TaskID                     string           `json:"-"`
@@ -433,6 +435,7 @@ type SyncSession struct {
 	Policy                     SyncPolicy       `json:"policy"`
 	State                      SyncState        `json:"state"`
 	BaseRevision               int64            `json:"base_revision"`
+	FolderBaselineRevision     *int64           `json:"-"`
 	TargetRevision             int64            `json:"target_revision"`
 	PinnedRevision             int64            `json:"-"`
 	Stage                      SyncStage        `json:"stage"`
@@ -1140,6 +1143,19 @@ func inDirectoryScope(directory string, scope []string) bool {
 	return false
 }
 
+func inDirectorySubtree(directory string, scope []string) bool {
+	if len(scope) == 0 {
+		return true
+	}
+	for _, candidate := range scope {
+		candidate = strings.TrimSuffix(candidate, "/")
+		if strings.EqualFold(directory, candidate) || strings.HasPrefix(strings.ToLower(directory), strings.ToLower(candidate)+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func sameFile(a, b File) bool {
 	return a.Path == b.Path && CanonicalFileKind(a.Kind) == CanonicalFileKind(b.Kind) && a.SymlinkTarget == b.SymlinkTarget && a.HardlinkTo == b.HardlinkTo &&
 		a.SizeBytes == b.SizeBytes && a.SHA256 == b.SHA256 && a.Mode == b.Mode && sameOptionalInt64(a.ModTimeNS, b.ModTimeNS) &&
@@ -1351,14 +1367,25 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 		seenMetadataDirectories[folded] = directory.Path
 	}
 	if len(value.Directories) > 0 {
-		metadataDirectoryCount := len(seenMetadataDirectories)
-		if _, hasRoot := seenMetadataDirectories["."]; hasRoot {
-			metadataDirectoryCount--
+		metadataDirectoryCount := 0
+		for _, directory := range seenMetadataDirectories {
+			if directory != "." && inDirectorySubtree(directory, value.Scope) {
+				metadataDirectoryCount++
+			}
 		}
-		if metadataDirectoryCount != len(expectedDirectories) {
+		expectedScopedDirectories := 0
+		for _, directory := range expectedDirectories {
+			if inDirectorySubtree(directory, value.Scope) {
+				expectedScopedDirectories++
+			}
+		}
+		if metadataDirectoryCount != expectedScopedDirectories {
 			return errors.New("sync directory metadata must cover every directory in the manifest")
 		}
 		for folded, expected := range expectedDirectories {
+			if !inDirectorySubtree(expected, value.Scope) {
+				continue
+			}
 			if actual, exists := seenMetadataDirectories[folded]; !exists || actual != expected {
 				return fmt.Errorf("directory %q has no matching metadata entry", expected)
 			}

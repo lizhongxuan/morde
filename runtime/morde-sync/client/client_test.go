@@ -55,7 +55,7 @@ func TestTaskLinkedSyncRequiresAndPreservesItsFence(t *testing.T) {
 	if err := (&Client{}).validateOptions(context.Background(), options); err != nil {
 		t.Fatalf("valid Task sync options rejected: %v", err)
 	}
-	data, err := createSessionPayload(options.Direction, options.Policy, baseRevision, options.Scope,
+	data, err := createSessionPayload("", options.Direction, options.Policy, baseRevision, options.Scope,
 		mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{}}, nil, nil, nil,
 		options.TaskID, options.TaskHubOperationKey)
 	if err != nil {
@@ -72,6 +72,127 @@ func TestTaskLinkedSyncRequiresAndPreservesItsFence(t *testing.T) {
 	options.SessionID, options.Direction, options.Policy, options.BaseRevision = testSession, "upload", "", nil
 	if err := (&Client{}).validateOptions(context.Background(), options); err != nil {
 		t.Fatalf("valid saved Task session could not be resumed without repeating its manifest scope: %v", err)
+	}
+}
+
+func TestProjectFolderSyncUsesUnscopedUploadSession(t *testing.T) {
+	const folderID = "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	baseRevision := int64(0)
+	created := false
+	writeSession := func(w http.ResponseWriter, status int, session SyncSession) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if err := json.NewEncoder(w).Encode(session); err != nil {
+			t.Errorf("encode sync session metadata: %v", err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sync-sessions") {
+			var request createSessionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode project upload metadata: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if request.FolderID != folderID || request.Direction != "upload" || request.Policy != "compare_merge" || request.BaseRevision != 0 ||
+				len(request.Scope) != 0 || len(request.Files) != 0 || len(request.EmptyDirectories) != 0 || len(request.DeletedPaths) != 0 || len(request.DeletedDirectories) != 0 {
+				t.Errorf("project upload request must contain only an empty local manifest and folder identity: %+v", request)
+			}
+			created = true
+			writeSession(w, http.StatusCreated, SyncSession{ID: testSession, WorkspaceID: testWorkspace, FolderID: folderID,
+				Direction: "upload", Policy: "compare_merge", State: "planned", BaseRevision: 0, TargetRevision: 1,
+				Stage: "compare", TransferBlocks: []TransferBlock{}, DownloadActions: []DownloadAction{}, Conflicts: []Conflict{}})
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sync-sessions/"+testSession+"/commit") {
+			writeSession(w, http.StatusOK, SyncSession{ID: testSession, WorkspaceID: testWorkspace, FolderID: folderID,
+				Direction: "upload", Policy: "compare_merge", State: "completed", BaseRevision: 0, TargetRevision: 1,
+				Stage: "complete", TransferBlocks: []TransferBlock{}, DownloadActions: []DownloadAction{}, Conflicts: []Conflict{}})
+			return
+		}
+		t.Errorf("unexpected project upload request %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL, "local-metadata-only-test-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Sync(context.Background(), SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(),
+		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{}})
+	if err != nil || !created || result.Session.State != "completed" || result.Session.FolderID != folderID {
+		t.Fatalf("project upload result = %+v, created=%v, err=%v", result, created, err)
+	}
+
+	invalid := []SyncOptions{
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "bidirectional", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "live", BaseRevision: &baseRevision},
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge"},
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{"src"}},
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, DeletedPaths: []string{"old.txt"}},
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, DeletedDirectories: []string{"old-directory"}},
+	}
+	for _, options := range invalid {
+		if err := client.validateOptions(context.Background(), options); err == nil {
+			t.Fatalf("project folder sync accepted invalid options: %+v", options)
+		}
+	}
+}
+
+func TestProjectUploadRejectsCloudToLocalSessionActions(t *testing.T) {
+	const folderID = "morde-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	baseRevision := int64(0)
+	sha := strings.Repeat("a", 64)
+	tests := []struct {
+		name           string
+		actions        []DownloadAction
+		transferBlocks []TransferBlock
+	}{
+		{name: "download action", actions: []DownloadAction{{Path: "cloud-only.txt", Action: "upsert", SHA256: &sha, SizeBytes: 0}}, transferBlocks: []TransferBlock{}},
+		{name: "download block", actions: []DownloadAction{}, transferBlocks: []TransferBlock{{Chunk: Chunk{SHA256: sha, SizeBytes: 1}, Role: "download"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/sync-sessions") {
+					t.Errorf("unexpected project upload request %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				var request createSessionRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("decode project upload metadata: %v", err)
+					http.Error(w, "invalid request", http.StatusBadRequest)
+					return
+				}
+				if request.FolderID != folderID || request.Direction != "upload" || request.Policy != "compare_merge" || request.BaseRevision != 0 ||
+					len(request.Scope) != 0 || len(request.Files) != 0 || len(request.EmptyDirectories) != 0 || len(request.DeletedPaths) != 0 || len(request.DeletedDirectories) != 0 {
+					t.Errorf("project upload request must contain only an empty local manifest and folder identity: %+v", request)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(SyncSession{ID: testSession, WorkspaceID: testWorkspace, FolderID: folderID,
+					Direction: "upload", Policy: "compare_merge", State: "planned", BaseRevision: 0, TargetRevision: 1,
+					Stage: "compare", TransferBlocks: test.transferBlocks, DownloadActions: test.actions, Conflicts: []Conflict{}})
+			}))
+			defer server.Close()
+
+			client, err := New(server.URL, "local-metadata-only-test-token", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Sync(context.Background(), SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(),
+				Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{}})
+			if err == nil || !strings.Contains(err.Error(), "project upload session unexpectedly contains") {
+				t.Fatalf("project upload accepted cloud-to-local session actions: %v", err)
+			}
+			if len(requests) != 1 || !strings.HasSuffix(requests[0], "/sync-sessions") {
+				t.Fatalf("project upload made requests beyond session metadata: %v", requests)
+			}
+		})
 	}
 }
 
@@ -195,7 +316,7 @@ func TestWorkspaceFileMappingPreservesSymlinkTargetWithoutBlocks(t *testing.T) {
 
 func TestClientEmptyDirectoryProtocolAndRecovery(t *testing.T) {
 	t.Run("create payload and action shape", func(t *testing.T) {
-		data, err := createSessionPayload("bidirectional", "live", 7, nil,
+		data, err := createSessionPayload("", "bidirectional", "live", 7, nil,
 			mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{"reports/empty"}},
 			[]string{"old.txt"}, []string{"old-directory"}, nil, "", "")
 		if err != nil {

@@ -662,6 +662,47 @@ func TestStdioHubFileSnapshotAndChunkTransfersLargeBinaryFiles(t *testing.T) {
 	}
 }
 
+func TestStdioHubFileChunkReportsChangedSnapshot(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "report.pdf")
+	if err := os.WriteFile(path, []byte("old snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := invokeRPC(t, map[string]any{
+		"jsonrpc": "2.0", "id": "root", "method": "hub_root",
+		"params": map[string]any{"directory": directory},
+	})
+	if selected.Error != nil {
+		t.Fatalf("hub_root response = %+v", selected)
+	}
+	var root client.HubRootSelection
+	if err := json.Unmarshal(selected.Result, &root); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := invokeRPC(t, map[string]any{
+		"jsonrpc": "2.0", "id": "snapshot", "method": "hub_file_snapshot",
+		"params": map[string]any{"directory": root.Directory, "identity": root.Identity, "path": "report.pdf"},
+	})
+	if snapshot.Error != nil {
+		t.Fatalf("hub_file_snapshot response = %+v", snapshot)
+	}
+	var value client.HubFileSnapshot
+	if err := json.Unmarshal(snapshot.Result, &value); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("new snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed := invokeRPC(t, map[string]any{
+		"jsonrpc": "2.0", "id": "chunk", "method": "hub_file_chunk",
+		"params": map[string]any{"directory": root.Directory, "identity": root.Identity, "path": "report.pdf",
+			"version": value.Version, "offset": 0, "max_bytes": 8},
+	})
+	if changed.Error == nil || changed.Error.Code != -32032 || strings.Contains(string(changed.Error.Message), directory) {
+		t.Fatalf("changed snapshot response = %+v", changed)
+	}
+}
+
 func TestStdioQuotaRetryRequiresSessionID(t *testing.T) {
 	params := syncParams{BaseURL: "http://127.0.0.1", BearerToken: testBearerToken,
 		WorkspaceID: testWorkspaceID, Directory: "/tmp/workspace", Direction: "upload", RetryCommitAfterQuota: true}
@@ -695,6 +736,35 @@ func TestStdioTaskSyncRequiresBoundUpload(t *testing.T) {
 	params.SessionID, params.Policy, params.BaseRevision, params.Scope = testSessionID, "", nil, nil
 	if err := validateSyncParams(params); err != nil {
 		t.Fatalf("saved Task sync could not be resumed: %v", err)
+	}
+}
+
+func TestStdioProjectUploadParamsRequireFixedUnscopedContract(t *testing.T) {
+	baseRevision := int64(0)
+	params := syncParams{
+		BaseURL: "http://127.0.0.1", BearerToken: testBearerToken, WorkspaceID: testWorkspaceID,
+		FolderID: "morde-0123456789abcdef0123456789abcdef", Directory: "/tmp/empty-project",
+		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision,
+	}
+	if err := validateSyncParams(params); err != nil {
+		t.Fatalf("valid empty project upload metadata rejected: %v", err)
+	}
+	invalid := []syncParams{
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: "bad",
+			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID,
+			Directory: params.Directory, Direction: "bidirectional", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID,
+			Directory: params.Directory, Direction: "upload", Policy: "fill_missing", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID,
+			Directory: params.Directory, Direction: "upload", Policy: "compare_merge"},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID,
+			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{"src"}},
+	}
+	for _, value := range invalid {
+		if err := validateSyncParams(value); err == nil {
+			t.Fatalf("invalid project upload metadata accepted: %+v", value)
+		}
 	}
 }
 

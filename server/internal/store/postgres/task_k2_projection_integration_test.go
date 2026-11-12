@@ -119,15 +119,23 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, parent.Task.ID, owner.ID, child.sessionID, ro
 		t.Fatal(err)
 	}
 	batchID := mustID(t, domain.NewMessageID)
+	triggerMessageID := mustID(t, domain.NewMessageID)
+	if err := store.WithTx(ctx, func(tx pgx.Tx) error {
+		return insertMessage(ctx, tx, conversation.Message{ID: triggerMessageID, OwnerID: owner.ID, ActorID: owner.ID,
+			ConversationID: conversationValue.ID, Role: conversation.RoleUser, Content: "Completed Task results are ready for review.",
+			SourceKind: "task_result_review"})
+	}); err != nil {
+		t.Fatalf("insert result review trigger: %v", err)
+	}
 	turnID := mustID(t, domain.NewStepID)
 	resultContent := "raw child result"
 	contentHash := sha256.Sum256([]byte(resultContent))
-	insertBatchAndSource := func(messageID string, revision, eventSequence int64, batchState, sourceState string) {
+	insertBatchAndSource := func(messageID string, revision, eventSequence int64, batchState, sourceState, triggerID string) {
 		t.Helper()
 		if _, err := store.pool.Exec(ctx, `INSERT INTO conversation_result_batches
-(message_id,service_instance_id,owner_id,actor_id,conversation_id,state,created_at,deadline)
-VALUES ($1,$2,$3,$3,$4,$5,now(),now()+interval '1 second')`, messageID, serviceInstanceID, owner.ID,
-			conversationValue.ID, batchState); err != nil {
+(message_id,service_instance_id,owner_id,actor_id,conversation_id,state,created_at,deadline,trigger_message_id)
+VALUES ($1,$2,$3,$3,$4,$5,now(),now()+interval '1 second',NULLIF($6,''))`, messageID, serviceInstanceID, owner.ID,
+			conversationValue.ID, batchState, triggerID); err != nil {
 			t.Fatalf("insert result batch %s: %v", messageID, err)
 		}
 		if _, err := store.pool.Exec(ctx, `INSERT INTO conversation_result_sources
@@ -137,7 +145,7 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 			t.Fatalf("insert result source for batch %s: %v", messageID, err)
 		}
 	}
-	insertBatchAndSource(batchID, 2, 4, "pending", "pending")
+	insertBatchAndSource(batchID, 2, 4, "pending", "pending", triggerMessageID)
 
 	dependencies, childJobs, review = readProjection(parent.Task.ID, 2)
 	if len(dependencies) != 4 || len(childJobs) != 2 || review == nil {
@@ -167,7 +175,7 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 		t.Fatalf("current revision child jobs = %#v", childJobs)
 	}
 	if review.State != "pending" || review.SourceTaskID != parent.Task.ID || review.SourceTaskRevision != 2 ||
-		review.SourceEventSequence != 4 || review.ReplyMessageID != nil {
+		review.SourceEventSequence != 4 || review.TriggerMessageID == nil || *review.TriggerMessageID != triggerMessageID || review.ReplyMessageID != nil {
 		t.Fatalf("pending result review = %#v", review)
 	}
 
@@ -186,7 +194,8 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 		projection, ok := page.K2Projections[parent.Task.ID]
 		if !foundTask || !ok || len(projection.Dependencies) != 4 || len(projection.ChildJobs) != 2 || projection.ResultReview == nil ||
 			projection.ResultReview.State != "pending" || projection.ResultReview.SourceTaskID != parent.Task.ID ||
-			projection.ResultReview.SourceTaskRevision != 2 || projection.ResultReview.SourceEventSequence != 4 {
+			projection.ResultReview.SourceTaskRevision != 2 || projection.ResultReview.SourceEventSequence != 4 ||
+			projection.ResultReview.TriggerMessageID == nil || *projection.ResultReview.TriggerMessageID != triggerMessageID {
 			t.Fatalf("%s K2 summary for parent: listed=%t projection=%#v", label, foundTask, projection)
 		}
 	}
@@ -208,7 +217,8 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 		t.Fatal(err)
 	}
 	_, _, review = readProjection(parent.Task.ID, 2)
-	if review == nil || review.State != "published" || review.ReplyMessageID == nil || *review.ReplyMessageID != batchID {
+	if review == nil || review.State != "published" || review.TriggerMessageID == nil || *review.TriggerMessageID != triggerMessageID ||
+		review.ReplyMessageID == nil || *review.ReplyMessageID != batchID {
 		t.Fatalf("published result review = %#v", review)
 	}
 	_, _, review = readProjection(parent.Task.ID, 3)
@@ -217,7 +227,7 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 	}
 
 	supersededBatchID := mustID(t, domain.NewMessageID)
-	insertBatchAndSource(supersededBatchID, 3, 5, "superseded", "superseded")
+	insertBatchAndSource(supersededBatchID, 3, 5, "superseded", "superseded", "")
 	_, _, review = readProjection(parent.Task.ID, 3)
 	if review != nil {
 		t.Fatalf("latest superseded result review = %#v, want nil", review)

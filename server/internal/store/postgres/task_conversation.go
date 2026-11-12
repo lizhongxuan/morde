@@ -512,8 +512,9 @@ func (s *Store) ListConversations(ctx context.Context, ownerID string, hostIDs [
 FROM conversations
 WHERE owner_id=$1 AND project_id IS NULL
   AND ($2::text[] IS NULL OR host_id=ANY($2::text[]))
-  AND ($3::timestamptz IS NULL OR updated_at<$3 OR (updated_at=$3 AND id<$4))
-ORDER BY updated_at DESC,id DESC LIMIT $5`, ownerID, hostIDs, cursorAt, cursorID, limit+1)
+  AND ($3::text = '' OR strpos(lower(title), lower($3)) > 0)
+  AND ($4::timestamptz IS NULL OR updated_at<$4 OR (updated_at=$4 AND id<$5))
+ORDER BY updated_at DESC,id DESC LIMIT $6`, ownerID, hostIDs, page.Search, cursorAt, cursorID, limit+1)
 	if err != nil {
 		return app.ConversationPage{}, fmt.Errorf("list conversations: %w", err)
 	}
@@ -729,8 +730,15 @@ func (s *Store) attachConversationResultSources(ctx context.Context, actorID, co
 }
 
 func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projectID, conversationID string, hostIDs []string, page app.PageRequest) (app.TaskPage, error) {
+	return s.ListConversationTasks(ctx, actorID, projectID, conversationID, hostIDs, app.ConversationTaskViewActive, page)
+}
+
+func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, conversationID string, hostIDs []string, view app.ConversationTaskView, page app.PageRequest) (app.TaskPage, error) {
 	if !domain.ValidUserID(actorID) || !domain.ValidConversationID(conversationID) || (projectID != "" && !project.ValidID(projectID)) {
 		return app.TaskPage{}, domain.NewError(domain.CodeNotFound, "conversation not found")
+	}
+	if view != app.ConversationTaskViewActive && view != app.ConversationTaskViewRecent {
+		return app.TaskPage{}, domain.InvalidArgument("view", "conversation task view is invalid")
 	}
 	for _, hostID := range hostIDs {
 		if !domain.ValidHostID(hostID) {
@@ -744,6 +752,7 @@ func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projec
 	var rows []sqlcgen.Task
 	var items []task.Task
 	var k2Projections map[string]app.TaskK2Projection
+	pendingCountsByHostID := make(map[string]int64)
 	err = s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		if projectID != "" {
 			if _, err := loadProjectConversationForActorInTx(ctx, tx, actorID, projectID, conversationID, false); err != nil {
@@ -759,12 +768,29 @@ func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projec
 			}
 		}
 		var err error
-		rows, err = sqlcgen.New(tx).ListConversationActiveTasks(ctx, sqlcgen.ListConversationActiveTasksParams{
-			ConversationID: conversationID, ProjectID: nullableText(projectID), ActorID: actorID,
+		queries := sqlcgen.New(tx)
+		rows, err = queries.ListConversationTasks(ctx, sqlcgen.ListConversationTasksParams{
+			ConversationID: conversationID, ProjectID: nullableText(projectID), ActorID: actorID, TaskView: string(view),
 			HostIds: hostIDs, CursorAt: cursorAt, CursorID: cursorID, PageLimit: limit + 1,
 		})
 		if err != nil {
 			return err
+		}
+		pendingRows, err := queries.CountConversationPendingTaskHosts(ctx, sqlcgen.CountConversationPendingTaskHostsParams{
+			ConversationID: conversationID, ProjectID: nullableText(projectID), ActorID: actorID, HostIds: hostIDs,
+		})
+		if err != nil {
+			return err
+		}
+		for _, row := range pendingRows {
+			if (row.HostID.Valid && !domain.ValidHostID(row.HostID.String)) || row.TaskCount < 0 {
+				return domain.NewError(domain.CodeInternal, "conversation task count is invalid")
+			}
+			hostID := ""
+			if row.HostID.Valid {
+				hostID = row.HostID.String
+			}
+			pendingCountsByHostID[hostID] = row.TaskCount
 		}
 		items = mapRows(rows, rowTaskDomain)
 		if err := populateTaskStepCounts(ctx, tx, items); err != nil {
@@ -781,9 +807,9 @@ func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projec
 		return err
 	})
 	if err != nil {
-		return app.TaskPage{}, fmt.Errorf("list active conversation tasks: %w", err)
+		return app.TaskPage{}, fmt.Errorf("list conversation tasks: %w", err)
 	}
-	result := app.TaskPage{Items: items, K2Projections: k2Projections}
+	result := app.TaskPage{Items: items, K2Projections: k2Projections, PendingCountsByHostID: pendingCountsByHostID}
 	result.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
 	if int32(len(items)) > limit {
 		result.Items = items[:limit]

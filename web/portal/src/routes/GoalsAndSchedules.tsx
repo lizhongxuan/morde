@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useLocation } from 'react-router';
 import type { components } from '../api/schema';
 import { api, unwrapApiResponse } from '../api/client';
 import { errorDetails, portalApi } from '../app/api';
@@ -57,6 +58,8 @@ function isActiveRun(run: ScheduleRun | null) {
 
 export function GoalsAndSchedules() {
   const client = useQueryClient();
+  const location = useLocation();
+  const activeView = new URLSearchParams(location.search).get('view') === 'schedules' ? 'schedules' : 'goals';
   const [goalFormOpen, setGoalFormOpen] = useState(false);
   const [expandedGoalID, setExpandedGoalID] = useState<string | null>(null);
   const [editingGoalID, setEditingGoalID] = useState<string | null>(null);
@@ -183,7 +186,7 @@ export function GoalsAndSchedules() {
   const goalWriteError = goalCreate.error ?? goalUpdate.error ?? goalDelete.error ?? goalStatus.error;
 
   return <section className="goals-grid">
-    <section className="connection-section" aria-labelledby="goals-title">
+    <section className="connection-section" aria-labelledby="goals-title" hidden={activeView !== 'goals'}>
       <div className="connection-section-heading">
         <div><h2 id="goals-title">目标</h2><p className="muted">目标状态和修订版本保存在你的个人云端数据中。</p></div>
         <button type="button" className="button button-primary" onClick={() => setGoalFormOpen((open) => !open)}>{goalFormOpen ? '收起' : '＋ 新建目标'}</button>
@@ -225,7 +228,7 @@ export function GoalsAndSchedules() {
       {goals.hasNextPage && <button type="button" className="button button-secondary schedule-load-more" disabled={goals.isFetchingNextPage} onClick={() => void goals.fetchNextPage()}>{goals.isFetchingNextPage ? '正在加载…' : '加载更多目标'}</button>}
     </section>
 
-    <section className="connection-section" aria-labelledby="schedules-title">
+    <section className="connection-section" aria-labelledby="schedules-title" hidden={activeView !== 'schedules'}>
       <div className="connection-section-heading">
         <div><h2 id="schedules-title">定时计划</h2><p className="muted">查看计划版本、运行状态和历史记录。</p></div>
         <button type="button" className="button button-primary" disabled={scheduleWriteDenied || hosts.isPending || models.isPending || !modelItems.length} onClick={() => setScheduleForm({ mode: 'create' })}>＋ 新建云端计划</button>

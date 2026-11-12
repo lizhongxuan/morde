@@ -119,7 +119,7 @@ enum MIFResourcePageSection: CaseIterable, Hashable {
         switch self {
         case .cloudComputers: return AppLocalized("Cloud computers")
         case .cloudPhones: return AppLocalized("Cloud phones")
-        case .workspaces: return AppLocalized("Workspaces")
+        case .workspaces: return AppLocalized("电脑文件")
         case .aiTools: return AppLocalized("AI tools")
         }
     }
@@ -128,7 +128,7 @@ enum MIFResourcePageSection: CaseIterable, Hashable {
         switch self {
         case .cloudComputers: return AppLocalized("No cloud computers are available in this account scope.")
         case .cloudPhones: return AppLocalized("Execution status unavailable")
-        case .workspaces: return AppLocalized("No Workspaces are available in this account scope.")
+        case .workspaces: return AppLocalized("此账号范围内没有可用的电脑文件。")
         case .aiTools: return AppLocalized("No AI tool runtime status is available in this account scope.")
         }
     }
@@ -481,7 +481,7 @@ struct MIFResourceRoom: View {
                                 .padding(.top, 1)
                         }
                         if host.status == .running && !host.canOpen && host.scope == .owned {
-                            Text(AppLocalized("A ready Workspace binding is required to open this computer."))
+                            Text(AppLocalized("电脑文件尚未就绪，暂时无法打开这台电脑。"))
                                 .font(.footnote)
                                 .foregroundStyle(Color.primary)
                                 .padding(.top, 1)
@@ -573,7 +573,7 @@ struct MIFResourceRoom: View {
 
     private func workspaceRow(_ workspace: MIFResourcePageState.Workspace) -> some View {
         let hostName = workspace.hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isMounted = workspace.status == .ready && hostName?.isEmpty == false
+        let isReadyOnComputer = workspace.status == .ready && hostName?.isEmpty == false
         return Button {
             actions.openWorkspaceFiles(workspace.id)
         } label: {
@@ -582,7 +582,7 @@ struct MIFResourceRoom: View {
                     .frame(width: 44, height: 44)
                     .background(rowIconFill, in: Circle())
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(workspace.name)
+                    Text(hostName.flatMap { $0.isEmpty ? nil : $0 } ?? AppLocalized("电脑文件"))
                         .font(.system(size: 16, weight: .semibold))
                         .tracking(-0.16)
                         .lineSpacing(1.5)
@@ -595,7 +595,7 @@ struct MIFResourceRoom: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     HStack(spacing: 6) {
-                        Text(isMounted ? AppLocalized("Mounted") : workspace.status.localizedTitle)
+                        Text(isReadyOnComputer ? AppLocalized("Ready") : workspace.status.localizedTitle)
                         if let hostName, !hostName.isEmpty {
                             Text("·")
                             Text(hostName)

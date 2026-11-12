@@ -622,6 +622,24 @@ type cloudDSHTestCompleter struct {
 	calls      int
 }
 
+type cloudDSHAckCrashTestCompleter struct {
+	instances  *cloudDSHTestInstanceStore
+	completion app.CloudDSHTaskCompletion
+	calls      int
+}
+
+func (c *cloudDSHAckCrashTestCompleter) Complete(_ context.Context, _ task.Task, completion app.CloudDSHTaskCompletion) error {
+	c.instances.mu.Lock()
+	stopped := c.instances.stopped
+	c.instances.mu.Unlock()
+	if stopped != 2 {
+		return errors.New("completion ran before recovery stopped the process tree")
+	}
+	c.calls++
+	c.completion = completion
+	return nil
+}
+
 func (c *cloudDSHTestCompleter) Complete(_ context.Context, _ task.Task, completion app.CloudDSHTaskCompletion) error {
 	c.instances.mu.Lock()
 	stopped := c.instances.stopped
@@ -2449,6 +2467,132 @@ func TestCloudDSHExecutorRecoversCompletedCheckpointWithPendingMessage(t *testin
 	}
 	if len(models.calls) != 2 || !strings.Contains(cloudDSHTestUserPrompt(t, models.calls[1]), "Follow up after completion.") {
 		t.Fatalf("pending message was not processed during recovery, model calls = %d", len(models.calls))
+	}
+}
+
+func TestCloudDSHExecutorRecoversCheckpointAfterRuntimeCrashBeforeAck(t *testing.T) {
+	executor, supervisor, instances, checkpoints, models, value := cloudDSHFixture(t)
+	tool := cloudDSHWriteTool()
+	toolResult := app.AgentToolResult{Status: app.AgentToolSucceeded, Output: `{"path":"notes.txt","bytes_written":5}`}
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: toolResult}
+	completer := &cloudDSHAckCrashTestCompleter{instances: instances}
+	executor.options.Tools, executor.options.Completion = tools, completer
+	value.Objective = "Update notes.txt with the requested detail."
+	checkpoints.pending = []app.AgentConversationMessage{{ID: "m1234567", Content: value.Objective, Initial: true}}
+	models.responses = []app.ModelResponse{
+		{ToolCalls: []app.ModelToolCall{{CallID: "call_write_crash", Name: tool.Name,
+			Arguments: `{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}`}},
+			StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}},
+		{Text: "Updated notes.txt with the requested detail.", StopReason: "stop",
+			Usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}},
+	}
+
+	// Save runs synchronously after the checkpoint side effect is durable and
+	// before runCloudDSH writes checkpoint_ack. Killing the local Runtime here
+	// leaves the stored event committed while ensuring the Runtime cannot receive
+	// its acknowledgement.
+	var crashCheckpoint app.AgentCheckpointCommand
+	var crashKillErr error
+	checkpoints.afterSave = func(command app.AgentCheckpointCommand) {
+		if crashCheckpoint.Payload != nil || !bytes.Contains(command.Payload, []byte(`"type":"tool/result"`)) {
+			return
+		}
+		crashCheckpoint = command
+		crashCheckpoint.Digest = append([]byte(nil), command.Digest...)
+		crashCheckpoint.Payload = append([]byte(nil), command.Payload...)
+		supervisor.mu.Lock()
+		process := supervisor.cmd
+		supervisor.mu.Unlock()
+		if process == nil || process.Process == nil {
+			crashKillErr = errors.New("test Runtime process is unavailable at checkpoint save")
+			return
+		}
+		crashKillErr = process.Process.Kill()
+	}
+	firstErr := executor.ExecuteTask(context.Background(), value)
+	if firstErr == nil || errors.Is(firstErr, ErrCloudDSHCompletionPending) || crashCheckpoint.Payload == nil || crashKillErr != nil {
+		t.Fatalf("pre-ack crash result=%v checkpoint=%d kill=%v", firstErr, crashCheckpoint.Through, crashKillErr)
+	}
+	if len(tools.calls) != 1 || len(models.calls) != 1 || instances.stopped != 1 {
+		t.Fatalf("first run tools=%d models=%d stopped=%d; want one completed side effect and one stopped Runtime", len(tools.calls), len(models.calls), instances.stopped)
+	}
+	if tail := latestAgentCheckpoint(checkpoints.commands, crashCheckpoint.Fence.AgentSessionID); tail.Through != crashCheckpoint.Through ||
+		!bytes.Equal(tail.Digest, crashCheckpoint.Digest) {
+		t.Fatalf("crash checkpoint was not the durable history tail: crash=%d tail=%d", crashCheckpoint.Through, tail.Through)
+	}
+
+	previous := supervisor.launch.Fence
+	value.AgentInstanceID, value.AgentGeneration, value.AgentSessionID = previous.AgentInstanceID, previous.AgentGeneration, previous.AgentSessionID
+	value.AgentEngineVersion, value.AgentProfileVersion = previous.EngineVersion, previous.ProfileVersion
+	value.CheckpointThroughSequence = crashCheckpoint.Through
+	value.CheckpointDigest = append([]byte(nil), crashCheckpoint.Digest...)
+	value.Lease.Version++
+	expires := time.Now().Add(time.Minute)
+	value.Lease.ExpiresAt = &expires
+	checkpoints.afterSave = nil
+	cloudDSHExpireTestRuntime(t, executor)
+
+	if err := executor.ExecuteTask(context.Background(), value); err != nil {
+		t.Fatalf("recovery after unacknowledged checkpoint = %v", err)
+	}
+	if len(tools.calls) != 1 || len(tools.recoveryCalls) != 1 || tools.recoveryCalls[0].CallID != "call_write_crash" ||
+		len(tools.recoveryExpected) != 1 || tools.recoveryExpected[0] == nil || *tools.recoveryExpected[0] != toolResult.Output ||
+		len(models.calls) != 2 || instances.stopped != 2 || completer.calls != 1 || len(checkpoints.reads) == 0 ||
+		completer.completion.Result != "Updated notes.txt with the requested detail." || len(completer.completion.Inputs) != 2 ||
+		completer.completion.Inputs[0].CallID != "call_write_crash" || completer.completion.Inputs[1].Output != toolResult.Output {
+		t.Fatalf("recovered state calls=%#v reconcile=%#v expected=%#v models=%d stopped=%d completions=%d candidate=%#v",
+			tools.calls, tools.recoveryCalls, tools.recoveryExpected, len(models.calls), instances.stopped, completer.calls, completer.completion)
+	}
+	if supervisor.launch.Fence.AgentGeneration != previous.AgentGeneration+1 ||
+		supervisor.launch.Fence.AgentSessionID != previous.AgentSessionID || supervisor.launch.Fence.AgentInstanceID == previous.AgentInstanceID {
+		t.Fatalf("recovery did not start the same checkpoint session in a new Runtime: previous=%#v current=%#v",
+			previous, supervisor.launch.Fence)
+	}
+	for _, request := range checkpoints.reads {
+		if request.SessionID != previous.AgentSessionID || request.Through != crashCheckpoint.Through ||
+			!bytes.Equal(request.ThroughDigest, crashCheckpoint.Digest) || request.Fence != supervisor.launch.Fence {
+			t.Fatalf("recovery read was not pinned to the unacknowledged checkpoint: %#v", request)
+		}
+	}
+	if !strings.Contains(cloudDSHTestUserPrompt(t, models.calls[0]), value.Objective) ||
+		!strings.Contains(cloudDSHTestUserPrompt(t, models.calls[1]), value.Objective) {
+		t.Fatal("recovered model input lost the original user message")
+	}
+
+	var userMessages, toolCalls, toolResults int
+	for _, command := range checkpoints.commands {
+		if command.Fence.AgentSessionID != crashCheckpoint.Fence.AgentSessionID {
+			continue
+		}
+		var body struct {
+			Events []struct {
+				Type string `json:"type"`
+				Data struct {
+					ID      string `json:"id"`
+					CallID  string `json:"callId"`
+					Message struct {
+						ToolCallID string `json:"toolCallId"`
+					} `json:"message"`
+				} `json:"data"`
+			} `json:"events"`
+		}
+		if err := json.Unmarshal(command.Payload, &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range body.Events {
+			if event.Type == "user/message" && event.Data.ID == "m1234567" {
+				userMessages++
+			}
+			if event.Type == "tool/call" && event.Data.CallID == "call_write_crash" {
+				toolCalls++
+			}
+			if event.Type == "tool/result" && event.Data.Message.ToolCallID == "call_write_crash" {
+				toolResults++
+			}
+		}
+	}
+	if userMessages != 1 || toolCalls != 1 || toolResults != 1 {
+		t.Fatalf("persisted event counts user=%d tool_call=%d tool_result=%d; want exactly one each", userMessages, toolCalls, toolResults)
 	}
 }
 

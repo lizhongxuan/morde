@@ -46,6 +46,20 @@ func ValidateSymlinkTarget(filePath, target string) error {
 	return nil
 }
 
+func validateSymlinkTargetWithinRoot(filePath, target, root string) error {
+	if err := ValidateRelativePath(root); err != nil || !inScope(strings.ToLower(filePath), []string{strings.ToLower(root)}) {
+		return errors.New("symlink path is outside its project folder")
+	}
+	if err := ValidateSymlinkTarget(filePath, target); err != nil {
+		return err
+	}
+	resolved := path.Clean(path.Join(path.Dir(filePath), target))
+	if !inScope(strings.ToLower(resolved), []string{strings.ToLower(root)}) {
+		return errors.New("symlink target escapes its project folder")
+	}
+	return nil
+}
+
 func validateWorkspaceSymlink(file File) error {
 	if err := ValidateSymlinkTarget(file.Path, file.SymlinkTarget); err != nil {
 		return err

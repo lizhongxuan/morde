@@ -40,7 +40,7 @@ test("the installer includes only the Morde desktop runtime", () => {
   assert.ok(extra.includes("    to: legal/LICENSE.syncthing.txt"));
   assert.ok(extra.includes("  - from: resources/THIRD_PARTY_NOTICES.syncthing.md"));
   assert.ok(extra.includes("    to: legal/THIRD_PARTY_NOTICES.syncthing.md"));
-  assert.ok(!extra.some((line) => /dsh\/|runtime\/|nanomuse-desktop/.test(line)));
+  assert.ok(!extra.some((line) => /dsh\/|runtime\/(?!morde-sync\/LICENSE)|nanomuse-desktop/.test(line)));
   const metadata = JSON.parse(readFileSync(new URL("package.json", here), "utf8"));
   assert.equal(metadata.description, "Morde desktop client");
 });

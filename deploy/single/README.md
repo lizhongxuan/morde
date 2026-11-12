@@ -8,6 +8,8 @@
 
 F02 中继由 Morde 自行托管，转发 Syncthing 加密节点流量，不加入公共 relay pool。Compose 使用独立的 `CH_WORKSPACE_SYNC_RELAY_TOKEN` 限制只有持有共享 token 的节点能加入；生成 32 字节随机 token（例如 `openssl rand -hex 32`），只保存在 root 持有、权限 `0600` 的 `/etc/cloudhost/cloudhost.env`，不要提交到仓库。桌面端通过设备登记响应取得 relay 的公网静态 URI；服务端账号节点使用 `CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS` 对应的主机 IPv4 连接同一个 relay，避免依赖云公网 NAT 回环。`CH_WORKSPACE_SYNC_RELAY_PUBLIC_ADDRESS` 必须是静态公网 IPv4 字面量和 TCP 22067，不能用 DNS 主机名；`CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS` 必须是可从账号 Docker bridge 路由到的具体主机 IPv4，不能用 `0.0.0.0` 或回环地址。nftables 按该主机 bind IPv4 的原始目的地址和原始 TCP 端口精确允许账号节点访问 relay，其他新建连接默认拒绝。每次 `preload` / `apply` 都清空动态接口白名单；Portal 启动时重放数据库中的所有账号配置，单账号在配置已应用并提交 `applied_revision` 后才重新开放 relay。设备、安装、账号状态/角色、凭据变更和自然到期撤权都先在 owner execution-control 锁内关闭接口，再提交授权变化。主机防火墙和云安全组仅开放 relay 入站 TCP 22067。Relay 使用关闭 IP masquerading 的专用 bridge，不接入账号 bridge，也不提供节点 API 通道。桌面端公网 relay 入口、设备/Workspace folder 配置及撤权屏障通过验收前，保持 workspace-sync profile 和同步 capability 关闭。Portal 使用的 bind address 与 Compose 实际发布地址必须一致；Supervisor 会逐项比对 Docker inspect 结果。
 
+项目文件上传由 `workspace_sync_node.project_upload_enabled` 控制，部署配置默认 `false`；只有专用数据挂载和真实上传、冲突、恢复、撤权验收通过后才能显式开启。开启时服务也会通告 `workspace_sync`，旧桌面根同步和 iOS Workspace 文件工具随之重新可用。此开关不会启动 Syncthing 节点或 relay。
+
 Syncthing 节点与 relay 镜像只在本机生成，不需要推送外部 registry。构建脚本固定并核对 Syncthing commit、Morde patch SHA-256 和 Go 1.27.1，检查配额 hook 源码与调用点，并只给节点镜像加 `f02-v1` hook 标记；Portal 拒绝缺少此标记的节点镜像。不要复用先前未包含该 hook 标记的本地镜像。创建 relay 状态目录时设为 `65532:65532` 所有、`0700` 权限；共享卷已挂载后，例如 `sudo install -d -o 65532 -g 65532 -m 0700 /srv/morde-workspace-sync/relay`。未挂载共享卷时不要在挂载点底层创建同名子目录。使用受控的 F02 Syncthing 源码 worktree 构建：
 
 ```sh

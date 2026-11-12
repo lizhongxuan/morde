@@ -16,10 +16,11 @@ type Capacity struct {
 // CreateHostParams keeps host insertion, workspace bindings, and allocation
 // checks in one store operation.
 type CreateHostParams struct {
-	Host         host.Host
-	WorkspaceIDs []string
-	Capacity     Capacity
-	Idempotency  IdempotencyRecord
+	Host                       host.Host
+	WorkspaceIDs               []string
+	Capacity                   Capacity
+	Idempotency                IdempotencyRecord
+	WorkspaceCopyReservationID string
 }
 
 // RestoreHostParams are intentionally kept out of CreateHostParams: restoring

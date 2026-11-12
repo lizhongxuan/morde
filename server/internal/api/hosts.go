@@ -15,6 +15,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -71,7 +72,7 @@ type resourcesResponse struct {
 
 type createHostRequest struct {
 	Name         string          `json:"name"`
-	WorkspaceIDs []string        `json:"workspace_ids"`
+	WorkspaceIDs json.RawMessage `json:"workspace_ids"`
 	Workspace    json.RawMessage `json:"workspace"`
 }
 
@@ -176,23 +177,21 @@ func (h *api) createHost(c *gin.Context) {
 		writeError(c, domain.InvalidArgument("workspace", "workspace is not a supported host creation field"))
 		return
 	}
-	if len(request.WorkspaceIDs) != 1 {
-		writeError(c, domain.InvalidArgument("workspace_ids", "exactly one workspace must be bound to a host"))
-		return
-	}
-	seenWorkspaceIDs := make(map[string]struct{}, len(request.WorkspaceIDs))
-	for _, workspaceID := range request.WorkspaceIDs {
-		if !domain.ValidWorkspaceID(workspaceID) {
+	var workspaceIDs []string
+	if request.WorkspaceIDs != nil {
+		if err := json.Unmarshal(request.WorkspaceIDs, &workspaceIDs); err != nil || workspaceIDs == nil || len(workspaceIDs) != 1 {
+			writeError(c, domain.InvalidArgument("workspace_ids", "exactly one workspace must be bound to a host"))
+			return
+		}
+		if !domain.ValidWorkspaceID(workspaceIDs[0]) {
 			writeError(c, domain.InvalidArgument("workspace_ids", "invalid workspace id"))
 			return
 		}
-		if _, exists := seenWorkspaceIDs[workspaceID]; exists {
-			writeError(c, domain.InvalidArgument("workspace_ids", "workspace ids must be unique"))
-			return
-		}
-		seenWorkspaceIDs[workspaceID] = struct{}{}
+	} else if principal.Kind != identity.KindSession {
+		writeError(c, domain.NewError(domain.CodeForbidden, "portal session required to create a Workspace automatically"))
+		return
 	}
-	command := app.CreateHostCommand{Name: request.Name, WorkspaceIDs: request.WorkspaceIDs, IdempotencyKey: keys[0]}
+	command := app.CreateHostCommand{Name: request.Name, WorkspaceIDs: workspaceIDs, IdempotencyKey: keys[0]}
 	created, err := h.deps.Hosts.Create(c.Request.Context(), principal, command)
 	if err != nil {
 		writeError(c, err)

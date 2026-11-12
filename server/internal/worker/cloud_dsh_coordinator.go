@@ -130,7 +130,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 	if ctx == nil || value.ModelID == "" || claim.Message.ID == "" || value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content {
 		return app.ConversationRouteDecision{}, domain.InvalidArgument("coordinator", "coordinator route context is invalid")
 	}
-	identity := cloudDSHCoordinatorIdentity(claim)
+	identity := cloudDSHCoordinatorIdentity(claim, value)
 	if err := app.ValidateConversationCoordinatorIdentity(claim, identity); err != nil {
 		return app.ConversationRouteDecision{}, err
 	}
@@ -294,9 +294,13 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 	}
 }
 
-func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim) app.ConversationCoordinatorIdentity {
+func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim, value app.ConversationRouteContext) app.ConversationCoordinatorIdentity {
 	seed := strings.Join([]string{"morde-dsh-coordinator-session-v1", claim.ServiceInstanceID, claim.Message.OwnerID,
 		claim.Message.ActorID, claim.Message.ConversationID, claim.Message.ID}, "\n")
+	if value.ResultReview != nil && value.ResultReview.RetryAttempt > 0 {
+		// Retries must not resume a completed DSH turn from the previous attempt.
+		seed += fmt.Sprintf("\nresult-review-retry:%d", value.ResultReview.RetryAttempt)
+	}
 	digest := sha256.Sum256([]byte(seed))
 	hexDigest := hex.EncodeToString(digest[:])
 	return app.ConversationCoordinatorIdentity{ServiceInstanceID: claim.ServiceInstanceID, OwnerID: claim.Message.OwnerID,

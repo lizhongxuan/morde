@@ -54,7 +54,8 @@ function isResultReview(value: unknown): value is K2ResultReview | null {
   return Boolean(item && typeof item.state === 'string' && resultReviewStates.has(item.state as K2ResultReview['state'])
     && nonEmptyString(item.source_task_id) && revision(item.source_task_revision)
     && revision(item.source_event_sequence, 1)
-    && (item.reply_message_id === null || nonEmptyString(item.reply_message_id)));
+    && (item.reply_message_id === null || nonEmptyString(item.reply_message_id))
+    && (item.trigger_message_id === undefined || item.trigger_message_id === null || nonEmptyString(item.trigger_message_id)));
 }
 
 /** Validates the OpenAPI K2 projection while tolerating older Task snapshots without K2 fields. */

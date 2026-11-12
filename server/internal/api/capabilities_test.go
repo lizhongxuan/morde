@@ -100,6 +100,13 @@ type clientContractFixture struct {
 	} `json:"personal_data"`
 }
 
+type projectUploadCapabilityTestService struct {
+	*workspaceSyncServiceStub
+	enabled bool
+}
+
+func (s *projectUploadCapabilityTestService) ProjectUploadEnabled() bool { return s.enabled }
+
 type personalDataCapabilityStub struct{ personalDataService }
 type personalSyncCapabilityStub struct{ personalSyncService }
 
@@ -147,10 +154,41 @@ func TestCapabilitiesArePublicAndOnlyAdvertiseAssembledServices(t *testing.T) {
 			t.Fatalf("missing %s in %v", feature, result.SupportedFeatures)
 		}
 	}
-	for _, feature := range []string{"client_login", "available_models", "task_api", "cloud_tasks", "task_media_generation", "project_budget_execution", "project_work_items_v2", "hub", "personal_sync", "workspace_sync"} {
+	for _, feature := range []string{"client_login", "available_models", "task_api", "cloud_tasks", "task_media_generation", "project_budget_execution", "project_work_items_v2", "hub", "personal_sync", "workspace_sync", "project_upload"} {
 		if slices.Contains(result.SupportedFeatures, feature) {
 			t.Fatalf("unassembled or unimplemented feature %s was advertised", feature)
 		}
+	}
+}
+
+func TestCapabilitiesAdvertiseWorkspaceSyncOnlyWhenProjectUploadGateIsOpen(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{{name: "closed"}, {name: "open", enabled: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			services := newServices()
+			deps := services.deps()
+			deps.ClientLogin = &clientLoginHTTPStub{}
+			deps.WorkspaceSync = &projectUploadCapabilityTestService{workspaceSyncServiceStub: &workspaceSyncServiceStub{}, enabled: test.enabled}
+			options := validOptions()
+			options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+			router, err := New(deps, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
+			var result capabilitiesResponse
+			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+				t.Fatalf("capability response=%d", response.Code)
+			}
+			for _, feature := range []string{"workspace_sync", "project_upload"} {
+				if advertised := slices.Contains(result.SupportedFeatures, feature); advertised != test.enabled {
+					t.Fatalf("project upload gate enabled=%t, capability %s advertised=%t: %v", test.enabled, feature, advertised, result.SupportedFeatures)
+				}
+			}
+		})
 	}
 }
 
@@ -608,12 +646,27 @@ func TestConversationTaskOpenAPIIsReadOnly(t *testing.T) {
 		t.Fatal("Portal OpenAPI conversation Task route is not bounded")
 	}
 	route := contract[routeStart : routeStart+1+routeEnd]
-	if !strings.Contains(route, "operationId: listConversationActiveTasks\n") || !strings.Contains(route, "    get:\n") ||
+	if !strings.Contains(route, "operationId: listConversationTasks\n") || !strings.Contains(route, "    get:\n") ||
 		strings.Contains(route, "    post:\n") {
-		t.Fatalf("Portal OpenAPI conversation Task route must only list active tasks:\n%s", route)
+		t.Fatalf("Portal OpenAPI conversation Task route must only list tasks:\n%s", route)
+	}
+	if !strings.Contains(route, "enum: [active, recent]") || !strings.Contains(route, "default: active") {
+		t.Fatalf("Portal OpenAPI conversation Task view must default to active and support recent:\n%s", route)
 	}
 	if strings.Contains(contract, "submitConversationTask") || strings.Contains(contract, "SubmitConversationTaskRequest") ||
 		strings.Contains(contract, "SubmittedConversationTaskResponse") {
 		t.Fatal("Portal OpenAPI still exposes direct conversation Task submission")
+	}
+}
+
+func TestMainConversationEnsureOpenAPIUsesRegisteredPath(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI schema: %v", err)
+	}
+	contract := string(openAPI)
+	if !strings.Contains(contract, "  /api/me/main-conversation/ensure:\n    post:\n      tags: [Tasks]\n      operationId: ensureMainConversation\n") ||
+		strings.Contains(contract, "  /api/me/main-conversation:\n    post:\n      tags: [Tasks]\n      operationId: ensureMainConversation\n") {
+		t.Fatal("Portal OpenAPI main conversation ensure path does not match the registered POST route")
 	}
 }

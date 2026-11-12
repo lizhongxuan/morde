@@ -965,7 +965,7 @@ describe("portal mock cookie sessions", () => {
   });
 
   it("rejects unauthenticated protected requests without creating resources", async () => {
-    const createHost = await createHostRequest({ name: "unauthenticated", workspace_ids: [] });
+    const createHost = await createHostRequest({ name: "unauthenticated" });
     const createKey = await api("/api/apikeys", json("POST", { name: "unauthenticated" }));
     expect(createHost.status).toBe(401);
     expect(createKey.status).toBe(401);
@@ -982,8 +982,9 @@ describe("portal mock cookie sessions", () => {
   it("requires and replays an exact host creation idempotency key", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     await allowHosts(2);
-    const body = { name: "retry host", workspace_ids: [] };
+    const body = { name: "retry host" };
     expect((await api("/api/hosts", json("POST", body))).status).toBe(400);
+    expect((await createHostRequest({ name: "empty Workspace list", workspace_ids: [] })).status).toBe(400);
 
     const first = await createHostRequest(body, "host-retry-key-001");
     const second = await createHostRequest(body, "host-retry-key-001");
@@ -1026,7 +1027,7 @@ describe("portal mock Host sharing", () => {
     await allowHosts(2, owner);
     const created = await owner("/api/hosts", {
       method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "share-host-key-001" },
-      body: JSON.stringify({ name: "共享测试电脑", workspace_ids: [] }),
+      body: JSON.stringify({ name: "共享测试电脑" }),
     });
     const host = await created.json() as { id: string };
     await wait(950);
@@ -1061,7 +1062,7 @@ describe("portal mock Host sharing", () => {
     await allowHosts(2, owner);
     const created = await owner("/api/hosts", {
       method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "terminal-share-key-001" },
-      body: JSON.stringify({ name: "终端专用共享", workspace_ids: [] }),
+      body: JSON.stringify({ name: "终端专用共享" }),
     });
     const host = await created.json() as { id: string };
     await wait(950);
@@ -1082,7 +1083,7 @@ describe("portal mock Host sharing", () => {
     await allowHosts(2, owner);
     const created = await owner("/api/hosts", {
       method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "workspace-share-key-001" },
-      body: JSON.stringify({ name: "工作区只读共享", workspace_ids: [] }),
+      body: JSON.stringify({ name: "工作区只读共享" }),
     });
     const host = await created.json() as { id: string };
     await wait(950);
@@ -1107,7 +1108,7 @@ describe("portal mock Host control", () => {
   it("keeps the Host fenced while tools stop, resumes the same request, and refreshes the returned version", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     await allowHosts(2);
-    const created = await createHostRequest({ name: "控制切换测试", workspace_ids: [] });
+    const created = await createHostRequest({ name: "控制切换测试" });
     const host = await created.json() as { id: string };
     await wait(950);
     await api("/api/hosts"); // Materialize the mock Host as running.
@@ -1437,28 +1438,28 @@ describe("portal mock quota and capacity", () => {
     expect(initialCapacity.allocated).toEqual({ cpu_milli: 0, mem_mib: 0 });
     const me = await (await api("/api/me")).json();
     expect(me.usage).toEqual({ hosts: 1, cpu_milli: 0, mem_mib: 0 });
-    const secondHost = await createHostRequest({ name: "beyond host-count quota", workspace_ids: [] });
+    const secondHost = await createHostRequest({ name: "beyond host-count quota" });
     expect(secondHost.status).toBe(409);
     expect((await secondHost.json()).error).toMatchObject({ code: "quota_exceeded", message: "达到云端电脑上限,无法再创建" });
 
     await allowHosts(2, api, 2000, 4096);
-    expect((await createHostRequest({ name: "within raised quota", workspace_ids: [] })).status).toBe(201);
+    expect((await createHostRequest({ name: "within raised quota" })).status).toBe(201);
     const afterSecondHost = await (await api("/api/me")).json();
     expect(afterSecondHost.usage).toEqual({ hosts: 2, cpu_milli: 1000, mem_mib: 2048 });
     const creatingCapacity = await (await api("/api/admin/capacity")).json();
     expect(creatingCapacity.allocated).toEqual({ cpu_milli: 1000, mem_mib: 2048 });
     expect(creatingCapacity.hosts_by_state).toEqual({ creating: 1, stopped: 1 });
     await allowHosts(3, api, 1500, 3072);
-    const resourceQuotaRejected = await createHostRequest({ name: "over resource quota", workspace_ids: [] });
+    const resourceQuotaRejected = await createHostRequest({ name: "over resource quota" });
     expect(resourceQuotaRejected.status).toBe(409);
     expect((await resourceQuotaRejected.json()).error).toMatchObject({ code: "quota_exceeded", details: { dimension: "cpu_milli", limit: 1500 } });
 
     await allowHosts(100, api, 100000, 200000);
     for (let index = 1; index < 48; index += 1) {
-      const response = await createHostRequest({ name: `capacity test ${index}`, workspace_ids: [] });
+      const response = await createHostRequest({ name: `capacity test ${index}` });
       expect(response.status).toBe(201);
     }
-    const capacityRejected = await createHostRequest({ name: "over capacity", workspace_ids: [] });
+    const capacityRejected = await createHostRequest({ name: "over capacity" });
     expect(capacityRejected.status).toBe(409);
     expect((await capacityRejected.json()).error).toMatchObject({ code: "capacity_exceeded", details: { dimension: "cpu_milli", limit: 48000 } });
   });
@@ -1582,21 +1583,24 @@ describe("portal mock quota and capacity", () => {
     resetMockState();
   });
 
-  it("keeps a Host allocated while deletion finishes when no Workspace is bound", async () => {
+  it("keeps a Host allocated during deletion and retains its Workspace", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     await allowHosts(2);
-    const created = await createHostRequest({ name: "deletion accounting", workspace_ids: [] });
+    const created = await createHostRequest({ name: "deletion accounting" });
     expect(created.status).toBe(201);
-    const host = await created.json();
+    const host = await created.json() as { id: string; workspaces: Array<{ workspace: { id: string } }> };
+    expect(host.workspaces).toHaveLength(1);
+    const workspaceID = host.workspaces[0]!.workspace.id;
     const before = await (await api("/api/me")).json();
 
     const deleted = await api(`/api/hosts/${host.id}`, { method: "DELETE" });
     const deletingHost = await deleted.json();
     expect(deleted.status).toBe(202);
     expect(deletingHost.state).toBe("deleting");
-    expect(deletingHost.workspaces).toEqual([]);
+    expect(deletingHost.workspaces).toHaveLength(1);
+    expect(deletingHost.workspaces[0].workspace.id).toBe(workspaceID);
     expect((await (await api(`/api/hosts/${host.id}`)).json()).state).toBe("deleting");
-    expect((await (await api("/api/workspaces")).json()).items).toEqual([]);
+    expect((await (await api("/api/workspaces")).json()).items).toContainEqual(expect.objectContaining({ id: workspaceID, state: "ready" }));
     expect((await (await api("/api/me")).json()).usage.hosts).toBe(before.usage.hosts);
 
     await wait(950);
@@ -1644,16 +1648,16 @@ describe("portal mock workspace bindings", () => {
     await allowHosts(2);
     const workspaceResponse = await createWorkspace("bindable workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number; used_bytes: number; quota_bytes: number };
-    const hostResponse = await createHostRequest({ name: "workspace host", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "workspace host", workspace_ids: [workspace.id] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
 
     const headers = { "content-type": "application/json", "Idempotency-Key": "workspace-bind-001" };
-    const stale = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", { workspace_id: workspace.id, expected_revision: workspace.revision + 1, expected_binding_version: 0 }), headers });
+    const stale = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", { workspace_id: workspace.id, expected_revision: workspace.revision + 1, expected_binding_version: 1 }), headers });
     expect(stale.status).toBe(409);
     expect((await stale.json()).error.code).toBe("workspace_conflict");
 
-    const request = { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 };
+    const request = { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 1 };
     const bound = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", request), headers });
     const binding = await bound.json();
     expect(bound.status).toBe(201);
@@ -1665,7 +1669,16 @@ describe("portal mock workspace bindings", () => {
     const hostAfterBinding = await (await api(`/api/hosts/${host.id}`)).json();
     expect(hostAfterBinding.workspaces).toHaveLength(1);
 
-    const staleRetry = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", { ...request, expected_revision: workspace.revision }), headers: { ...headers, "Idempotency-Key": "workspace-bind-002" } });
+    const otherWorkspaceResponse = await createWorkspace("replacement workspace");
+    const otherWorkspace = await otherWorkspaceResponse.json() as { id: string; revision: number };
+    const replacement = await api(`/api/hosts/${host.id}/workspace-bindings`, {
+      ...json("POST", { workspace_id: otherWorkspace.id, expected_revision: otherWorkspace.revision, expected_binding_version: 0 }),
+      headers: { ...headers, "Idempotency-Key": "workspace-bind-other-01" },
+    });
+    expect(replacement.status).toBe(409);
+    expect((await replacement.json()).error.code).toBe("workspace_conflict");
+
+    const staleRetry = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", { ...request, expected_binding_version: 0 }), headers: { ...headers, "Idempotency-Key": "workspace-bind-002" } });
     expect(staleRetry.status).toBe(409);
     expect((await staleRetry.json()).error.code).toBe("workspace_conflict");
 
@@ -1680,23 +1693,16 @@ describe("portal mock workspace bindings", () => {
     expect((await api(`/api/workspaces/${workspace.id}/sync-progress`)).status).toBe(404);
   });
 
-  it("binds a ready workspace to a stopped host before restore", async () => {
+  it("keeps the single Workspace on a stopped Host through restore", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     await allowHosts(2);
     const workspaceResponse = await createWorkspace("stopped host workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number };
-    const hostResponse = await createHostRequest({ name: "stopped workspace host", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "stopped workspace host", workspace_ids: [workspace.id] });
     const host = await hostResponse.json() as { id: string };
     await waitForHostState(host.id, "running");
     await api(`/api/hosts/${host.id}/release`, json("POST", { confirm_process_termination: true }));
     await waitForHostState(host.id, "stopped");
-
-    const headers = { "content-type": "application/json", "Idempotency-Key": "stopped-host-bind-01" };
-    const bound = await api(`/api/hosts/${host.id}/workspace-bindings`, {
-      ...json("POST", { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 }), headers,
-    });
-    expect(bound.status).toBe(201);
-    expect(await bound.json()).toMatchObject({ state: "preparing", desired_revision: workspace.revision, applied_revision: 0 });
 
     const restore = await api(`/api/hosts/${host.id}/restore`, json("POST", {}));
     expect(restore.status).toBe(202);
@@ -1709,11 +1715,11 @@ describe("portal mock workspace bindings", () => {
     await allowHosts(2);
     const workspaceResponse = await createWorkspace("retained workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number; state: string };
-    const hostResponse = await createHostRequest({ name: "unbind host", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "unbind host", workspace_ids: [workspace.id] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
     const bindHeaders = { "content-type": "application/json", "Idempotency-Key": "workspace-unbind-bind-01" };
-    const bindBody = { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 };
+    const bindBody = { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 1 };
     await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", bindBody), headers: bindHeaders });
 
     const path = `/api/hosts/${host.id}/workspace-bindings/${workspace.id}`;
@@ -1741,12 +1747,12 @@ describe("portal mock workspace bindings", () => {
     await allowHosts(2);
     const workspaceResponse = await createWorkspace("sync conflict workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number };
-    const hostResponse = await createHostRequest({ name: "sync conflict host", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "sync conflict host", workspace_ids: [workspace.id] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
     const bindHeaders = { "content-type": "application/json", "Idempotency-Key": "workspace-sync-bind-01" };
     const boundResponse = await api(`/api/hosts/${host.id}/workspace-bindings`, {
-      ...json("POST", { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 }), headers: bindHeaders,
+      ...json("POST", { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 1 }), headers: bindHeaders,
     });
     expect(boundResponse.status).toBe(201);
     const bound = await boundResponse.json() as { binding_version: number };

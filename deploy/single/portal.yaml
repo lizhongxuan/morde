@@ -74,9 +74,11 @@ workspace_storage:
   max_workspace_bytes: ${CH_WORKSPACE_MAX_BYTES}
   max_owner_bytes: ${CH_WORKSPACE_OWNER_MAX_BYTES}
   min_free_bytes: ${CH_WORKSPACE_MIN_FREE_BYTES}
-# Enable only after Workspace sync current-files, admission, private relay, and revocation barriers are verified.
+# Enable Syncthing only after current-files, admission, relay, and revocation barriers are verified.
+# Project upload is independently gated and also remains closed until its real end-to-end acceptance.
 workspace_sync_node:
   enabled: false
+  project_upload_enabled: false
   data_root: ${CH_WORKSPACE_SYNC_DATA_ROOT_DIR}
   image_digest: ${CH_WORKSPACE_SYNC_NODE_IMAGE_ID}
   relay_image_digest: ${CH_WORKSPACE_SYNC_RELAY_IMAGE_ID}

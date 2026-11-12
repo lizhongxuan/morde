@@ -1114,13 +1114,13 @@
       "extractionState" : "manual",
       "localizations" : {
         "de" : { "stringUnit" : { "state" : "translated", "value" : "Arbeitsbereichsdateien durchsuchen" } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Browse workspace files" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Browse computer files" } },
         "es" : { "stringUnit" : { "state" : "translated", "value" : "Explorar archivos del espacio de trabajo" } },
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "Parcourir les fichiers de l’espace de travail" } },
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "ワークスペースのファイルを確認" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 공간 파일 살펴보기" } },
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Просмотр файлов рабочего пространства" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "查看工作区文件" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "查看电脑文件" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "查看工作區檔案" } }
       }
     },
@@ -1128,13 +1128,13 @@
       "extractionState" : "manual",
       "localizations" : {
         "de" : { "stringUnit" : { "state" : "translated", "value" : "Arbeitsbereichsdatei lesen" } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Read a workspace file" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Read a computer file" } },
         "es" : { "stringUnit" : { "state" : "translated", "value" : "Leer un archivo del espacio de trabajo" } },
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "Lire un fichier de l’espace de travail" } },
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "ワークスペースのファイルを読む" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 공간 파일 읽기" } },
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Чтение файла рабочего пространства" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "读取工作区文件" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "读取电脑文件" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "讀取工作區檔案" } }
       }
     },
@@ -1142,13 +1142,13 @@
       "extractionState" : "manual",
       "localizations" : {
         "de" : { "stringUnit" : { "state" : "translated", "value" : "Arbeitsbereichsdatei aktualisieren" } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Update a workspace file" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Update a computer file" } },
         "es" : { "stringUnit" : { "state" : "translated", "value" : "Actualizar un archivo del espacio de trabajo" } },
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "Mettre à jour un fichier de l’espace de travail" } },
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "ワークスペースのファイルを更新" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 공간 파일 업데이트" } },
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Обновление файла рабочего пространства" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更新工作区文件" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更新电脑文件" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "更新工作區檔案" } }
       }
     },
@@ -1184,13 +1184,13 @@
       "extractionState" : "manual",
       "localizations" : {
         "de" : { "stringUnit" : { "state" : "translated", "value" : "Im Arbeitsbereich arbeiten" } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Work in the workspace" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Work with computer files" } },
         "es" : { "stringUnit" : { "state" : "translated", "value" : "Trabajar en el espacio de trabajo" } },
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "Travailler dans l’espace de travail" } },
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "ワークスペースで作業" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 공간에서 작업" } },
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Работа в рабочем пространстве" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "处理工作区内容" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "处理电脑文件" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "處理工作區內容" } }
       }
     },
@@ -1226,13 +1226,13 @@
       "extractionState" : "manual",
       "localizations" : {
         "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Aufgabe ist an einen anderen Arbeitsbereich gebunden. Starten Sie für das neue Ziel eine neue Aufgabe." } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Task is bound to another workspace; start a new task for the new target." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Task computer files changed; start a new task for the new target." } },
         "es" : { "stringUnit" : { "state" : "translated", "value" : "La tarea está vinculada a otro espacio de trabajo. Inicia una nueva tarea para el nuevo destino." } },
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "La tâche est liée à un autre espace de travail. Créez une nouvelle tâche pour la nouvelle cible." } },
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "タスクは別のワークスペースに紐付いています。新しい対象には別のタスクを開始してください。" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업이 다른 작업 공간에 연결되어 있습니다. 새 대상에 대해 새 작업을 시작하세요." } },
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Задача привязана к другому рабочему пространству. Для новой цели начните новую задачу." } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务已绑定其他工作区，无法安全切换；请为新目标另发起任务。" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务所用电脑文件已变化，无法安全切换；请为新目标另发起任务。" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務已綁定其他工作區，無法安全切換；請為新目標另行發起任務。" } }
       }
     },
@@ -1268,13 +1268,13 @@
       "extractionState" : "manual",
       "localizations" : {
         "de" : { "stringUnit" : { "state" : "translated", "value" : "Benötigter Arbeitsbereich nicht verfügbar" } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Required workspace is unavailable" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Required computer files are unavailable" } },
         "es" : { "stringUnit" : { "state" : "translated", "value" : "El espacio de trabajo necesario no está disponible" } },
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’espace de travail requis est indisponible" } },
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "必要なワークスペースを利用できません" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "필요한 작업 공간을 사용할 수 없습니다" } },
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Нужное рабочее пространство недоступно" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "所需工作区暂不可用" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "所需电脑文件暂不可用" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "所需工作區暫時無法使用" } }
       }
     },
@@ -36975,7 +36975,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "云端主机"
+            "value" : "云端电脑"
           }
         },
         "zh-Hant" : {
@@ -91760,7 +91760,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Mounted"
+            "value" : "Ready"
           }
         },
         "es" : {
@@ -91796,7 +91796,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已挂载"
+            "value" : "已就绪"
           }
         },
         "zh-Hant" : {
@@ -102033,7 +102033,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Not mounted"
+            "value" : "Not linked to a cloud computer"
           }
         },
         "es" : {
@@ -102069,7 +102069,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "未挂载"
+            "value" : "未关联云端电脑"
           }
         },
         "zh-Hant" : {
@@ -120729,7 +120729,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Record Workspace version"
+            "value" : "Record computer file version"
           }
         },
         "es" : {
@@ -120765,13 +120765,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "记录 Workspace 版本"
+            "value" : "登记电脑文件版本"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "記錄 Workspace 版本"
+            "value" : "登記電腦檔案版本"
           }
         }
       }
@@ -120788,7 +120788,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Recorded delivery: Task %1$@ · Workspace %2$@ v%3$lld"
+            "value" : "Recorded delivery: Task %1$@ · computer file version v%3$lld"
           }
         },
         "es" : {
@@ -120824,13 +120824,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已记录交付：任务 %1$@ · Workspace %2$@ v%3$lld"
+            "value" : "已记录交付：任务 %1$@ · 电脑文件版本 v%3$lld"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已記錄交付：任務 %1$@ · Workspace %2$@ v%3$lld"
+            "value" : "已記錄交付：任務 %1$@ · 電腦檔案版本 v%3$lld"
           }
         }
       }
@@ -160036,7 +160036,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "The Workspace version changed. Select and confirm the current version again."
+            "value" : "The computer file version changed. Select and confirm the current version again."
           }
         },
         "es" : {
@@ -160072,7 +160072,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Workspace 版本已更改。请重新选择并确认当前版本。"
+            "value" : "电脑文件版本已变化。请重新选择并确认当前版本。"
           }
         },
         "zh-Hant" : {
@@ -179321,7 +179321,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Workspace changed; awaiting confirmation"
+            "value" : "Computer files changed; awaiting confirmation"
           }
         },
         "es" : {
@@ -179357,7 +179357,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "工作区已变化，等待确认"
+            "value" : "电脑文件已变化，等待确认"
           }
         },
         "zh-Hant" : {
@@ -182961,7 +182961,11 @@
 
     },
     "云端文件" : {
-
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud files" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "云端文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "雲端檔案" } }
+      }
     },
     "云端运行" : {
 
@@ -182987,6 +182991,146 @@
     },
     "仅显示已授权的 Workspace" : {
 
+    },
+    "电脑文件" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer files" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案" } }
+      }
+    },
+    "电脑文件路径" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer file path" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件路径" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案路徑" } }
+      }
+    },
+    "电脑文件访问仍需单独授权" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer file access still requires separate authorization." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件访问仍需单独授权" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案存取仍需個別授權" } }
+      }
+    },
+    "电脑文件尚未就绪，暂时无法打开这台电脑。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This computer's files are not ready, so it cannot be opened yet." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件尚未就绪，暂时无法打开这台电脑。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案尚未就緒，暫時無法開啟這台電腦。" } }
+      }
+    },
+    "此账号范围内没有可用的电脑文件。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No computer files are available in this account scope." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此账号范围内没有可用的电脑文件。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "此帳戶範圍內沒有可用的電腦檔案。" } }
+      }
+    },
+    "服务端未开放电脑文件传输；上传和下载已锁定。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer file transfer is unavailable on the server; uploads and downloads are disabled." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "服务端未开放电脑文件传输；上传和下载已锁定。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "伺服器尚未開放電腦檔案傳輸；上傳和下載已鎖定。" } }
+      }
+    },
+    "正在确认服务端文件能力。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checking server file capabilities." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在确认服务端文件能力。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在確認伺服器檔案能力。" } }
+      }
+    },
+    "选择获准电脑后读取其文件清单。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Select an authorized computer to view its file list." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "选择获准电脑后读取其文件清单。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "選擇已授權的電腦以讀取其檔案清單。" } }
+      }
+    },
+    "正在提交文件操作…" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Submitting file operation…" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在提交文件操作…" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在提交檔案操作…" } }
+      }
+    },
+    "正在读取文件版本差异…" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Loading file version differences…" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在读取文件版本差异…" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在讀取檔案版本差異…" } }
+      }
+    },
+    "分享电脑文件" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Share computer files" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "分享电脑文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "分享電腦檔案" } }
+      }
+    },
+    "确认恢复文件路径？" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restore this file path?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "确认恢复文件路径？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "確認還原檔案路徑？" } }
+      }
+    },
+    "电脑文件 · %@ · %@。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer files · %@ · %@." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件 · %@ · %@。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案 · %@ · %@。" } }
+      }
+    },
+    "删除电脑文件？" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete computer files?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除电脑文件？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除電腦檔案？" } }
+      }
+    },
+    "删除电脑文件" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete computer file" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除电脑文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除電腦檔案" } }
+      }
+    },
+    "删除 %@，基于文件版本 v%lld 创建新版本记录。旧版本仍可比较和恢复。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete %1$@ and create a new version based on file version v%2$lld. Older versions remain available for comparison and restore." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除 %1$@，基于文件版本 v%2$lld 创建新版本记录。旧版本仍可比较和恢复。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除 %1$@，以檔案版本 v%2$lld 建立新版本記錄。舊版本仍可比較和還原。" } }
+      }
+    },
+    "显示此文件在本机和电脑文件目录中的操作" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Show actions for this file locally and in the computer file directory." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "显示此文件在本机和电脑文件目录中的操作" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "顯示此檔案在本機和電腦檔案目錄中的操作" } }
+      }
+    },
+    "电脑文件清单已变化或当前版本已过期，请刷新后重试。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The computer file list changed or the current version is outdated. Refresh and try again." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件清单已变化或当前版本已过期，请刷新后重试。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案清單已變更或目前版本已過期，請重新整理後再試。" } }
+      }
+    },
+    "领取后会创建归你所有的独立副本，之后与原文件目录无关。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Accepting creates a separate copy owned by you, independent of the original file directory." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "领取后会创建归你所有的独立副本，之后与原文件目录无关。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "領取後會建立歸你所有的獨立副本，之後與原檔案目錄無關。" } }
+      }
+    },
+    "领取文件副本" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Get file copy" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "领取文件副本" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "領取檔案副本" } }
+      }
     },
     "从 v%lld 恢复到当前 v%lld：%@%@。服务端可能因版本变化、绑定电脑或未完成写入而拒绝。" : {
       "localizations" : {
@@ -183147,8 +183291,103 @@
     "关联当前 Task %@" : {
 
     },
-    "关联的电脑与 Workspace" : {
-
+    "关联的电脑与文件" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Linked computers and files" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "关联的电脑与文件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "關聯的電腦與檔案" } }
+      }
+    },
+    "关联只记录项目资源，不会授予其他项目成员访问电脑或文件的权限。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This links project resources only; it does not grant other project members access to the computer or its files." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "关联只记录项目资源，不会授予其他项目成员访问电脑或文件的权限。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "關聯僅記錄專案資源，不會授予其他專案成員存取電腦或其檔案的權限。" } }
+      }
+    },
+    "当前服务未开放电脑文件复制或移交；资源关联不代表副本，也不会授予成员访问权限。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer file copy and handoff are unavailable; linking a resource does not create a copy or grant member access." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "当前服务未开放电脑文件复制或移交；资源关联不代表副本，也不会授予成员访问权限。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目前服務未開放電腦檔案複製或移交；資源關聯不代表副本，也不會授予成員存取權。" } }
+      }
+    },
+    "项目消息由当前账号提交；需要使用电脑文件时会在执行时核验。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Project messages are sent by your account; computer file access is checked when used." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "项目消息由当前账号提交；需要使用电脑文件时会在执行时核验。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "專案訊息由目前帳戶提交；需要使用電腦檔案時會在執行時核驗。" } }
+      }
+    },
+    "加入项目不会自动共享个人主会话或记忆。关联电脑或其文件只记录资源，不复制文件，也不授予项目成员访问权限。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Joining a project does not share personal conversations or memories. Linking a computer or its files records the resource only; it does not copy files or grant member access." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "加入项目不会自动共享个人主会话或记忆。关联电脑或其文件只记录资源，不复制文件，也不授予项目成员访问权限。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "加入專案不會自動共享個人主會話或記憶。關聯電腦或其檔案僅記錄資源，不會複製檔案或授予專案成員存取權。" } }
+      }
+    },
+    "当前项目会话或电脑文件已变化，请重新选择。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The current project conversation or computer files changed. Select again." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "当前项目会话或电脑文件已变化，请重新选择。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目前專案會話或電腦檔案已變更，請重新選取。" } }
+      }
+    },
+    "登记当前电脑文件版本交付" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Record delivery of the current computer file version" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "登记当前电脑文件版本交付" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "登記目前電腦檔案版本交付" } }
+      }
+    },
+    "Computer file read" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer file read" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件读取" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案讀取" } }
+      }
+    },
+    "仅可为当前项目中关联的 Task 登记已就绪电脑文件版本；服务端还会验证已保存产物。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Only a ready computer file version linked to this project can be recorded for its Task; the server also verifies the saved artifact." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "仅可为当前项目中关联的 Task 登记已就绪电脑文件版本；服务端还会验证已保存产物。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "僅可為目前專案中關聯的 Task 登記已就緒電腦檔案版本；伺服器也會驗證已儲存的產物。" } }
+      }
+    },
+    "服务端已核验并登记电脑文件交付版本；本操作未传送文件。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The server verified and recorded the delivered computer file version. This action did not transfer files." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "服务端已核验并登记电脑文件交付版本；本操作未传送文件。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "伺服器已核驗並登記電腦檔案交付版本；此操作未傳送檔案。" } }
+      }
+    },
+    "请先选择当前账号可访问的电脑或电脑文件。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Select a computer or computer files accessible to this account first." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "请先选择当前账号可访问的电脑或电脑文件。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "請先選取目前帳戶可存取的電腦或電腦檔案。" } }
+      }
+    },
+    "资源关联已添加。关联不会授予项目成员电脑或文件访问权限。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Resource link added. It does not grant project members access to the computer or its files." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "资源关联已添加。关联不会授予项目成员电脑或文件访问权限。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已新增資源關聯。此關聯不會授予專案成員電腦或檔案存取權。" } }
+      }
+    },
+    "已记录交付：Task %@ · 电脑文件 %@ · v%lld" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delivery recorded: Task %@ · computer files %@ · v%lld" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已记录交付：Task %@ · 电脑文件 %@ · v%lld" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已記錄交付：Task %@ · 電腦檔案 %@ · v%lld" } }
+      }
+    },
+    "电脑与账号设置" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Computer and account settings" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑与账号设置" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦與帳戶設定" } }
+      }
     },
     "关联资源" : {
 
@@ -183531,6 +183770,13 @@
     },
     "只上传下方列出的文件；每个文件最多 300 MiB。服务端确认全部分块和 SHA-256 后才提交不可变 Workspace 检查点。" : {
 
+    },
+    "只上传下方列出的文件；每个文件最多 300 MiB。服务端确认全部分块和 SHA-256 后才保存新的文件版本。" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Only the files listed below are uploaded; each file can be up to 300 MiB. A new file version is saved after the server verifies every chunk and SHA-256 hash." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "只上传下方列出的文件；每个文件最多 300 MiB。服务端确认全部分块和 SHA-256 后才保存新的文件版本。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "僅上傳下方列出的檔案；每個檔案最多 300 MiB。伺服器確認所有分塊和 SHA-256 後才會儲存新的檔案版本。" } }
+      }
     },
     "只对比已确认版本。恢复会创建新版本，不改写历史；服务端会重新检查权限、当前版本和 Host 写入状态。" : {
 

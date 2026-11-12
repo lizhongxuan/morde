@@ -28,6 +28,19 @@ type taskFileFetchQueryStub struct {
 	err       error
 }
 
+type taskFileFetchListStub struct {
+	TaskFileFetchEndpointService
+	principal identity.Principal
+	taskID    string
+	calls     int
+}
+
+func (s *taskFileFetchListStub) ListTaskFileFetches(_ context.Context, principal identity.Principal, taskID string) ([]app.TaskFileFetch, error) {
+	s.calls++
+	s.principal, s.taskID = principal, taskID
+	return []app.TaskFileFetch{}, nil
+}
+
 func (s *taskFileFetchQueryStub) GetTaskFileFetch(_ context.Context, principal identity.Principal, taskID, fetchID string) (app.TaskFileFetch, error) {
 	s.calls++
 	s.principal, s.taskID, s.fetchID = principal, taskID, fetchID
@@ -96,6 +109,10 @@ type taskFileFetchTransferStub struct {
 	manifestCalls int
 	chunkCalls    int
 	commitCalls   int
+	abortCalls    int
+	abortTaskID   string
+	abortFetchID  string
+	abortTicket   string
 }
 
 func (s *taskFileFetchTransferStub) ManifestTaskFileFetch(_ context.Context, taskID, fetchID, ticket string,
@@ -117,6 +134,12 @@ func (s *taskFileFetchTransferStub) CommitTaskFileFetch(_ context.Context, taskI
 	return app.TaskFileFetchCommitReceipt{FetchID: fetchID, TaskRevision: 1, TargetGrantVersion: 1, Status: string(task.FileFetchCompleted),
 		SourceVersion: request.SourceVersion, SourceSHA256: request.SourceSHA256, SizeBytes: request.SizeBytes,
 		ContentID: "o7654321", ExpiresAt: time.Now().UTC().Add(time.Hour)}, nil
+}
+
+func (s *taskFileFetchTransferStub) AbortTaskFileFetch(_ context.Context, taskID, fetchID, ticket string) error {
+	s.abortCalls++
+	s.abortTaskID, s.abortFetchID, s.abortTicket = taskID, fetchID, ticket
+	return nil
 }
 
 func TestTaskFileFetchTransferRoutesRequireTicketAndStrictRequestShape(t *testing.T) {
@@ -169,6 +192,39 @@ func TestTaskFileFetchTransferRoutesRequireTicketAndStrictRequestShape(t *testin
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" || service.manifestCalls != 1 {
 		t.Fatalf("valid manifest status=%d calls=%d headers=%v body=%s", response.Code, service.manifestCalls, response.Header(), response.Body.String())
 	}
+
+	for _, test := range []struct {
+		name      string
+		url       string
+		authorize string
+		body      string
+		wantCode  int
+	}{
+		{name: "missing ticket", url: "/api/tasks/q1234567/file-fetches/o1234567/abort", wantCode: http.StatusNotFound},
+		{name: "query string", url: "/api/tasks/q1234567/file-fetches/o1234567/abort?ticket=secret", authorize: "Bearer fixture", wantCode: http.StatusBadRequest},
+		{name: "body", url: "/api/tasks/q1234567/file-fetches/o1234567/abort", authorize: "Bearer fixture", body: `{}`, wantCode: http.StatusBadRequest},
+	} {
+		t.Run("abort "+test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.url, strings.NewReader(test.body))
+			if test.authorize != "" {
+				request.Header.Set("Authorization", test.authorize)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if response.Code != test.wantCode || strings.Contains(response.Body.String(), "secret") {
+				t.Fatalf("abort status=%d body=%s; want %d", response.Code, response.Body.String(), test.wantCode)
+			}
+		})
+	}
+	request = httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/file-fetches/o1234567/abort", nil)
+	request.Header.Set("Authorization", "Bearer fixture")
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || response.Header().Get("Cache-Control") != "no-store" || service.abortCalls != 1 ||
+		service.abortTaskID != "q1234567" || service.abortFetchID != "o1234567" || service.abortTicket != "fixture" {
+		t.Fatalf("valid abort status=%d calls=%d task=%q fetch=%q ticket=%q headers=%v body=%s", response.Code, service.abortCalls,
+			service.abortTaskID, service.abortFetchID, service.abortTicket, response.Header(), response.Body.String())
+	}
 }
 
 func TestGetTaskFileFetchRequiresPortalSessionAndCanonicalQuery(t *testing.T) {
@@ -199,6 +255,40 @@ func TestGetTaskFileFetchRequiresPortalSessionAndCanonicalQuery(t *testing.T) {
 			}
 			if strings.Contains(response.Body.String(), "secret") {
 				t.Fatal("error response echoed the rejected ticket query")
+			}
+		})
+	}
+}
+
+func TestListTaskFileFetchesPassesSessionAndRejectsClientCredential(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		principal identity.Principal
+		wantCode  int
+		wantCalls int
+	}{
+		{name: "client web session", principal: identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession,
+			TokenID: "t1234567", ClientInstallationID: "i1234567"}, wantCode: http.StatusOK, wantCalls: 1},
+		{name: "client credential", principal: identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient,
+			TokenID: "t1234567", ClientInstallationID: "i1234567"}, wantCode: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			engine := gin.New()
+			engine.Use(func(c *gin.Context) {
+				c.Set(principalKey, test.principal)
+				c.Next()
+			})
+			service := &taskFileFetchListStub{}
+			handler := &api{options: Options{ServiceInstanceID: "11111111-1111-4111-8111-111111111111"}}
+			handler.registerTaskFileFetchOwnerRoutes(engine.Group("/api"), service)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/file-fetches", nil))
+			if response.Code != test.wantCode || service.calls != test.wantCalls {
+				t.Fatalf("list status=%d calls=%d; want %d/%d; body=%s", response.Code, service.calls, test.wantCode, test.wantCalls, response.Body.String())
+			}
+			if test.wantCalls > 0 && (service.principal.ClientInstallationID != test.principal.ClientInstallationID || service.taskID != "q1234567") {
+				t.Fatalf("list request principal/task = %+v/%q", service.principal, service.taskID)
 			}
 		})
 	}

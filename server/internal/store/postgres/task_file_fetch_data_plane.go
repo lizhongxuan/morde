@@ -266,6 +266,62 @@ RETURNING content_id,expires_at`, fetch.OwnerID, taskID, fetchID, candidateConte
 	return receipt, err
 }
 
+func (s *Store) AbortTaskFileFetch(ctx context.Context, taskID, fetchID string, ticketHash []byte) error {
+	if ctx == nil || !domain.ValidTaskID(taskID) || !domain.ValidOperationID(fetchID) || len(ticketHash) != sha256.Size {
+		return domain.InvalidArgument("file_fetch", "Task file fetch identity is invalid")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		var ownerID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id FROM task_file_fetches WHERE task_id=$1 AND fetch_id=$2`, taskID, fetchID).Scan(&ownerID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeNotFound, "file fetch not found")
+			}
+			return fmt.Errorf("read Task file fetch for abort: %w", err)
+		}
+		fetch, err := getTaskFileFetchDataForUpdate(ctx, tx, ownerID, taskID, fetchID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeNotFound, "file fetch not found")
+			}
+			return fmt.Errorf("lock Task file fetch for abort: %w", err)
+		}
+		var storedHash []byte
+		if err := tx.QueryRow(ctx, `SELECT ticket_hash FROM task_file_fetches WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`, ownerID, taskID, fetchID).Scan(&storedHash); err != nil {
+			return fmt.Errorf("read Task file fetch abort ticket: %w", err)
+		}
+		if len(storedHash) != 0 && subtle.ConstantTimeCompare(storedHash, ticketHash) != 1 {
+			return domain.NewError(domain.CodeNotFound, "file fetch not found")
+		}
+		if fetch.Status == task.FileFetchCompleted {
+			if len(storedHash) != 0 {
+				if _, err := tx.Exec(ctx, `UPDATE task_file_fetches SET ticket_hash=NULL,ticket_expires_at=NULL,updated_at=clock_timestamp()
+WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`, ownerID, taskID, fetchID); err != nil {
+					return fmt.Errorf("revoke completed Task file fetch ticket: %w", err)
+				}
+			}
+			return nil
+		}
+		if fetch.Status == task.FileFetchFailed || fetch.Status == task.FileFetchCancelled {
+			return nil
+		}
+		if len(storedHash) != sha256.Size || fetch.ContentState != task.FileFetchContentNone ||
+			(fetch.Status != task.FileFetchQueued && fetch.Status != task.FileFetchWaitingDevice &&
+				fetch.Status != task.FileFetchTransferring && fetch.Status != task.FileFetchVerifying) {
+			return domain.NewError(domain.CodeNotFound, "file fetch not found")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_file_fetches SET status='failed',waiting_reason=NULL,failure_reason=$4,
+ticket_hash=NULL,ticket_expires_at=NULL,staging_expires_at=NULL,confirmed_bytes=0,updated_at=clock_timestamp()
+WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3 AND status IN ('queued','waiting_device','transferring','verifying')`,
+			ownerID, taskID, fetchID, task.FileFetchFailureAccessDenied); err != nil {
+			return fmt.Errorf("abort Task file fetch and revoke ticket: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM task_file_fetch_chunks WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`, ownerID, taskID, fetchID); err != nil {
+			return fmt.Errorf("clear aborted Task file fetch staging: %w", err)
+		}
+		return nil
+	})
+}
+
 func (s *Store) CancelTaskFileFetch(ctx context.Context, ownerID, taskID, fetchID string) (app.TaskFileFetch, error) {
 	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidTaskID(taskID) || !domain.ValidOperationID(fetchID) {
 		return app.TaskFileFetch{}, domain.InvalidArgument("file_fetch", "Task file fetch identity is invalid")

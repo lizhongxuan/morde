@@ -880,11 +880,7 @@ func (c *Controller) stop(ctx context.Context, operation contract.Operation) (ru
 	} else {
 		return runtimecore.StopResult{VerifiedStopped: false}, nil
 	}
-	if binding.EffectMayHaveRun {
-		// Context disposal stops future work but cannot undo an input or
-		// navigation that the page may already have accepted.
-		return runtimecore.StopResult{VerifiedStopped: false}, nil
-	}
+	// Context disposal proves this task can no longer issue input; it does not resolve the action result.
 	return runtimecore.StopResult{VerifiedStopped: true}, nil
 }
 
@@ -1305,13 +1301,9 @@ func typeIntoElement(ctx context.Context, target targetConnection, role, name, t
 	defer func() {
 		_ = target.Call(context.Background(), "Runtime.releaseObject", map[string]any{"objectId": objectID}, nil)
 	}()
-	var node struct {
-		NodeID int64 `json:"nodeId"`
-	}
-	if err := target.Call(ctx, "DOM.requestNode", map[string]any{"objectId": objectID}, &node); err != nil || node.NodeID <= 0 {
-		return errors.New("browser textbox could not be prepared")
-	}
-	if err := target.Call(ctx, "DOM.focus", map[string]any{"nodeId": node.NodeID}, nil); err != nil {
+	if err := target.Call(ctx, "Runtime.callFunctionOn", map[string]any{
+		"objectId": objectID, "functionDeclaration": "function(){this.focus();return true}", "returnByValue": true,
+	}, nil); err != nil {
 		return errors.New("browser textbox could not be focused")
 	}
 	if err := ctx.Err(); err != nil {

@@ -122,7 +122,7 @@ ORDER BY session.task_id,step.sequence,session.session_id`, ids, revisions)
 	}
 	rows.Close()
 
-	rows, err = tx.Query(ctx, `SELECT source.task_id,source.task_revision,source.event_sequence,source.state,batch.state,batch.published_message_id
+	rows, err = tx.Query(ctx, `SELECT source.task_id,source.task_revision,source.event_sequence,source.state,batch.state,batch.trigger_message_id,batch.published_message_id
 FROM unnest($1::text[],$2::bigint[]) AS requested(task_id,task_revision)
 JOIN conversation_result_sources source ON source.task_id=requested.task_id AND source.task_revision=requested.task_revision
 JOIN conversation_result_batches batch ON batch.message_id=source.batch_message_id
@@ -133,9 +133,9 @@ ORDER BY source.task_id`, ids, revisions)
 	for rows.Next() {
 		var taskID, sourceState, batchState string
 		var review app.ResultReview
-		var replyMessageID pgtype.Text
+		var triggerMessageID, replyMessageID pgtype.Text
 		if err := rows.Scan(&taskID, &review.SourceTaskRevision, &review.SourceEventSequence,
-			&sourceState, &batchState, &replyMessageID); err != nil {
+			&sourceState, &batchState, &triggerMessageID, &replyMessageID); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Task result review: %w", err)
 		}
@@ -155,6 +155,10 @@ ORDER BY source.task_id`, ids, revisions)
 			return nil, domain.NewError(domain.CodeInvalidState, "Task result-review projection escaped its page")
 		}
 		review.State = batchState
+		if triggerMessageID.Valid {
+			value := triggerMessageID.String
+			review.TriggerMessageID = &value
+		}
 		if replyMessageID.Valid {
 			value := replyMessageID.String
 			review.ReplyMessageID = &value

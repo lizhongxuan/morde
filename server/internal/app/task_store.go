@@ -16,6 +16,7 @@ const maxEventPage = 100
 type PageRequest struct {
 	Limit  int32
 	Cursor string
+	Search string
 }
 
 type ConversationPage struct {
@@ -29,10 +30,19 @@ type MessagePage struct {
 }
 
 type TaskPage struct {
-	Items         []task.Task
-	NextCursor    string
-	K2Projections map[string]TaskK2Projection
+	Items                 []task.Task
+	NextCursor            string
+	PendingCount          int64
+	PendingCountsByHostID map[string]int64
+	K2Projections         map[string]TaskK2Projection
 }
+
+type ConversationTaskView string
+
+const (
+	ConversationTaskViewActive ConversationTaskView = "active"
+	ConversationTaskViewRecent ConversationTaskView = "recent"
+)
 
 type TaskListRequest struct {
 	HostIDs []string
@@ -60,6 +70,7 @@ type ResultReview struct {
 	SourceTaskID        string
 	SourceTaskRevision  int64
 	SourceEventSequence int64
+	TriggerMessageID    *string
 	ReplyMessageID      *string
 }
 
@@ -271,7 +282,7 @@ type TaskStore interface {
 	SubmitTask(context.Context, TaskSubmission) (TaskSubmissionResult, error)
 	GetTask(context.Context, string, string) (TaskDetails, error)
 	ListTasks(context.Context, string, TaskListRequest) (TaskPage, error)
-	ListConversationActiveTasks(context.Context, string, string, string, []string, PageRequest) (TaskPage, error)
+	ListConversationTasks(context.Context, string, string, string, []string, ConversationTaskView, PageRequest) (TaskPage, error)
 	ListTaskEvents(context.Context, string, string, int64, int32) ([]task.Event, error)
 	GetTaskEventPage(context.Context, string, string, int64, int32) (TaskEventPage, error)
 	ClaimNextTask(context.Context, string, time.Duration) (task.Task, bool, error)

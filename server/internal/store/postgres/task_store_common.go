@@ -46,8 +46,7 @@ func pagination(pageSize int32, cursor string) (int32, pgtype.Timestamptz, strin
 }
 
 func encodePageCursor(createdAt time.Time, id string) string {
-	value := createdAt.UTC().Format(time.RFC3339Nano) + "\n" + id
-	return base64.RawURLEncoding.EncodeToString([]byte(value))
+	return app.EncodePageCursor(createdAt, id)
 }
 
 func decodePageCursor(value string) (*pageCursor, error) {

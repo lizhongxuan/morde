@@ -76,6 +76,35 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	}
 }
 
+func TestLoadProjectUploadGateDefaultsClosedAndOpensExplicitly(t *testing.T) {
+	workbenchDir := t.TempDir()
+	t.Setenv("T02_TEST_INSTANCE", "test-instance")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := validConfigYAML(workbenchDir)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkspaceSyncNode.ProjectUploadEnabled {
+		t.Fatal("project upload gate must default to closed")
+	}
+
+	data = strings.Replace(data, "site_storage:\n", "workspace_sync_node:\n  project_upload_enabled: true\nsite_storage:\n", 1)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WorkspaceSyncNode.ProjectUploadEnabled {
+		t.Fatal("explicit project_upload_enabled=true was not loaded")
+	}
+}
+
 func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.CloudDSH = CloudDSH{

@@ -26,7 +26,13 @@ func chownAppliedPaths(root string, paths []string, uid, gid uint32) error {
 	}
 	defer unix.Close(fd)
 	for _, value := range paths {
-		if value == "" || filepath.IsAbs(value) || filepath.Clean(value) != value || value == "." || value == ".." || strings.HasPrefix(value, ".."+string(filepath.Separator)) {
+		if value == "." {
+			if err := unix.Fchown(fd, int(uid), int(gid)); err != nil {
+				return errors.New("set Host workspace directory owner")
+			}
+			continue
+		}
+		if value == "" || filepath.IsAbs(value) || filepath.Clean(value) != value || value == ".." || strings.HasPrefix(value, ".."+string(filepath.Separator)) {
 			return errors.New("sync returned an invalid workspace path")
 		}
 		if err := chownAppliedPath(fd, strings.Split(value, string(filepath.Separator)), uid, gid); err != nil {

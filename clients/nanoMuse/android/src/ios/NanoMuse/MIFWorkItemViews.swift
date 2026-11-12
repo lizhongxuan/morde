@@ -326,7 +326,7 @@ struct MIFWorkItemRoom: View {
         } message: {
             if let request = deliveryConfirmation {
                 Text(String(format: AppLocalized("%1$@ · Task %2$@ · %3$@ v%4$lld. Only version metadata will be recorded; no files will be sent."),
-                            request.item.title, request.taskID, request.target.workspaceName, request.target.revision))
+                            request.item.title, request.taskID, request.target.hostName, request.target.revision))
             }
         }
         .overlay(alignment: .bottom) {
@@ -843,8 +843,7 @@ struct MIFWorkItemRoom: View {
                         MIFWorkItemPresentation.canRecordDelivery(item: item, taskID: task.id,
                                                                   target: $0, role: role)
                     }) { target in
-                        Button(String(format: AppLocalized("%1$@ · %2$@ v%3$lld"),
-                                      target.hostName, target.workspaceName, target.revision)) {
+                        Button("\(target.hostName) · 电脑文件 v\(target.revision)") {
                             deliveryConfirmation = MIFWorkItemDeliveryConfirmation(
                                 projectID: projectID, item: item, target: target, taskID: task.id)
                         }

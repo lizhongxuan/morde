@@ -245,8 +245,10 @@ func Open(options Options) (*Manager, error) {
 	}
 	for _, record := range m.ops {
 		if record.Operation.Status == contract.OperationUnknown {
-			m.closeStores()
-			return nil, ErrRuntimeStateUnavailable
+			if m.handlers[handlerKey(record.Operation.Capability, record.Operation.Action)] == nil {
+				m.closeStores()
+				return nil, ErrRuntimeStateUnavailable
+			}
 		}
 	}
 	instanceID, err := randomID("ri_")
@@ -285,8 +287,10 @@ func Open(options Options) (*Manager, error) {
 	}
 	for _, record := range m.ops {
 		if record.Operation.Status == contract.OperationUnknown {
-			m.closeStores()
-			return nil, ErrRuntimeStateUnavailable
+			if m.handlers[handlerKey(record.Operation.Capability, record.Operation.Action)] == nil {
+				m.closeStores()
+				return nil, ErrRuntimeStateUnavailable
+			}
 		}
 	}
 	m.state.Generation = options.Generation
@@ -1924,7 +1928,7 @@ func validTransition(from, to contract.OperationStatus) bool {
 	case contract.OperationCancelling:
 		return to == contract.OperationCancelled || to == contract.OperationUnknown || to == contract.OperationFailed
 	case contract.OperationUnknown:
-		return to == contract.OperationCancelled || to == contract.OperationFailed || to == contract.OperationSucceeded
+		return to == contract.OperationCancelling || to == contract.OperationCancelled || to == contract.OperationFailed || to == contract.OperationSucceeded
 	default:
 		return false
 	}

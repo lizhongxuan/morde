@@ -32,6 +32,8 @@ type taskServiceStub struct {
 	listPage               app.TaskPage
 	conversationTasks      app.TaskPage
 	conversationTaskID     string
+	conversationTaskView   app.ConversationTaskView
+	conversationTaskCalls  int
 	getID                  string
 	getDetails             *app.TaskDetails
 	actionTaskID           string
@@ -78,6 +80,11 @@ type conversationRecoveryTaskServiceStub struct {
 }
 
 func (s *conversationRecoveryTaskServiceStub) ListConversationActiveTasks(_ context.Context, _ identity.Principal, _, id string, _ app.PageRequest) (app.TaskPage, error) {
+	s.conversationTaskID = id
+	return s.activePage, nil
+}
+
+func (s *conversationRecoveryTaskServiceStub) ListConversationTasks(_ context.Context, _ identity.Principal, _, id string, _ app.ConversationTaskView, _ app.PageRequest) (app.TaskPage, error) {
 	s.conversationTaskID = id
 	return s.activePage, nil
 }
@@ -177,6 +184,13 @@ func (s *taskServiceStub) List(_ context.Context, _ identity.Principal, request 
 
 func (s *taskServiceStub) ListConversationActiveTasks(_ context.Context, _ identity.Principal, _ string, id string, _ app.PageRequest) (app.TaskPage, error) {
 	s.conversationTaskID = id
+	return s.conversationTasks, s.err
+}
+
+func (s *taskServiceStub) ListConversationTasks(_ context.Context, _ identity.Principal, _ string, id string, view app.ConversationTaskView, _ app.PageRequest) (app.TaskPage, error) {
+	s.conversationTaskCalls++
+	s.conversationTaskID = id
+	s.conversationTaskView = view
 	return s.conversationTasks, s.err
 }
 
@@ -727,12 +741,14 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 	value := apiTestTask()
 	value.StepCount = 3
 	value.CompletedStepCount = 1
+	triggerMessageID := "m8765432"
 	service := &taskServiceStub{listPage: app.TaskPage{
 		Items: []task.Task{value},
 		K2Projections: map[string]app.TaskK2Projection{value.ID: {
 			Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusCompleted, Satisfied: true}},
 			ChildJobs:    []app.ChildJob{{JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning}},
-			ResultReview: &app.ResultReview{State: "pending", SourceTaskID: value.ID, SourceTaskRevision: 3, SourceEventSequence: 9},
+			ResultReview: &app.ResultReview{State: "pending", SourceTaskID: value.ID, SourceTaskRevision: 3,
+				SourceEventSequence: 9, TriggerMessageID: &triggerMessageID},
 		}},
 	}}
 	engine := taskAPIRouter(service, nil)
@@ -756,7 +772,8 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 	if len(body.Items) != 1 || body.Items[0].StepCount != 3 || body.Items[0].CompletedStepCount != 1 ||
 		len(body.Items[0].Dependencies) != 1 || body.Items[0].Dependencies[0].TaskID != "q7654321" || !body.Items[0].Dependencies[0].Satisfied ||
 		len(body.Items[0].ChildJobs) != 1 || body.Items[0].ChildJobs[0].JobID != "dsh-child-1" ||
-		body.Items[0].ResultReview == nil || body.Items[0].ResultReview.State != "pending" || body.Items[0].ResultReview.SourceTaskID != value.ID {
+		body.Items[0].ResultReview == nil || body.Items[0].ResultReview.State != "pending" || body.Items[0].ResultReview.SourceTaskID != value.ID ||
+		body.Items[0].ResultReview.TriggerMessageID == nil || *body.Items[0].ResultReview.TriggerMessageID != triggerMessageID {
 		t.Fatalf("task summary counts and K2 projection = %#v", body.Items)
 	}
 }
@@ -764,12 +781,14 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 func TestTaskDetailMapsDependenciesChildJobsAndResultReview(t *testing.T) {
 	current := apiTestTask()
 	replyMessageID := "m1234567"
+	triggerMessageID := "m2345678"
 	view, err := toTaskResponse(app.TaskDetails{
 		Task:         current,
 		Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusCompleted, Satisfied: true}},
 		ChildJobs:    []app.ChildJob{{JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning}},
 		ResultReview: &app.ResultReview{
-			State: "published", SourceTaskID: current.ID, SourceTaskRevision: 3, SourceEventSequence: 9, ReplyMessageID: &replyMessageID,
+			State: "published", SourceTaskID: current.ID, SourceTaskRevision: 3, SourceEventSequence: 9,
+			TriggerMessageID: &triggerMessageID, ReplyMessageID: &replyMessageID,
 		},
 	})
 	if err != nil || len(view.Dependencies) != 1 || view.Dependencies[0] != (taskDependencyResponse{
@@ -778,7 +797,8 @@ func TestTaskDetailMapsDependenciesChildJobsAndResultReview(t *testing.T) {
 		JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning,
 	}) || view.ResultReview == nil || view.ResultReview.State != "published" ||
 		view.ResultReview.SourceTaskID != current.ID || view.ResultReview.SourceTaskRevision != 3 ||
-		view.ResultReview.SourceEventSequence != 9 || view.ResultReview.ReplyMessageID == nil || *view.ResultReview.ReplyMessageID != replyMessageID {
+		view.ResultReview.SourceEventSequence != 9 || view.ResultReview.TriggerMessageID == nil ||
+		*view.ResultReview.TriggerMessageID != triggerMessageID || view.ResultReview.ReplyMessageID == nil || *view.ResultReview.ReplyMessageID != replyMessageID {
 		t.Fatalf("coordination detail response = %#v, err=%v", view, err)
 	}
 	encoded, err := json.Marshal(view)
@@ -789,10 +809,12 @@ func TestTaskDetailMapsDependenciesChildJobsAndResultReview(t *testing.T) {
 		Dependencies []json.RawMessage `json:"dependencies"`
 		ChildJobs    []json.RawMessage `json:"child_jobs"`
 		ResultReview struct {
-			ReplyMessageID *string `json:"reply_message_id"`
+			TriggerMessageID *string `json:"trigger_message_id"`
+			ReplyMessageID   *string `json:"reply_message_id"`
 		} `json:"result_review"`
 	}
 	if err := json.Unmarshal(encoded, &body); err != nil || len(body.Dependencies) != 1 || len(body.ChildJobs) != 1 ||
+		body.ResultReview.TriggerMessageID == nil || *body.ResultReview.TriggerMessageID != triggerMessageID ||
 		body.ResultReview.ReplyMessageID == nil || *body.ResultReview.ReplyMessageID != replyMessageID {
 		t.Fatalf("coordination detail JSON = %s, err=%v", encoded, err)
 	}
@@ -800,12 +822,12 @@ func TestTaskDetailMapsDependenciesChildJobsAndResultReview(t *testing.T) {
 	view, err = toTaskResponse(app.TaskDetails{Task: current, ResultReview: &app.ResultReview{
 		State: "pending", SourceTaskID: current.ID, SourceTaskRevision: 0, SourceEventSequence: 1,
 	}})
-	if err != nil || view.ResultReview == nil || view.ResultReview.ReplyMessageID != nil {
+	if err != nil || view.ResultReview == nil || view.ResultReview.TriggerMessageID != nil || view.ResultReview.ReplyMessageID != nil {
 		t.Fatalf("null review reply message = %#v, err=%v", view.ResultReview, err)
 	}
 	encoded, err = json.Marshal(view)
-	if err != nil || !strings.Contains(string(encoded), `"reply_message_id":null`) {
-		t.Fatalf("nullable review reply JSON = %s, err=%v", encoded, err)
+	if err != nil || !strings.Contains(string(encoded), `"trigger_message_id":null`) || !strings.Contains(string(encoded), `"reply_message_id":null`) {
+		t.Fatalf("nullable review message IDs JSON = %s, err=%v", encoded, err)
 	}
 }
 
@@ -835,6 +857,7 @@ func TestTaskDetailRejectsInvalidCoordinationFields(t *testing.T) {
 		{"review source task id", func(v *app.TaskDetails) { v.ResultReview.SourceTaskID = "bad" }},
 		{"review source revision", func(v *app.TaskDetails) { v.ResultReview.SourceTaskRevision = -1 }},
 		{"review event sequence", func(v *app.TaskDetails) { v.ResultReview.SourceEventSequence = 0 }},
+		{"review trigger message id", func(v *app.TaskDetails) { invalid := "bad"; v.ResultReview.TriggerMessageID = &invalid }},
 		{"review reply message id", func(v *app.TaskDetails) { invalid := "bad"; v.ResultReview.ReplyMessageID = &invalid }},
 	}
 	for _, test := range cases {
@@ -963,7 +986,7 @@ func TestConversationMessageRequiresMatchingIdempotencyKey(t *testing.T) {
 
 func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 	service := &taskServiceStub{acceptReplayed: true}
-	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader("{\"client_message_id\":\"message-0001\",\"previous_client_message_id\":\"message-0000\",\"reference_task_id\":\"q1234567\",\"host_id\":\"h1234567\",\"workspace_id\":\"w1234567\",\"mcp_connector_ids\":[\"kbbbbbbb\"],\"client_attachment_ids\":[\"client-file-0001\"],\"application_id\":\"wechat\",\"model_id\":\"model-a\",\"content\":\"hello\"}"))
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader("{\"client_message_id\":\"message-0001\",\"previous_client_message_id\":\"message-0000\",\"reference_task_id\":\"q1234567\",\"host_id\":\"h1234567\",\"workspace_id\":\"w1234567\",\"change_task_target\":true,\"mcp_connector_ids\":[\"kbbbbbbb\"],\"client_attachment_ids\":[\"client-file-0001\"],\"application_id\":\"wechat\",\"model_id\":\"model-a\",\"content\":\"hello\"}"))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "message-0001")
 	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
@@ -977,6 +1000,7 @@ func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 		service.acceptCommand.IdempotencyKey != "message-0001" || service.acceptCommand.ClientMessageID != "message-0001" ||
 		service.acceptCommand.PreviousClientMessageID != "message-0000" || service.acceptCommand.ReferenceTaskID != "q1234567" ||
 		service.acceptCommand.HostID != "h1234567" || service.acceptCommand.WorkspaceID != "w1234567" ||
+		!service.acceptCommand.ChangeTaskTarget ||
 		len(service.acceptCommand.MCPConnectorIDs) != 1 || service.acceptCommand.MCPConnectorIDs[0] != "kbbbbbbb" ||
 		len(service.acceptCommand.ClientAttachmentIDs) != 1 || service.acceptCommand.ClientAttachmentIDs[0] != "client-file-0001" ||
 		service.acceptCommand.ApplicationID != "wechat" || service.acceptCommand.ModelID != "model-a" ||
@@ -1049,6 +1073,7 @@ func TestConversationActiveTasksIncludesCursor(t *testing.T) {
 	value.EventSequence = 7
 	service := &taskServiceStub{conversationTasks: app.TaskPage{
 		Items: []task.Task{value}, NextCursor: "next",
+		PendingCount: 2,
 		K2Projections: map[string]app.TaskK2Projection{value.ID: {
 			Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusRunning}},
 			ChildJobs:    []app.ChildJob{{JobID: "dsh-child-2", TaskStepID: "s1234568", Title: "Draft", TaskRevision: 1, Status: task.StepSucceeded}},
@@ -1062,15 +1087,32 @@ func TestConversationActiveTasksIncludesCursor(t *testing.T) {
 			taskSummaryResponse
 			EventSequence int64 `json:"event_sequence"`
 		} `json:"items"`
-		NextCursor string `json:"next_cursor"`
+		NextCursor   string `json:"next_cursor"`
+		PendingCount int64  `json:"pending_count"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK ||
-		service.conversationTaskID != "c1234567" || len(body.Items) != 1 || body.Items[0].ID != value.ID ||
+		service.conversationTaskID != "c1234567" || service.conversationTaskView != app.ConversationTaskViewActive || len(body.Items) != 1 || body.Items[0].ID != value.ID ||
 		body.Items[0].EventSequence != 7 || body.NextCursor != "next" || len(body.Items[0].Dependencies) != 1 ||
 		body.Items[0].Dependencies[0].TaskStatus != task.StatusRunning || len(body.Items[0].ChildJobs) != 1 ||
-		body.Items[0].ChildJobs[0].TaskRevision != 1 || body.Items[0].ResultReview == nil ||
+		body.Items[0].ChildJobs[0].TaskRevision != 1 || body.PendingCount != 2 || body.Items[0].ResultReview == nil ||
 		body.Items[0].ResultReview.State != "published" {
 		t.Fatalf("active tasks response=%d body=%s err=%v", response.Code, response.Body.String(), err)
+	}
+}
+
+func TestConversationTasksAcceptsRecentViewAndRejectsInvalidViews(t *testing.T) {
+	service := &taskServiceStub{conversationTasks: app.TaskPage{Items: []task.Task{apiTestTask()}}}
+	engine := taskAPIRouter(service, nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/tasks?view=recent", nil))
+	if response.Code != http.StatusOK || service.conversationTaskView != app.ConversationTaskViewRecent {
+		t.Fatalf("recent tasks response=%d view=%q body=%s", response.Code, service.conversationTaskView, response.Body.String())
+	}
+	calls := service.conversationTaskCalls
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/tasks?view=all", nil))
+	if response.Code != http.StatusBadRequest || service.conversationTaskCalls != calls {
+		t.Fatalf("invalid view response=%d list calls=%d want=%d body=%s", response.Code, service.conversationTaskCalls, calls, response.Body.String())
 	}
 }
 

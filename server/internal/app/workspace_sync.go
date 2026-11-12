@@ -62,14 +62,15 @@ type WorkspaceCurrentMaterializationLockStore interface {
 }
 
 type WorkspaceSyncService struct {
-	store              WorkspaceSyncStore
-	blocks             WorkspaceBlockStore
-	maxManifestBytes   int64
-	maxOwnerBytes      int64
-	materializeCurrent WorkspaceCurrentMaterializer
-	currentRevision    WorkspaceCurrentRevisionReader
-	verifyCurrent      WorkspaceCurrentManifestVerifier
-	nodeObserver       WorkspaceSyncNodeObserver
+	store                WorkspaceSyncStore
+	blocks               WorkspaceBlockStore
+	maxManifestBytes     int64
+	maxOwnerBytes        int64
+	projectUploadEnabled bool
+	materializeCurrent   WorkspaceCurrentMaterializer
+	currentRevision      WorkspaceCurrentRevisionReader
+	verifyCurrent        WorkspaceCurrentManifestVerifier
+	nodeObserver         WorkspaceSyncNodeObserver
 }
 
 type WorkspaceSyncNodeObserver interface {
@@ -93,14 +94,29 @@ type workspaceOwnershipTransferManifestReader interface {
 	GetWorkspaceManifestPageForOwnershipTransfer(context.Context, string, string, string, int64, string, string, int32) (workspace.ManifestPage, error)
 }
 
+// WorkspaceSyncOptions contains release gates for newly introduced sync flows.
+// Project uploads are closed unless explicitly enabled by the server.
+type WorkspaceSyncOptions struct {
+	ProjectUploadEnabled bool
+}
+
 func NewWorkspaceSyncService(store WorkspaceSyncStore, blocks WorkspaceBlockStore, maxManifestBytes, maxOwnerBytes int64) (*WorkspaceSyncService, error) {
+	return NewWorkspaceSyncServiceWithOptions(store, blocks, maxManifestBytes, maxOwnerBytes, WorkspaceSyncOptions{})
+}
+
+// NewWorkspaceSyncServiceWithOptions constructs the synchronization service with explicit feature gates.
+func NewWorkspaceSyncServiceWithOptions(store WorkspaceSyncStore, blocks WorkspaceBlockStore, maxManifestBytes, maxOwnerBytes int64,
+	options WorkspaceSyncOptions) (*WorkspaceSyncService, error) {
 	if store == nil || blocks == nil || maxOwnerBytes <= 0 {
 		return nil, errors.New("workspace synchronization dependencies and owner quota are required")
 	}
 	if maxManifestBytes <= 0 || maxManifestBytes > workspace.MaxSyncManifestBytes {
 		maxManifestBytes = workspace.MaxSyncManifestBytes
 	}
-	return &WorkspaceSyncService{store: store, blocks: blocks, maxManifestBytes: maxManifestBytes, maxOwnerBytes: maxOwnerBytes}, nil
+	return &WorkspaceSyncService{
+		store: store, blocks: blocks, maxManifestBytes: maxManifestBytes, maxOwnerBytes: maxOwnerBytes,
+		projectUploadEnabled: options.ProjectUploadEnabled,
+	}, nil
 }
 
 func (s *WorkspaceSyncService) SetWorkspaceCurrentMaterializer(materializer WorkspaceCurrentMaterializer) error {
@@ -109,6 +125,11 @@ func (s *WorkspaceSyncService) SetWorkspaceCurrentMaterializer(materializer Work
 	}
 	s.materializeCurrent = materializer
 	return nil
+}
+
+// ProjectUploadEnabled reports whether the explicit project upload flow passed its server-side release gate.
+func (s *WorkspaceSyncService) ProjectUploadEnabled() bool {
+	return s != nil && s.projectUploadEnabled
 }
 
 func (s *WorkspaceSyncService) SetWorkspaceCurrentRevisionReader(reader WorkspaceCurrentRevisionReader) error {
@@ -576,6 +597,9 @@ func (s *WorkspaceSyncService) authorizeWorkspaceChanges(ctx context.Context, pr
 }
 
 func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal identity.Principal, workspaceID string, command workspace.CreateSyncSession, idempotencyKey string) (result workspace.SyncSession, retErr error) {
+	if command.FolderID != "" {
+		return s.createProjectUploadSession(ctx, principal, workspaceID, command, idempotencyKey)
+	}
 	value, err := s.authorize(ctx, principal, workspaceID)
 	if err != nil {
 		return workspace.SyncSession{}, err
@@ -732,19 +756,9 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 }
 
 func (s *WorkspaceSyncService) GetSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID string) (workspace.SyncSession, error) {
-	value, err := s.authorize(ctx, principal, workspaceID)
+	_, session, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return workspace.SyncSession{}, err
-	}
-	if !workspace.ValidSessionID(sessionID) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
-	}
-	session, err := s.store.GetWorkspaceSyncSession(ctx, workspaceID, sessionID)
-	if err != nil {
-		return workspace.SyncSession{}, err
-	}
-	if session.OwnerID != value.OwnerID || session.ReplicaID != syncReplicaID(principal) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
 	return session, nil
 }
@@ -816,22 +830,15 @@ func (s *WorkspaceSyncService) ListDeviceSyncProgress(ctx context.Context, princ
 }
 
 func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID, idempotencyKey string) (workspace.SyncSession, error) {
-	value, err := s.authorize(ctx, principal, workspaceID)
+	value, session, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
-	if !workspace.ValidSessionID(sessionID) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	if session.FolderID != "" && !s.projectUploadEnabled {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "project upload is unavailable")
 	}
 	if err := validateSyncIdempotencyKey(idempotencyKey); err != nil {
 		return workspace.SyncSession{}, err
-	}
-	session, err := s.store.GetWorkspaceSyncSession(ctx, workspaceID, sessionID)
-	if err != nil {
-		return workspace.SyncSession{}, err
-	}
-	if session.OwnerID != value.OwnerID || session.ReplicaID != syncReplicaID(principal) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
 	if value.ReadOnly && session.Direction != workspace.SyncDownload {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
@@ -901,22 +908,12 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 }
 
 func (s *WorkspaceSyncService) CancelSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID, idempotencyKey string) (workspace.SyncSession, error) {
-	value, err := s.authorize(ctx, principal, workspaceID)
+	value, _, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return workspace.SyncSession{}, err
-	}
-	if !workspace.ValidSessionID(sessionID) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
 	if err := validateSyncIdempotencyKey(idempotencyKey); err != nil {
 		return workspace.SyncSession{}, err
-	}
-	session, err := s.store.GetWorkspaceSyncSession(ctx, workspaceID, sessionID)
-	if err != nil {
-		return workspace.SyncSession{}, err
-	}
-	if session.OwnerID != value.OwnerID || session.ReplicaID != syncReplicaID(principal) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
 	record, err := idempotencyRecord(value.OwnerID, "workspace.sync.cancel", idempotencyKey, struct {
 		WorkspaceID string `json:"workspace_id"`
@@ -933,12 +930,15 @@ func (s *WorkspaceSyncService) CancelSyncSession(ctx context.Context, principal 
 }
 
 func (s *WorkspaceSyncService) PutSyncBlock(ctx context.Context, principal identity.Principal, workspaceID, sessionID, digest string, body io.Reader) (written int64, retErr error) {
-	value, err := s.authorize(ctx, principal, workspaceID)
+	if !validSyncDigest(digest) || body == nil {
+		return 0, domain.InvalidArgument("block", "workspace sync block is invalid")
+	}
+	_, session, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return 0, err
 	}
-	if !validSyncDigest(digest) || body == nil {
-		return 0, domain.InvalidArgument("block", "workspace sync block is invalid")
+	if session.FolderID != "" && !s.projectUploadEnabled {
+		return 0, domain.NewError(domain.CodeWorkspaceUnavailable, "project upload is unavailable")
 	}
 	blockLock, err := s.lockWorkspaceBlockStore(ctx, workspaceID, true)
 	if err != nil {
@@ -949,10 +949,6 @@ func (s *WorkspaceSyncService) PutSyncBlock(ctx context.Context, principal ident
 			retErr = errors.Join(retErr, fmt.Errorf("release workspace block store read lock: %w", err))
 		}
 	}()
-	session, err := s.authorizeSession(ctx, principal, value, workspaceID, sessionID)
-	if err != nil {
-		return 0, err
-	}
 	if session.State != workspace.SyncPlanned && session.State != workspace.SyncTransferring &&
 		session.State != workspace.SyncVerifying && session.State != workspace.SyncApplying {
 		return 0, domain.NewError(domain.CodeInvalidState, "workspace sync session does not accept uploads")
@@ -975,6 +971,13 @@ func (s *WorkspaceSyncService) PutSyncBlock(ctx context.Context, principal ident
 	switch principal.Kind {
 	case identity.KindDevice:
 		reader = reauthorizeSyncReader{reader: body, authorize: func() error {
+			if session.FolderID != "" {
+				folders, ok := s.store.(workspaceSyncProjectFolderStore)
+				if !ok {
+					return domain.NewError(domain.CodeWorkspaceUnavailable, "project upload is unavailable")
+				}
+				return folders.CheckWorkspaceSyncProjectFolderAccess(ctx, principal, workspaceID, session.FolderID)
+			}
 			return s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID)
 		}}
 	case identity.KindHostReplica:
@@ -1063,11 +1066,7 @@ func (s *WorkspaceSyncService) lockWorkspaceBlockStore(ctx context.Context, work
 // acknowledges each destination file or deletion separately after applying it
 // with AckDownloadAction; GET alone cannot establish either guarantee.
 func (s *WorkspaceSyncService) AckDownloadedBlock(ctx context.Context, principal identity.Principal, workspaceID, sessionID, digest string) error {
-	value, err := s.authorize(ctx, principal, workspaceID)
-	if err != nil {
-		return err
-	}
-	session, err := s.authorizeSession(ctx, principal, value, workspaceID, sessionID)
+	_, session, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return err
 	}
@@ -1092,11 +1091,7 @@ func (s *WorkspaceSyncService) AckDownloadedBlock(ctx context.Context, principal
 }
 
 func (s *WorkspaceSyncService) AckDownloadAction(ctx context.Context, principal identity.Principal, workspaceID, sessionID, path string, action workspace.ChangeAction, sha256 string, sizeBytes int64) error {
-	value, err := s.authorize(ctx, principal, workspaceID)
-	if err != nil {
-		return err
-	}
-	session, err := s.authorizeSession(ctx, principal, value, workspaceID, sessionID)
+	_, session, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return err
 	}
@@ -1157,13 +1152,12 @@ func (s *WorkspaceSyncService) StreamSyncBlock(ctx context.Context, principal id
 }
 
 func (s *WorkspaceSyncService) readSyncBlock(ctx context.Context, principal identity.Principal, workspaceID, sessionID, digest string) ([]byte, error) {
-	value, err := s.authorize(ctx, principal, workspaceID)
+	_, session, err := s.authorizeSyncSession(ctx, principal, workspaceID, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	session, err := s.authorizeSession(ctx, principal, value, workspaceID, sessionID)
-	if err != nil {
-		return nil, err
+	if session.FolderID != "" && !s.projectUploadEnabled {
+		return nil, domain.NewError(domain.CodeWorkspaceUnavailable, "project upload is unavailable")
 	}
 	if !validSyncDigest(digest) {
 		return nil, domain.NewError(domain.CodeNotFound, "workspace sync block not found")
@@ -1266,20 +1260,6 @@ func (r authorizedSyncReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return readBytes, readErr
-}
-
-func (s *WorkspaceSyncService) authorizeSession(ctx context.Context, principal identity.Principal, value workspace.Workspace, workspaceID, sessionID string) (workspace.SyncSession, error) {
-	if !workspace.ValidSessionID(sessionID) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
-	}
-	session, err := s.store.GetWorkspaceSyncSession(ctx, workspaceID, sessionID)
-	if err != nil {
-		return workspace.SyncSession{}, err
-	}
-	if session.OwnerID != value.OwnerID || session.ReplicaID != syncReplicaID(principal) {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
-	}
-	return session, nil
 }
 
 func (s *WorkspaceSyncService) readManifest(ctx context.Context, ownerID, workspaceID string, revision int64, scopes []string) ([]workspace.File, []string, []workspace.Directory, error) {

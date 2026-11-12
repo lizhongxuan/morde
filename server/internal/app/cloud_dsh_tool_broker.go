@@ -776,14 +776,15 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		if parseErr != nil {
 			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 		}
-		bound, reason, bindErr := b.bindDeferredRuntimeTarget(ctx, claimed, target, mapping, arguments)
+		call.Arguments = string(arguments)
+		bound, resolvedCall, reason, bindErr := b.bindDeferredRuntimeTarget(ctx, claimed, target, mapping, call)
 		if bindErr != nil {
 			return AgentToolResult{}, bindErr
 		}
 		if reason != "" {
 			return b.pauseDeferredTarget(ctx, claimed, reason)
 		}
-		claimed = bound
+		claimed, call = bound, resolvedCall
 	}
 	if call.Name == agentAskUserToolName {
 		return b.clarify(ctx, claimed, call, recovering)
@@ -1001,7 +1002,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	if operation.ID == "" || operation.HostID != current.HostID || operation.WorkspaceID != preparation.WorkspaceID ||
 		operation.BindingVersion != preparation.BindingVersion || !sameTaskInputRevision(operation.InputRevision, inputRevision) ||
-		!sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) ||
+		!operationWorkspaceCheckpointMatches(operation, current) ||
 		!bytes.Equal(operation.RequestHash, hash[:]) {
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The stored tool operation does not match this exact request.")
 	}
@@ -1471,7 +1472,7 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 	if operation.ID == "" || !domain.ValidOperationID(operation.ID) || operation.TaskID != current.ID || operation.Key != operationKey ||
 		workspaceErr != nil || operation.HostID != current.HostID || operation.WorkspaceID != workspaceID ||
 		!sameTaskInputRevision(operation.InputRevision, current.InputRevision) ||
-		!sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) ||
+		!operationWorkspaceCheckpointMatches(operation, current) ||
 		(operation.WorkspaceID != "" && operation.BindingVersion < 1) ||
 		(operation.WorkspaceID == "" && operation.BindingVersion != 0) || !bytes.Equal(operation.RequestHash, hash[:]) {
 		return pause("The stored tool operation does not match this exact checkpointed request.")

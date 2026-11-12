@@ -16,9 +16,10 @@ import (
 // routed message. It is only an intent: looking it up must not probe the Host
 // or bind a Workspace snapshot.
 type DeferredTaskTarget struct {
-	HostID        string
-	WorkspaceID   string
-	ApplicationID string
+	HostID                  string
+	WorkspaceID             string
+	ApplicationID           string
+	WorkspaceBindingVersion int64
 	// The original selection belongs to a different service instance. Keep
 	// ordinary conversation available, but do not use or disclose that target.
 	Unavailable bool
@@ -29,6 +30,13 @@ type DeferredTaskTarget struct {
 type DeferredTaskTargetStore interface {
 	LoadDeferredTaskTarget(context.Context, task.Task) (DeferredTaskTarget, bool, error)
 	BindDeferredTaskTarget(context.Context, task.Task, DeferredTaskTarget, *int64, []byte) (task.Task, error)
+}
+
+// DeferredTaskWorkspaceResolver derives the personal Workspace bound to the
+// selected Host only when a Workspace-scoped Host tool is actually invoked.
+// The binding version is rechecked by BindDeferredTaskTarget.
+type DeferredTaskWorkspaceResolver interface {
+	ResolveDeferredTaskWorkspace(context.Context, task.Task, DeferredTaskTarget) (DeferredTaskTarget, bool, error)
 }
 
 // A Workspace is a tool in its own right; selecting one must not require a
@@ -187,6 +195,8 @@ func (b *CloudDSHToolBroker) refreshDeferredTask(ctx context.Context, claimed ta
 		return task.Task{}, target, true, err
 	}
 	current := details.Task
+	workspaceBoundFromSelectedHost := !target.Unavailable && target.WorkspaceID == "" && target.HostID != "" &&
+		claimed.ProjectID == "" && current.HostID == target.HostID
 	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.InitiatorID != claimed.InitiatorID ||
 		current.ProjectID != claimed.ProjectID || current.ConversationID != claimed.ConversationID ||
 		current.ModelID != claimed.ModelID || current.ExecutionLocation != claimed.ExecutionLocation ||
@@ -194,7 +204,8 @@ func (b *CloudDSHToolBroker) refreshDeferredTask(ctx context.Context, claimed ta
 		current.AgentSessionID != claimed.AgentSessionID || current.Lease.Owner != claimed.Lease.Owner ||
 		current.Lease.Version != claimed.Lease.Version || !sameCloudDSHAuthorization(current.Authorization, claimed.Authorization) ||
 		(!target.Unavailable && claimed.HostID == "" && current.HostID != "" && current.HostID != target.HostID) ||
-		(!target.Unavailable && claimed.WorkspaceID == "" && current.WorkspaceID != "" && current.WorkspaceID != target.WorkspaceID) ||
+		(!target.Unavailable && claimed.WorkspaceID == "" && current.WorkspaceID != "" && current.WorkspaceID != target.WorkspaceID &&
+			!workspaceBoundFromSelectedHost) ||
 		(claimed.HostID != "" && current.HostID != claimed.HostID) ||
 		(claimed.WorkspaceID != "" && current.WorkspaceID != claimed.WorkspaceID) {
 		return task.Task{}, target, true, domain.NewError(domain.CodeInvalidState, "deferred Task identity or target changed")
@@ -211,14 +222,70 @@ func deferredRuntimeToolDefinitions(target DeferredTaskTarget, authorization tas
 			continue
 		}
 		description := mapping.description + " The selected computer is checked only when this tool is called."
-		if runtimeclient.WorkspaceScopedCapability(mapping.capability) && target.WorkspaceID != "" {
-			description += " The user's selected workspace_id is " + target.WorkspaceID + "."
+		parameters := append(json.RawMessage(nil), mapping.parameters...)
+		if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
+			parameters = deferredWorkspaceScopedToolParameters(parameters)
 		}
 		definitions = append(definitions, AgentToolDefinition{ModelTool: ModelTool{
-			Name: mapping.name, Description: description, Parameters: append(json.RawMessage(nil), mapping.parameters...),
+			Name: mapping.name, Description: description, Parameters: parameters,
 		}, RequiredScope: mapping.scope})
 	}
 	return definitions
+}
+
+func deferredWorkspaceScopedToolParameters(raw json.RawMessage) json.RawMessage {
+	var schema map[string]json.RawMessage
+	if json.Unmarshal(raw, &schema) != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	var properties map[string]json.RawMessage
+	if json.Unmarshal(schema["properties"], &properties) != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	delete(properties, "workspace_id")
+	encodedProperties, err := json.Marshal(properties)
+	if err != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	schema["properties"] = encodedProperties
+	var required []string
+	if json.Unmarshal(schema["required"], &required) == nil {
+		filtered := required[:0]
+		for _, field := range required {
+			if field != "workspace_id" {
+				filtered = append(filtered, field)
+			}
+		}
+		encodedRequired, err := json.Marshal(filtered)
+		if err != nil {
+			return append(json.RawMessage(nil), raw...)
+		}
+		schema["required"] = encodedRequired
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	return encoded
+}
+
+func deferredWorkspaceToolArguments(raw json.RawMessage, workspaceID string) (json.RawMessage, error) {
+	if !domain.ValidWorkspaceID(workspaceID) || !validAgentJSONObject(raw, maxAgentToolArgsBytes) {
+		return nil, domain.InvalidArgument("tool_call.arguments", "runtime Workspace arguments are invalid")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return nil, domain.InvalidArgument("tool_call.arguments", "runtime Workspace arguments are invalid")
+	}
+	serverWorkspaceID, _ := json.Marshal(workspaceID)
+	// The model never chooses the Workspace identity. Drop any stale or
+	// hand-authored value and inject the binding resolved for this Host.
+	fields["workspace_id"] = serverWorkspaceID
+	encoded, err := json.Marshal(fields)
+	if err != nil || len(encoded) > maxAgentToolArgsBytes {
+		return nil, domain.InvalidArgument("tool_call.arguments", "runtime Workspace arguments are invalid")
+	}
+	return encoded, nil
 }
 
 func (b *CloudDSHToolBroker) pauseDeferredTarget(ctx context.Context, claimed task.Task, reason string) (AgentToolResult, error) {
@@ -258,58 +325,80 @@ func (b *CloudDSHToolBroker) pauseDeferredTarget(ctx context.Context, claimed ta
 // bindDeferredRuntimeTarget performs no remote action. It freezes the target
 // and Workspace snapshot only for an actual Host tool call.
 func (b *CloudDSHToolBroker) bindDeferredRuntimeTarget(ctx context.Context, claimed task.Task,
-	target DeferredTaskTarget, mapping runtimeToolMapping, arguments json.RawMessage) (task.Task, string, error) {
+	target DeferredTaskTarget, mapping runtimeToolMapping, call ModelToolCall) (task.Task, ModelToolCall, string, error) {
+	arguments := call.Arguments
 	if target.Unavailable {
-		return task.Task{}, "computer_unavailable", nil
+		return task.Task{}, ModelToolCall{}, "computer_unavailable", nil
 	}
 	if target.HostID == "" {
-		return task.Task{}, "computer_target_missing", nil
+		return task.Task{}, ModelToolCall{}, "computer_target_missing", nil
 	}
 	if claimed.HostID == "" && claimed.WorkspaceID != "" {
 		// Moving a live hostless snapshot onto a computer requires a separate
 		// reconciliation of prior Workspace operations and bindings.
-		return task.Task{}, "computer_target_changed", nil
+		return task.Task{}, ModelToolCall{}, "computer_target_changed", nil
 	}
 	if claimed.HostID != "" && claimed.HostID != target.HostID {
-		return task.Task{}, "computer_target_changed", nil
-	}
-	if !validRuntimeToolArguments(mapping, arguments) {
-		return task.Task{}, "", domain.InvalidArgument("tool_call.arguments", "runtime tool arguments are invalid")
+		return task.Task{}, ModelToolCall{}, "computer_target_changed", nil
 	}
 	proposed := claimed
 	proposed.HostID = target.HostID
 	if err := b.runtime.authorize(ctx, proposed, mapping.scope); err != nil {
-		return task.Task{}, "computer_unavailable", nil
+		return task.Task{}, ModelToolCall{}, "computer_unavailable", nil
 	}
 	if _, err := b.runtime.readFence(ctx, proposed, nil); err != nil {
-		return task.Task{}, "computer_unavailable", nil
+		return task.Task{}, ModelToolCall{}, "computer_unavailable", nil
 	}
+	resolvedCall := call
 	selected := DeferredTaskTarget{HostID: target.HostID, ApplicationID: target.ApplicationID}
 	workspaceOwner := claimed.InitiatorID
 	write := mapping.capability != "file.read" && mapping.capability != "file.list" && mapping.capability != "file.find"
 	if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
-		if target.WorkspaceID == "" || runtimeToolWorkspaceID(mapping, arguments) != target.WorkspaceID {
-			return task.Task{}, "workspace_unavailable", nil
+		if target.WorkspaceID == "" {
+			if claimed.ProjectID != "" {
+				return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
+			}
+			resolver, ok := b.store.(DeferredTaskWorkspaceResolver)
+			if !ok {
+				return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
+			}
+			resolved, found, err := resolver.ResolveDeferredTaskWorkspace(ctx, claimed, target)
+			if err != nil || !found || resolved.HostID != target.HostID || resolved.WorkspaceID == "" || resolved.WorkspaceBindingVersion < 1 {
+				return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
+			}
+			target.WorkspaceID = resolved.WorkspaceID
+			target.WorkspaceBindingVersion = resolved.WorkspaceBindingVersion
 		}
 		if claimed.WorkspaceID != "" && claimed.WorkspaceID != target.WorkspaceID {
-			return task.Task{}, "workspace_target_changed", nil
+			return task.Task{}, ModelToolCall{}, "workspace_target_changed", nil
 		}
 		selected.WorkspaceID = target.WorkspaceID
+		selected.WorkspaceBindingVersion = target.WorkspaceBindingVersion
+		resolvedArguments, err := deferredWorkspaceToolArguments(json.RawMessage(arguments), selected.WorkspaceID)
+		if err != nil {
+			return task.Task{}, ModelToolCall{}, "", err
+		}
+		if !validRuntimeToolArguments(mapping, resolvedArguments) {
+			return task.Task{}, ModelToolCall{}, "", domain.InvalidArgument("tool_call.arguments", "runtime Workspace arguments are invalid")
+		}
+		resolvedCall.Arguments = string(resolvedArguments)
 		if claimed.ProjectID != "" {
 			access, ok := b.store.(ProjectTaskWorkspaceAccess)
 			if !ok {
-				return task.Task{}, "workspace_unavailable", nil
+				return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
 			}
 			var err error
 			workspaceOwner, err = access.ValidateProjectTaskWorkspaceAccess(ctx, claimed, target.WorkspaceID, write)
 			if err != nil {
-				return task.Task{}, "workspace_unavailable", nil
+				return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
 			}
 		}
+	} else if !validRuntimeToolArguments(mapping, json.RawMessage(arguments)) {
+		return task.Task{}, ModelToolCall{}, "", domain.InvalidArgument("tool_call.arguments", "runtime tool arguments are invalid")
 	}
 	store, ok := b.store.(DeferredTaskTargetStore)
 	if !ok {
-		return task.Task{}, "", fmt.Errorf("deferred target storage is unavailable")
+		return task.Task{}, ModelToolCall{}, "", fmt.Errorf("deferred target storage is unavailable")
 	}
 	var bound task.Task
 	bind := func(bindingCtx context.Context, ownerID string) error {
@@ -340,7 +429,7 @@ func (b *CloudDSHToolBroker) bindDeferredRuntimeTarget(ctx context.Context, clai
 	if claimed.ProjectID != "" && selected.WorkspaceID != "" {
 		selection, ok := b.store.(ProjectTaskWorkspaceSelection)
 		if !ok {
-			return task.Task{}, "workspace_unavailable", nil
+			return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
 		}
 		err = selection.WithProjectTaskWorkspaceSelection(ctx, claimed, selected, write, bind)
 	} else {
@@ -348,23 +437,23 @@ func (b *CloudDSHToolBroker) bindDeferredRuntimeTarget(ctx context.Context, clai
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return task.Task{}, "", ctx.Err()
+			return task.Task{}, ModelToolCall{}, "", ctx.Err()
 		}
 		if domain.CodeOf(err) == domain.CodeWorkspaceConflict || domain.CodeOf(err) == domain.CodeWorkspaceBusy {
-			return task.Task{}, "workspace_unavailable", nil
+			return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
 		}
 		if domain.CodeOf(err) == domain.CodeConflict {
-			return task.Task{}, "target_result_unknown", nil
+			return task.Task{}, ModelToolCall{}, "target_result_unknown", nil
 		}
 		if selected.WorkspaceID != "" {
-			return task.Task{}, "workspace_unavailable", nil
+			return task.Task{}, ModelToolCall{}, "workspace_unavailable", nil
 		}
-		return task.Task{}, "computer_unavailable", nil
+		return task.Task{}, ModelToolCall{}, "computer_unavailable", nil
 	}
 	if bound.HostID != target.HostID || bound.InitiatorID != claimed.InitiatorID ||
 		bound.AgentInstanceID != claimed.AgentInstanceID || bound.AgentGeneration != claimed.AgentGeneration ||
 		bound.Lease.Owner != claimed.Lease.Owner || bound.Lease.Version != claimed.Lease.Version {
-		return task.Task{}, "", domain.NewError(domain.CodeInvalidState, "deferred target binding did not match the task")
+		return task.Task{}, ModelToolCall{}, "", domain.NewError(domain.CodeInvalidState, "deferred target binding did not match the task")
 	}
-	return bound, "", nil
+	return bound, resolvedCall, "", nil
 }

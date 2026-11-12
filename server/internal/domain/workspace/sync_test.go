@@ -29,6 +29,19 @@ func TestValidSyncFolderID(t *testing.T) {
 	}
 }
 
+func TestValidateSyncProjectFolderName(t *testing.T) {
+	for _, value := range []string{"blog", "My Project", "博客", "release.v2", "Café"} {
+		if err := ValidateSyncProjectFolderName(value); err != nil {
+			t.Errorf("ValidateSyncProjectFolderName(%q) = %v", value, err)
+		}
+	}
+	for _, value := range []string{"", ".", "..", " ../x", "a/b", `a\\b`, "bad:name", "trailing.", "trailing ", "CON", "con.txt", "LPT9", "bad\x00name", strings.Repeat("a", 121)} {
+		if err := ValidateSyncProjectFolderName(value); err == nil {
+			t.Errorf("ValidateSyncProjectFolderName(%q) accepted an invalid or reserved name", value)
+		}
+	}
+}
+
 func TestValidateCreateSyncSessionEnforcesManifestLimitsAndPaths(t *testing.T) {
 	valid := CreateSyncSession{Direction: SyncUpload, Policy: SyncCompareMerge, Files: []File{file("src/main.go", strings.Repeat("a", 64), 3)}}
 	if err := ValidateCreateSyncSession(valid, 1024); err != nil {

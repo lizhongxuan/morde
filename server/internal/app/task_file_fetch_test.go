@@ -9,9 +9,104 @@ import (
 	"testing"
 	"time"
 
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/hub"
 	"morde/server/internal/domain/task"
 )
+
+type taskFileFetchOwnerStoreStub struct {
+	*taskStoreStub
+	TaskFileFetchStore
+	TaskFileFetchDataStore
+	fetch             TaskFileFetch
+	listOwnerID       string
+	listTaskID        string
+	getOwnerID        string
+	getTaskID         string
+	getFetchID        string
+	listCalls         int
+	getFetchCall      int
+	allowWeb          bool
+	authorizeCalls    int
+	authorizedUser    string
+	authorizedInstall string
+}
+
+func (s *taskFileFetchOwnerStoreStub) IsDesktopClientWebSession(_ context.Context, ownerID, installationID string) (bool, error) {
+	s.authorizeCalls++
+	s.authorizedUser, s.authorizedInstall = ownerID, installationID
+	return s.allowWeb, nil
+}
+
+func (s *taskFileFetchOwnerStoreStub) GetTaskFileFetch(_ context.Context, ownerID, taskID, fetchID string) (TaskFileFetch, error) {
+	s.getFetchCall++
+	s.getOwnerID, s.getTaskID, s.getFetchID = ownerID, taskID, fetchID
+	return s.fetch, nil
+}
+
+func (s *taskFileFetchOwnerStoreStub) ListTaskFileFetches(_ context.Context, ownerID, taskID string) ([]TaskFileFetch, error) {
+	s.listCalls++
+	s.listOwnerID, s.listTaskID = ownerID, taskID
+	return []TaskFileFetch{s.fetch}, nil
+}
+
+func TestTaskFileFetchOwnerAllowsClientWebSessionForOwnTask(t *testing.T) {
+	const ownerID, taskID = "u1234567", "q1234567"
+	now := time.Now().UTC()
+	store := &taskFileFetchOwnerStoreStub{
+		taskStoreStub: &taskStoreStub{details: TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID, HostID: "h1234567"}}},
+		allowWeb:      true,
+		fetch: TaskFileFetch{ID: "o1234567", OwnerID: ownerID, TaskID: taskID, OperationKey: "agent:test",
+			SourceInstallationID: "i7654321", SourceDeviceName: "B40 PC", SourceDirectoryName: "reports", TargetGrantVersion: 4,
+			TaskAuthorizationVersion: 3, TaskRevision: 0, RelativePath: "reports/result.pdf", Status: task.FileFetchTransferring,
+			ContentState: task.FileFetchContentNone, ParseStatus: task.FileFetchParsePending, CreatedAt: now, UpdatedAt: now},
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := taskTestPrincipal()
+	principal.ClientInstallationID = "i1234567"
+	if _, err := service.GetTaskFileFetch(context.Background(), principal, taskID, store.fetch.ID); err != nil {
+		t.Fatalf("GetTaskFileFetch(client web session) = %v", err)
+	}
+	items, err := service.ListTaskFileFetches(context.Background(), principal, taskID)
+	if err != nil || len(items) != 1 || store.getFetchCall != 1 || store.listCalls != 1 ||
+		store.getOwnerID != ownerID || store.getTaskID != taskID || store.getFetchID != store.fetch.ID ||
+		store.listOwnerID != ownerID || store.listTaskID != taskID {
+		t.Fatalf("file fetch owner queries = get %d/%q/%q/%q, list %d/%q/%q, err=%v", store.getFetchCall,
+			store.getOwnerID, store.getTaskID, store.getFetchID, store.listCalls, store.listOwnerID, store.listTaskID, err)
+	}
+	if _, err := service.taskFileFetchOwnerStore(context.Background(), principal, taskID, store.fetch.ID); err != nil {
+		t.Fatalf("taskFileFetchOwnerStore(client web session) = %v", err)
+	}
+	if store.authorizeCalls != 3 || store.authorizedUser != ownerID || store.authorizedInstall != principal.ClientInstallationID {
+		t.Fatalf("desktop session authorization = %d/%q/%q", store.authorizeCalls, store.authorizedUser, store.authorizedInstall)
+	}
+}
+
+func TestTaskFileFetchOwnerRejectsNonDesktopClientWebSession(t *testing.T) {
+	const ownerID, taskID = "u1234567", "q1234567"
+	store := &taskFileFetchOwnerStoreStub{
+		taskStoreStub: &taskStoreStub{details: TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID, HostID: "h1234567"}}},
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := taskTestPrincipal()
+	principal.ClientInstallationID = "i1234567"
+	if _, err := service.ListTaskFileFetches(context.Background(), principal, taskID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("ListTaskFileFetches(non-desktop Web session) err=%v; want not found", err)
+	}
+	if _, err := service.taskFileFetchOwnerStore(context.Background(), principal, taskID, "o1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("taskFileFetchOwnerStore(non-desktop Web session) err=%v; want not found", err)
+	}
+	if store.authorizeCalls != 2 || store.authorizedUser != ownerID || store.authorizedInstall != principal.ClientInstallationID ||
+		store.listCalls != 0 || store.getFetchCall != 0 {
+		t.Fatalf("non-desktop session reached owner store: authorization=%d list=%d get=%d", store.authorizeCalls, store.listCalls, store.getFetchCall)
+	}
+}
 
 func TestValidTaskFileFetchDirectoryName(t *testing.T) {
 	for _, value := range []string{"reports", "报告", strings.Repeat("a", 100)} {
@@ -41,6 +136,21 @@ func TestTaskFileFetchFailureReasonSanitizesPCAndServerErrors(t *testing.T) {
 		if got := TaskFileFetchFailureReason(input); got != want || !task.ValidFileFetchFailureReason(got) {
 			t.Errorf("TaskFileFetchFailureReason(%q) = %q, want safe %q", input, got, want)
 		}
+	}
+}
+
+func TestCloudDSHFileFetchRejectsUnsafePathAsFailedToolResult(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	result, err := broker.Execute(context.Background(), claimed, ModelToolCall{
+		CallID: "call_file_fetch_traversal", Name: "morde_hub_file_fetch_i7654321_v5", Arguments: `{"path":"../outside.pdf"}`,
+	})
+	if err != nil || result.Status != AgentToolFailed || strings.Contains(result.Output, "outside.pdf") || !strings.Contains(result.Output, "no file was read") {
+		t.Fatalf("unsafe file.fetch result=%#v err=%v", result, err)
+	}
+	if len(store.operations) != 0 || len(store.fetches) != 0 {
+		t.Fatalf("unsafe file.fetch created server state: operations=%#v fetches=%#v", store.operations, store.fetches)
 	}
 }
 

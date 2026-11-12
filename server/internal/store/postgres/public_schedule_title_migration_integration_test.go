@@ -12,6 +12,7 @@ import (
 func TestScheduleTitleMigrationBackfillsAndGuardsRollback(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
+	owner := createTestUser(t, store, 1, 2_000, 4_096)
 	provider, closeProvider, err := newMigrationProvider(store.pool)
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +22,6 @@ func TestScheduleTitleMigrationBackfillsAndGuardsRollback(t *testing.T) {
 		t.Fatalf("roll schema back before title migration: %v", err)
 	}
 
-	owner := createTestUser(t, store, 1, 2_000, 4_096)
 	scheduleID, err := schedule.NewID()
 	if err != nil {
 		t.Fatal(err)

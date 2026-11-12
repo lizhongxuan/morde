@@ -20,6 +20,7 @@ type conversationServiceStub struct {
 	createdValue conversation.Conversation
 	replayed     bool
 	listCalls    int
+	listRequest  app.PageRequest
 	listPage     app.ConversationPage
 	getID        string
 	conversation conversation.Conversation
@@ -49,9 +50,19 @@ func (s *conversationServiceStub) Create(_ context.Context, _ identity.Principal
 	}, s.replayed, s.err
 }
 
-func (s *conversationServiceStub) List(context.Context, identity.Principal, app.PageRequest) (app.ConversationPage, error) {
+func (s *conversationServiceStub) List(_ context.Context, _ identity.Principal, page app.PageRequest) (app.ConversationPage, error) {
 	s.listCalls++
+	s.listRequest = page
 	return s.listPage, s.err
+}
+
+func TestConversationListPassesSearchQueryToService(t *testing.T) {
+	service := &conversationServiceStub{}
+	response := httptest.NewRecorder()
+	taskAPIRouter(nil, service).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations?q=planning%20notes&limit=2", nil))
+	if response.Code != http.StatusOK || service.listCalls != 1 || service.listRequest.Search != "planning notes" || service.listRequest.Limit != 2 {
+		t.Fatalf("conversation list = %d %s; request=%+v calls=%d", response.Code, response.Body.String(), service.listRequest, service.listCalls)
+	}
 }
 
 func (s *conversationServiceStub) Get(_ context.Context, _ identity.Principal, id string) (conversation.Conversation, error) {

@@ -293,23 +293,23 @@ func TestHandoffCreateKeyDistinguishesRequests(t *testing.T) {
 	const portalURL = "https://morde.example"
 	const directory = "/work/project"
 	manifest := mustScan(context.Background(), t.TempDir(), nil)
-	first, err := derivedCreateKey(handoffID, portalURL, directory, testWorkspace, "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
+	first, err := derivedCreateKey(handoffID, portalURL, directory, testWorkspace, "", "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := derivedCreateKey(handoffID, portalURL, directory, testWorkspace, "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
+	again, err := derivedCreateKey(handoffID, portalURL, directory, testWorkspace, "", "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
 	if err != nil || again != first {
 		t.Fatalf("same create request keys=%q and %q, error=%v", first, again, err)
 	}
-	changed, err := derivedCreateKey(handoffID, portalURL, directory, testWorkspace, "bidirectional", "live", 2, nil, manifest, nil, nil, nil, "", "")
+	changed, err := derivedCreateKey(handoffID, portalURL, directory, testWorkspace, "", "bidirectional", "live", 2, nil, manifest, nil, nil, nil, "", "")
 	if err != nil || changed == first || len(first) > 128 {
 		t.Fatalf("changed create request keys=%q and %q, error=%v", first, changed, err)
 	}
-	otherDirectory, err := derivedCreateKey(handoffID, portalURL, "/work/other", testWorkspace, "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
+	otherDirectory, err := derivedCreateKey(handoffID, portalURL, "/work/other", testWorkspace, "", "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
 	if err != nil || otherDirectory == first {
 		t.Fatalf("another directory reused key %q, error=%v", otherDirectory, err)
 	}
-	otherPortal, err := derivedCreateKey(handoffID, "https://other.example", directory, testWorkspace, "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
+	otherPortal, err := derivedCreateKey(handoffID, "https://other.example", directory, testWorkspace, "", "bidirectional", "live", 1, nil, manifest, nil, nil, nil, "", "")
 	if err != nil || otherPortal == first {
 		t.Fatalf("another Portal reused key %q, error=%v", otherPortal, err)
 	}

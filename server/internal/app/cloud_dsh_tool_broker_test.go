@@ -958,6 +958,61 @@ func TestCloudDSHToolBrokerReconcilesCheckpointedResultWithoutMoreToolBudget(t *
 	}
 }
 
+func TestCloudDSHToolBrokerReconcilesOnlyTerminalWorkspaceOperationsAfterCheckpointAdvance(t *testing.T) {
+	for _, status := range []task.OperationStatus{task.OperationSucceeded, task.OperationUnknown} {
+		t.Run(string(status), func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+				capability: "window.list", action: "list", result: `{"windows":[]}`,
+			}})
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			session, err := fixture.executor.connect(context.Background(), store.details.Task, fixture.fence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.fences.fence = agentFenceFromRuntime(session.Fence)
+			session.Close()
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed := store.details.Task
+			call := ModelToolCall{CallID: "call_dsh_workspace_reconcile_1", Name: runtimeToolWindowList, Arguments: `{}`}
+			first, err := broker.Execute(context.Background(), claimed, call)
+			if err != nil || first.Status != AgentToolSucceeded {
+				t.Fatalf("initial operation = %#v, err=%v", first, err)
+			}
+
+			store.mu.Lock()
+			advancedCheckpoint := int64(1)
+			store.details.Task.WorkspaceCheckpointRevision = &advancedCheckpoint
+			claimed = store.details.Task
+			operation := store.operations[agentOperationKey(call.CallID)]
+			if status == task.OperationUnknown {
+				operation.Status = status
+				store.operations[operation.Key] = operation
+				store.operation = operation
+			}
+			store.mu.Unlock()
+
+			output := first.Output
+			recovered, err := broker.Reconcile(context.Background(), claimed, call, &output)
+			if err != nil || fixture.handlers["window.list"].calls.Load() != 1 {
+				t.Fatalf("recovered operation = %#v, err=%v, Host calls=%d", recovered, err, fixture.handlers["window.list"].calls.Load())
+			}
+			if status == task.OperationSucceeded {
+				if recovered.Status != AgentToolSucceeded || recovered.Output != first.Output || store.details.Task.Status != task.StatusRunning {
+					t.Fatalf("terminal result was not safely reused: result=%#v task=%#v", recovered, store.details.Task)
+				}
+				return
+			}
+			if recovered.Status != AgentToolUnknown || store.details.Task.Status != task.StatusWaitingUser {
+				t.Fatalf("unresolved operation crossed a changed Workspace checkpoint: result=%#v task=%#v", recovered, store.details.Task)
+			}
+		})
+	}
+}
+
 func TestCloudDSHToolBrokerQueriesUnknownOperationAtExhaustedBudget(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
 		capability: "window.list", action: "list",

@@ -263,6 +263,22 @@ func (s *Store) GetTaskFileFetch(ctx context.Context, ownerID, taskID, fetchID s
 	return value, nil
 }
 
+func (s *Store) IsDesktopClientWebSession(ctx context.Context, ownerID, installationID string) (bool, error) {
+	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidClientInstallationID(installationID) {
+		return false, domain.InvalidArgument("client_installation", "Task file fetch session identity is invalid")
+	}
+	var allowed bool
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(platform='desktop' AND revoked_at IS NULL AND expires_at>clock_timestamp(),false)
+FROM client_installations WHERE id=$1 AND owner_id=$2`, installationID, ownerID).Scan(&allowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check Task file fetch desktop session: %w", err)
+	}
+	return allowed, nil
+}
+
 func (s *Store) GetTaskFileFetchByOperation(ctx context.Context, ownerID, taskID, operationKey string) (app.TaskFileFetch, error) {
 	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidTaskID(taskID) || !validTaskHubOperationKey(operationKey) {
 		return app.TaskFileFetch{}, domain.InvalidArgument("file_fetch", "Task file fetch operation identity is invalid")
@@ -358,7 +374,7 @@ func validTaskFileFetchCreate(value app.TaskFileFetch, operation app.TaskHubOper
 		value.OperationKey == operation.Key && operation.Action == hub.ActionFileFetch && value.OwnerID == operation.OwnerID &&
 		value.TaskID == operation.TaskID && value.SourceInstallationID == operation.TargetInstallationID &&
 		value.TargetGrantVersion == operation.TargetGrantVersion && value.TaskAuthorizationVersion == operation.TaskAuthorizationVersion &&
-		value.TaskRevision == operation.TaskRevision && value.TaskRevision > 0 && workspace.ValidateRelativePath(value.RelativePath) == nil &&
+		value.TaskRevision == operation.TaskRevision && value.TaskRevision >= 0 && workspace.ValidateRelativePath(value.RelativePath) == nil &&
 		value.Status == task.FileFetchQueued && value.WaitingReason == "" && value.SourceVersion == "" && value.SourceSHA256 == "" &&
 		value.SizeBytes == 0 && value.ConfirmedBytes == 0 && value.ContentID == "" && value.ExpiresAt == nil
 }

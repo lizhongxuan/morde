@@ -264,13 +264,13 @@ test('an incoming Task caller is trusted only with a complete valid Task and tar
   const base = { id: 'server-task', name: 'Morde Task', kind: 'task' }
   s.push({
     type: 'call', id: 'c1', from: {
-      ...base, task_id: 'q1234567', task_revision: 4, authorization_version: 3, target_grant_version: 2, operation_id: 'op_abcd-1234',
+      ...base, task_id: 'q1234567', task_revision: 0, authorization_version: 3, target_grant_version: 2, operation_id: 'op_abcd-1234',
     }, action: 'command', args: {},
   })
   await tick()
   assert.deepEqual(callers[0], {
     ...base, taskContext: {
-      taskID: 'q1234567', taskRevision: 4, authorizationVersion: 3, targetGrantVersion: 2, operationID: 'op_abcd-1234',
+      taskID: 'q1234567', taskRevision: 0, authorizationVersion: 3, targetGrantVersion: 2, operationID: 'op_abcd-1234',
     },
   })
 

@@ -1,9 +1,9 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, Tray, WebContentsView, type Session } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, Tray, WebContentsView, type Session, type WebContents } from "electron";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type WebSession } from "./morde-core";
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 
@@ -69,10 +69,31 @@ type LiveSyncRecord = {
   childPid?: number;
   message?: string;
 };
+type ProjectMapping = {
+  selectionID: string;
+  hostId: string;
+  workspaceId: string;
+  projectName: string;
+  directory: string;
+  dev: string;
+  ino: string;
+  folderId?: string;
+  registrationKey: string;
+};
+type ProjectTarget = {
+  hostId: string;
+  hostName: string;
+  hostState: "running" | "stopped";
+  workspaceId: string;
+  workspaceName: string;
+  folders: { folderID: string; projectName: string; relativePath: string; state: string }[];
+  blockedMessage?: string;
+};
 let clientLoginAttempts: Record<string, ClientLoginFence> = {};
 let clientLoginAttemptsError = false;
 let activeProfile: string | null = null;
 let mappings: Mapping[] = [];
+let projectMappings: ProjectMapping[] = [];
 let syncCheckpoint: SyncCheckpoint | null = null;
 type SyncRecoveryWarning = { state: "unknown" | "failed"; workspaceId?: string; mode?: SyncCheckpoint["mode"]; message: string };
 let syncRecoveryWarning: SyncRecoveryWarning | null = null;
@@ -93,12 +114,15 @@ let syncChildPid: number | undefined;
 let webView: WebContentsView | null = null;
 let webPartition: Session | null = null;
 let webAttached = false;
+let webOpenTask: { window: BrowserWindow; promise: Promise<void> } | null = null;
 let view: "web" | "sync" = "web";
 let webRefreshTimer: NodeJS.Timeout | null = null;
 let credentialExpiryTimer: NodeJS.Timeout | null = null;
 let authorizationCheckTimer: NodeJS.Timeout | null = null;
 let logoutInProgress = false;
 let directorySelectionInProgress = false;
+let projectDirectorySelectionInProgress = false;
+let projectUploadInProgress = false;
 let preservedOperationInProgress = false;
 let exitReady = false;
 let quitInProgress = false;
@@ -152,6 +176,7 @@ async function checkedWorkspaceDirectory(directory: string, workspaceId: string)
   const appData = app.getPath("userData");
   const protectedMappings = [
     ...mappings.filter((item) => item.workspaceId !== workspaceId),
+    ...projectMappings.map(projectAsMapping),
     { workspaceId: "", directory: appData, dev: "", ino: "" },
   ];
   const candidate = await checkedDirectory(directory, protectedMappings);
@@ -179,6 +204,55 @@ async function checkedWorkspaceDirectory(directory: string, workspaceId: string)
   return candidate;
 }
 
+function projectAsMapping(value: ProjectMapping): Mapping {
+  return { workspaceId: value.workspaceId, directory: value.directory, dev: value.dev, ino: value.ino };
+}
+
+function normalizedProjectName(value: unknown): string {
+  if (typeof value !== "string") throw new Error("项目名无效");
+  const name = value.normalize("NFC");
+  if (!name || name.trim() !== name || [...name].length > 120 || name === "." || name === ".." ||
+    /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f]/u.test(name) || /[. ]$/.test(name)) throw new Error("项目名必须是一个有效的目录名");
+  const base = name.split(".", 1)[0]!.toUpperCase();
+  if (["CON", "PRN", "AUX", "NUL"].includes(base) || /^(?:COM|LPT)[1-9]$/.test(base)) throw new Error("项目名是系统保留名称");
+  return name;
+}
+
+async function checkedProjectDirectory(directory: string, workspaceId: string, exceptSelectionID?: string): Promise<Mapping> {
+  const protectedMappings = [
+    ...mappings,
+    ...projectMappings.filter((item) => item.selectionID !== exceptSelectionID).map(projectAsMapping),
+    { workspaceId: "", directory: app.getPath("userData"), dev: "", ino: "" },
+  ];
+  const candidate = await checkedDirectory(directory, protectedMappings);
+  const candidateRecoveryRoot = await checkedPreservedRoot(candidate.directory);
+  if (await pathsOverlap(candidate.directory, candidateRecoveryRoot)) throw new Error("项目目录与本地安全副本目录重叠");
+  for (const other of protectedMappings) {
+    if (await pathsOverlap(candidateRecoveryRoot, other.directory)) throw new Error("本地安全副本目录与其他受保护目录重叠");
+    if (other.workspaceId) {
+      const otherRecoveryRoot = await checkedPreservedRoot(other.directory);
+      if (await pathsOverlap(candidate.directory, otherRecoveryRoot)) throw new Error("项目目录与其他本地安全副本目录重叠");
+    }
+  }
+  for (const root of systemDirectoryRoots()) {
+    let canonicalRoot: string;
+    try { canonicalRoot = await realpath(root); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error("无法验证受保护的系统目录");
+    }
+    if (isSystemDirectory(candidate.directory, canonicalRoot)) throw new Error("请选择系统目录之外的项目文件夹");
+  }
+  return { ...candidate, workspaceId };
+}
+
+async function confirmProjectMapping(mapping: ProjectMapping): Promise<void> {
+  const current = await checkedProjectDirectory(mapping.directory, mapping.workspaceId, mapping.selectionID);
+  if (current.directory !== mapping.directory || current.dev !== mapping.dev || current.ino !== mapping.ino) {
+    throw new Error("项目文件夹身份已变化，请重新选择");
+  }
+}
+
 async function checkedPreservedRoot(directory: string): Promise<string> {
   const root = join(dirname(directory), ".morde-preserved");
   try {
@@ -201,7 +275,7 @@ async function confirmWorkspaceMapping(mapping: Mapping): Promise<void> {
 }
 
 function preservedOperationBlocked(): boolean {
-  return preservedOperationInProgress || directorySelectionInProgress || workspaceSyncOperationInProgress || workspaceNode.mayOwnWorkspace() ||
+  return preservedOperationInProgress || directorySelectionInProgress || projectDirectorySelectionInProgress || projectUploadInProgress || workspaceSyncOperationInProgress || workspaceNode.mayOwnWorkspace() ||
     sync.snapshot() !== "idle" || syncCheckpoint !== null || childMayStillRun(syncCheckpoint) || activeLiveSync();
 }
 
@@ -255,6 +329,14 @@ function publicDirectoryName(directory: string): string {
 
 function publicMapping(mapping: Mapping): { workspaceId: string; directoryName: string } {
   return { workspaceId: mapping.workspaceId, directoryName: publicDirectoryName(mapping.directory) };
+}
+
+function publicProjectMapping(mapping: ProjectMapping): { selectionID: string; hostId: string; workspaceId: string; projectName: string; directoryName: string; folderId?: string } {
+  return {
+    selectionID: mapping.selectionID, hostId: mapping.hostId, workspaceId: mapping.workspaceId,
+    projectName: mapping.projectName, directoryName: publicDirectoryName(mapping.directory),
+    ...(mapping.folderId ? { folderId: mapping.folderId } : {}),
+  };
 }
 
 function publicHandoff(record: HandoffRecord | null): Omit<HandoffRecord, "id"> | null {
@@ -443,7 +525,7 @@ function accountProfileID(origin: string, accountName: string): string { return 
 function profileID(auth: Credentials): string {
   return createHash("sha256").update(`${auth.origin}\0${auth.serviceInstanceID}\0${auth.accountName}\0${auth.installationId}`).digest("hex");
 }
-function profileFile(name: "mappings" | "sync-checkpoint" | "workspace-sync" | "handoff" | "live-sync"): string {
+function profileFile(name: "mappings" | "project-mappings" | "sync-checkpoint" | "workspace-sync" | "handoff" | "live-sync"): string {
   if (!activeProfile) throw new Error("Log in before changing local Workspace state");
   return `${name}-${activeProfile}.${name === "workspace-sync" || name === "live-sync" ? "bin" : "json"}`;
 }
@@ -465,6 +547,20 @@ function validHandoffRecord(value: unknown): value is HandoffRecord {
     (record.phase === "verified" && record.revision === undefined)) return false;
   try { validateSyncScope(record.scope); return true; }
   catch { return false; }
+}
+
+function validProjectMapping(value: unknown): value is ProjectMapping {
+  if (!value || typeof value !== "object") return false;
+  const mapping = value as Partial<ProjectMapping>;
+  try { normalizedProjectName(mapping.projectName); }
+  catch { return false; }
+  return typeof mapping.selectionID === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mapping.selectionID) &&
+    typeof mapping.hostId === "string" && /^h[a-z0-9]{7}$/.test(mapping.hostId) &&
+    typeof mapping.workspaceId === "string" && /^w[a-z0-9]{7}$/.test(mapping.workspaceId) &&
+    typeof mapping.directory === "string" && isAbsolute(mapping.directory) && resolve(mapping.directory) === mapping.directory &&
+    typeof mapping.dev === "string" && /^\d+$/.test(mapping.dev) && typeof mapping.ino === "string" && /^\d+$/.test(mapping.ino) &&
+    (mapping.folderId === undefined || typeof mapping.folderId === "string" && /^morde-[a-f0-9]{32}$/.test(mapping.folderId)) &&
+    typeof mapping.registrationKey === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mapping.registrationKey);
 }
 
 function saveHandoffRecord(record: HandoffRecord | null): void {
@@ -663,6 +759,7 @@ function validWorkspaceSyncProfile(value: unknown, auth: Credentials): value is 
 function loadProfile(auth: Credentials): void {
   activeProfile = profileID(auth);
   mappings = [];
+  projectMappings = [];
   syncCheckpoint = null;
   liveSyncRecords = {};
   liveSyncStateError = null;
@@ -675,6 +772,7 @@ function loadProfile(auth: Credentials): void {
   workspaceSyncProfileError = null;
   workspaceSyncError = null;
   const mappingFile = profileFile("mappings");
+  const projectMappingFile = profileFile("project-mappings");
   const checkpointFile = profileFile("sync-checkpoint");
   try {
     const raw = readOptional(mappingFile);
@@ -685,10 +783,19 @@ function loadProfile(auth: Credentials): void {
     }
   } catch { profileError = "本机同步配置无法读取；同步已暂停，请修复本机安全存储。"; }
   try {
+    const raw = readOptional(projectMappingFile);
+    if (raw !== null) {
+      const saved = JSON.parse(raw) as ProjectMapping[];
+      if (!Array.isArray(saved) || !saved.every(validProjectMapping) || new Set(saved.map((item) => item.selectionID)).size !== saved.length) throw new Error("Invalid project mapping");
+      projectMappings = saved;
+    }
+  } catch { profileError ??= "本机项目同步配置无法读取；项目同步已暂停，请检查本机安全存储。"; }
+  try {
     const raw = readOptional(checkpointFile);
     if (raw !== null) {
       const saved = JSON.parse(raw) as SyncCheckpoint;
-      if (!saved || saved.serviceInstanceID !== auth.serviceInstanceID || saved.installationId !== auth.installationId || !/^w[a-z0-9]{7}$/.test(saved.workspaceId) || typeof saved.directory !== "string" || typeof saved.dev !== "string" || typeof saved.ino !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(saved.idempotencyKey) || !["upload", "download", "bidirectional", "live_sync", "handoff_checkpoint"].includes(saved.mode) || (saved.sessionId && !/^p[a-z0-9]{7}$/.test(saved.sessionId)) || (saved.childPid !== undefined && (!Number.isSafeInteger(saved.childPid) || saved.childPid <= 0)) || (saved.handoffTarget !== undefined && (saved.mode !== "handoff_checkpoint" || !["desktop", "cloud_workspace"].includes(saved.handoffTarget)))) throw new Error("Invalid sync recovery point");
+      if (!saved || saved.serviceInstanceID !== auth.serviceInstanceID || saved.installationId !== auth.installationId || !/^w[a-z0-9]{7}$/.test(saved.workspaceId) || typeof saved.directory !== "string" || typeof saved.dev !== "string" || typeof saved.ino !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(saved.idempotencyKey) || !["upload", "download", "bidirectional", "live_sync", "handoff_checkpoint", "project_upload"].includes(saved.mode) || (saved.sessionId && !/^p[a-z0-9]{7}$/.test(saved.sessionId)) || (saved.childPid !== undefined && (!Number.isSafeInteger(saved.childPid) || saved.childPid <= 0)) || (saved.handoffTarget !== undefined && (saved.mode !== "handoff_checkpoint" || !["desktop", "cloud_workspace"].includes(saved.handoffTarget))) ||
+        (saved.mode === "project_upload" && (typeof saved.projectSelectionID !== "string" || !/^[0-9a-f-]{36}$/i.test(saved.projectSelectionID) || typeof saved.hostId !== "string" || !/^h[a-z0-9]{7}$/.test(saved.hostId) || typeof saved.folderId !== "string" || !/^morde-[a-f0-9]{32}$/.test(saved.folderId) || typeof saved.projectName !== "string"))) throw new Error("Invalid sync recovery point");
       syncCheckpoint = { ...saved, scope: validateSyncScope(saved.scope === undefined ? [] : saved.scope), ...(saved.mode === "handoff_checkpoint" ? { handoffTarget: saved.handoffTarget ?? "cloud_workspace" } : {}) };
     }
   } catch {
@@ -931,7 +1038,7 @@ async function startLiveSync(workspaceIDInput: unknown, scopeInput: unknown, res
   const auth = credentials;
   if (!auth || !activeProfile || activeProfile !== profileID(auth)) throw new Error("Log in to Morde before starting live sync");
   if (profileError || liveSyncStateError || workspaceSyncProfileError || !workspaceSyncProfile) throw new Error("Local Workspace sync state is unavailable; live sync is paused");
-  if (logoutInProgress || preservedOperationInProgress || workspaceSyncOperationInProgress || directorySelectionInProgress) throw new Error("Another local Workspace operation is in progress");
+  if (logoutInProgress || preservedOperationInProgress || workspaceSyncOperationInProgress || directorySelectionInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("Another local Workspace operation is in progress");
   if (sync.snapshot() !== "idle" || syncCheckpoint || childMayStillRun(syncCheckpoint)) throw new Error("Resolve the existing sync recovery point before starting live sync");
   if (liveSyncStartWaiters.has(workspaceID) || activeLiveSync(workspaceID)) throw new Error("This Workspace already has a live sync operation");
   const previous = liveSyncRecords[workspaceID];
@@ -1145,7 +1252,7 @@ async function setWorkspaceSyncEnabled(workspaceIDInput: unknown, enabled: unkno
   if (!auth || !workspaceSyncProfile || workspaceSyncProfileError || activeProfile !== profileID(auth)) {
     throw new Error(workspaceSyncProfileError ?? "Log in to Morde before enabling Workspace sync");
   }
-  if (workspaceSyncOperationInProgress || preservedOperationInProgress || directorySelectionInProgress) throw new Error("Another local Workspace operation is in progress");
+  if (workspaceSyncOperationInProgress || preservedOperationInProgress || directorySelectionInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("Another local Workspace operation is in progress");
   if (activeLiveSync(workspaceID) || enabled && (liveSyncRecords[workspaceID]?.recoveryRequired || liveSyncRecords[workspaceID]?.state === "conflict")) throw new Error("Stop or resolve this Workspace's live sync before changing its sync binding");
   if (sync.snapshot() !== "idle" || syncCheckpoint || childMayStillRun(syncCheckpoint)) throw new Error("Resolve the prior sync recovery point before enabling Workspace sync");
   const matches = mappings.filter((item) => item.workspaceId === workspaceID);
@@ -1231,8 +1338,10 @@ function publicState(): unknown {
     authenticated: Boolean(credentials), accountName: credentials?.accountName ?? null, origin: credentials?.origin ?? lastOrigin,
     installationId: credentials?.installationId ?? null, expiresAt: credentials?.clientExpiresAt ?? null,
     expiresSoon: credentials ? credentialExpiresSoon(credentials.clientExpiresAt) : false,
-    mappings: credentials ? mappings.map(publicMapping) : [], syncState: sync.snapshot(),
-    syncCheckpoint: credentials && syncCheckpoint ? { workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, installationId: syncCheckpoint.installationId, scope: syncCheckpoint.scope, ...(syncCheckpoint.handoffTarget ? { handoffTarget: syncCheckpoint.handoffTarget } : {}) } : null,
+    mappings: credentials ? mappings.map(publicMapping) : [], projectMappings: credentials ? projectMappings.map(publicProjectMapping) : [], syncState: sync.snapshot(),
+    syncCheckpoint: credentials && syncCheckpoint ? { workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, installationId: syncCheckpoint.installationId, scope: syncCheckpoint.scope,
+      ...(syncCheckpoint.projectSelectionID ? { projectSelectionID: syncCheckpoint.projectSelectionID, projectName: syncCheckpoint.projectName } : {}),
+      ...(syncCheckpoint.handoffTarget ? { handoffTarget: syncCheckpoint.handoffTarget } : {}) } : null,
     syncRecovery: credentials ? syncRecoveryView() : null,
     liveSyncCapability: credentials ? liveSyncCapability : "disabled",
     liveSyncCapabilityMessage: credentials ? liveSyncCapabilityMessage : "",
@@ -1251,6 +1360,242 @@ function publicState(): unknown {
 function notifyState(): void { mainWindow?.webContents.send("morde:state", publicState()); }
 function clearTimer(timer: NodeJS.Timeout | null): null { if (timer) clearTimeout(timer); return null; }
 function closeHostWindows(): void { for (const window of hostWindows) window.close(); }
+
+type HostProjectUploadContext = { host: Record<string, unknown>; workspaceBinding: Record<string, unknown> };
+
+async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown, workspaceIDInput: unknown): Promise<HostProjectUploadContext> {
+  const hostID = checkedId("host", hostIDInput);
+  const workspaceID = checkedId("workspace", workspaceIDInput);
+  const [meValue, hostValue] = await Promise.all([api.me(), api.host(hostID)]) as [Record<string, unknown>, Record<string, unknown>];
+  const workspaces = hostValue?.workspaces;
+  if (credentials !== auth || activeProfile !== profileID(auth)) throw new Error("Authorization changed while checking the cloud computer");
+  if (!meValue || typeof meValue.id !== "string" || hostValue?.id !== hostID || hostValue.owner_id !== meValue.id ||
+    !["running", "stopped"].includes(String(hostValue.state)) || !Array.isArray(workspaces) || workspaces.length !== 1) {
+    throw new Error("请选择自己拥有且已绑定工作区的云端电脑");
+  }
+  const binding = workspaces[0] as Record<string, unknown> | null;
+  const workspace = binding?.workspace as Record<string, unknown> | null;
+  if (!binding || binding.state !== "active" || !workspace || workspace.id !== workspaceID || workspace.state !== "ready") {
+    throw new Error("云端电脑的工作区未就绪或与所选目标不匹配");
+  }
+  return { host: hostValue, workspaceBinding: binding };
+}
+
+async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
+  const auth = credentials;
+  if (!auth || !activeProfile || activeProfile !== profileID(auth)) throw new Error("请先登录 Morde");
+  if (profileError) throw new Error(profileError);
+  await api.requireProjectUploadCapability();
+  const [meValue, hostsValue, portalSession] = await Promise.all([api.me(), api.hosts(), api.webSession()]) as [Record<string, unknown>, { items?: unknown }, WebSession];
+  if (credentials !== auth || activeProfile !== profileID(auth)) throw new Error("Authorization changed while loading cloud computers");
+  if (!meValue || typeof meValue.id !== "string" || !hostsValue || !Array.isArray(hostsValue.items)) throw new Error("云端电脑列表无效");
+  const targets: ProjectTarget[] = [];
+  for (const rawHost of hostsValue.items) {
+    const host = rawHost as Record<string, unknown> | null;
+    if (!host || typeof host.id !== "string" || !/^h[a-z0-9]{7}$/.test(host.id) || host.owner_id !== meValue.id ||
+      !["running", "stopped"].includes(String(host.state)) || !Array.isArray(host.workspaces) || host.workspaces.length !== 1) continue;
+    const binding = host.workspaces[0] as Record<string, unknown> | null;
+    const workspace = binding?.workspace as Record<string, unknown> | null;
+    if (!binding || binding.state !== "active" || !workspace || typeof workspace.id !== "string" ||
+      !/^w[a-z0-9]{7}$/.test(workspace.id) || workspace.state !== "ready") continue;
+    const folders = await api.hostProjectFolders(host.id, portalSession);
+    if (credentials !== auth || activeProfile !== profileID(auth)) throw new Error("Authorization changed while loading project folders");
+    const rootFolder = folders.find((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked");
+    const projectFolders = folders.filter((folder) => folder.folderKind === "project").map((folder) => ({
+      folderID: folder.folderID, projectName: folder.projectName!, relativePath: folder.relativePath, state: folder.state,
+    }));
+    targets.push({
+      hostId: host.id, hostName: typeof host.name === "string" && host.name ? host.name : host.id,
+      hostState: host.state as "running" | "stopped",
+      workspaceId: workspace.id, workspaceName: typeof workspace.name === "string" && workspace.name ? workspace.name : workspace.id,
+      folders: projectFolders,
+      ...(rootFolder ? { blockedMessage: "此云端工作区仍登记为整个工作区根目录，不能同时登记项目目录。" } : {}),
+    });
+  }
+  return targets;
+}
+
+async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: unknown): Promise<unknown> {
+  if (preservedOperationInProgress || workspaceSyncOperationInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("当前有本机文件操作正在运行");
+  if (sync.snapshot() !== "idle" || syncCheckpoint || childMayStillRun(syncCheckpoint)) throw new Error("先完成或处理现有同步恢复点");
+  const auth = credentials;
+  if (!auth || !activeProfile || activeProfile !== profileID(auth)) throw new Error("请先登录 Morde");
+  if (profileError) throw new Error(profileError);
+  const hostID = checkedId("host", hostIDInput), workspaceID = checkedId("workspace", workspaceIDInput);
+  await api.requireProjectUploadCapability();
+  await checkedOwnedHostWorkspace(auth, hostID, workspaceID);
+  const portalSession = await api.webSession();
+  const folders = await api.hostProjectFolders(hostID, portalSession);
+  if (folders.some((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked")) {
+    throw new Error("此云端工作区仍使用整个工作区根目录同步，暂不能登记独立项目目录");
+  }
+  if (workspaceSyncProfile?.bindings[workspaceID]?.enabled) throw new Error("先暂停此工作区已有的固定同步绑定");
+  if (directorySelectionInProgress) throw new Error("另一项本机目录选择正在进行");
+  projectDirectorySelectionInProgress = true;
+  try {
+    const picked = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory"] });
+    if (picked.canceled || !picked.filePaths[0]) return null;
+    const projectName = normalizedProjectName(basename(picked.filePaths[0].replace(/\\/g, "/").replace(/\/+$/, "")));
+    const previous = projectMappings.find((item) => item.hostId === hostID && item.workspaceId === workspaceID && item.projectName === projectName);
+    const candidate = await checkedProjectDirectory(picked.filePaths[0], workspaceID, previous?.selectionID);
+    if (credentials !== auth || sync.snapshot() !== "idle" || syncCheckpoint) throw new Error("本机授权或同步状态已变化，请重新选择");
+    await assertNoLiveSyncForDirectory(candidate.directory, workspaceID);
+    const mapping: ProjectMapping = {
+      selectionID: previous?.selectionID ?? randomUUID(), hostId: hostID, workspaceId: workspaceID, projectName,
+      directory: candidate.directory, dev: candidate.dev, ino: candidate.ino,
+      ...(previous?.folderId ? { folderId: previous.folderId } : {}),
+      registrationKey: previous?.registrationKey ?? randomUUID(),
+    };
+    const next = [...projectMappings.filter((item) => item.selectionID !== mapping.selectionID), mapping];
+    savePrivate(profileFile("project-mappings"), JSON.stringify(next));
+    projectMappings = next;
+    notifyState();
+    return publicProjectMapping(mapping);
+  } finally { projectDirectorySelectionInProgress = false; }
+}
+
+async function ensureProjectFolder(auth: Credentials, mapping: ProjectMapping, projectName: string): Promise<ProjectSyncFolder> {
+  const { host } = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
+  if (credentials !== auth) throw new Error("Authorization changed before project folder registration");
+  const session = await api.webSession();
+  const folders = await api.hostProjectFolders(mapping.hostId, session);
+  if (folders.some((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked")) {
+    throw new Error("目标工作区仍登记为整体同步目录；项目目录同步已停止");
+  }
+  let folder: ProjectSyncFolder | undefined;
+  if (mapping.folderId) {
+    folder = folders.find((item) => item.folderID === mapping.folderId);
+    if (!folder || folder.folderKind !== "project" || folder.workspaceID !== mapping.workspaceId || folder.projectName !== projectName ||
+      folder.relativePath !== "project/" + projectName || folder.state === "revoked" || folder.syncAvailable) {
+      throw new Error("登记的项目目录已变化或撤销；请检查云端目录后重新选择");
+    }
+  } else {
+    const matching = folders.filter((item) => item.folderKind === "project" && item.projectName === projectName);
+    if (matching.some((item) => item.state === "revoked")) throw new Error("同名云端项目目录已撤销，请先在云端处理该目录");
+    folder = matching.find((item) => item.state === "active" || item.state === "pending_node");
+    if (!folder) folder = await api.registerHostProjectFolder(mapping.hostId, projectName, session, mapping.registrationKey);
+    if (folder.workspaceID !== mapping.workspaceId || folder.folderKind !== "project" || folder.projectName !== projectName ||
+      folder.relativePath !== "project/" + projectName || folder.state === "revoked" || folder.syncAvailable) {
+      throw new Error("云端返回的项目目录与所选电脑不匹配");
+    }
+  }
+  if (credentials !== auth || host.id !== mapping.hostId) throw new Error("Authorization changed while registering the project folder");
+  const updated = { ...mapping, projectName, folderId: folder.folderID };
+  const next = projectMappings.map((item) => item.selectionID === mapping.selectionID ? updated : item);
+  savePrivate(profileFile("project-mappings"), JSON.stringify(next));
+  projectMappings = next;
+  return folder;
+}
+
+async function projectHostApplyStatus(auth: Credentials, hostID: string, workspaceID: string): Promise<{ state: "applied" | "pending_apply"; desiredRevision?: number; appliedRevision?: number }> {
+  try {
+    const host = await api.host(hostID) as Record<string, unknown>;
+    if (credentials !== auth || host.id !== hostID || !Array.isArray(host.workspaces)) return { state: "pending_apply" };
+    const binding = host.workspaces.map((item) => item as Record<string, unknown>).find((item) => (item.workspace as Record<string, unknown> | undefined)?.id === workspaceID);
+    const desired = binding?.desired_revision, applied = binding?.applied_revision;
+    const valid = Number.isSafeInteger(desired) && Number(desired) >= 0 && Number.isSafeInteger(applied) && Number(applied) >= 0;
+    return {
+      state: host.state === "running" && binding?.state === "active" && valid && Number(applied) >= Number(desired) ? "applied" : "pending_apply",
+      ...(valid ? { desiredRevision: Number(desired), appliedRevision: Number(applied) } : {}),
+    };
+  } catch { return { state: "pending_apply" }; }
+}
+
+async function uploadProject(selectionIDInput: unknown, projectNameInput: unknown): Promise<unknown> {
+  if (projectUploadInProgress) throw new Error("A project upload is already being prepared or transferred");
+  projectUploadInProgress = true;
+  try { return await performProjectUpload(selectionIDInput, projectNameInput); }
+  finally { projectUploadInProgress = false; }
+}
+
+async function performProjectUpload(selectionIDInput: unknown, projectNameInput: unknown): Promise<unknown> {
+  if (preservedOperationInProgress || directorySelectionInProgress || projectDirectorySelectionInProgress || workspaceSyncOperationInProgress) throw new Error("Finish the local file operation before uploading a project");
+  if (profileError) throw new Error(profileError);
+  const selectionID = typeof selectionIDInput === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(selectionIDInput)
+    ? selectionIDInput : "";
+  const projectName = normalizedProjectName(projectNameInput);
+  const auth = credentials;
+  const mapping = projectMappings.find((item) => item.selectionID === selectionID);
+  if (!auth || !activeProfile || activeProfile !== profileID(auth) || !mapping) throw new Error("先选择本机项目文件夹");
+  if (mapping.folderId && mapping.projectName !== projectName) throw new Error("项目名已绑定到云端目录；如需更名，请重新选择文件夹并创建新项目目录");
+  if (sync.snapshot() !== "idle" || childMayStillRun(syncCheckpoint)) throw new Error("先停止并核对已有的同步操作");
+  if (syncCheckpoint && (syncCheckpoint.mode !== "project_upload" || syncCheckpoint.projectSelectionID !== selectionID ||
+    syncCheckpoint.hostId !== mapping.hostId || syncCheckpoint.folderId !== mapping.folderId || syncCheckpoint.projectName !== projectName ||
+    syncCheckpoint.workspaceId !== mapping.workspaceId || syncCheckpoint.directory !== mapping.directory ||
+    syncCheckpoint.dev !== mapping.dev || syncCheckpoint.ino !== mapping.ino)) {
+    throw new Error("另一个同步恢复点仍待处理，请先恢复或明确放弃");
+  }
+  await api.requireProjectUploadCapability();
+  const confirmation = await dialog.showMessageBox(mainWindow!, {
+    type: "warning", buttons: ["上传项目", "取消"], defaultId: 1, cancelId: 1,
+    title: "单向上传项目文件夹",
+    message: "将“" + publicDirectoryName(mapping.directory) + "”上传到“" + projectName + "”",
+    detail: "目标：~/workspace/project/" + projectName + "\n范围：上传所选本机文件夹的全部文件和子目录，并保留相对路径。只从本机上传，云端变化不会下载到本机。继续后，只有上次成功同步的内容才可能按同步基线处理删除与冲突。",
+    noLink: true,
+  });
+  if (confirmation.response !== 0) return { cancelled: true };
+  if (credentials !== auth) throw new Error("Authorization changed before project upload");
+  await confirmProjectMapping(mapping);
+  await assertNoLiveSyncForDirectory(mapping.directory, mapping.workspaceId);
+  if (workspaceSyncProfile?.bindings[mapping.workspaceId]?.enabled) throw new Error("先暂停此工作区已有的固定同步绑定");
+  const folder = await ensureProjectFolder(auth, mapping, projectName);
+  const currentMapping = projectMappings.find((item) => item.selectionID === selectionID);
+  if (!currentMapping || currentMapping.folderId !== folder.folderID) throw new Error("本机项目目录映射保存状态未确认");
+  const checked = await checkedProjectDirectory(currentMapping.directory, currentMapping.workspaceId, currentMapping.selectionID);
+  if (checked.directory !== currentMapping.directory || checked.dev !== currentMapping.dev || checked.ino !== currentMapping.ino) throw new Error("项目文件夹身份已变化，请重新选择");
+  await checkedOwnedHostWorkspace(auth, currentMapping.hostId, currentMapping.workspaceId);
+  if (syncCheckpoint && syncCheckpoint.folderId !== folder.folderID) throw new Error("当前恢复点属于其他项目目录");
+  if (!syncCheckpoint) {
+    syncCheckpoint = {
+      serviceInstanceID: auth.serviceInstanceID, installationId: auth.installationId, workspaceId: currentMapping.workspaceId,
+      directory: currentMapping.directory, dev: currentMapping.dev, ino: currentMapping.ino, mode: "project_upload", scope: [],
+      projectSelectionID: selectionID, hostId: currentMapping.hostId, folderId: folder.folderID, projectName,
+      idempotencyKey: randomUUID(),
+    };
+    try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(syncCheckpoint)); }
+    catch {
+      syncRecoveryWarning = { state: "failed", workspaceId: currentMapping.workspaceId, mode: "project_upload", message: "本机恢复点未能保存；上传未启动。" };
+      syncCheckpoint = null;
+      notifyState();
+      throw new Error("Could not save the project upload recovery point; upload was not started");
+    }
+    syncRecoveryWarning = null;
+  }
+  let result: unknown;
+  try {
+    result = await sync.run(auth, projectAsMapping(currentMapping), "project_upload", [], syncCheckpoint,
+      () => credentials === auth && !logoutInProgress,
+      () => confirmProjectMapping(currentMapping));
+  } finally { if (sync.snapshot() === "idle" && !childMayStillRun(syncCheckpoint)) clearConfirmedChild(); }
+  const outcome = result && typeof result === "object" ? result as { session?: { id?: unknown; workspace_id?: unknown; folder_id?: unknown; state?: unknown }; conflicts?: unknown } : null;
+  const session = outcome?.session;
+  const conflicts = publicSyncConflicts(outcome?.conflicts);
+  if (!session || typeof session.id !== "string" || !/^p[a-z0-9]{7}$/.test(session.id) || session.workspace_id !== currentMapping.workspaceId ||
+    session.folder_id !== folder.folderID || !["running", "completed", "conflict", "cancelled", "failed", "expired"].includes(String(session.state)) || conflicts === null) {
+    throw new Error("Project upload result is unknown; the recovery point was retained");
+  }
+  if (session.state === "completed" && conflicts.length === 0) {
+    removeSyncCheckpointFile();
+    syncCheckpoint = null;
+    syncRecoveryWarning = null;
+    notifyState();
+    const hostStatus = await projectHostApplyStatus(auth, currentMapping.hostId, currentMapping.workspaceId);
+    return {
+      session: { id: session.id, workspace_id: currentMapping.workspaceId, folder_id: folder.folderID, state: "completed" }, conflicts,
+      cloudStatus: "confirmed", hostStatus: hostStatus.state,
+      ...(hostStatus.desiredRevision !== undefined ? { desiredRevision: hostStatus.desiredRevision, appliedRevision: hostStatus.appliedRevision } : {}),
+    };
+  }
+  if (session.state !== "running") {
+    // morde-sync removes local session metadata after a terminal response. Keep
+    // only non-terminal checkpoints so the UI never offers an impossible resume.
+    removeSyncCheckpointFile();
+    syncCheckpoint = null;
+    syncRecoveryWarning = null;
+    notifyState();
+  }
+  return { session: { id: session.id, workspace_id: currentMapping.workspaceId, folder_id: folder.folderID, state: String(session.state) }, conflicts, cloudStatus: "pending" };
+}
 
 function detachWeb(): void {
   closeHostWindows();
@@ -1327,12 +1672,98 @@ function scheduleAuthorizationCheck(): void {
 function sameOriginURL(value: string, origin: string): URL | null {
   try { const url = new URL(value); return url.origin === origin && !url.username && !url.password ? url : null; } catch { return null; }
 }
+const documentLoadOptions = { extraHeaders: "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
+function installDocumentErrorRecovery(partition: Session, origin?: string): (contents: WebContents, fallbackURL: string, fallbackLabel: string) => (value: string) => boolean {
+  type RecoveryPage = { contents: WebContents; fallbackURL: string; fallbackLabel: string; recoveryPageURL: string | null; blockedDocumentURL: string | null };
+  const pages = new Map<number, RecoveryPage>();
+  partition.webRequest.onHeadersReceived({ urls: origin ? [`${origin}/*`] : ["<all_urls>"] }, (details, callback) => {
+    const contentType = Object.entries(details.responseHeaders ?? {})
+      .find(([name]) => name.toLowerCase() === "content-type")?.[1].join(";").toLowerCase() ?? "";
+    const isJSONDocument = contentType.includes("application/json") || contentType.includes("+json");
+    const page = details.webContentsId === undefined
+      ? [...pages.values()].find((candidate) => details.webContents === candidate.contents)
+      : pages.get(details.webContentsId);
+    if (page && details.resourceType === "mainFrame" && (details.statusCode >= 400 || isJSONDocument)) {
+      page.blockedDocumentURL = details.url;
+      callback({ cancel: true });
+      return;
+    }
+    callback({});
+  });
+  return (contents, fallbackURL, fallbackLabel) => {
+    const page: RecoveryPage = { contents, fallbackURL, fallbackLabel, recoveryPageURL: null, blockedDocumentURL: null };
+    pages.set(contents.id, page);
+    contents.on("destroyed", () => pages.delete(contents.id));
+    const showRecoveryPage = () => {
+      if (contents.isDestroyed()) return;
+      const scriptString = (value: string) => JSON.stringify(value).replace(/</g, "\\u003c");
+      const html = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Morde</title><style>*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:24px;display:grid;place-items:center;background:#f5f7fb;color:#1b2932;font:16px/1.6 Inter,system-ui,-apple-system,"Segoe UI",sans-serif}main{width:min(560px,100%);padding:44px 32px;border:1px solid #e3e9ed;border-radius:18px;background:#fff;box-shadow:0 14px 46px #24425417;text-align:center}.mark{width:48px;height:48px;margin:0 auto 18px;display:grid;place-items:center;border:1px solid #f1c9c5;border-radius:50%;color:#b42318;background:#fff4f2;font-size:24px;font-weight:750}h1{margin:0 0 10px;font-size:24px;line-height:1.3}p{margin:0 auto 24px;color:#637784}.actions{display:flex;justify-content:center;flex-wrap:wrap;gap:10px}button{min-height:38px;padding:8px 14px;border:1px solid #c5d0dc;border-radius:9px;background:#fff;color:#34465c;font:600 14px/1.2 Inter,system-ui,sans-serif;cursor:pointer}button.primary{border-color:#2e74a6;background:#2e74a6;color:#fff}</style><body><main role="alert"><div class="mark" aria-hidden="true">!</div><h1>页面暂时无法显示</h1><p>服务没有返回可显示的页面。你可以返回上一页，或回到安全页面继续使用。</p><div class="actions"><button id="back">返回上一页</button><button id="home" class="primary">${fallbackLabel}</button></div></main><script>const fallbackURL=${scriptString(fallbackURL)};document.getElementById('back').onclick=()=>history.length>1?history.back():location.replace(fallbackURL);document.getElementById('home').onclick=()=>location.replace(fallbackURL);</script></body></html>`;
+      page.recoveryPageURL = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+      void contents.loadURL(page.recoveryPageURL).catch(() => undefined);
+    };
+    contents.on("did-fail-load", (_event, errorCode, _description, failedURL, isMainFrame) => {
+      if (!isMainFrame) return;
+      if (page.blockedDocumentURL === failedURL) { page.blockedDocumentURL = null; showRecoveryPage(); return; }
+      if (errorCode !== -3 && (origin ? sameOriginURL(failedURL, origin) : /^https?:\/\//i.test(failedURL))) showRecoveryPage();
+    });
+    return (value) => value === page.recoveryPageURL;
+  };
+}
 function hostEntryURL(value: string, origin: string): { id: string; target: string | null } | null {
   const url = sameOriginURL(value, origin);
   if (!url || url.hash || !/^\/host-entry\/h[a-z0-9]{7}$/.test(url.pathname) || [...url.searchParams.keys()].some((key) => key !== "target") || url.searchParams.getAll("target").length > 1) return null;
   const target = url.searchParams.get("target");
   if (target && target !== "desktop" && target !== "terminal") return null;
   return { id: url.pathname.slice("/host-entry/".length), target };
+}
+
+function taskObservationTarget(value: string, serviceOrigin: string): { id: string; url: URL } | null {
+  let url: URL;
+  try { url = new URL(value); } catch { return null; }
+  const id = url.hostname.split(".")[0] ?? "";
+  const ticket = url.searchParams.get("ticket");
+  if (!/^h[a-z0-9]{7}$/.test(id) || (url.protocol !== "https:" && !localGatewayOrigin(url, serviceOrigin)) || url.username || url.password || url.hash ||
+    url.pathname !== "/__ch/task-auth" || url.searchParams.getAll("ticket").length !== 1 || !/^[A-Za-z0-9_-]{40,128}$/.test(ticket ?? "") ||
+    [...url.searchParams.keys()].some((key) => key !== "ticket")) return null;
+  return { id, url };
+}
+
+function taskObservationPage(value: string, origin: string): boolean {
+  const url = sameOriginURL(value, origin);
+  if (!url || url.hash) return false;
+  if (url.pathname === "/__ch/task-auth") {
+    const ticket = url.searchParams.get("ticket");
+    return url.searchParams.getAll("ticket").length === 1 && /^[A-Za-z0-9_-]{40,128}$/.test(ticket ?? "") &&
+      [...url.searchParams.keys()].every((key) => key === "ticket");
+  }
+  if (url.pathname !== "/__ch/wb/") return false;
+  const taskID = url.searchParams.get("task_id");
+  return url.searchParams.getAll("task_id").length === 1 && /^q[a-z0-9]{7}$/.test(taskID ?? "") &&
+    [...url.searchParams.keys()].every((key) => key === "task_id");
+}
+
+function guardTaskObservationWindow(win: BrowserWindow, auth: Credentials, isRecoveryPage: (value: string) => boolean): void {
+  let allowedGateway: string | null = null;
+  let authorizing = false;
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event, value) => {
+    if (isRecoveryPage(value) || value === "about:blank" || (allowedGateway && taskObservationPage(value, allowedGateway))) return;
+    const target = taskObservationTarget(value, auth.origin);
+    event.preventDefault();
+    if (!target || authorizing || credentials !== auth) {
+      if (!win.isDestroyed()) win.close();
+      return;
+    }
+    authorizing = true;
+    void hostOrigin(target.id, false, auth.origin).then((expected) => {
+      if (expected !== target.url.origin || credentials !== auth || win.isDestroyed()) throw new Error("Task observation Host changed");
+      allowedGateway = expected;
+      return win.loadURL(target.url.href, documentLoadOptions).catch(() => undefined);
+    }).catch(() => { if (!win.isDestroyed()) win.close(); }).finally(() => { authorizing = false; });
+  });
+  win.webContents.on("will-redirect", (event, value) => {
+    if (!allowedGateway || !taskObservationPage(value, allowedGateway)) event.preventDefault();
+  });
 }
 
 async function hostOrigin(id: string, shared: boolean, serviceOrigin: string): Promise<string> {
@@ -1343,7 +1774,7 @@ async function hostOrigin(id: string, shared: boolean, serviceOrigin: string): P
   return url.origin;
 }
 
-function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string | null }, auth: Credentials): void {
+function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string | null }, auth: Credentials, isRecoveryPage: (value: string) => boolean): void {
   hostWindows.add(win);
   win.on("closed", () => hostWindows.delete(win));
   let allowedGateway: string | null = null;
@@ -1353,6 +1784,7 @@ function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string
   };
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (event, value) => {
+    if (isRecoveryPage(value)) return;
     const same = sameOriginURL(value, auth.origin);
     if (same?.pathname === `/host-entry/${entry.id}`) return;
     if (same?.pathname === "/hosts") { event.preventDefault(); returnToMain(); return; }
@@ -1365,10 +1797,11 @@ function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string
     void hostOrigin(entry.id, Boolean(entry.target), auth.origin).then((expected) => {
       if (expected !== origin || credentials !== auth || win.isDestroyed()) throw new Error("Host ticket target changed");
       allowedGateway = origin;
-      return win.loadURL(target);
+      return win.loadURL(target, documentLoadOptions).catch(() => undefined);
     }).catch((error: unknown) => { if (!win.isDestroyed()) void dialog.showMessageBox(win, { type: "error", message: String(error) }); });
   });
   win.webContents.on("will-redirect", (event, value) => {
+    if (isRecoveryPage(value)) return;
     const url = sameOriginURL(value, auth.origin);
     if (url?.pathname === "/hosts") { event.preventDefault(); returnToMain(); return; }
     const portalEntry = url?.pathname === `/host-entry/${entry.id}`;
@@ -1395,7 +1828,7 @@ function installDownloadAndClipboard(partition: Session, auth: Credentials): voi
 function positionWeb(): void {
   if (!mainWindow || !webView) return;
   const bounds = mainWindow.getContentBounds();
-  webView.setBounds({ x: 0, y: 64, width: bounds.width, height: Math.max(0, bounds.height - 64) });
+  webView.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height });
 }
 function showView(next: "web" | "sync"): void {
   view = next;
@@ -1425,11 +1858,11 @@ async function refreshWebSession(auth: Credentials, initial?: WebSession): Promi
   }
 }
 
-async function openWeb(initial?: WebSession, page: "assistant" | "account" = "assistant"): Promise<void> {
+async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): Promise<void> {
   const auth = credentials;
   if (!auth) throw new Error("Log in to Morde first");
+  if (mainWindow !== owner || owner.isDestroyed()) return;
   const assistantURL = `${auth.origin}/assistant`;
-  const pageURL = page === "account" ? `${auth.origin}/settings` : assistantURL;
   if (!webPartition) {
     webPartition = session.fromPartition(`morde-user-${randomUUID()}`);
     installDownloadAndClipboard(webPartition, auth);
@@ -1437,30 +1870,42 @@ async function openWeb(initial?: WebSession, page: "assistant" | "account" = "as
       if (credentials === auth && details.statusCode === 204 && details.method === "POST") clearAuthorization();
     });
   }
+  const partition = webPartition;
+  if (!partition) return;
   await refreshWebSession(auth, initial);
-  if (credentials !== auth) return;
+  if (credentials !== auth || mainWindow !== owner || owner.isDestroyed() || webPartition !== partition) return;
   if (!webView) {
-    const content = new WebContentsView({ webPreferences: { session: webPartition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+    const content = new WebContentsView({ webPreferences: { session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
     webView = content;
+    const registerDocumentRecovery = installDocumentErrorRecovery(partition);
+    const isRecoveryPage = registerDocumentRecovery(content.webContents, assistantURL, "返回助手");
     const restoreFromLogin = () => {
       void refreshWebSession(auth).then(() => {
-        if (credentials === auth && !content.webContents.isDestroyed()) return content.webContents.loadURL(assistantURL);
-      }).catch(() => { if (credentials === auth) showView("sync"); });
+        if (credentials === auth && mainWindow === owner && webPartition === partition && !content.webContents.isDestroyed()) return content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined);
+      }).catch(() => { if (credentials === auth && mainWindow === owner) showView("sync"); });
     };
     content.webContents.setWindowOpenHandler((details) => {
       const entry = hostEntryURL(details.url, auth.origin);
       if (!entry || credentials !== auth) {
+        if (details.url === "about:blank" && credentials === auth) return { action: "allow", createWindow: (options) => {
+          const win = new BrowserWindow({ ...options, width: 960, height: 720, title: "Morde Task Observation", webPreferences: { ...options.webPreferences, session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+          const isObservationRecoveryPage = registerDocumentRecovery(win.webContents, assistantURL, "返回助手");
+          guardTaskObservationWindow(win, auth, isObservationRecoveryPage);
+          return win.webContents;
+        } };
         const target = sameOriginURL(details.url, auth.origin);
         if (target?.pathname.startsWith("/admin")) void shell.openExternal(target.href);
         return { action: "deny" };
       }
       return { action: "allow", createWindow: (options) => {
         const win = new BrowserWindow({ ...options, width: 1280, height: 800, title: "Morde Host", webPreferences: { ...options.webPreferences, session: webPartition!, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
-        guardHostWindow(win, entry, auth);
+        const isHostRecoveryPage = registerDocumentRecovery(win.webContents, `${auth.origin}/hosts`, "返回助手");
+        guardHostWindow(win, entry, auth, isHostRecoveryPage);
         return win.webContents;
       } };
     });
     const guardNavigation = (event: { preventDefault(): void }, value: string) => {
+      if (isRecoveryPage(value)) return;
       const target = sameOriginURL(value, auth.origin);
       if (!target || target.pathname.startsWith("/admin") || target.pathname === "/login") {
         event.preventDefault();
@@ -1474,13 +1919,24 @@ async function openWeb(initial?: WebSession, page: "assistant" | "account" = "as
       const target = sameOriginURL(value, auth.origin);
       if (credentials !== auth) return;
       if (target?.pathname === "/login") restoreFromLogin();
-      if (target?.pathname.startsWith("/admin")) { void shell.openExternal(target.href); void content.webContents.loadURL(assistantURL); }
+      if (target?.pathname.startsWith("/admin")) { void shell.openExternal(target.href); void content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined); }
     });
-    await content.webContents.loadURL(pageURL);
-  } else if (webView.webContents.getURL() !== pageURL) {
-    await webView.webContents.loadURL(pageURL);
+    await content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined);
+  } else if (webView.webContents.getURL() !== assistantURL) {
+    await webView.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined);
   }
+  if (credentials !== auth || mainWindow !== owner || owner.isDestroyed() || webPartition !== partition) return;
   showView("web");
+}
+
+function openAssistant(initial?: WebSession): Promise<void> {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed()) return Promise.reject(new Error("Morde window is unavailable"));
+  if (webOpenTask?.window === owner) return webOpenTask.promise;
+  const task = openWeb(initial, owner);
+  const promise = task.finally(() => { if (webOpenTask?.promise === promise) webOpenTask = null; });
+  webOpenTask = { window: owner, promise };
+  return promise;
 }
 
 async function login(origin: unknown, name: unknown, password: unknown): Promise<unknown> {
@@ -1522,7 +1978,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     scheduleCredentialExpiry();
     scheduleAuthorizationCheck();
     void refreshLiveSyncCapability(result.credentials);
-    await openWeb(result.webSession);
+    await openAssistant(result.webSession);
     void restoreWorkspaceNode(result.credentials);
     return publicState();
   } catch (error) {
@@ -1551,7 +2007,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
 }
 
 async function logout(): Promise<string | null> {
-  if (preservedOperationInProgress || workspaceSyncOperationInProgress) throw new Error("Finish the local Workspace operation before signing out");
+  if (preservedOperationInProgress || workspaceSyncOperationInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("Finish the local Workspace operation before signing out");
   if (!credentials) return null;
   if (logoutInProgress) throw new Error("Sign-out is already in progress");
   const auth = credentials;
@@ -1604,6 +2060,7 @@ async function logout(): Promise<string | null> {
     if (syncStopConfirmed && workspaceStopConfirmed && liveStopsConfirmed) {
       activeProfile = null;
       mappings = [];
+      projectMappings = [];
       syncCheckpoint = null;
       liveSyncRecords = {};
       liveSyncRunners.clear();
@@ -1666,11 +2123,6 @@ function register(): void {
   handler("morde:state", () => publicState());
   handler("morde:login", login);
   handler("morde:logout", logout);
-  handler("morde:show-web", async (page: unknown = "assistant") => {
-    if (page !== "assistant" && page !== "account") throw new Error("Invalid Morde page");
-    try { await openWeb(undefined, page); } catch (error) { showView("sync"); throw error; }
-  });
-  handler("morde:show-sync", () => { if (!credentials) throw new Error("Log in to Morde first"); void refreshLiveSyncCapability(); showView("sync"); });
   handler("morde:public-page", (path: unknown, requestedOrigin?: unknown) => {
     if (path !== "register" && path !== "download") throw new Error("Invalid public page");
     const origin = credentials?.origin ?? (requestedOrigin ? portalOrigin(requestedOrigin) : lastOrigin);
@@ -1679,23 +2131,30 @@ function register(): void {
     partition.on("will-download", (_event, item) => item.setSaveDialogOptions({ title: "保存 Morde 安装包" }));
     partition.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
     const window = new BrowserWindow({ width: 960, height: 720, title: "Morde", webPreferences: { session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+    const registerDocumentRecovery = installDocumentErrorRecovery(partition, origin);
+    const isRecoveryPage = registerDocumentRecovery(window.webContents, `${origin}/`, "返回首页");
     window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     window.webContents.on("will-navigate", (event, value) => {
+      if (isRecoveryPage(value)) return;
       const target = sameOriginURL(value, origin);
       if (target?.pathname === "/login") { event.preventDefault(); window.close(); mainWindow?.focus(); return; }
-      if (!target || (target.pathname !== "/register" && target.pathname !== "/download")) { event.preventDefault(); if (value.startsWith("https://")) void shell.openExternal(value); }
+      if (!target || (target.pathname !== "/" && target.pathname !== "/register" && target.pathname !== "/download")) { event.preventDefault(); if (value.startsWith("https://")) void shell.openExternal(value); }
     });
     window.webContents.on("will-redirect", (event, value) => {
+      if (isRecoveryPage(value)) return;
       const target = sameOriginURL(value, origin);
-      if (!target || (target.pathname !== "/register" && target.pathname !== "/download")) event.preventDefault();
+      if (!target || (target.pathname !== "/" && target.pathname !== "/register" && target.pathname !== "/download")) event.preventDefault();
       if (target?.pathname === "/login") { window.close(); mainWindow?.focus(); }
     });
     window.webContents.on("did-navigate-in-page", (_event, value) => {
       if (sameOriginURL(value, origin)?.pathname === "/login") { window.close(); mainWindow?.focus(); }
     });
-    void window.loadURL(`${origin}/${path}`);
+    void window.loadURL(`${origin}/${path}`, documentLoadOptions).catch(() => undefined);
   });
   handler("morde:workspaces", () => api.workspaces());
+  handler("morde:project-upload-targets", listProjectUploadTargets);
+  handler("morde:project-select-directory", selectProjectDirectory);
+  handler("morde:project-upload", uploadProject);
   handler("morde:workspace-sync-toggle", setWorkspaceSyncEnabled);
   handler("morde:live-sync-start", startLiveSync);
   handler("morde:live-sync-stop", stopLiveSync);
@@ -1734,7 +2193,7 @@ function register(): void {
     if (workspaceSyncProfile?.bindings[id]?.enabled) throw new Error("Pause Workspace sync before changing its local folder");
     const workspace = await api.workspace(id) as { state?: string };
     if (workspace.state !== "ready") throw new Error("Workspace is not ready for sync");
-    if (directorySelectionInProgress) throw new Error("Another folder selection is in progress");
+    if (directorySelectionInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("Another folder selection is in progress");
     directorySelectionInProgress = true;
     try {
       const picked = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory"] });
@@ -1761,7 +2220,7 @@ function register(): void {
   });
   handler("morde:sync", async (workspaceId: unknown, mode: Parameters<MordeSync["run"]>[2], scopeInput: unknown = [], confirmedQuiesced: unknown = false, handoffTargetInput: unknown = "cloud_workspace") => {
     if (preservedOperationInProgress) throw new Error("Finish the local safety-copy operation before starting sync");
-    if (directorySelectionInProgress) throw new Error("Finish selecting the Workspace folder before starting sync");
+    if (directorySelectionInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("Finish selecting the Workspace folder before starting sync");
     if (profileError) throw new Error(profileError);
     if (!["upload", "download", "bidirectional", "live_sync", "handoff_checkpoint"].includes(mode)) throw new Error("Unsupported sync mode");
     const scope = validateSyncScope(scopeInput);
@@ -1936,30 +2395,71 @@ function makeWindow(): BrowserWindow {
   win.on("closed", () => { detachWeb(); mainWindow = null; });
   return win;
 }
-function showWindow(): void {
-  if (!mainWindow) {
-    mainWindow = makeWindow();
-    if (credentials) void openWeb().catch(() => { mainWindow?.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" }); showView("sync"); });
-  } else mainWindow.show();
-  mainWindow.focus();
+function showWindow(nextView: "web" | "sync" = "web"): void {
+  const created = !mainWindow;
+  if (created) mainWindow = makeWindow();
+  if (credentials) {
+    if (nextView === "sync") {
+      void refreshLiveSyncCapability();
+      showView("sync");
+    } else if (webView) showView("web");
+    else {
+      const owner = mainWindow;
+      void openAssistant().catch(() => {
+        if (!owner || mainWindow !== owner || owner.isDestroyed()) return;
+        owner.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
+        showView("sync");
+      });
+    }
+  }
+  mainWindow?.show();
+  mainWindow?.focus();
+}
+
+function signOutFromMenu(): void {
+  void logout().then((warning) => {
+    if (warning && mainWindow && !mainWindow.isDestroyed()) void dialog.showMessageBox(mainWindow, { type: "warning", message: warning });
+  }).catch((error: unknown) => {
+    if (mainWindow && !mainWindow.isDestroyed()) void dialog.showMessageBox(mainWindow, { type: "error", message: safeRendererErrorMessage(error) });
+  });
+}
+
+function menuSettings() {
+  return [
+    { label: zh ? "本机同步" : "Local Sync", click: () => showWindow("sync") },
+    { label: zh ? "退出此电脑" : "Sign Out This PC", click: signOutFromMenu },
+  ];
 }
 
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on("second-instance", showWindow);
+  app.on("second-instance", () => showWindow());
   app.whenReady().then(() => {
     loadState();
     scheduleCredentialExpiry();
     scheduleAuthorizationCheck();
     register();
-    Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: "Morde", submenu: [{ label: zh ? "打开" : "Open", click: showWindow }, { label: zh ? "退出" : "Quit", click: () => app.quit() }] }]));
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { label: "Morde", submenu: [
+        { label: zh ? "打开 Morde" : "Open Morde", click: () => showWindow() },
+        { label: zh ? "设置" : "Settings", submenu: menuSettings() },
+        { type: "separator" },
+        { label: zh ? "退出 Morde" : "Quit Morde", click: () => app.quit() },
+      ] },
+      { role: "editMenu" },
+    ]));
     showWindow();
     if (credentials) {
       void restoreWorkspaceNode(credentials);
     }
-    try { tray = new Tray(join(__dirname, "../resources/morde-icon.png")); tray.setToolTip("Morde"); tray.setContextMenu(Menu.buildFromTemplate([{ label: zh ? "打开 Morde" : "Open Morde", click: showWindow }, { label: zh ? "退出" : "Quit", click: () => app.quit() }])); tray.on("double-click", showWindow); } catch { tray = null; }
+    try { tray = new Tray(join(__dirname, "../resources/morde-icon.png")); tray.setToolTip("Morde"); tray.setContextMenu(Menu.buildFromTemplate([
+      { label: zh ? "打开 Morde" : "Open Morde", click: () => showWindow() },
+      ...menuSettings(),
+      { type: "separator" },
+      { label: zh ? "退出 Morde" : "Quit Morde", click: () => app.quit() },
+    ])); tray.on("double-click", () => showWindow()); } catch { tray = null; }
   });
-  app.on("activate", showWindow);
+  app.on("activate", () => showWindow());
   app.on("window-all-closed", () => { if (process.platform !== "darwin" && !tray) app.quit(); });
   app.on("before-quit", (event) => {
     if (exitReady) return;

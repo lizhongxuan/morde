@@ -48,6 +48,16 @@ func TestOwnershipUpdatesDoNotFollowWorkspaceSymlinks(t *testing.T) {
 	if linkInfo.Sys().(*syscall.Stat_t).Uid != 1000 {
 		t.Fatalf("workspace symlink uid = %d, want 1000", linkInfo.Sys().(*syscall.Stat_t).Uid)
 	}
+	if err := chownAppliedPaths(workspace, []string{"."}, 1200, 1201); err != nil {
+		t.Fatalf("chownAppliedPaths rejected workspace root: %v", err)
+	}
+	rootInfo, err := os.Stat(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat := rootInfo.Sys().(*syscall.Stat_t); stat.Uid != 1200 || stat.Gid != 1201 {
+		t.Fatalf("workspace root owner = %d:%d, want 1200:1201", stat.Uid, stat.Gid)
+	}
 	if err := chownAppliedPaths(workspace, []string{"../outside"}, 1000, 1000); err == nil {
 		t.Fatal("chownAppliedPaths accepted traversal")
 	}

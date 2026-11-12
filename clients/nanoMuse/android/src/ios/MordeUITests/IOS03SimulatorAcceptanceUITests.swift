@@ -86,7 +86,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let portalOrigin: String
         if let configuredPortalOrigin {
             guard configuredPortalOrigin == configuredPortalOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
-                  var components = URLComponents(string: configuredPortalOrigin),
+                  var components = URLComponents(string: Self.repairLoopbackSchemeSeparator(configuredPortalOrigin)),
                   let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
                   let host = components.host?.lowercased(), ["127.0.0.1", "localhost"].contains(host),
                   components.user == nil, components.password == nil,
@@ -422,7 +422,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let configuredOrigin = ProcessInfo.processInfo.environment["MORDE_C20_PORTAL_ORIGIN"]
             ?? "http://127.0.0.1:24941"
         guard configuredOrigin == configuredOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
-              var components = URLComponents(string: configuredOrigin),
+              var components = URLComponents(string: Self.repairLoopbackSchemeSeparator(configuredOrigin)),
               let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
               let host = components.host?.lowercased(), ["127.0.0.1", "localhost"].contains(host),
               components.user == nil, components.password == nil,
@@ -995,6 +995,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                 let task = try await portalJSON("/api/tasks/\(taskID)", headers: headers)
                 let status = task["status"] as? String
                 if status == "completed" { return task }
+                if status == "waiting_user" {
+                    let reason = task["waiting_reason"] as? String ?? "unknown"
+                    throw NSError(domain: "Morde G3 Task", code: 409,
+                                  userInfo: [NSLocalizedDescriptionKey: "Task is waiting for user action (\(reason))."])
+                }
                 if status == "failed" || status == "cancelled" {
                     throw URLError(.cannotConnectToHost)
                 }
@@ -1107,12 +1112,26 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             ].merging(portalSessionHeaders) { _, new in new }, requestBody: ["expected_epoch": epoch])
             XCTAssertEqual(enabledExecution["state"] as? String, "enabled")
         }
-        let conversation = try await portalJSON("/api/me/main-conversation/ensure", method: "POST",
-            headers: portalSessionHeaders.merging(["Idempotency-Key": UUID().uuidString]) { _, new in new })
-        guard conversation["status"] as? String == "ready",
-              let conversationID = conversation["conversation_id"] as? String,
+        let (conversationData, conversationResponse) = try await portalResponse("/api/conversations", method: "POST",
+            headers: portalSessionHeaders.merging(["Idempotency-Key": UUID().uuidString]) { _, new in new },
+            requestBody: ["title": "C30 G3 \(UUID().uuidString)"])
+        guard [200, 201].contains(conversationResponse.statusCode),
+              let conversation = try JSONSerialization.jsonObject(with: conversationData) as? [String: Any],
+              let conversationID = conversation["id"] as? String,
+              conversation["is_main"] as? Bool == false,
               validResourceID(conversationID, prefix: 99) else {
-            XCTFail("The local test account did not provide a ready main conversation.")
+            XCTFail("The local test account did not provide an isolated side conversation.")
+            return
+        }
+        let hostPage = try await portalJSON("/api/hosts", headers: portalSessionHeaders)
+        let ownedHosts = (hostPage["items"] as? [[String: Any]] ?? []).filter {
+            $0["owner_id"] as? String == actorID
+        }
+        // Reuse the account's default Host when the isolated fixture lacks a dedicated G3Synthetic Host.
+        guard let targetHost = ownedHosts.first(where: { $0["name"] as? String == "G3Synthetic" }) ?? ownedHosts.first,
+              let targetHostName = targetHost["name"] as? String,
+              !targetHostName.isEmpty else {
+            XCTFail("The local fixture must expose an owned Host.")
             return
         }
 
@@ -1122,26 +1141,56 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         app.launchArguments = ["-morde.server", portalOrigin, "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launch()
-        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu")).firstMatch
-        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
-        if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
-        let usernameField = app.textFields["morde.auth.username"]
-        XCTAssertTrue(usernameField.waitForExistence(timeout: 15))
-        usernameField.tap()
-        if let currentUsername = usernameField.value as? String,
-           currentUsername != usernameField.placeholderValue {
-            usernameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentUsername.count))
+        if app.buttons["morde.nav.menu"].waitForExistence(timeout: 5) {
+            signOutCurrentMordeAccount(app)
         }
-        usernameField.typeText(username)
-        let passwordField = app.secureTextFields["morde.auth.password"]
-        passwordField.tap()
-        passwordField.typeText(password)
-        app.buttons["morde.auth.submit"].tap()
+        let expiredSignIn = app.buttons["morde.auth.expiredSignIn"]
+        if expiredSignIn.waitForExistence(timeout: 5) { expiredSignIn.tap() }
+        let usernameField = app.textFields["morde.auth.username"]
         let composer = app.textFields["morde.chat.composer"]
+        if usernameField.waitForExistence(timeout: 10) {
+            usernameField.tap()
+            if let currentUsername = usernameField.value as? String,
+               currentUsername != usernameField.placeholderValue {
+                usernameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentUsername.count))
+            }
+            usernameField.typeText(username)
+            let passwordField = app.secureTextFields["morde.auth.password"]
+            passwordField.tap()
+            if let currentPassword = passwordField.value as? String,
+               currentPassword != passwordField.placeholderValue {
+                passwordField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentPassword.count))
+            }
+            passwordField.typeText(password)
+            let signIn = app.buttons["morde.auth.submit"]
+            XCTAssertTrue(signIn.waitForExistence(timeout: 5))
+            XCTAssertTrue(signIn.isEnabled, "The real Portal login form should have both credentials before submission.")
+            signIn.tap()
+        }
         let chatTab = app.buttons["morde.nav.tab.chat"]
         if !composer.waitForExistence(timeout: 5), chatTab.waitForExistence(timeout: 10) { chatTab.tap() }
-        XCTAssertTrue(composer.waitForExistence(timeout: 30), "Real loopback Portal login should open chat.")
+        XCTAssertTrue(composer.waitForExistence(timeout: 30), "The real Portal should open chat.")
+        let menu = app.buttons["morde.nav.menu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+        menu.tap()
+        let conversationRow = app.buttons["morde.nav.drawer.conversation-\(conversationID)"]
+        XCTAssertTrue(conversationRow.waitForExistence(timeout: 15), "The isolated conversation should appear in the drawer.")
+        conversationRow.tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        let actions = app.descendants(matching: .any)["morde.chat.actions"]
+        XCTAssertTrue(actions.waitForExistence(timeout: 10))
+        actions.press(forDuration: 1)
+        let taskOptions = app.buttons["morde.chat.action.taskOptions"]
+        XCTAssertTrue(taskOptions.waitForExistence(timeout: 5))
+        taskOptions.tap()
+        let hostTarget = app.descendants(matching: .any)["morde.chat.hostTarget"]
+        XCTAssertTrue(hostTarget.waitForExistence(timeout: 10))
+        hostTarget.tap()
+        let authorizedHost = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", targetHostName)).firstMatch
+        XCTAssertTrue(authorizedHost.waitForExistence(timeout: 10), "The owned Host must be selectable.")
+        authorizedHost.tap()
+        XCTAssertTrue(hostTarget.label.contains(targetHostName), "The selected Host must remain in Task options.")
+        app.buttons["morde.chat.taskOptions.done"].tap()
         composer.tap()
         composer.typeText(messageText)
         let send = app.buttons["morde.task.send"]
@@ -1165,6 +1214,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let fetch = try await waitForCompletedFileFetch(taskID: taskID, headers: ownerSessionHeaders)
         let fetchID = try XCTUnwrap(fetch["fetch_id"] as? String)
         XCTAssertEqual(fetch["task_id"] as? String, taskID)
+        XCTAssertFalse((fetch["source_device_name"] as? String ?? "").isEmpty,
+                       "The completed fetch must identify its source PC.")
         XCTAssertEqual(fetch["relative_path"] as? String, "reports/summary.txt")
         XCTAssertEqual(fetch["status"] as? String, "completed")
         XCTAssertEqual((fetch["size_bytes"] as? NSNumber)?.intValue, expectedBytes.count)
@@ -1197,6 +1248,256 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["morde.task.fileFetch.size.\(fetchID)"].label.contains(String(expectedBytes.count)))
         XCTAssertTrue(app.staticTexts["morde.task.fileFetch.sha256.\(fetchID)"].label.contains(expectedHash))
         XCTAssertEqual(actualBytes.count, expectedBytes.count)
+    }
+
+    @MainActor
+    func testMordeG3PortalRestartRestoresSameTaskAndFileVersion() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let username = environment["MORDE_G3_USERNAME"], !username.isEmpty,
+              let password = environment["MORDE_G3_PASSWORD"], !password.isEmpty,
+              let taskID = environment["MORDE_C40_TASK_ID"], !taskID.isEmpty,
+              let fetchID = environment["MORDE_C40_FETCH_ID"], !fetchID.isEmpty,
+              let expectedHash = environment["MORDE_C40_EXPECTED_SHA256"], expectedHash.count == 64 else {
+            throw XCTSkip("Set local synthetic Portal credentials and C40 restart evidence for the recovery test.")
+        }
+        let configuredOrigin = environment["MORDE_G3_PORTAL_ORIGIN"] ?? "http://127.0.0.1:25051"
+        let portalOrigin = Self.repairLoopbackSchemeSeparator(configuredOrigin)
+        guard let components = URLComponents(string: portalOrigin),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host?.lowercased(), ["127.0.0.1", "localhost"].contains(host),
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/" else {
+            XCTFail("The C40 recovery test requires a local loopback Portal origin.")
+            return
+        }
+
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = ["-morde.server", portalOrigin, "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launch()
+        let usernameField = app.textFields["morde.auth.username"]
+        if usernameField.waitForExistence(timeout: 5) {
+            usernameField.tap()
+            usernameField.typeText(username)
+            let passwordField = app.secureTextFields["morde.auth.password"]
+            passwordField.tap()
+            passwordField.typeText(password)
+            app.buttons["morde.auth.submit"].tap()
+        }
+
+        let tasksTab = app.buttons["morde.nav.tab.tasks"]
+        XCTAssertTrue(tasksTab.waitForExistence(timeout: 30), "The G3 account should restore its task list after Portal restart.")
+        tasksTab.tap()
+        let taskRow = app.buttons["morde.tasks.row.\(taskID)"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 30), "The same completed Task should remain in the account history.")
+        taskRow.tap()
+        XCTAssertTrue(app.staticTexts["morde.task.objective"].waitForExistence(timeout: 15))
+        let fetchStatus = app.staticTexts["morde.task.fileFetch.status.\(fetchID)"]
+        XCTAssertTrue(fetchStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(fetchStatus.label.localizedCaseInsensitiveContains("received"))
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.path.\(fetchID)"].label.contains("reports/summary.txt"))
+        XCTAssertTrue(app.staticTexts["morde.task.fileFetch.sha256.\(fetchID)"].label.contains(expectedHash))
+    }
+
+    @MainActor
+    func testMordeG3PortalOfflineOutboxStaysWithOriginalAccount() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let configuredOrigin = environment["MORDE_G3_PORTAL_ORIGIN"],
+              let accountAName = environment["MORDE_C40_ACCOUNT_A_USERNAME"],
+              let accountAPassword = environment["MORDE_C40_ACCOUNT_A_PASSWORD"],
+              let accountBName = environment["MORDE_C40_ACCOUNT_B_USERNAME"],
+              let accountBPassword = environment["MORDE_C40_ACCOUNT_B_PASSWORD"],
+              !accountAName.isEmpty, !accountAPassword.isEmpty, !accountBName.isEmpty, !accountBPassword.isEmpty else {
+            throw XCTSkip("Set the local G3 Portal origin and two local C40 synthetic accounts.")
+        }
+        let portalOrigin = Self.repairLoopbackSchemeSeparator(configuredOrigin)
+        guard let components = URLComponents(string: portalOrigin),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host?.lowercased(), Self.isLocalPortalHost(host),
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/" else {
+            XCTFail("The C40 account-isolation test requires a local loopback Portal origin.")
+            return
+        }
+        var originComponents = components
+        originComponents.scheme = scheme
+        originComponents.host = host
+        originComponents.path = ""
+        let normalizedOrigin = originComponents.string!
+        let baseURL = URL(string: normalizedOrigin)!
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
+        let session = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+
+        func portalResponse(_ path: String, method: String = "GET", cookie: String? = nil,
+                            body: [String: Any]? = nil) async throws -> (Data, HTTPURLResponse) {
+            guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.httpShouldHandleCookies = false
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            if method != "GET" { request.setValue(normalizedOrigin, forHTTPHeaderField: "Origin") }
+            if let cookie { request.setValue("ch_portal=\(cookie)", forHTTPHeaderField: "Cookie") }
+            if let body {
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            }
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  ios03HTTPResponseMatchesOrigin(httpResponse, origin: baseURL) else {
+                throw URLError(.badServerResponse)
+            }
+            return (data, httpResponse)
+        }
+
+        func portalJSON(_ path: String, cookie: String) async throws -> [String: Any] {
+            let (data, response) = try await portalResponse(path, cookie: cookie)
+            guard response.statusCode == 200,
+                  let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw URLError(.cannotParseResponse)
+            }
+            return value
+        }
+
+        func loginCookie(_ name: String, _ password: String) async throws -> String {
+            let (data, response) = try await portalResponse("/api/auth/login", method: "POST",
+                body: ["name": name, "password": password])
+            guard response.statusCode == 200,
+                  let login = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  login["user"] is [String: Any] else { throw URLError(.userAuthenticationRequired) }
+            let headers = Dictionary(uniqueKeysWithValues: response.allHeaderFields.compactMap { item -> (String, String)? in
+                guard let name = item.key as? String, let value = item.value as? String else { return nil }
+                return (name, value)
+            })
+            guard let cookie = HTTPCookie.cookies(withResponseHeaderFields: headers, for: baseURL)
+                    .first(where: { $0.name == "ch_portal" }), !cookie.value.isEmpty else {
+                throw URLError(.userAuthenticationRequired)
+            }
+            return cookie.value
+        }
+
+        func serverMessageCount(_ content: String, cookie: String) async throws -> Int {
+            let conversations = try await portalJSON("/api/conversations?limit=100", cookie: cookie)
+            guard let main = (conversations["items"] as? [[String: Any]])?.first(where: {
+                $0["is_main"] as? Bool == true
+            }), let conversationID = main["id"] as? String else { throw URLError(.cannotParseResponse) }
+            let messages = try await portalJSON("/api/conversations/\(conversationID)/messages?limit=100", cookie: cookie)
+            return (messages["items"] as? [[String: Any]] ?? []).filter {
+                $0["role"] as? String == "user" && $0["content"] as? String == content
+            }.count
+        }
+
+        let message = "C40 account-scoped offline message \(UUID().uuidString)"
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        if app.state != .notRunning { app.terminate() }
+        app.launchArguments = ["-morde.server", normalizedOrigin,
+            "-morde.portalMessageTransportFailureFixture",
+            "-morde.portalMessageTransportFailureOrigin", normalizedOrigin,
+            "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        if app.buttons["morde.nav.menu"].waitForExistence(timeout: 5) {
+            signOutCurrentMordeAccount(app)
+            XCTAssertTrue(app.textFields["morde.auth.username"].waitForExistence(timeout: 60),
+                          "The previous account must finish signing out before this test starts.")
+        }
+        if app.buttons["morde.auth.expiredSignIn"].waitForExistence(timeout: 3) {
+            app.buttons["morde.auth.expiredSignIn"].tap()
+        }
+
+        func signIn(_ name: String, _ password: String) -> Bool {
+            if app.buttons["morde.auth.expiredSignIn"].waitForExistence(timeout: 3) {
+                app.buttons["morde.auth.expiredSignIn"].tap()
+            }
+            let username = app.textFields["morde.auth.username"]
+            XCTAssertTrue(username.waitForExistence(timeout: 15))
+            username.tap()
+            if let value = username.value as? String, value != username.placeholderValue {
+                username.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
+            }
+            username.typeText(name)
+            let passwordField = app.secureTextFields["morde.auth.password"]
+            passwordField.tap()
+            if let value = passwordField.value as? String, value != passwordField.placeholderValue {
+                passwordField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
+            }
+            passwordField.typeText(password)
+            let submit = app.buttons["morde.auth.submit"]
+            XCTAssertTrue(submit.waitForExistence(timeout: 5))
+            XCTAssertTrue(submit.isEnabled)
+            submit.tap()
+            let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+            let allowLocalNetwork = springboard.alerts.buttons
+                .matching(NSPredicate(format: "label IN %@", ["Allow", "允许"])).firstMatch
+            if allowLocalNetwork.waitForExistence(timeout: 5) { allowLocalNetwork.tap() }
+            let menu = app.buttons["morde.nav.menu"]
+            let chatTab = app.buttons["morde.nav.tab.chat"]
+            guard chatTab.waitForExistence(timeout: 60) else {
+                let alertText = app.alerts.firstMatch.staticTexts.allElementsBoundByIndex
+                    .map(\.label).filter { !$0.isEmpty }.joined(separator: " | ")
+                XCTFail("Sign-in did not reach an authenticated route; alert text: \(alertText.isEmpty ? "<none>" : alertText), loginForm=\(app.textFields["morde.auth.username"].exists), composer=\(app.textFields["morde.chat.composer"].exists)")
+                return false
+            }
+            if !menu.exists { chatTab.tap() }
+            guard menu.waitForExistence(timeout: 10) else {
+                XCTFail("Sign-in reached the app but the chat navigation menu did not appear.")
+                return false
+            }
+            chatTab.tap()
+            guard app.textFields["morde.chat.composer"].waitForExistence(timeout: 30) else {
+                XCTFail("Sign-in reached the app shell but the chat composer did not load.")
+                return false
+            }
+            return true
+        }
+
+        func signOutAndWaitForLogin() {
+            signOutCurrentMordeAccount(app)
+            XCTAssertTrue(app.textFields["morde.auth.username"].waitForExistence(timeout: 60),
+                          "Sign-out must complete before changing accounts or relaunching the app.")
+        }
+
+        guard signIn(accountAName, accountAPassword) else { return }
+        let accountACookie = try await loginCookie(accountAName, accountAPassword)
+        let composerA = app.textFields["morde.chat.composer"]
+        composerA.tap()
+        composerA.typeText(message)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+        XCTAssertTrue(app.staticTexts[message].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 20))
+        let beforeSwitchCount = try await serverMessageCount(message, cookie: accountACookie)
+        XCTAssertEqual(beforeSwitchCount, 0, "The failed transport request must remain only in Account A's local outbox.")
+
+        signOutAndWaitForLogin()
+        guard signIn(accountBName, accountBPassword) else { return }
+        XCTAssertFalse(app.staticTexts[message].exists,
+                       "Account B must not display Account A's queued message.")
+        let accountBCookie = try await loginCookie(accountBName, accountBPassword)
+        let accountBCount = try await serverMessageCount(message, cookie: accountBCookie)
+        XCTAssertEqual(accountBCount, 0, "Account B must not receive Account A's queued message on the Portal.")
+
+        signOutAndWaitForLogin()
+        app.terminate()
+        app.launchArguments = ["-morde.server", normalizedOrigin,
+            "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        guard signIn(accountAName, accountAPassword) else { return }
+        XCTAssertTrue(app.staticTexts[message].waitForExistence(timeout: 60))
+        XCTAssertTrue(app.staticTexts["已发送"].waitForExistence(timeout: 60),
+                      "Returning to Account A with connectivity restored must reconcile the saved outbox item.")
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", message)).count, 1)
+        let afterRecoveryCount = try await serverMessageCount(message, cookie: accountACookie)
+        XCTAssertEqual(afterRecoveryCount, 1, "The same queued client message must be accepted exactly once.")
+
+        _ = try? await portalResponse("/api/auth/logout", method: "POST", cookie: accountACookie)
+        _ = try? await portalResponse("/api/auth/logout", method: "POST", cookie: accountBCookie)
     }
 
     func testMordeDesignNavigationRoutes() {
@@ -2980,32 +3281,38 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
                                                    "-morde.localWorkspaceReadOnlyFixture",
-                                                   "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"])
+                                                   "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"],
+                        resetExistingAccount: true)
         app.buttons["morde.nav.tab.resources"].tap()
 
         let workspace = app.buttons["morde.resources.workspace.open.w0000001"]
         XCTAssertTrue(workspace.waitForExistence(timeout: 10))
-        XCTAssertTrue(workspace.label.contains("已挂载"), "A ready Workspace with a healthy Host binding shows its mounted state.")
-        XCTAssertTrue(workspace.label.contains("Running host"), "The mounted label names its actual bound Host.")
+        XCTAssertTrue(waitForAccessibilityLabel(workspace, containing: "就绪", timeout: 10),
+                      "A computer's files show ready only when the server confirms the binding. Actual: \(workspace.label)")
+        XCTAssertTrue(workspace.label.contains("Running host"), "The file state names its actual bound computer.")
         let syncingWorkspace = app.buttons["morde.resources.workspace.open.w0000002"]
         XCTAssertTrue(syncingWorkspace.waitForExistence(timeout: 5))
-        XCTAssertTrue(syncingWorkspace.label.contains("同步中"), "An active but syncing binding keeps its real status.")
+        XCTAssertTrue(waitForAccessibilityLabel(syncingWorkspace, containing: "同步中", timeout: 10),
+                      "An active but syncing binding keeps its real status. Actual: \(syncingWorkspace.label)")
         XCTAssertTrue(syncingWorkspace.label.contains("Unready binding host"), "The syncing row keeps its actual Host name.")
-        XCTAssertFalse(syncingWorkspace.label.contains("已挂载"))
+        XCTAssertFalse(syncingWorkspace.label.contains("已就绪"))
         let unavailableWorkspace = app.buttons["morde.resources.workspace.open.w0000003"]
         XCTAssertTrue(unavailableWorkspace.exists)
         XCTAssertTrue(unavailableWorkspace.label.contains("不可用"), "A Workspace the API reports as syncing stays unavailable.")
-        XCTAssertFalse(unavailableWorkspace.label.contains("已挂载"))
+        XCTAssertFalse(unavailableWorkspace.label.contains("已就绪"))
         XCTAssertFalse(unavailableWorkspace.label.contains("Unready binding host"), "No Host name is shown without a binding.")
         let unboundWorkspace = app.buttons["morde.resources.workspace.open.w0000005"]
         XCTAssertTrue(unboundWorkspace.exists)
-        XCTAssertTrue(unboundWorkspace.label.contains("未挂载"), "A ready Workspace without a Host binding stays unmounted.")
-        XCTAssertFalse(unboundWorkspace.label.contains("已挂载"))
+        XCTAssertTrue(unboundWorkspace.label.contains("未关联云端电脑"), "An unlinked computer-file resource is identified accurately.")
+        XCTAssertFalse(unboundWorkspace.label.contains("已就绪"))
         XCTAssertFalse(unboundWorkspace.label.contains("Running host"), "An unbound Workspace does not invent a Host.")
         let host = app.buttons["morde.resources.host.open.h0000001"]
         XCTAssertTrue(host.exists)
-        XCTAssertTrue(app.staticTexts["云端主机"].exists)
-        XCTAssertFalse(app.staticTexts["云端电脑"].exists)
+        XCTAssertTrue(host.label.contains("电脑文件已就绪"), "Show the binding's confirmed file readiness on its computer.")
+        let syncingHost = app.buttons["morde.resources.host.open.h0000003"]
+        XCTAssertTrue(syncingHost.label.contains("电脑文件同步中"), "Show the server's pending sync state on its computer.")
+        XCTAssertTrue(app.staticTexts["云端电脑"].exists)
+        XCTAssertFalse(app.staticTexts["云端主机"].exists)
         let cloudPhoneStatus = app.descendants(matching: .any)["morde.resources.empty.cloudPhones"]
         XCTAssertTrue(cloudPhoneStatus.exists,
                       "Client device records must not be presented as cloud phone runtime entries.")
@@ -3106,13 +3413,13 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                        "File actions should stay inside the row menu instead of adding persistent row controls.")
         XCTAssertFalse(app.buttons["重命名"].exists)
         XCTAssertFalse(app.buttons["移动"].exists)
-        XCTAssertFalse(app.buttons["删除云端文件"].exists)
+        XCTAssertFalse(app.buttons["删除电脑文件"].exists)
 
         fileActions.tap()
         let download = app.buttons["下载并校验"]
         let rename = app.buttons["重命名"]
         let move = app.buttons["移动"]
-        let delete = app.buttons["删除云端文件"]
+        let delete = app.buttons["删除电脑文件"]
         XCTAssertTrue(download.waitForExistence(timeout: 5))
         XCTAssertTrue(rename.exists)
         XCTAssertTrue(move.exists)
@@ -3201,7 +3508,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         app.buttons["morde.resources.workspace.open.w0000001"].tap()
         app.buttons["morde.workspace.share"].tap()
 
-        XCTAssertTrue(app.staticTexts["分享「Ready Workspace」"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["分享电脑文件"].waitForExistence(timeout: 5))
         let editPermission = app.buttons["morde.workspace.share.permission.edit"]
         XCTAssertTrue(editPermission.waitForExistence(timeout: 5))
         editPermission.tap()
@@ -3225,7 +3532,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(acceptCopy.waitForExistence(timeout: 20), "The share deep link should present the recipient claim flow.")
         XCTAssertTrue(app.staticTexts["Ready Workspace"].exists)
         XCTAssertTrue(app.staticTexts["可查看 · 只能看文件"].exists)
-        XCTAssertTrue(app.staticTexts["领取后会创建归你所有的独立副本，之后与原 Workspace 无关。"].exists)
+        XCTAssertTrue(app.staticTexts["领取后会创建归你所有的独立副本，之后与原文件目录无关。"].exists)
         acceptCopy.tap()
 
         let resources = app.buttons["morde.nav.tab.resources"]
@@ -3252,7 +3559,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(acceptCopy.waitForExistence(timeout: 20), "The edit-share deep link should present the recipient claim flow.")
         XCTAssertTrue(app.staticTexts["Ready Workspace"].exists)
         XCTAssertTrue(app.staticTexts["可编辑 · 能改文件"].exists)
-        XCTAssertTrue(app.staticTexts["领取后会创建归你所有的独立副本，之后与原 Workspace 无关。"].exists)
+        XCTAssertTrue(app.staticTexts["领取后会创建归你所有的独立副本，之后与原文件目录无关。"].exists)
         acceptCopy.tap()
 
         let resources = app.buttons["morde.nav.tab.resources"]
@@ -3276,7 +3583,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.buttons["重命名"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["重命名"].isEnabled)
         XCTAssertTrue(app.buttons["移动"].isEnabled)
-        XCTAssertTrue(app.buttons["删除云端文件"].isEnabled,
+        XCTAssertTrue(app.buttons["删除电脑文件"].isEnabled,
                       "The accepted edit copy should allow Workspace file mutations.")
     }
 
@@ -3373,7 +3680,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let download = app.buttons["下载并校验"]
         let rename = app.buttons["重命名"]
         let move = app.buttons["移动"]
-        let delete = app.buttons["删除云端文件"]
+        let delete = app.buttons["删除电脑文件"]
         XCTAssertTrue(download.waitForExistence(timeout: 5))
         XCTAssertTrue(download.isEnabled, "Read-only workspaces allow reading visible file content.")
         XCTAssertFalse(rename.isEnabled)
@@ -3444,7 +3751,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let host = app.buttons["morde.resources.host.open.h0000001"]
         XCTAssertTrue(host.waitForExistence(timeout: 15))
         XCTAssertTrue(host.label.contains("PC-01"))
-        XCTAssertTrue(host.label.contains("morde 仓库"))
+        XCTAssertTrue(host.label.contains("电脑文件已就绪"))
+        XCTAssertFalse(host.label.contains("morde 仓库"), "The cloud-computer row should show file readiness, not the internal Workspace name.")
         XCTAssertEqual(app.staticTexts["morde.resources.host.status.h0000001"].label, "运行中")
         XCTAssertFalse(app.buttons["morde.resources.host.open.h0000002"].exists,
                        "This visual fixture intentionally shows one ordinary Host state.")
@@ -3526,7 +3834,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(title.label, "全由你掌控")
         let subtitle = app.staticTexts["morde.computer.subtitle"]
         XCTAssertTrue(subtitle.exists)
-        XCTAssertTrue(subtitle.label.contains("Running host · Ready Workspace"))
+        XCTAssertTrue(subtitle.label.contains("云端电脑 Running host"))
         let workbench = app.descendants(matching: .any)["morde.computer.webview"]
         XCTAssertTrue(workbench.waitForExistence(timeout: 10))
         XCTAssertTrue(workbench.staticTexts["新标签页"].waitForExistence(timeout: 20),
@@ -3577,8 +3885,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(files.exists)
         XCTAssertTrue(workbench.staticTexts["新标签页"].exists,
                        "The fixture's rendered page content confirms the WKWebView completed navigation.")
-        XCTAssertTrue(app.staticTexts["morde.computer.subtitle"].label.contains("PC-01 · morde 仓库"),
-                      "Use the design稿's paired Host and Workspace names when comparing the compact header.")
+        XCTAssertTrue(app.staticTexts["morde.computer.subtitle"].label.contains("云端电脑 PC-01"),
+                      "Show the cloud-computer name without exposing the internal Workspace name.")
 
         XCTAssertFalse(workbench.buttons["Workspace"].exists,
                        "Workspace should not occupy a permanent tab in the iOS workbench shell.")
@@ -3972,6 +4280,61 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "fixture.pdf")).firstMatch.exists)
         XCTAssertFalse(app.buttons["morde.chat.stopTask"].exists)
         assertChatLongPressMenuOffersStopTask(app, taskID: "q1234567")
+    }
+
+    func testMordeExpiredClientSessionRequiresReauthentication() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        if app.state != .notRunning { app.terminate() }
+        let fixturePort = UInt16.random(in: 50_000...59_999)
+        app.launchArguments = [
+            "-morde.server", "https://127.0.0.1:\(fixturePort)",
+            "-morde.localRegistrationStub", "-morde.localRegistrationApproved",
+            "-morde.localMainChatFixture", "-morde.localClientSessionExpiryOnceFixture",
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ]
+        app.launch()
+
+        let username = app.textFields["morde.auth.username"]
+        func signInAgain() {
+            XCTAssertTrue(username.waitForExistence(timeout: 15))
+            username.tap()
+            if let current = username.value as? String, current != username.placeholderValue {
+                username.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+            }
+            let keyboard = app.keyboards.firstMatch
+            if !keyboard.waitForExistence(timeout: 2) { username.tap() }
+            XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+            username.typeText("morde-expired-session-test")
+            let password = app.secureTextFields["morde.auth.password"]
+            password.tap()
+            if let current = password.value as? String, current != password.placeholderValue {
+                password.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+            }
+            password.typeText("local-password")
+            let submit = app.buttons["morde.auth.submit"]
+            XCTAssertTrue(submit.waitForExistence(timeout: 5))
+            XCTAssertTrue(submit.isEnabled, "Both synthetic credentials must be entered before sign-in.")
+            submit.tap()
+        }
+
+        signInAgain()
+        let authenticatedMenu = app.buttons["morde.nav.menu"]
+        XCTAssertTrue(authenticatedMenu.waitForExistence(timeout: 10),
+                      "The first sign-in should show the authenticated shell before the server rejects the session.")
+        XCTAssertTrue(username.waitForExistence(timeout: 30),
+                      "A server-rejected session should return the user to the sign-in form.")
+        signInAgain()
+
+        XCTAssertTrue(authenticatedMenu.waitForExistence(timeout: 30),
+                      "A fresh sign-in should restore the authenticated Morde shell.")
+        XCTAssertTrue(app.textFields["morde.chat.composer"].waitForExistence(timeout: 15))
+        XCTAssertFalse(username.exists)
+
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5), "Home should background the active Morde session.")
+        app.activate()
+        XCTAssertTrue(app.textFields["morde.chat.composer"].waitForExistence(timeout: 15),
+                      "Returning from the background should keep the authenticated chat available.")
     }
 
     func testMordeChatComposerRecoversPlainTextAfterOfflineRestart() {
@@ -4384,7 +4747,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         task.tap()
         XCTAssertTrue(app.staticTexts["morde.task.objective"].waitForExistence(timeout: 15),
                       "Load the verified Task detail before opening its artifact in the library.")
-        app.buttons["chevron.left"].tap()
+        app.buttons["morde.task.back"].tap()
         XCTAssertTrue(task.waitForExistence(timeout: 10), "Return to the task list before changing sections.")
         app.buttons["morde.nav.tab.resources"].tap()
         app.buttons["morde.nav.menu"].tap()
@@ -4405,7 +4768,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(artifact.waitForExistence(timeout: 15),
                       "The verified synthetic Task artifact should appear in AI outputs.")
         artifact.tap()
-        let quickLook = app.descendants(matching: .any)["QLPreviewControllerView"]
+        let quickLook = app.descendants(matching: .any)["morde.attachment.preview.quickLook"]
         XCTAssertTrue(quickLook.waitForExistence(timeout: 15),
                       "The native Quick Look controller should present for the verified local Task artifact.")
         XCTAssertGreaterThan(quickLook.frame.height, app.frame.height * 0.7,
@@ -4754,6 +5117,25 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["云端还没有文件"].exists)
     }
 
+    private static func repairLoopbackSchemeSeparator(_ origin: String) -> String {
+        let prefixes = [
+            "http:/127.0.0.1:", "https:/127.0.0.1:",
+            "http:/localhost:", "https:/localhost:"
+        ]
+        guard let prefix = prefixes.first(where: { origin.lowercased().hasPrefix($0) }) else { return origin }
+        let scheme = prefix.hasPrefix("https:") ? "https" : "http"
+        let host = prefix.contains("127.0.0.1") ? "127.0.0.1" : "localhost"
+        return "\(scheme)://\(host):\(origin.dropFirst(prefix.count))"
+    }
+
+    private static func isLocalPortalHost(_ host: String) -> Bool {
+        if ["127.0.0.1", "localhost"].contains(host) { return true }
+        let octets = host.split(separator: ".").compactMap { UInt8($0) }
+        guard octets.count == 4 else { return false }
+        return octets[0] == 10 || (octets[0] == 172 && (16...31).contains(Int(octets[1]))) ||
+            (octets[0] == 192 && octets[1] == 168)
+    }
+
     private func launchLocalChat(_ app: XCUIApplication, additionalArguments: [String] = [],
                                  loginName: String = "morde-design-test",
                                  resetExistingAccount: Bool = false) {
@@ -4943,6 +5325,13 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    private func waitForAccessibilityLabel(_ element: XCUIElement, containing value: String,
+                                           timeout: TimeInterval) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", value), object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
 }

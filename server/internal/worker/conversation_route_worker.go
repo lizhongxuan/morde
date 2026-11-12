@@ -78,8 +78,8 @@ func (w *ConversationRouteWorker) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// RunOnce processes at most one leased message. Model failures are durable
-// route failures, while an absent predecessor is deferred without guessing.
+// RunOnce processes at most one leased message. Model failures and stale
+// context conflicts are durable; an absent predecessor is deferred without guessing.
 func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if ctx == nil {
 		return false, errors.New("conversation routing context is required")
@@ -116,7 +116,6 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		if err == nil {
 			err = errors.New("resolved conversation model identity is invalid")
 		}
-		w.options.Logger.Warn("conversation route model resolution failed", zap.String("code", string(domain.CodeOf(err))))
 		return true, w.failRoute(ctx, claim, "model_unavailable", err)
 	}
 	if snapshot.Context.ResultReview == nil {
@@ -170,7 +169,6 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, classifyContext)
 		if err != nil {
-			w.options.Logger.Warn("conversation route classification failed", zap.String("code", string(domain.CodeOf(err))), zap.Error(err))
 			if snapshot.Context.ResultReview != nil && routeCtx.Err() != nil && ctx.Err() == nil {
 				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 5*time.Second)
 			}
@@ -189,7 +187,8 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				}
 			}
 			if !snapshot.PreviousMissing && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
-				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 2*time.Second)
+				// Surface stale context to the existing retry action instead of leaving the accepted message pending forever.
+				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 			}
 			return true, w.failRoute(ctx, claim, "model_unavailable", err)
 		}

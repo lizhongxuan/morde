@@ -224,7 +224,10 @@ func serve(ctx context.Context, configPath string) error {
 		return fmt.Errorf("open Workspace current-file storage: %w", err)
 	}
 	defer func() { _ = workspaceCurrent.Close() }()
-	workspaceSync, err := app.NewWorkspaceSyncService(store, workspaceBlocks, workspace.MaxSyncManifestBytes, cfg.WorkspaceStorage.MaxOwnerBytes)
+	workspaceSync, err := app.NewWorkspaceSyncServiceWithOptions(
+		store, workspaceBlocks, workspace.MaxSyncManifestBytes, cfg.WorkspaceStorage.MaxOwnerBytes,
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: cfg.WorkspaceSyncNode.ProjectUploadEnabled},
+	)
 	if err != nil {
 		return err
 	}
@@ -448,6 +451,10 @@ func serve(ctx context.Context, configPath string) error {
 	})
 	if err != nil {
 		return err
+	}
+	hostCopies, err := app.NewHostCopyService(hosts, workspaceCopies)
+	if err != nil {
+		return fmt.Errorf("initialize Host copy service: %w", err)
 	}
 	adminHostResources, err := app.NewAdminHostResourcesService(store, app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB}, router)
 	if err != nil {
@@ -724,7 +731,7 @@ func serve(ctx context.Context, configPath string) error {
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, HostUsage: hostUsageService, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices, WorkspaceDiff: workspaceSync,
-		WorkspaceCopies: workspaceCopies, WorkspaceTransfers: workspaceOwnershipTransfers, WorkspaceShares: workspaceShares,
+		WorkspaceCopies: workspaceCopies, HostCopies: hostCopies, WorkspaceTransfers: workspaceOwnershipTransfers, WorkspaceShares: workspaceShares,
 		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,

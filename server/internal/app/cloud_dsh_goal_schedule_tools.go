@@ -318,7 +318,7 @@ func (b *CloudDSHToolBroker) executeGoalServiceTool(ctx context.Context, current
 		if decodeStrictRuntimeResult(raw, &args) != nil || args.Limit < 1 || args.Limit > cloudDSHGoalListLimit || len(args.Cursor) > 1024 {
 			return nil, "", domain.InvalidArgument("goal_list", "goal list arguments are invalid")
 		}
-		page, err := b.goals.List(ctx, principal, PageRequest(args))
+		page, err := b.goals.List(ctx, principal, PageRequest{Limit: args.Limit, Cursor: args.Cursor})
 		if err != nil {
 			return nil, "", err
 		}

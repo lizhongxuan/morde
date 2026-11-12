@@ -14,6 +14,7 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/store/postgres/sqlcgen"
 )
 
@@ -84,14 +85,17 @@ ORDER BY intent.expected_revision`, value.ID, value.OwnerID, value.InitiatorID, 
 		if err := rows.Scan(&metadata, &routeInstance, &instanceID, &messageID); err != nil {
 			return deferredTargetSelection{}, false, fmt.Errorf("scan revised Task target intent: %w", err)
 		}
-		if routeInstance != instanceID {
-			return deferredTargetSelection{target: app.DeferredTaskTarget{Unavailable: true}}, true, nil
-		}
 		if json.Unmarshal(metadata, &update) != nil || update.ProjectID != value.ProjectID ||
 			(update.HostID != "" && !domain.ValidHostID(update.HostID)) ||
 			(update.WorkspaceID != "" && !domain.ValidWorkspaceID(update.WorkspaceID)) ||
 			(update.ApplicationID != "" && !app.ValidHostApplicationID(update.ApplicationID)) {
 			return deferredTargetSelection{}, false, domain.NewError(domain.CodeInvalidState, "revised Task target intent is invalid")
+		}
+		if !update.ChangeTaskTarget {
+			continue
+		}
+		if routeInstance != instanceID {
+			return deferredTargetSelection{target: app.DeferredTaskTarget{Unavailable: true}}, true, nil
 		}
 		if update.HostID != "" {
 			if update.HostID != selection.target.HostID {
@@ -155,6 +159,120 @@ WHERE r.message_id=$1 AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=
 		}
 	}
 	return nil
+}
+
+type deferredHostWorkspaceBinding struct {
+	ownerID, workspaceID string
+	bindingVersion       int64
+	workspaceRevision    int64
+}
+
+// lockUniqueTaskHostWorkspaceBinding accepts only the Host's single usable
+// personal Workspace binding. Host mutations take the Host row lock first;
+// callers hold that lock for the whole transaction so binding changes cannot
+// race resolution or target binding.
+func lockUniqueTaskHostWorkspaceBinding(ctx context.Context, tx pgx.Tx, hostID, actorID, expectedWorkspaceID string,
+	expectedBindingVersion int64) (deferredHostWorkspaceBinding, error) {
+	var result deferredHostWorkspaceBinding
+	rows, err := tx.Query(ctx, `SELECT wb.owner_id,wb.workspace_id,wb.state,wb.binding_version,
+wb.desired_revision,wb.applied_revision,wb.sync_state,w.owner_id,w.state,w.revision,w.deleted_at IS NOT NULL
+FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
+WHERE wb.host_id=$1 AND wb.state<>'detached'
+ORDER BY wb.created_at,wb.id FOR UPDATE OF wb,w`, hostID)
+	if err != nil {
+		return result, fmt.Errorf("lock Host Workspace bindings for Task: %w", err)
+	}
+	defer rows.Close()
+	var count int
+	var bindingState, syncState, workspaceState string
+	var desiredRevision, appliedRevision, workspaceRevision int64
+	var workspaceOwnerID string
+	var deleted bool
+	for rows.Next() {
+		count++
+		if count > 1 {
+			return result, domain.NewError(domain.CodeWorkspaceConflict, "Host has multiple non-detached Workspace bindings")
+		}
+		if err := rows.Scan(&result.ownerID, &result.workspaceID, &bindingState, &result.bindingVersion,
+			&desiredRevision, &appliedRevision, &syncState, &workspaceOwnerID, &workspaceState, &workspaceRevision, &deleted); err != nil {
+			return result, fmt.Errorf("scan locked Host Workspace binding for Task: %w", err)
+		}
+		result.workspaceRevision = workspaceRevision
+	}
+	if err := rows.Err(); err != nil {
+		return result, fmt.Errorf("iterate locked Host Workspace bindings for Task: %w", err)
+	}
+	if count == 0 {
+		return result, domain.NewError(domain.CodeNotFound, "Host has no Workspace binding")
+	}
+	if bindingState != string(workspace.BindingActive) || result.bindingVersion < 1 ||
+		syncState != string(workspace.BindingSyncHealthy) || deleted || workspaceState != string(workspace.StateReady) ||
+		desiredRevision != appliedRevision || appliedRevision != workspaceRevision {
+		return result, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding is not current and healthy")
+	}
+	if result.ownerID != actorID || workspaceOwnerID != actorID {
+		return result, domain.NewError(domain.CodeForbidden, "Host Workspace is not owned by the Task initiator")
+	}
+	if expectedWorkspaceID != "" && result.workspaceID != expectedWorkspaceID {
+		if expectedBindingVersion > 0 {
+			return result, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed")
+		}
+		return result, domain.NewError(domain.CodeForbidden, "Workspace is not bound to the selected Host")
+	}
+	if expectedBindingVersion > 0 && result.bindingVersion != expectedBindingVersion {
+		return result, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding version changed")
+	}
+	return result, nil
+}
+
+// ResolveDeferredTaskWorkspace resolves the personal Workspace for a Host-only
+// intent. It is called only when a Workspace-scoped Host tool is invoked.
+func (s *Store) ResolveDeferredTaskWorkspace(ctx context.Context, value task.Task, target app.DeferredTaskTarget) (app.DeferredTaskTarget, bool, error) {
+	if ctx == nil || !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
+		!domain.ValidUserID(value.InitiatorID) || value.OwnerID != value.InitiatorID || value.ProjectID != "" ||
+		!domain.ValidConversationID(value.ConversationID) || !domain.ValidHostID(target.HostID) ||
+		target.WorkspaceID != "" || target.WorkspaceBindingVersion != 0 || target.Unavailable {
+		return app.DeferredTaskTarget{}, false, domain.InvalidArgument("target", "Host Workspace resolution input is invalid")
+	}
+	var resolved app.DeferredTaskTarget
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockTaskTargetHost(ctx, tx, target.HostID, value.InitiatorID); err != nil {
+			return err
+		}
+		current, err := lockAuthorizedAgentTask(ctx, tx, deferredTargetFence(value))
+		if err != nil {
+			return err
+		}
+		if !matchesDeferredTaskAgent(current, value) {
+			return domain.NewError(domain.CodeInvalidState, "deferred Task Agent changed")
+		}
+		selection, found, err := loadDeferredTaskTargetInTx(ctx, tx, value)
+		if err != nil {
+			return err
+		}
+		if !found || selection.target.Unavailable || selection.target.HostID != target.HostID ||
+			selection.target.WorkspaceID != "" || selection.target.ApplicationID != target.ApplicationID {
+			return domain.NewError(domain.CodeForbidden, "Host-only Workspace selection is unavailable")
+		}
+		if err := verifyDeferredTargetSources(ctx, tx, value, selection, true, false); err != nil {
+			return err
+		}
+		if value.HostID != "" && value.HostID != target.HostID {
+			return domain.NewError(domain.CodeConflict, "Task is bound to a different Host")
+		}
+		binding, err := lockUniqueTaskHostWorkspaceBinding(ctx, tx, target.HostID, value.InitiatorID, "", 0)
+		if err != nil {
+			return err
+		}
+		if value.WorkspaceID != "" && value.WorkspaceID != binding.workspaceID {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace differs from the Host binding")
+		}
+		resolved = target
+		resolved.WorkspaceID = binding.workspaceID
+		resolved.WorkspaceBindingVersion = binding.bindingVersion
+		return nil
+	})
+	return resolved, err == nil, err
 }
 
 // LoadDeferredTaskTarget reads user intent without consulting Host health or
@@ -295,6 +413,7 @@ workspace_owner_id=$5,workspace_project_resource_version=$6 WHERE id=$1`,
 // Workspace lock before it is attached to the task.
 func (s *Store) BindDeferredTaskTarget(ctx context.Context, value task.Task, selected app.DeferredTaskTarget, revision *int64, digest []byte) (task.Task, error) {
 	if ctx == nil || !domain.ValidHostID(selected.HostID) ||
+		selected.WorkspaceBindingVersion < 0 || (selected.WorkspaceID == "" && selected.WorkspaceBindingVersion != 0) ||
 		(selected.WorkspaceID == "") != (revision == nil) ||
 		(selected.WorkspaceID == "") != (len(digest) == 0) ||
 		(selected.WorkspaceID != "" && (!domain.ValidWorkspaceID(selected.WorkspaceID) || *revision < 0 || len(digest) != 32)) {
@@ -304,6 +423,7 @@ func (s *Store) BindDeferredTaskTarget(ctx context.Context, value task.Task, sel
 	err := s.withProjectWorkspaceSelectionTx(ctx, value, selected.WorkspaceID, selected.HostID, func(tx pgx.Tx) error {
 		workspaceOwner := value.InitiatorID
 		var resourceVersion *int64
+		var workspaceRevision int64
 		if value.ProjectID != "" {
 			if _, _, err := lockProjectForActorInTx(ctx, tx, value.InitiatorID, value.ProjectID, project.RoleMember, false); err != nil {
 				return err
@@ -326,6 +446,19 @@ func (s *Store) BindDeferredTaskTarget(ctx context.Context, value task.Task, sel
 		if err := lockTaskTargetHost(ctx, tx, selected.HostID, value.InitiatorID); err != nil {
 			return err
 		}
+		if value.ProjectID == "" && selected.WorkspaceID != "" {
+			binding, err := lockUniqueTaskHostWorkspaceBinding(ctx, tx, selected.HostID, value.InitiatorID,
+				selected.WorkspaceID, selected.WorkspaceBindingVersion)
+			if err != nil {
+				return err
+			}
+			workspaceRevision = binding.workspaceRevision
+		} else if selected.WorkspaceID != "" {
+			if err := tx.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1 AND deleted_at IS NULL FOR SHARE`,
+				selected.WorkspaceID).Scan(&workspaceRevision); err != nil {
+				return storeError("read deferred Task Workspace revision", "workspace", err)
+			}
+		}
 		current, err := lockAuthorizedAgentTask(ctx, tx, deferredTargetFence(value))
 		if err != nil {
 			return err
@@ -337,8 +470,11 @@ func (s *Store) BindDeferredTaskTarget(ctx context.Context, value task.Task, sel
 		if err != nil {
 			return err
 		}
+		workspaceIntentMatches := selected.WorkspaceID == "" || intent.target.WorkspaceID == selected.WorkspaceID ||
+			(intent.target.WorkspaceID == "" && selected.WorkspaceID != "" && value.ProjectID == "" &&
+				selected.WorkspaceBindingVersion > 0)
 		if !found || intent.target.HostID != selected.HostID || intent.target.ApplicationID != selected.ApplicationID ||
-			(selected.WorkspaceID != "" && intent.target.WorkspaceID != selected.WorkspaceID) {
+			!workspaceIntentMatches {
 			return domain.NewError(domain.CodeForbidden, "deferred Task target does not match the user selection")
 		}
 		if err := verifyDeferredTargetSources(ctx, tx, value, intent, true, selected.WorkspaceID != ""); err != nil {
@@ -395,9 +531,10 @@ func (s *Store) BindDeferredTaskTarget(ctx context.Context, value task.Task, sel
 				return err
 			}
 		} else if selected.WorkspaceID != "" &&
-			(!sameTaskInputRevision(bound.InputRevision, revision) || !sameTaskInputRevision(bound.WorkspaceCheckpointRevision, revision) ||
+			(!sameTaskInputRevision(bound.InputRevision, revision) ||
+				!sameTaskInputRevision(bound.WorkspaceCheckpointRevision, &workspaceRevision) || !bytes.Equal(bound.ContextDigest, digest) ||
 				bound.WorkspaceOwnerID != workspaceOwner || !sameTaskInputRevision(bound.WorkspaceProjectResourceVersion, resourceVersion)) {
-			return domain.NewError(domain.CodeWorkspaceConflict, "task Workspace snapshot is already fixed")
+			return domain.NewError(domain.CodeWorkspaceConflict, "task Workspace checkpoint is not current")
 		}
 		if !row.HostID.Valid {
 			// The Agent's Host authorization snapshot is established exactly once.

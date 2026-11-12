@@ -26,6 +26,7 @@ type taskStoreStub struct {
 	created                []conversation.Conversation
 	listHostIDs            []string
 	listTasksPage          TaskPage
+	listTaskView           ConversationTaskView
 	listConvPage           ConversationPage
 	messagePage            MessagePage
 	details                TaskDetails
@@ -65,6 +66,31 @@ type taskStoreStub struct {
 	grantConnectorID       string
 	grantVersion           int64
 	grantRevoked           TaskMCPConnectorGrant
+}
+
+func TestConversationTaskListFiltersPendingCountByCurrentHostAuthorization(t *testing.T) {
+	store := &taskStoreStub{
+		conversations: map[string]conversation.Conversation{
+			"c1234567": {ID: "c1234567", OwnerID: "u1234567"},
+		},
+		listTasksPage: TaskPage{
+			Items: []task.Task{
+				{ID: "q1234567", OwnerID: "u1234567", ConversationID: "c1234567", HostID: "h1234567", Status: task.StatusWaitingUser},
+				{ID: "qhostles", OwnerID: "u1234567", ConversationID: "c1234567", Status: task.StatusWaitingUser},
+			},
+			PendingCountsByHostID: map[string]int64{"h1234567": 2, "h7654321": 9, "": 3},
+		},
+	}
+	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{"h7654321": domain.NewError(domain.CodeForbidden, "host not authorized")}}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
+
+	page, err := service.ListConversationTasks(context.Background(), taskTestPrincipal(), "", "c1234567", ConversationTaskViewActive, PageRequest{Limit: 10})
+	if err != nil || page.PendingCount != 5 || page.PendingCountsByHostID != nil || store.listTaskView != ConversationTaskViewActive || len(page.Items) != 2 {
+		t.Fatalf("visible conversation tasks = %+v, %v", page, err)
+	}
+	if _, err := service.ListConversationTasks(context.Background(), taskTestPrincipal(), "", "c1234567", ConversationTaskView("all"), PageRequest{}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("invalid conversation task view error = %v", err)
+	}
 }
 
 type taskWorkspaceStoreStub struct {
@@ -186,6 +212,12 @@ func (s *taskStoreStub) ListTasks(_ context.Context, _ string, filter TaskListRe
 
 func (s *taskStoreStub) ListConversationActiveTasks(_ context.Context, _ string, _, _ string, hostIDs []string, _ PageRequest) (TaskPage, error) {
 	s.listHostIDs = hostIDs
+	return s.listTasksPage, s.storeErr
+}
+
+func (s *taskStoreStub) ListConversationTasks(_ context.Context, _ string, _, _ string, hostIDs []string, view ConversationTaskView, _ PageRequest) (TaskPage, error) {
+	s.listHostIDs = hostIDs
+	s.listTaskView = view
 	return s.listTasksPage, s.storeErr
 }
 

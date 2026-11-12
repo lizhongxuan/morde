@@ -246,7 +246,8 @@ func acceptProjectConversationMessage(service projectConversationRoutesService) 
 		message, replayed, err := service.AcceptMessage(c.Request.Context(), principal, projectID, conversationID, app.AcceptConversationMessageCommand{
 			ProjectID: projectID, ServiceInstanceID: instanceID, ClientMessageID: request.ClientMessageID,
 			PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
-			HostID: request.HostID, WorkspaceID: request.WorkspaceID, MCPConnectorIDs: request.MCPConnectorIDs,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget,
+			MCPConnectorIDs:     request.MCPConnectorIDs,
 			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
 			ModelID: request.ModelID, Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})

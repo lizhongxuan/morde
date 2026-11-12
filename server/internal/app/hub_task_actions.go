@@ -211,7 +211,7 @@ func (s *HubService) CallTaskAction(ctx context.Context, ownerID, targetID strin
 			"task_id": taskContext.TaskID, "authorization_version": taskContext.AuthorizationVersion,
 			"target_grant_version": taskContext.TargetGrantVersion, "operation_id": taskContext.OperationID,
 		}
-		if taskContext.TaskRevision > 0 {
+		if action == hub.ActionFileFetch || taskContext.TaskRevision > 0 {
 			taskFrom["task_revision"] = taskContext.TaskRevision
 		}
 	}
@@ -276,7 +276,7 @@ func validTaskHubRevisionBinding(action string, taskContext hub.TaskContext, raw
 		return taskContext.TaskRevision == 0
 	}
 	var args hub.FileFetchArgs
-	return taskContext.TaskRevision > 0 && json.Unmarshal(raw, &args) == nil &&
+	return taskContext.TaskRevision >= 0 && json.Unmarshal(raw, &args) == nil &&
 		args.TaskRevision == taskContext.TaskRevision && args.FetchID == taskContext.OperationID
 }
 
@@ -390,6 +390,9 @@ func (b *CloudDSHToolBroker) hubTaskDefinitions(ctx context.Context, current tas
 	}
 	definitions := make([]AgentToolDefinition, 0)
 	for _, tool := range hubTaskTools {
+		if current.HostID == "" && tool.action != hub.ActionFileFetch {
+			continue
+		}
 		if b.authorizeServerTaskScope(ctx, current, tool.scope) != nil {
 			continue
 		}
@@ -428,11 +431,18 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		return AgentToolResult{}, err
 	}
 	current := details.Task
+	if current.HostID == "" && tool.action != hub.ActionFileFetch {
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Task Hub actions require an assigned cloud Host")
+	}
 	if err := b.authorizeServerTaskScope(ctx, current, tool.scope); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Task authorization does not allow this Hub action")
 	}
+	invalidFileFetch := AgentToolResult{Status: AgentToolFailed, Output: "The selected file path was rejected; no file was read."}
 	args, err := hubTaskActionArguments(call.Arguments)
 	if err != nil {
+		if tool.action == hub.ActionFileFetch {
+			return invalidFileFetch, nil
+		}
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Task Hub action arguments are invalid")
 	}
 	var fileFetchPath string
@@ -442,6 +452,9 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		err = hub.ValidateTaskActionArgs(tool.action, args)
 	}
 	if err != nil {
+		if tool.action == hub.ActionFileFetch {
+			return invalidFileFetch, nil
+		}
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Task Hub action arguments are invalid")
 	}
 	var writeRequest hub.WorkspaceWriteArgs
@@ -457,7 +470,7 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 	var taskRevision int64
 	if tool.action == hub.ActionFileFetch {
 		if current.Status != task.StatusRunning || current.CurrentRevision == nil || current.DesiredRevision == nil ||
-			*current.CurrentRevision < 1 || *current.CurrentRevision != *current.DesiredRevision {
+			*current.CurrentRevision < 0 || *current.CurrentRevision != *current.DesiredRevision {
 			return AgentToolResult{}, domain.NewError(domain.CodeConflict, "file.fetch requires the current running Task revision")
 		}
 		taskRevision = *current.CurrentRevision

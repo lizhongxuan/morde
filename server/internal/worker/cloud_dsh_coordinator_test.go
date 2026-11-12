@@ -148,6 +148,32 @@ func coordinatorTestClaimAndContext() (app.ConversationRouteClaim, app.Conversat
 	return claim, value
 }
 
+func TestCloudDSHCoordinatorUsesFreshSessionPerResultReviewRetry(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	initial := cloudDSHCoordinatorIdentity(claim, value)
+	if err := app.ValidateConversationCoordinatorIdentity(claim, initial); err != nil {
+		t.Fatalf("initial coordinator identity is invalid: %v", err)
+	}
+
+	value.ResultReview = &app.ConversationTaskResultReview{RetryAttempt: 1}
+	firstRetry := cloudDSHCoordinatorIdentity(claim, value)
+	if err := app.ValidateConversationCoordinatorIdentity(claim, firstRetry); err != nil {
+		t.Fatalf("first retry coordinator identity is invalid: %v", err)
+	}
+	if firstRetry.SessionID == initial.SessionID || firstRetry.AgentID == initial.AgentID {
+		t.Fatal("first result review retry reused the previous DSH session identity")
+	}
+	if firstRetry.SessionID != cloudDSHCoordinatorIdentity(claim, value).SessionID {
+		t.Fatal("same result review retry produced an unstable DSH session identity")
+	}
+
+	value.ResultReview.RetryAttempt = 2
+	secondRetry := cloudDSHCoordinatorIdentity(claim, value)
+	if secondRetry.SessionID == firstRetry.SessionID || secondRetry.AgentID == firstRetry.AgentID {
+		t.Fatal("second result review retry reused an earlier DSH session identity")
+	}
+}
+
 func TestCloudDSHCoordinatorRejectsChangedCheckpointContextBeforeRuntimeOrModel(t *testing.T) {
 	claim, value := coordinatorTestClaimAndContext()
 	wrong := sha256.Sum256([]byte("different authorized context"))
@@ -193,7 +219,7 @@ func TestCloudDSHCoordinatorRunsMatchingTextOnlyTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	modelDigest := sha256.Sum256(modelRequest)
-	identity := cloudDSHCoordinatorIdentity(claim)
+	identity := cloudDSHCoordinatorIdentity(claim, value)
 	from, through := int64(0), int64(0)
 	callID, err := app.DSHConversationCoordinatorModelCallID(identity.ConversationID, identity.MessageID, identity.SessionID, through)
 	if err != nil {

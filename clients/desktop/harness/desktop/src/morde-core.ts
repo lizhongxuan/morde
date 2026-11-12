@@ -13,6 +13,7 @@ export type Credentials = {
 
 export type WebSession = { credential: string; expiresAt: string };
 export type ClientLoginAttempt = { clientInstanceID: string; attemptGeneration: string; idempotencyKey: string };
+export type ProjectSyncFolder = { folderID: string; workspaceID: string; folderKind: "workspace_root" | "project"; projectName?: string; relativePath: string; state: "pending_node" | "active" | "revoked"; syncAvailable: boolean };
 
 const IDS = { host: /^h[a-z0-9]{7}$/, workspace: /^w[a-z0-9]{7}$/ };
 const SYNC_DEVICE_ID = /^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){7}$/;
@@ -107,6 +108,31 @@ function validSession(value: unknown): WebSession {
   return { credential: response.web_session_credential, expiresAt: response.web_session_expires_at };
 }
 
+function validProjectFolderName(value: string): boolean {
+  if (!value || value.trim() !== value || [...value].length > 120 || value === "." || value === ".." || /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f]/u.test(value) || /[. ]$/.test(value)) return false;
+  const base = value.split(".", 1)[0]!.toUpperCase();
+  return !new Set(["CON", "PRN", "AUX", "NUL"]).has(base) && !/^(?:COM|LPT)[1-9]$/.test(base);
+}
+
+function parseProjectSyncFolder(value: unknown): ProjectSyncFolder {
+  const folder = value as Record<string, unknown> | null;
+  if (!folder || typeof folder.folder_id !== "string" || !SYNC_FOLDER_ID.test(folder.folder_id) ||
+    typeof folder.workspace_id !== "string" || !/^w[a-z0-9]{7}$/.test(folder.workspace_id) ||
+    (folder.folder_kind !== "workspace_root" && folder.folder_kind !== "project") ||
+    typeof folder.relative_path !== "string" || folder.relative_path.startsWith("/") || folder.relative_path.includes("\\") ||
+    !["pending_node", "active", "revoked"].includes(String(folder.state)) || typeof folder.sync_available !== "boolean" ||
+    (folder.folder_kind === "project" && (typeof folder.project_name !== "string" || !validProjectFolderName(folder.project_name)))) {
+    throw new Error("Invalid Morde project folder response");
+  }
+  const expectedPath = folder.folder_kind === "project" ? `project/${folder.project_name}` : ".";
+  if (folder.relative_path !== expectedPath) throw new Error("Invalid Morde project folder path");
+  return {
+    folderID: folder.folder_id, workspaceID: folder.workspace_id, folderKind: folder.folder_kind,
+    ...(folder.folder_kind === "project" ? { projectName: folder.project_name as string } : {}),
+    relativePath: folder.relative_path, state: folder.state as ProjectSyncFolder["state"], syncAvailable: folder.sync_available,
+  };
+}
+
 function decodeBase64(value: unknown, maxBytes: number): Uint8Array | null {
   if (typeof value !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null;
   const bytes = Buffer.from(value, "base64");
@@ -193,6 +219,16 @@ export class MordeAPI {
     }
   }
 
+  async requireProjectUploadCapability(): Promise<void> {
+    const auth = this.credentials();
+    if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
+    const capabilities = await this.checkCapabilities(auth.origin);
+    if (capabilities.serviceInstanceID !== auth.serviceInstanceID) throw new Error("Morde service identity changed; log in again");
+    if (!capabilities.supportedFeatures.includes("workspace_sync") || !capabilities.supportedFeatures.includes("project_upload")) {
+      throw new Error("此 Morde 服务尚未开放云端电脑项目上传");
+    }
+  }
+
   async login(originInput: unknown, name: unknown, password: unknown, attempt: ClientLoginAttempt, renewal?: { installationID: string; serviceInstanceID: string }): Promise<{ credentials: Credentials; webSession: WebSession }> {
     const origin = portalOrigin(originInput);
     if (typeof name !== "string" || !name.trim() || typeof password !== "string" || !password ||
@@ -270,6 +306,25 @@ export class MordeAPI {
     await this.request("/api/auth/client-logout", "POST");
   }
 
+  private async portalRequest(path: string, session: WebSession, method = "GET", body?: unknown, idempotencyKey?: string): Promise<unknown> {
+    const auth = this.credentials();
+    if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
+    if (!session || typeof session.credential !== "string" || !session.credential || credentialExpired(session.expiresAt)) {
+      throw new Error("Portal session expired; retry the operation");
+    }
+    const response = await fetch(`${auth.origin}${path}`, {
+      method, headers: {
+        cookie: `ch_portal=${session.credential}`, accept: "application/json",
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) throw new Error(response.status === 401 ? "Portal authorization expired or revoked" : `Morde returned HTTP ${response.status}`);
+    return response.status === 204 ? null : response.json();
+  }
+
   async createWorkspaceSyncDeviceChallenge(workspaceID: unknown, deviceID: unknown, certificateDER: Uint8Array): Promise<WorkspaceSyncDeviceChallenge> {
     const id = checkedId("workspace", workspaceID);
     if (typeof deviceID !== "string" || !SYNC_DEVICE_ID.test(deviceID) || !(certificateDER instanceof Uint8Array) ||
@@ -314,6 +369,10 @@ export class MordeAPI {
     return this.request("/api/workspaces");
   }
 
+  hosts(): Promise<unknown> {
+    return this.request("/api/hosts");
+  }
+
   workspace(id: unknown): Promise<unknown> {
     return this.request(`/api/workspaces/${checkedId("workspace", id)}`);
   }
@@ -324,6 +383,22 @@ export class MordeAPI {
 
   host(id: unknown): Promise<unknown> {
     return this.request(`/api/hosts/${checkedId("host", id)}`);
+  }
+
+  async hostProjectFolders(hostID: unknown, session: WebSession): Promise<ProjectSyncFolder[]> {
+    const host = checkedId("host", hostID);
+    const value = await this.portalRequest(`/api/hosts/${host}/sync-folders`, session) as { items?: unknown } | null;
+    if (!value || !Array.isArray(value.items)) throw new Error("Invalid Morde project folder response");
+    return value.items.map((item) => parseProjectSyncFolder(item));
+  }
+
+  async registerHostProjectFolder(hostID: unknown, projectName: unknown, session: WebSession, idempotencyKey: unknown): Promise<ProjectSyncFolder> {
+    const host = checkedId("host", hostID);
+    if (typeof projectName !== "string" || !validProjectFolderName(projectName) || typeof idempotencyKey !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(idempotencyKey)) {
+      throw new Error("Invalid Morde project folder registration request");
+    }
+    const value = await this.portalRequest(`/api/hosts/${host}/sync-folders`, session, "POST", { project_name: projectName }, idempotencyKey);
+    return parseProjectSyncFolder(value);
   }
 
   sharedHosts(): Promise<unknown> {

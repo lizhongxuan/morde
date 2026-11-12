@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
@@ -14,6 +16,10 @@ type conversationStoreStub struct {
 	value        conversation.Conversation
 	key          IdempotencyRecord
 	filterHosts  []string
+	filterSearch string
+	listPage     *ConversationPage
+	listPages    map[string]ConversationPage
+	listRequests []PageRequest
 	main         conversation.MainConversation
 	mainRecord   IdempotencyRecord
 	mainTarget   string
@@ -35,8 +41,16 @@ func (s *conversationStoreStub) GetConversation(_ context.Context, id, ownerID s
 	return s.value, nil
 }
 
-func (s *conversationStoreStub) ListConversations(_ context.Context, ownerID string, hostIDs []string, _ PageRequest) (ConversationPage, error) {
+func (s *conversationStoreStub) ListConversations(_ context.Context, ownerID string, hostIDs []string, page PageRequest) (ConversationPage, error) {
 	s.filterHosts = hostIDs
+	s.filterSearch = page.Search
+	s.listRequests = append(s.listRequests, page)
+	if result, ok := s.listPages[page.Cursor]; ok {
+		return result, nil
+	}
+	if s.listPage != nil {
+		return *s.listPage, nil
+	}
 	if s.value.OwnerID != ownerID {
 		return ConversationPage{Items: []conversation.Conversation{}}, nil
 	}
@@ -89,10 +103,82 @@ func TestConversationServiceDoesNotBindConversationToHost(t *testing.T) {
 	if err != nil || len(page.Items) != 1 || store.filterHosts != nil {
 		t.Fatalf("account conversation list = %+v, %v", page, err)
 	}
+	page, err = service.List(context.Background(), principal, PageRequest{Search: "  work  "})
+	if err != nil || len(page.Items) != 1 || store.filterSearch != "work" {
+		t.Fatalf("searched conversation list = %+v, %v; search=%q", page, err, store.filterSearch)
+	}
+	if _, err := service.List(context.Background(), principal, PageRequest{Search: string(make([]byte, 121))}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("oversized conversation search error = %v", err)
+	}
 	other := principal
 	other.UserID = "u7654321"
 	if _, err := service.Get(context.Background(), other, value.ID); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("another account accessed the conversation: %v", err)
+	}
+}
+
+func TestConversationListFiltersHostsOutsideCurrentAuthorization(t *testing.T) {
+	store := &conversationStoreStub{}
+	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
+		"hblocked": domain.NewError(domain.CodeForbidden, "host access denied"),
+	}}
+	store.listPage = &ConversationPage{Items: []conversation.Conversation{
+		{ID: "cvisible", OwnerID: "u1234567", HostID: "hvisible"},
+		{ID: "cblocked", OwnerID: "u1234567", HostID: "hblocked"},
+		{ID: "cnohost1", OwnerID: "u1234567"},
+	}}
+	service, err := NewConversationService(store, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.List(context.Background(), taskTestPrincipal(), PageRequest{Limit: 10, Search: "plan"})
+	if err != nil || len(result.Items) != 2 || result.Items[0].ID != "cvisible" || result.Items[1].ID != "cnohost1" || result.NextCursor != "" {
+		t.Fatalf("authorized conversations = %+v, %v", result, err)
+	}
+}
+
+func TestConversationSearchPaginatesAfterHostAuthorization(t *testing.T) {
+	base := time.Date(2026, time.November, 12, 9, 0, 0, 0, time.UTC)
+	firstRawPage := make([]conversation.Conversation, maxPageSize)
+	for index := range firstRawPage {
+		firstRawPage[index] = conversation.Conversation{
+			ID: fmt.Sprintf("c%07d", index), OwnerID: "u1234567", HostID: "hblocked",
+			UpdatedAt: base.Add(-time.Duration(index) * time.Second),
+		}
+	}
+	firstRawPage[maxPageSize-1].ID = "cvisib01"
+	firstRawPage[maxPageSize-1].HostID = "hvisible"
+	rawCursor := EncodePageCursor(firstRawPage[maxPageSize-1].UpdatedAt, firstRawPage[maxPageSize-1].ID)
+	secondRawPage := []conversation.Conversation{
+		{ID: "cblock02", OwnerID: "u1234567", HostID: "hblocked", UpdatedAt: base.Add(-100 * time.Second)},
+		{ID: "cvisib02", OwnerID: "u1234567", HostID: "hvisible", UpdatedAt: base.Add(-101 * time.Second)},
+		{ID: "cvisib03", OwnerID: "u1234567", HostID: "hvisible", UpdatedAt: base.Add(-102 * time.Second)},
+	}
+	visibleSecondCursor := EncodePageCursor(secondRawPage[1].UpdatedAt, secondRawPage[1].ID)
+	store := &conversationStoreStub{listPages: map[string]ConversationPage{
+		"":                        {Items: firstRawPage, NextCursor: rawCursor},
+		rawCursor:                 {Items: secondRawPage},
+		visibleSecondCursor:       {Items: secondRawPage[2:]},
+	}}
+	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
+		"hblocked": domain.NewError(domain.CodeForbidden, "host access denied"),
+	}}
+	service, err := NewConversationService(store, authorizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.List(context.Background(), taskTestPrincipal(), PageRequest{Limit: 2, Search: "meeting"})
+	if err != nil || len(page.Items) != 2 || page.Items[0].ID != "cvisib01" || page.Items[1].ID != "cvisib02" || page.NextCursor != visibleSecondCursor {
+		t.Fatalf("first authorized conversation page = %+v, err=%v", page, err)
+	}
+	if len(store.listRequests) != 2 || store.listRequests[0].Limit != maxPageSize || store.listRequests[0].Search != "meeting" ||
+		store.listRequests[1].Cursor != rawCursor || store.listRequests[1].Limit != maxPageSize {
+		t.Fatalf("raw storage pages did not continue across filtered rows: %+v", store.listRequests)
+	}
+	page, err = service.List(context.Background(), taskTestPrincipal(), PageRequest{Limit: 2, Cursor: page.NextCursor, Search: "meeting"})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != "cvisib03" || page.NextCursor != "" ||
+		store.listRequests[len(store.listRequests)-1].Cursor != visibleSecondCursor {
+		t.Fatalf("second authorized conversation page = %+v, err=%v requests=%+v", page, err, store.listRequests)
 	}
 }
 

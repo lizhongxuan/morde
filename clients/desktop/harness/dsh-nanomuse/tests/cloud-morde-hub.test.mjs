@@ -403,7 +403,7 @@ test('Morde Hub caller permits approved opens and bounded notifications to activ
   }
 })
 
-test('file.fetch requires server-supplied Task revision while existing file.get remains compatible', async () => {
+test('file.fetch accepts a nonnegative server-supplied Task revision while existing file.get remains compatible', async () => {
   const out = await service()
   try {
     await out.credentials.set(credentialRef(MORDE_CLIENT_CREDENTIAL), 'chc_target-secret')
@@ -415,6 +415,12 @@ test('file.fetch requires server-supplied Task revision while existing file.get 
     const caller = { kind: 'task', taskContext: { taskID: 'q1234567', authorizationVersion: 1, targetGrantVersion: 2, operationID: 'op_0123456789abcdef' } }
     await assert.doesNotReject(out.svc.mordeHubTaskGrant('file.get', caller))
     await assert.rejects(out.svc.mordeHubTaskGrant('file.fetch', caller), (error) => error.code === 'not_allowed')
+    await assert.doesNotReject(out.svc.mordeHubTaskGrant('file.fetch', {
+      ...caller, taskContext: { ...caller.taskContext, taskRevision: 0 },
+    }))
+    await assert.rejects(out.svc.mordeHubTaskGrant('file.fetch', {
+      ...caller, taskContext: { ...caller.taskContext, taskRevision: -1 },
+    }), (error) => error.code === 'not_allowed')
     await assert.doesNotReject(out.svc.mordeHubTaskGrant('file.fetch', {
       ...caller, taskContext: { ...caller.taskContext, taskRevision: 3 },
     }))
@@ -462,6 +468,10 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
   const ticket4 = Buffer.alloc(32, 0x5d).toString('base64url')
   const ticket5 = Buffer.alloc(32, 0x5e).toString('base64url')
   const ticket6 = Buffer.alloc(32, 0x5f).toString('base64url')
+  const ticket7 = Buffer.alloc(32, 0x60).toString('base64url')
+  const ticket8 = Buffer.alloc(32, 0x68).toString('base64url')
+  const changedPath = 'reports/changed.pdf'
+  const changedFetchID = 'o9753186'
   const digest = createHash('sha256').update(content).digest('hex')
   const version = 'cd'.repeat(32)
   const snapshot = { path, size_bytes: content.length, sha256: digest, version }
@@ -471,7 +481,9 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     { path, offset: 0, version, sha256: createHash('sha256').update(chunks[0]).digest('hex'), data: chunks[0].toString('base64') },
     { path, offset: 512 * 1024, version, sha256: createHash('sha256').update(chunks[1]).digest('hex'), data: chunks[1].toString('base64') },
   ].map((result) => JSON.stringify({ jsonrpc: '2.0', id: 'morde-hub', result }))
-  await writeFile(helper, `#!/bin/sh\nIFS= read -r request\ncase "$request" in\n  *hub_file_snapshot*) printf '%s\\n' '${helperReplies[0]}' ;;\n  *offset\\\":524288,*) printf '%s\\n' '${helperReplies[2]}' ;;\n  *hub_file_chunk*) printf '%s\\n' '${helperReplies[1]}' ;;\n  *) exit 1 ;;\nesac\n`)
+  const changedSnapshotReply = JSON.stringify({ jsonrpc: '2.0', id: 'morde-hub', result: { ...snapshot, path: changedPath } })
+  const changedFileReply = JSON.stringify({ jsonrpc: '2.0', id: 'morde-hub', error: { code: -32032, message: 'selected file changed after snapshot' } })
+  await writeFile(helper, `#!/bin/sh\nIFS= read -r request\ncase "$request" in\n  *hub_file_snapshot*reports/changed.pdf*) printf '%s\\n' '${changedSnapshotReply}' ;;\n  *hub_file_chunk*reports/changed.pdf*) printf '%s\\n' '${changedFileReply}' ;;\n  *hub_file_snapshot*) printf '%s\\n' '${helperReplies[0]}' ;;\n  *offset\\\":524288,*) printf '%s\\n' '${helperReplies[2]}' ;;\n  *hub_file_chunk*) printf '%s\\n' '${helperReplies[1]}' ;;\n  *) exit 1 ;;\nesac\n`)
   await chmod(helper, 0o700)
   process.env.MORDE_SYNC_BIN = helper
   const handlers = new Map()
@@ -485,7 +497,11 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
   let manifestConflictFor = ''
   let manifestFailureFor
   let revokeAfterManifestFor = ''
+  let revokeController
   let unknownCommitFor = ''
+  let completedThenRevokedFor = ''
+  const completedFetchIDs = new Set()
+  const abortCalls = []
   let activeFetchID = ''
   let expectedDirectoryName = 'é'.repeat(50)
   let expectedTicket = ticket
@@ -501,6 +517,7 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
       }
       if (fetchID === revokeAfterManifestFor) {
         out.svc.state.mordeHub = { ...out.svc.state.mordeHub, targetGrantVersion: 3, grants: { ...out.svc.state.mordeHub.grants, files: false } }
+        revokeController?.abort(new Error('file grant revoked'))
       }
       assert.deepEqual(JSON.parse(init.body), {
         source_directory_name: expectedDirectoryName,
@@ -527,11 +544,26 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
       return response({ fetch_id: url.pathname.split('/')[5], sequence: 1, confirmed_bytes: content.length, replayed: false })
     }
     if (url.pathname.endsWith('/commit')) {
-      if (url.pathname.split('/')[5] === unknownCommitFor) throw new TypeError('simulated response loss after commit')
+      const fetchID = url.pathname.split('/')[5]
+      if (fetchID === unknownCommitFor) throw new TypeError('simulated response loss after commit')
+      if (fetchID === completedThenRevokedFor) {
+        completedFetchIDs.add(fetchID)
+        out.svc.state.mordeHub = { ...out.svc.state.mordeHub, targetGrantVersion: 3, grants: { ...out.svc.state.mordeHub.grants, files: false } }
+        return response({
+          fetch_id: fetchID, status: 'completed', source_version: version, source_sha256: '00'.repeat(32),
+          size_bytes: content.length, content_id: 'o7654322', expires_at: '2030-01-01T00:00:00Z',
+        })
+      }
       return response({
-        fetch_id: url.pathname.split('/')[5], status: 'completed', source_version: version, source_sha256: digest,
+        fetch_id: fetchID, status: 'completed', source_version: version, source_sha256: digest,
         size_bytes: content.length, content_id: 'o7654321', expires_at: '2030-01-01T00:00:00Z',
       })
+    }
+    if (url.pathname.endsWith('/abort')) {
+      const fetchID = url.pathname.split('/')[5]
+      const status = completedFetchIDs.has(fetchID) ? 'completed' : 'failed'
+      abortCalls.push({ fetchID, init, status })
+      return response({ fetch_id: fetchID, status })
     }
     throw new Error(`unexpected local request: ${url}`)
   }
@@ -547,13 +579,18 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     out.svc.startMordeHub()
     const handler = handlers.get('file.fetch')
     const args = {
-      fetch_id: 'o1234567', path, task_revision: 3,
+      fetch_id: 'o1234567', path, task_revision: 0,
       ticket, ticket_expires_at: '2030-01-01T00:05:00Z',
     }
+    await assert.rejects(handler({ ...args, task_revision: -1 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
+      signal: new AbortController().signal, event() {},
+    }), (error) => error.code === 'not_allowed')
+    assert.equal(requests.length, 0, 'negative Task revisions are rejected before any server request')
     for (const directory of ['/', '/tmp/.', '/tmp/..', '/tmp/folder\\name', `/tmp/${'x'.repeat(101)}`, `/tmp/${'目录'.repeat(17)}`, '/tmp/folder\u0007name']) {
       out.svc.state.mordeHub.fileRoot.directory = directory
       await assert.rejects(handler(args, {
-        from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
+        from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
         signal: new AbortController().signal, event() {},
       }), (error) => error.code === 'not_allowed', `unsafe source directory name must be rejected: ${JSON.stringify(directory)}`)
       assert.equal(requests.length, 0, 'invalid directory names stop before any server request')
@@ -561,11 +598,11 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     out.svc.state.mordeHub.fileRoot.directory = `/tmp/${expectedDirectoryName}`
     const events = []
     const result = await handler(args, {
-      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: args.fetch_id } },
       signal: new AbortController().signal, event: (body) => events.push(body),
     })
     assert.deepEqual(result, {
-      fetch_id: 'o1234567', task_revision: 3, status: 'completed', target_grant_version: 2,
+      fetch_id: 'o1234567', task_revision: 0, status: 'completed', target_grant_version: 2,
       source_version: version, source_sha256: digest, size_bytes: content.length, content_id: 'o7654321', expires_at: '2030-01-01T00:00:00Z',
     })
     assert.equal(JSON.stringify(result).includes(args.ticket), false)
@@ -581,12 +618,22 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     for (const { init } of requests) assert.notEqual(init.headers.authorization, 'Bearer chc_client-secret')
 
     requests.length = 0
+    expectedTicket = ticket7
+    await assert.rejects(handler({ ...args, fetch_id: changedFetchID, path: changedPath, ticket: ticket7 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: changedFetchID } },
+      signal: new AbortController().signal, event() {},
+    }), (error) => error.code === 'conflict')
+    assert.equal(requests.length, 1, 'a changed local snapshot is rejected before any file chunk is sent')
+    assert.equal(requests[0].url.pathname.endsWith('/manifest'), true)
+    assert.equal(out.svc.mordeHubView().fileAccessRecords.find((record) => record.fetchID === changedFetchID)?.status, 'failed')
+
+    requests.length = 0
     waitForCancel = true
     activeFetchID = 'o7654321'
     expectedTicket = ticket2
     const controller = new AbortController()
     const cancelled = handler({ ...args, fetch_id: activeFetchID, ticket: ticket2 }, {
-      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: activeFetchID } },
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: activeFetchID } },
       signal: controller.signal, event() {},
     })
     await chunkStarted
@@ -594,33 +641,36 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     await assert.rejects(cancelled, (error) => error.code === 'cancelled')
     assert.equal(requests.some(({ url }) => url.pathname.endsWith('/commit')), false)
     assert.equal(requests.length, 2, 'abort stops the transfer before another block or commit')
+    assert.equal(abortCalls.length, 0, 'a temporary interrupted upload keeps its staging for resume')
     assert.equal(out.svc.mordeHubView().fileAccessRecords.find((record) => record.fetchID === activeFetchID)?.status, 'cancelled')
 
     requests.length = 0
     waitForCancel = false
     expectedTicket = ticket3
     const resumed = await handler({ ...args, fetch_id: activeFetchID, ticket: ticket3 }, {
-      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: activeFetchID } },
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: activeFetchID } },
       signal: new AbortController().signal, event() {},
     })
     assert.equal(resumed.status, 'completed')
     assert.deepEqual(requests.map(({ url }) => url.pathname.split('/').at(-1)), ['manifest', '1', 'commit'], 'confirmed chunks resume without rereading or uploading the block')
+    assert.equal(abortCalls.length, 0, 'a successful resume does not abort its staging')
 
     requests.length = 0
     unknownCommitFor = 'o4567890'
     expectedTicket = ticket6
     await assert.rejects(handler({ ...args, fetch_id: unknownCommitFor, ticket: ticket6 }, {
-      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: unknownCommitFor } },
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: unknownCommitFor } },
       signal: new AbortController().signal, event() {},
     }), (error) => error.code === 'failed')
     assert.equal(out.svc.mordeHubView().fileAccessRecords.find((record) => record.fetchID === unknownCommitFor)?.status, 'unknown')
+    assert.equal(abortCalls.length, 0, 'an ambiguous commit without a local grant change remains resumable')
 
     requests.length = 0
     unknownCommitFor = ''
     manifestConflictFor = 'o2345678'
     expectedTicket = ticket4
     await assert.rejects(handler({ ...args, fetch_id: manifestConflictFor, ticket: ticket4 }, {
-      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: manifestConflictFor } },
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: manifestConflictFor } },
       signal: new AbortController().signal, event() {},
     }), (error) => error.code === 'conflict')
     assert.equal(requests.length, 1, 'a source version conflict stops before sending bytes')
@@ -636,7 +686,7 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
       manifestFailureFor = { ...failure, fetchID: `o900000${index + 1}` }
       expectedTicket = Buffer.alloc(32, 0x61 + index).toString('base64url')
       await assert.rejects(handler({ ...args, fetch_id: manifestFailureFor.fetchID, ticket: expectedTicket }, {
-        from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: manifestFailureFor.fetchID } },
+        from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: manifestFailureFor.fetchID } },
         signal: new AbortController().signal, event() {},
       }), (error) => error.code === failure.expected && error.message === 'The file transfer could not be completed')
       assert.equal(requests.length, 1, 'a failed receipt stops before uploading a file chunk')
@@ -645,11 +695,41 @@ test('file.fetch transfers the full selected file with a ticket and stops an abo
     manifestFailureFor = undefined
     revokeAfterManifestFor = 'o3456789'
     expectedTicket = ticket5
+    const revokedController = new AbortController()
+    revokeController = revokedController
     await assert.rejects(handler({ ...args, fetch_id: revokeAfterManifestFor, ticket: ticket5 }, {
-      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 3, authorizationVersion: 4, targetGrantVersion: 2, operationID: revokeAfterManifestFor } },
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: revokeAfterManifestFor } },
+      signal: revokedController.signal, event() {},
+    }), (error) => error.code === 'cancelled')
+    revokeController = undefined
+    assert.equal(requests.length, 2, 'revoking the selected folder stops transfer and submits one abort request')
+    assert.equal(requests[1].url.pathname.endsWith('/abort'), true)
+    assert.equal(requests[1].init.method, 'POST')
+    assert.equal(requests[1].init.body, undefined, 'abort has no request body')
+    assert.equal(requests[1].init.headers.authorization, `Bearer ${ticket5}`, 'abort uses the original file-fetch ticket')
+    assert.notEqual(requests[1].init.signal, revokedController.signal, 'abort uses a signal independent of the cancelled Hub call')
+    assert.equal(requests[1].init.signal.aborted, false, 'abort is not sent with an already-aborted signal')
+    assert.equal(abortCalls.length, 1)
+
+    // The server may have committed before its receipt is lost or rejected. The
+    // client still asks the server to abort by fetch ID; the completed record
+    // remains completed, and no retained-content delete route is called.
+    requests.length = 0
+    expectedTicket = ticket8
+    completedThenRevokedFor = 'o4567891'
+    out.svc.state.mordeHub = {
+      ...out.svc.state.mordeHub, targetGrantVersion: 2,
+      grants: { ...out.svc.state.mordeHub.grants, files: true },
+    }
+    await assert.rejects(handler({ ...args, fetch_id: completedThenRevokedFor, ticket: ticket8 }, {
+      from: { kind: 'task', taskContext: { taskID: 'q1234567', taskRevision: 0, authorizationVersion: 4, targetGrantVersion: 2, operationID: completedThenRevokedFor } },
       signal: new AbortController().signal, event() {},
-    }), (error) => error.code === 'not_allowed')
-    assert.equal(requests.length, 1, 'revoking the selected folder stops the next helper read and transfer block')
+    }), (error) => error.code === 'failed')
+    assert.equal(completedFetchIDs.has(completedThenRevokedFor), true)
+    assert.equal(abortCalls.at(-1)?.fetchID, completedThenRevokedFor)
+    assert.equal(abortCalls.at(-1)?.status, 'completed', 'server reports completed without deleting the retained copy')
+    assert.equal(abortCalls.at(-1)?.init.body, undefined)
+    assert.equal(requests.some(({ url, init }) => init.method === 'DELETE' && url.pathname.endsWith('/content')), false)
   } finally {
     globalThis.fetch = originalFetch
     HubClient.prototype.handle = originalHandle

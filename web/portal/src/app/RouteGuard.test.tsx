@@ -49,16 +49,16 @@ describe('RouteGuard', () => {
     expect(screen.queryByText('助手页面')).toBeNull();
   });
 
-  it('管理 API 返回 403 后隐藏并清理已缓存的管理数据', async () => {
+  it('管理 API 单项返回 403 时留在当前页并显示页面错误', async () => {
     vi.mocked(portalApi.me).mockResolvedValue({ id: 'u1234567', name: 'admin', role: 'admin' } as never);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     function CachedAdminPage() {
-      const { data } = useQuery({
+      const query = useQuery({
         queryKey: ['admin', 'workspaces'],
         queryFn: async () => { throw new ApiError({ message: '权限已撤销', code: 'forbidden', status: 403 }); },
         initialData: [{ id: 'w1234567', name: '旧管理数据' }],
       });
-      return <p>{data[0]?.name}</p>;
+      return <p>{query.isError ? '此项数据暂时无法读取' : query.data[0]?.name}</p>;
     }
     render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/admin']}><Routes>
       <Route element={<RouteGuard loginPath="/admin/login" />}>
@@ -68,13 +68,15 @@ describe('RouteGuard', () => {
       <Route path="/admin/login" element={<p>管理登录页面</p>} />
     </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
 
-    expect(await screen.findByText('没有管理权限')).toBeInTheDocument();
-    expect(screen.queryByText('旧管理数据')).toBeNull();
-    await waitFor(() => expect(queryClient.getQueryData(['admin', 'workspaces'])).toBeUndefined());
+    expect(await screen.findByText('此项数据暂时无法读取')).toBeInTheDocument();
+    expect(screen.queryByText('没有管理权限')).toBeNull();
+    expect(queryClient.getQueryData(['admin', 'workspaces'])).toEqual([{ id: 'w1234567', name: '旧管理数据' }]);
   });
 
-  it('管理写操作返回 403 后也隐藏并清理管理数据', async () => {
-    vi.mocked(portalApi.me).mockResolvedValue({ id: 'u1234567', name: 'admin', role: 'admin' } as never);
+  it('仅在复核发现管理员角色已撤销后跳转并清理管理数据', async () => {
+    vi.mocked(portalApi.me)
+      .mockResolvedValueOnce({ id: 'u1234567', name: 'admin', role: 'admin' } as never)
+      .mockResolvedValueOnce({ id: 'u1234567', name: 'admin', role: 'user' } as never);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(['admin', 'users'], [{ id: 'u7654321', name: '旧管理数据' }]);
     function MutatingAdminPage() {

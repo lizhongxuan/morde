@@ -20,12 +20,12 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
-func (h *api) registerWorkspaceSync(group *gin.RouterGroup, service WorkspaceSyncService) {
+func (h *api) registerWorkspaceSync(group *gin.RouterGroup, service WorkspaceSyncService, devices WorkspaceSyncDeviceService) {
 	group.GET("/workspaces/:id/manifest", h.getWorkspaceManifest(service))
 	group.GET("/workspaces/:id/changes", h.getWorkspaceChanges(service))
 	group.POST("/workspaces/:id/sync-sessions", h.createWorkspaceSyncSession(service))
 	group.GET("/workspaces/:id/sync-sessions/:session_id", h.getWorkspaceSyncSession(service))
-	group.GET("/workspaces/:id/sync-progress", h.listDeviceWorkspaceSyncProgress(service))
+	group.GET("/workspaces/:id/sync-progress", h.listDeviceWorkspaceSyncProgress(service, devices))
 	group.POST("/workspaces/:id/sync-sessions/:session_id/commit", h.commitWorkspaceSyncSession(service))
 	group.POST("/workspaces/:id/sync-sessions/:session_id/cancel", h.cancelWorkspaceSyncSession(service))
 	group.PUT("/workspaces/:id/sync-sessions/:session_id/blocks/:digest", h.putWorkspaceSyncBlock(service))
@@ -34,7 +34,7 @@ func (h *api) registerWorkspaceSync(group *gin.RouterGroup, service WorkspaceSyn
 	group.POST("/workspaces/:id/sync-sessions/:session_id/download-actions/ack", h.ackWorkspaceSyncDownloadAction(service))
 }
 
-func (h *api) listDeviceWorkspaceSyncProgress(service WorkspaceSyncService) gin.HandlerFunc {
+func (h *api) listDeviceWorkspaceSyncProgress(service WorkspaceSyncService, devices WorkspaceSyncDeviceService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if service == nil {
 			serviceUnavailable(c)
@@ -48,6 +48,29 @@ func (h *api) listDeviceWorkspaceSyncProgress(service WorkspaceSyncService) gin.
 		workspaceID, ok := safeID(c, "id", domain.ValidWorkspaceID)
 		if !ok {
 			return
+		}
+		folderID, ok := workspaceSyncQueryText(c, "folder_id", 38, false)
+		if !ok {
+			return
+		}
+		if folderID != "" {
+			if devices == nil {
+				serviceUnavailable(c)
+				return
+			}
+			if !workspace.ValidSyncFolderID(folderID) {
+				writeError(c, domain.InvalidArgument("folder_id", "workspace sync folder id is invalid"))
+				return
+			}
+			folder, err := devices.GetFolder(c.Request.Context(), principal, workspaceID, folderID)
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			if !folder.SyncAvailable() {
+				writeError(c, domain.NewError(domain.CodeWorkspaceUnavailable, "project folder progress is not available yet"))
+				return
+			}
 		}
 		progress, err := service.ListDeviceSyncProgress(c.Request.Context(), principal, workspaceID)
 		if err != nil {

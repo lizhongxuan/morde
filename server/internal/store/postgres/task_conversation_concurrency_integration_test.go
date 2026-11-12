@@ -164,6 +164,34 @@ JOIN task_revision_intents i ON i.message_id=r.message_id WHERE r.message_id=$1`
 	if _, _, err := store.AcceptConversationMessage(ctx, foreign); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("cross-user receipt: %v", err)
 	}
+	for _, update := range []struct {
+		id     string
+		status string
+	}{
+		{first.Task.ID, "completed"},
+		{results[0].Task.ID, "waiting_user"},
+		{results[1].Task.ID, "failed"},
+	} {
+		if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status=$2,waiting_reason=CASE WHEN $2='waiting_user' THEN 'clarification_needed' ELSE NULL END,
+finished_at=CASE WHEN $2 IN ('completed','failed') THEN clock_timestamp() ELSE NULL END WHERE id=$1`, update.id, update.status); err != nil {
+			t.Fatalf("set task %s status to %s: %v", update.id, update.status, err)
+		}
+	}
+	active, err := store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewActive, app.PageRequest{Limit: 10})
+	if err != nil || len(active.Items) != 1 || active.Items[0].ID != results[0].Task.ID || active.PendingCountsByHostID[""] != 1 {
+		t.Fatalf("active conversation task view = %+v, err=%v", active, err)
+	}
+	recent, err := store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewRecent, app.PageRequest{Limit: 1})
+	if err != nil || len(recent.Items) != 1 || recent.NextCursor == "" {
+		t.Fatalf("first recent task page = %+v, err=%v", recent, err)
+	}
+	recentIDs := map[string]bool{recent.Items[0].ID: true}
+	recent, err = store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewRecent,
+		app.PageRequest{Limit: 1, Cursor: recent.NextCursor})
+	if err != nil || len(recent.Items) != 1 || recent.NextCursor != "" || recentIDs[recent.Items[0].ID] ||
+		!(recentIDs[first.Task.ID] && recent.Items[0].ID == results[1].Task.ID || recentIDs[results[1].Task.ID] && recent.Items[0].ID == first.Task.ID) {
+		t.Fatalf("second recent task page = %+v, seen=%v, err=%v", recent, recentIDs, err)
+	}
 }
 
 func TestPostgresTaskServiceReplaysTerminalConversationMessage(t *testing.T) {

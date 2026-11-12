@@ -21,6 +21,8 @@ xcodebuild build \
   CODE_SIGNING_ALLOWED=NO
 ```
 
+该命令只用于未签名的设备目标编译，不能用于 iOS Simulator Keychain 登录验收。Simulator 的 UI/登录测试需保持代码签名开启，使 Xcode 为应用签入 `Morde.entitlements` 中的默认 Keychain access group；实体设备验收还需可用的 Apple Development 身份及匹配的 provisioning profile。
+
 需要运行历史 `Minis` scheme 时，先初始化固定版本的 iSH 子模块：
 
 ```sh

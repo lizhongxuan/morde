@@ -29,13 +29,13 @@ const deviceProgress: components['schemas']['DeviceWorkspaceSyncProgress'] = {
 const deviceProgressSummary = { revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
   remaining_bytes: workspace.quota_bytes - workspace.used_bytes, quota_status: 'available' as const, quota_pauses: [] };
 
-function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace'][], initialHosts: components['schemas']['Host'][] = []) {
+function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace'][], initialHosts: components['schemas']['Host'][] = [], initialEntry = '/workspaces') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, ...(initialWorkspaces ? { staleTime: Infinity } : {}) }, mutations: { retry: false } } });
   if (initialWorkspaces) {
     client.setQueryData(['workspaces'], { items: initialWorkspaces });
     client.setQueryData(['hosts'], { items: initialHosts });
   }
-  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[initialEntry]}><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('Workspaces', () => {
@@ -45,32 +45,13 @@ describe('Workspaces', () => {
   });
   afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
-  it('opens and closes the workspace form without creating anything', async () => {
+  it('routes new cloud-file creation through cloud-computer creation', async () => {
     const create = vi.spyOn(portalApi, 'createWorkspace');
-    const user = userEvent.setup();
     renderWorkspaces();
 
-    const open = screen.getByRole('button', { name: '＋ 创建工作区' });
-    expect(open).toHaveAttribute('aria-expanded', 'false');
-    await user.click(open);
-    expect(screen.getByRole('form', { name: '创建独立工作区' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '收起' })).toHaveAttribute('aria-expanded', 'true');
-    await user.click(screen.getByRole('button', { name: '收起' }));
+    expect(screen.getByRole('link', { name: '＋ 创建云端电脑' })).toHaveAttribute('href', '/hosts/new');
     expect(screen.queryByLabelText('工作区名称')).not.toBeInTheDocument();
     expect(create).not.toHaveBeenCalled();
-  });
-
-  it('creates a standalone workspace through the API', async () => {
-    const create = vi.spyOn(portalApi, 'createWorkspace').mockResolvedValue(workspace);
-    const user = userEvent.setup();
-    renderWorkspaces();
-
-    await user.click(screen.getByRole('button', { name: '＋ 创建工作区' }));
-    await user.type(await screen.findByLabelText('工作区名称'), '  客户项目  ');
-    await user.click(screen.getByRole('button', { name: '创建工作区' }));
-
-    await waitFor(() => expect(create).toHaveBeenCalledWith({ name: '客户项目' }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/)));
-    expect(await screen.findByText('工作区已在服务端创建并保存。')).toBeInTheDocument();
   });
 
   it('does not offer a second Workspace binding for a host that already has one', async () => {
@@ -83,6 +64,16 @@ describe('Workspaces', () => {
     expect(screen.queryByRole('combobox', { name: `工作区 ${workspace.name} 的绑定主机` })).not.toBeInTheDocument();
   });
 
+  it('shows only the files bound to the computer opened from its card', async () => {
+    const otherWorkspace = { ...workspace, id: 'w7654321', name: '其他电脑文件' };
+    renderWorkspaces([workspace, otherWorkspace], [{ ...host, workspaces: [binding] }], `/workspaces?host=${host.id}`);
+
+    expect(await screen.findByRole('heading', { name: '开发电脑 · 文件与版本' })).toBeInTheDocument();
+    expect(screen.getByText(workspace.name)).toBeInTheDocument();
+    expect(screen.queryByText(otherWorkspace.name)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /新建云端文件空间/ })).not.toBeInTheDocument();
+  });
+
   it('explains an initial workspace is waiting for its creating host, not a file transfer', async () => {
     const initial = { ...workspace, revision: 0, used_bytes: 0 };
     const initialBinding = { ...binding, workspace: { ...binding.workspace, revision: 0, used_bytes: 0 },
@@ -92,9 +83,9 @@ describe('Workspaces', () => {
 
     expect(screen.getByText('初始版本，暂无历史版本')).toBeInTheDocument();
     expect(screen.getByText('电脑创建中，工作区等待挂载。')).toBeInTheDocument();
-    expect(screen.queryByText(/Host Runtime 未在线确认/)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '比较工作区版本 项目工作区' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '打开主机 开发电脑' })).toBeDisabled();
+    expect(screen.queryByText(/电脑运行环境未在线确认/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '比较云端文件版本 项目工作区' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '打开云端电脑 开发电脑' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '查看设备同步进度 项目工作区' })).toBeEnabled();
   });
 
@@ -102,7 +93,7 @@ describe('Workspaces', () => {
     renderWorkspaces([{ ...workspace, used_bytes: 0 }]);
 
     expect(screen.queryByText('初始版本，暂无历史版本')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '比较工作区版本 项目工作区' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '比较云端文件版本 项目工作区' })).toBeEnabled();
   });
 
   it('does not claim a host is still being created when its recovery is uncertain', () => {
@@ -122,7 +113,7 @@ describe('Workspaces', () => {
       sync_state: 'conflict' as const, sync_conflicts: ['notes.txt'] };
     renderWorkspaces([initial], [{ ...host, state: 'creating', workspace_runtime_online: false, workspaces: [conflictBinding] }]);
 
-    expect(screen.getByText('Host 工作区同步冲突')).toBeInTheDocument();
+    expect(screen.getByText('云端电脑文件冲突')).toBeInTheDocument();
     expect(screen.getByText('notes.txt')).toBeInTheDocument();
   });
 
@@ -137,7 +128,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     expect(screen.getByText(/小型文本可展开查看/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '比较版本' }));
 
@@ -158,7 +149,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     const targetRevision = screen.getByLabelText('目标 revision');
     await user.clear(targetRevision);
     await user.type(targetRevision, '3');
@@ -177,7 +168,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
 
     expect(await screen.findByText('共 51 个路径差异；按路径分页显示。')).toBeInTheDocument();
@@ -195,7 +186,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('历史差异响应的工作区、revision 或路径格式无效');
@@ -209,7 +200,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('历史 revision 冲突：工作区历史版本已变化');
@@ -238,18 +229,18 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
     await user.click(await screen.findByRole('button', { name: '从 v1 恢复 3 个路径' }));
     expect(screen.getByText(/以当前 v2 为条件创建新 revision/)).toBeInTheDocument();
-    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
-    await user.click(screen.getByRole('button', { name: '恢复并创建新版本' }));
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能修改这些云端文件/ }));
+    await user.click(screen.getByRole('button', { name: '恢复文件并创建新版本' }));
     expect(await screen.findByText('服务器已接受请求，但响应丢失')).toBeInTheDocument();
     const pending = JSON.parse(localStorage.getItem('morde.pending-workspace-restore.u1234567') ?? 'null') as PendingWorkspaceRestore;
     expect(pending.phase).toBe('restore_workspace');
     expect(pending.restoreRequested).toBe(true);
     await user.click(screen.getByRole('button', { name: '核对状态并继续恢复' }));
-    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能修改这些云端文件/ }));
     await user.click(screen.getByRole('button', { name: '核对状态并继续' }));
 
     await waitFor(() => expect(restore).toHaveBeenCalledTimes(2));
@@ -258,7 +249,7 @@ describe('Workspaces', () => {
     expect(firstRequest[1]).toEqual({ target_revision: 1, expected_current_revision: 2, paths: ['docs', 'new.md', 'old.md'] });
     expect(firstRequest[2]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
     expect(restore.mock.calls[1]).toEqual(firstRequest);
-    expect(await screen.findByText('Workspace 已恢复为 revision v3，新版本 projection 已确认。')).toBeInTheDocument();
+    expect(await screen.findByText('云端文件已恢复为版本 v3，新版本文件已确认。')).toBeInTheDocument();
     expect(localStorage.getItem('morde.pending-workspace-restore.u1234567')).toBeNull();
   });
 
@@ -297,15 +288,15 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }]);
 
-    await user.click(await screen.findByRole('button', { name: '比较工作区版本 ' + workspace.name }));
+    await user.click(await screen.findByRole('button', { name: '比较云端文件版本 ' + workspace.name }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
     await user.click(await screen.findByRole('button', { name: '安全恢复并重启 Host' }));
-    const confirm = screen.getByRole('button', { name: '解绑、恢复并重启 Host' });
+    const confirm = screen.getByRole('button', { name: '解除关联、恢复文件并重启电脑' });
     expect(confirm).toBeDisabled();
-    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能修改这些云端文件/ }));
     await user.click(confirm);
 
-    expect(await screen.findByText(/Host 与新版本应用状态均已确认/)).toBeInTheDocument();
+    expect(await screen.findByText(/云端电脑与新版本应用状态均已确认/)).toBeInTheDocument();
     expect(unbind).toHaveBeenCalledWith(host.id, workspace.id, { expected_binding_version: 1, writers_stopped: true }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
     expect(release).toHaveBeenCalledWith(host.id, true);
     expect(restore).toHaveBeenCalledWith(workspace.id, { target_revision: 1, expected_current_revision: 2, paths: ['notes.md'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
@@ -329,11 +320,11 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }]);
 
-    await user.click(await screen.findByRole('button', { name: '比较工作区版本 ' + workspace.name }));
+    await user.click(await screen.findByRole('button', { name: '比较云端文件版本 ' + workspace.name }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
     await user.click(await screen.findByRole('button', { name: '安全恢复并重启 Host' }));
-    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
-    await user.click(screen.getByRole('button', { name: '解绑、恢复并重启 Host' }));
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能修改这些云端文件/ }));
+    await user.click(screen.getByRole('button', { name: '解除关联、恢复文件并重启电脑' }));
 
     expect(await screen.findByText('解绑结果未知')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '核对状态并继续恢复' })).toBeInTheDocument();
@@ -352,7 +343,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces([workspace]);
 
-    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     await user.clear(screen.getByLabelText('起始 revision'));
     await user.type(screen.getByLabelText('起始 revision'), '0');
     await user.clear(screen.getByLabelText('目标 revision'));
@@ -392,12 +383,11 @@ describe('Workspaces', () => {
       if (attempts++ === 0) throw new TypeError('服务器已创建工作区，但响应丢失');
       return result;
     });
+    localStorage.setItem('morde.pending-workspace-create.u1234567', JSON.stringify({ version: 1, name: '项目工作区', idempotencyKey: 'legacy-create-key' }));
     const user = userEvent.setup();
     const firstRender = renderWorkspaces();
 
-    await user.click(screen.getByRole('button', { name: '＋ 创建工作区' }));
-    await user.type(await screen.findByLabelText('工作区名称'), '项目工作区');
-    await user.click(screen.getByRole('button', { name: '创建工作区' }));
+    await user.click(screen.getByRole('button', { name: '继续上次创建' }));
     expect(await screen.findByText('创建失败：服务器已创建工作区，但响应丢失')).toBeInTheDocument();
     const storageKey = 'morde.pending-workspace-create.u1234567';
     const pending = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as { name: string; idempotencyKey: string };
@@ -406,7 +396,7 @@ describe('Workspaces', () => {
 
     firstRender.unmount();
     renderWorkspaces();
-    expect(await screen.findByLabelText('工作区名称')).toHaveValue('项目工作区');
+    expect(await screen.findByLabelText('历史文件名称')).toHaveValue('项目工作区');
     expect(screen.getByRole('button', { name: '继续上次创建' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '继续上次创建' }));
 
@@ -424,17 +414,13 @@ describe('Workspaces', () => {
     renderWorkspaces();
 
     expect(await screen.findByRole('alert')).toHaveTextContent('无法读取本机上次创建记录');
-    expect(screen.getByLabelText('工作区名称')).toBeDisabled();
     expect(screen.getByRole('button', { name: '创建工作区' })).toBeDisabled();
     expect(create).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole('button', { name: '我已核实，清除记录' }));
     expect(localStorage.getItem('morde.pending-workspace-create.u1234567')).toBeNull();
-    await user.type(screen.getByLabelText('工作区名称'), '新项目');
-    await user.click(screen.getByRole('button', { name: '创建工作区' }));
-
-    expect(await screen.findByText('工作区已在服务端创建并保存。')).toBeInTheDocument();
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('link', { name: '＋ 创建云端电脑' })).toHaveAttribute('href', '/hosts/new');
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('binds an existing workspace to an owned running host and opens it after the API reports it applied', async () => {
@@ -449,13 +435,13 @@ describe('Workspaces', () => {
 
     await user.click(await screen.findByRole('button', { name: '绑定' }));
     await waitFor(() => expect(bind).toHaveBeenCalledWith(host.id, { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 }));
-    expect(await screen.findByText('服务端已接受绑定，正在等待主机应用工作区。')).toBeInTheDocument();
+    expect(await screen.findByText('服务端已接受关联，正在等待电脑应用云端文件。')).toBeInTheDocument();
     expect(await screen.findByText('服务端已保存')).toBeInTheDocument();
     expect(await screen.findByText('应用：已应用')).toBeInTheDocument();
     expect(screen.getByText('同步：已同步 v2')).toBeInTheDocument();
     expect(screen.getByText('项目：文件已就绪')).toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: '打开主机 开发电脑' }));
+    await user.click(screen.getByRole('button', { name: '打开云端电脑 开发电脑' }));
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${host.id}`, '_blank');
     expect(tab.opener).toBeNull();
     expect(enter).not.toHaveBeenCalled();
@@ -476,7 +462,7 @@ describe('Workspaces', () => {
     await user.selectOptions(hostSelect, secondHost.id);
     finishBind(binding);
 
-    expect(await screen.findByText('服务端已确认工作区应用到主机。')).toBeInTheDocument();
+    expect(await screen.findByText('服务端已确认云端文件应用到电脑。')).toBeInTheDocument();
     expect(screen.getByRole('combobox', { name: '工作区 项目工作区 的绑定主机' })).toHaveValue(secondHost.id);
   });
 
@@ -489,7 +475,7 @@ describe('Workspaces', () => {
     renderWorkspaces();
 
     expect(await screen.findByRole('button', { name: '删除工作区 项目工作区' })).toBeDisabled();
-    await user.click(await screen.findByRole('button', { name: '解绑工作区 项目工作区 与主机 开发电脑' }));
+    await user.click(await screen.findByRole('button', { name: '解除云端文件与电脑 开发电脑 的关联' }));
     expect(screen.getByRole('heading', { name: '解绑工作区与主机 开发电脑' })).toBeInTheDocument();
     expect(screen.getByText(/Morde 无法自动检测外部写入者.*关闭会写入该工作区的 AI、IDE、终端任务和其他应用/)).toBeInTheDocument();
     expect(screen.getByText(/解绑不会删除服务端工作区或主机磁盘副本/)).toBeInTheDocument();
@@ -503,7 +489,7 @@ describe('Workspaces', () => {
     }));
     expect(await screen.findByText('应用：正在解绑')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '删除工作区 项目工作区' })).toBeDisabled();
-    expect(await screen.findByText('已提交解绑，服务端正在等待操作完成并校验工作区。')).toBeInTheDocument();
+    expect(await screen.findByText('已提交解除关联，服务端正在等待操作完成并校验文件。')).toBeInTheDocument();
     await waitFor(() => {
       expect(portalApi.hosts).toHaveBeenCalledTimes(2);
       expect(portalApi.workspaces).toHaveBeenCalledTimes(2);
@@ -564,13 +550,13 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces();
 
-    await user.click(await screen.findByRole('button', { name: '解绑工作区 项目工作区 与主机 开发电脑' }));
+    await user.click(await screen.findByRole('button', { name: '解除云端文件与电脑 开发电脑 的关联' }));
     await user.click(screen.getByRole('button', { name: '已停止写入者，确认解绑' }));
 
     expect(await screen.findByText('应用：正在解绑')).toBeInTheDocument();
     expect(await screen.findByText('工作区绑定版本已变化，请重试。')).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '解绑工作区与主机 开发电脑' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '解绑工作区 项目工作区 与主机 开发电脑' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '解除云端文件与电脑 开发电脑 的关联' })).not.toBeInTheDocument();
   });
 
   it('polls while deletion is pending and keeps the deleted state in the inventory', async () => {
@@ -631,8 +617,8 @@ describe('Workspaces', () => {
 
     expect(await screen.findByText('服务端已保存')).toBeInTheDocument();
     expect(screen.getByText('应用：正在应用')).toBeInTheDocument();
-    expect(screen.getByText('项目：等待主机应用')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '打开主机 开发电脑' })).toBeDisabled();
+    expect(screen.getByText('项目：等待电脑应用文件')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '打开云端电脑 开发电脑' })).toBeDisabled();
   });
 
   it('does not mark a host with an older workspace revision as project-ready', async () => {
@@ -641,9 +627,9 @@ describe('Workspaces', () => {
     vi.mocked(portalApi.hosts).mockResolvedValue({ items: [{ ...host, workspaces: [binding] }] });
     renderWorkspaces();
 
-    expect(await screen.findByText('同步：待同步：主机 v2 / 工作区 v3')).toBeInTheDocument();
-    expect(screen.getByText('项目：等待文件同步')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '打开主机 开发电脑' })).toBeDisabled();
+    expect(await screen.findByText('同步：待应用：电脑 v2 / 文件 v3')).toBeInTheDocument();
+    expect(screen.getByText('项目：等待电脑应用文件')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '打开云端电脑 开发电脑' })).toBeDisabled();
   });
 
   it('shows a bounded Host conflict list, lets only the owner retry, and refreshes hosts', async () => {
@@ -657,18 +643,18 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     renderWorkspaces();
 
-    expect(await screen.findByText('Host 工作区同步冲突')).toBeInTheDocument();
+    expect(await screen.findByText('云端电脑文件冲突')).toBeInTheDocument();
     expect(screen.getByText('src/file-1.go')).toBeInTheDocument();
     expect(screen.getByText('src/file-5.go')).toBeInTheDocument();
     expect(screen.queryByText('src/file-6.go')).not.toBeInTheDocument();
     expect(screen.getByText('另有 2 个冲突路径未展开')).toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: '重试 Host 同步 项目工作区 到 开发电脑' }));
+    await user.click(screen.getByRole('button', { name: '重试电脑文件同步 项目工作区 到 开发电脑' }));
 
     await waitFor(() => expect(retry).toHaveBeenCalledWith(host.id, workspace.id, binding.binding_version));
     await waitFor(() => expect(hosts).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('同步：已同步 v2')).toBeInTheDocument();
-    expect(screen.queryByText('Host 工作区同步冲突')).not.toBeInTheDocument();
+    expect(screen.queryByText('云端电脑文件冲突')).not.toBeInTheDocument();
   });
 
   it('polls active Host bindings so a new runtime conflict appears without a manual refresh', async () => {
@@ -679,7 +665,7 @@ describe('Workspaces', () => {
     renderWorkspaces();
 
     expect(await screen.findByText('同步：已同步 v2')).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText('Host 工作区同步冲突')).toBeInTheDocument(), { timeout: 5000 });
+    await waitFor(() => expect(screen.getByText('云端电脑文件冲突')).toBeInTheDocument(), { timeout: 5000 });
     expect(await screen.findByText('src/main.go')).toBeInTheDocument();
     expect(hosts).toHaveBeenCalledTimes(2);
   });
@@ -690,9 +676,9 @@ describe('Workspaces', () => {
     vi.mocked(portalApi.hosts).mockResolvedValue({ items: [{ ...host, owner_id: 'u9999999', workspaces: [conflictBinding] }] });
     renderWorkspaces();
 
-    expect(await screen.findByText('Host 工作区同步冲突')).toBeInTheDocument();
+    expect(await screen.findByText('云端电脑文件冲突')).toBeInTheDocument();
     expect(screen.getByText('README.md')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /重试 Host 同步/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /重试电脑文件同步/ })).not.toBeInTheDocument();
   });
 
   it('loads and labels only the authorized device sync summary without file details', async () => {

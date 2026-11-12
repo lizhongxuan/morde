@@ -315,7 +315,7 @@ func answerHubTaskInfo(t *testing.T, target *hubTestPeer, actions []string, targ
 func newCloudDSHHubBroker(t *testing.T, fixture *runtimeToolExecutorFixture, hubService *HubService) (*CloudDSHToolBroker, *cloudDSHHubTaskStore, task.Task) {
 	t.Helper()
 	value := fixture.store.details.Task
-	value.HostID, value.ExecutionLocation, value.Status = "", "server", task.StatusRunning
+	value.HostID, value.ExecutionLocation, value.Status = "h1234567", "server", task.StatusRunning
 	value.Authorization = task.Authorization{
 		Kind: string(identity.KindSession), TokenID: "t1234567", Version: 1,
 		Scopes: []string{string(identity.ScopeComputerObserve), string(identity.ScopeComputerOperate), string(identity.ScopeTaskRead)},
@@ -334,6 +334,51 @@ func newCloudDSHHubBroker(t *testing.T, fixture *runtimeToolExecutorFixture, hub
 		t.Fatal(err)
 	}
 	return broker, store, value
+}
+
+func TestCloudDSHHubHostlessTaskOnlyAllowsFileFetch(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+	_ = target.next(t, "devices")
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	claimed.HostID = ""
+	fixture.store.details.Task.HostID = ""
+
+	definitionsCh := make(chan []AgentToolDefinition, 1)
+	errorsCh := make(chan error, 1)
+	go func() {
+		definitions, err := broker.Definitions(context.Background(), claimed)
+		definitionsCh <- definitions
+		errorsCh <- err
+	}()
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionScreenshot, hub.ActionFiles, hub.ActionFileGet,
+		hub.ActionFileFetch, hub.ActionCommand}, int64(5))
+	definitions := <-definitionsCh
+	if err := <-errorsCh; err != nil {
+		t.Fatalf("hostless server definitions = %#v, err=%v", definitions, err)
+	}
+	var canAskUser, canFileFetch bool
+	for _, definition := range definitions {
+		if definition.Name == agentAskUserToolName {
+			canAskUser = true
+		}
+		if tool, _, _, ok := parseHubTaskToolName(definition.Name); ok {
+			if tool.action != hub.ActionFileFetch {
+				t.Fatalf("hostless server task was offered non-file PC action %q", definition.Name)
+			}
+			canFileFetch = true
+		}
+	}
+	if !canAskUser || !canFileFetch {
+		t.Fatalf("hostless server definitions lost ordinary conversation or authorized file.fetch: %#v", definitions)
+	}
+	call := ModelToolCall{CallID: "call-hostless-hub", Name: hubTaskToolName("morde_hub_command", "i7654321", 5),
+		Arguments: `{"command":"pwd","timeout_ms":1000}`}
+	_, err := broker.Execute(context.Background(), claimed, call)
+	if domain.CodeOf(err) != domain.CodeForbidden || len(store.operations) != 0 {
+		t.Fatalf("hostless non-file PC dispatch err=%v, operations=%#v; want forbidden before operation creation", err, store.operations)
+	}
 }
 
 func TestCloudDSHHubExpiredTaskAuthorizationHidesToolsAndBlocksDispatch(t *testing.T) {

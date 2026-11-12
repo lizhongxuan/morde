@@ -15,6 +15,8 @@ import (
 func TestPersonalMainConversationScopeMigrationRemovesProjectReferencesOnly(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
+	personalOwner := createTestUser(t, store, 4, 20_000, 40_000)
 	provider, closeProvider, err := newMigrationProvider(pool)
 	if err != nil {
 		t.Fatal(err)
@@ -24,8 +26,6 @@ func TestPersonalMainConversationScopeMigrationRemovesProjectReferencesOnly(t *t
 		t.Fatalf("roll back before personal main-conversation cleanup: %v", err)
 	}
 
-	owner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
-	personalOwner := createTestUser(t, store, 4, 20_000, 40_000)
 	projectValue := createProjectStoreFixture(t, ctx, store, owner.ID, "Project chat", "legacy main scope", "main-scope-project")
 	projectConversationID, err := domain.NewConversationID()
 	if err != nil {

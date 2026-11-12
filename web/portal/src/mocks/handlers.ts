@@ -9,6 +9,7 @@ type Workspace = components["schemas"]["Workspace"];
 type WorkspaceRef = components["schemas"]["WorkspaceRef"];
 type WorkspaceBinding = components["schemas"]["WorkspaceBinding"];
 type Host = Omit<components["schemas"]["Host"], "workspaces"> & { sandbox_id?: string | null; workspaces: WorkspaceBinding[] };
+type HostCopyResult = components["schemas"]["HostCopyResult"];
 type ControlTransition = components["schemas"]["ControlTransition"];
 type ControlActionRequest = components["schemas"]["ControlActionRequest"];
 type ControlActionResponse = components["schemas"]["ControlActionResponse"];
@@ -159,6 +160,7 @@ let notificationOwners = new Map<string, string>();
 const workspaceCreateReplays = new Map<string, { request: string; response: Workspace }>();
 const workspaceRestoreReplays = new Map<string, { request: string; response: components["schemas"]["WorkspaceRestoreResult"] }>();
 const hostCreateReplays = new Map<string, { request: string; response: Host }>();
+const hostCopyReplays = new Map<string, { request: string; response: HostCopyResult }>();
 const hostControlTransitions = new Map<string, ControlTransition>();
 const hostControlActionReplays = new Map<string, { request: string; response: ControlActionResponse }>();
 const hostControlLeases = new Map<string, string>();
@@ -452,6 +454,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaceCreateReplays.clear();
   workspaceRestoreReplays.clear();
   hostCreateReplays.clear();
+  hostCopyReplays.clear();
   hostControlTransitions.clear();
   hostControlActionReplays.clear();
   hostControlLeases.clear();
@@ -1817,13 +1820,12 @@ export const handlers = [
     if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((field) => field !== "name" && field !== "workspace_ids")) {
       return failure("invalid_argument", "用户不能选择云端电脑规格", 400);
     }
-    if (body.workspace_ids !== undefined && (!Array.isArray(body.workspace_ids) || body.workspace_ids.some((workspaceId) => typeof workspaceId !== "string") || new Set(body.workspace_ids).size !== body.workspace_ids.length)) {
-      return failure("invalid_argument", "workspace_ids 必须是无重复的工作区编号列表", 400);
+    if (body.workspace_ids !== undefined && (!Array.isArray(body.workspace_ids) || body.workspace_ids.length !== 1 || body.workspace_ids.some((workspaceId) => typeof workspaceId !== "string"))) {
+      return failure("invalid_argument", "workspace_ids 必须包含一个工作区编号", 400);
     }
     const template = templates.find((item) => item.id === "std-1c2g")!;
     const resources = { ...user.default_host_resources, cpu_limit_milli: user.default_host_resources.cpu_milli, mem_limit_mib: user.default_host_resources.mem_mib };
-    const workspaceIDs = [...(body.workspace_ids ?? [])].sort();
-    const normalizedRequest = JSON.stringify({ template_id: template.id, name: body.name?.trim() || template.name, workspace_ids: workspaceIDs });
+    const normalizedRequest = JSON.stringify({ template_id: template.id, name: body.name?.trim() || template.name, workspace_ids: body.workspace_ids ?? null });
     const replayKey = `${user.id}\u0000${idempotencyKey}`;
     const prior = hostCreateReplays.get(replayKey);
     if (prior) {
@@ -1833,8 +1835,6 @@ export const handlers = [
     if (hosts.filter((host) => host.owner_id === user.id).length >= user.quota.hosts) {
       return failure("quota_exceeded", "达到云端电脑上限,无法再创建", 409, { dimension: "hosts", limit: user.quota.hosts });
     }
-    const selectedWorkspaces = (body.workspace_ids ?? []).map((workspaceId) => workspaces.find((item) => item.id === workspaceId && workspaceOwners.get(item.id) === user.id));
-    if (selectedWorkspaces.some((workspace) => !workspace || workspace.state !== "ready")) return failure("workspace_busy", "工作区不存在、正在删除或无权访问", 409);
     const usage = usageFor(user.id);
     const quotaCheck = [
       ["cpu_milli", usage.cpu_milli, resources.cpu_milli, user.quota.cpu_milli],
@@ -1845,12 +1845,86 @@ export const handlers = [
     const allocated = capacityUsage();
     const capacityExceeded = (["cpu_milli", "mem_mib"] as const).find((dimension) => allocated[dimension] + resources[dimension] > capacityLimit[dimension]);
     if (capacityExceeded) return failure("capacity_exceeded", "集群资源容量不足", 409, { dimension: capacityExceeded, limit: capacityLimit[capacityExceeded], allocated: allocated[capacityExceeded], requested: resources[capacityExceeded] });
+    let selectedWorkspaces: Array<Workspace | undefined>;
+    if (body.workspace_ids !== undefined) {
+      selectedWorkspaces = body.workspace_ids.map((workspaceId) => workspaces.find((item) => item.id === workspaceId && workspaceOwners.get(item.id) === user.id));
+      if (selectedWorkspaces.some((workspace) => !workspace || workspace.state !== "ready")) return failure("workspace_busy", "工作区不存在、正在删除或无权访问", 409);
+    } else {
+      let selected = workspaces.find((item) => item.state === "ready" && workspaceOwners.get(item.id) === user.id &&
+        !hosts.some((host) => host.owner_id === user.id && host.workspaces.some((binding) => binding.workspace.id === item.id && binding.state !== "detached")));
+      if (!selected) {
+        const timestamp = now();
+        selected = { id: id("w"), name: "Default Workspace", revision: 0, used_bytes: 0,
+          quota_bytes: template.workspace_size_mib * 1024 * 1024, is_read_only: false, state: "ready", created_at: timestamp, updated_at: timestamp };
+        workspaces = [selected, ...workspaces];
+        workspaceOwners.set(selected.id, user.id);
+      }
+      selectedWorkspaces = [selected];
+    }
     const timestamp = now();
     const host: Host = { id: id("h"), name: body.name?.trim() || template.name, owner_id: user.id, template_id: template.id, isolation: template.isolation, state: "creating", state_reason: "", runtime_generation: 1, control_version: 0, control_state: "ai", url: import.meta.env.VITE_WORKBENCH_URL ?? "http://127.0.0.1:5174", workspaces: selectedWorkspaces.filter((workspace): workspace is Workspace => Boolean(workspace)).map((workspace): WorkspaceBinding => ({ workspace: toWorkspaceRef(workspace), directory: `projects/${workspace.id}`, state: "active", binding_version: 1, desired_revision: workspace.revision, applied_revision: workspace.revision, sync_state: "healthy", sync_conflicts: [] })), resources, expires_at: new Date(Date.now() + template.ttl_seconds * 1000).toISOString(), last_active_at: timestamp, created_at: timestamp };
     hosts = [host, ...hosts];
     hostCreateReplays.set(replayKey, { request: normalizedRequest, response: host });
     persistAssistantState();
     return json(host, 201);
+  }),
+  http.post("/api/hosts/:hostId/copies", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const source = hosts.find((item) => item.id === String(params.hostId) && item.owner_id === user.id);
+    if (!source) return failure("not_found", "主机不存在", 404);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "需要有效的 Idempotency-Key", 400);
+    const body = await request.json().catch(() => null) as { name?: unknown; expected_current_revision?: unknown } | null;
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((field) => field !== "name" && field !== "expected_current_revision")
+      || typeof body.name !== "string" || !body.name.trim() || Array.from(body.name.trim()).length > 100
+      || typeof body.expected_current_revision !== "number" || !Number.isSafeInteger(body.expected_current_revision) || body.expected_current_revision < 0) {
+      return failure("invalid_argument", "电脑复制请求无效", 400);
+    }
+    const name = body.name.trim();
+    const normalizedRequest = JSON.stringify({ name, expected_current_revision: body.expected_current_revision });
+    const replayKey = `${user.id}\u0000${source.id}\u0000${key}`;
+    const prior = hostCopyReplays.get(replayKey);
+    if (prior) {
+      if (prior.request !== normalizedRequest) return failure("idempotency_conflict", "幂等键已用于不同的电脑复制请求", 409);
+      return json({ ...prior.response, replayed: true }, 200);
+    }
+    if (source.state !== "stopped" || source.sandbox_id || source.control_state !== "ai") return failure("workspace_busy", "请先停止源电脑并交还 AI 控制权", 409);
+    const bindings = source.workspaces.filter((binding) => binding.state !== "detached");
+    const binding = bindings[0];
+    const sourceWorkspace = binding && workspaces.find((item) => item.id === binding.workspace.id && workspaceOwners.get(item.id) === user.id);
+    if (bindings.length !== 1 || !binding || binding.state !== "active" || !sourceWorkspace || sourceWorkspace.state !== "ready"
+      || binding.sync_state !== "healthy" || binding.sync_conflicts.length > 0 || binding.desired_revision !== body.expected_current_revision
+      || binding.applied_revision !== body.expected_current_revision || sourceWorkspace.revision !== body.expected_current_revision) {
+      return failure("workspace_conflict", "源电脑文件尚未完全确认", 409);
+    }
+    const usage = usageFor(user.id);
+    if (usage.hosts >= user.quota.hosts || usage.cpu_milli + source.resources.cpu_milli > user.quota.cpu_milli
+      || usage.mem_mib + source.resources.mem_mib > user.quota.mem_mib) return failure("quota_exceeded", "已达到用户主机配额上限", 409);
+    const allocated = capacityUsage();
+    if (allocated.cpu_milli + source.resources.cpu_milli > capacityLimit.cpu_milli
+      || allocated.mem_mib + source.resources.mem_mib > capacityLimit.mem_mib) return failure("capacity_exceeded", "集群资源容量不足", 409);
+
+    const timestamp = now();
+    const copiedWorkspace: Workspace = { ...sourceWorkspace, id: id("w"), name: `${name} 文件`, revision: 1, state: "ready", created_at: timestamp, updated_at: timestamp };
+    const copiedHost: Host = {
+      id: id("h"), name, owner_id: user.id, template_id: source.template_id, isolation: source.isolation,
+      state: "creating", state_reason: "", runtime_generation: 1, control_version: 0, control_state: "ai",
+      url: import.meta.env.VITE_WORKBENCH_URL ?? "http://127.0.0.1:5174",
+      workspaces: [{ workspace: toWorkspaceRef(copiedWorkspace), directory: `projects/${copiedWorkspace.id}`, state: "active", binding_version: 1,
+        desired_revision: 1, applied_revision: 1, sync_state: "healthy", sync_conflicts: [] }],
+      resources: { ...source.resources }, expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(), last_active_at: timestamp, created_at: timestamp,
+    };
+    const result: HostCopyResult = {
+      source_host_id: source.id, source_workspace_id: sourceWorkspace.id, host: copiedHost,
+      workspace: { id: copiedWorkspace.id, name: copiedWorkspace.name, revision: 1, state: "ready" },
+      source_revision: sourceWorkspace.revision, state: "completed", replayed: false,
+    };
+    workspaces.unshift(copiedWorkspace);
+    workspaceOwners.set(copiedWorkspace.id, user.id);
+    hosts.unshift(copiedHost);
+    hostCopyReplays.set(replayKey, { request: normalizedRequest, response: result });
+    persistAssistantState();
+    return json(result, 201);
   }),
   http.get("/api/hosts/:hostId/control", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2117,6 +2191,7 @@ export const handlers = [
     if (body.expected_revision !== undefined && body.expected_revision !== workspace.revision) return failure("workspace_conflict", "工作区版本已变化", 409);
     materializeHost(host);
     if (host.state !== "running" && host.state !== "stopped") return failure("host_not_ready", "主机尚未就绪", 409);
+    if (host.workspaces.some((binding) => binding.workspace.id !== body.workspace_id)) return failure("workspace_conflict", "电脑的 Workspace 归属不可更换", 409);
 
     const history = host.workspaces.filter((item) => item.workspace.id === workspace.id);
     const currentVersion = Math.max(0, ...history.map((item) => item.binding_version));

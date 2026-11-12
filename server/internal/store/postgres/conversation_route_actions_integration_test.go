@@ -222,6 +222,73 @@ FROM tasks t WHERE t.id=$1`, taskID, []string{second.Message.ID, third.Message.I
 	}
 }
 
+func TestConversationRouteDefaultComputerDoesNotChangeRevisionTargetContext(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		changeTaskTarget bool
+	}{
+		{name: "default computer"},
+		{name: "explicit task target", changeTaskTarget: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newRouteActionsTestFixture(t)
+			ctx := context.Background()
+			initial := f.receive(t, "target-intent-initial-001", "Answer my question", app.ConversationRoutingInput{HostID: "h1234567"})
+			snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, initial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Context.ModelID = "p1234567"
+			if err := f.store.ApplyConversationRoute(ctx, initial, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+				t.Fatal(err)
+			}
+			var taskID, initialIntent string
+			if err := f.store.pool.QueryRow(ctx, `SELECT id,file_delivery_intent FROM tasks WHERE conversation_id=$1`, f.conversation.ID).
+				Scan(&taskID, &initialIntent); err != nil || initialIntent != "none" {
+				t.Fatalf("initial task target intent=%q task=%q err=%v", initialIntent, taskID, err)
+			}
+
+			revision := f.receive(t, "target-intent-revision-001", "修复项目代码", app.ConversationRoutingInput{
+				ReferenceTaskID: taskID, HostID: "h7654321", WorkspaceID: "w7654321", ChangeTaskTarget: test.changeTaskTarget,
+			})
+			snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, revision)
+			if err != nil || len(snapshot.Context.Candidates) != 1 || snapshot.Context.Candidates[0].TaskID != taskID {
+				t.Fatalf("revision snapshot=%+v err=%v", snapshot, err)
+			}
+			snapshot.Context.ModelID = "p1234567"
+			if err := f.store.ApplyConversationRoute(ctx, revision, snapshot, app.ConversationRouteDecision{
+				Action: app.ConversationRouteUpdate, TaskID: taskID, ExpectedRevision: snapshot.Context.Candidates[0].Revision,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
+				t.Fatal(err)
+			}
+			stop, found, err := f.store.ClaimNextTaskStop(ctx, "target-intent-stop-worker", time.Minute)
+			if err != nil || !found || stop.Task.ID != taskID {
+				t.Fatalf("claim target change stop: found=%t err=%v", found, err)
+			}
+			if _, err := f.store.CompleteTaskStop(ctx, taskID, stop.Request.ID, stop.Request.LeaseOwner, stop.Request.LeaseVersion); err != nil {
+				t.Fatal(err)
+			}
+			if applied, err := f.store.ApplyNextConversationTaskRevision(ctx); err != nil || !applied {
+				t.Fatalf("apply target change revision: applied=%t err=%v", applied, err)
+			}
+			var actualIntent string
+			if err := f.store.pool.QueryRow(ctx, `SELECT file_delivery_intent FROM tasks WHERE id=$1`, taskID).Scan(&actualIntent); err != nil {
+				t.Fatal(err)
+			}
+			wantFileIntent := initialIntent
+			if test.changeTaskTarget {
+				wantFileIntent = "required"
+			}
+			if actualIntent != wantFileIntent {
+				t.Fatalf("file delivery intent=%q, want %q", actualIntent, wantFileIntent)
+			}
+		})
+	}
+}
+
 func TestConversationRouteDirectReplyIsAtomicAndIdempotent(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()

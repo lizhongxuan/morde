@@ -48,6 +48,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
   const syncModule = require('../out/morde-sync.js');
   const handlers = new Map(), windows = [], views = [], appEvents = new Map(), paths = { appData: join(root, 'app-data') };
   const workspaceRequests = [], preservedCalls = [];
+  let applicationMenu = [];
   let workspaceOffline = false, blockedPreservedMethod = '', releasePreserved;
   let childOwnsFolder = false, stopSyncResult = true, fakeSyncState = 'idle', startSyncForExit = false, quitCount = 0, shutdownWarnings = 0;
   const workspaceRoot = join(root, 'workspaces');
@@ -76,6 +77,8 @@ test('authenticated WebView restores Assistant and workspace folder selection en
   }
   class FakeWindow {
     constructor(options) {
+      this.options = options;
+      this.loaded = [];
       this.webContents = new FakeContents();
       this.contentView = { addChildView() {}, removeChildView() {} };
       windows.push(this);
@@ -83,6 +86,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     on(name, fn) { this.events ??= new Map(); this.events.set(name, fn); }
     once(name, fn) { this.on(name, fn); }
     async loadFile() {}
+    async loadURL(url) { this.loaded.push(url); this.webContents.url = url; }
     getContentBounds() { return { x: 0, y: 0, width: 1120, height: 760 }; }
     isDestroyed() { return false; }
     show() {}
@@ -103,6 +107,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
       };
     }
     async webSession() { return { credential: 'renewed-web-secret', expiresAt }; }
+    async host(id) { return { url: `https://${id}.hosts.example` }; }
     async requireWorkspaceSyncCapability() {}
     async workspace(id) { workspaceRequests.push(id); if (workspaceOffline) throw new Error('Workspace API offline'); return { state: 'ready' }; }
   }
@@ -131,7 +136,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     },
     BrowserWindow: FakeWindow, WebContentsView: FakeView,
     session: { fromPartition: () => ({
-      cookies: { async set() {} }, webRequest: { onCompleted() {} }, on() {}, setPermissionRequestHandler() {},
+      cookies: { async set() {} }, webRequest: { onCompleted() {}, onHeadersReceived() {} }, on() {}, setPermissionRequestHandler() {},
       async clearStorageData() {},
     }) },
     ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
@@ -139,7 +144,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
       showMessageBox: async () => { shutdownWarnings++; return { response: 0 }; },
       showOpenDialog: async () => selectedDirectory ? { canceled: false, filePaths: [selectedDirectory] } : { canceled: true, filePaths: [] },
     },
-    Menu: { buildFromTemplate: (items) => items, setApplicationMenu() {} },
+    Menu: { buildFromTemplate: (items) => items, setApplicationMenu: (items) => { applicationMenu = items; } },
     safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() },
     shell: { openExternal: async () => {} },
     Tray: class { setToolTip() {} setContextMenu() {} on() {} },
@@ -177,23 +182,48 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     const assistantURL = 'https://portal.example/assistant';
     assert.deepEqual(contents.loaded, [assistantURL]);
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).accountName, 'user');
-    await handlers.get('morde:show-web')({ sender: mainWindow.webContents }, 'account');
-    assert.deepEqual(contents.loaded, [assistantURL, 'https://portal.example/settings']);
-    await handlers.get('morde:show-web')({ sender: mainWindow.webContents }, 'assistant');
-    assert.deepEqual(contents.loaded, [assistantURL, 'https://portal.example/settings', assistantURL]);
-    await assert.rejects(() => handlers.get('morde:show-web')({ sender: mainWindow.webContents }, 'https://evil.example/'), /Invalid Morde page/);
+    assert.equal(applicationMenu[1].role, 'editMenu');
+    const appActions = applicationMenu[0].submenu;
+    assert.deepEqual(appActions.map((item) => item.label), ['Open Morde', 'Settings', undefined, 'Quit Morde']);
+    const settings = appActions.find((item) => item.label === 'Settings').submenu;
+    assert.deepEqual(settings.map((item) => item.label), ['Local Sync', 'Sign Out This PC']);
+    settings[0].click();
+    assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'sync');
+    appActions[0].click();
+    assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
+    assert.deepEqual(contents.loaded, [assistantURL]);
+    assert.equal(handlers.has('morde:show-web'), false);
 
     let prevented = false;
     const navigate = contents.events.get('will-navigate');
     navigate({ preventDefault() { prevented = true; } }, 'https://evil.example/assistant');
     assert.equal(prevented, true);
-    assert.deepEqual(contents.loaded, [assistantURL, 'https://portal.example/settings', assistantURL]);
+    assert.deepEqual(contents.loaded, [assistantURL]);
+
+    const observationPopup = contents.open({ url: 'about:blank' });
+    assert.equal(observationPopup.action, 'allow');
+    const observationContents = observationPopup.createWindow({ webPreferences: {} });
+    const observationWindow = windows.at(-1);
+    const navigateObservation = observationContents.events.get('will-navigate');
+    const observationURL = `https://h1234567.hosts.example/__ch/task-auth?ticket=${'a'.repeat(64)}`;
+    prevented = false;
+    navigateObservation({ preventDefault() { prevented = true; } }, observationURL);
+    assert.equal(prevented, true, 'Task observation URLs must wait for Portal Host-origin validation');
+    for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(observationWindow.loaded, [observationURL]);
+    const redirectObservation = observationContents.events.get('will-redirect');
+    prevented = false;
+    redirectObservation({ preventDefault() { prevented = true; } }, 'https://h1234567.hosts.example/__ch/wb/?task_id=q1234567');
+    assert.equal(prevented, false, 'the validated Host may redirect to its Task-read Workbench page');
+    prevented = false;
+    redirectObservation({ preventDefault() { prevented = true; } }, 'https://h1234567.hosts.example/__ch/terminal');
+    assert.equal(prevented, true, 'Task observation popups must not navigate into other Workbench features');
 
     prevented = false;
     navigate({ preventDefault() { prevented = true; } }, 'https://portal.example/login');
     assert.equal(prevented, true);
     for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(contents.loaded, [assistantURL, 'https://portal.example/settings', assistantURL, assistantURL]);
+    assert.deepEqual(contents.loaded, [assistantURL, assistantURL]);
 
     const invoke = handlers.get('morde:choose-directory');
     selectedDirectory = workspaceA;

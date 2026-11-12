@@ -7,7 +7,7 @@ import { portalApi } from '../app/api';
 import { ToastProvider } from '../app/toast';
 import { Hosts } from './Hosts';
 
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567', quota: { hosts: 2 } } }) }));
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567', quota: { hosts: 20 } } }) }));
 
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 const pollingHostCases: [Host['state'], string][] = [
@@ -45,7 +45,7 @@ describe('Hosts', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const view = render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: `查看主机 ${ownedHost.name}` })).toBeEnabled();
+    expect(await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeEnabled();
     expect(document.getElementById(`host-${ownedHost.id}`)).toBeInTheDocument();
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center' });
     view.unmount();
@@ -70,12 +70,12 @@ describe('Hosts', () => {
 
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '查看主机 测试主机' })).toBeEnabled();
-    expect(screen.queryByRole('button', { name: /暂停主机|恢复主机|管理主机令牌/ })).not.toBeInTheDocument();
-    await user.click(await screen.findByRole('button', { name: '删除主机 测试主机' }));
+    expect(await screen.findByRole('button', { name: '查看云端电脑 测试主机' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /暂停主机|恢复云端电脑|管理主机令牌/ })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '删除云端电脑 测试主机' }));
     expect(screen.getByText(/云端电脑的运行环境和专属资料卷会被删除，正在运行的终端命令及服务会中止/)).toBeInTheDocument();
-    expect(screen.getByText(/绑定的独立工作区会自动解绑并保留在服务端，不随主机删除/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: /^删除主机$/ }));
+    expect(screen.getByText(/关联的云端文件会自动解除关联并保留在服务端，不随电脑删除/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^删除电脑$/ }));
     await waitFor(() => expect(deleteHost).toHaveBeenCalledWith('h1234567'));
     expect(portalApi.templates).not.toHaveBeenCalled();
   });
@@ -96,11 +96,11 @@ describe('Hosts', () => {
 
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '查看主机 他人主机' })).toBeDisabled();
+    expect(await screen.findByRole('button', { name: '查看云端电脑 他人主机' })).toBeDisabled();
     expect(screen.getByText('仅主机所有者可以进入工作环境。')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /管理共享成员/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '续期主机 他人主机' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: '删除主机 他人主机' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '删除云端电脑 他人主机' })).toBeEnabled();
   });
 
   it('requires one fully applied Workspace before opening or restoring an owned host', async () => {
@@ -117,13 +117,13 @@ describe('Hosts', () => {
 
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '查看主机 未绑定运行中主机' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '查看主机 多绑定运行中主机' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '查看主机 工作区版本未同步主机' })).toBeDisabled();
-    expect(screen.getByText('Workspace 正在准备、同步或存在冲突；打开和移交操作暂不可用。')).toBeInTheDocument();
-    expect(screen.getAllByText(/请先绑定恰好一个已就绪的工作区/)).toHaveLength(3);
-    expect(screen.getByRole('button', { name: '恢复主机 未绑定已停止主机' })).toBeDisabled();
-    expect(screen.getByLabelText('恢复前选择一个工作区')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '查看云端电脑 未绑定运行中主机' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '查看云端电脑 多绑定运行中主机' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '查看云端电脑 工作区版本未同步主机' })).toBeDisabled();
+    expect(screen.getByText('云端电脑的文件正在准备、同步或存在冲突；打开和移交操作暂不可用。')).toBeInTheDocument();
+    expect(screen.getAllByText(/请先关联并准备好这台电脑的文件/)).toHaveLength(3);
+    expect(screen.getByRole('button', { name: '恢复云端电脑 未绑定已停止主机' })).toBeDisabled();
+    expect(screen.getByLabelText('恢复前关联已有云端文件')).toBeInTheDocument();
   });
 
   it('binds one ready Workspace to a stopped legacy host before enabling restore', async () => {
@@ -151,12 +151,12 @@ describe('Hosts', () => {
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    const workspaceSelect = await screen.findByLabelText('恢复前选择一个工作区');
+    const workspaceSelect = await screen.findByLabelText('恢复前关联已有云端文件');
     await screen.findByRole('option', { name: /旧电脑工作区/ });
     await user.selectOptions(workspaceSelect, workspace.id);
-    await user.click(screen.getByRole('button', { name: '绑定所选工作区' }));
+    await user.click(screen.getByRole('button', { name: '关联所选文件' }));
     expect(await screen.findByText(/已绑定 旧电脑工作区；恢复电脑后会继续应用/)).toBeInTheDocument();
-    const restoreButton = await screen.findByRole('button', { name: `恢复主机 ${stoppedHost.name}` });
+    const restoreButton = await screen.findByRole('button', { name: `恢复云端电脑 ${stoppedHost.name}` });
     expect(restoreButton).toBeEnabled();
 
     await user.click(restoreButton);
@@ -203,10 +203,65 @@ describe('Hosts', () => {
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    await user.click(await screen.findByRole('button', { name: '恢复主机 我的云端电脑' }));
+    await user.click(await screen.findByRole('button', { name: '恢复云端电脑 我的云端电脑' }));
     expect(screen.getByText(/保留原有文件/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '恢复主机' }));
     await waitFor(() => expect(restore).toHaveBeenCalledWith(host.id));
+  });
+
+  it('copies a stopped host from its confirmed Workspace revision and reuses the idempotency key on retry', async () => {
+    const host: Host = { ...ownedHost, state: 'stopped' };
+    const copiedHost: Host = {
+      ...host, id: 'h7654321', name: '复制的测试主机',
+      workspaces: [{ ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, id: 'w7654321', name: '复制的测试主机文件' } }],
+    };
+    const copyResult: Awaited<ReturnType<typeof portalApi.copyHost>> = {
+      source_host_id: host.id, source_workspace_id: hostWorkspaceBinding.workspace.id, host: copiedHost,
+      workspace: { id: 'w7654321', name: '复制的测试主机文件', revision: 1, state: 'ready' },
+      source_revision: 2, state: 'completed', replayed: false,
+    };
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
+    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
+    const copy = vi.spyOn(portalApi, 'copyHost')
+      .mockRejectedValueOnce(new Error('网络超时'))
+      .mockResolvedValue(copyResult);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    await user.click(await screen.findByRole('button', { name: `复制云端电脑 ${host.name}` }));
+    expect(screen.getByText(/隐藏文件、配置和密钥/)).toBeInTheDocument();
+    expect(screen.getByText(/运行环境、应用状态、平台凭据、任务和本机同步关联不会复制/)).toBeInTheDocument();
+    const name = screen.getByLabelText('新电脑名称');
+    await user.clear(name);
+    await user.type(name, '复制的测试主机');
+    await user.click(screen.getByRole('button', { name: '创建副本' }));
+    expect(await screen.findByText(/网络超时/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '创建副本' }));
+
+    await waitFor(() => expect(copy).toHaveBeenCalledTimes(2));
+    expect(copy.mock.calls[0]![0]).toBe(host.id);
+    expect(copy.mock.calls[0]![1]).toEqual({ name: '复制的测试主机', expected_current_revision: 2 });
+    expect(copy.mock.calls[0]![2]).toBeTruthy();
+    expect(copy.mock.calls[1]).toEqual(copy.mock.calls[0]);
+    expect(await screen.findByText(/已创建云端电脑“复制的测试主机”/)).toBeInTheDocument();
+  });
+
+  it('disables host copy unless the owner has stopped the computer at a confirmed revision with AI control', async () => {
+    const stopped: Host = { ...ownedHost, id: 'h7654321', name: '已停止电脑', state: 'stopped' };
+    const stale: Host = { ...stopped, id: 'h7654322', name: '文件未确认电脑', workspaces: [{
+      ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, revision: 3 },
+    }] };
+    const userControlled: Host = { ...stopped, id: 'h7654323', name: '人工控制电脑', control_state: 'user' };
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost, stale, userControlled] });
+    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByRole('button', { name: `复制云端电脑 ${ownedHost.name}` })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '复制云端电脑 文件未确认电脑' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '复制云端电脑 人工控制电脑' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '复制云端电脑 已停止电脑' })).not.toBeInTheDocument();
   });
 
   it.each(pollingHostCases)('re-polls a %s host after three seconds', async (state, label) => {
@@ -241,7 +296,7 @@ describe('Hosts', () => {
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '查看主机 测试主机' })).toBeEnabled();
+    expect(await screen.findByRole('button', { name: '查看云端电脑 测试主机' })).toBeEnabled();
     const openManager = screen.getByRole('button', { name: /管理共享成员/ });
     expect(openManager).toBeInTheDocument();
     expect(listMembers).not.toHaveBeenCalled();
@@ -292,11 +347,11 @@ describe('Hosts', () => {
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByText('权限：读取工作区文件')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '查看工作区' })).toBeEnabled();
+    expect(await screen.findByText('权限：读取云端电脑文件')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看电脑文件' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: '查看桌面' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '打开终端' })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '查看工作区' }));
+    await user.click(screen.getByRole('button', { name: '查看电脑文件' }));
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${ownedHost.id}?target=workspace`, '_blank');
     expect(ticket).not.toHaveBeenCalled();
   });

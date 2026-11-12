@@ -118,6 +118,293 @@ func TestWorkspaceSyncDeviceRegistrationIsInstallationBoundAndIdempotent(t *test
 	}
 }
 
+func TestWorkspaceProjectFolderRegistrationGatesSyncUntilPathSupport(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-project-folder-gate")
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, value.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	sessionToken := clientTestToken(t, owner.ID, "", identity.KindSession, nil)
+	if _, err := store.CreateToken(ctx, sessionToken); err != nil {
+		t.Fatal(err)
+	}
+	portal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: sessionToken.ID}
+	projectSession := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, projectSession, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "project-folder-active-session", projectSession.ID)); err != nil {
+		t.Fatalf("create pre-existing root Workspace session: %v", err)
+	}
+
+	projectFolder := workspace.SyncFolder{
+		OwnerID: owner.ID, FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Kind: workspace.SyncFolderKindProject,
+		ProjectName: "demo", RelativePath: "project/demo", State: "pending_node",
+	}
+	folderKeyHash := sha256.Sum256([]byte("project-folder-register-key"))
+	folderRequestHash := sha256.Sum256([]byte("project-folder-register-request"))
+	if _, err := store.RegisterWorkspaceSyncFolder(ctx, portal, hostValue.ID, projectFolder, folderKeyHash[:], folderRequestHash[:]); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("folder registration during active session = %v, want workspace busy", err)
+	}
+	var folderRows int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&folderRows); err != nil {
+		t.Fatal(err)
+	}
+	if folderRows != 0 {
+		t.Fatalf("active-session conflict left %d sync folder rows", folderRows)
+	}
+	client := syncDeviceTestPrincipal(t, store, owner.ID)
+	rootCertificate := []byte("root challenge issued before project metadata")
+	rootCertificateHash := sha256.Sum256(rootCertificate)
+	rootChallenge := newSyncDeviceTestChallenge(t, owner.ID, value.ID, client.ClientInstallationID,
+		"DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD", rootCertificate, rootCertificateHash[:])
+	if err := store.CreateWorkspaceSyncDeviceChallenge(ctx, client, rootChallenge); err != nil {
+		t.Fatalf("create legacy root challenge before project metadata: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_sessions SET state='completed',stage='complete',updated_at=clock_timestamp()
+WHERE workspace_id=$1 AND id=$2`, value.ID, projectSession.ID); err != nil {
+		t.Fatal(err)
+	}
+	registeredFolder, err := store.RegisterWorkspaceSyncFolder(ctx, portal, hostValue.ID, projectFolder, folderKeyHash[:], folderRequestHash[:])
+	if err != nil || registeredFolder.FolderID != projectFolder.FolderID || registeredFolder.RelativePath != "project/demo" || registeredFolder.SyncAvailable() {
+		t.Fatalf("register project folder after session settles = %#v, %v", registeredFolder, err)
+	}
+	// Replaying the same registration is safe and returns the same metadata row.
+	retryFolder := projectFolder
+	retryFolder.FolderID = "morde-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	retriedFolder, err := store.RegisterWorkspaceSyncFolder(ctx, portal, hostValue.ID, retryFolder, folderKeyHash[:], folderRequestHash[:])
+	if err != nil || retriedFolder.FolderID != registeredFolder.FolderID {
+		t.Fatalf("idempotent folder registration retry = %#v, %v; original=%#v", retriedFolder, err, registeredFolder)
+	}
+	rootKeyHash, rootRequestHash := syncDeviceTestHashes("root-challenge-after-project-key", value.ID, client.ClientInstallationID,
+		rootChallenge.DeviceID, rootCertificateHash[:])
+	rootBindingID, err := domain.NewWorkspaceSyncDeviceBindingID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterWorkspaceSyncDevice(ctx, client, value.ID, rootChallenge.ID, rootKeyHash, rootRequestHash,
+		rootBindingID, "morde-cccccccccccccccccccccccccccccccc"); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+		t.Fatalf("root registration from pre-existing challenge after project metadata = %v, want unavailable", err)
+	}
+	var rootChallengeRows, earlyIdentities, earlyBindings, earlyReceipts, earlyNodeRevisions int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_device_challenges WHERE id=$1`, rootChallenge.ID).Scan(&rootChallengeRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_device_identities WHERE owner_id=$1`, owner.ID).Scan(&earlyIdentities); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_device_bindings WHERE owner_id=$1`, owner.ID).Scan(&earlyBindings); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_device_registration_requests WHERE owner_id=$1`, owner.ID).Scan(&earlyReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_node_revisions WHERE owner_id=$1`, owner.ID).Scan(&earlyNodeRevisions); err != nil {
+		t.Fatal(err)
+	}
+	if rootChallengeRows != 1 || earlyIdentities != 0 || earlyBindings != 0 || earlyReceipts != 0 || earlyNodeRevisions != 0 {
+		t.Fatalf("rejected stale root challenge state: challenges=%d identities=%d bindings=%d receipts=%d node_revisions=%d",
+			rootChallengeRows, earlyIdentities, earlyBindings, earlyReceipts, earlyNodeRevisions)
+	}
+
+	projectSessionAfterRegistration := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, projectSessionAfterRegistration, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "project-folder-session-gate", projectSessionAfterRegistration.ID)); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+		t.Fatalf("project Workspace session creation error = %v, want unavailable", err)
+	}
+	if _, err := store.ListDeviceWorkspaceSyncProgress(ctx, owner.ID, value.ID); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+		t.Fatalf("project Workspace progress error = %v, want unavailable", err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, projectSession.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "project-folder-commit-gate", projectSession.ID)); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+		t.Fatalf("project Workspace commit error = %v, want unavailable", err)
+	}
+	reservationID, err := domain.NewPendingRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiveRequest := app.WorkspaceSyncReceiveRequest{
+		OwnerID: owner.ID, WorkspaceID: value.ID, FolderID: registeredFolder.FolderID,
+		OperationID: strings.Repeat("f", 64), Path: "project/demo/file.txt",
+		Operation: app.WorkspaceSyncReceiveUpsert, TargetBytes: 1,
+	}
+	receiveHash := sha256.Sum256([]byte("project receive should remain blocked"))
+	if _, err := store.ReserveWorkspaceSyncReceive(ctx, receiveRequest, reservationID, receiveHash[:]); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("project Workspace receive reservation error = %v, want forbidden", err)
+	}
+	var projectReceiveReservations int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_receive_reservations WHERE workspace_id=$1`, value.ID).Scan(&projectReceiveReservations); err != nil {
+		t.Fatal(err)
+	}
+	if projectReceiveReservations != 0 {
+		t.Fatalf("project receive gate created %d reservations", projectReceiveReservations)
+	}
+
+	// A project challenge binds the stable folder identity and path, but Store registration
+	// rejects it before creating a device identity, binding, receipt, or node desired state.
+	certificateDER := []byte("public Syncthing project challenge certificate")
+	certificateHash := sha256.Sum256(certificateDER)
+	projectChallenge := newSyncDeviceTestChallenge(t, owner.ID, value.ID, client.ClientInstallationID,
+		"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB", certificateDER, certificateHash[:])
+	projectChallenge.FolderID = registeredFolder.FolderID
+	projectChallenge.FolderKind = workspace.SyncFolderKindProject
+	projectChallenge.RelativePath = registeredFolder.RelativePath
+	if err := store.CreateWorkspaceSyncDeviceChallenge(ctx, client, projectChallenge); err != nil {
+		t.Fatal(err)
+	}
+	keyHash, requestHash := syncDeviceTestHashes("project-registration-key", value.ID, client.ClientInstallationID,
+		projectChallenge.DeviceID, certificateHash[:])
+	bindingID, err := domain.NewWorkspaceSyncDeviceBindingID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_folders SET project_name='changed',relative_path='project/changed' WHERE workspace_id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetWorkspaceSyncDeviceChallenge(ctx, client, value.ID, projectChallenge.ID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("challenge read after project path change = %v, want workspace conflict", err)
+	}
+	if _, err := store.RegisterWorkspaceSyncDevice(ctx, client, value.ID, projectChallenge.ID, keyHash, requestHash, bindingID, registeredFolder.FolderID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("project registration after challenged path change = %v, want workspace conflict", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_folders SET project_name='demo',relative_path='project/demo' WHERE workspace_id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	legacyCertificate := []byte("legacy root certificate")
+	legacyCertificateHash := sha256.Sum256(legacyCertificate)
+	legacyRootChallenge := newSyncDeviceTestChallenge(t, owner.ID, value.ID, client.ClientInstallationID,
+		"CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC", legacyCertificate, legacyCertificateHash[:])
+	if err := store.CreateWorkspaceSyncDeviceChallenge(ctx, client, legacyRootChallenge); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+		t.Fatalf("legacy root challenge on project-mapped Workspace = %v, want unavailable", err)
+	}
+	if _, err := store.RegisterWorkspaceSyncDevice(ctx, client, value.ID, projectChallenge.ID, keyHash, requestHash, bindingID, registeredFolder.FolderID); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+		t.Fatalf("project Store device registration error = %v, want unavailable", err)
+	}
+	var challengeRows, identities, bindings, registrationReceipts, nodeRevisions int
+	for query, destination := range map[string]*int{
+		`SELECT count(*) FROM workspace_sync_device_challenges WHERE id=$1`:                  &challengeRows,
+		`SELECT count(*) FROM workspace_sync_device_identities WHERE owner_id=$1`:            &identities,
+		`SELECT count(*) FROM workspace_sync_device_bindings WHERE owner_id=$1`:              &bindings,
+		`SELECT count(*) FROM workspace_sync_device_registration_requests WHERE owner_id=$1`: &registrationReceipts,
+		`SELECT count(*) FROM workspace_sync_node_revisions WHERE owner_id=$1`:               &nodeRevisions,
+	} {
+		args := []any{owner.ID}
+		if strings.Contains(query, "id=$1") {
+			args = []any{projectChallenge.ID}
+		}
+		if err := store.pool.QueryRow(ctx, query, args...).Scan(destination); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if challengeRows != 1 || identities != 0 || bindings != 0 || registrationReceipts != 0 || nodeRevisions != 0 {
+		t.Fatalf("project registration state: challenges=%d identities=%d bindings=%d receipts=%d node_revisions=%d",
+			challengeRows, identities, bindings, registrationReceipts, nodeRevisions)
+	}
+}
+
+func TestWorkspaceSyncProjectFolderRegistrationWaitsForReceiveReservation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-project-folder-receive-gate")
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, value.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	portalToken := clientTestToken(t, owner.ID, "", identity.KindSession, nil)
+	if _, err := store.CreateToken(ctx, portalToken); err != nil {
+		t.Fatal(err)
+	}
+	portal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portalToken.ID}
+	client := syncDeviceTestPrincipal(t, store, owner.ID)
+	registerTestWorkspaceSyncDevice(t, store, client, value.ID,
+		"FFFFFFF-FFFFFFF-FFFFFFF-FFFFFFF-FFFFFFF-FFFFFFF-FFFFFFF-FFFFFFF", "receive-test-device-"+owner.ID)
+	applyWorkspaceSyncNodeState(t, store, owner.ID)
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, value.Revision); err != nil {
+		t.Fatal(err)
+	}
+	receive := reserveTestWorkspaceReceive(t, ctx, store,
+		receiveTestRequest(owner.ID, value.ID, "active.txt", 1, "project-folder-race"))
+	if receive.State != "reserved" {
+		t.Fatalf("active root receive reservation = %#v", receive)
+	}
+	projectFolder := workspace.SyncFolder{OwnerID: owner.ID, FolderID: "morde-ffffffffffffffffffffffffffffffff",
+		Kind: workspace.SyncFolderKindProject, ProjectName: "demo", RelativePath: "project/demo"}
+	folderKeyHash := sha256.Sum256([]byte("project-folder-receive-key"))
+	folderRequestHash := sha256.Sum256([]byte("project-folder-receive-request"))
+	if _, err := store.RegisterWorkspaceSyncFolder(ctx, portal, hostValue.ID, projectFolder, folderKeyHash[:], folderRequestHash[:]); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("project folder registration during receive = %v, want workspace busy", err)
+	}
+	var folderRows int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&folderRows); err != nil {
+		t.Fatal(err)
+	}
+	if folderRows != 1 {
+		t.Fatalf("active-receive conflict changed root folder metadata; rows=%d", folderRows)
+	}
+}
+
+func TestWorkspaceSyncProjectFolderRegistrationPreservesExistingRootMapping(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-project-folder-root-compat")
+	client := syncDeviceTestPrincipal(t, store, owner.ID)
+	root := registerTestWorkspaceSyncDevice(t, store, client, value.ID,
+		"DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD", "root registration before project")
+	if root.FolderKind != workspace.SyncFolderKindWorkspaceRoot || root.RelativePath != "." {
+		t.Fatalf("legacy root binding metadata = %#v", root)
+	}
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, value.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	sessionToken := clientTestToken(t, owner.ID, "", identity.KindSession, nil)
+	if _, err := store.CreateToken(ctx, sessionToken); err != nil {
+		t.Fatal(err)
+	}
+	portal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: sessionToken.ID}
+	projectFolder := workspace.SyncFolder{OwnerID: owner.ID, FolderID: "morde-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		Kind: workspace.SyncFolderKindProject, ProjectName: "demo", RelativePath: "project/demo"}
+	folderKeyHash := sha256.Sum256([]byte("project-over-existing-root-key"))
+	folderRequestHash := sha256.Sum256([]byte("project-over-existing-root-request"))
+	if _, err := store.RegisterWorkspaceSyncFolder(ctx, portal, hostValue.ID, projectFolder, folderKeyHash[:], folderRequestHash[:]); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("project registration over legacy root mapping = %v, want conflict", err)
+	}
+	var folderID, folderKind, relativePath string
+	if err := store.pool.QueryRow(ctx, `SELECT folder_id,folder_kind,relative_path FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).
+		Scan(&folderID, &folderKind, &relativePath); err != nil {
+		t.Fatal(err)
+	}
+	if folderID != root.FolderID || folderKind != string(workspace.SyncFolderKindWorkspaceRoot) || relativePath != "." {
+		t.Fatalf("legacy root mapping changed after project conflict: id=%s kind=%s path=%s", folderID, folderKind, relativePath)
+	}
+	secondRoot := registerTestWorkspaceSyncDevice(t, store, client, value.ID,
+		"EEEEEEE-EEEEEEE-EEEEEEE-EEEEEEE-EEEEEEE-EEEEEEE-EEEEEEE-EEEEEEE", "root registration after project conflict")
+	if secondRoot.FolderID != root.FolderID || secondRoot.FolderKind != workspace.SyncFolderKindWorkspaceRoot {
+		t.Fatalf("legacy root registration after rejected project target = %#v", secondRoot)
+	}
+}
+
 func TestWorkspaceSyncNodeRevisionChangesTransactionallyWithRegistration(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -797,6 +1084,7 @@ func newSyncDeviceTestChallenge(t *testing.T, ownerID, workspaceID, installation
 		t.Fatal(err)
 	}
 	return workspace.SyncDeviceChallenge{ID: id, OwnerID: ownerID, WorkspaceID: workspaceID,
+		FolderKind: workspace.SyncFolderKindWorkspaceRoot, RelativePath: ".",
 		ClientInstallationID: installationID, DeviceID: deviceID, CertificateDER: certificateDER,
 		CertificateSHA256: certificateHash, Nonce: make([]byte, 32), ExpiresAt: time.Now().Add(5 * time.Minute)}
 }

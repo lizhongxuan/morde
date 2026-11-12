@@ -3,11 +3,14 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/runtimeclient"
 )
 
 func TestRuntimeControlStopTaskOperationRequiresExactRuntimeFenceAndHandlesNotFound(t *testing.T) {
@@ -19,6 +22,10 @@ func TestRuntimeControlStopTaskOperationRequiresExactRuntimeFenceAndHandlesNotFo
 	session, err := service.Connect(ctx, "h1234567", nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	priorInstanceID := "ri_prior_process"
+	server.Config.Handler = operationOriginResponseRewriter{
+		Handler: server.Config.Handler, operationID: "o1234567", runtimeInstanceID: priorInstanceID,
 	}
 	defer session.Close()
 	claimed := task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", Status: task.StatusCancelling}
@@ -34,9 +41,12 @@ func TestRuntimeControlStopTaskOperationRequiresExactRuntimeFenceAndHandlesNotFo
 	}
 	stored := task.Operation{
 		ID: runtimeOperation.OperationID, TaskID: runtimeOperation.TaskID, HostID: runtimeOperation.HostID,
-		RuntimeGeneration: runtimeOperation.RuntimeGeneration, RuntimeInstanceID: runtimeOperation.RuntimeInstanceID,
+		RuntimeGeneration: runtimeOperation.RuntimeGeneration, RuntimeInstanceID: priorInstanceID,
 		ControlVersion: runtimeOperation.ControlVersion, LeaseVersion: 3, RuntimeLeaseVersion: runtimeOperation.LeaseVersion,
 		Status: task.OperationDispatched,
+	}
+	if stored.RuntimeInstanceID == session.Fence.RuntimeInstanceID {
+		t.Fatal("test must reconcile an operation from a prior runtime instance")
 	}
 	status, _, notFound, err := service.StopTaskOperation(ctx, claimed, stored)
 	if err != nil || notFound || status != task.OperationFailed {
@@ -54,4 +64,43 @@ func TestRuntimeControlStopTaskOperationRequiresExactRuntimeFenceAndHandlesNotFo
 	if _, _, notFound, err = service.StopTaskOperation(ctx, claimed, stored); err == nil || notFound {
 		t.Fatalf("stale runtime instance was accepted: notFound=%v err=%v", notFound, err)
 	}
+}
+
+type operationOriginResponseRewriter struct {
+	http.Handler
+	operationID       string
+	runtimeInstanceID string
+}
+
+func (h operationOriginResponseRewriter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || r.URL.Path != "/runtime/v1/operations/"+h.operationID+"/cancel" {
+		h.Handler.ServeHTTP(w, r)
+		return
+	}
+	response := httptest.NewRecorder()
+	h.Handler.ServeHTTP(response, r)
+	if response.Code != http.StatusOK {
+		for name, values := range response.Header() {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		w.WriteHeader(response.Code)
+		_, _ = w.Write(response.Body.Bytes())
+		return
+	}
+	var value runtimeclient.OperationResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &value); err != nil {
+		http.Error(w, "invalid synthetic operation response", http.StatusInternalServerError)
+		return
+	}
+	value.Operation.RuntimeInstanceID = h.runtimeInstanceID
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		http.Error(w, "invalid synthetic operation response", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(encoded)
 }

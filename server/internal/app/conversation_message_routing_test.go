@@ -35,6 +35,7 @@ func TestConversationReceiptDefersModelAndHostChecks(t *testing.T) {
 		ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
 		ClientMessageID:   "message-0001", IdempotencyKey: "message-0001", Content: "帮我整理资料",
 		HostID: "h1234567", WorkspaceID: "w1234567", ModelID: "unavailable-model",
+		ChangeTaskTarget:    true,
 		ClientAttachmentIDs: []string{"attachment-0001"},
 	}
 	message, replayed, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command)
@@ -45,6 +46,7 @@ func TestConversationReceiptDefersModelAndHostChecks(t *testing.T) {
 		t.Fatalf("receipt checked a tool or model: host=%q model=%q", authorizer.lastHost, models.modelID)
 	}
 	if store.receipts[0].Input.HostID != command.HostID || store.receipts[0].Input.WorkspaceID != command.WorkspaceID ||
+		!store.receipts[0].Input.ChangeTaskTarget ||
 		store.receipts[0].Message.DeliveryStatus != conversation.DeliveryPending {
 		t.Fatalf("receipt did not preserve input and pending delivery: %+v", store.receipts[0])
 	}

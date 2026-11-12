@@ -44,6 +44,43 @@ process.stdin.once('data', chunk => { const req = JSON.parse(String(chunk).trim(
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('project upload sends only the folder identity and fixed one-way session metadata to the local helper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'morde-project-sync-metadata-'));
+  try {
+    const directory = join(root, 'empty-project'), binary = join(root, 'metadata-sync');
+    await mkdir(directory);
+    await writeFile(binary, `#!/usr/bin/env node
+process.stdin.once('data', chunk => {
+  const request = JSON.parse(String(chunk).trim());
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{params:request.params}})+'\\n');
+  process.exit(0);
+});
+`);
+    await chmod(binary, 0o700);
+    const mapping = { ...await checkedDirectory(directory, []), workspaceId: 'w1234567' };
+    const folderID = 'morde-0123456789abcdef0123456789abcdef';
+    const checkpoint = {
+      serviceInstanceID: '12345678-1234-4234-8234-123456789abc', installationId: 'i1234567',
+      ...mapping, mode: 'project_upload', scope: [], projectSelectionID: '123e4567-e89b-42d3-a456-426614174000',
+      hostId: 'h1234567', folderId: folderID, projectName: 'demo', idempotencyKey: 'project-upload-key',
+    };
+    const sync = new MordeSync(() => binary, () => {});
+    const result = await sync.run({
+      origin: 'https://portal.example', installationId: 'i1234567', clientCredential: 'client-secret',
+      clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z',
+    }, mapping, 'project_upload', [], checkpoint);
+    assert.equal(result.params.folder_id, folderID);
+    assert.equal(result.params.direction, 'upload');
+    assert.equal(result.params.policy, 'compare_merge');
+    assert.equal(result.params.base_revision, 0);
+    assert.deepEqual(result.params.scope, []);
+    assert.equal(result.params.idempotency_key, 'project-upload-key');
+    assert.equal(result.params.bearer_token, 'sync-secret');
+    assert.equal(JSON.stringify(result.params).includes('client-secret'), false);
+    assert.equal(sync.snapshot(), 'idle');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('a JSON-RPC success without an object result is not a confirmed sync', async () => {
   const root = await mkdtemp(join(tmpdir(), 'morde-sync-invalid-result-'));
   try {

@@ -431,7 +431,6 @@ struct NanoMuseHomeView: View {
     @State private var showSharedFolders = false
     @State private var showDevices = false
     @State private var showProjects = false
-    @State private var showWorkspaceNotConnected = false
     @State private var agentName = NanoMuseHomeView.currentAgentName()
     /// Reduce Motion on: the bottom bar fades out for the keyboard instead of sliding down.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -540,11 +539,6 @@ struct NanoMuseHomeView: View {
         .sheet(isPresented: $showProjects) {
             MordeProjectsEntryView()
         }
-        .alert(AppLocalized("Default"), isPresented: $showWorkspaceNotConnected) {
-            Button(AppLocalized("OK"), role: .cancel) {}
-        } message: {
-            Text(AppLocalized("Not set") + " · " + AppLocalized("Not Supported"))
-        }
         .sheet(isPresented: $showNanoMuseSettings) {
             NavigationStack {
                 NanoMuseSettingsHomeView(onOpenCloudTasks: {
@@ -573,7 +567,6 @@ struct NanoMuseHomeView: View {
             case "newTask":
                 openSideChat(NanoMuseMainChat.draftPrefix + UUID().uuidString, focusComposer: true)
             case "computers": showDevices = true
-            case "defaultWorkspace": showWorkspaceNotConnected = true
             case "sharedFolders": showSharedFolders = true
             case "askDevice":
                 // C7: "Ask this device" in the Devices list — the main chat with "@<name> " in the composer.
@@ -1113,7 +1106,7 @@ private struct NanoMuseCategoryShape: Shape {
 // MARK: - Room header
 
 extension Notification.Name {
-    /// `object` is one of "settings", "routines", "computers", or "defaultWorkspace".
+    /// `object` is one of "settings", "routines", or "computers".
     /// "systemFiles", "sharedFolders", or "chatFiles": the home opens that page over the current tab.
     static let nanoMuseHomeAction = Notification.Name("nanoMuse.homeAction")
 }
@@ -1161,9 +1154,6 @@ struct NanoMuseRoomHeader<Trailing: View>: View {
                         Menu {
                             Button { chrome.open("computers") } label: {
                                 Label(AppLocalized("Computers"), systemImage: "desktopcomputer")
-                            }
-                            Button { chrome.open("defaultWorkspace") } label: {
-                                Label(AppLocalized("Default"), systemImage: "folder")
                             }
                         } label: {
                             NanoMuseRoundDisc(symbol: "square.stack.3d.up")

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link } from 'react-router';
+import { Link, useLocation } from 'react-router';
 import { newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
 import { ideasFromFeedPreferences, personalIdeas } from '../data/ideas';
@@ -129,10 +129,12 @@ function downloadBlob(blob: Blob, name: string): void {
 
 export function PersonalData() {
   const { user } = useAuth();
+  const location = useLocation();
   const userID = user?.id;
   const store = useMemo(() => userID ? new PersonalDataStore(userID) : null, [userID]);
   const [state, setState] = useState<PersonalDataState | null>(null);
-  const [activeSection, setActiveSection] = useState<Section>('profile');
+  const requestedSection = new URLSearchParams(location.search).get('section');
+  const activeSection: Section = sections.some((section) => section.id === requestedSection) ? requestedSection as Section : 'profile';
   const [localError, setLocalError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [syncEnabled, setSyncEnabled] = useState(() => user ? getPersonalDataSyncEnabled(user.id) : true);
@@ -406,11 +408,6 @@ export function PersonalData() {
         <strong>{item.objectType} / {item.objectID}</strong>：{JSON.stringify(item.body).slice(0, 240)}
       </li>)}</ul>
     </details>}
-
-    <div className="connection-section-heading personal-data-tabs" role="tablist" aria-label="个人数据分类">
-      {sections.map((section) => <button key={section.id} type="button" role="tab" aria-selected={activeSection === section.id}
-        className={`button ${activeSection === section.id ? 'button-primary' : 'button-secondary'}`} onClick={() => setActiveSection(section.id)}>{section.title}</button>)}
-    </div>
 
     {remoteLoading && <div className="loading-card" role="status">正在读取服务端个人数据；本地草稿仍可离线访问。</div>}
 

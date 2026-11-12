@@ -1,6 +1,6 @@
 # C30 iOS 文件任务与产物实施任务 TODO
 
-**会话：C｜阶段：P3｜状态：进行中（C30-T1 已完成；C30-T2 owner session 复验中；C30-T3 联调中）。**
+**会话：C｜阶段：P3｜状态：已完成（2026-11-11；C30-T1/T2/T3 与 G3 真服务 UI 联验均通过）。**
 
 来源：[需求与架构](../../Morde个人Muse需求与架构设计方案.md)；共同规则：[执行总览](00-三会话执行总览.md)；接口：[共享合同](01-共享接口与联调合同.md)。
 
@@ -21,21 +21,23 @@ iOS 的消息、任务文件来源/进度/产物显示和现有打开/预览能�
   - 验收：fixture 中文件等待只影响对应步骤，其他任务继续；无绝对路径/令牌泄露，目录未授权不能显示为可读，取消受理与已取消区分。
   - 证据（2026-11-11）：`C30-OfflineWait-Verified3.xcresult` safe-progress 1/1；`C30-HelperUsers-Verified1.xcresult` offline-wait/cancel 1/1。独立聊天消息、来源目录/相对路径及离线取消状态均通过 UI 验收。
 
-- [ ] C30-T2（进行中；待真实 owner session 复验）展示完整文件结果和副本生命周期
+- [x] C30-T2（已完成）展示完整文件结果和副本生命周期
   - 前置：C30-T1、A30-T1。
   - 修改：使用服务端校验后的文件引用接现有预览/产物界面；显示解析失败、来源版本、临时/已保留副本和可用删除入口，按 API 权限操作。
   - 验收：文本、PDF 和选定办公文件的显示路径可验证；完整传输与解析失败不混淆，不能将旧副本标为最新；撤销目录不虚报已删除所有副本。
   - 证据（2026-11-11）：`C30-HelperUsers-Verified1.xcresult` 三条相关 UI 用例 3/3（offline、篡改拒绝并删除副本、raw-only PDF Quick Look）；PDF 正文可见截图：`/tmp/morde-c30-signed-20261111/helper-users-attachments/18225D54-2F0A-49FF-B67B-482F9B618C66.png`。
-  - 复核（2026-11-11）：真实 G3 API 要求文件 owner 接口使用无安装 ID 的普通 Portal Session；当前 app 只用安装绑定的 client Web Session，不能通过 owner 文件接口鉴权。保持服务端授权不变，修复双 session 登录与调用后再完成本项。
+  - 复核（2026-11-11）：真实 G3 API 要求文件 owner 接口使用无安装 ID 的普通 Portal Session；客户端已补齐双 session 登录并使用 owner session 调用文件接口，未改变服务端授权边界。
+  - G3 复验（2026-11-11）：真实 Portal v2 + iOS Simulator UI 用例通过，owner Portal session 可读文件列表，client Web Session 被拒绝（404）；实际获取文件为 27 字节且 SHA-256 与 UI 显示相符。与既有 `C30-HelperUsers-Verified1.xcresult` 的篡改拒绝后删除副本、raw-only PDF Quick Look 用例共同覆盖生命周期投影。
 
 ### 验证限制
 
 - `MinisTests/MIFTaskViewsTests.swift` 的两个定向单测未运行：Minis 宿主 app 构建需要本地 `Configs/ProviderCustomization.xcconfig` 以及 FFmpeg/Rclone Simulator XCFramework；当前工作区缺少这些配置/产物，FFmpeg 本地源码亦缺失。Minis 工程将这些 Framework 无条件加入宿主 app，未发现可仅排除 Multimedia 链接的现有构建设置；首轮 xcodebuild 在测试启动前失败，未计为测试失败或通过。
 
-- [ ] C30-T3（进行中）从 iOS 发起 PC 文件任务联调
+- [x] C30-T3（已完成）从 iOS 发起 PC 文件任务联调
   - 前置：C30-T2、A30-T3、B30-T4。
   - 修改：使用 A30-T3 服务与 B30-T4 桥接版本，均在 C 的独立本地 fixture，读取合成目录；不得控制 B 正在开发的桌面资料目录。
   - 验收：覆盖 A8–A10：完整读取、PC 断连、文件变化、越界拒绝和撤权；界面与实际收到的文件版本一致。交付 A30-T4；接口或桥接缺口交 A/B。
+  - G3 证据（2026-11-11）：`.local/a30-g3-v2/g3-ios-2026-11-11T05-39-00.240Z.xcresult` 中 `IOS03SimulatorAcceptanceUITests/testMordeG3RealPortalFetchesSyntheticPCFile` 在隔离 Portal v2 + 真实本机 helper 下 1/1 通过：iOS 发起合成文件任务、服务端返回正确 owner 投影、实际 27 字节/hash 与 UI 一致。完整读取、离线等待/恢复、源版本变化、越界/超限及撤权由 A30 的真实 Go/PostgreSQL/Hub/PC helper 集成测试覆盖；失败分支并非逐项通过 iOS UI 操作触发。
 
 ## 交付
 

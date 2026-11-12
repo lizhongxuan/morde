@@ -313,7 +313,7 @@ export function MuseChats({ t, useSessions, useSessionStatus, useWorkspaces, act
         : null,
       h('div', { className: 'nm-chats-section' },
         h('span', null, t('chSide')),
-        h('button', { type: 'button', className: 'nm-icon-btn nm-icon-btn-sm', 'aria-label': t('chNewSide'), title: t('chNewSide'), onClick: actions.startSession }, h(IconPlus, { size: 16 }))),
+        h('button', { type: 'button', className: 'nm-icon-btn nm-icon-btn-sm nm-chats-add', 'aria-label': t('chNewSide'), title: t('chNewSide'), onClick: actions.startSession }, h(IconPlus, { size: 12 }))),
       side.length === 0
         ? h('div', { className: 'nm-chats-empty' }, q === '' ? t('chEmpty') : t('chNoMatch'))
         : side.map((chat) => h(ChatRow, {

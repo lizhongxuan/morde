@@ -99,13 +99,61 @@ func (s *ConversationService) List(ctx context.Context, principal identity.Princ
 	if err := validateConversationPrincipal(principal, identity.ScopeTaskRead); err != nil {
 		return ConversationPage{}, err
 	}
+	page.Search = strings.TrimSpace(page.Search)
+	if !utf8.ValidString(page.Search) || utf8.RuneCountInString(page.Search) > 120 {
+		return ConversationPage{}, domain.InvalidArgument("q", "conversation search query is invalid")
+	}
 	if err := validatePageRequest(page); err != nil {
 		return ConversationPage{}, err
 	}
 	if page.Limit == 0 {
 		page.Limit = defaultPageSize
 	}
-	return s.store.ListConversations(ctx, principal.UserID, nil, page)
+	hostIDs, err := authorizedTaskHostIDs(ctx, s.authorizer, principal, identity.ScopeTaskRead)
+	if err != nil {
+		return ConversationPage{}, err
+	}
+	result := ConversationPage{Items: make([]conversation.Conversation, 0, page.Limit)}
+	rawCursor := page.Cursor
+	seenCursors := make(map[string]struct{})
+	for {
+		rawPage, err := s.store.ListConversations(ctx, principal.UserID, hostIDs, PageRequest{
+			Limit: maxPageSize, Cursor: rawCursor, Search: page.Search,
+		})
+		if err != nil {
+			return ConversationPage{}, err
+		}
+		for index, item := range rawPage.Items {
+			if item.HostID != "" {
+				if _, err := authorizeTaskHost(ctx, s.authorizer, principal, item.HostID, identity.ScopeTaskRead); err != nil {
+					switch domain.CodeOf(err) {
+					case domain.CodeNotFound, domain.CodeForbidden:
+						continue
+					default:
+						return ConversationPage{}, err
+					}
+				}
+			}
+			result.Items = append(result.Items, item)
+			if int32(len(result.Items)) == page.Limit {
+				if index+1 < len(rawPage.Items) || rawPage.NextCursor != "" {
+					result.NextCursor = EncodePageCursor(item.UpdatedAt, item.ID)
+				}
+				return result, nil
+			}
+		}
+		if rawPage.NextCursor == "" {
+			return result, nil
+		}
+		if rawPage.NextCursor == rawCursor {
+			return ConversationPage{}, domain.NewError(domain.CodeInternal, "conversation page cursor did not advance")
+		}
+		if _, ok := seenCursors[rawPage.NextCursor]; ok {
+			return ConversationPage{}, domain.NewError(domain.CodeInternal, "conversation page cursor repeated")
+		}
+		seenCursors[rawPage.NextCursor] = struct{}{}
+		rawCursor = rawPage.NextCursor
+	}
 }
 
 func (s *ConversationService) Get(ctx context.Context, principal identity.Principal, id string) (conversation.Conversation, error) {

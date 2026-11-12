@@ -15,14 +15,15 @@ import (
 
 type workspaceCopyServiceStore struct {
 	*syncServiceStore
-	reservation    workspace.CopyReservation
-	record         IdempotencyRecord
-	lockHeld       bool
-	stagedFiles    []workspace.File
-	stagedDirs     []string
-	stagedMetadata []workspace.Directory
-	staged         int
-	completed      int
+	reservation     workspace.CopyReservation
+	record          IdempotencyRecord
+	lockHeld        bool
+	stagedFiles     []workspace.File
+	stagedDirs      []string
+	stagedMetadata  []workspace.Directory
+	staged          int
+	completed       int
+	hostFenceChecks int
 }
 
 func (s *workspaceCopyServiceStore) GetWorkspaceCopyReservationByIdempotency(_ context.Context, record IdempotencyRecord,
@@ -35,6 +36,14 @@ func (s *workspaceCopyServiceStore) GetWorkspaceCopyReservationByIdempotency(_ c
 		return workspace.CopyReservation{}, false, domain.NewError(domain.CodeIdempotencyConflict, "copy key mismatch")
 	}
 	return s.reservation, true, nil
+}
+
+func (s *workspaceCopyServiceStore) ValidateHostCopyReservationSource(_ context.Context, ownerID, reservationID string) error {
+	s.hostFenceChecks++
+	if ownerID != s.reservation.SourceOwnerID || reservationID != s.reservation.ID || s.reservation.SourceHostID == "" || !s.reservation.HostCopyPending {
+		return domain.NewError(domain.CodeWorkspaceConflict, "Host copy source fence mismatch")
+	}
+	return nil
 }
 
 func (s *workspaceCopyServiceStore) CreateWorkspaceCopyReservation(_ context.Context, request WorkspaceCopyReservationRequest) (workspace.CopyReservation, bool, error) {
@@ -261,6 +270,45 @@ func TestWorkspaceCopyServiceCopiesConfirmedCheckpointAndReplaysAfterSourceChang
 	replay, err := service.Copy(context.Background(), principal, "w1234567", WorkspaceCopyCommand{Name: "copy", ExpectedCurrentRevision: 1}, "copy-key-01")
 	if err != nil || !replay.Replayed || replay.Workspace.ID != result.Workspace.ID || copier.calls != 1 {
 		t.Fatalf("same-key replay after source changes = %#v, %v; copier calls=%d", replay, err, copier.calls)
+	}
+}
+
+func TestWorkspaceCopyHostReplaySkipsLiveSourceCheckWhenCompleted(t *testing.T) {
+	service, store, _, _ := newWorkspaceCopyServiceForTest(t, &workspaceCopyServiceCopier{})
+	store.record, _ = hostCopyIdempotencyRecord("u1234567", "h1234567", "copy", 1, "copy-key-host-1")
+	store.reservation = workspace.CopyReservation{
+		ID: "r1234567", SourceOwnerID: "u1234567", TargetOwnerID: "u1234567", SourceHostID: "h1234567",
+		SourceBindingVersion: 1, HostCopyPending: true, SourceWorkspaceID: "w1234567", TargetWorkspaceID: "w7654321",
+		ServiceInstanceID: "instance-1", SourceRevision: 1, State: workspace.CopyCompleted,
+	}
+	result, found, err := service.ResumeOrReplayHostCopy(context.Background(), identity.Principal{
+		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession,
+	}, "h1234567", WorkspaceCopyCommand{Name: "copy", ExpectedCurrentRevision: 1}, "copy-key-host-1")
+	if err != nil || !found || !result.Replayed || result.Workspace.ID != "w7654321" || store.hostFenceChecks != 0 {
+		t.Fatalf("completed Host copy replay = %#v, found=%t, fence checks=%d, err=%v", result, found, store.hostFenceChecks, err)
+	}
+}
+
+func TestWorkspaceCopyHostResumeRevalidatesStoredSourceFence(t *testing.T) {
+	mode, modified := uint32(0o750), int64(1_700_000_000_123_000_000)
+	service, store, _, _ := newWorkspaceCopyServiceForTest(t, &workspaceCopyServiceCopier{
+		directories: []workspace.Directory{{Path: ".hidden", Mode: &mode, ModTimeNS: &modified}},
+	})
+	store.record, _ = hostCopyIdempotencyRecord("u1234567", "h1234567", "copy", 1, "copy-key-host-2")
+	reservedBytes, _, err := service.copyBlockReservations(store.snapshots[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.reservation = workspace.CopyReservation{
+		ID: "r1234567", SourceOwnerID: "u1234567", TargetOwnerID: "u1234567", SourceHostID: "h1234567",
+		SourceBindingVersion: 1, HostCopyPending: true, SourceWorkspaceID: "w1234567", TargetWorkspaceID: "w7654321",
+		ServiceInstanceID: "instance-1", SourceRevision: 1, ReservedBytes: reservedBytes, State: workspace.CopyUnknown,
+	}
+	result, found, err := service.ResumeOrReplayHostCopy(context.Background(), identity.Principal{
+		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession,
+	}, "h1234567", WorkspaceCopyCommand{Name: "copy", ExpectedCurrentRevision: 1}, "copy-key-host-2")
+	if err != nil || !found || !result.Replayed || result.State != workspace.CopyCompleted || store.hostFenceChecks != 2 {
+		t.Fatalf("Host copy recovery = %#v, found=%t, fence checks=%d, err=%v", result, found, store.hostFenceChecks, err)
 	}
 }
 

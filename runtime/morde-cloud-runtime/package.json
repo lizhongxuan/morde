@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build:dsh-compaction": "esbuild vendor/deepseek-harness/packages/compaction/compaction-basic/src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=vendor/deepseek-harness/packages/compaction/compaction-basic/dist/index.js",
-    "test": "npm run build:dsh-compaction && node --test test/*.test.mjs"
+    "test": "npm run build:dsh-compaction && node --test --test-concurrency=1 test/*.test.mjs"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "4.1.0",

@@ -30,7 +30,6 @@ type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
-type WorkspaceBinding = Host['workspaces'][number];
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
   snapshotStatus?: 'streaming' | 'completed' | 'interrupted';
 };
@@ -124,12 +123,12 @@ export function assistantRecentConversationKey(serviceInstanceID: string, userID
 export function resolveTaskObservationURL(ticket: string, hostURL: string, hostID: string, portalHostname = window.location.hostname): string {
   let host: URL;
   try { host = new URL(hostURL); } catch { throw new Error('服务器返回了无效的 Workbench 地址。'); }
-  const localHTTP = (portalHostname === 'portal.localhost' || portalHostname === 'localhost')
+  const localHTTP = ['portal.localhost', 'localhost', '127.0.0.1', '[::1]'].includes(portalHostname)
     && host.protocol === 'http:' && host.hostname === `${hostID}.hosts.localhost` && !host.port;
   // eslint-disable-next-line no-control-regex -- Control bytes must not enter an opaque credential URL.
-  if (!ticket || ticket.length < 16 || ticket.length > 4096 || /[\u0000-\u001f\u007f]/.test(ticket)
-    || (!localHTTP && host.protocol !== 'https:') || host.username || host.password || host.hash || host.search || host.pathname !== '/') {
-    throw new Error('服务器返回了无效的 Workbench 地址或观察票据。');
+  if (!ticket || ticket.length < 16 || ticket.length > 4096 || /[\u0000-\u001f\u007f]/.test(ticket)) throw new Error('Task 观察票据格式无效。');
+  if ((!localHTTP && host.protocol !== 'https:') || host.username || host.password || host.hash || host.search || host.pathname !== '/') {
+    throw new Error('服务器返回的 Workbench 地址不符合安全规则。');
   }
   const entry = new URL('/__ch/task-auth', host);
   entry.searchParams.set('ticket', ticket);
@@ -209,7 +208,7 @@ const taskFileFetchStatusLabel: Record<TaskFileFetch['status'], string> = {
   cancelling: '正在取消', cancelled: '已取消', failed: '失败',
 };
 const taskFileFetchContentStateLabel: Record<TaskFileFetch['content_state'], string> = {
-  none: '无服务端副本', retained: '服务端副本保留中', deleted: '服务端副本已删除', expired: '服务端副本已到期',
+  none: '无副本', retained: '保留中', deleted: '已删除', expired: '已到期',
 };
 // shortcut: stream four tasks per tab; the rest use 1.5s snapshot polling until task events are multiplexed.
 const maxTaskEventStreams = 4;
@@ -230,17 +229,11 @@ function latestConversationClientMessageID(messages: ConversationMessage[] | und
 const controlStateLabels: Record<Host['control_state'], string> = {
   ai: '云端 AI 控制', taking_over: '正在接管', user: '人工控制', returning: '正在交还 AI',
 };
-function workspaceBindingReady(binding: WorkspaceBinding): boolean {
-  return binding.state === 'active' && binding.workspace.state === 'ready' && binding.sync_state === 'healthy' &&
-    binding.applied_revision === binding.desired_revision && binding.applied_revision === binding.workspace.revision;
-}
 
 function taskTargetText(task: TaskSummary, hosts: Host[]): string {
   const host = task.host_id ? hosts.find((item) => item.id === task.host_id) : undefined;
-  const computer = task.host_id ? host ? `${host.name || host.id}（${hostStateLabel[host.state] || host.state}）` : `主机 ${task.host_id}（当前不可访问）` : '无电脑目标';
-  const binding = task.workspace_id ? host?.workspaces.find((item) => item.workspace.id === task.workspace_id) : undefined;
-  const workspace = task.workspace_id ? `${binding?.workspace.name || task.workspace_id}${task.input_revision === undefined ? '' : ` v${task.input_revision}`}` : '无 Workspace';
-  return `${computer} · ${workspace}`;
+  const computer = task.host_id ? host ? `${host.name || host.id}（${hostStateLabel[host.state] || host.state}）` : `云端电脑 ${task.host_id}（当前不可访问）` : '无电脑目标';
+  return task.input_revision === undefined ? computer : `${computer} · 文件版本 v${task.input_revision}`;
 }
 
 function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): string {
@@ -262,10 +255,10 @@ function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): s
   if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_missing') return '尚未选择云端电脑，本次操作未执行。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_changed') return '任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'computer_unavailable') return '所选云端电脑当前不可用或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '所选 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_target_changed') return '任务已绑定其他 Workspace，无法安全切换；请为新目标另发起任务。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '云端电脑文件当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_target_changed') return '任务已绑定其他云端电脑的文件，无法安全切换；请为新目标另发起任务。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'target_result_unknown') return '上次电脑操作的结果需要核对，暂不能重复执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步 Workspace；确认版本已应用后才会完成。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步文件；确认版本已应用后才会完成。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'model_context_limit') return '消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'dsh_recovery_unresolved') return 'AI 运行中断，无法确认本次执行结果。请停止任务后重试。';
   if (task.status === 'waiting_user') return '任务正在等待你的确认或补充信息。';
@@ -332,9 +325,9 @@ function stepTitle(step: Task['steps'][number]): string {
   const name = step.title.slice(prefix.length);
   if (name === 'morde_web_search' || name.includes('searxng_web_search')) return '搜索网页';
   if (name === 'morde_web_read' || name.includes('web_url_read')) return '读取网页';
-  if (name === 'morde_workspace_list') return '查看工作区文件';
-  if (name === 'morde_workspace_read') return '读取工作区文件';
-  if (name === 'morde_workspace_write') return '保存工作区文件';
+  if (name === 'morde_workspace_list') return '查看电脑文件';
+  if (name === 'morde_workspace_read') return '读取电脑文件';
+  if (name === 'morde_workspace_write') return '保存电脑文件';
   if (name.startsWith('browser_')) return '操作浏览器';
   if (name.startsWith('desktop_')) return '操作云端电脑';
   if (name.startsWith('file_')) return '处理文件';
@@ -350,6 +343,67 @@ const taskStatusLabel: Record<Task['status'], string> = {
   queued: '排队中', running: '运行中', waiting_user: '等待用户', pausing: '正在暂停', paused: '已暂停',
   cancelling: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止',
 };
+
+type TaskActivityGroup = 'waiting' | 'active' | 'paused' | 'recent' | 'unknown';
+function taskActivityGroup(status: string): TaskActivityGroup {
+  if (status === 'waiting_user') return 'waiting';
+  if (status === 'paused') return 'paused';
+  if (['queued', 'running', 'pausing', 'cancelling'].includes(status)) return 'active';
+  if (['completed', 'failed', 'cancelled'].includes(status)) return 'recent';
+  return 'unknown';
+}
+
+function taskActivityStatusText(summary: TaskSummary, task?: Task): string {
+  const status = task?.status ?? summary.status;
+  if (status === 'completed' && ['pending', 'processing'].includes(summary.result_review?.state ?? '')) return '回复整理中';
+  if (status === 'waiting_user' && task?.pending_request) return '待审批';
+  if (status === 'waiting_user' && task?.clarification_request) return '待补充信息';
+  const labels: Record<string, string> = {
+    queued: '等待执行', running: '进行中', waiting_user: '待你处理', pausing: '正在暂停', paused: '已暂停',
+    cancelling: '正在停止', completed: '已完成', failed: '失败', cancelled: '已停止',
+  };
+  return labels[status] ?? '状态待确认';
+}
+
+function taskActivityProgressText(summary: TaskSummary, task: Task | undefined, cloudTasksAvailable: boolean | undefined): string {
+  if (!task) return summary.status === 'running' ? '正在处理，打开详情查看进展。'
+    : summary.status === 'queued' ? '已排队等待开始。' : '打开详情查看任务状态。';
+  if (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(summary.result_review?.state ?? '')))
+    return '任务已完成，回复整理中。';
+  if (task.status === 'waiting_user') {
+    if (task.pending_request) return `等待审批：${task.pending_request.title}`;
+    if (task.clarification_request) return `等待补充：${task.clarification_request.question}`;
+  }
+  const currentStep = task.steps.find((step) => step.id === task.current_step);
+  if (currentStep && task.status === 'running' && currentStep.kind !== 'model') return stepTitle(currentStep);
+  if (task.status === 'failed') return '任务执行失败，查看工作过程或更多信息了解原因。';
+  if (task.status === 'completed') return '任务已完成，打开详情查看结果。';
+  return taskStatusText(task, cloudTasksAvailable);
+}
+
+function taskFileFetchFailureText(reason: TaskFileFetch['failure_reason']): string {
+  const labels: Record<NonNullable<TaskFileFetch['failure_reason']>, string> = {
+    access_denied: '读取权限已变更', source_changed: '本机文件在读取期间发生变化', file_unavailable: '本机文件不可用',
+    limit_exceeded: '文件超出大小限制', unsupported: '暂不支持此文件类型', source_unavailable: '本机暂不可用',
+    transfer_failed: '文件传输失败',
+  };
+  return reason ? labels[reason] : '文件读取失败';
+}
+
+function taskFileFetchContentText(item: TaskFileFetch): string {
+  if (item.status !== 'completed') return '传输完成后再检查文件内容是否可读取。';
+  if (item.parse_status === 'extracted') return '内容已提取，可供任务处理。';
+  if (item.parse_status === 'raw_only') return '云端保留了原文件，当前无法提取正文。';
+  if (item.parse_status === 'failed') {
+    const reasons: Record<NonNullable<TaskFileFetch['parse_error']>, string> = {
+      invalid_encoding: '文件编码无法读取', invalid_document: '文件格式无法读取',
+      result_too_large: '文件内容超过读取上限', content_unavailable: '文件内容暂不可用', integrity_failed: '文件校验未通过',
+    };
+    return `文件已传输，${item.parse_error ? reasons[item.parse_error] : '内容读取失败'}。`;
+  }
+  if (item.parse_status === 'unavailable') return '文件已传输，但内容暂不可用。';
+  return '文件已传输，内容处理状态暂不可用。';
+}
 
 function dependencyStatusText(dependency: K2TaskDependency): string {
   return dependency.satisfied
@@ -440,7 +494,6 @@ export function Assistant() {
   const hasNavigationIdea = typeof navigationIdea?.ideaID === 'string' && Boolean(navigationIdea.ideaID) && Boolean(ideaPrompt);
   const [conversationSelection, setConversationSelection] = useState<{ scope: string; id: string | null } | null>(null);
   const [hostSelection, setHostSelection] = useState<string | null>(null);
-  const [workspaceSelection, setWorkspaceSelection] = useState('');
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
@@ -451,8 +504,10 @@ export function Assistant() {
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const [taskSupplementDrafts, setTaskSupplementDrafts] = useState<Record<string, string>>({});
   const [supplementTaskID, setSupplementTaskID] = useState<string | null>(null);
-  const [expandedTaskIDs, setExpandedTaskIDs] = useState<string[]>([]);
+  const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
+  const [taskPanelFilter, setTaskPanelFilter] = useState<'all' | 'conversation'>('all');
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
+  const taskCardButtons = useRef(new Map<string, HTMLButtonElement>());
   const [sideConversationsOpen, setSideConversationsOpen] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [openingTaskID, setOpeningTaskID] = useState('');
@@ -581,16 +636,18 @@ export function Assistant() {
     ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
     ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
   ]);
+  const activeAccountTaskIDs = new Set((accountTasks.data?.items ?? [])
+    .filter((item) => !terminalTaskStatuses.has(item.status)).map((item) => item.id));
   const taskQueries = useQueries({ queries: taskIDs.map((id) => ({
     queryKey: ['task', id], queryFn: () => portalApi.task(id),
-    enabled: currentConversationTaskIDs.has(id) || expandedTaskIDs.includes(id),
+    enabled: currentConversationTaskIDs.has(id) || (taskPanelOpen && activeAccountTaskIDs.has(id)) || taskDetailTaskID === id,
     refetchInterval: (query: { state: { data: Task | undefined } }) => query.state.data?.result_message_pending ? 1000
       : query.state.data && terminalTaskStatuses.has(query.state.data.status) ? false
         : query.state.data && query.state.data.conversation_id !== conversationID ? 5000 : 1500,
   })) });
   const taskFileFetchQueries = useQueries({ queries: taskIDs.map((id, index) => ({
     queryKey: ['task-file-fetches', id], queryFn: () => portalApi.taskFileFetches(id),
-    enabled: currentConversationTaskIDs.has(id) || expandedTaskIDs.includes(id),
+    enabled: taskPanelOpen && taskDetailTaskID === id,
     refetchInterval: (query: { state: { data: { items: TaskFileFetch[] } | undefined } }) => {
       const task = taskQueries[index]?.data;
       return query.state.data?.items.some((item) => activeTaskFileFetchStatuses.has(item.status)) ||
@@ -608,8 +665,24 @@ export function Assistant() {
   const taskPanelTasks = taskPanelIDs.flatMap((id) => {
     const summary = accountTaskByID.get(id) ?? conversationTasks.data?.items.find((item) => item.id === id) ?? allTasksByID.get(id);
     return summary ? [summary] : [];
-  });
-  const pendingTaskCount = accountTasks.data?.items.filter((item) => item.status === 'waiting_user').length ?? null;
+  }).sort((left, right) => Date.parse(allTasksByID.get(right.id)?.updated_at ?? right.updated_at) -
+    Date.parse(allTasksByID.get(left.id)?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id));
+  const taskStatusForSummary = (item: TaskSummary) => allTasksByID.get(item.id)?.status ?? item.status;
+  const visibleTaskPanelTasks = taskPanelFilter === 'conversation'
+    ? taskPanelTasks.filter((item) => item.conversation_id === conversationID) : taskPanelTasks;
+  const taskProgressReadError = taskQueries.some((query, index) => query.isError &&
+    (activeAccountTaskIDs.has(taskIDs[index] ?? '') || currentConversationTaskIDs.has(taskIDs[index] ?? '')));
+  const taskPanelGroups = ([
+    { id: 'waiting', title: '待你处理', items: [] },
+    { id: 'active', title: '进行中', items: [] },
+    { id: 'paused', title: '已暂停', items: [] },
+    { id: 'recent', title: '最近结束', items: [] },
+    { id: 'unknown', title: '状态待确认', items: [] },
+  ] as const).map((group) => ({ ...group, items: visibleTaskPanelTasks.filter((item) => taskActivityGroup(taskStatusForSummary(item)) === group.id) }));
+  const pendingTaskCount = accountTasks.isSuccess && !taskProgressReadError
+    ? accountTasks.data.items.filter((item) => taskStatusForSummary(item) === 'waiting_user').length : null;
+  const activeTaskCount = accountTasks.isSuccess && !taskProgressReadError
+    ? accountTasks.data.items.filter((item) => ['queued', 'running', 'pausing', 'cancelling'].includes(taskStatusForSummary(item))).length : null;
   const resultsAwaitingMessages = tasks.some((task) => task.result_message_pending || (task.result_message_published &&
     !messages.data?.items.some((message) => message.sources?.some((source) => source.task_id === task.id &&
       source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence))));
@@ -658,8 +731,6 @@ export function Assistant() {
   const hostItems = hosts.data?.items ?? [];
   const selectedHost = hostItems.find((host) => host.id === preferredHostID);
   const hostIsReady = selectedHost?.state === 'running' && selectedHost.control_state === 'ai';
-  const workspaceBindings = selectedHost?.workspaces ?? [];
-  const selectedBinding = workspaceBindings.find((binding) => binding.workspace.id === workspaceSelection);
   async function openTaskObservation(task: Task, host: Host) {
     if (taskObservationRequest.current) return;
     const popup = window.open('about:blank', '_blank');
@@ -827,7 +898,7 @@ export function Assistant() {
     }
   };
   const retryProcessing = useMutation({
-    mutationFn: async (target: { conversationID: string; messageID: string }) => {
+    mutationFn: async (target: { conversationID: string; messageID: string; taskID?: string; resultReview?: boolean }) => {
       if (!user?.id || !capabilities.data?.service_instance_id) throw new Error('账号或服务尚未确认。');
       const instanceID = capabilities.data.service_instance_id;
       const current = await portalApi.capabilities();
@@ -839,8 +910,13 @@ export function Assistant() {
       clearProcessingRetryKey(instanceID, user.id, '', target.conversationID, target.messageID);
     },
     onSuccess: async (_value, target) => {
-      notify('已请求重新处理消息。', 'success');
+      notify(target.resultReview ? '已请求重新整理任务结果。' : '已请求重新处理消息。', 'success');
       await client.invalidateQueries({ queryKey: ['conversation-messages', target.conversationID] });
+      if (target.taskID) {
+        await client.invalidateQueries({ queryKey: ['task', target.taskID] });
+        await client.invalidateQueries({ queryKey: ['conversation-tasks', target.conversationID] });
+        await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
+      }
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
   });
@@ -1022,7 +1098,6 @@ export function Assistant() {
           client_message_id: id, content: effectiveText,
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
           ...(hostSelection ? { host_id: hostSelection } : {}),
-          ...(workspaceSelection ? { workspace_id: workspaceSelection } : {}),
           ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
           ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
         },
@@ -1160,6 +1235,7 @@ export function Assistant() {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       setTaskPanelOpen(false);
+      setTaskDetailTaskID(null);
       taskPanelToggle.current?.focus();
     };
     window.addEventListener('keydown', closeOnEscape);
@@ -1200,38 +1276,16 @@ export function Assistant() {
         onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' && message.attachments.length ? '重试附件' : '核对并重试'}</button>}
     </article>;
   };
-  const renderTaskActivity = (summary: TaskSummary) => {
+  const renderTaskDetail = (summary: TaskSummary) => {
     const task = allTasksByID.get(summary.id);
-    const listItem = task ?? summary;
-    const busy = !terminalTaskStatuses.has(listItem.status);
-    const taskConversation = conversationsData.find((item) => item.id === listItem.conversation_id);
-    const expanded = expandedTaskIDs.includes(listItem.id);
-    const taskQuery = taskQueries[taskIDs.indexOf(listItem.id)];
-    const taskFileFetchQuery = taskFileFetchQueries[taskIDs.indexOf(listItem.id)];
-    if (!task || (!expanded && !currentConversationTaskIDs.has(listItem.id))) return <section className="task-activity task-activity-summary" key={`activity:${listItem.id}`}
-      aria-label={`任务 ${listItem.id} 的工作过程`}>
-      <header className="task-activity-heading">
-        <div><strong>{listItem.objective || `任务 ${listItem.id}`}</strong>
-          <small>{taskConversation?.title || `会话 ${listItem.conversation_id}`} · 任务 {listItem.id}</small></div>
-          <span>服务端状态：{taskStatusLabel[listItem.status]}{listItem.current_revision !== undefined || listItem.desired_revision !== undefined
-          ? ` · 修订 ${listItem.current_revision ?? '—'} / ${listItem.desired_revision ?? '—'}` : ''}</span>
-      </header>
-      {listItem.host_id && <p className="assistant-task-target">当前任务使用：{taskTargetText(listItem, hostItems)}。输入区的目标只影响下一条消息。</p>}
-      <div className="inline-actions task-activity-actions">
-        <button type="button" className="button button-small button-secondary" onClick={() => selectConversationID(listItem.conversation_id)}>打开关联会话</button>
-        <button type="button" className="button button-small button-secondary" aria-expanded={expanded}
-          onClick={() => setExpandedTaskIDs((current) => expanded ? current.filter((id) => id !== listItem.id) : [...current, listItem.id])}>
-          {expanded ? '收起任务详情' : '查看任务详情'}
-        </button>
-        {busy && listItem.status === 'paused' && <button type="button" className="button button-small button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('resume', listItem)}>继续任务</button>}
-        {busy && ['queued', 'running', 'waiting_user'].includes(listItem.status) && <button type="button" className="button button-small button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('pause', listItem)}>暂停任务</button>}
-        {busy && ['queued', 'running', 'waiting_user', 'paused'].includes(listItem.status) && <button type="button" className="button button-small button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('cancel', listItem)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
-      </div>
-      {expanded && taskQuery?.isPending && <p className="muted" role="status">正在读取任务详情…</p>}
-    </section>;
+    const taskQuery = taskQueries[taskIDs.indexOf(summary.id)];
+    const taskFileFetchQuery = taskFileFetchQueries[taskIDs.indexOf(summary.id)];
+    if (!task) return taskQuery?.isError
+      ? <div className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
+        <button type="button" className="button button-small button-secondary" onClick={() => void taskQuery.refetch()}>重试</button></div>
+      : <p className="muted" role="status">正在读取任务详情…</p>;
+    const busy = !terminalTaskStatuses.has(task.status);
+    const taskConversation = conversationsData.find((item) => item.id === task.conversation_id);
     const k2Read = readK2TaskProjection(task);
     const k2 = k2Read.kind === 'available' ? k2Read.projection : null;
     const review = k2?.result_review ?? null;
@@ -1239,14 +1293,10 @@ export function Assistant() {
     const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
     const visibleSteps = task.steps.filter((step) => ['tool', 'subagent', 'verification', 'verify', 'batch_item', 'batch_result', 'progress'].includes(step.kind) &&
       !(task.waiting_reason === 'dsh_recovery_unresolved' && step.status === 'unknown'));
-    const ownConversationReplyVisible = task.conversation_id === conversationID && displayMessages.some((message) => message.role === 'assistant' && (message.task_id === task.id ||
-      message.sources?.some((source) => source.task_id === task.id && source.task_revision === task.assistant_message?.task_revision &&
-        source.event_sequence === task.assistant_message?.result_event_sequence)));
     const publishedReplyVisible = Boolean(review?.state === 'published' && review.source_task_id === task.id && review.reply_message_id &&
       (task.conversation_id !== conversationID || displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
         message.sources?.some((source) => source.task_id === review.source_task_id &&
           source.task_revision === review.source_task_revision && source.event_sequence === review.source_event_sequence))));
-    const hasReply = ownConversationReplyVisible || (task.conversation_id !== conversationID && publishedReplyVisible);
     const taskHost = task.host_id ? hostItems.find((host) => host.id === task.host_id) : undefined;
     const browserHandoffRequested = task.waiting_reason === 'clarification' && Boolean(task.clarification_request) && task.steps.some((step) =>
       step.kind === 'tool' && (step.title === 'Run cloud dsh tool: browser_prepare_user_handoff' ||
@@ -1254,148 +1304,195 @@ export function Assistant() {
     const answer = clarificationAnswers[task.id] ?? '';
     const supplementEntries = outbox.entries.filter(({ message }) => message.conversationID === task.conversation_id &&
       message.request.reference_task_id === task.id);
-    return <section className="task-activity" key={`activity:${task.id}`} aria-label={`任务 ${task.id} 的工作过程`}>
-        <header className="task-activity-heading">
-          <div><strong>{task.objective || `任务 ${task.id}`}</strong>
-            <small>{taskConversation?.title || `会话 ${task.conversation_id}`} · 任务 {task.id}</small></div>
-          <span>服务端状态：{taskStatusLabel[task.status]}{task.current_revision !== undefined || task.desired_revision !== undefined
-            ? ` · 修订 ${task.current_revision ?? '—'} / ${task.desired_revision ?? '—'}` : ''}</span>
-        </header>
-        {(busy || task.status === 'failed' || task.status === 'cancelled' || task.result_message_pending ||
-          (task.result_message_published && !hasReply)) && <div className="assistant-progress" role={task.status === 'failed' ? 'alert' : 'status'}>
-          <span>{taskStatusText(task, cloudTasksAvailable)}</span>
-          {recoveryMessage && <span>{recoveryMessage}</span>}
-          {busy && currentStep?.title && task.waiting_reason !== 'dsh_recovery_unresolved' && currentStep.kind !== 'model' && <span>{stepTitle(currentStep)}</span>}
-          {busy && taskEventFeeds[task.id] === 'disconnected' && !showConsolidatedNetworkError && <span>连接中断，正在重连…</span>}
-        </div>}
-        <div className="inline-actions task-activity-actions">
-          <button type="button" className="button button-small button-secondary" onClick={() => selectConversationID(task.conversation_id)}>打开关联会话</button>
-          {!currentConversationTaskIDs.has(task.id) && <button type="button" className="button button-small button-secondary"
-            onClick={() => setExpandedTaskIDs((current) => current.filter((id) => id !== task.id))}>收起任务详情</button>}
-        </div>
-        {task.host_id && <p className="assistant-task-target">当前任务使用：{taskTargetText(task, hostItems)}。下面的目标选择只影响下一条新消息。</p>}
-        {(taskFileFetchQuery?.isPending || taskFileFetchQuery?.isError || (taskFileFetchQuery?.data?.items.length ?? 0) > 0) &&
-          <section className="task-activity-k2 task-activity-file-fetches" aria-label={`任务 ${task.id} 的文件取回`}>
-            <h4>PC 文件取回</h4>
-            {taskFileFetchQuery?.isPending && <p className="muted" role="status">正在读取文件取回状态…</p>}
-            {taskFileFetchQuery?.isError && <p className="error-inline" role="alert">无法读取文件取回状态：{errorDetails(taskFileFetchQuery.error).message}
-              <button type="button" className="button button-small button-secondary" onClick={() => void taskFileFetchQuery.refetch()}>重试</button>
-            </p>}
-            {taskFileFetchQuery?.data?.items.length ? <ul>{taskFileFetchQuery.data.items.map((item) => {
-              const hasSize = item.size_bytes !== null;
-              const progressValue = hasSize ? Math.min(item.confirmed_bytes, item.size_bytes!) : 0;
-              return <li key={item.fetch_id}>
-                <span><strong>{item.relative_path}</strong><small>{taskFileFetchStatusLabel[item.status]}</small></span>
-                <small>来源设备：{item.source_device_name} · 已确认 {formatBytes(item.confirmed_bytes)}{hasSize ? ` / ${formatBytes(item.size_bytes!)}` : ' / 总大小待确认'}</small>
-                <small>来源版本：{item.source_version ?? '待确认'}</small>
-                {hasSize && item.size_bytes! > 0 && <progress max={item.size_bytes!} value={progressValue}
-                  aria-label={`文件取回进度：${item.relative_path}`} />}
-                <small>服务端副本：{taskFileFetchContentStateLabel[item.content_state]}
-                  {item.expires_at ? ` · 保留到 ${formatDate(item.expires_at)}` : ''}
-                  {item.deleted_at ? ` · 删除于 ${formatDate(item.deleted_at)}` : ''}</small>
-                {item.status === 'completed' && item.content_state === 'retained' && <button type="button" className="button button-small button-secondary"
-                  disabled={deleteTaskFileFetchContent.isPending}
-                  onClick={() => {
-                    if (window.confirm(`确认删除“${item.relative_path}”的服务端副本？删除后无法恢复。`)) {
-                      deleteTaskFileFetchContent.mutate({ taskID: task.id, fetchID: item.fetch_id });
-                    }
-                  }}>删除服务端副本</button>}
-              </li>;
-            })}</ul> : null}
-          </section>}
-        {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
-          <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
-          <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
-        </div>}
-        {busy && <div className="inline-actions task-activity-actions">
-          {task.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-            onClick={() => submitTaskControl('resume', task)}>继续任务</button>}
-          {['queued', 'running', 'waiting_user'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-            onClick={() => submitTaskControl('pause', task)}>暂停任务</button>}
-          {['queued', 'running', 'waiting_user', 'paused'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-            onClick={() => submitTaskControl('cancel', task)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
-          <button type="button" className="button button-secondary"
-            onClick={() => setSupplementTaskID((current) => current === task.id ? null : task.id)}>
-            {supplementTaskID === task.id ? '收起补充任务' : '补充任务'}
-          </button>
-        </div>}
-        {busy && supplementTaskID === task.id && task.waiting_reason !== 'project_recovery_unavailable' && <form className="task-supplement-form"
-          aria-label={`补充任务 ${task.id}`} onSubmit={(event) => submitTaskSupplement(event, task)}>
-          <label htmlFor={`task-supplement-${task.id}`}>补充任务内容</label>
-          <textarea id={`task-supplement-${task.id}`} value={taskSupplementDrafts[task.id] ?? ''} maxLength={maxMessageBytes}
-            onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))}
-            disabled={savingMessage} />
-          <button type="submit" className="button button-primary" disabled={!taskSupplementDrafts[task.id]?.trim() || savingMessage}>发送补充任务</button>
-        </form>}
-        {supplementEntries.map(({ message, scope }) => <div className="task-supplement-status" key={message.request.client_message_id}>
-          <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
-            : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{message.error ? `：${message.error}` : ''}</small>
-          {message.status !== 'sending' && <button type="button" className="button button-small button-secondary"
-            onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' ? '核对消息' : '核对并重试'}</button>}
-        </div>)}
-        {visibleSteps.length > 0 && <details><summary>查看工作过程</summary><ol className="task-activity-steps">
-          {visibleSteps.map((step) => <li key={step.id}><span aria-hidden="true">•</span><span><strong>{stepTitle(step)}</strong>
-            {step.kind !== 'progress' && <small>{stepStatus[step.status]}</small>}
-            {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
-          </span></li>)}
-        </ol></details>}
-        {k2Read.kind === 'invalid' && <div className="notice notice-warning" role="alert">
-          并发任务投影格式无效；当前只显示服务端 Task 状态，不会把未核验的结果当作最终回复。
-        </div>}
-        {k2 && k2.dependencies.length > 0 && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的依赖`}>
-          <h4>依赖任务</h4>
-          <ul>{k2.dependencies.map((dependency) => <li key={`${dependency.task_id}:${dependency.required_revision}`}>
+    const fileFetches = taskFileFetchQuery?.data?.items ?? [];
+    const progressText = taskActivityProgressText(summary, task, cloudTasksAvailable);
+    return <section className="task-activity" data-task-id={task.id} aria-label={`任务详情：${task.objective || '未命名任务'}`}>
+      <header className="task-activity-heading">
+        <div><strong>{task.objective || '未命名任务'}</strong>
+          <small>{taskConversation?.title || '所属会话'} · 更新于 {formatDate(task.updated_at)}</small></div>
+        <span className={`task-activity-status status-${task.status}`}>{taskActivityStatusText(summary, task)}</span>
+      </header>
+      {task.pending_request && <section className="notice notice-warning task-detail-attention" aria-label="需要批准的操作">
+        <h3>{task.pending_request.title}</h3><p>{task.pending_request.object}</p><p>{task.pending_request.content}</p><p>可能影响：{task.pending_request.impact}</p>
+        <div className="inline-actions">{(['approve', 'reject'] as const).map((decision) => <button key={decision} type="button"
+          className={`button ${decision === 'approve' ? 'button-primary' : 'button-secondary'}`} disabled={respondToApproval.isPending}
+          onClick={() => {
+            const request = task.pending_request!;
+            const actionScope = `approval:${task.id}:${request.id}`;
+            const fingerprint = JSON.stringify({ version: request.version, decision });
+            respondToApproval.mutate({ taskID: task.id, approvalID: request.id, version: request.version,
+              decision, actionScope, key: taskActionKey(actionScope, fingerprint) });
+          }}>{decision === 'approve' ? '批准并继续' : '拒绝'}</button>)}</div>
+      </section>}
+      {task.clarification_request && <form className="notice notice-warning task-detail-attention" aria-label="补充任务信息"
+        onSubmit={(event) => submitClarification(event, task)}>
+        <h3>任务需要补充信息</h3><p>{task.clarification_request.question}</p>
+        <label htmlFor={`task-clarification-${task.id}`}>你的回答</label>
+        <textarea id={`task-clarification-${task.id}`} value={answer} maxLength={16384} required
+          onChange={(event) => setClarificationAnswers((current) => ({ ...current, [task.id]: event.target.value }))} disabled={answerClarification.isPending} />
+        <button type="submit" className="button button-primary" disabled={!answer.trim() || answerClarification.isPending}>
+          {answerClarification.isPending ? '正在提交…' : '提交并继续'}
+        </button>
+      </form>}
+      <section className="task-current-progress" aria-label="当前进展">
+        <h3>当前进展</h3>
+        <p role={task.status === 'failed' ? 'alert' : 'status'}>{progressText}</p>
+        {recoveryMessage && <p role="status">{recoveryMessage}</p>}
+        {taskEventFeeds[task.id] === 'disconnected' && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
+      </section>
+      {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
+        <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
+        <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
+      </div>}
+      {taskFileFetchQuery?.isPending && !taskFileFetchQuery.data && <p className="muted" role="status">正在核对本机文件读取记录…</p>}
+      {taskFileFetchQuery?.isError && <p className="error-inline task-file-fetch-error" role="alert">
+        {fileFetches.length ? '读取记录暂不可用，以下为最近一次已确认状态。' : '部分任务记录暂不可用，无法确认任务是否读取了本机文件。'}
+        <button type="button" className="button button-small button-secondary" onClick={() => void taskFileFetchQuery.refetch()}>重试</button>
+      </p>}
+      {fileFetches.length > 0 && <section className="task-activity-k2 task-activity-file-fetches" aria-label="读取本机文件">
+        <h3>读取本机文件</h3>
+        <p>文件副本临时保存在云端供本任务使用；删除副本不会更改本机原文件，也不会撤回任务已读取的内容。</p>
+        <ul>{fileFetches.map((item) => {
+          const hasSize = item.size_bytes !== null;
+          const progressValue = hasSize ? Math.min(item.confirmed_bytes, item.size_bytes!) : 0;
+          return <li key={item.fetch_id}>
+            <span><strong>{item.relative_path}</strong><small>{item.source_device_name} · {item.status === 'failed'
+              ? taskFileFetchFailureText(item.failure_reason) : taskFileFetchStatusLabel[item.status]}</small></span>
+            <small>已确认 {formatBytes(item.confirmed_bytes)}{hasSize ? ` / ${formatBytes(item.size_bytes!)}` : ' / 总大小待确认'}</small>
+            {hasSize && item.size_bytes! > 0 && <progress max={item.size_bytes!} value={progressValue}
+              aria-label={`读取本机文件进度：${item.relative_path}`} />}
+            <small>{taskFileFetchContentText(item)}</small>
+            <small>云端临时副本：{taskFileFetchContentStateLabel[item.content_state]}
+              {item.expires_at ? ` · 到期 ${formatDate(item.expires_at)}` : ''}
+              {item.deleted_at ? ` · 删除于 ${formatDate(item.deleted_at)}` : ''}</small>
+            {item.status === 'completed' && item.content_state === 'retained' && <button type="button" className="button button-small button-secondary"
+              disabled={deleteTaskFileFetchContent.isPending || taskFileFetchQuery?.isError}
+              onClick={() => {
+                if (window.confirm(`确认删除“${item.relative_path}”的云端临时副本？删除后无法恢复，本机原文件不受影响。`)) {
+                  deleteTaskFileFetchContent.mutate({ taskID: task.id, fetchID: item.fetch_id });
+                }
+              }}>删除云端副本</button>}
+          </li>;
+        })}</ul>
+      </section>}
+      {busy && <div className="inline-actions task-activity-actions">
+        <button type="button" className="button button-small button-secondary" onClick={() => {
+          selectConversationID(task.conversation_id);
+          setTaskDetailTaskID(null);
+          setTaskPanelOpen(false);
+        }}>打开所属会话</button>
+        {task.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('resume', task)}>继续任务</button>}
+        {['queued', 'running', 'waiting_user'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('pause', task)}>暂停任务</button>}
+        {['queued', 'running', 'waiting_user', 'paused'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('cancel', task)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
+        <button type="button" className="button button-secondary"
+          onClick={() => setSupplementTaskID((current) => current === task.id ? null : task.id)}>
+          {supplementTaskID === task.id ? '收起补充任务' : '补充任务'}
+        </button>
+      </div>}
+      {!busy && <div className="inline-actions task-activity-actions"><button type="button" className="button button-small button-secondary" onClick={() => {
+        selectConversationID(task.conversation_id);
+        setTaskDetailTaskID(null);
+        setTaskPanelOpen(false);
+      }}>打开所属会话</button></div>}
+      {busy && supplementTaskID === task.id && task.waiting_reason !== 'project_recovery_unavailable' && <form className="task-supplement-form"
+        aria-label="补充任务" onSubmit={(event) => submitTaskSupplement(event, task)}>
+        <label htmlFor={`task-supplement-${task.id}`}>补充任务内容</label>
+        <textarea id={`task-supplement-${task.id}`} value={taskSupplementDrafts[task.id] ?? ''} maxLength={maxMessageBytes}
+          onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))}
+          disabled={savingMessage} />
+        <button type="submit" className="button button-primary" disabled={!taskSupplementDrafts[task.id]?.trim() || savingMessage}>发送补充任务</button>
+      </form>}
+      {supplementEntries.map(({ message, scope }) => <div className="task-supplement-status" key={message.request.client_message_id}>
+        <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
+          : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{message.error ? `：${message.error}` : ''}</small>
+        {message.status !== 'sending' && <button type="button" className="button button-small button-secondary"
+          onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' ? '核对消息' : '核对并重试'}</button>}
+      </div>)}
+      {visibleSteps.length > 0 && <details className="task-detail-work"><summary>工作过程</summary><ol className="task-activity-steps">
+        {visibleSteps.map((step) => <li key={step.id}><span aria-hidden="true">•</span><span><strong>{stepTitle(step)}</strong>
+          {step.kind !== 'progress' && <small>{stepStatus[step.status]}</small>}
+          {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
+        </span></li>)}
+      </ol></details>}
+      {k2Read.kind === 'invalid' && <div className="notice notice-warning" role="alert">
+        任务协作记录暂不可用；当前仅展示已确认的任务状态和结果。
+      </div>}
+      {k2?.child_jobs.length ? <section className="task-activity-k2" aria-label="子任务进度">
+        <h3>子任务进度</h3><ul>{k2.child_jobs.map((job) => <li key={job.job_id}>
+          <span><strong>{job.title || '子任务'}</strong><small>{stepStatus[job.status]}</small></span>
+        </li>)}</ul>
+      </section> : null}
+      {review && <section className="task-activity-k2 task-activity-review" aria-label="结果整理">
+        <h3>结果整理</h3>
+        <p role={review.state === 'failed' ? 'alert' : 'status'}>{resultReviewStatusText(review, publishedReplyVisible)}</p>
+        {review.state === 'failed' && review.trigger_message_id && <button type="button" className="button button-small button-secondary"
+          disabled={retryProcessing.isPending}
+          onClick={() => retryProcessing.mutate({ conversationID: task.conversation_id, messageID: review.trigger_message_id!, taskID: task.id, resultReview: true })}>
+          重试结果整理
+        </button>}
+      </section>}
+      {task.artifacts.length > 0 && <section className="task-activity-k2 task-activity-artifacts" aria-label="任务成果">
+        <h3>任务成果</h3><ul>{task.artifacts.map((artifact) => <li key={artifact.id}>
+          <strong>{artifact.label}</strong>
+          <small>{artifact.path} · {artifact.media_type}{artifact.size_bytes === null ? '' : ` · ${formatBytes(artifact.size_bytes)}`}
+            {' · '}{artifact.verified ? '已核验' : '核验状态待确认'}</small>
+        </li>)}</ul>
+      </section>}
+      {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
+        {taskHost?.state === 'running'
+          ? <button type="button" className="button button-secondary" disabled={openingTaskID === task.id}
+            onClick={() => void openTaskObservation(task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…'
+              : task.artifacts.some((artifact) => artifact.verified) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
+          : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
+        {taskObservationError?.taskID === task.id && <p className="error-text" role="alert">{taskObservationError.message}</p>}
+      </div>}
+      <details className="task-detail-diagnostics"><summary>更多信息</summary>
+        <p>任务 ID：{task.id}{task.current_revision !== undefined || task.desired_revision !== undefined
+          ? ` · 修订 ${task.current_revision ?? '—'} / ${task.desired_revision ?? '—'}` : ''}</p>
+        {task.host_id && <p>执行目标：{taskTargetText(task, hostItems)}</p>}
+        {k2?.dependencies.length ? <section className="task-activity-k2" aria-label="依赖任务">
+          <h3>依赖任务</h3><ul>{k2.dependencies.map((dependency) => <li key={`${dependency.task_id}:${dependency.required_revision}`}>
             <span>{dependencyStatusText(dependency)}</span>
           </li>)}</ul>
+        </section> : null}
+        {k2?.child_jobs.length ? <ul>{k2.child_jobs.map((job) => <li key={job.job_id}>
+          {job.job_id} · 步骤 {job.task_step_id} · 修订 {job.task_revision}
+        </li>)}</ul> : null}
+        {review && <p>结果来源任务 {review.source_task_id} · 修订 {review.source_task_revision} · 结果事件 {review.source_event_sequence}
+          {review.reply_message_id ? ` · 回复消息 ${review.reply_message_id}` : ''}</p>}
+        {task.result && <section className="task-activity-k2" aria-label="原始结果">
+          <h3>原始结果</h3><details><summary>查看原始结果（不是最终回复）</summary><ChatMarkdown content={task.result} /></details>
         </section>}
-        {k2 && k2.child_jobs.length > 0 && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的子任务`}>
-          <h4>子任务进度</h4>
-          <ul>{k2.child_jobs.map((job) => <li key={job.job_id}>
-            <span><strong>{job.title || job.job_id}</strong><small>{stepStatus[job.status]}</small></span>
-            <small>子会话 {job.job_id} · 步骤 {job.task_step_id} · 修订 {job.task_revision}</small>
-          </li>)}</ul>
-        </section>}
-        {review && <section className="task-activity-k2 task-activity-review" aria-label={`任务 ${task.id} 的结果整理`}>
-          <h4>主助手结果整理</h4>
-          <p role={review.state === 'failed' ? 'alert' : 'status'}>{resultReviewStatusText(review, publishedReplyVisible)}</p>
-          <small>来源任务 {review.source_task_id} · 修订 {review.source_task_revision} · 结果事件 {review.source_event_sequence}</small>
-          {review.reply_message_id && <small>最终回复消息 {review.reply_message_id}</small>}
-        </section>}
-        {task.result && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的原始结果`}>
-          <h4>Task 原始结果</h4>
-          <details><summary>查看 Task 原始结果（不是最终回复）</summary><ChatMarkdown content={task.result} /></details>
-        </section>}
-        {task.artifacts.map((artifact) => <p className="task-activity-artifact" key={artifact.id}>成果：{artifact.label}</p>)}
-        {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
-          {taskHost?.state === 'running'
-            ? <button type="button" className="button button-secondary" disabled={openingTaskID === task.id}
-              onClick={() => void openTaskObservation(task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…' : '在 Workbench 只读观察'}</button>
-            : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
-          {taskObservationError?.taskID === task.id && <p className="error-text" role="alert">{taskObservationError.message}</p>}
-        </div>}
-        {task.pending_request && <section className="notice notice-warning" aria-label="需要批准的操作">
-          <h3>{task.pending_request.title}</h3><p>{task.pending_request.object}</p><p>{task.pending_request.content}</p><p>可能影响：{task.pending_request.impact}</p>
-          <div className="inline-actions">{(['approve', 'reject'] as const).map((decision) => <button key={decision} type="button"
-            className={`button ${decision === 'approve' ? 'button-primary' : 'button-secondary'}`} disabled={respondToApproval.isPending}
-            onClick={() => {
-              const request = task.pending_request!;
-              const actionScope = `approval:${task.id}:${request.id}`;
-              const fingerprint = JSON.stringify({ version: request.version, decision });
-              respondToApproval.mutate({ taskID: task.id, approvalID: request.id, version: request.version,
-                decision, actionScope, key: taskActionKey(actionScope, fingerprint) });
-            }}>{decision === 'approve' ? '批准并继续' : '拒绝'}</button>)}</div>
-        </section>}
-        {task.clarification_request && <form className="notice notice-warning" aria-label="补充任务信息" onSubmit={(event) => submitClarification(event, task)}>
-          <h3>任务需要补充信息</h3><p>{task.clarification_request.question}</p>
-          <label htmlFor={`task-clarification-${task.id}`}>你的回答</label>
-          <textarea id={`task-clarification-${task.id}`} value={answer} maxLength={16384} required
-            onChange={(event) => setClarificationAnswers((current) => ({ ...current, [task.id]: event.target.value }))} disabled={answerClarification.isPending} />
-          <button type="submit" className="button button-primary" disabled={!answer.trim() || answerClarification.isPending}>
-            {answerClarification.isPending ? '正在提交…' : '提交并继续'}
-          </button>
-        </form>}
-      </section>;
+      </details>
+    </section>;
   };
+
+  const renderTaskSummary = (summary: TaskSummary) => {
+    const task = allTasksByID.get(summary.id);
+    const taskConversation = conversationsData.find((item) => item.id === summary.conversation_id);
+    const title = task?.objective || summary.objective || '未命名任务';
+    const status = task?.status ?? summary.status;
+    const updatedAt = task?.updated_at ?? summary.updated_at;
+    const waiting = status === 'waiting_user';
+    return <article className="task-activity-card" data-task-id={summary.id} key={summary.id}>
+      <button ref={(button) => { if (button) taskCardButtons.current.set(summary.id, button); else taskCardButtons.current.delete(summary.id); }}
+        type="button" className="task-activity-card-button"
+        aria-label={`${waiting ? '查看并处理' : '查看详情'}：${title}，${taskActivityStatusText(summary, task)}`}
+        onClick={() => setTaskDetailTaskID(summary.id)}>
+        <span className="task-activity-card-title"><strong>{title}</strong>
+          <span className={`task-activity-status status-${status}`}>{taskActivityStatusText(summary, task)}</span></span>
+        <span className="task-activity-card-subtitle">{taskConversation?.title || '所属会话'} · {taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
+        <span className="task-activity-card-footer"><small>更新于 {formatDate(updatedAt)}</small>
+          <span>{waiting ? '查看并处理' : '查看详情'} <span aria-hidden="true">›</span></span></span>
+      </button>
+    </article>;
+  };
+  const selectedTaskSummary = taskDetailTaskID
+    ? taskPanelTasks.find((item) => item.id === taskDetailTaskID) ?? allTasksByID.get(taskDetailTaskID) ?? null
+    : null;
 
   return <section className="assistant-page">
     {showConsolidatedNetworkError && <div className="error-card assistant-network-error" role="alert">网络异常，部分对话数据暂时无法读取。<button type="button" className="button button-secondary" onClick={retryNetworkReads}>重试</button></div>}
@@ -1412,30 +1509,34 @@ export function Assistant() {
       云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
     </div>}
     <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}`}>
-      <aside className="assistant-sidebar" aria-label="最近对话">
-        <div className="assistant-sidebar-heading"><button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); }}><MordeIcon name="refresh" /></button></div>
-        {conversations.isPending ? <p className="muted" role="status">正在加载对话…</p> : conversations.isError && !conversations.data
-          ? showConsolidatedNetworkError ? <p className="muted">对话列表暂不可用</p>
-            : <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.refetch()}>重试</button></div>
-          : <>
-            {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
-              : mainConversationDetail.isError ? <div className="error-inline" role="alert">无法读取主会话：{errorDetails(mainConversationDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void mainConversationDetail.refetch()}>重试</button></div>
-                : <p className="muted" role="status">正在读取主会话…</p>)}
-            <div className="conversation-group">
-              <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
-                <summary>旁路会话</summary>
-                <div className="conversation-list">{sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}</div>
-                {conversations.isFetchNextPageError && <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></div>}
-                {(sideConversations.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
-                  disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
-                  {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
-                </button>}
-                {!sideConversations.length && !conversations.hasNextPage && <p className="muted assistant-sidebar-empty">还没有旁路会话。</p>}
-              </details>
-              <button type="button" className="button button-secondary conversation-new" aria-label="新建旁路会话" title="新建旁路会话" onClick={startNew}>+</button>
-            </div>
-          </>}
-        <p className="assistant-sidebar-hint">主会话保留日常交流，旁路会话可用于单独讨论。</p>
+      <aside id="context-sidebar" className="assistant-sidebar" aria-label="对话">
+        <div className="assistant-sidebar-heading">
+          <button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); }}><MordeIcon name="refresh" /></button>
+        </div>
+        <div id="conversation-history" className="assistant-history-content">
+          {conversations.isPending ? <p className="muted" role="status">正在加载对话…</p> : conversations.isError && !conversations.data
+            ? showConsolidatedNetworkError ? <p className="muted">对话列表暂不可用</p>
+              : <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.refetch()}>重试</button></div>
+            : <>
+              {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
+                : mainConversationDetail.isError ? <div className="error-inline" role="alert">无法读取主会话：{errorDetails(mainConversationDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void mainConversationDetail.refetch()}>重试</button></div>
+                  : <p className="muted" role="status">正在读取主会话…</p>)}
+              <div className="conversation-group">
+                <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
+                  <summary>旁路会话</summary>
+                  <div className="conversation-list">{sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}</div>
+                  {conversations.isFetchNextPageError && <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></div>}
+                  {(sideConversations.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
+                    disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
+                    {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
+                  </button>}
+                  {!sideConversations.length && !conversations.hasNextPage && <p className="muted assistant-sidebar-empty">还没有旁路会话。</p>}
+                </details>
+                <button type="button" className="button button-secondary conversation-new" aria-label="新建旁路会话" title="新建旁路会话" onClick={startNew}>+</button>
+              </div>
+            </>}
+          <p className="assistant-sidebar-hint">主会话保留日常交流，旁路会话可用于单独讨论。</p>
+        </div>
       </aside>
       <div className="assistant-main">
         <header className="conversation-view-heading">
@@ -1447,7 +1548,10 @@ export function Assistant() {
             aria-label="任务动态" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
             aria-expanded={taskPanelOpen} aria-controls="assistant-task-panel"
             title={pendingTaskCount === null ? '任务动态，待处理数量暂不可用' : `任务动态，${pendingTaskCount} 项等待用户`}
-            onClick={() => setTaskPanelOpen((open) => !open)}>
+            onClick={() => setTaskPanelOpen((open) => {
+              if (open) setTaskDetailTaskID(null);
+              return !open;
+            })}>
             <MordeIcon name="panel" />任务动态{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
             {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
           </button>
@@ -1519,7 +1623,6 @@ export function Assistant() {
           {hosts.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取目标电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>}
           {preferredHostID && !selectedHost && !hosts.isPending && !hosts.isError && <p className="notice notice-warning" role="status">所选电脑状态待核对；实际使用该目标时会检查权限和状态。</p>}
           {selectedHost && !hostIsReady && <p className="notice notice-warning" role="status">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</p>}
-          {workspaceSelection && !selectedBinding && <p className="notice notice-warning" role="status">所选 Workspace 状态待核对；消息仍可发送，使用时会再次核验。</p>}
           {showJumpToLatest && conversationID && <div className="assistant-jump-latest"><button type="button" className="button button-secondary"
             onClick={() => { followConversation.current = true; if (conversationView.current) conversationView.current.scrollTop = conversationView.current.scrollHeight; setShowJumpToLatest(false); }}>
             ↓ 回到最新消息</button></div>}
@@ -1573,19 +1676,11 @@ export function Assistant() {
                 </select></label>
                 <div className="assistant-target-row">
                   <label className="assistant-selector"><MordeIcon name="monitor" /><span className="sr-only">目标电脑</span><select aria-label="选择目标电脑" value={selectedHost?.id ?? hostSelection ?? ''}
-                    disabled={hosts.isPending} onChange={(event) => { setHostSelection(event.target.value); setWorkspaceSelection(''); }}>
+                    disabled={hosts.isPending} onChange={(event) => setHostSelection(event.target.value)}>
                     <option value="">无电脑目标</option>
                     {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
                     {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
                   </select></label>
-                  {selectedHost && <label className="assistant-selector"><MordeIcon name="folder" /><span className="sr-only">Workspace</span><select aria-label="选择目标 Workspace" value={selectedBinding?.workspace.id ?? workspaceSelection}
-                    onChange={(event) => setWorkspaceSelection(event.target.value)}>
-                    <option value="">不附加 Workspace</option>
-                    {workspaceSelection && !selectedBinding && <option value={workspaceSelection}>所选 Workspace 状态待核验</option>}
-                    {workspaceBindings.map((binding) => <option key={binding.workspace.id} value={binding.workspace.id}>
-                      {binding.workspace.name || binding.workspace.id} · v{binding.workspace.revision} · {workspaceBindingReady(binding) ? '已应用' : '未就绪'}
-                    </option>)}
-                  </select></label>}
                 </div>
                 {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
@@ -1610,27 +1705,60 @@ export function Assistant() {
       </div>
       {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="任务动态">
         <header className="task-panel-heading">
-          <div><h2>任务动态</h2><span>{accountTasks.isSuccess ? `账号任务 · ${accountTasks.data.items.length} 项` : '当前账号可见任务'}</span></div>
+          <div><h2>任务动态</h2><span>{pendingTaskCount !== null && activeTaskCount !== null
+            ? `${pendingTaskCount} 项待处理 · ${activeTaskCount} 项进行中`
+            : accountTasks.isError || taskProgressReadError ? '任务状态暂不可用' : '正在读取任务状态…'}</span></div>
           <div className="inline-actions">
-            <button type="button" className="icon-button" aria-label="刷新任务动态" onClick={() => { void accountTasks.refetch(); void conversationTasks.refetch(); }}>↻</button>
-            <button type="button" className="icon-button" aria-label="关闭任务动态" onClick={() => { setTaskPanelOpen(false); taskPanelToggle.current?.focus(); }}>×</button>
+            <button type="button" className="icon-button" aria-label="刷新任务动态" onClick={() => {
+              void accountTasks.refetch();
+              void conversationTasks.refetch();
+              void client.invalidateQueries({ queryKey: ['task'] });
+              if (taskDetailTaskID) void client.invalidateQueries({ queryKey: ['task-file-fetches', taskDetailTaskID] });
+            }}>↻</button>
+            <button type="button" className="icon-button" aria-label="关闭任务动态" onClick={() => {
+              setTaskPanelOpen(false);
+              setTaskDetailTaskID(null);
+              taskPanelToggle.current?.focus();
+            }}>×</button>
           </div>
         </header>
-        <div className="task-panel-list">
+        {taskDetailTaskID && <div className="task-panel-detail task-panel-list">
+          <div className="task-panel-detail-nav"><button type="button" className="button button-small button-secondary"
+            onClick={() => {
+              setTaskDetailTaskID(null);
+              window.requestAnimationFrame(() => taskCardButtons.current.get(taskDetailTaskID)?.focus());
+            }}>‹ 返回任务列表</button></div>
+          {selectedTaskSummary ? renderTaskDetail(selectedTaskSummary)
+            : <p className="muted" role="status">此任务已不在当前可见列表中，请刷新任务动态。</p>}
+        </div>}
+        <div className="task-panel-list" hidden={Boolean(taskDetailTaskID)}>
+          <div className="task-panel-filters" role="group" aria-label="任务范围">
+            <button type="button" className={taskPanelFilter === 'all' ? 'is-selected' : ''} aria-pressed={taskPanelFilter === 'all'}
+              onClick={() => setTaskPanelFilter('all')}>全部任务</button>
+            <button type="button" className={taskPanelFilter === 'conversation' ? 'is-selected' : ''} aria-pressed={taskPanelFilter === 'conversation'}
+              disabled={!conversationID} onClick={() => setTaskPanelFilter('conversation')}>当前会话</button>
+          </div>
           {capabilities.isPending && <p className="muted" role="status">正在确认账号与服务身份…</p>}
           {!accountTasksEnabled && !capabilities.isPending && <p className="muted" role="status">账号或服务身份尚未确认，任务列表暂不可用。</p>}
           {accountTasksEnabled && accountTasks.isPending && <p className="muted" role="status">正在读取账号任务…</p>}
-          {accountTasks.isError && <div className="error-inline" role="alert">无法读取完整任务列表，当前任务可能不全：{errorDetails(accountTasks.error).message}
+          {accountTasks.isError && <div className="error-inline" role="alert">任务状态暂不可用，当前列表可能不完整。
             <button type="button" className="button button-small button-secondary" onClick={() => void accountTasks.refetch()}>重试</button></div>}
-          {conversationTasks.isError && accountTasks.isError && <div className="error-inline" role="alert">当前会话活动任务也无法读取：{errorDetails(conversationTasks.error).message}
+          {conversationTasks.isError && !accountTasks.isSuccess && <div className="error-inline" role="alert">当前会话任务状态也暂不可用。
             <button type="button" className="button button-small button-secondary" onClick={() => void conversationTasks.refetch()}>重试</button></div>}
-          {taskQueries.some((query, index) => query.isPending && (currentConversationTaskIDs.has(taskIDs[index] ?? '') || expandedTaskIDs.includes(taskIDs[index] ?? '')))
-            && <p className="muted" role="status">正在读取任务详情…</p>}
-          {taskQueries.map((query, index) => query.isError && <div className="error-inline" role="alert" key={`task-error:${taskIDs[index]}`}>
-            无法读取任务 {taskIDs[index]} 的详情：{errorDetails(query.error).message}
-            <button type="button" className="button button-small button-secondary" onClick={() => void query.refetch()}>重试</button></div>)}
-          {!accountTasks.isPending && !accountTasks.isError && taskPanelTasks.length === 0 && <p className="muted">还没有任务。</p>}
-          {taskPanelTasks.map(renderTaskActivity)}
+          {taskProgressReadError && <div className="error-inline" role="alert">
+            部分任务进展暂不可用，显示最近一次已确认状态。<button type="button" className="button button-small button-secondary"
+              onClick={() => void client.invalidateQueries({ queryKey: ['task'] })}>重试</button></div>}
+          {!accountTasks.isPending && !accountTasks.isError && !taskProgressReadError && !visibleTaskPanelTasks.length &&
+            <p className="muted">{taskPanelFilter === 'conversation' ? '当前会话还没有任务。' : '还没有任务。'}</p>}
+          {taskPanelGroups.map((group) => !group.items.length ? null : group.id === 'recent'
+            ? <details className="task-panel-group task-panel-group-recent" key={group.id}>
+              <summary>{group.title}<span>{group.items.length}</span></summary>
+              <div className="task-panel-cards">{group.items.map(renderTaskSummary)}</div>
+            </details>
+            : <section className="task-panel-group" key={group.id} aria-label={group.title}>
+              <h3>{group.title}<span>{group.items.length}</span></h3>
+              <div className="task-panel-cards">{group.items.map(renderTaskSummary)}</div>
+            </section>)}
         </div>
       </aside>}
     </div>

@@ -3,7 +3,6 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'">
 <title>Morde</title><link rel="stylesheet" href="morde.css"></head>
 <body>
-<header><strong>Morde</strong><span id="account"></span><nav id="navigation" hidden><button id="web" type="button">AI 助手</button><button id="account-settings" type="button">账户设置</button><button id="local-sync" type="button">本机同步</button><button id="logout" type="button">退出登录</button></nav></header>
 <main>
   <section id="login"><h1>登录 Morde</h1><p>使用你的 Morde 账号登录。此电脑会自动获得授权。</p>
     <form id="login-form"><label>服务地址<input id="origin" type="url" placeholder="https://your-morde.example" autocomplete="url" required></label>
@@ -12,8 +11,14 @@
       <button id="submit" type="submit">登录</button></form>
     <p><button id="register" class="text-button" type="button">注册账号</button><button id="download" class="text-button" type="button">下载安装包</button></p>
   </section>
-  <section id="sync-page" hidden><h1>本机 Workspace 同步</h1><p>为每个云端 Workspace 选择本机目录后，可按需指定同步方向和相对路径范围。单次同步与固定实时同步节点由各自控件管理。</p>
+  <section id="sync-page" hidden><h1>文件同步</h1>
     <p id="expiry-warning" class="card" role="status" hidden>客户端登录将在 7 天内到期，请重新登录。</p>
+    <section id="project-upload" class="card">
+      <h2>上传项目到云端电脑</h2>
+      <p>选择云端电脑和本机项目文件夹，再点击上传。每次只从本机上传到 <code>~/workspace/project/&lt;项目名&gt;/</code>；云端修改不会下载到本机。电脑关机时，云端确认与电脑应用是两个状态。</p>
+      <div id="project-upload-content"></div>
+    </section>
+    <h2>已有 Workspace 同步</h2><p>以下为已有的 Workspace 同步和恢复入口。</p>
     <div id="workspaces"></div>
   </section>
 </main>

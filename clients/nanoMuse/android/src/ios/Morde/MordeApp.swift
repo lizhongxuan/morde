@@ -31,6 +31,10 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskQueueFixtureLaunchArgument = "-morde.localTaskQueueFixture"
     static let chatSendOfflineFixtureLaunchArgument = "-morde.localChatSendOfflineFixture"
     static let chatOfflineRecoveryFixtureLaunchArgument = "-morde.localChatOfflineRecoveryFixture"
+    static let portalMessageTransportFailureFixtureLaunchArgument = "-morde.portalMessageTransportFailureFixture"
+    static let clientSessionExpiryOnceFixtureLaunchArgument = "-morde.localClientSessionExpiryOnceFixture"
+    private static let clientSessionExpiryFixtureLock = NSLock()
+    private static var clientSessionExpiryFixtureDidRespond = false
     private static let chatOfflineRecoveryMessageDefaultsKey = "morde.localChatOfflineRecoveryMessage.v1"
     static let messageSendWithoutAutoRoutingFixtureLaunchArgument = "-morde.localMessageSendWithoutAutoRoutingFixture"
     static let selectedUnavailableHostSendFixtureLaunchArgument = "-morde.localSelectedUnavailableHostSendFixture"
@@ -344,10 +348,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
             version: NSNull(), hash: NSNull(), media: NSNull(), size: NSNull(), confirmed: 0,
             status: offlineStatus, waiting: offlineStatus == "waiting_device" ? "device_offline" : NSNull(),
             contentID: NSNull(), contentState: "none", parseStatus: "pending")
-        let progress = record("o0000002", directory: "Authorized Reports", path: "reports/current.txt",
+        var progress = record("o0000002", directory: "Authorized Reports", path: "reports/current.txt",
             version: String(repeating: "a", count: 64), hash: NSNull(), media: "text/plain",
             size: 10, confirmed: 4, status: "transferring", waiting: NSNull(),
             contentID: NSNull(), contentState: "none", parseStatus: "pending")
+        progress["task_revision"] = 0
         let pdf = record("o0000003", directory: "Reference Materials", path: "docs/source.pdf",
             version: String(repeating: "b", count: 64), hash: digest, media: "application/pdf",
             size: taskFileFetchPDF.count, confirmed: taskFileFetchPDF.count, status: "completed", waiting: NSNull(),
@@ -751,6 +756,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
 
     private static func isAccountA(_ request: URLRequest) -> Bool {
         request.value(forHTTPHeaderField: "Authorization") == "Bearer local-account-a-credential"
+    }
+
+    private static func shouldExpireClientSession(_ request: URLRequest) -> Bool {
+        guard ProcessInfo.processInfo.arguments.contains(clientSessionExpiryOnceFixtureLaunchArgument),
+              request.httpMethod == "GET", request.url?.path == "/api/me",
+              request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true else { return false }
+        clientSessionExpiryFixtureLock.lock(); defer { clientSessionExpiryFixtureLock.unlock() }
+        guard !clientSessionExpiryFixtureDidRespond else { return false }
+        clientSessionExpiryFixtureDidRespond = true
+        return true
     }
 
     private static func fixtureLoginUser(for request: URLRequest) -> [String: String] {
@@ -2398,7 +2413,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
-        usesLocalFixture && request.url?.scheme == "https"
+        guard usesLocalFixture else { return false }
+        if request.url?.scheme == "https" { return true }
+        return false
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -2527,13 +2544,19 @@ private final class MordeAuthURLProtocol: URLProtocol {
         let personalSyncUnavailableResponse = isFixtureOrigin && request.httpMethod == "GET" &&
             request.url?.path == "/api/sync/snapshot" &&
             ProcessInfo.processInfo.arguments.contains(Self.personalSyncUnavailableFixtureLaunchArgument)
+        let shouldExpireClientSession = isFixtureOrigin && Self.shouldExpireClientSession(request)
         let chatAttachmentResponse = isFixtureOrigin ? Self.chatAttachmentFixtureResponse(for: request) : nil
         let executionResponse = isFixtureOrigin ? Self.executionFixtureResponse(for: request) : nil
         if executionResponse?.status == -1 {
             client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
             return
         }
-        if personalSyncUnavailableResponse {
+        if shouldExpireClientSession {
+            // Keep the signed-in shell visible long enough for the UI test to observe the expiry transition.
+            Thread.sleep(forTimeInterval: 2)
+            statusCode = 401
+            body = Data(#"{"error":{"code":"unauthorized","message":"Synthetic client session expired"}}"#.utf8)
+        } else if personalSyncUnavailableResponse {
             statusCode = 503
             body = Data(#"{"error":{"code":"unavailable","message":"Synthetic personal sync is unavailable"}}"#.utf8)
         } else if let taskFileFetchResponse {
@@ -2561,7 +2584,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
         } else if isFixtureOrigin, request.url?.path == "/api/auth/login", request.httpMethod == "POST" {
             statusCode = 200
             body = Self.fixtureJSON(["user": Self.fixtureLoginUser(for: request)])
-            mediaResponseHeaders["Set-Cookie"] = "ch_portal=chs_t7654321_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; Path=/; Expires=Fri, 01 Jan 2100 00:00:00 GMT; HttpOnly; SameSite=Strict"
+            mediaResponseHeaders["Set-Cookie"] = "ch_portal=chs_t7654321_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; Path=/; Expires=Fri, 01 Jan 2100 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict"
         } else if isFixtureOrigin, request.url?.path == "/api/auth/register", request.httpMethod == "POST",
            request.value(forHTTPHeaderField: "Content-Type") == "application/json" {
             if ProcessInfo.processInfo.arguments.contains("-morde.localRegistrationBusyFixture") {
@@ -4689,7 +4712,7 @@ struct MordeTaskFileFetch: Decodable, Identifiable, Equatable {
               validDisplayName(source_device_name), validDirectory,
               relative_path.utf8.count <= 1024,
               (try? MordeWorkspaceTransferSupport.validatePath(relative_path)) != nil,
-              task_revision > 0, confirmed_bytes >= 0,
+              task_revision >= 0, confirmed_bytes >= 0,
               ["queued", "waiting_device", "transferring", "verifying", "completed", "cancelling", "cancelled", "failed"].contains(status),
               failure_reason == nil || (status == "failed" && ["access_denied", "source_changed", "file_unavailable", "limit_exceeded", "unsupported", "source_unavailable", "transfer_failed"].contains(failure_reason ?? "")),
               ["none", "retained", "deleted", "expired"].contains(content_state),
@@ -8234,6 +8257,21 @@ private struct MordeIndependentSendTarget {
         }
         let data: Data
         let response: URLResponse
+#if DEBUG
+        let fixtureArguments = ProcessInfo.processInfo.arguments
+        let fixtureOriginIndex = fixtureArguments.firstIndex(of: "-morde.portalMessageTransportFailureOrigin")
+        let fixtureOrigin = fixtureOriginIndex.flatMap { index in
+            fixtureArguments.indices.contains(index + 1) ? fixtureArguments[index + 1] : nil
+        }.flatMap(MordeLoginStateStore.serviceOrigin)
+        if ProcessInfo.processInfo.arguments.contains(
+            MordeAuthURLProtocol.portalMessageTransportFailureFixtureLaunchArgument),
+           let url = request.url, url.scheme == "http",
+           MordeLoginStateStore.serviceOrigin(url.absoluteString) == fixtureOrigin,
+           request.httpMethod == "POST", url.path.hasPrefix("/api/conversations/"),
+           url.path.hasSuffix("/messages") {
+            throw URLError(.notConnectedToInternet)
+        }
+#endif
         (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         var recordedUnconfirmedLogout = false
@@ -10051,7 +10089,7 @@ private struct MordeIndependentSendTarget {
               MordeProjectPolicy.canRecordDelivery(role: role, state: item.state, taskID: taskID,
                                                     taskIDs: item.task_ids, workspaceID: workspaceID,
                                                     revision: Int64(binding.workspace.revision)) else {
-            projectActionError = "仅可为当前项目中关联的 Task 登记已就绪 Workspace 当前版本；服务端还会验证已保存产物。"
+            projectActionError = "仅可为当前项目中关联的 Task 登记已就绪电脑文件版本；服务端还会验证已保存产物。"
             return false
         }
         let revision = Int64(binding.workspace.revision)
@@ -10069,7 +10107,7 @@ private struct MordeIndependentSendTarget {
                 throw URLError(.cannotParseResponse)
             }
             await loadProjectWorkItems(projectID)
-            projectNotice = "服务端已核验并登记 Workspace 交付版本；本操作未传送文件。"
+            projectNotice = "服务端已核验并登记电脑文件交付版本；本操作未传送文件。"
             return true
         } catch { await handleProjectMutationError(error, scope: scope, includeProjectBudget: false); return false }
     }
@@ -10350,7 +10388,7 @@ private struct MordeIndependentSendTarget {
               MordeProjectPolicy.isOwner(ownerID: project.owner_id, currentUserID: user?.id),
               MordeProjectPolicy.hasValidResourceID(kind: kind, id: resourceID),
               (kind == "host" ? hosts.contains(where: { $0.id == resourceID }) : workspaces.contains(where: { $0.id == resourceID })) else {
-            projectActionError = "请先选择当前账号可访问的电脑或 Workspace。"
+            projectActionError = "请先选择当前账号可访问的电脑或电脑文件。"
             return false
         }
         projectActionInFlight = true; projectActionError = nil; projectNotice = nil
@@ -10362,7 +10400,7 @@ private struct MordeIndependentSendTarget {
             guard scope == currentDataScope, resource.project_id == projectID, resource.kind == kind,
                   resource.resource_id == resourceID, resource.version > 0 else { throw URLError(.cannotParseResponse) }
             await loadProjects()
-            projectNotice = "资源关联已添加。关联不会授予项目成员 Host 或 Workspace 权限。"
+            projectNotice = "资源关联已添加。关联不会授予项目成员电脑或文件访问权限。"
             return true
         } catch { await handleProjectMutationError(error, scope: scope); return false }
     }
@@ -10395,7 +10433,7 @@ private struct MordeIndependentSendTarget {
     private func requireWorkspaceSync() throws {
         guard workspaceSyncAvailable == true else {
             throw NSError(domain: "Morde.WorkspaceSync", code: 503,
-                          userInfo: [NSLocalizedDescriptionKey: "服务端尚未开放 Workspace 文件传输"])
+                          userInfo: [NSLocalizedDescriptionKey: "服务端尚未开放电脑文件传输"])
         }
     }
 
@@ -10562,7 +10600,7 @@ private struct MordeIndependentSendTarget {
         }
         guard session.conflicts.isEmpty else {
             throw NSError(domain: "Morde", code: 409,
-                          userInfo: [NSLocalizedDescriptionKey: "所选文件与 Workspace 当前版本冲突：\(session.conflicts.map(\.path).joined(separator: "、"))。请刷新文件并重新确认。"])
+                          userInfo: [NSLocalizedDescriptionKey: "所选文件与电脑文件当前版本冲突：\(session.conflicts.map(\.path).joined(separator: "、"))。请刷新文件并重新确认。"])
         }
         var confirmed = session.confirmed_bytes
         progress(confirmed, session.planned_bytes)
@@ -10585,7 +10623,7 @@ private struct MordeIndependentSendTarget {
             key: UUID().uuidString)
         guard session.state == "completed" else {
             throw NSError(domain: "Morde", code: 409,
-                          userInfo: [NSLocalizedDescriptionKey: "文件已传输，但 Workspace 检查点尚未确认（\(session.state)）。请刷新后核对状态。"])
+                          userInfo: [NSLocalizedDescriptionKey: "文件已传输，但新文件版本尚未确认（\(session.state)）。请刷新后核对状态。"])
         }
         await refreshWorkspaces()
         return session
@@ -10622,7 +10660,7 @@ private struct MordeIndependentSendTarget {
         guard actions.count == 1, let action = actions.first, action.action == "upsert",
               action.sha256 == file.sha256, action.size_bytes == file.sizeBytes else {
             throw NSError(domain: "Morde", code: 409,
-                          userInfo: [NSLocalizedDescriptionKey: "Workspace 文件版本已变化，请刷新清单后重新下载。"])
+                          userInfo: [NSLocalizedDescriptionKey: "电脑文件版本已变化，请刷新清单后重新下载。"])
         }
         let downloadBlocks = session.transfer_blocks.filter { $0.role == "download" }
         let blockMap = Dictionary(downloadBlocks.map { ($0.chunk.sha256, $0.chunk) }, uniquingKeysWith: { first, _ in first })
@@ -11060,6 +11098,7 @@ private struct MordeIndependentSendTarget {
             }
             await load()
         } catch {
+            let userFacingError = error.localizedDescription
             if !loginCommitted, let rollbackOrigin {
                 if clientAuthorizationWasWritten, let key = rollbackClientStorageKey {
                     restoreKeychainValue(rollbackPreviousClientAuthorization, key: key)
@@ -11083,7 +11122,7 @@ private struct MordeIndependentSendTarget {
             if let intent, !loginStateStore.isLatest(intent) { return }
             if let attempt, !loginStateStore.isCurrent(attempt) { return }
             if let intent { _ = try? loginStateStore.finish(intent) }
-            self.error = error.localizedDescription
+            self.error = userFacingError
         }
     }
 
@@ -12621,7 +12660,7 @@ private struct MordeIndependentSendTarget {
             } else {
                 guard let host = ownedHost(id), canOpenHost(host) else {
                     throw NSError(domain: "Morde.Workspace", code: 409,
-                                  userInfo: [NSLocalizedDescriptionKey: "电脑必须绑定且只绑定一个已就绪 Workspace 后才能打开"])
+                                  userInfo: [NSLocalizedDescriptionKey: "电脑必须关联且只关联一个已就绪的电脑文件目录后才能打开"])
                 }
                 origin = host.url
             }
@@ -12924,10 +12963,27 @@ struct MIFConversationDrawerItem: Identifiable {
             client.hosts.filter { $0.owner_id == userID }
         } ?? []
         let ownedHostViews = ownedHosts.map { host in
-            let workspaceNames = host.workspaces?.map { $0.workspace.name }.filter { !$0.isEmpty }.joined(separator: " · ")
+            let workspaceSummary: String?
+            if let bindings = host.workspaces {
+                switch bindings.count {
+                case 0:
+                    workspaceSummary = "电脑文件未关联"
+                case 1:
+                    let binding = bindings[0]
+                    if binding.sync_state == "syncing" || binding.sync_state == "pending" {
+                        workspaceSummary = "电脑文件同步中"
+                    } else {
+                        workspaceSummary = client.isReady(binding) ? "电脑文件已就绪" : "电脑文件未就绪"
+                    }
+                default:
+                    workspaceSummary = "电脑文件关联异常"
+                }
+            } else {
+                workspaceSummary = "电脑文件状态未知"
+            }
             return MIFResourcePageState.Host(
                 id: host.id, name: host.name, scope: .owned, status: Self.status(host.state),
-                workspaceSummary: workspaceNames?.isEmpty == false ? workspaceNames : nil,
+                workspaceSummary: workspaceSummary,
                 canOpen: client.canOpenHost(host), control: control(for: host),
                 error: client.hostOpenErrors[host.id])
         }
@@ -13338,7 +13394,7 @@ struct MordeAccountSettingsView: View {
                         Label("API Keys", systemImage: "key.horizontal")
                     }
                 } header: {
-                    Text("Workspace and account settings")
+                    Text("电脑与账号设置")
                 } footer: {
                     Text("These pages use a short-lived user session for this installation. Server permissions still apply; no client credential is given to the web page.")
                 }
@@ -13694,13 +13750,13 @@ private struct MordeWorkspaceFilesView: View {
 
     private var workspaceBreadcrumbs: [WorkspaceBreadcrumb] {
         guard !currentDirectoryPath.isEmpty else {
-            return [WorkspaceBreadcrumb(title: selectedWorkspace?.name ?? "Workspace", path: "")]
+            return [WorkspaceBreadcrumb(title: "电脑文件", path: "")]
         }
         let components = currentDirectoryPath.split(separator: "/").map(String.init)
         guard let currentName = components.last else { return [] }
         let parentComponents = components.dropLast()
         let parentPath = parentComponents.joined(separator: "/")
-        let parentName = parentComponents.last ?? selectedWorkspace?.name ?? "Workspace"
+        let parentName = parentComponents.last ?? "电脑文件"
         return [WorkspaceBreadcrumb(title: "‹ \(parentName)", path: parentPath),
                 WorkspaceBreadcrumb(title: currentName, path: currentDirectoryPath)]
     }
@@ -13819,7 +13875,7 @@ private struct MordeWorkspaceFilesView: View {
         }
         .padding(.top, 6)
         .padding(.bottom, 2)
-        .accessibilityLabel("Workspace 路径")
+        .accessibilityLabel("电脑文件路径")
     }
 
     private func directoryRow(_ path: String) -> some View {
@@ -13888,7 +13944,7 @@ private struct MordeWorkspaceFilesView: View {
         } header: {
             Text("选择并确认上传范围")
         } footer: {
-            Text("只上传下方列出的文件；每个文件最多 300 MiB。服务端确认全部分块和 SHA-256 后才提交不可变 Workspace 检查点。")
+            Text("只上传下方列出的文件；每个文件最多 300 MiB。服务端确认全部分块和 SHA-256 后才保存新的文件版本。")
         }
     }
 
@@ -13905,8 +13961,8 @@ private struct MordeWorkspaceFilesView: View {
             workspaceBreadcrumbBar
             if client.workspaceSyncAvailable != true {
                 Text(client.workspaceSyncAvailable == false
-                     ? "服务端未开放 Workspace 文件传输；上传和下载已锁定。"
-                     : "正在确认服务端 Workspace 文件能力。")
+                     ? "服务端未开放电脑文件传输；上传和下载已锁定。"
+                     : "正在确认服务端文件能力。")
                     .font(.system(size: 14))
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 12)
@@ -13926,7 +13982,7 @@ private struct MordeWorkspaceFilesView: View {
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 12)
             } else if manifestRevision == nil {
-                Text("选择获准 Workspace 后读取真实文件清单。")
+                Text("选择获准电脑后读取其文件清单。")
                     .font(.system(size: 14))
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 12)
@@ -13958,7 +14014,7 @@ private struct MordeWorkspaceFilesView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         } else {
-            ProgressView("正在提交 Workspace 操作…")
+            ProgressView("正在提交文件操作…")
         }
     }
 
@@ -13969,7 +14025,7 @@ private struct MordeWorkspaceFilesView: View {
             Button("比较来源版本与当前版本") { Task { await loadWorkspaceDiff() } }
                 .disabled(workspaceHistoryLoading || selectedWorkspace == nil)
             if workspaceHistoryLoading {
-                ProgressView("正在读取 Workspace 差异…")
+                ProgressView("正在读取文件版本差异…")
             }
             if let workspaceHistoryError {
                 Text(workspaceHistoryError).font(.footnote).foregroundStyle(.orange)
@@ -14027,7 +14083,7 @@ private struct MordeWorkspaceFilesView: View {
 
     private var workspaceShareSheet: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("分享「\(selectedWorkspace?.name ?? "Workspace")」")
+            Text("分享电脑文件")
                 .font(.system(size: 17.5, weight: .bold))
                 .tracking(-0.175)
                 .accessibilityIdentifier("morde.workspace.share.title")
@@ -14120,7 +14176,7 @@ private struct MordeWorkspaceFilesView: View {
                     if let onBack { onBack() } else { dismiss() }
                 }
                 .accessibilityIdentifier("morde.workspace.back")
-                Text(selectedWorkspace?.name ?? "Workspace")
+                Text("电脑文件")
                     .font(.headline.weight(.semibold))
                     .tracking(-0.17)
                     .lineLimit(1)
@@ -14142,7 +14198,7 @@ private struct MordeWorkspaceFilesView: View {
                     }
                     .padding(.leading, 10)
                 Spacer(minLength: 8)
-                NanoMuseRoundButton(symbol: "square.and.arrow.up", label: "分享这个 Workspace", size: 38) {
+                NanoMuseRoundButton(symbol: "square.and.arrow.up", label: "分享电脑文件", size: 38) {
                     sharePermission = "view"
                     shareError = nil
                     shareSheetPresented = true
@@ -14185,9 +14241,9 @@ private struct MordeWorkspaceFilesView: View {
                     Button("上传并提交检查点") { Task { await uploadSelection() } }
                     Button("取消", role: .cancel) {}
                 } message: {
-                    Text("\(selectedWorkspace?.name ?? "Workspace") · \(selectedFiles.map { $0.file.path }.joined(separator: "、")) · \(Self.fileSize(selectedBytes))。")
+                    Text("电脑文件 · \(selectedFiles.map { $0.file.path }.joined(separator: "、")) · \(Self.fileSize(selectedBytes))。")
                 }
-                .confirmationDialog("确认恢复 Workspace 路径？", isPresented: $confirmWorkspaceRestore,
+                .confirmationDialog("确认恢复文件路径？", isPresented: $confirmWorkspaceRestore,
                                     titleVisibility: .visible) {
                     Button("恢复所选路径", role: .destructive) { Task { await restoreWorkspaceChanges() } }
                         .disabled(!workspaceHistoryCanRestore || workspaceHistoryLoading)
@@ -14269,7 +14325,7 @@ private struct MordeWorkspaceFilesView: View {
         } message: {
             Text(selectedLocalFile?.path ?? "")
         }
-        .confirmationDialog("删除云端 Workspace 文件？", isPresented: $confirmCloudDelete,
+        .confirmationDialog("删除电脑文件？", isPresented: $confirmCloudDelete,
                             titleVisibility: .visible) {
             Button("删除并提交新检查点", role: .destructive) {
                 guard let file = selectedCloudDelete, let revision = selectedCloudDeleteRevision else { return }
@@ -14284,11 +14340,11 @@ private struct MordeWorkspaceFilesView: View {
             }
         } message: {
             if let file = selectedCloudDelete, let revision = selectedCloudDeleteRevision {
-                Text("删除 \(file.path)，基于 Workspace v\(revision) 创建新检查点。旧版本仍可比较和恢复。")
+                Text("删除 \(file.path)，基于文件版本 v\(revision) 创建新版本记录。旧版本仍可比较和恢复。")
             }
         }
         .sheet(item: $previewItem) { item in MordeWorkspaceQuickLook(url: item.url) }
-        .alert(filePathOperation.map { Text("\($0.title) Workspace 文件") } ?? Text("文件操作失败"),
+        .alert(filePathOperation.map { Text("\($0.title) 电脑文件") } ?? Text("文件操作失败"),
                isPresented: Binding(
                 get: { filePathOperation != nil || (errorMessage != nil && isTransferring == false) },
                 set: { presented in
@@ -14385,12 +14441,12 @@ private struct MordeWorkspaceFilesView: View {
                     }
                     .disabled(isTransferring || client.workspaceSyncAvailable != true)
                 }
-                Section("云端文件") {
+                Section("电脑文件") {
                     Button("重命名") { beginFilePathOperation(.rename, file: file) }
                         .disabled(!canMutateWorkspaceFiles)
                     Button("移动") { beginFilePathOperation(.move, file: file) }
                         .disabled(!canMutateWorkspaceFiles)
-                    Button("删除云端文件", role: .destructive) {
+                    Button("删除电脑文件", role: .destructive) {
                         selectedCloudDelete = file
                         selectedCloudDeleteRevision = manifestRevision
                         confirmCloudDelete = true
@@ -14404,7 +14460,7 @@ private struct MordeWorkspaceFilesView: View {
                     .contentShape(Rectangle())
             }
             .accessibilityLabel("\(file.path) 的操作")
-            .accessibilityHint("显示此文件在本机和 Workspace 云端的操作")
+            .accessibilityHint("显示此文件在本机和电脑文件目录中的操作")
         }
         .padding(.vertical, 13)
     }
@@ -14655,7 +14711,7 @@ private struct MordeWorkspaceFilesView: View {
                                                targetPath: String, revision: Int64) async {
         guard canMutateWorkspaceFiles, manifestRevision == revision,
               let workspace = selectedWorkspace else {
-            errorMessage = "Workspace 文件清单已变化或当前版本已过期，请刷新后重试。"
+            errorMessage = "电脑文件清单已变化或当前版本已过期，请刷新后重试。"
             return
         }
         let workspaceID = workspace.id
@@ -14705,7 +14761,7 @@ private struct MordeWorkspaceShareAcceptanceView: View {
                     Text(preview.workspace_name).font(.title3.weight(.semibold))
                     Text(preview.permission == "view" ? "可查看 · 只能看文件" : "可编辑 · 能改文件")
                         .foregroundStyle(.secondary)
-                    Text("领取后会创建归你所有的独立副本，之后与原 Workspace 无关。")
+                    Text("领取后会创建归你所有的独立副本，之后与原文件目录无关。")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button {
                         Task { await accept() }
@@ -14726,7 +14782,7 @@ private struct MordeWorkspaceShareAcceptanceView: View {
             }
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .navigationTitle("领取 Workspace")
+            .navigationTitle("领取文件副本")
             .navigationBarTitleDisplayMode(.inline)
         }
         .presentationDetents([.medium])
@@ -15161,7 +15217,7 @@ private struct MordeHostSharingSheet: View {
             "desktop:view": AppLocalized("Desktop view"),
             "terminal:control": AppLocalized("Terminal control"),
             "mcp:control": AppLocalized("MCP control"),
-            "workspace:file:read": AppLocalized("Workspace file read"),
+            "workspace:file:read": AppLocalized("Computer file read"),
         ]
         return permissions.compactMap { labels[$0] }.joined(separator: " · ")
     }
@@ -15481,10 +15537,6 @@ private struct MordeRoot: View {
     @State private var localMessageUploadRecoveryDraftStarting = false
 #endif
     private var selectedHost: MordeHost? { client.hosts.first(where: { $0.id == host }) }
-    private var workspaceBindings: [MordeWorkspaceBinding] { client.workspaceBindings(for: host) }
-    private var selectedBinding: MordeWorkspaceBinding? {
-        workspaceBindings.first(where: { $0.workspace.id == workspace })
-    }
     private var selectedHostReady: Bool { selectedHost.map(client.isReady) ?? false }
     private var allowedTextModelIDs: Set<String> {
         Set(client.models.filter { $0.capabilities.text }.map(\.id))
@@ -16652,11 +16704,11 @@ private struct MordeRoot: View {
             Section("目标电脑") {
                 emptyResourceState(.hosts, itemCount: client.hosts.count,
                                    emptyMessage: "当前没有可访问的电脑。可以不选电脑提交文本任务。")
-                emptyResourceState(.workspaces, itemCount: client.workspaces.count,
-                                   emptyMessage: "当前没有可访问的 Workspace。")
                 Picker("目标电脑", selection: Binding(get: { host }, set: { value in
                     host = value
-                    workspace = ""
+                    let bindings = client.workspaceBindings(for: value)
+                    workspace = bindings.count == 1 && bindings.first.map({ client.isReady($0) }) == true
+                        ? bindings[0].workspace.id : ""
                 })) {
                     Text("无电脑目标").tag("")
                     if !host.isEmpty && selectedHost == nil { Text("所选 Host 状态待核验").tag(host) }
@@ -16672,27 +16724,6 @@ private struct MordeRoot: View {
                     if !selectedHostReady {
                         Text("任务需要使用这台电脑时，助手会检查其状态。")
                             .font(.footnote).foregroundStyle(.orange)
-                    }
-                    Picker("Workspace（可选）", selection: $workspace) {
-                        Text("不指定 Workspace").tag("")
-                        if !workspace.isEmpty && selectedBinding == nil { Text("所选 Workspace 状态待核验").tag(workspace) }
-                        ForEach(workspaceBindings, id: \.workspace.id) { binding in
-                            Text("\(binding.workspace.name.isEmpty ? binding.workspace.id : binding.workspace.name) · \(client.isReady(binding) ? "已就绪" : "未就绪")")
-                                .tag(binding.workspace.id)
-                        }
-                    }
-                    .accessibilityIdentifier("morde.chat.workspaceTarget")
-                    if !workspace.isEmpty && selectedBinding == nil {
-                        Text(client.resourceState(.workspaces).failureMessage.map {
-                            "Workspace 列表未成功读取：\($0)。使用时将核验状态。"
-                        } ?? "所选 Workspace 当前状态未知，使用时将核验。")
-                            .font(.footnote).foregroundStyle(.orange)
-                    } else if let selectedBinding, !client.isReady(selectedBinding) {
-                        Text("任务需要使用此 Workspace 时，助手会检查其状态。")
-                            .font(.footnote).foregroundStyle(.orange)
-                    } else if let selectedBinding {
-                        Text("任务需要使用 \(selectedBinding.workspace.name) 时，会检查其当前状态。")
-                            .font(.footnote).foregroundStyle(.secondary)
                     }
                 } else if !host.isEmpty {
                     Text(client.resourceState(.hosts).failureMessage.map {
@@ -17805,7 +17836,6 @@ private struct MordeProjectsRoom: View {
     @State private var projectDescription = ""
     @State private var inviteUserID = ""
     @State private var inviteRole = "member"
-    @State private var resourceKind = "host"
     @State private var resourceID = ""
     @State private var ownerTransferUserID = ""
     @State private var memberToRemove: MordeProjectMember?
@@ -18137,7 +18167,7 @@ private struct MordeProjectsRoom: View {
 
             if let project = selectedProject {
                 Section("共享范围") {
-                    Text("加入项目不会自动共享个人主会话或记忆。电脑和 Workspace 关联只记录资源，不复制文件，也不授予项目成员访问权限。")
+                    Text("加入项目不会自动共享个人主会话或记忆。关联电脑或其文件只记录资源，不复制文件，也不授予项目成员访问权限。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("项目共享会话") {
@@ -18340,8 +18370,8 @@ private struct MordeProjectsRoom: View {
                     }
                 }
 
-                Section("关联的电脑与 Workspace") {
-                    Text("关联只记录项目资源，不会授予其他项目成员访问 Host 或 Workspace 的权限。")
+                Section("关联的电脑与文件") {
+                    Text("关联只记录项目资源，不会授予其他项目成员访问电脑或文件的权限。")
                         .font(.footnote).foregroundStyle(.secondary)
                     if client.projectResources.isEmpty && client.projectDetailState.isLoaded {
                         Text("没有当前账号可见的关联资源。")
@@ -18351,7 +18381,7 @@ private struct MordeProjectsRoom: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(resourceTitle(resource))
-                                Text(resource.kind == "host" ? "电脑状态：\(hostState(resource.resource_id))" : "仅显示已授权的 Workspace")
+                                Text(resource.kind == "host" ? "电脑状态：\(hostState(resource.resource_id))" : "电脑文件访问仍需单独授权")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -18362,23 +18392,15 @@ private struct MordeProjectsRoom: View {
                         }
                     }
                     if isOwner {
-                        Picker("资源类型", selection: $resourceKind) {
-                            Text("电脑").tag("host")
-                            Text("Workspace").tag("workspace")
+                        Picker("云端电脑", selection: $resourceID) {
+                            Text("选择云端电脑").tag("")
+                            ForEach(client.hosts) { host in Text(host.name.isEmpty ? host.id : host.name).tag(host.id) }
                         }
-                        Picker("可访问资源", selection: $resourceID) {
-                            Text("选择资源").tag("")
-                            if resourceKind == "host" {
-                                ForEach(client.hosts) { host in Text(host.name.isEmpty ? host.id : host.name).tag(host.id) }
-                            } else {
-                                ForEach(client.workspaces) { workspace in Text(workspace.name).tag(workspace.id) }
-                            }
-                        }
-                        Button("关联资源") {
-                            Task { await client.addProjectResource(projectID: project.id, kind: resourceKind, resourceID: resourceID) }
+                        Button("关联云端电脑") {
+                            Task { await client.addProjectResource(projectID: project.id, kind: "host", resourceID: resourceID) }
                         }
                         .disabled(client.projectActionInFlight || resourceID.isEmpty)
-                        Text("当前服务未开放 Workspace 复制或移交；资源关联不代表副本，也不会授予成员访问权限。")
+                        Text("当前服务未开放电脑文件复制或移交；资源关联不代表副本，也不会授予成员访问权限。")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
@@ -18523,7 +18545,6 @@ private struct MordeProjectsRoom: View {
             budgetCurrency = budget.currency
             budgetLimitMicros = String(budget.limit_micros)
         }
-        .onChange(of: resourceKind) { _ in resourceID = "" }
         .confirmationDialog("转移项目负责人？", isPresented: $confirmsOwnerTransfer, titleVisibility: .visible) {
             if let project = selectedProject, !ownerTransferUserID.isEmpty {
                 Button("转移给 \(ownerTransferUserID)", role: .destructive) {
@@ -18565,9 +18586,10 @@ private struct MordeProjectsRoom: View {
         } message: {
             if let item = workItemDeliveryConfirmation, let task = selectedProjectConversationTask,
                let binding = selectedProjectDeliveryBinding {
-                Text("\(item.title) · Task \(task.id) · \(binding.workspace.name) v\(binding.workspace.revision)。服务端会核验已保存产物；这里只提交版本元数据，不传送文件。")
+                let hostName = client.hosts.first(where: { $0.id == projectConversationHostID })?.name ?? "云端电脑"
+                Text("\(item.title) · Task \(task.id) · 云端电脑 \(hostName) 的电脑文件版本 v\(binding.workspace.revision)。服务端会核验已保存产物；这里只提交版本元数据，不传送文件。")
             } else {
-                Text("当前项目会话或 Workspace 已变化，请重新选择。")
+                Text("当前项目会话或电脑文件已变化，请重新选择。")
             }
         }
         }
@@ -18632,7 +18654,7 @@ private struct MordeProjectsRoom: View {
                 Text("阻塞原因：\(item.blocked_reason)").font(.footnote).foregroundStyle(.orange)
             }
             if let delivery = item.delivery {
-                Text("已记录交付：Task \(delivery.task_id) · Workspace \(delivery.workspace_id) · v\(delivery.revision)")
+                Text("已记录交付：Task \(delivery.task_id) · 电脑文件版本 v\(delivery.revision)")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             if canManageWorkItems, let task = selectedProjectConversationTask {
@@ -18649,7 +18671,7 @@ private struct MordeProjectsRoom: View {
                     role: client.projectMembers.first(where: { $0.project_id == projectID && $0.user_id == client.user?.id })?.role,
                     state: item.state, taskID: task.id, taskIDs: item.task_ids,
                     workspaceID: binding.workspace.id, revision: Int64(binding.workspace.revision)) {
-                    Button("登记当前 Workspace 版本交付") { workItemDeliveryConfirmation = item }
+                    Button("登记当前电脑文件版本交付") { workItemDeliveryConfirmation = item }
                         .disabled(client.projectActionInFlight)
                 }
             }
@@ -18966,14 +18988,6 @@ private struct MordeProjectsRoom: View {
                     Text(host.name.isEmpty ? host.id : host.name).tag(host.id)
                 }
             }
-            if !projectConversationHostID.isEmpty {
-                Picker("Workspace", selection: $projectConversationWorkspaceID) {
-                    Text("选择 Workspace").tag("")
-                    ForEach(client.workspaceBindings(for: projectConversationHostID), id: \.workspace.id) { binding in
-                        Text(projectWorkspaceOptionLabel(binding)).tag(binding.workspace.id)
-                    }
-                }
-            }
             ForEach(Array(attachments.enumerated()), id: \.offset) { index, attachment in
                 HStack {
                     Label(attachment.originalFilename ?? attachment.localPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? AppLocalized("Attachment"),
@@ -19037,14 +19051,9 @@ private struct MordeProjectsRoom: View {
                 .disabled(projectConversationDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
                 .accessibilityIdentifier("morde.projectConversation.send")
             }
-            Text("项目消息由当前账号提交，电脑和 Workspace 在实际使用时检查。")
+            Text("项目消息由当前账号提交；需要使用电脑文件时会在执行时核验。")
                 .font(.caption).foregroundStyle(.secondary)
         }
-    }
-
-    private func projectWorkspaceOptionLabel(_ binding: MordeWorkspaceBinding) -> String {
-        let revision = binding.workspace.revision
-        return "\(binding.workspace.name) · v\(revision)"
     }
 
     private func projectRow(_ project: MordeProject) -> some View {
@@ -19086,7 +19095,12 @@ private struct MordeProjectsRoom: View {
         if resource.kind == "host" {
             return client.hosts.first(where: { $0.id == resource.resource_id })?.name ?? resource.resource_id
         }
-        return client.workspaces.first(where: { $0.id == resource.resource_id })?.name ?? resource.resource_id
+        if let host = client.hosts.first(where: { host in
+            host.workspaces?.contains(where: { $0.workspace.id == resource.resource_id }) == true
+        }) {
+            return host.name.isEmpty ? host.id : host.name
+        }
+        return "电脑文件（未关联云端电脑）"
     }
 }
 
@@ -19106,10 +19120,6 @@ private struct MordeComputerDesignRoom: View {
             ? client.sharedHosts.first(where: { $0.id == hostID })?.name
             : client.hosts.first(where: { $0.id == hostID })?.name
         return name ?? hostID
-    }
-
-    private var workspaceName: String? {
-        boundWorkspace?.workspace.name
     }
 
     private var boundWorkspace: MordeWorkspaceBinding? {
@@ -19137,10 +19147,7 @@ private struct MordeComputerDesignRoom: View {
         }
     }
 
-    private var computerSubtitle: String {
-        let hostAndWorkspace = workspaceName.map { "\(hostName) · \($0)" } ?? hostName
-        return "云电脑 \(hostAndWorkspace)"
-    }
+    private var computerSubtitle: String { "云端电脑 \(hostName)" }
 
     private var hostControl: MordeHostControlStatus? {
         client.hostControlStatuses[hostID]

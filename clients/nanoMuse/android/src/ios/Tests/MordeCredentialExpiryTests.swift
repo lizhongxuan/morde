@@ -322,7 +322,7 @@ enum MordeCredentialExpiryTests {
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "clarification_required") == "等待你补充信息")
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "mcp_result_unknown") == "操作结果待核对")
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "workspace_host_sync") == "等待电脑同步")
-        precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "workspace_input_changed") == "工作区已变化，等待确认")
+        precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "workspace_input_changed") == "电脑文件已变化，等待确认")
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "desktop_focus_changed") == "电脑焦点已变化，等待确认")
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "mcp_result_unsupported") == "当前操作不受支持，等待处理")
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "mcp_connector_revoked") == "连接器已撤销，等待处理")
@@ -1190,7 +1190,7 @@ enum MordeCredentialExpiryTests {
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "computer_target_changed") ==
             "任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。")
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "workspace_target_changed") ==
-            "任务已绑定其他工作区，无法安全切换；请为新目标另发起任务。")
+            "任务所用电脑文件已变化，无法安全切换；请为新目标另发起任务。")
         precondition(MordeRoutingPresentation.failureLocalizationKey(nil) == "Message processing failed")
         let retryStorage = MordeRoutingRetryAttempt.storageKey(scope: scope, projectID: nil,
                                                               conversationID: "c1234567", messageID: "m1234567")

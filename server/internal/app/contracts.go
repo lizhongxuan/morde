@@ -11,9 +11,10 @@ import (
 )
 
 type CreateHostCommand struct {
-	Name           string
-	WorkspaceIDs   []string
-	IdempotencyKey string
+	Name                       string
+	WorkspaceIDs               []string
+	IdempotencyKey             string
+	workspaceCopyReservationID string
 }
 
 type DeleteHostCommand struct {

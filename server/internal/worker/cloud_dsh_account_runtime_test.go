@@ -779,11 +779,11 @@ func TestAccountAgentRuntimeRejectsCoordinatorFromDifferentRuntimeSession(t *tes
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			claim, _ := coordinatorTestClaimAndContext()
+			claim, value := coordinatorTestClaimAndContext()
 			if testCase.mutateClaim != nil {
 				testCase.mutateClaim(&claim)
 			}
-			identity := cloudDSHCoordinatorIdentity(claim)
+			identity := cloudDSHCoordinatorIdentity(claim, value)
 			runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: claim.ServiceInstanceID,
 				ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime_123",
 				RuntimeGeneration: 1, LeaseOwner: "route-worker", LeaseVersion: 1, ExecutionEpoch: 1}

@@ -1,62 +1,128 @@
-import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router';
+import { useEffect, useRef, useState } from 'react';
+import { Link, NavLink, Outlet, useLocation, useNavigate, useNavigationType } from 'react-router';
 import { useAuth } from '../app/auth';
 import { errorDetails } from '../app/api';
 import { useToast } from '../app/toast';
 import { MordeIcon, type MordeIconName } from './MordeIcon';
 
 const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
-  { to: '/hosts', label: '云端电脑', icon: 'monitor', end: true },
-  { to: '/assistant', label: 'moder', icon: 'spark' },
-  { to: '/projects', label: '项目', icon: 'folder' },
+  { to: '/assistant', label: '对话', icon: 'spark' },
   { to: '/personal', label: '个人数据', icon: 'user' },
   { to: '/goals', label: '目标与计划', icon: 'target' },
-  { to: '/workspaces', label: '工作区', icon: 'folder' },
+  { to: '/connections', label: '设置', icon: 'settings' },
 ];
 
 const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
-  { to: '/connections', label: '模型连接', icon: 'link' },
-  { to: '/clients', label: '客户端', icon: 'monitor' },
+  { to: '/connections', label: '模型与工具', icon: 'link' },
+  { to: '/hosts', label: '云端电脑', icon: 'monitor' },
+  { to: '/clients', label: '客户端', icon: 'panel' },
   { to: '/apikeys', label: 'API Key', icon: 'key' },
-  { to: '/settings', label: '账户设置', icon: 'settings' },
+  { to: '/settings', label: '账户', icon: 'user' },
 ];
 
-const titles: Record<string, string> = {
-  '/assistant': 'moder', '/hosts': '云端电脑', '/projects': '项目',
-  '/personal': '个人数据', '/goals': '目标与计划',
-  '/hosts/new': '创建电脑', '/workspaces': '工作区', '/connections': '模型连接',
-  '/clients': '客户端', '/apikeys': 'API Key',
-  '/settings': '账户设置',
-  '/notifications': '通知', '/download': '下载 Morde Desktop',
+type PageNavigationItem = { label: string; to: string; icon: MordeIconName; query?: [string, string] };
+type PageNavigation = { title: string; items: PageNavigationItem[]; queryDefault?: [string, string] };
+
+const personalSections: Array<[string, string, MordeIconName]> = [
+  ['profile', '个人资料', 'user'], ['soul', 'AI 个性', 'spark'], ['memory', '记忆', 'file'],
+  ['feed', '动态', 'file'], ['ideas', '灵感', 'target'], ['library', '资源库', 'folder'], ['preferences', '偏好', 'settings'],
+];
+
+const pageNavigationFor = (pathname: string): PageNavigation | null => {
+  if (pathname === '/personal') return {
+    title: '个人数据', queryDefault: ['section', 'profile'],
+    items: personalSections.map(([value, label, icon]) => ({ label, icon, to: `/personal?section=${value}`, query: ['section', value] })),
+  };
+  if (pathname === '/goals') return {
+    title: '目标与计划', queryDefault: ['view', 'goals'],
+    items: [
+      { label: '目标', icon: 'target', to: '/goals?view=goals', query: ['view', 'goals'] },
+      { label: '定时计划', icon: 'refresh', to: '/goals?view=schedules', query: ['view', 'schedules'] },
+    ],
+  };
+  if (pathname === '/connections' || pathname === '/hosts' || pathname.startsWith('/hosts/') || pathname === '/clients' || pathname === '/apikeys' || pathname === '/settings') return {
+    title: '设置', items: settingLinks,
+  };
+  return null;
 };
+
+function readContextSidebarCollapsed() {
+  try { return localStorage.getItem('morde:pc-context-sidebar-collapsed') === 'true'; }
+  catch { return false; }
+}
+
+function matchesPageItem(item: PageNavigationItem, pathname: string, search: string, fallback?: [string, string]) {
+  const target = new URL(item.to, window.location.origin);
+  if (target.pathname !== pathname && !(target.pathname === '/hosts' && pathname.startsWith('/hosts/'))) return false;
+  if (!item.query) return true;
+  const params = new URLSearchParams(search);
+  const fallbackValue = fallback?.[0] === item.query[0] ? fallback[1] : undefined;
+  return (params.get(item.query[0]) ?? fallbackValue) === item.query[1];
+}
 
 export function PortalLayout() {
   const { user, signOut } = useAuth();
   const { notify } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
-  const pageTitle = titles[location.pathname] ?? 'PC 用户端';
+  const navigationType = useNavigationType();
+  const [contextSidebarCollapsed, setContextSidebarCollapsed] = useState(readContextSidebarCollapsed);
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+  const routeHistory = useRef([{ key: location.key, url: `${location.pathname}${location.search}${location.hash}` }]);
+  const routeHistoryIndex = useRef(0);
+  const pageNavigation = pageNavigationFor(location.pathname);
+
+  useEffect(() => {
+    const current = { key: location.key, url: `${location.pathname}${location.search}${location.hash}` };
+    const existingIndex = routeHistory.current.findIndex((entry) => entry.key === current.key);
+    if (navigationType === 'POP' && existingIndex >= 0) routeHistoryIndex.current = existingIndex;
+    else if (navigationType === 'REPLACE') routeHistory.current[routeHistoryIndex.current] = current;
+    else {
+      routeHistory.current = [...routeHistory.current.slice(0, routeHistoryIndex.current + 1), current];
+      routeHistoryIndex.current = routeHistory.current.length - 1;
+    }
+    setCanGoBack(routeHistoryIndex.current > 0);
+    setCanGoForward(routeHistoryIndex.current < routeHistory.current.length - 1);
+  }, [location.hash, location.key, location.pathname, location.search, navigationType]);
+
+  useEffect(() => {
+    try { localStorage.setItem('morde:pc-context-sidebar-collapsed', contextSidebarCollapsed ? 'true' : 'false'); }
+    catch { /* Keep navigation usable when browser storage is unavailable. */ }
+  }, [contextSidebarCollapsed]);
+
   const logout = async () => {
     try { await signOut(); navigate('/login', { replace: true }); }
     catch (error) { notify(`退出登录失败：${errorDetails(error).message}`, 'error'); }
   };
 
-  return <div className="morde-shell">
+  return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}`}>
     <a className="skip-link" href="#main-content">跳到主要内容</a>
+    <header className="morde-topbar"><div className="morde-top-navigation">
+      <button type="button" className="morde-top-control" aria-label="返回上一页" title="返回上一页" disabled={!canGoBack} onClick={() => navigate(-1)}><MordeIcon name="back" /></button>
+      <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={() => navigate(1)}><MordeIcon name="forward" /></button>
+      <span className="morde-top-divider" aria-hidden="true" />
+      <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>
+    </div><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><MordeIcon name="monitor" /></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
-      <Link to="/" className="morde-brand"><span className="morde-brand-mark">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
-      <nav className="morde-navigation" aria-label="工作导航">
-        <span className="morde-nav-heading">工作</span>
-        {primaryLinks.filter(({ to }) => to !== '/projects' || user?.role === 'user').map(({ to, label, icon, end }) => <NavLink className="morde-nav-link" to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
-        <span className="morde-nav-heading morde-nav-heading-spaced">设置与授权</span>
-        {settingLinks.map(({ to, label, icon }) => <NavLink className="morde-nav-link" to={to} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
+      <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
+      <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">
+        {primaryLinks.map(({ to, label, icon, end }) => <NavLink className={({ isActive }) => `morde-nav-link${to === '/connections' && ['/connections', '/hosts', '/clients', '/apikeys', '/settings'].includes(location.pathname) ? ' active' : isActive ? ' active' : ''}`} to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
       </nav>
       <div className="morde-sidebar-bottom">
         {(user?.role === 'admin' || user?.role === 'super_admin') && <a className="morde-nav-link" href="/admin/" aria-label="切换至管理后台" title="切换至管理后台"><MordeIcon name="link" /><span>切换至管理后台</span></a>}
-        <div className="morde-profile"><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span><strong>{user?.name}</strong><small>PC 用户端</small></span><button className="button button-quiet button-small" type="button" onClick={() => void logout()}>退出</button></div>
+        <div className="morde-profile"><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span><strong>{user?.name}</strong><small>PC 用户端</small></span><button className="button button-quiet button-small morde-profile-logout" type="button" onClick={() => void logout()} aria-label="退出登录"><MordeIcon name="logout" /><span>退出</span></button></div>
       </div>
     </aside>
+    {pageNavigation && <aside id="context-sidebar" className="page-navigation" aria-label={`${pageNavigation.title}子菜单`}>
+      <nav aria-label={`${pageNavigation.title}分类`}>
+        {pageNavigation.items.map((item) => {
+          const active = matchesPageItem(item, location.pathname, location.search, pageNavigation.queryDefault);
+          return <Link key={item.to} className={`page-navigation-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} to={item.to} title={item.label}><MordeIcon name={item.icon} /><span>{item.label}</span></Link>;
+        })}
+      </nav>
+    </aside>}
     <main className="morde-main">
-      <header className="morde-topbar"><div className="morde-crumb"><span>PC 用户端</span><span aria-hidden="true">/</span><h1 className="morde-crumb-title">{pageTitle}</h1></div><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><MordeIcon name="monitor" /></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>
       <div id="main-content" className="morde-page" tabIndex={-1}><Outlet /></div>
     </main>
   </div>;

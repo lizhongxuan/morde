@@ -159,7 +159,7 @@ WHERE message_id=$1 AND state='pending' AND trigger_message_id IS NULL`, batch.M
 }
 
 func loadConversationTaskResultReviewInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (*app.ConversationTaskResultReview, error) {
-	rows, err := tx.Query(ctx, `SELECT source.user_message_id,source.task_id,source.task_revision,source.event_sequence,
+	rows, err := tx.Query(ctx, `SELECT batch.retry_attempt,source.user_message_id,source.task_id,source.task_revision,source.event_sequence,
 source.authorization_version,source.turn_id,source.content,source.payload_sha256,task.objective,task.current_revision,
 task.desired_revision,task.status,task.result,COALESCE(task.current_step,''),task.auth_version,
 NOT EXISTS (SELECT 1 FROM task_dependencies dependency JOIN tasks prerequisite
@@ -183,7 +183,7 @@ ORDER BY source.source_order FOR SHARE OF batch,source,task`, claim.Input.Result
 		var payloadDigest []byte
 		var currentRevision, desiredRevision, authVersion int64
 		var dependenciesSatisfied bool
-		if err := rows.Scan(&userMessageID, &source.TaskID, &source.TaskRevision, &source.EventSequence,
+		if err := rows.Scan(&value.RetryAttempt, &userMessageID, &source.TaskID, &source.TaskRevision, &source.EventSequence,
 			&source.AuthorizationVersion, &turnID, &source.Content, &payloadDigest, &source.Objective,
 			&currentRevision, &desiredRevision, &status, &result, &currentStep, &authVersion, &dependenciesSatisfied); err != nil {
 			rows.Close()

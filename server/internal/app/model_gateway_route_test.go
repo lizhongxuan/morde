@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -70,6 +71,32 @@ func TestConversationRouteGatewayAccountsForTextOnlyDecisionAndRecoversIt(t *tes
 	value.Content = "different"
 	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("mismatched message was accepted: %v", err)
+	}
+}
+
+func TestConversationResultReviewRetryUsesFreshModelCallIdentity(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	value.ResultReview = &ConversationTaskResultReview{Sources: []ConversationTaskResultSource{{
+		TaskID: "q1234567", TaskRevision: 1, EventSequence: 2, AuthorizationVersion: 1,
+		Objective: "return a short text result", Content: "B40-PASS",
+	}}}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest, firstCallID, err := conversationRouteCallDigest(claim, value, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.ResultReview.RetryAttempt = 1
+	retryRequest, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryDigest, retryCallID, err := conversationRouteCallDigest(claim, value, retryRequest)
+	if err != nil || bytes.Equal(firstDigest, retryDigest) || firstCallID == retryCallID ||
+		request.Instructions != retryRequest.Instructions || request.Input[0].Text != retryRequest.Input[0].Text {
+		t.Fatalf("explicit result review retry reused its model call identity: first=%q retry=%q err=%v", firstCallID, retryCallID, err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -132,7 +133,7 @@ WHERE owner_id=$1 AND deleted_at IS NULL AND state <> 'deleted'`, params.Host.Ow
 			return err
 		}
 
-		workspaceRevisions, err := lockWorkspacesForBinding(ctx, tx, params.WorkspaceIDs, params.Host.OwnerID)
+		workspaceRevisions, err := lockWorkspacesForBinding(ctx, tx, params.WorkspaceIDs, params.Host.OwnerID, params.WorkspaceCopyReservationID)
 		if err != nil {
 			return err
 		}
@@ -158,6 +159,14 @@ VALUES ($1, $2, $3, $4, $4, 'preparing', 1, $5, 0)`,
 				bindingID(params.Host.ID, workspaceID), params.Host.OwnerID, params.Host.ID,
 				workspaceID, workspaceRevisions[workspaceID]); err != nil {
 				return workspaceBindingInsertError(err)
+			}
+		}
+		if params.WorkspaceCopyReservationID != "" {
+			consumed, err := tx.Exec(ctx, `UPDATE workspace_copy_reservations SET host_copy_pending=false,updated_at=clock_timestamp()
+WHERE id=$1 AND target_owner_id=$2 AND target_workspace_id=$3 AND state='completed' AND host_copy_pending`,
+				params.WorkspaceCopyReservationID, params.Host.OwnerID, params.WorkspaceIDs[0])
+			if err != nil || consumed.RowsAffected() != 1 {
+				return errors.Join(domain.NewError(domain.CodeWorkspaceBusy, "Host copy reservation is no longer available"), err)
 			}
 		}
 		row, err := queries.GetHost(ctx, params.Host.ID)
@@ -287,6 +296,9 @@ func validateHostInsert(params app.CreateHostParams, state host.State) error {
 	if params.Capacity.CPUMilli <= 0 || params.Capacity.MemMiB <= 0 {
 		return domain.InvalidArgument("capacity", "cluster capacity limits are invalid")
 	}
+	if params.WorkspaceCopyReservationID != "" && !domain.ValidPendingRequestID(params.WorkspaceCopyReservationID) {
+		return domain.InvalidArgument("workspace_copy", "Workspace copy reservation is invalid")
+	}
 	if len(params.WorkspaceIDs) != 1 {
 		return domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
 	}
@@ -303,7 +315,17 @@ func validateHostInsert(params app.CreateHostParams, state host.State) error {
 	return nil
 }
 
-func lockWorkspacesForBinding(ctx context.Context, tx pgx.Tx, workspaceIDs []string, ownerID string) (map[string]int64, error) {
+func lockWorkspacesForBinding(ctx context.Context, tx pgx.Tx, workspaceIDs []string, ownerID string, copyReservationIDs ...string) (map[string]int64, error) {
+	if len(copyReservationIDs) > 1 {
+		return nil, domain.InvalidArgument("workspace_copy", "Workspace copy reservation is invalid")
+	}
+	copyReservationID := ""
+	if len(copyReservationIDs) == 1 {
+		copyReservationID = copyReservationIDs[0]
+	}
+	if copyReservationID != "" && !domain.ValidPendingRequestID(copyReservationID) {
+		return nil, domain.InvalidArgument("workspace_copy", "Workspace copy reservation is invalid")
+	}
 	ids := append([]string(nil), workspaceIDs...)
 	sort.Strings(ids)
 	revisions := make(map[string]int64, len(ids))
@@ -348,7 +370,23 @@ ORDER BY id FOR UPDATE`, ids)
 		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	for _, id := range lockedIDs {
-		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, id); err != nil {
+		if copyReservationID == "" {
+			if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, id); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var reservedTarget bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_copy_reservations
+WHERE id=$1 AND target_owner_id=$2 AND target_workspace_id=$3 AND state='completed' AND host_copy_pending
+)`, copyReservationID, ownerID, id).Scan(&reservedTarget); err != nil {
+			return nil, fmt.Errorf("verify completed Host copy reservation before binding: %w", err)
+		}
+		if !reservedTarget {
+			return nil, domain.NewError(domain.CodeWorkspaceBusy, "Host copy reservation is no longer available")
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozenExceptCopy(ctx, tx, id, copyReservationID); err != nil {
 			return nil, err
 		}
 	}

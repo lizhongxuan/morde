@@ -53,7 +53,7 @@ export function requireMordeHubTaskGrant(action: 'screenshot' | 'files' | 'file.
     !Number.isSafeInteger(task.authorizationVersion) || task.authorizationVersion < 1 ||
     !Number.isSafeInteger(task.targetGrantVersion) || task.targetGrantVersion !== grant.targetGrantVersion ||
     !/^[A-Za-z0-9._:-]{4,80}$/.test(task.operationID) ||
-    action === 'file.fetch' && (!Number.isSafeInteger(task.taskRevision) || Number(task.taskRevision) < 1)) {
+    action === 'file.fetch' && (!Number.isSafeInteger(task.taskRevision) || Number(task.taskRevision) < 0)) {
     throw new HubError('not_allowed', 'This action requires a current authorized Morde Task')
   }
   if (action === 'screenshot' && !grant.grants.screenshot) throw new HubError('not_allowed', 'Screenshot access is not allowed on this computer')
@@ -239,8 +239,15 @@ function processOutput(child: ChildProcess, method: string, params: Record<strin
       } catch {
         return fail(new HubError('failed', 'The local file helper returned an invalid response'))
       }
-      if (response.jsonrpc !== '2.0' || response.id !== 'morde-hub' || response.error) {
+      if (response.jsonrpc !== '2.0' || response.id !== 'morde-hub') {
         return fail(new HubError('not_allowed', 'The local file helper rejected this path'))
+      }
+      if (response.error) {
+        const errorCode = typeof response.error === 'object' && response.error !== null
+          ? (response.error as Record<string, unknown>).code
+          : undefined
+        return fail(new HubError(errorCode === -32032 ? 'conflict' : 'not_allowed',
+          errorCode === -32032 ? 'The selected file changed during retrieval' : 'The local file helper rejected this path'))
       }
       resolveResult(response.result)
     })

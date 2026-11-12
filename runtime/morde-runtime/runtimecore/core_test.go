@@ -599,7 +599,8 @@ func TestRestartQuarantinesUnknownOperationWithoutReplay(t *testing.T) {
 	for _, id := range []string{"o1234567", "o7654321"} {
 		record := operationRecord{Operation: contract.Operation{
 			HostID: fence.HostID, RuntimeGeneration: fence.RuntimeGeneration, RuntimeInstanceID: fence.RuntimeInstanceID,
-			ControlVersion: fence.ControlVersion, TaskID: testTaskID, OperationID: id, LeaseVersion: 1, Status: contract.OperationAccepted,
+			ControlVersion: fence.ControlVersion, TaskID: testTaskID, OperationID: id, LeaseVersion: 1,
+			Capability: "test.action", Action: "run", Status: contract.OperationAccepted,
 		}, RequestHash: "sha256-test"}
 		if err := first.appendOperationLocked(record); err != nil {
 			first.mu.Unlock()
@@ -625,9 +626,9 @@ func TestRestartQuarantinesUnknownOperationWithoutReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ledger.Close()
 	events, err := ledger.Events()
 	if err != nil {
+		_ = ledger.Close()
 		t.Fatal(err)
 	}
 	statuses := map[string]contract.OperationStatus{}
@@ -644,9 +645,74 @@ func TestRestartQuarantinesUnknownOperationWithoutReplay(t *testing.T) {
 	if statuses["o1234567"] != contract.OperationFailed || statuses["o7654321"] != contract.OperationUnknown {
 		t.Fatalf("restart recovery statuses = %#v", statuses)
 	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Open(Options{StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 3}); !errors.Is(err, ErrRuntimeStateUnavailable) {
 		t.Fatalf("replay of an old unknown operation error = %v, want fail closed", err)
 	}
+	ledger, err = operationstore.Open(dir, uint32(os.Geteuid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err = ledger.Events()
+	if err != nil {
+		_ = ledger.Close()
+		t.Fatal(err)
+	}
+	statuses = map[string]contract.OperationStatus{}
+	for _, event := range events {
+		if event.Kind != "operation" {
+			continue
+		}
+		var record operationRecord
+		if err := json.Unmarshal(event.Data, &record); err != nil {
+			_ = ledger.Close()
+			t.Fatal(err)
+		}
+		statuses[record.Operation.OperationID] = record.Operation.Status
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if statuses["o1234567"] != contract.OperationFailed || statuses["o7654321"] != contract.OperationUnknown {
+		t.Fatalf("unknown operation recovery statuses = %#v", statuses)
+	}
+
+	manager, err := Open(Options{
+		StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 3,
+		Handlers: []ActionHandler{capabilityHandler{capability: "test.action", action: "run"}},
+	})
+	if err != nil {
+		t.Fatalf("startup with a Stop handler for the old unknown operation = %v", err)
+	}
+	fence = currentFence(t, manager)
+	if got := manager.ops["o7654321"].Operation.Status; got != contract.OperationUnknown || manager.state.Mode != contract.ModeBlocked {
+		t.Fatalf("startup replayed unknown operation or enabled control: status=%q mode=%q", got, manager.state.Mode)
+	}
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, Mode: contract.ModeAI,
+	}); !errors.Is(err, ErrFenceRejected) {
+		t.Fatalf("unknown operation allowed AI control: %v", err)
+	}
+	quiesce, err := manager.Quiesce(context.Background(), contract.QuiesceRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence,
+		TargetControlVersion: fence.ControlVersion + 1, TaskIDs: []string{testTaskID},
+	})
+	if err != nil || quiesce.Status != contract.QuiesceDrained || quiesce.DrainedReceipt == nil {
+		t.Fatalf("verified Stop did not drain old unknown operation: response=%#v err=%v", quiesce, err)
+	}
+	if got := manager.ops["o7654321"].Operation.Status; got != contract.OperationCancelled {
+		t.Fatalf("verified Stop status=%q, want cancelled", got)
+	}
+	humanFence := fence
+	humanFence.ControlVersion++
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: humanFence, Mode: contract.ModeHuman, DrainedReceipt: quiesce.DrainedReceipt,
+	}); err != nil {
+		t.Fatalf("verified takeover after stopping unknown operation: %v", err)
+	}
+	closeManager(t, manager)
 }
 
 func TestOperationStoreUnavailableFailsClosed(t *testing.T) {

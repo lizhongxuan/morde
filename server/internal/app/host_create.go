@@ -162,7 +162,7 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 	}, nil
 }
 
-func (s *hostService) Create(ctx context.Context, principal identity.Principal, command CreateHostCommand) (host.Host, error) {
+func (s *hostService) Create(ctx context.Context, principal identity.Principal, command CreateHostCommand) (result host.Host, resultErr error) {
 	if err := validatePrincipal(principal); err != nil {
 		return host.Host{}, err
 	}
@@ -183,24 +183,25 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		name = tmpl.Name
 	}
 
-	if len(command.WorkspaceIDs) != 1 {
-		return host.Host{}, domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
-	}
 	sortedWorkspaceIDs := append([]string(nil), command.WorkspaceIDs...)
-	seenWorkspaceIDs := make(map[string]struct{}, len(sortedWorkspaceIDs))
-	for _, workspaceID := range sortedWorkspaceIDs {
-		if !domain.ValidWorkspaceID(workspaceID) {
-			return host.Host{}, domain.InvalidArgument("workspace_ids", "workspace id is invalid")
+	if command.WorkspaceIDs == nil {
+		if principal.Kind != identity.KindSession {
+			return host.Host{}, domain.NewError(domain.CodeForbidden, "portal session required to create a Workspace automatically")
 		}
-		if !principal.AllowsWorkspace(workspaceID) {
-			return host.Host{}, domain.NewError(domain.CodeForbidden, "workspace is outside the credential authorization scope")
+	} else {
+		if len(sortedWorkspaceIDs) != 1 {
+			return host.Host{}, domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
 		}
-		if _, exists := seenWorkspaceIDs[workspaceID]; exists {
-			return host.Host{}, domain.InvalidArgument("workspace_ids", "workspace ids must be unique")
+		for _, workspaceID := range sortedWorkspaceIDs {
+			if !domain.ValidWorkspaceID(workspaceID) {
+				return host.Host{}, domain.InvalidArgument("workspace_ids", "workspace id is invalid")
+			}
+			if !principal.AllowsWorkspace(workspaceID) {
+				return host.Host{}, domain.NewError(domain.CodeForbidden, "workspace is outside the credential authorization scope")
+			}
 		}
-		seenWorkspaceIDs[workspaceID] = struct{}{}
+		sort.Strings(sortedWorkspaceIDs)
 	}
-	sort.Strings(sortedWorkspaceIDs)
 	var idempotency IdempotencyRecord
 	if command.IdempotencyKey != "" {
 		if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
@@ -226,6 +227,50 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 			}
 			return replay, nil
 		}
+	}
+	if command.WorkspaceIDs == nil {
+		unlock := func() error { return nil }
+		if locker, ok := s.hosts.(hostDefaultCreationLocker); ok {
+			var lockErr error
+			unlock, lockErr = locker.AcquireDefaultHostLock(ctx, principal.UserID)
+			if lockErr != nil {
+				return host.Host{}, lockErr
+			}
+			if unlock == nil {
+				return host.Host{}, domain.NewError(domain.CodeInternal, "default Host lock is unavailable")
+			}
+			defer func() {
+				if unlockErr := unlock(); unlockErr != nil {
+					resultErr = errors.Join(resultErr, fmt.Errorf("release default Host lock: %w", unlockErr))
+				}
+			}()
+		}
+		if command.IdempotencyKey != "" {
+			replay, found, err := s.hosts.GetHostCreateReplay(ctx, idempotency)
+			if err != nil {
+				return host.Host{}, err
+			}
+			if found {
+				if replay.State == host.StateCreating {
+					if err := s.notifyCreate(ctx, replay.ID); err != nil {
+						s.logger.Error("notify host creation retry failed", zap.String("host_id", replay.ID), zap.Error(err))
+					}
+				}
+				return replay, nil
+			}
+		}
+		if s.defaultWorkspaces == nil {
+			return host.Host{}, domain.NewError(domain.CodeInternal, "default workspace provider is unavailable")
+		}
+		selected, err := s.defaultWorkspaces.EnsureDefaultWorkspace(ctx, principal.UserID)
+		if err != nil {
+			return host.Host{}, err
+		}
+		if !domain.ValidWorkspaceID(selected.ID) || selected.OwnerID != principal.UserID ||
+			selected.State != workspace.StateReady || selected.DeletedAt != nil {
+			return host.Host{}, domain.NewError(domain.CodeInvalidState, "default workspace is unavailable")
+		}
+		sortedWorkspaceIDs = []string{selected.ID}
 	}
 	for _, workspaceID := range sortedWorkspaceIDs {
 		value, err := s.workspaces.GetWorkspace(ctx, workspaceID)
@@ -278,6 +323,7 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		createRecord.ResourceID = value.ID
 		created, replayed, createErr = s.hosts.CreateHost(ctx, CreateHostParams{
 			Host: value, WorkspaceIDs: sortedWorkspaceIDs, Capacity: s.capacity, Idempotency: createRecord,
+			WorkspaceCopyReservationID: command.workspaceCopyReservationID,
 		})
 		if createErr == nil || !isUniqueViolation(createErr) {
 			break

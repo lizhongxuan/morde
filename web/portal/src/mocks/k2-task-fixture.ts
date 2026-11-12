@@ -86,7 +86,7 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
       dependencies: [],
       child_jobs: [{ job_id: "child-d-failed", task_step_id: "s0000005", title: "执行失败分支", task_revision: 1, status: "failed" }],
       result_review: { state: "failed", source_task_id: "q0000004", source_task_revision: 1,
-        source_event_sequence: 4, reply_message_id: null },
+        source_event_sequence: 4, reply_message_id: null, trigger_message_id: "m0000005" },
     },
   ];
 

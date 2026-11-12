@@ -75,6 +75,10 @@ type TaskFileFetchStore interface {
 	GetTaskFileFetch(context.Context, string, string, string) (TaskFileFetch, error)
 }
 
+type TaskFileFetchOwnerSessionAuthorizer interface {
+	IsDesktopClientWebSession(context.Context, string, string) (bool, error)
+}
+
 func TaskFileFetchFailureReason(code string) string {
 	switch code {
 	case "denied", "forbidden", "not_allowed", "permission_required", "unauthenticated":
@@ -95,8 +99,8 @@ func TaskFileFetchFailureReason(code string) string {
 }
 
 func (s *TaskService) GetTaskFileFetch(ctx context.Context, principal identity.Principal, taskID, fetchID string) (TaskFileFetch, error) {
-	if principal.Kind != identity.KindSession || principal.ClientInstallationID != "" {
-		return TaskFileFetch{}, domain.NewError(domain.CodeNotFound, "file fetch not found")
+	if err := s.authorizeTaskFileFetchOwnerSession(ctx, principal); err != nil {
+		return TaskFileFetch{}, err
 	}
 	details, err := s.Get(ctx, principal, taskID)
 	if err != nil {
@@ -124,7 +128,7 @@ func validTaskFileFetchProjection(value TaskFileFetch) bool {
 		validTaskFileFetchOperationKey(value.OperationKey) && domain.ValidClientInstallationID(value.SourceInstallationID) &&
 		value.SourceDeviceName != "" &&
 		(value.SourceDirectoryName == "" || ValidTaskFileFetchDirectoryName(value.SourceDirectoryName)) &&
-		value.TargetGrantVersion > 0 && value.TaskAuthorizationVersion > 0 && value.TaskRevision > 0 &&
+		value.TargetGrantVersion > 0 && value.TaskAuthorizationVersion > 0 && value.TaskRevision >= 0 &&
 		workspace.ValidateRelativePath(value.RelativePath) == nil && task.ValidFileFetchStatus(value.Status) &&
 		(value.FailureReason == "" || value.Status == task.FileFetchFailed && task.ValidFileFetchFailureReason(value.FailureReason)) &&
 		task.ValidFileFetchContentState(value.ContentState) &&

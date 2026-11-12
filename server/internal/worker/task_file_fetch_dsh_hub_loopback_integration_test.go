@@ -27,6 +27,7 @@ import (
 	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/storage/workspacefs"
@@ -88,6 +89,10 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	serviceInstanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	router, err := api.New(api.Deps{
 		Hosts: f01UnusedHostService{}, TLSAuthorizer: f01UnusedTLSAuthorizer{}, Verifier: credentials,
@@ -95,7 +100,8 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 		TaskFileFetch: taskService, Hub: hubService, MCPDisabled: true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20, MCPMaxBodyBytes: 16 << 20,
-		SessionTTL: time.Hour, HostScheme: "https", PortalDomain: "portal.example.test", HostSuffix: "hosts.example.test",
+		ServiceInstanceID: serviceInstanceID,
+		SessionTTL:        time.Hour, HostScheme: "https", PortalDomain: "portal.example.test", HostSuffix: "hosts.example.test",
 		PreviewPortMin: 1024,
 	})
 	if err != nil {
@@ -206,9 +212,10 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	observedTools := &a30ObservedTaskTools{CloudDSHToolBroker: toolBroker}
 	model := newA30FileFetchModel()
 	node, dshScript := f01NodeRuntimePaths(t)
-	instances, accountRuntimes, _ := newF01ConversationRuntime(t, store, node, dshScript, "a30-file-fetch-supervisor",
+	instances, accountRuntimes, supervisor := newF01ConversationRuntime(t, store, node, dshScript, "a30-file-fetch-supervisor",
 		bytes.Repeat([]byte{0x4b}, 32))
 	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
 	if err != nil {
@@ -221,12 +228,8 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		SupervisorID: "a30-file-fetch-supervisor", AccountRuntimes: accountRuntimes, Instances: instances,
 		Checkpoints: checkpoints, Models: model, ToolCapabilities: cloudDSHTestToolCapability{allowed: true},
-		Tools: toolBroker, Children: children, Completion: toolBroker,
+		Tools: observedTools, Children: children, Completion: toolBroker,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	serviceInstanceID, err := store.ServiceInstanceID(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,6 +266,7 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 		if response.StatusCode != http.StatusAccepted {
 			t.Fatalf("ordinary chat message status=%d body=%s", response.StatusCode, responseBody)
 		}
+		_ = response.Body.Close()
 		var accepted struct {
 			Message struct {
 				ID            string `json:"id"`
@@ -273,13 +277,29 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 		if err := json.Unmarshal(responseBody, &accepted); err != nil || accepted.Message.ID == "" || accepted.Message.TaskID != "" || accepted.Message.RoutingStatus != "pending" {
 			t.Fatalf("ordinary chat message receipt=%s err=%v", responseBody, err)
 		}
-		found, err := routeWorker.RunOnce(ctx)
-		if err != nil || !found {
-			t.Fatalf("route ordinary chat message into a Task: found=%t err=%v", found, err)
+		var message conversation.Message
+		var found, routed bool
+		var err error
+		routeDeadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(routeDeadline) {
+			if _, err = routeWorker.RunOnce(ctx); err != nil {
+				t.Fatalf("route ordinary chat message into a Task: %v", err)
+			}
+			message, found, err = store.FindConversationMessageByClientID(ctx, owner.ID, "", mainConversation.ConversationID, messageID, serviceInstanceID)
+			if err != nil || !found {
+				t.Fatalf("read routed chat message=%+v found=%t err=%v", message, found, err)
+			}
+			if message.RoutingStatus == "routed" && message.TaskID != "" {
+				routed = true
+				break
+			}
+			if message.RoutingStatus != "pending" {
+				t.Fatalf("chat message finished routing unexpectedly: %+v", message)
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-		message, found, err := store.FindConversationMessageByClientID(ctx, owner.ID, "", mainConversation.ConversationID, messageID, serviceInstanceID)
-		if err != nil || !found || message.RoutingStatus != "routed" || message.TaskID == "" {
-			t.Fatalf("routed chat message=%+v found=%t err=%v", message, found, err)
+		if !routed {
+			t.Fatalf("ordinary chat message was not routed before deadline: %+v", message)
 		}
 		model.configure(message.TaskID, relativePath, beforeTool)
 		details, err := runA30TaskWorker(ctx, store, executor, "a30-file-fetch-worker", sequence, owner.ID, message.TaskID)
@@ -293,7 +313,12 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	// online PC action, and the production helper sends two acknowledged chunks.
 	fullDetails := runChatTask("main file fetch", "a30-chat-success-001", "A30_MAIN_FETCH reports/full.pdf", "reports/full.pdf", nil)
 	if fullDetails.Task.Status != task.StatusCompleted || fullDetails.Task.Result != a30FileFetchAnswer {
-		t.Fatalf("full local file.fetch Task status=%q result=%q", fullDetails.Task.Status, fullDetails.Task.Result)
+		model.mu.Lock()
+		modelCalls := model.calls[fullDetails.Task.ID]
+		model.mu.Unlock()
+		t.Fatalf("full local file.fetch Task status=%q waiting_reason=%q model_calls=%d runtime=%s",
+			fullDetails.Task.Status, fullDetails.Task.WaitingReason, modelCalls,
+			f01AccountRuntimeFrameSummary([]byte(supervisor.output()))+" tools={"+observedTools.summary()+"}")
 	}
 	fullFetch := a30GetOnlyFetch(t, ctx, ownerClient, fullDetails.Task.ID)
 	fullHash := sha256.Sum256(fullSource)
@@ -308,24 +333,41 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	if err != nil || fullContentResponse.StatusCode != http.StatusOK || fullContentResponse.Header.Get("Content-Type") != "application/pdf" || !bytes.Equal(fullContent, fullSource) {
 		t.Fatalf("owner content download status=%v bytes=%d err=%v", responseStatus(fullContentResponse), len(fullContent), err)
 	}
+	_ = fullContentResponse.Body.Close()
 	if modelOutput := model.outputFor(fullDetails.Task.ID); strings.Contains(strings.ToLower(modelOutput), "ticket") ||
 		!strings.Contains(modelOutput, "transfer succeeded") || !strings.Contains(modelOutput, "raw-only") {
 		t.Fatalf("model received an unsafe or incomplete file.fetch result: %q", modelOutput)
 	}
-	if boundSessionResponse, _, requestErr := chatClient.do(ctx, http.MethodGet,
-		fmt.Sprintf("/api/tasks/%s/file-fetches", fullDetails.Task.ID), nil, "", nil); requestErr != nil || boundSessionResponse.StatusCode != http.StatusNotFound {
+	boundSessionResponse, _, requestErr := chatClient.do(ctx, http.MethodGet,
+		fmt.Sprintf("/api/tasks/%s/file-fetches", fullDetails.Task.ID), nil, "", nil)
+	if boundSessionResponse != nil {
+		_ = boundSessionResponse.Body.Close()
+	}
+	if requestErr != nil || boundSessionResponse.StatusCode != http.StatusNotFound {
 		t.Fatalf("iOS ClientWebSession accessed owner-only fetch list: status=%v err=%v", responseStatus(boundSessionResponse), requestErr)
 	}
-	if boundSessionResponse, _, requestErr := chatClient.do(ctx, http.MethodGet,
-		fmt.Sprintf("/api/tasks/%s/file-fetches/%s/content", fullDetails.Task.ID, fullFetch.FetchID), nil, "", nil); requestErr != nil || boundSessionResponse.StatusCode != http.StatusNotFound {
+	boundSessionResponse, _, requestErr = chatClient.do(ctx, http.MethodGet,
+		fmt.Sprintf("/api/tasks/%s/file-fetches/%s/content", fullDetails.Task.ID, fullFetch.FetchID), nil, "", nil)
+	if boundSessionResponse != nil {
+		_ = boundSessionResponse.Body.Close()
+	}
+	if requestErr != nil || boundSessionResponse.StatusCode != http.StatusNotFound {
 		t.Fatalf("iOS ClientWebSession accessed owner-only file content: status=%v err=%v", responseStatus(boundSessionResponse), requestErr)
 	}
-	if clientCredentialResponse, _, requestErr := a30HTTPDo(ctx, httpClient, portal.URL,
-		http.MethodGet, fmt.Sprintf("/api/tasks/%s/file-fetches", fullDetails.Task.ID), nil, "", clientCredential, nil); requestErr != nil || clientCredentialResponse.StatusCode != http.StatusNotFound {
+	clientCredentialResponse, _, requestErr := a30HTTPDo(ctx, httpClient, portal.URL,
+		http.MethodGet, fmt.Sprintf("/api/tasks/%s/file-fetches", fullDetails.Task.ID), nil, nil, clientCredential, nil)
+	if clientCredentialResponse != nil {
+		_ = clientCredentialResponse.Body.Close()
+	}
+	if requestErr != nil || clientCredentialResponse.StatusCode != http.StatusNotFound {
 		t.Fatalf("iOS Client credential accessed owner-only fetch list: status=%v err=%v", responseStatus(clientCredentialResponse), requestErr)
 	}
-	if clientCredentialResponse, _, requestErr := a30HTTPDo(ctx, httpClient, portal.URL,
-		http.MethodGet, fmt.Sprintf("/api/tasks/%s/file-fetches/%s/content", fullDetails.Task.ID, fullFetch.FetchID), nil, "", clientCredential, nil); requestErr != nil || clientCredentialResponse.StatusCode != http.StatusNotFound {
+	clientCredentialResponse, _, requestErr = a30HTTPDo(ctx, httpClient, portal.URL,
+		http.MethodGet, fmt.Sprintf("/api/tasks/%s/file-fetches/%s/content", fullDetails.Task.ID, fullFetch.FetchID), nil, nil, clientCredential, nil)
+	if clientCredentialResponse != nil {
+		_ = clientCredentialResponse.Body.Close()
+	}
+	if requestErr != nil || clientCredentialResponse.StatusCode != http.StatusNotFound {
 		t.Fatalf("iOS Client credential accessed owner-only file content: status=%v err=%v", responseStatus(clientCredentialResponse), requestErr)
 	}
 
@@ -399,7 +441,8 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	changeFetch := a30GetOnlyFetch(t, ctx, ownerClient, changeDetails.Task.ID)
 	if changeDetails.Task.Status != task.StatusCompleted || changeDetails.Task.Result != a30FileFetchFailedAnswer ||
 		changeFetch.Status != string(task.FileFetchFailed) ||
-		changeFetch.ConfirmedBytes < app.TaskFileFetchChunkBytes || changeFetch.ContentState != string(task.FileFetchContentNone) ||
+		changeFetch.FailureReason != task.FileFetchFailureSourceChanged || changeFetch.ConfirmedBytes != 0 ||
+		changeFetch.ContentState != string(task.FileFetchContentNone) ||
 		a30OwnerContentStatus(t, ctx, ownerClient, changeDetails.Task.ID, changeFetch.FetchID) != http.StatusNotFound {
 		t.Fatalf("source mutation did not fail closed: task=%q fetch=%+v", changeDetails.Task.Status, changeFetch)
 	}
@@ -457,10 +500,25 @@ func TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge(t *testing.T)
 	if err := <-revokeDone; err != nil {
 		t.Fatalf("grant-revocation interleaving: %v", err)
 	}
-	revokeFetch := a30GetOnlyFetch(t, ctx, ownerClient, revokeDetails.Task.ID)
-	if revokeFetch.ConfirmedBytes < app.TaskFileFetchChunkBytes || revokeFetch.ContentState != string(task.FileFetchContentNone) ||
+	revokeWaitCtx, revokeWaitCancel := context.WithTimeout(ctx, 5*time.Second)
+	revokeFetch, err := waitA30FetchStatus(revokeWaitCtx, ownerClient, revokeDetails.Task.ID, string(task.FileFetchFailed))
+	revokeWaitCancel()
+	if err != nil {
+		t.Fatalf("wait for PC ticket abort after local file-grant revocation: %v", err)
+	}
+	var revokeStagingChunks int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_file_fetch_chunks WHERE fetch_id=$1`, revokeFetch.FetchID).Scan(&revokeStagingChunks); err != nil {
+		t.Fatalf("count revoked file-fetch staging chunks: %v", err)
+	}
+	var revokedTicketHash []byte
+	if err := pool.QueryRow(ctx, `SELECT ticket_hash FROM task_file_fetches WHERE fetch_id=$1`, revokeFetch.FetchID).Scan(&revokedTicketHash); err != nil {
+		t.Fatalf("read revoked file-fetch ticket hash: %v", err)
+	}
+	if revokeFetch.ConfirmedBytes != 0 || revokeFetch.FailureReason != task.FileFetchFailureAccessDenied ||
+		revokeFetch.ContentState != string(task.FileFetchContentNone) || revokeStagingChunks != 0 || len(revokedTicketHash) != 0 ||
 		a30OwnerContentStatus(t, ctx, ownerClient, revokeDetails.Task.ID, revokeFetch.FetchID) != http.StatusNotFound {
-		t.Fatalf("revoked in-flight transfer published content: task=%q fetch=%+v", revokeDetails.Task.Status, revokeFetch)
+		t.Fatalf("revoked in-flight transfer retained staging or published content: task=%q fetch=%+v chunks=%d ticket_hash_bytes=%d",
+			revokeDetails.Task.Status, revokeFetch, revokeStagingChunks, len(revokedTicketHash))
 	}
 	if revokeDetails.Task.Status != task.StatusWaitingUser || revokeDetails.Task.WaitingReason != "hub_action_unknown" ||
 		revokeDetails.Task.Result == a30FileFetchAnswer {
@@ -571,6 +629,7 @@ type a30FileFetchResponse struct {
 	SizeBytes           *int64  `json:"size_bytes"`
 	ConfirmedBytes      int64   `json:"confirmed_bytes"`
 	Status              string  `json:"status"`
+	FailureReason       string  `json:"failure_reason"`
 	ContentState        string  `json:"content_state"`
 	ParseStatus         string  `json:"parse_status"`
 }
@@ -581,6 +640,34 @@ type a30FileFetchModel struct {
 	hooks   map[string]func(string) error
 	calls   map[string]int
 	outputs map[string]string
+}
+
+type a30ObservedTaskTools struct {
+	*app.CloudDSHToolBroker
+	mu             sync.Mutex
+	calls          int
+	lastErrorCode  string
+	lastErrorType  string
+	lastToolStatus app.AgentToolResultStatus
+}
+
+func (tools *a30ObservedTaskTools) Execute(ctx context.Context, current task.Task, call app.ModelToolCall) (app.AgentToolResult, error) {
+	result, err := tools.CloudDSHToolBroker.Execute(ctx, current, call)
+	tools.mu.Lock()
+	defer tools.mu.Unlock()
+	tools.calls++
+	tools.lastToolStatus = result.Status
+	if err != nil {
+		tools.lastErrorCode, tools.lastErrorType = string(domain.CodeOf(err)), fmt.Sprintf("%T", err)
+	}
+	return result, err
+}
+
+func (tools *a30ObservedTaskTools) summary() string {
+	tools.mu.Lock()
+	defer tools.mu.Unlock()
+	return fmt.Sprintf("execute_calls=%d last_status=%q error_code=%q error_type=%q",
+		tools.calls, tools.lastToolStatus, tools.lastErrorCode, tools.lastErrorType)
 }
 
 func newA30FileFetchModel() *a30FileFetchModel {
@@ -714,6 +801,15 @@ func startA30PCBridge(ctx context.Context, t *testing.T, baseURL, account, passw
 	script := `
 import { createInterface } from 'node:readline'
 const { default: NanomuseCloud } = await import(process.env.A30_CLOUD_MODULE)
+const fetch = globalThis.fetch
+globalThis.fetch = async (input, init) => {
+  const response = await fetch(input, init)
+  const rawURL = typeof input === 'string' ? input : input.url
+  const path = new URL(rawURL).pathname
+  const route = path === '/api/capabilities' || path === '/api/auth/client-login' ? path : '/other'
+  process.stdout.write('HTTP ' + JSON.stringify({ route, status: response.status }) + '\n')
+  return response
+}
 const credentials = new Map()
 const ctx = {
   reflect: { provide() {} },
@@ -741,9 +837,19 @@ async function waitConnected(want) {
   }
   throw new Error('local Hub connection did not reach the requested state')
 }
-await cloud.mordeHubLogin(process.env.A30_SERVER_URL, process.env.A30_ACCOUNT, process.env.A30_PASSWORD)
-await cloud.mordeHubUpdateGrants({ file_root: process.env.A30_FILE_ROOT, files: true })
-const initial = await waitConnected(true)
+let initial
+let stage = 'hub_login'
+try {
+  await cloud.mordeHubLogin(process.env.A30_SERVER_URL, process.env.A30_ACCOUNT, process.env.A30_PASSWORD)
+  stage = 'grants'
+  await cloud.mordeHubUpdateGrants({ file_root: process.env.A30_FILE_ROOT, files: true })
+  stage = 'wait_connected'
+  initial = await waitConnected(true)
+} catch (error) {
+  const code = /^[a-z0-9_]{1,80}$/i.test(String(error?.code ?? '')) ? String(error.code) : 'unknown'
+  process.stdout.write('FATAL ' + JSON.stringify({ stage, code, status: Number.isInteger(error?.status) ? error.status : 0 }) + '\n')
+  process.exit(1)
+}
 process.stdout.write('READY ' + JSON.stringify({ installation_id: initial.installationID, target_grant_version: initial.targetGrantVersion }) + '\n')
 const lines = createInterface({ input: process.stdin })
 for await (const line of lines) {
@@ -797,6 +903,7 @@ cloud.mordeHub?.stop('A30 local fixture stopped')
 	}()
 	readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer readyCancel()
+	var diagnostics []string
 	for {
 		select {
 		case line, ok := <-bridge.lines:
@@ -804,14 +911,24 @@ cloud.mordeHub?.stop('A30 local fixture stopped')
 				_ = cmd.Wait()
 				return nil, errors.New("production local PC bridge exited before Hub login")
 			}
+			if strings.HasPrefix(line, "FATAL ") {
+				return nil, fmt.Errorf("production local PC bridge initialization failed: %s http=%v", strings.TrimPrefix(line, "FATAL "), diagnostics)
+			}
+			if strings.HasPrefix(line, "HTTP ") {
+				diagnostics = append(diagnostics, strings.TrimPrefix(line, "HTTP "))
+				continue
+			}
 			if !strings.HasPrefix(line, "READY ") {
 				continue
 			}
 			var ready struct {
 				InstallationID string `json:"installation_id"`
 			}
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "READY ")), &ready); err != nil || ready.InstallationID == "" {
-				return nil, fmt.Errorf("production PC bridge returned invalid readiness receipt: %v", err)
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "READY ")), &ready); err != nil {
+				return nil, fmt.Errorf("decode production PC bridge readiness receipt: %w", err)
+			}
+			if ready.InstallationID == "" {
+				return nil, errors.New("production PC bridge returned an empty installation ID")
 			}
 			bridge.installationID = ready.InstallationID
 			return bridge, nil
@@ -861,10 +978,12 @@ func (bridge *a30PCBridge) close() {
 	done := make(chan error, 1)
 	go func() { done <- bridge.cmd.Wait() }()
 	select {
-	case <-done:
+	case waitErr := <-done:
+		_ = waitErr
 	case <-time.After(5 * time.Second):
 		_ = bridge.cmd.Process.Kill()
-		<-done
+		waitErr := <-done
+		_ = waitErr
 	}
 }
 
@@ -908,14 +1027,18 @@ func a30ClientLogin(ctx context.Context, t *testing.T, client *http.Client, base
 	if err != nil {
 		return "", err
 	}
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("ClientLogin status=%d body=%s", response.StatusCode, responseBody)
 	}
 	var result struct {
 		ClientCredential string `json:"client_credential"`
 	}
-	if err := json.Unmarshal(responseBody, &result); err != nil || result.ClientCredential == "" {
+	if err := json.Unmarshal(responseBody, &result); err != nil {
 		return "", fmt.Errorf("decode ClientLogin receipt: %w", err)
+	}
+	if result.ClientCredential == "" {
+		return "", errors.New("decode ClientLogin receipt: credential is empty")
 	}
 	return result.ClientCredential, nil
 }
@@ -926,14 +1049,18 @@ func a30CreateWebSession(ctx context.Context, client *http.Client, baseURL, clie
 	if err != nil {
 		return "", err
 	}
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("Client Web Session status=%d body=%s", response.StatusCode, body)
 	}
 	var result struct {
 		Credential string `json:"web_session_credential"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil || result.Credential == "" {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("decode Client Web Session receipt: %w", err)
+	}
+	if result.Credential == "" {
+		return "", errors.New("decode Client Web Session receipt: credential is empty")
 	}
 	return result.Credential, nil
 }
@@ -944,6 +1071,7 @@ func a30PortalLogin(ctx context.Context, client *http.Client, baseURL, account, 
 	if err != nil {
 		return "", err
 	}
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("owner Portal Session login status=%d body=%s", response.StatusCode, body)
 	}
@@ -1062,6 +1190,7 @@ func a30ListFetches(t *testing.T, ctx context.Context, client *a30PortalSessionC
 	if err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("list owner Task file fetches: status=%v err=%v body=%s", responseStatus(response), err, body)
 	}
+	_ = response.Body.Close()
 	if bytes.Contains(bytes.ToLower(body), []byte("ticket")) || bytes.Contains(bytes.ToLower(body), []byte("ticket_hash")) {
 		t.Fatal("owner file.fetch projection leaked a ticket field")
 	}
@@ -1091,6 +1220,7 @@ func a30OwnerContentStatus(t *testing.T, ctx context.Context, client *a30PortalS
 		t.Errorf("request owner file.fetch content: %v", err)
 		return 0
 	}
+	_ = response.Body.Close()
 	return response.StatusCode
 }
 
@@ -1099,11 +1229,38 @@ func waitA30FetchProgress(ctx context.Context, client *a30PortalSessionClient, t
 	defer ticker.Stop()
 	for {
 		response, body, err := client.doTaskRequest(ctx, http.MethodGet, fmt.Sprintf("/api/tasks/%s/file-fetches", taskID), nil, nil)
+		if response != nil {
+			_ = response.Body.Close()
+		}
 		if err == nil && response.StatusCode == http.StatusOK {
 			var result struct {
 				Items []a30FileFetchResponse `json:"items"`
 			}
 			if json.Unmarshal(body, &result) == nil && len(result.Items) == 1 && result.Items[0].ConfirmedBytes >= minConfirmed {
+				return result.Items[0], nil
+			}
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return a30FileFetchResponse{}, ctx.Err()
+		}
+	}
+}
+
+func waitA30FetchStatus(ctx context.Context, client *a30PortalSessionClient, taskID, wantStatus string) (a30FileFetchResponse, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		response, body, err := client.doTaskRequest(ctx, http.MethodGet, fmt.Sprintf("/api/tasks/%s/file-fetches", taskID), nil, nil)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		if err == nil && response.StatusCode == http.StatusOK {
+			var result struct {
+				Items []a30FileFetchResponse `json:"items"`
+			}
+			if json.Unmarshal(body, &result) == nil && len(result.Items) == 1 && result.Items[0].Status == wantStatus {
 				return result.Items[0], nil
 			}
 		}

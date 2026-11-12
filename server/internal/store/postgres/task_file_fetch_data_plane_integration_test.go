@@ -160,6 +160,26 @@ WHERE id=$1 AND owner_id=$2`, claimed.ID, owner.ID, revision); err != nil {
 		completed.SourceDirectoryName != request.SourceDirectoryName {
 		t.Fatalf("retained content projection: fetch=%+v err=%v", completed, err)
 	}
+	otherOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	if _, err := store.GetTaskFileFetch(ctx, otherOwner.ID, claimed.ID, fetch.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("read another owner's fetch status err=%v; want not_found", err)
+	}
+	otherBody, _, err := store.OpenTaskFileFetchContent(ctx, otherOwner.ID, claimed.ID, fetch.ID)
+	if err == nil {
+		if otherBody != nil {
+			_ = otherBody.Close()
+		}
+		t.Fatal("another owner read retained file content")
+	}
+	if domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("read another owner's content err=%v; want not_found", err)
+	}
+	if _, err := store.CancelTaskFileFetch(ctx, otherOwner.ID, claimed.ID, fetch.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("cancel another owner's fetch err=%v; want not_found", err)
+	}
+	if _, err := store.DeleteTaskFileFetchContent(ctx, otherOwner.ID, claimed.ID, fetch.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("delete another owner's content err=%v; want not_found", err)
+	}
 	parsed, err := store.SetTaskFileFetchParseResult(ctx, owner.ID, claimed.ID, fetch.ID, task.FileFetchParseExtracted, "")
 	if err != nil || parsed.ParseStatus != task.FileFetchParseExtracted || parsed.ParseError != "" {
 		t.Fatalf("save completed transfer parse state: fetch=%+v err=%v", parsed, err)
@@ -271,5 +291,181 @@ WHERE id=$1 AND owner_id=$2`, claimed.ID, owner.ID, revision); err != nil {
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_file_fetch_chunks WHERE fetch_id=$1`, failureFetch.ID).Scan(&chunkCount); err != nil || chunkCount != 0 {
 		t.Fatalf("failed staging chunks: count=%d err=%v", chunkCount, err)
+	}
+
+	// Every data-plane route rejects an expired ticket before accepting bytes.
+	_, expiredFetch, expiredTicketHash := newFetch("agent:file-fetch-ticket-expired", "reports/expired-ticket.txt")
+	expiredData := []byte("ticket expired")
+	expiredManifest := manifest(expiredData)
+	if _, err := store.pool.Exec(ctx, `UPDATE task_file_fetches SET ticket_expires_at=clock_timestamp()-interval '1 second' WHERE fetch_id=$1`, expiredFetch.ID); err != nil {
+		t.Fatalf("expire Task fetch ticket: %v", err)
+	}
+	if _, err := store.AcceptTaskFileFetchManifest(ctx, claimed.ID, expiredFetch.ID, expiredTicketHash, expiredManifest); domain.CodeOf(err) != domain.CodeTransferExpired {
+		t.Fatalf("manifest with expired ticket err=%v; want transfer_expired", err)
+	}
+	if _, err := store.PutTaskFileFetchChunk(ctx, claimed.ID, expiredFetch.ID, expiredTicketHash, 0,
+		chunkDigest(expiredData), expiredData); domain.CodeOf(err) != domain.CodeTransferExpired {
+		t.Fatalf("chunk with expired ticket err=%v; want transfer_expired", err)
+	}
+	if _, err := store.CommitTaskFileFetch(ctx, claimed.ID, expiredFetch.ID, expiredTicketHash,
+		app.TaskFileFetchCommitRequest{SourceVersion: expiredManifest.SourceVersion, SourceSHA256: expiredManifest.SourceSHA256, SizeBytes: expiredManifest.SizeBytes},
+		mustID(t, domain.NewOperationID)); domain.CodeOf(err) != domain.CodeTransferExpired {
+		t.Fatalf("commit with expired ticket err=%v; want transfer_expired", err)
+	}
+	var expiredStatus string
+	var expiredBytes int64
+	if err := store.pool.QueryRow(ctx, `SELECT status,confirmed_bytes FROM task_file_fetches WHERE fetch_id=$1`, expiredFetch.ID).
+		Scan(&expiredStatus, &expiredBytes); err != nil || expiredStatus != string(task.FileFetchQueued) || expiredBytes != 0 {
+		t.Fatalf("expired-ticket fetch changed: status=%q bytes=%d err=%v", expiredStatus, expiredBytes, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_file_fetch_chunks WHERE fetch_id=$1`, expiredFetch.ID).Scan(&chunkCount); err != nil || chunkCount != 0 {
+		t.Fatalf("expired-ticket staging chunks: count=%d err=%v", chunkCount, err)
+	}
+
+	// A ticket issued for an older Task revision cannot stage or publish data.
+	_, revisedFetch, revisedTicketHash := newFetch("agent:file-fetch-revision-changed", "reports/revision-changed.txt")
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET current_revision=$2,desired_revision=$2 WHERE id=$1`, claimed.ID, revision+1); err != nil {
+		t.Fatalf("advance Task revision after PC dispatch: %v", err)
+	}
+	revisedData := []byte("old revision")
+	revisedManifest := manifest(revisedData)
+	if _, err := store.AcceptTaskFileFetchManifest(ctx, claimed.ID, revisedFetch.ID, revisedTicketHash, revisedManifest); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("manifest after Task revision changed err=%v; want conflict", err)
+	}
+	if _, err := store.PutTaskFileFetchChunk(ctx, claimed.ID, revisedFetch.ID, revisedTicketHash, 0,
+		chunkDigest(revisedData), revisedData); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("chunk after Task revision changed err=%v; want conflict", err)
+	}
+	if _, err := store.CommitTaskFileFetch(ctx, claimed.ID, revisedFetch.ID, revisedTicketHash,
+		app.TaskFileFetchCommitRequest{SourceVersion: revisedManifest.SourceVersion, SourceSHA256: revisedManifest.SourceSHA256, SizeBytes: revisedManifest.SizeBytes},
+		mustID(t, domain.NewOperationID)); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("commit after Task revision changed err=%v; want conflict", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_file_fetch_chunks WHERE fetch_id=$1`, revisedFetch.ID).Scan(&chunkCount); err != nil || chunkCount != 0 {
+		t.Fatalf("old-revision staging chunks: count=%d err=%v", chunkCount, err)
+	}
+}
+
+func TestPostgresTaskFileFetchAbortSerializesWithCommit(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	targetID := mustID(t, domain.NewClientInstallationID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO client_installations (id,owner_id,display_name,platform,expires_at)
+VALUES ($1,$2,'Synthetic PC','desktop',clock_timestamp()+interval '1 day')`, targetID, owner.ID); err != nil {
+		t.Fatalf("insert target installation: %v", err)
+	}
+	submission := newTestTaskSubmission(t, owner.ID, "", "file-fetch-abort-commit-race", "read one local report")
+	submission.Task.ExecutionLocation = "server"
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "file-fetch-abort-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Task: found=%t task=%+v err=%v", found, claimed, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1,status='running' WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatalf("set current Task revision: %v", err)
+	}
+	operation := app.TaskHubOperation{OwnerID: owner.ID, TaskID: claimed.ID, Key: "agent:file-fetch-abort-commit-race",
+		ToolName: "morde_hub_file_fetch_i1234567_v5", TargetInstallationID: targetID, Action: hub.ActionFileFetch,
+		TaskAuthorizationVersion: claimed.Authorization.Version, TargetGrantVersion: 5, TaskRevision: 1,
+		LeaseVersion: claimed.Lease.Version, RequestHash: hashBytes("file.fetch abort-commit-race"), Status: task.OperationPrepared}
+	operation, replayed, err := store.PrepareTaskHubOperation(ctx, operation, claimed.Lease.Owner)
+	if err != nil || replayed {
+		t.Fatalf("prepare Task operation: replayed=%t err=%v", replayed, err)
+	}
+	fetchID := mustID(t, domain.NewOperationID)
+	fetch := app.TaskFileFetch{ID: fetchID, OwnerID: owner.ID, TaskID: claimed.ID, OperationKey: operation.Key,
+		SourceInstallationID: targetID, TargetGrantVersion: operation.TargetGrantVersion,
+		TaskAuthorizationVersion: operation.TaskAuthorizationVersion, TaskRevision: operation.TaskRevision,
+		RelativePath: "reports/race.txt", Status: task.FileFetchQueued}
+	if _, replayed, err := store.CreateTaskFileFetch(ctx, app.TaskFileFetchCreate{Operation: operation, Fetch: fetch}, claimed.Lease.Owner); err != nil || replayed {
+		t.Fatalf("create Task fetch: replayed=%t err=%v", replayed, err)
+	}
+	ticketHash := sha256.Sum256([]byte("synthetic-abort-commit-race-ticket"))
+	expires := time.Now().UTC().Add(app.TaskFileFetchTicketLifetime)
+	if dispatched, err := store.DispatchTaskFileFetch(ctx, operation, fetchID, ticketHash[:], &expires, true, claimed.Lease.Owner); err != nil || !dispatched {
+		t.Fatalf("dispatch Task fetch: dispatched=%t err=%v", dispatched, err)
+	}
+	data := []byte("commit races with local file grant revocation")
+	versionDigest := sha256.Sum256([]byte("source-version"))
+	contentDigest := sha256.Sum256(data)
+	manifest := app.TaskFileFetchManifestRequest{SourceVersion: hex.EncodeToString(versionDigest[:]),
+		SourceSHA256: hex.EncodeToString(contentDigest[:]), SizeBytes: int64(len(data)), MediaType: "text/plain", SourceDirectoryName: "reports"}
+	if _, err := store.AcceptTaskFileFetchManifest(ctx, claimed.ID, fetchID, ticketHash[:], manifest); err != nil {
+		t.Fatalf("pin Task fetch manifest: %v", err)
+	}
+	chunkDigest := hex.EncodeToString(contentDigest[:])
+	if _, err := store.PutTaskFileFetchChunk(ctx, claimed.ID, fetchID, ticketHash[:], 0, chunkDigest, data); err != nil {
+		t.Fatalf("store complete Task fetch chunk: %v", err)
+	}
+	wrongTicket := sha256.Sum256([]byte("another fetch ticket"))
+	if err := store.AbortTaskFileFetch(ctx, claimed.ID, fetchID, wrongTicket[:]); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("abort Task fetch with wrong ticket err=%v; want not_found", err)
+	}
+
+	start := make(chan struct{})
+	type result struct{ err error }
+	commitDone, abortDone := make(chan result, 1), make(chan result, 1)
+	candidateContentID := mustID(t, domain.NewOperationID)
+	go func() {
+		<-start
+		_, err := store.CommitTaskFileFetch(ctx, claimed.ID, fetchID, ticketHash[:],
+			app.TaskFileFetchCommitRequest{SourceVersion: manifest.SourceVersion, SourceSHA256: manifest.SourceSHA256, SizeBytes: manifest.SizeBytes},
+			candidateContentID)
+		commitDone <- result{err: err}
+	}()
+	go func() {
+		<-start
+		abortDone <- result{err: store.AbortTaskFileFetch(ctx, claimed.ID, fetchID, ticketHash[:])}
+	}()
+	close(start)
+	commitResult, abortResult := <-commitDone, <-abortDone
+	if abortResult.err != nil {
+		t.Fatalf("abort concurrent Task fetch: %v", abortResult.err)
+	}
+	final, err := store.GetTaskFileFetch(ctx, owner.ID, claimed.ID, fetchID)
+	if err != nil {
+		t.Fatalf("read final Task fetch state: %v", err)
+	}
+	var chunks int64
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_file_fetch_chunks WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`,
+		owner.ID, claimed.ID, fetchID).Scan(&chunks); err != nil {
+		t.Fatalf("count final Task fetch chunks: %v", err)
+	}
+	var revokedTicket []byte
+	if err := store.pool.QueryRow(ctx, `SELECT ticket_hash FROM task_file_fetches WHERE owner_id=$1 AND task_id=$2 AND fetch_id=$3`,
+		owner.ID, claimed.ID, fetchID).Scan(&revokedTicket); err != nil {
+		t.Fatalf("read final Task fetch ticket: %v", err)
+	}
+	switch final.Status {
+	case task.FileFetchFailed:
+		if commitResult.err == nil || final.FailureReason != task.FileFetchFailureAccessDenied || final.ConfirmedBytes != 0 ||
+			final.ContentState != task.FileFetchContentNone || chunks != 0 || len(revokedTicket) != 0 {
+			t.Fatalf("abort-first race left commit, staging or ticket live: commit_err=%v fetch=%+v chunks=%d ticket_hash_bytes=%d",
+				commitResult.err, final, chunks, len(revokedTicket))
+		}
+		if _, _, err := store.OpenTaskFileFetchContent(ctx, owner.ID, claimed.ID, fetchID); domain.CodeOf(err) != domain.CodeNotFound {
+			t.Fatalf("read aborted Task fetch content err=%v; want not_found", err)
+		}
+	case task.FileFetchCompleted:
+		if commitResult.err != nil || final.ContentState != task.FileFetchContentRetained || chunks != 1 || len(revokedTicket) != 0 {
+			t.Fatalf("commit-first race lost completed content or retained a ticket: commit_err=%v fetch=%+v chunks=%d ticket_hash_bytes=%d",
+				commitResult.err, final, chunks, len(revokedTicket))
+		}
+		content, _, err := store.OpenTaskFileFetchContent(ctx, owner.ID, claimed.ID, fetchID)
+		if err != nil {
+			t.Fatalf("read committed Task fetch content: %v", err)
+		}
+		got, readErr := io.ReadAll(content)
+		_ = content.Close()
+		if readErr != nil || !bytes.Equal(got, data) {
+			t.Fatalf("commit-first race content=%q read_err=%v", got, readErr)
+		}
+	default:
+		t.Fatalf("abort/commit race left nonterminal fetch state: commit_err=%v fetch=%+v", commitResult.err, final)
 	}
 }

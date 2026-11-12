@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { resolveSyncTarget } from './morde-target.mjs';
 
 const sourceCommit = 'ed38528d7fba3dd6a42c9c9fc6780af432dc15d2';
-const f02PatchSHA256 = 'c6bfa517918183efac18b96eff0ca4ad6f844f42abe5601ab1c757ff06586539';
+const f02PatchSHA256 = 'dc46d4e233ff4e12d238ab31efa5e953b17539d1aced85d8b82c709f6a405e0a';
 const safeInitPatchSHA256 = '972ffce777fb97c610647caac1dc4d834e4710fecea8e93f51d3fdb1291c89c6';
 const sourceURL = 'https://github.com/syncthing/syncthing.git';
 const expectedGoVersion = 'go1.27.1';

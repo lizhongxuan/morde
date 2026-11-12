@@ -16,9 +16,10 @@ function entry(request: unknown, attachments = [attachment]): PendingConversatio
 describe('outbox receipt request', () => {
   it('keeps the accepted message, target and attachment slot', () => {
     const original = entry({ client_message_id: 'message-001', content: '完整原文', reference_task_id: 'q1234567',
-      model_id: 'p1234567', workspace_id: 'w1234567', client_attachment_ids: [attachment.id] });
+      model_id: 'p1234567', workspace_id: 'w1234567', change_task_target: true, client_attachment_ids: [attachment.id] });
     expect(outboxReceiptRequest(original)).toEqual({ client_message_id: 'message-001', content: '完整原文',
-      reference_task_id: 'q1234567', model_id: 'p1234567', workspace_id: 'w1234567', client_attachment_ids: [attachment.id] });
+      reference_task_id: 'q1234567', model_id: 'p1234567', workspace_id: 'w1234567', change_task_target: true,
+      client_attachment_ids: [attachment.id] });
     expect(original.attachments[0]?.blob).toBe(attachment.blob);
   });
 

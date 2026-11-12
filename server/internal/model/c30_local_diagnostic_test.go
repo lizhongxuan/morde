@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"testing"
 
 	"morde/server/internal/app"
 )
 
 func TestC30G3LocalModelRouteDiagnostic(t *testing.T) {
+	if os.Getenv("CH_C30_MODEL_DIAGNOSTIC") != "1" {
+		t.Skip("set CH_C30_MODEL_DIAGNOSTIC=1 to run the opt-in local model route diagnostic")
+	}
 	client, err := NewResponsesClient([]string{"api.openai.com"}, "http://127.0.0.1:18080")
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +43,7 @@ func TestC30G3LocalModelRouteDiagnostic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("local Responses API transport failed (%T): %v", err, err)
 	}
-	defer responseBody.Body.Close()
+	defer func() { _ = responseBody.Body.Close() }()
 	data, err := readResponseBody(responseBody.Body, maxResponseBytes)
 	if err != nil {
 		t.Fatalf("read local Responses API body (%T): %v", err, err)

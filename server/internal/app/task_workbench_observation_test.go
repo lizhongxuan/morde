@@ -30,6 +30,14 @@ func (s *observationTaskStoreStub) GetHost(_ context.Context, id string) (host.H
 	return s.host, nil
 }
 
+func (s *observationTaskStoreStub) GetTokenByID(_ context.Context, id string) (identity.Token, error) {
+	if id != "t1234567" {
+		return identity.Token{}, domain.NewError(domain.CodeNotFound, "token not found")
+	}
+	return identity.Token{ID: id, OwnerID: s.host.OwnerID, Kind: identity.KindSession,
+		ClientInstallationID: "c1234567", ExpiresAt: time.Now().Add(time.Hour)}, nil
+}
+
 func (s *observationTaskStoreStub) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
 	if id != "w1234567" {
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
@@ -78,7 +86,8 @@ func (s *observationTaskStoreStub) GetTaskWorkbenchObservationSession(_ context.
 }
 
 type observationTaskAuthorizer struct {
-	revoked bool
+	revoked                   bool
+	requireClientInstallation bool
 }
 
 func (a *observationTaskAuthorizer) AuthorizeTaskAction(_ context.Context, _ string, _ identity.Kind, tokenID string, _ string, _ []identity.Scope, scope identity.Scope) error {
@@ -89,6 +98,9 @@ func (a *observationTaskAuthorizer) AuthorizeTaskAction(_ context.Context, _ str
 }
 
 func (a *observationTaskAuthorizer) AuthorizeTaskExecution(ctx context.Context, principal identity.Principal, hostID string, scope identity.Scope) (task.Authorization, error) {
+	if a.requireClientInstallation && principal.ClientInstallationID != "c1234567" {
+		return task.Authorization{}, identity.ErrInvalidCredential
+	}
 	if err := a.AuthorizeTaskAction(ctx, principal.UserID, principal.Kind, principal.TokenID, hostID, principal.Scopes, scope); err != nil {
 		return task.Authorization{}, err
 	}
@@ -110,18 +122,20 @@ func TestTaskWorkbenchObservationTicketIsSingleUseAndProjectsOnlySafeReadData(t 
 		records: map[string]TaskWorkbenchObservationRecord{},
 		host:    host.Host{ID: "h1234567", OwnerID: "u1234567", State: host.StateRunning, RuntimeGeneration: 9},
 	}
-	authorizer := &observationTaskAuthorizer{}
+	authorizer := &observationTaskAuthorizer{requireClientInstallation: true}
 	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession,
+		TokenID: "t1234567", ClientInstallationID: "c1234567"}
 	ticket, err := service.IssueWorkbenchObservationTicket(context.Background(), principal, "q1234567")
 	if err != nil || ticket.TaskID != "q1234567" || ticket.HostID != "h1234567" || !ticket.ExpiresAt.After(time.Now()) {
 		t.Fatalf("IssueWorkbenchObservationTicket() = %#v, %v", ticket, err)
 	}
 	record := store.records[hex.EncodeToString(observationHash(ticket.Ticket))]
-	if err := service.revalidateObservationTask(context.Background(), record); err != nil {
+	installationID, err := service.revalidateObservationTask(context.Background(), record)
+	if err != nil || installationID != "c1234567" {
 		t.Fatalf("pre-exchange revalidation: %v", err)
 	}
 	if record.TaskID != ticket.TaskID || record.ActorID != principal.UserID || record.RuntimeGeneration != 9 || record.Scope != "task:read" {
@@ -137,7 +151,7 @@ func TestTaskWorkbenchObservationTicketIsSingleUseAndProjectsOnlySafeReadData(t 
 		t.Fatalf("cross-generation ticket exchange error = %v, want not found", err)
 	}
 	cookie, session, err := service.ConsumeWorkbenchObservationTicket(context.Background(), ticket.Ticket, ticket.HostID, 9)
-	if err != nil || cookie == "" || session.TaskID != ticket.TaskID || session.RuntimeGeneration != 9 {
+	if err != nil || cookie == "" || session.TaskID != ticket.TaskID || session.RuntimeGeneration != 9 || session.clientInstallationID != "c1234567" {
 		t.Fatalf("ConsumeWorkbenchObservationTicket() = %q, %#v, %v", cookie, session, err)
 	}
 	if _, _, err := service.ConsumeWorkbenchObservationTicket(context.Background(), ticket.Ticket, ticket.HostID, 9); domain.CodeOf(err) != domain.CodeNotFound {

@@ -85,6 +85,23 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertFalse(firstScope.hasSameAccount(as: changedScope))
     }
 
+    func testChangedAccountCannotReadExistingOutbox() throws {
+        let firstScope = try makeScope(accountID: "user-old")
+        let changedScope = try makeScope(accountID: "user-new")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("morde-account-outbox-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let outbox = MordeMessageOutbox(root: root)
+        let queued = try outbox.enqueue(scope: firstScope, conversationID: "c1234567", content: "旧账号待发内容",
+            modelID: nil, attachmentIDs: [])
+
+        XCTAssertEqual(try outbox.messages(scope: firstScope), [queued])
+        XCTAssertTrue(try MordeMessageOutbox(root: root).messages(scope: changedScope).isEmpty)
+        XCTAssertNotEqual(firstScope.messageOutboxKey, changedScope.messageOutboxKey)
+        XCTAssertFalse(firstScope.hasSameAccount(as: changedScope))
+    }
+
     func testOutboxRestartPreservesClientAndPredecessorMessageIDs() throws {
         let scope = try makeScope(instanceID: "11111111-1111-4111-8111-111111111111")
         let root = FileManager.default.temporaryDirectory
@@ -127,8 +144,9 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(next.previousClientMessageID, recoveredSecond.id)
     }
 
-    private func makeScope(instanceID: String) throws -> MordeClientDataScope {
+    private func makeScope(instanceID: String = "11111111-1111-4111-8111-111111111111",
+                           accountID: String = "user-1") throws -> MordeClientDataScope {
         try XCTUnwrap(MordeClientDataScope(serviceOrigin: "https://morde.example",
-            serviceInstanceID: instanceID, accountID: "user-1", installationID: "install-1"))
+            serviceInstanceID: instanceID, accountID: accountID, installationID: "install-1"))
     }
 }

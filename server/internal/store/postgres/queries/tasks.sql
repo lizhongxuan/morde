@@ -29,6 +29,36 @@ WHERE tasks.conversation_id = sqlc.arg(conversation_id)
 ORDER BY tasks.created_at DESC, tasks.id DESC
 LIMIT sqlc.arg(page_limit);
 
+-- name: ListConversationTasks :many
+SELECT tasks.* FROM tasks
+WHERE tasks.conversation_id = sqlc.arg(conversation_id)
+  AND tasks.project_id IS NOT DISTINCT FROM sqlc.narg(project_id)::text
+  AND ((tasks.project_id IS NULL AND tasks.owner_id = sqlc.arg(actor_id) AND tasks.initiator_id = tasks.owner_id)
+    OR (tasks.project_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
+      WHERE pm.project_id = tasks.project_id AND pm.user_id = sqlc.arg(actor_id)
+    )))
+  AND ((sqlc.arg(task_view)::text = 'active' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling'))
+    OR (sqlc.arg(task_view)::text = 'recent' AND tasks.status IN ('completed', 'failed', 'cancelled')))
+  AND (sqlc.narg(host_ids)::text[] IS NULL OR tasks.host_id = ANY(sqlc.narg(host_ids)::text[]))
+  AND (sqlc.narg(cursor_at)::timestamptz IS NULL OR tasks.created_at < sqlc.narg(cursor_at)::timestamptz
+    OR (tasks.created_at = sqlc.narg(cursor_at)::timestamptz AND tasks.id < sqlc.arg(cursor_id)))
+ORDER BY tasks.created_at DESC, tasks.id DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: CountConversationPendingTaskHosts :many
+SELECT tasks.host_id, count(*)::bigint AS task_count FROM tasks
+WHERE tasks.conversation_id = sqlc.arg(conversation_id)
+  AND tasks.project_id IS NOT DISTINCT FROM sqlc.narg(project_id)::text
+  AND ((tasks.project_id IS NULL AND tasks.owner_id = sqlc.arg(actor_id) AND tasks.initiator_id = tasks.owner_id)
+    OR (tasks.project_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
+      WHERE pm.project_id = tasks.project_id AND pm.user_id = sqlc.arg(actor_id)
+    )))
+  AND tasks.status = 'waiting_user'
+  AND (sqlc.narg(host_ids)::text[] IS NULL OR tasks.host_id = ANY(sqlc.narg(host_ids)::text[]))
+GROUP BY tasks.host_id;
+
 -- name: ListTaskSteps :many
 SELECT * FROM task_steps WHERE task_id = $1 ORDER BY sequence;
 

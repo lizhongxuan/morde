@@ -212,6 +212,7 @@ func conversationRouteCallDigest(claim ConversationRouteClaim, value Conversatio
 		ConversationID    string
 		ActorID           string
 		ModelID           string
+		ReviewAttempt     int64 `json:"review_attempt,omitempty"`
 		Instructions      string
 		Input             []ModelInput
 		MaxOutputTokens   int
@@ -219,12 +220,20 @@ func conversationRouteCallDigest(claim ConversationRouteClaim, value Conversatio
 		History           []historyEvidence
 		Candidates        []ConversationRouteCandidate
 	}{claim.ServiceInstanceID, claim.Message.ID, claim.Message.ConversationID, claim.Message.ActorID,
-		value.ModelID, request.Instructions, request.Input, request.MaxOutputTokens, request.DisableThinking, history, value.Candidates})
+		value.ModelID, conversationRouteRetryAttempt(value), request.Instructions, request.Input, request.MaxOutputTokens,
+		request.DisableThinking, history, value.Candidates})
 	if err != nil {
 		return nil, "", err
 	}
 	idHash := sha256.Sum256(append([]byte("morde-route-model-v1\n"+claim.Message.ID+"\n"), digest...))
 	return digest, "route_" + hex.EncodeToString(idHash[:]), nil
+}
+
+func conversationRouteRetryAttempt(value ConversationRouteContext) int64 {
+	if value.ResultReview != nil {
+		return value.ResultReview.RetryAttempt
+	}
+	return 0
 }
 
 func (s *ModelGatewayService) routeProjectReservation(ctx context.Context, call ModelCallReservation, request ModelRequest) (*ProjectModelReservation, error) {

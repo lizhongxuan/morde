@@ -49,6 +49,10 @@ type taskWorkbenchObservationHostReader interface {
 	GetHost(context.Context, string) (host.Host, error)
 }
 
+type taskWorkbenchObservationTokenReader interface {
+	GetTokenByID(context.Context, string) (identity.Token, error)
+}
+
 type TaskWorkbenchObservationTicket struct {
 	Ticket    string    `json:"ticket"`
 	TaskID    string    `json:"task_id"`
@@ -59,12 +63,13 @@ type TaskWorkbenchObservationTicket struct {
 // TaskWorkbenchObservationSession deliberately contains only the identifiers
 // Gateway needs. The Portal session token and read scope remain server-side.
 type TaskWorkbenchObservationSession struct {
-	TaskID            string
-	HostID            string
-	ActorID           string
-	RuntimeGeneration int64
-	ExpiresAt         time.Time
-	sessionTokenID    string
+	TaskID               string
+	HostID               string
+	ActorID              string
+	RuntimeGeneration    int64
+	ExpiresAt            time.Time
+	sessionTokenID       string
+	clientInstallationID string
 }
 
 type TaskWorkbenchObservationArtifact struct {
@@ -160,7 +165,8 @@ func (s *TaskService) ConsumeWorkbenchObservationTicket(ctx context.Context, raw
 	if !record.ExpiresAt.After(time.Now()) {
 		return "", TaskWorkbenchObservationSession{}, observationNotFound()
 	}
-	if err := s.revalidateObservationTask(ctx, record); err != nil {
+	clientInstallationID, err := s.revalidateObservationTask(ctx, record)
+	if err != nil {
 		return "", TaskWorkbenchObservationSession{}, err
 	}
 	rawSession, _, err := newObservationSecret()
@@ -178,7 +184,9 @@ func (s *TaskService) ConsumeWorkbenchObservationTicket(ctx context.Context, raw
 	if !sameObservationBinding(record, consumed) {
 		return "", TaskWorkbenchObservationSession{}, observationNotFound()
 	}
-	return rawSession, observationSession(consumed), nil
+	session := observationSession(consumed)
+	session.clientInstallationID = clientInstallationID
+	return rawSession, session, nil
 }
 
 // ValidateWorkbenchObservationSession rechecks the Host generation and current
@@ -198,10 +206,13 @@ func (s *TaskService) ValidateWorkbenchObservationSession(ctx context.Context, r
 		!record.SessionExpiresAt.After(now) {
 		return TaskWorkbenchObservationSession{}, observationNotFound()
 	}
-	if err := s.revalidateObservationTask(ctx, record); err != nil {
+	clientInstallationID, err := s.revalidateObservationTask(ctx, record)
+	if err != nil {
 		return TaskWorkbenchObservationSession{}, err
 	}
-	return observationSession(record), nil
+	session := observationSession(record)
+	session.clientInstallationID = clientInstallationID
+	return session, nil
 }
 
 // GetWorkbenchObservationSnapshot returns the intentionally narrow read model.
@@ -267,31 +278,44 @@ func (s *TaskService) observationStore() (taskWorkbenchObservationStore, bool) {
 	return store, ok
 }
 
-func (s *TaskService) revalidateObservationTask(ctx context.Context, record TaskWorkbenchObservationRecord) error {
+func (s *TaskService) revalidateObservationTask(ctx context.Context, record TaskWorkbenchObservationRecord) (string, error) {
 	if !validObservationTicketRecord(record) {
-		return observationNotFound()
+		return "", observationNotFound()
 	}
 	hosts, ok := s.store.(taskWorkbenchObservationHostReader)
 	if !ok {
-		return observationNotFound()
+		return "", observationNotFound()
 	}
 	hostValue, err := hosts.GetHost(ctx, record.HostID)
 	if err != nil {
-		return hideObservationAuthorization(err)
+		return "", hideObservationAuthorization(err)
 	}
 	if hostValue.ID != record.HostID || hostValue.OwnerID != record.ActorID ||
 		hostValue.State != host.StateRunning || hostValue.RuntimeGeneration != record.RuntimeGeneration || hostValue.DeletedAt != nil {
-		return observationNotFound()
+		return "", observationNotFound()
 	}
-	principal := identity.Principal{UserID: record.ActorID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: record.SessionTokenID}
+	tokens, ok := s.store.(taskWorkbenchObservationTokenReader)
+	if !ok {
+		return "", observationNotFound()
+	}
+	token, err := tokens.GetTokenByID(ctx, record.SessionTokenID)
+	if err != nil {
+		return "", hideObservationAuthorization(err)
+	}
+	if token.ID != record.SessionTokenID || token.OwnerID != record.ActorID || token.Kind != identity.KindSession ||
+		token.RevokedAt != nil || !token.ExpiresAt.After(time.Now()) {
+		return "", observationNotFound()
+	}
+	principal := identity.Principal{UserID: record.ActorID, Role: identity.RoleUser, Kind: identity.KindSession,
+		TokenID: record.SessionTokenID, ClientInstallationID: token.ClientInstallationID}
 	details, err := s.Get(ctx, principal, record.TaskID)
 	if err != nil {
-		return hideObservationAuthorization(err)
+		return "", hideObservationAuthorization(err)
 	}
 	if details.Task.ID != record.TaskID || details.Task.HostID != record.HostID {
-		return observationNotFound()
+		return "", observationNotFound()
 	}
-	return nil
+	return token.ClientInstallationID, nil
 }
 
 func (s *TaskService) getObservationTask(ctx context.Context, session TaskWorkbenchObservationSession) (TaskDetails, error) {
@@ -299,7 +323,8 @@ func (s *TaskService) getObservationTask(ctx context.Context, session TaskWorkbe
 }
 
 func observationPrincipal(session TaskWorkbenchObservationSession) identity.Principal {
-	return identity.Principal{UserID: session.ActorID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: session.sessionTokenID}
+	return identity.Principal{UserID: session.ActorID, Role: identity.RoleUser, Kind: identity.KindSession,
+		TokenID: session.sessionTokenID, ClientInstallationID: session.clientInstallationID}
 }
 
 func observationSession(record TaskWorkbenchObservationRecord) TaskWorkbenchObservationSession {

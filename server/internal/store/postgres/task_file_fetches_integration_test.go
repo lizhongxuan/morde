@@ -12,6 +12,39 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func TestTaskFileFetchOwnerSessionRequiresActiveDesktopInstallation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	desktopID := createTestClientInstallation(t, store.pool, owner.ID, nil)
+	iosID := mustID(t, domain.NewClientInstallationID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO client_installations (id,owner_id,display_name,platform,expires_at)
+VALUES ($1,$2,'Synthetic iOS','ios',clock_timestamp()+interval '1 day')`, iosID, owner.ID); err != nil {
+		t.Fatalf("insert iOS installation: %v", err)
+	}
+	for _, test := range []struct {
+		name           string
+		installationID string
+		want           bool
+	}{
+		{name: "desktop", installationID: desktopID, want: true},
+		{name: "ios", installationID: iosID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			allowed, err := store.IsDesktopClientWebSession(ctx, owner.ID, test.installationID)
+			if err != nil || allowed != test.want {
+				t.Fatalf("IsDesktopClientWebSession(%s)=%t err=%v; want %t", test.name, allowed, err, test.want)
+			}
+		})
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE client_installations SET revoked_at=clock_timestamp() WHERE id=$1`, desktopID); err != nil {
+		t.Fatalf("revoke desktop installation: %v", err)
+	}
+	if allowed, err := store.IsDesktopClientWebSession(ctx, owner.ID, desktopID); err != nil || allowed {
+		t.Fatalf("revoked desktop installation allowed=%t err=%v; want denied", allowed, err)
+	}
+}
+
 func TestPostgresTaskFileFetchPersistsTaskFenceTicketHashAndOfflineWait(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

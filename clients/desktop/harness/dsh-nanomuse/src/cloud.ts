@@ -3405,7 +3405,7 @@ export default class NanomuseCloud extends Service {
     hub.handle('file.fetch', async (args, call) => {
       if (Object.keys(args).some((key) => !['fetch_id', 'path', 'task_revision', 'ticket', 'ticket_expires_at'].includes(key)) ||
         typeof args.fetch_id !== 'string' || !/^o[a-z0-9]{7}$/.test(args.fetch_id) ||
-        typeof args.path !== 'string' || !Number.isSafeInteger(args.task_revision) || Number(args.task_revision) < 1 ||
+        typeof args.path !== 'string' || !Number.isSafeInteger(args.task_revision) || Number(args.task_revision) < 0 ||
         typeof args.ticket !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(args.ticket) ||
         typeof args.ticket_expires_at !== 'string' ||
         !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(args.ticket_expires_at) || !Number.isFinite(Date.parse(args.ticket_expires_at))) {
@@ -3445,6 +3445,25 @@ export default class NanomuseCloud extends Service {
       await saveAccessRecord({}, true)
       const route = `tasks/${encodeURIComponent(callerTask.taskID)}/file-fetches/${encodeURIComponent(fetchID)}`
       let commitStarted = false
+      const fileGrantWasRevoked = () => {
+        const current = this.state.mordeHub
+        return !current || current.installationID !== state.installationID || current.baseURL !== state.baseURL ||
+          current.targetGrantVersion !== targetGrantVersion || !current.grants.files ||
+          current.fileRoot?.identity !== state.fileRoot?.identity
+      }
+      const abortStagedFetch = async () => {
+        try {
+          // This cleanup must survive the Hub call being cancelled by the grant change.
+          // The old, fetch-scoped ticket authorizes only this fetch; no body is needed.
+          await mordeRequest<unknown>(state.baseURL, `${route}/abort`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${ticket}` },
+            signal: AbortSignal.timeout(5_000),
+          })
+        } catch {
+          this.ctx.logger.warn('nanomuse: revoked Morde file fetch staging could not be cleared')
+        }
+      }
       const request = async (method: 'POST' | 'PUT', suffix: string, body: Record<string, unknown> | Uint8Array, chunkSHA?: string): Promise<Record<string, unknown>> => {
         if (call.signal.aborted) throw new HubError('cancelled', 'The file transfer was cancelled')
         await this.recheckMordeHubTaskGrant('file.fetch', call.from)
@@ -3541,6 +3560,7 @@ export default class NanomuseCloud extends Service {
           content_id: receipt.content_id, expires_at: receipt.expires_at,
         }
       } catch (error: unknown) {
+        if (fileGrantWasRevoked()) await abortStagedFetch()
         const status = commitStarted ? 'unknown' : call.signal.aborted || error instanceof HubError && error.code === 'cancelled' ? 'cancelled' : 'failed'
         await saveAccessRecord({ status }, true)
         throw error

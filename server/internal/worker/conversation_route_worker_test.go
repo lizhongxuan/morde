@@ -277,11 +277,12 @@ func TestConversationRouteWorkerRequeuesOnlySafelyRecoveredPredecessorRace(t *te
 	}
 }
 
-func TestConversationRouteWorkerDefersStaleContextAfterClassification(t *testing.T) {
+func TestConversationRouteWorkerFailsStaleContextAfterClassification(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	stub.classifyErr = domain.NewError(domain.CodeConflict, "authorized route context changed")
-	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 1 || len(stub.failures) != 0 || len(stub.applied) != 0 {
-		t.Fatalf("stale context should be retried: deferred=%d failures=%v applied=%v err=%v", stub.deferred, stub.failures, stub.applied, err)
+	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 0 || len(stub.failures) != 1 ||
+		stub.failures[0] != "routing_context_unavailable" || len(stub.applied) != 0 {
+		t.Fatalf("stale context should become a recoverable failure: deferred=%d failures=%v applied=%v err=%v", stub.deferred, stub.failures, stub.applied, err)
 	}
 }
 
