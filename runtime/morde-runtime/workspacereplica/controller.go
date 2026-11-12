@@ -72,15 +72,40 @@ type bindingSnapshot struct {
 }
 
 type replicaItem struct {
-	WorkspaceID     string   `json:"workspace_id"`
-	SyncCredential  string   `json:"sync_credential"`
-	Directory       string   `json:"directory"`
-	State           string   `json:"state"`
-	SyncState       string   `json:"sync_state"`
-	SyncConflicts   []string `json:"sync_conflicts"`
-	BindingVersion  int64    `json:"binding_version"`
-	DesiredRevision int64    `json:"desired_revision"`
-	AppliedRevision int64    `json:"applied_revision"`
+	WorkspaceID               string                     `json:"workspace_id"`
+	SyncCredential            string                     `json:"sync_credential"`
+	Directory                 string                     `json:"directory"`
+	State                     string                     `json:"state"`
+	SyncState                 string                     `json:"sync_state"`
+	SyncConflicts             []string                   `json:"sync_conflicts"`
+	BindingVersion            int64                      `json:"binding_version"`
+	DesiredRevision           int64                      `json:"desired_revision"`
+	AppliedRevision           int64                      `json:"applied_revision"`
+	ProjectUploadApplications []projectUploadApplication `json:"project_upload_applications"`
+}
+
+type projectUploadApplication struct {
+	SessionID       string `json:"session_id"`
+	SourceBindingID string `json:"source_binding_id"`
+	ProjectPath     string `json:"project_path"`
+	TargetRevision  int64  `json:"target_revision"`
+	ManifestSHA256  string `json:"manifest_sha256"`
+}
+
+type projectUploadAppliedRequest struct {
+	SourceBindingID string                `json:"source_binding_id"`
+	TargetRevision  int64                 `json:"target_revision"`
+	ManifestSHA256  string                `json:"manifest_sha256"`
+	Status          string                `json:"status"`
+	AppliedRevision *int64                `json:"applied_revision"`
+	SyncState       *string               `json:"sync_state"`
+	Impacts         []projectUploadImpact `json:"impacts"`
+}
+
+type projectUploadImpact struct {
+	Path   string `json:"path"`
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
 }
 
 func New(options Options) (*Controller, error) {
@@ -145,6 +170,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		return errors.New("Portal returned an invalid Host workspace snapshot")
 	}
 	items := make(map[string]replicaItem, len(snapshot.Items))
+	seenProjectSessions := make(map[string]struct{})
 	for _, item := range snapshot.Items {
 		if !validWorkspaceID(item.WorkspaceID) || item.Directory != item.WorkspaceID || item.BindingVersion < 1 ||
 			item.DesiredRevision < 0 || item.AppliedRevision < 0 ||
@@ -156,6 +182,15 @@ func (c *Controller) reconcile(ctx context.Context) error {
 			if !validSyncConflictPath(conflictPath) {
 				return errors.New("Portal returned an invalid Host workspace sync conflict")
 			}
+		}
+		for _, application := range item.ProjectUploadApplications {
+			if !validProjectUploadApplication(application) {
+				return errors.New("Portal returned an invalid project upload application")
+			}
+			if _, exists := seenProjectSessions[application.SessionID]; exists {
+				return errors.New("Portal returned duplicate project upload applications")
+			}
+			seenProjectSessions[application.SessionID] = struct{}{}
 		}
 		if _, exists := items[item.WorkspaceID]; exists {
 			return errors.New("Portal returned duplicate Host workspace bindings")
@@ -321,7 +356,8 @@ func (c *Controller) reconcile(ctx context.Context) error {
 			deletionPollErr = err
 		}
 	}
-	return errors.Join(syncErr, deletionPollErr)
+	projectUploadErr := c.applyProjectUploadApplications(ctx, active)
+	return errors.Join(syncErr, deletionPollErr, projectUploadErr)
 }
 
 func (c *Controller) applyTaskWorkspaceViewDeletions(ctx context.Context, fence contract.HostFence, items []contract.PendingTaskWorkspaceViewDeletion) error {
@@ -636,6 +672,117 @@ func (c *Controller) reportSyncStatus(ctx context.Context, item replicaItem, sta
 	return c.requestJSON(ctx, http.MethodPost, c.bindingActionURL(item, "sync-status"), c.options.BootstrapCredential, body, nil)
 }
 
+func (c *Controller) applyProjectUploadApplications(ctx context.Context, items map[string]replicaItem) error {
+	workspaceIDs := make([]string, 0, len(items))
+	for workspaceID := range items {
+		workspaceIDs = append(workspaceIDs, workspaceID)
+	}
+	sort.Strings(workspaceIDs)
+	var reportErr error
+	for _, workspaceID := range workspaceIDs {
+		item := items[workspaceID]
+		if item.State != "active" {
+			continue
+		}
+		for _, application := range item.ProjectUploadApplications {
+			body := projectUploadAppliedRequest{
+				SourceBindingID: application.SourceBindingID, TargetRevision: application.TargetRevision,
+				ManifestSHA256: application.ManifestSHA256, Impacts: []projectUploadImpact{},
+			}
+			switch {
+			case item.SyncState == "healthy" && item.AppliedRevision >= application.TargetRevision:
+				syncState, appliedRevision := "healthy", item.AppliedRevision
+				body.Status, body.SyncState, body.AppliedRevision, body.Impacts = "applied", &syncState, &appliedRevision, []projectUploadImpact{}
+			case item.SyncState == "conflict":
+				syncState := "conflict"
+				body.Status, body.SyncState = "unknown", &syncState
+				body.Impacts = projectConflictImpacts(application.ProjectPath, item.SyncConflicts)
+				if len(body.Impacts) > 0 {
+					body.Status = "conflict"
+				}
+			default:
+				continue
+			}
+			if err := c.requestJSON(ctx, http.MethodPost, c.projectUploadAppliedURL(item, application),
+				c.options.BootstrapCredential, body, nil); err != nil && reportErr == nil {
+				reportErr = fmt.Errorf("project upload application receipt failed: %w", err)
+			}
+		}
+	}
+	return reportErr
+}
+
+func projectConflictImpacts(projectPath string, conflicts []string) []projectUploadImpact {
+	prefix := projectPath + "/"
+	result := make([]projectUploadImpact, 0, len(conflicts))
+	seen := make(map[string]struct{}, len(conflicts))
+	for _, conflictPath := range conflicts {
+		if !validSyncConflictPath(conflictPath) || !strings.HasPrefix(conflictPath, prefix) {
+			continue
+		}
+		relative := strings.TrimPrefix(conflictPath, prefix)
+		if !validSyncConflictPath(relative) {
+			continue
+		}
+		if _, exists := seen[relative]; exists {
+			continue
+		}
+		seen[relative] = struct{}{}
+		result = append(result, projectUploadImpact{Path: relative, State: "conflict", Reason: "workspace_conflict"})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result
+}
+
+func validProjectUploadApplication(application projectUploadApplication) bool {
+	if !validReplicaSessionID(application.SessionID) || !validProjectSourceBindingID(application.SourceBindingID) ||
+		!validSyncConflictPath(application.ProjectPath) || !strings.HasPrefix(application.ProjectPath, "project/") ||
+		application.TargetRevision < 0 || !validLowerHexSHA256(application.ManifestSHA256) {
+		return false
+	}
+	return true
+}
+
+func validReplicaSessionID(value string) bool {
+	if len(value) != 8 || value[0] != 'p' {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		if !(value[i] >= 'a' && value[i] <= 'z') && !(value[i] >= '0' && value[i] <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validProjectSourceBindingID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' ||
+		value[14] != '4' || (value[19] != '8' && value[19] != '9' && value[19] != 'a' && value[19] != 'b') {
+		return false
+	}
+	for i, char := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !(char >= '0' && char <= '9') && !(char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validLowerHexSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for i := range value {
+		if !(value[i] >= '0' && value[i] <= '9') && !(value[i] >= 'a' && value[i] <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func syncStatusConflicts(conflicts []mordesync.Conflict) []string {
 	result := make([]string, 0, len(conflicts))
 	seen := make(map[string]struct{}, len(conflicts))
@@ -749,6 +896,12 @@ func (c *Controller) taskWorkspaceViewDeletionAppliedURL(item contract.PendingTa
 func (c *Controller) bindingActionURL(item replicaItem, action string) string {
 	return c.portal.JoinPath("api", "host-replicas", c.options.HostID, "generations", strconv.FormatInt(c.options.Generation, 10),
 		"workspaces", item.WorkspaceID, "bindings", strconv.FormatInt(item.BindingVersion, 10), action).String()
+}
+
+func (c *Controller) projectUploadAppliedURL(item replicaItem, application projectUploadApplication) string {
+	return c.portal.JoinPath("api", "host-replicas", c.options.HostID, "generations", strconv.FormatInt(c.options.Generation, 10),
+		"workspaces", item.WorkspaceID, "bindings", strconv.FormatInt(item.BindingVersion, 10),
+		"project-uploads", application.SessionID, "applied").String()
 }
 
 func (c *Controller) workspacePath(workspaceID string) string {

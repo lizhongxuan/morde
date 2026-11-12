@@ -16,7 +16,7 @@ import { messageOutbox } from '../app/message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import type { MainConversation } from '../app/api';
 import { ToastProvider } from '../app/toast';
-import { Assistant, assistantRecentConversationKey, mergeTaskAssistantMessage, resolveTaskObservationURL } from './Assistant';
+import { Assistant, assistantMainConversationCacheKey, assistantRecentConversationKey, mergeTaskAssistantMessage, resolveTaskObservationURL } from './Assistant';
 import { assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
 import type { AssistantComposerDraft } from './assistant-drafts';
 
@@ -542,6 +542,22 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText(/无法读取模型：/)).not.toBeInTheDocument();
   });
 
+  it('keeps a main-conversation API error out of the page layout and allows retry', async () => {
+    mockCommon();
+    vi.spyOn(portalApi, 'mainConversation')
+      .mockRejectedValueOnce(new Error('主会话接口暂不可用'))
+      .mockResolvedValue({ status: 'selection_required', conversation_id: null, version: 0 });
+    const user = userEvent.setup();
+    renderPage();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('无法刷新服务端主会话');
+    expect(alert.closest('.toast-region')).toBeInTheDocument();
+    expect(alert.closest('.assistant-page')).toBeNull();
+    await user.click(within(alert).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(screen.queryByText(/无法刷新服务端主会话/)).not.toBeInTheDocument());
+  });
+
   it('builds a same-Host task-auth URL and rejects unsafe Workbench origins', () => {
     const url = new URL(resolveTaskObservationURL('opaque-ticket-123456', targetHost.url, targetHost.id, 'portal.example.test'));
     expect(url.origin).toBe(new URL(targetHost.url).origin);
@@ -592,6 +608,39 @@ describe('Assistant durable tasks', () => {
     expect(await screen.findByText('本机最近查看')).toBeInTheDocument();
     await waitFor(() => expect(getTask).toHaveBeenCalledWith(task.id));
     expect(await screen.findByText('你好！')).toBeInTheDocument();
+  });
+
+  it('keeps the last known main conversation visible when conversation history cannot load', async () => {
+    const serviceInstanceID = clientContract.capabilities.cloud_execution.service_instance_id;
+    localStorage.setItem(assistantMainConversationCacheKey(authUser.id), JSON.stringify({ conversationID: conversation.id, serviceInstanceID }));
+    mockCommon();
+    vi.spyOn(portalApi, 'conversations').mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.spyOn(portalApi, 'mainConversation').mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.spyOn(portalApi, 'conversation').mockRejectedValue(new TypeError('Failed to fetch'));
+
+    renderPage();
+
+    const sidebar = screen.getByRole('complementary', { name: '对话' });
+    const main = await within(sidebar).findByRole('button', { name: /^主会话/ });
+    expect(main).toHaveClass('is-selected');
+    expect(within(sidebar).getByText('旁聊历史暂不可用')).toBeInTheDocument();
+    expect(within(sidebar).queryByText('对话列表暂不可用')).not.toBeInTheDocument();
+    expect(within(sidebar).getByRole('button', { name: '新建旁聊' })).toBeEnabled();
+  });
+
+  it('does not use a cached main conversation from another service instance', async () => {
+    localStorage.setItem(assistantMainConversationCacheKey(authUser.id), JSON.stringify({
+      conversationID: conversation.id, serviceInstanceID: 'different-service',
+    }));
+    mockCommon();
+    vi.spyOn(portalApi, 'conversations').mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.spyOn(portalApi, 'mainConversation').mockRejectedValue(new TypeError('Failed to fetch'));
+
+    renderPage();
+
+    const sidebar = screen.getByRole('complementary', { name: '对话' });
+    expect(await within(sidebar).findByText('旁聊历史暂不可用')).toBeInTheDocument();
+    expect(within(sidebar).queryByRole('button', { name: /^主会话/ })).not.toBeInTheDocument();
   });
 
   it('pins the main conversation and reveals side conversations five at a time in latest activity order', async () => {
@@ -1138,6 +1187,18 @@ describe('Assistant durable tasks', () => {
     await user.click(within(filesPanel).getByRole('button', { name: '第 3 页' }));
     expect(within(filesPanel).getByText('旁聊成果')).toBeInTheDocument();
     expect(within(filesPanel).getByRole('button', { name: '查看任务成果' })).toBeInTheDocument();
+
+    await user.click(within(taskPanel).getByRole('button', { name: '任务' }));
+    await findTaskActivity(sideTask.id);
+    await user.click(within(sidebar).getByRole('button', { name: /主会话/ }));
+    await waitFor(() => expect(within(taskPanel).getByText('主会话任务')).toBeInTheDocument());
+    expect(within(taskPanel).queryByText('旁聊任务')).not.toBeInTheDocument();
+    await user.click(within(taskPanel).getByRole('button', { name: '文件' }));
+    const mainFilesPanel = document.querySelector<HTMLElement>('#assistant-task-panel .task-panel-files')!;
+    expect(within(mainFilesPanel).getByRole('link', { name: '下载消息附件 1' })).toHaveAttribute(
+      'href', '/api/personal-data/attachments/a1234567');
+    expect(within(mainFilesPanel).queryByRole('link', { name: /a7654321/ })).not.toBeInTheDocument();
+    expect(within(mainFilesPanel).queryByText('旁聊成果')).not.toBeInTheDocument();
   });
 
   it('uses the newest server predecessor when history is returned newest first', async () => {

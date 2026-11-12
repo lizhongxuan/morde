@@ -110,7 +110,9 @@ test('project uploader reports cloud confirmation separately from Host applicati
       uploadCount++;
       return uploadCount === 1
         ? { session: { state: 'conflict' }, cloudStatus: 'pending', conflicts: [{ path: 'cloud-existing.txt' }] }
-        : { session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'pending_apply', conflicts: [] };
+        : uploadCount === 2
+          ? { session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied', desiredRevision: 9, appliedRevision: 9, conflicts: [] }
+          : { session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied', hostApplication: { status: 'applied', targetRevision: 9, appliedRevision: 10, impacts: [] }, conflicts: [] };
     },
     workspaces: async () => ({ items: [] }),
     onState() {}, onSync() {},
@@ -135,10 +137,53 @@ test('project uploader reports cloud confirmation separately from Host applicati
     ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
     ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
   ]);
-  assert.match(textOf(elements.get('project-upload-content')), /云端已确认；电脑待应用/);
-  assert.match(textOf(elements.get('project-upload-content')), /关机电脑不会自动启动/);
+  assert.match(textOf(elements.get('project-upload-content')), /云端已确认；等待目标电脑应用本次项目/);
+  assert.doesNotMatch(textOf(elements.get('project-upload-content')), /电脑已应用 revision/);
+  assert.doesNotMatch(textOf(elements.get('project-upload-content')), /目标电脑已应用本次项目 revision/);
+  assert.doesNotMatch(textOf(elements.get('project-upload-content')), /applied 9 \/ desired 9/);
   controls = flatten(elements.get('project-upload-content').childNodes);
   assert.equal(controls.find((node) => node.textContent === '单向上传到云端电脑').disabled, false);
+  controls.find((node) => node.textContent === '单向上传到云端电脑').onclick();
+  for (let attempt = 0; attempt < 4; attempt++) await new Promise((resolve) => setImmediate(resolve));
+  assert.match(textOf(elements.get('project-upload-content')), /目标电脑已应用本次项目 revision 10/);
+  assert.deepEqual(calls.slice(1), [
+    ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
+    ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
+    ['upload', '123e4567-e89b-42d3-a456-426614174000', 'demo'],
+  ]);
+});
+
+test('completed unresolved project checkpoint offers receipt polling without offering a new upload', async () => {
+  const selection = { selectionID: '123e4567-e89b-42d3-a456-426614174000', hostId: 'h1234567', workspaceId: 'w1234567',
+    projectName: 'demo', directoryName: 'demo', folderId: 'morde-0123456789abcdef0123456789abcdef' };
+  const current = {
+    authenticated: true, storageReady: true, view: 'sync', syncState: 'idle', syncRecovery: { state: 'pending', mode: 'project_upload' },
+    projectMappings: [selection],
+    syncCheckpoint: { mode: 'project_upload', projectSelectionID: selection.selectionID, projectName: 'demo', workspaceId: 'w1234567',
+      hostId: 'h1234567', folderId: selection.folderId, sessionId: 'p1234567', sessionState: 'completed', hostApplicationStatus: 'unknown' },
+  };
+  const calls = [];
+  const elements = await mount({
+    state: async () => current,
+    projectUploadTargets: async () => [{ hostId: 'h1234567', hostName: '云端电脑', hostState: 'running', workspaceId: 'w1234567', workspaceName: '工作区', folders: [] }],
+    selectProjectDirectory: async () => { throw new Error('receipt polling must not select a directory'); },
+    uploadProject: async (...args) => {
+      calls.push(args);
+      return { session: { id: 'p1234567', state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
+        hostApplication: { status: 'applied', targetRevision: 7, appliedRevision: 7, impacts: [] }, conflicts: [] };
+    },
+    workspaces: async () => ({ items: [] }), onState() {}, onSync() {},
+  });
+  for (let attempt = 0; attempt < 4; attempt++) await new Promise((resolve) => setImmediate(resolve));
+  let controls = flatten(elements.get('project-upload-content').childNodes);
+  assert.match(textOf(elements.get('project-upload-content')), /应用结果未知；项目恢复点已保留/);
+  const check = controls.find((node) => node.textContent === '检查目标电脑应用状态');
+  assert.ok(check, 'completed unresolved session should offer a receipt check');
+  assert.equal(controls.some((node) => node.textContent === '单向上传到云端电脑'), false, 'completed session must not offer a new upload');
+  check.onclick();
+  for (let attempt = 0; attempt < 4; attempt++) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [[selection.selectionID, 'demo']]);
+  assert.match(textOf(elements.get('project-upload-content')), /目标电脑已应用本次项目 revision 7/);
 });
 
 test('desktop shell leaves Portal navigation unobstructed by its own header', async () => {

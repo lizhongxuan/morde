@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -237,36 +238,69 @@ func writeTaskEvents(writer gin.ResponseWriter, events []task.Event) error {
 }
 
 func publicTaskEventPayload(event task.Event) (json.RawMessage, error) {
-	if event.Type != "task.step" {
-		return json.RawMessage(event.Payload), nil
+	allowed, ok := publicTaskEventFields(event.Type)
+	if !ok {
+		return json.RawMessage(`{}`), nil
 	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload == nil {
 		return json.RawMessage(`{}`), nil
 	}
-	for _, key := range []string{"text", "tool_calls", "output"} {
-		delete(payload, key)
-	}
-	if detailBytes, ok := payload["detail"]; ok {
-		var detail map[string]json.RawMessage
-		if err := json.Unmarshal(detailBytes, &detail); err != nil || detail == nil {
-			payload["detail"] = json.RawMessage(`{}`)
-		} else {
-			for _, key := range []string{"text", "tool_calls", "output"} {
-				delete(detail, key)
+	filtered := filterTaskEventFields(payload, allowed)
+	if event.Type == "task.step" {
+		if detailBytes, exists := filtered["detail"]; exists {
+			var detail map[string]json.RawMessage
+			if err := json.Unmarshal(detailBytes, &detail); err != nil || detail == nil {
+				filtered["detail"] = json.RawMessage(`{}`)
+			} else {
+				encodedDetail, err := json.Marshal(filterTaskEventFields(detail, []string{"phase", "status", "kind", "tool", "usage_known", "requires_reconciliation"}))
+				if err != nil {
+					return nil, err
+				}
+				filtered["detail"] = encodedDetail
 			}
-			encodedDetail, err := json.Marshal(detail)
-			if err != nil {
-				return nil, err
-			}
-			payload["detail"] = encodedDetail
 		}
 	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := json.Marshal(filtered)
 	if err != nil {
 		return nil, err
 	}
 	return encoded, nil
+}
+
+func publicTaskEventFields(eventType string) ([]string, bool) {
+	switch eventType {
+	case "task.status":
+		return []string{"status", "reason", "batch_item_id", "batch_attempt"}, true
+	case "task.step":
+		return []string{"step_id", "status", "kind", "phase", "tool", "call_id", "title", "summary", "detail"}, true
+	case "task.operation":
+		return []string{"operation_id", "status", "reason", "requires_reconciliation"}, true
+	case "task.message":
+		return []string{"role", "message_id", "turn_id", "task_revision", "done"}, true
+	case "task.batch_item":
+		return []string{"batch_item_id", "key", "status", "attempt"}, true
+	case "task.artifact":
+		return []string{"artifact_id", "step_id", "label", "media_type", "path", "workspace_id", "revision", "size_bytes", "sha256", "batch_item_id", "batch_attempt", "redacted"}, true
+	case "task.waiting_user":
+		return []string{"status", "reason", "required_revision", "applied_revision"}, true
+	case "task.response":
+		return []string{"pending_id", "pending_version", "clarification_id", "clarification_version", "decision", "reason", "status", "idempotency_replayed", "lease_version", "file_delivery_intent"}, true
+	case "task.result":
+		return []string{"status", "reason", "task_revision"}, true
+	default:
+		return nil, false
+	}
+}
+
+func filterTaskEventFields(payload map[string]json.RawMessage, allowed []string) map[string]json.RawMessage {
+	filtered := make(map[string]json.RawMessage, len(allowed))
+	for _, key := range allowed {
+		if value, exists := payload[key]; exists {
+			filtered[key] = value
+		}
+	}
+	return filtered
 }
 
 func validateTaskEvents(events []task.Event, after int64) error {
@@ -290,7 +324,20 @@ func validTaskEventName(value string) bool {
 	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result":
 		return true
 	default:
-		return false
+		if len(value) > 128 || !strings.HasPrefix(value, "task.") {
+			return false
+		}
+		name := strings.TrimPrefix(value, "task.")
+		if name == "" {
+			return false
+		}
+		for _, char := range name {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+				(char < '0' || char > '9') && char != '_' && char != '.' && char != '-' {
+				return false
+			}
+		}
+		return true
 	}
 }
 

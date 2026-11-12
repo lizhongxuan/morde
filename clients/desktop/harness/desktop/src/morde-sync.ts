@@ -11,7 +11,8 @@ export type PreservedFile = { id: string; workspace_id: string; path: string; cr
 type Progress = { state: string; stage?: string; confirmed_bytes?: number; planned_bytes?: number; session_id?: string; confirmed_revision?: number };
 export type HandoffTarget = "desktop" | "cloud_workspace";
 export type HandoffRecord = { id: string; workspaceId: string; scope: string[]; source: HandoffTarget; target: HandoffTarget; phase: "checking" | "needs_review" | "verified"; revision?: number };
-export type SyncCheckpoint = { serviceInstanceID: string; installationId: string; workspaceId: string; directory: string; dev: string; ino: string; mode: "upload" | "download" | "bidirectional" | "live_sync" | "handoff_checkpoint" | "project_upload"; scope: string[]; handoffTarget?: HandoffTarget; projectSelectionID?: string; hostId?: string; folderId?: string; projectName?: string; idempotencyKey: string; sessionId?: string; childPid?: number };
+export type ProjectHostApplicationStatus = "pending_apply" | "applied" | "conflict" | "unknown";
+export type SyncCheckpoint = { serviceInstanceID: string; installationId: string; workspaceId: string; directory: string; dev: string; ino: string; mode: "upload" | "download" | "bidirectional" | "live_sync" | "handoff_checkpoint" | "project_upload"; scope: string[]; handoffTarget?: HandoffTarget; projectSelectionID?: string; sourceBindingID?: string; hostId?: string; folderId?: string; projectName?: string; idempotencyKey: string; sessionId?: string; sessionState?: "running" | "completed" | "conflict" | "cancelled" | "failed" | "expired"; hostApplicationStatus?: ProjectHostApplicationStatus; childPid?: number };
 
 export function validateSyncScope(value: unknown): string[] {
   if (!Array.isArray(value) || value.length > 1000 || value.some((part) => typeof part !== "string" || !part || isAbsolute(part) || /^[A-Za-z]:/.test(part) || part.split(/[\\/]/).some((segment) => segment === ".." || segment === "." || !segment))) throw new Error("Invalid sync scope");
@@ -222,13 +223,14 @@ export class MordeSync {
     }
     if (this.child || this.state === "shutdown_unknown") throw new Error("Sync is already active or its prior shutdown is unverified");
     if (mode === "project_upload" && (scope.length !== 0 || !checkpoint?.folderId || !/^morde-[a-f0-9]{32}$/.test(checkpoint.folderId) ||
+      !checkpoint.sourceBindingID || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(checkpoint.sourceBindingID) ||
       !checkpoint.hostId || !/^h[a-z0-9]{7}$/.test(checkpoint.hostId) || !checkpoint.projectName || checkpoint.projectSelectionID === undefined)) {
       throw new Error("Project upload recovery point is incomplete");
     }
     const params = { base_url: auth.origin, bearer_token: auth.syncCredential, workspace_id: mapping.workspaceId, directory: mapping.directory, scope };
     const method = mode === "live_sync" || mode === "handoff_checkpoint" ? mode : "sync";
     const data = mode === "project_upload"
-      ? { ...params, folder_id: checkpoint!.folderId, direction: "upload", policy: "compare_merge", base_revision: 0, scope: [], idempotency_key: checkpoint!.idempotencyKey, ...(checkpoint!.sessionId ? { session_id: checkpoint!.sessionId } : {}) }
+      ? { ...params, folder_id: checkpoint!.folderId, source_binding_id: checkpoint!.sourceBindingID, direction: "upload", policy: "compare_merge", base_revision: 0, scope: [], idempotency_key: checkpoint!.idempotencyKey, ...(checkpoint!.sessionId ? { session_id: checkpoint!.sessionId } : {}) }
       : method === "sync" ? { ...params, direction: mode, idempotency_key: checkpoint?.idempotencyKey ?? randomUUID(), ...(checkpoint?.sessionId ? { session_id: checkpoint.sessionId } : {}) } : method === "handoff_checkpoint" ? { ...params, idempotency_key: checkpoint?.idempotencyKey ?? randomUUID() } : { ...params, rescan_seconds: rescanSeconds };
     this.state = "running";
     this.stopping = false;

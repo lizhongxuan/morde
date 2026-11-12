@@ -1837,27 +1837,95 @@ func TestCloudDSHExecutorResumesBackgroundJobAfterRuntimeRestartWithoutReplaying
 			children.child.CheckpointDigest = append([]byte(nil), command.Digest...)
 		}
 	}
-	rootCalls, interrupted := 0, false
+	rootCalls := make(map[int64]int)
+	interrupted := false
+	containsText := func(raw json.RawMessage, fragment string) bool {
+		var request struct {
+			Messages []struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if json.Unmarshal(raw, &request) != nil {
+			return false
+		}
+		for _, message := range request.Messages {
+			for _, block := range message.Content {
+				if block.Type == "text" && strings.Contains(block.Text, fragment) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	toolResult := func(raw json.RawMessage, callID string) (string, bool) {
+		var request struct {
+			Messages []struct {
+				Role       string `json:"role"`
+				ToolCallID string `json:"toolCallId"`
+				Content    []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if json.Unmarshal(raw, &request) != nil {
+			return "", false
+		}
+		for _, message := range request.Messages {
+			if message.Role == "tool" && message.ToolCallID == callID && len(message.Content) == 1 {
+				return message.Content[0].Text, true
+			}
+		}
+		return "", false
+	}
 	models.complete = func(_ context.Context, call app.ModelCall) (app.ModelResponse, error) {
 		if call.Task == nil {
 			return app.ModelResponse{}, errors.New("model call is missing its Agent Session fence")
 		}
 		if call.Task.AgentSessionID == "child_test" {
-			if len(tools.recoveryCalls) == 0 {
+			if call.Task.AgentGeneration == 1 && len(tools.recoveryCalls) == 0 {
 				return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "background_read", Name: tool.Name,
 					Arguments: `{"workspace_id":"w1234567","path":"README.md"}`}}, StopReason: "tool_calls",
 					Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}, nil
 			}
+			if call.Task.AgentGeneration != 2 {
+				return app.ModelResponse{}, errors.New("settled background child was unexpectedly resumed")
+			}
 			return app.ModelResponse{Text: "Background work complete.", StopReason: "stop",
 				Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}}, nil
 		}
-		rootCalls++
-		if rootCalls == 1 {
+		generation := call.Task.AgentGeneration
+		rootCalls[generation]++
+		if generation == 1 && rootCalls[generation] == 1 {
 			return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "spawn_background_restart", Name: cloudDSHDelegateToolName,
 				Arguments: `{"title":"Restartable job","objective":"Read README and summarize it.","tool_names":["file_read"],"run_in_background":true}`}},
 				StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}}, nil
 		}
-		return app.ModelResponse{Text: "Parent completed.", StopReason: "stop",
+		if generation < 3 {
+			return app.ModelResponse{Text: "Parent completed without reading the background output.", StopReason: "stop",
+				Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}}, nil
+		}
+		if !containsText(call.RawRequest, "Internal continuation:") {
+			return app.ModelResponse{}, errors.New("completed parent recovery omitted its internal output continuation")
+		}
+		if output, ok := toolResult(call.RawRequest, "read_child_output"); ok {
+			var result struct {
+				JobID      string `json:"job_id"`
+				Status     string `json:"status"`
+				NextCursor int64  `json:"next_cursor"`
+				Output     string `json:"output"`
+			}
+			if json.Unmarshal([]byte(output), &result) != nil || result.JobID != "child_test" || result.Status != "succeeded" ||
+				result.NextCursor != children.child.CheckpointThrough || result.Output != "Background work complete." {
+				return app.ModelResponse{}, errors.New("parent did not receive the complete durable background output")
+			}
+			return app.ModelResponse{Text: "Parent reviewed the background output.", StopReason: "stop",
+				Usage: app.ModelUsage{Known: true, InputTokens: 5, OutputTokens: 1}}, nil
+		}
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "read_child_output", Name: cloudDSHJobOutputToolName,
+			Arguments: `{"job_id":"child_test","after_seq":-1}`}}, StopReason: "tool_calls",
 			Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}}, nil
 	}
 	tools.afterExecute = func() {
@@ -1886,14 +1954,127 @@ func TestCloudDSHExecutorResumesBackgroundJobAfterRuntimeRestartWithoutReplaying
 	expires := time.Now().Add(time.Minute)
 	value.Lease.ExpiresAt = &expires
 	tools.afterExecute = nil
-	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
-		t.Fatalf("recovered background job result = %v", err)
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, errCloudDSHBackgroundOutputPending) {
+		t.Fatalf("recovered background job without parent output = %v", err)
 	}
 	if children.creates != 2 || children.settles != 1 || children.child.SessionID != childSessionID || !children.child.Background ||
 		children.settleCommand.Status != task.StepSucceeded || len(tools.calls) != 1 || len(tools.recoveryCalls) != 1 ||
 		tools.recoveryCalls[0].CallID != cloudDSHNamespacedToolCallID(value.ID, childSessionID, "background_read") || len(checkpoints.reads) < 2 {
 		t.Fatalf("recovered background job create/settle=%d/%d child=%#v tools=%#v reconcile=%#v reads=%d",
 			children.creates, children.settles, children.child, tools.calls, tools.recoveryCalls, len(checkpoints.reads))
+	}
+	rootFence = supervisor.launch.Fence
+	rootTail = latestAgentCheckpoint(checkpoints.commands, rootFence.AgentSessionID)
+	childTail = latestAgentCheckpoint(checkpoints.commands, childSessionID)
+	if children.child.Step.Status != task.StepSucceeded || rootTail.Fence.AgentSessionID == "" || childTail.Fence.AgentSessionID == "" ||
+		children.child.CheckpointThrough != childTail.Through || !bytes.Equal(children.child.CheckpointDigest, childTail.Digest) {
+		t.Fatalf("settled background checkpoints are not pinned: child=%#v root=%#v child_tail=%#v", children.child, rootTail, childTail)
+	}
+	value.AgentInstanceID, value.AgentGeneration, value.AgentSessionID = rootFence.AgentInstanceID, rootFence.AgentGeneration, rootFence.AgentSessionID
+	value.AgentEngineVersion, value.AgentProfileVersion = rootFence.EngineVersion, rootFence.ProfileVersion
+	value.CheckpointThroughSequence, value.CheckpointDigest = rootTail.Through, append([]byte(nil), rootTail.Digest...)
+	value.Lease.Version++
+	expires = time.Now().Add(time.Minute)
+	value.Lease.ExpiresAt = &expires
+	cloudDSHExpireTestRuntime(t, executor)
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("parent output continuation result = %v", err)
+	}
+	modelsAfterOutput := len(models.calls)
+	completedFence := supervisor.launch.Fence
+	if rootCalls[completedFence.AgentGeneration] != 2 || modelsAfterOutput < 2 || children.child.Step.Status != task.StepSucceeded {
+		t.Fatalf("parent did not consume the terminal child output: root_calls=%v models=%d child=%#v", rootCalls, modelsAfterOutput, children.child)
+	}
+	rootFence = completedFence
+	rootTail = latestAgentCheckpoint(checkpoints.commands, rootFence.AgentSessionID)
+	value.AgentInstanceID, value.AgentGeneration, value.AgentSessionID = rootFence.AgentInstanceID, rootFence.AgentGeneration, rootFence.AgentSessionID
+	value.AgentEngineVersion, value.AgentProfileVersion = rootFence.EngineVersion, rootFence.ProfileVersion
+	value.CheckpointThroughSequence, value.CheckpointDigest = rootTail.Through, append([]byte(nil), rootTail.Digest...)
+	value.Lease.Version++
+	expires = time.Now().Add(time.Minute)
+	value.Lease.ExpiresAt = &expires
+	cloudDSHExpireTestRuntime(t, executor)
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("already-consumed background output recovery = %v", err)
+	}
+	if len(models.calls) != modelsAfterOutput {
+		t.Fatalf("already-consumed output repeated the parent continuation: models before=%d after=%d", modelsAfterOutput, len(models.calls))
+	}
+	rootHistory := newCloudDSHCheckpointHistory(rootFence.AgentSessionID)
+	rootHistory.beginRestore()
+	for _, command := range checkpoints.commands {
+		if command.Fence.AgentSessionID == rootFence.AgentSessionID {
+			if err := rootHistory.append(command.Payload, command.From, command.Through); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	outputCall := rootHistory.calls["read_child_output"]
+	delegateCall := rootHistory.calls["spawn_background_restart"]
+	var delegateHandle struct {
+		JobID  string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	var outputResult struct {
+		JobID      string `json:"job_id"`
+		Status     string `json:"status"`
+		NextCursor int64  `json:"next_cursor"`
+		Output     string `json:"output"`
+	}
+	if delegateCall == nil || !delegateCall.resultSeen || json.Unmarshal([]byte(delegateCall.resultText), &delegateHandle) != nil ||
+		delegateHandle.JobID != childSessionID || delegateHandle.Status != "running" ||
+		outputCall == nil || !outputCall.resultSeen || json.Unmarshal([]byte(outputCall.resultText), &outputResult) != nil ||
+		outputCall.name != cloudDSHJobOutputToolName || outputResult.JobID != childSessionID || outputResult.Status != "succeeded" ||
+		outputResult.NextCursor != children.child.CheckpointThrough || outputResult.Output != "Background work complete." {
+		t.Fatalf("matching child output was not durable in the parent checkpoint: %#v %#v", outputCall, outputResult)
+	}
+}
+
+func TestCloudDSHBackgroundOutputContinuationRequiresMatchingTerminalStatusAndCursor(t *testing.T) {
+	definition := cloudDSHReadTool()
+	for _, test := range []struct {
+		name       string
+		stepStatus task.StepStatus
+		cancel     bool
+		jobStatus  string
+	}{
+		{name: "failed", stepStatus: task.StepFailed, jobStatus: "failed"},
+		{name: "cancelled", stepStatus: task.StepFailed, cancel: true, jobStatus: "cancelled"},
+		{name: "unknown", stepStatus: task.StepUnknown, jobStatus: "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			jobID, spawnKey := "child_"+test.name, "spawn_"+test.name
+			arguments := []byte(`{"title":"Background job","objective":"Finish the delegated task.","tool_names":["file_read"],"run_in_background":true}`)
+			history := newCloudDSHCheckpointHistory("session_parent")
+			history.calls[spawnKey] = &cloudDSHToolCall{name: cloudDSHDelegateToolName, arguments: arguments,
+				callSeen: true, resultSeen: true, resultText: `{"job_id":"` + jobID + `","status":"running"}`}
+			child := app.AgentChildSession{TaskID: "q1234567", SessionID: jobID, ParentSessionID: history.sessionID,
+				SpawnKey: spawnKey, Background: true, CancelRequested: test.cancel, AllowedTools: []string{"file_read"},
+				CheckpointThrough: 7, CheckpointDigest: bytes.Repeat([]byte{3}, sha256.Size),
+				Step: task.Step{ID: "step_" + test.name, TaskID: "q1234567", Sequence: 1, Kind: "subagent", Status: test.stepStatus}}
+			continuations, waiting, err := cloudDSHBackgroundOutputContinuations(history, []app.AgentChildSession{child},
+				child.TaskID, history.sessionID, []app.AgentToolDefinition{definition})
+			if err != nil || waiting || len(continuations) != 1 || continuations[0].JobID != jobID ||
+				continuations[0].Status != test.jobStatus || continuations[0].AfterSeq != -1 || continuations[0].ThroughSeq != child.CheckpointThrough {
+				t.Fatalf("unconsumed terminal result = %#v waiting=%t err=%v", continuations, waiting, err)
+			}
+
+			history.calls["read_output"] = &cloudDSHToolCall{name: cloudDSHJobOutputToolName,
+				arguments: []byte(`{"after_seq":-1,"job_id":"` + jobID + `"}`), callSeen: true, resultSeen: true,
+				resultText: `{"job_id":"` + jobID + `","status":"` + test.jobStatus + `","next_cursor":7,"output":"terminal output"}`}
+			continuations, waiting, err = cloudDSHBackgroundOutputContinuations(history, []app.AgentChildSession{child},
+				child.TaskID, history.sessionID, []app.AgentToolDefinition{definition})
+			if err != nil || waiting || len(continuations) != 0 {
+				t.Fatalf("matching terminal output should be consumed: %#v waiting=%t err=%v", continuations, waiting, err)
+			}
+
+			history.calls["read_output"].resultText = `{"job_id":"` + jobID + `","status":"succeeded","next_cursor":7,"output":"terminal output"}`
+			continuations, waiting, err = cloudDSHBackgroundOutputContinuations(history, []app.AgentChildSession{child},
+				child.TaskID, history.sessionID, []app.AgentToolDefinition{definition})
+			if err != nil || waiting || len(continuations) != 1 || continuations[0].AfterSeq != 7 {
+				t.Fatalf("status mismatch must require a terminal-status read at the last cursor: %#v waiting=%t err=%v", continuations, waiting, err)
+			}
+		})
 	}
 }
 
@@ -2693,10 +2874,14 @@ func TestCloudDSHExecutorRejectsUntrustedFramesAndMissingSupervisor(t *testing.T
 		`{"type":"ready","version":1,"version":1,"engine":"dsh","engine_version":"0.2.0-rc.2"}`,
 		`{"type":"ready","version":1,"engine":"dsh","engine_version":"0.2.0-rc.2","extra":true}`,
 		`{"type":"model","request":{"tools":[],"tools":[]}}`,
+		`{"type":"failed","code":"runtime_unavailable"}`,
 	} {
 		if _, err := decodeCloudDSHFrame([]byte(raw)); err == nil {
 			t.Fatal("invalid frame accepted")
 		}
+	}
+	if _, err := decodeCloudDSHFrame([]byte(`{"type":"failed","code":"runtime_unavailable","task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1"}`)); err != nil {
+		t.Fatalf("valid fenced runtime failure frame rejected: %v", err)
 	}
 	if _, err := decodeCloudDSHFrame([]byte(`{"type":"checkpoint_read","id":"page-1","task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1","from_seq":0}`)); err != nil {
 		t.Fatalf("valid checkpoint read frame rejected: %v", err)

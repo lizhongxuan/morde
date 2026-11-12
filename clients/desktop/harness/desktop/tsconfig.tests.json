@@ -1,4 +1,17 @@
 {
   "extends": "./tsconfig.json",
-  "include": ["src/morde-*.ts", "src/host-work.ts"]
+  "include": [
+    "src/morde-*.ts",
+    "src/host-work.ts",
+    "src/glow.ts",
+    "src/host-start.ts",
+    "src/mac-helper.ts",
+    "src/mac-permissions.ts",
+    "src/navigation.ts",
+    "src/private-json.ts",
+    "src/profile-link.ts",
+    "src/protected-exit.ts",
+    "src/proxy.ts",
+    "src/windows-updates.ts"
+  ]
 }

@@ -2,6 +2,9 @@ package runtimeactions
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -126,5 +129,32 @@ func TestNewShellHandlerFailsClosedWithoutDelegatedCgroup(t *testing.T) {
 	handler, err := NewShellHandler(ShellOptions{CgroupRoot: t.TempDir()})
 	if err == nil || handler != nil {
 		t.Fatalf("NewShellHandler()=(%v,%v), want fail-closed error", handler, err)
+	}
+	want := ShellFailureOther
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		want = ShellFailureCgroup
+	}
+	if got := ShellFailureCategoryOf(err); got != want {
+		t.Fatalf("ShellFailureCategoryOf(NewShellHandler error)=%q, want %q", got, want)
+	}
+}
+
+func TestShellFailureCategoryOfReturnsOnlyStaticCategories(t *testing.T) {
+	for _, category := range []ShellFailureCategory{
+		ShellFailureCgroup, ShellFailureRequiredTool, ShellFailureWorkspaceProbe,
+	} {
+		err := shellStartupUnavailable(category)
+		if got := ShellFailureCategoryOf(err); got != category {
+			t.Errorf("ShellFailureCategoryOf(%v)=%q, want %q", err, got, category)
+		}
+		if !errors.Is(err, ErrProcessDomainUnavailable) {
+			t.Errorf("categorized error %q no longer matches ErrProcessDomainUnavailable", category)
+		}
+	}
+	if got := ShellFailureCategoryOf(shellStartupUnavailable(ShellFailureCategory("secret/path"))); got != ShellFailureOther {
+		t.Fatalf("invalid category=%q, want %q", got, ShellFailureOther)
+	}
+	if got := ShellFailureCategoryOf(errors.New("secret/path")); got != ShellFailureOther {
+		t.Fatalf("raw error category=%q, want %q", got, ShellFailureOther)
 	}
 }

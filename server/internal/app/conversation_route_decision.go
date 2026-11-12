@@ -109,7 +109,7 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		!validConversationRouteSummaryContext(value) {
 		return ModelRequest{}, domain.InvalidArgument("route_context", "routing context is invalid")
 	}
-	var timeZone *time.Location = time.UTC
+	var timeZone = time.UTC
 	if value.TimeZone != "" {
 		var err error
 		timeZone, err = time.LoadLocation(value.TimeZone)

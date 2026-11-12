@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate, useNavigationType } from 'react-router';
 import { useAuth } from '../app/auth';
 import { errorDetails } from '../app/api';
@@ -22,6 +22,46 @@ const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
 
 type PageNavigationItem = { label: string; to: string; icon: MordeIconName; query?: [string, string] };
 type PageNavigation = { title: string; items: PageNavigationItem[]; queryDefault?: [string, string] };
+type RouteHistoryEntry = { key: string; url: string };
+type RouteHistoryState = { canGoBack: boolean; canGoForward: boolean; goBack: () => void; goForward: () => void };
+
+const RouteHistoryContext = createContext<RouteHistoryState>({ canGoBack: false, canGoForward: false, goBack: () => {}, goForward: () => {} });
+
+export function PortalNavigationHistoryProvider({ children }: { children: ReactNode }) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const navigationType = useNavigationType();
+  const routeHistory = useRef<RouteHistoryEntry[]>([]);
+  const routeHistoryIndex = useRef(0);
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+
+  useEffect(() => {
+    const current = { key: location.key, url: `${location.pathname}${location.search}${location.hash}` };
+    if (!routeHistory.current.length) {
+      routeHistory.current = [current];
+      routeHistoryIndex.current = 0;
+    } else {
+      const keyIndex = routeHistory.current.findIndex((entry) => entry.key === current.key);
+      const existingIndex = keyIndex >= 0 ? keyIndex : routeHistory.current.findIndex((entry) => entry.url === current.url);
+      if (navigationType === 'POP' && existingIndex >= 0) routeHistoryIndex.current = existingIndex;
+      else if (navigationType === 'REPLACE') routeHistory.current[routeHistoryIndex.current] = current;
+      else if (routeHistory.current[routeHistoryIndex.current]?.key !== current.key) {
+        if (navigationType === 'POP') {
+          routeHistory.current = [current];
+          routeHistoryIndex.current = 0;
+        } else {
+          routeHistory.current = [...routeHistory.current.slice(0, routeHistoryIndex.current + 1), current];
+          routeHistoryIndex.current = routeHistory.current.length - 1;
+        }
+      }
+    }
+    setCanGoBack(routeHistoryIndex.current > 0);
+    setCanGoForward(routeHistoryIndex.current < routeHistory.current.length - 1);
+  }, [location.hash, location.key, location.pathname, location.search, navigationType]);
+
+  return <RouteHistoryContext.Provider value={{ canGoBack, canGoForward, goBack: () => navigate(-1), goForward: () => navigate(1) }}>{children}</RouteHistoryContext.Provider>;
+}
 
 const personalSections: Array<[string, string, MordeIconName]> = [
   ['profile', '个人资料', 'user'], ['soul', 'AI 个性', 'spark'], ['memory', '记忆', 'file'],
@@ -65,28 +105,11 @@ export function PortalLayout() {
   const { notify } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
-  const navigationType = useNavigationType();
+  const { canGoBack, canGoForward, goBack, goForward } = useContext(RouteHistoryContext);
   const [contextSidebarCollapsed, setContextSidebarCollapsed] = useState(readContextSidebarCollapsed);
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
-  const [canGoBack, setCanGoBack] = useState(false);
-  const [canGoForward, setCanGoForward] = useState(false);
-  const routeHistory = useRef([{ key: location.key, url: `${location.pathname}${location.search}${location.hash}` }]);
-  const routeHistoryIndex = useRef(0);
   const pageNavigation = pageNavigationFor(location.pathname);
   const hasCollapsibleSidebar = Boolean(pageNavigation) || location.pathname === '/assistant';
-
-  useEffect(() => {
-    const current = { key: location.key, url: `${location.pathname}${location.search}${location.hash}` };
-    const existingIndex = routeHistory.current.findIndex((entry) => entry.key === current.key);
-    if (navigationType === 'POP' && existingIndex >= 0) routeHistoryIndex.current = existingIndex;
-    else if (navigationType === 'REPLACE') routeHistory.current[routeHistoryIndex.current] = current;
-    else {
-      routeHistory.current = [...routeHistory.current.slice(0, routeHistoryIndex.current + 1), current];
-      routeHistoryIndex.current = routeHistory.current.length - 1;
-    }
-    setCanGoBack(routeHistoryIndex.current > 0);
-    setCanGoForward(routeHistoryIndex.current < routeHistory.current.length - 1);
-  }, [location.hash, location.key, location.pathname, location.search, navigationType]);
 
   useEffect(() => {
     try { localStorage.setItem('morde:pc-context-sidebar-collapsed', contextSidebarCollapsed ? 'true' : 'false'); }
@@ -101,8 +124,8 @@ export function PortalLayout() {
   return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}`}>
     <a className="skip-link" href="#main-content">跳到主要内容</a>
     <header className="morde-topbar"><div className="morde-top-navigation">
-      <button type="button" className="morde-top-control" aria-label="返回上一页" title="返回上一页" disabled={!canGoBack} onClick={() => navigate(-1)}><MordeIcon name="back" /></button>
-      <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={() => navigate(1)}><MordeIcon name="forward" /></button>
+      <button type="button" className="morde-top-control" aria-label="返回上一页" title="返回上一页" disabled={!canGoBack} onClick={goBack}><MordeIcon name="back" /></button>
+      <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={goForward}><MordeIcon name="forward" /></button>
       <span className="morde-top-divider" aria-hidden="true" />
       {hasCollapsibleSidebar && <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>}
     </div><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><MordeIcon name="monitor" /></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>

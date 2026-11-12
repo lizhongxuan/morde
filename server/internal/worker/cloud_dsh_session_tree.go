@@ -408,7 +408,180 @@ func validCloudDSHBackgroundHandle(output, sessionID string) bool {
 	if !uniqueCloudDSHJSON([]byte(output)) || decoder.Decode(&handle) != nil || decoder.Decode(new(any)) != io.EOF || handle.JobID != sessionID {
 		return false
 	}
-	return handle.Status == "running" || handle.Status == "succeeded"
+	return validCloudDSHJobStatus(handle.Status)
+}
+
+type cloudDSHBackgroundOutputContinuation struct {
+	JobID      string `json:"job_id"`
+	Status     string `json:"status"`
+	AfterSeq   int64  `json:"after_seq"`
+	ThroughSeq int64  `json:"checkpoint_through_seq"`
+}
+
+func validCloudDSHJobStatus(status string) bool {
+	switch status {
+	case "queued", "running", "cancelling", "waiting_user", "succeeded", "cancelled", "failed", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloudDSHTerminalChildStatus(status task.StepStatus) bool {
+	return status == task.StepSucceeded || status == task.StepFailed || status == task.StepUnknown
+}
+
+// cloudDSHBackgroundOutputContinuations verifies durable child identity and
+// finds the furthest output cursor recorded in the parent's checkpoint. A
+// terminal status is consumed only after a matching dsh_job_output result has
+// reached the child's pinned checkpoint cursor.
+func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, children []app.AgentChildSession,
+	taskID, parentSessionID string, parentDefinitions []app.AgentToolDefinition) ([]cloudDSHBackgroundOutputContinuation, bool, error) {
+	if len(children) > 16 {
+		return nil, false, errors.New("background child-session set exceeds its limit")
+	}
+	seen := make(map[string]struct{}, len(children))
+	bySpawnKey := make(map[string]app.AgentChildSession, len(children))
+	continuations := make([]cloudDSHBackgroundOutputContinuation, 0, len(children))
+	waiting := false
+	for _, child := range children {
+		if !child.Background {
+			continue
+		}
+		if child.TaskID != taskID || child.Step.TaskID != taskID || child.ParentSessionID != parentSessionID ||
+			!cloudDSHID.MatchString(child.SessionID) || child.SessionID == parentSessionID || !cloudDSHID.MatchString(child.SpawnKey) ||
+			!cloudDSHID.MatchString(child.Step.ID) || child.Step.Sequence < 1 || child.Step.Kind != "subagent" ||
+			!validCloudDSHStoredToolNames(child.AllowedTools) || child.CheckpointThrough < -1 || child.CheckpointThrough > 1<<53-1 ||
+			(child.CheckpointThrough == -1 && len(child.CheckpointDigest) != 0) ||
+			(child.CheckpointThrough >= 0 && len(child.CheckpointDigest) != sha256.Size) ||
+			!utf8.ValidString(child.Step.Summary) || len(child.Step.Summary) > 2048 {
+			return nil, false, errors.New("background child-session identity is invalid")
+		}
+		if _, exists := seen[child.SessionID]; exists {
+			return nil, false, errors.New("background child-session identity is repeated")
+		}
+		seen[child.SessionID] = struct{}{}
+		if _, exists := bySpawnKey[child.SpawnKey]; exists {
+			return nil, false, errors.New("background child-session spawn key is repeated")
+		}
+		bySpawnKey[child.SpawnKey] = child
+		status := cloudDSHJobStatus(child)
+		if !validCloudDSHJobStatus(status) {
+			return nil, false, errors.New("background child-session status is invalid")
+		}
+		if !cloudDSHTerminalChildStatus(child.Step.Status) {
+			if child.Step.Status != task.StepRunning {
+				return nil, false, errors.New("background child is not in a resumable or terminal state")
+			}
+			waiting = true
+			continue
+		}
+		if history == nil || history.sessionID != parentSessionID {
+			return nil, false, errors.New("background job parent history is unavailable")
+		}
+		delegation := history.calls[child.SpawnKey]
+		if delegation == nil || delegation.name != cloudDSHDelegateToolName || !delegation.callSeen || !delegation.resultSeen ||
+			delegation.status == app.AgentToolFailed {
+			return nil, false, errors.New("background child is not linked to a durable parent delegation")
+		}
+		arguments, definitions, err := validateCloudDSHDelegateArguments(delegation.arguments, parentDefinitions)
+		if err != nil || !arguments.RunInBackground {
+			return nil, false, errors.New("background child delegation is invalid")
+		}
+		allowedTools := make([]string, 0, len(definitions))
+		for _, definition := range definitions {
+			allowedTools = append(allowedTools, definition.Name)
+		}
+		if !sameWorkerToolNames(child.AllowedTools, allowedTools) || !validCloudDSHBackgroundHandle(delegation.resultText, child.SessionID) {
+			return nil, false, errors.New("background child authorization or handle changed")
+		}
+
+		cursor := int64(-1)
+		consumed := false
+		for _, call := range history.calls {
+			if call.name != cloudDSHJobOutputToolName || !call.callSeen || !call.resultSeen {
+				continue
+			}
+			var request struct {
+				JobID    string `json:"job_id"`
+				AfterSeq int64  `json:"after_seq"`
+			}
+			decoder := json.NewDecoder(bytes.NewReader(call.arguments))
+			decoder.DisallowUnknownFields()
+			if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF || !cloudDSHID.MatchString(request.JobID) || request.AfterSeq < -1 {
+				return nil, false, errors.New("background output call in the parent checkpoint is invalid")
+			}
+			if request.JobID != child.SessionID {
+				continue
+			}
+			var result struct {
+				JobID      string `json:"job_id"`
+				Status     string `json:"status"`
+				NextCursor int64  `json:"next_cursor"`
+				Output     string `json:"output"`
+			}
+			decoder = json.NewDecoder(bytes.NewReader([]byte(call.resultText)))
+			decoder.DisallowUnknownFields()
+			if !uniqueCloudDSHJSON([]byte(call.resultText)) || decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF ||
+				result.JobID != child.SessionID || !validCloudDSHJobStatus(result.Status) || !utf8.ValidString(result.Output) ||
+				len(result.Output) > cloudDSHJobOutputMaxBytes || result.NextCursor < request.AfterSeq || result.NextCursor > child.CheckpointThrough {
+				return nil, false, errors.New("background output result in the parent checkpoint is invalid")
+			}
+			if result.NextCursor > cursor {
+				cursor = result.NextCursor
+			}
+			if result.Status == status && result.NextCursor >= child.CheckpointThrough {
+				consumed = true
+			}
+		}
+		if !consumed {
+			continuations = append(continuations, cloudDSHBackgroundOutputContinuation{JobID: child.SessionID,
+				Status: status, AfterSeq: cursor, ThroughSeq: child.CheckpointThrough})
+		}
+	}
+	if history != nil {
+		if history.sessionID != parentSessionID {
+			return nil, false, errors.New("background job parent history is invalid")
+		}
+		for spawnKey, delegation := range history.calls {
+			if delegation.name != cloudDSHDelegateToolName || !delegation.callSeen || !delegation.resultSeen {
+				continue
+			}
+			var selection struct {
+				Title           string   `json:"title"`
+				Objective       string   `json:"objective"`
+				ToolNames       []string `json:"tool_names"`
+				RunInBackground bool     `json:"run_in_background"`
+			}
+			decoder := json.NewDecoder(bytes.NewReader(delegation.arguments))
+			decoder.DisallowUnknownFields()
+			if decoder.Decode(&selection) != nil || decoder.Decode(new(any)) != io.EOF {
+				return nil, false, errors.New("background job delegation in the parent checkpoint is invalid")
+			}
+			if !selection.RunInBackground {
+				continue
+			}
+			if _, _, err := validateCloudDSHDelegateArguments(delegation.arguments, parentDefinitions); err != nil {
+				return nil, false, errors.New("background job delegation in the parent checkpoint is invalid")
+			}
+			child, exists := bySpawnKey[spawnKey]
+			if !exists || !validCloudDSHBackgroundHandle(delegation.resultText, child.SessionID) {
+				return nil, false, errors.New("durable background delegation has no matching child session")
+			}
+		}
+	}
+	return continuations, waiting, nil
+}
+
+func cloudDSHBackgroundOutputContinuationPrompt(continuations []cloudDSHBackgroundOutputContinuation) (string, error) {
+	if len(continuations) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(continuations)
+	if err != nil || len(encoded) > 16<<10 {
+		return "", errors.New("background output continuation request exceeds its limit")
+	}
+	return "Internal continuation: the following durable background jobs have settled, but this parent Task has not consumed their complete output. For each job, call dsh_job_output using its job_id and after_seq, continue through additional pages until next_cursor reaches checkpoint_through_seq, and review the returned status and output before reporting. Treat failed, cancelled, and unknown outcomes accurately; do not claim success without evidence. Do not repeat other completed actions. Jobs: " + string(encoded), nil
 }
 
 func (e *CloudDSHExecutor) cloudDSHRecoverSettledPersonalChildren(ctx context.Context, claimed task.Task, fence app.AgentInstanceFence,
@@ -740,7 +913,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			return errors.New("dsh child sessions are unavailable")
 		}
 		childSessions = children
-		for _, child := range children {
+		for index, child := range children {
 			if !child.Background || child.Step.Status != task.StepRunning {
 				continue
 			}
@@ -768,6 +941,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					!bytes.Equal(settled.CheckpointDigest, child.CheckpointDigest) {
 					return errors.New("dsh cancelled background job outcome could not be durably reconciled")
 				}
+				childSessions[index] = settled
 				continue
 			}
 			if child.CheckpointThrough < 0 || len(child.CheckpointDigest) != sha256.Size {
@@ -789,6 +963,64 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"spawn_key": child.SpawnKey, "title": child.Step.Title, "background": true, "cancel_requested": false,
 				"step_status": child.Step.Status, "tools": cloudDSHToolPayload(definitions),
 				"checkpoint_through_seq": child.CheckpointThrough, "checkpoint_sha256": hex.EncodeToString(child.CheckpointDigest)})
+		}
+	}
+	var outputContinuationPrompt string
+	if resume {
+		hasTerminalBackgroundJob := false
+		for _, child := range childSessions {
+			if child.Background && cloudDSHTerminalChildStatus(child.Step.Status) {
+				hasTerminalBackgroundJob = true
+				break
+			}
+		}
+		if hasTerminalBackgroundJob {
+			if !toolsAllowed {
+				return errors.New("dsh background output cannot be resumed without model tool capability")
+			}
+			_, rootHistory, historyErr := e.cloudDSHReadPinnedCheckpointHistory(ctx, fence, rootIdentity.SessionID, rootThrough, rootDigest, false)
+			if historyErr != nil {
+				return errors.New("dsh parent checkpoint for background output is unavailable")
+			}
+			continuations, _, continuationErr := cloudDSHBackgroundOutputContinuations(rootHistory, childSessions,
+				value.ID, rootIdentity.SessionID, rootDefinitions)
+			if continuationErr != nil {
+				return continuationErr
+			}
+			childrenByID := make(map[string]app.AgentChildSession, len(childSessions))
+			for _, child := range childSessions {
+				if child.Background {
+					childrenByID[child.SessionID] = child
+				}
+			}
+			for _, continuation := range continuations {
+				if continuation.ThroughSeq < 0 {
+					continue
+				}
+				child, exists := childrenByID[continuation.JobID]
+				if !exists {
+					return errors.New("background output continuation child is unavailable")
+				}
+				_, childHistory, readErr := e.cloudDSHReadPinnedCheckpointHistory(ctx, fence, child.SessionID,
+					child.CheckpointThrough, child.CheckpointDigest, false)
+				if readErr != nil || childHistory.nextSeq != child.CheckpointThrough+1 {
+					return errors.New("background output continuation checkpoint is unavailable")
+				}
+				childHistory.finishRestore()
+				childIdentity := rootIdentity
+				childIdentity.SessionID = child.SessionID
+				outputState := newCloudDSHSessionState(fence, childIdentity, child.ParentSessionID, child.SpawnKey,
+					nil, false, false, child.CheckpointThrough, child.CheckpointDigest)
+				outputState.history = childHistory
+				outputState.settled = true
+				states[child.SessionID] = outputState
+			}
+			if rootHistory.hasCompletedResult() {
+				outputContinuationPrompt, historyErr = cloudDSHBackgroundOutputContinuationPrompt(continuations)
+				if historyErr != nil {
+					return historyErr
+				}
+			}
 		}
 	}
 	frames := make(chan cloudDSHRead, 1)
@@ -1043,6 +1275,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				start["resume"] = true
 				start["checkpoint_through_seq"] = rootThrough
 				start["checkpoint_sha256"] = hex.EncodeToString(rootDigest)
+				if outputContinuationPrompt != "" {
+					start["prompt"] = outputContinuationPrompt
+				}
 			} else {
 				prompt, err := cloudDSHInitialPrompt(value)
 				if err != nil {
@@ -1152,6 +1387,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			continue
 		}
 		if frame.Type == "failed" {
+			if frame.cloudDSHIdentity != rootIdentity {
+				return errors.New("dsh runtime failure frame identity is invalid")
+			}
 			return errors.New("dsh reported an unavailable runtime")
 		}
 		if frame.Type == "child_create" {
@@ -1303,6 +1541,20 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				(state.resume && (state.readThrough != state.restoreThrough || state.lastModel < 0 && !state.history.hasCompletedResult())) ||
 				(!state.resume && state.lastModel < 0) {
 				return errors.New("dsh did not produce a completed candidate")
+			}
+			if e.options.Children != nil {
+				children, err := e.options.Children.List(ctx, fence, rootIdentity.SessionID)
+				if err != nil {
+					return errors.New("dsh background job settlement is unavailable")
+				}
+				continuations, waiting, err := cloudDSHBackgroundOutputContinuations(state.history, children,
+					value.ID, rootIdentity.SessionID, rootDefinitions)
+				if err != nil {
+					return err
+				}
+				if waiting || len(continuations) != 0 {
+					return errCloudDSHBackgroundOutputPending
+				}
 			}
 			candidate, err := state.history.completion(fence, state.through, state.checkpointDigest)
 			if err != nil {

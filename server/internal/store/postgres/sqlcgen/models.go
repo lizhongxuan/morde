@@ -570,6 +570,24 @@ type HostControlTransition struct {
 	ActorUserID            pgtype.Text        `json:"actor_user_id"`
 }
 
+type HostEmbedTicket struct {
+	TicketHash           []byte             `json:"ticket_hash"`
+	HostID               string             `json:"host_id"`
+	ConversationID       string             `json:"conversation_id"`
+	ActorUserID          string             `json:"actor_user_id"`
+	PortalTokenID        string             `json:"portal_token_id"`
+	ClientInstallationID pgtype.Text        `json:"client_installation_id"`
+	ServiceInstanceID    string             `json:"service_instance_id"`
+	PortalOrigin         string             `json:"portal_origin"`
+	InitialTarget        string             `json:"initial_target"`
+	TargetGrants         []byte             `json:"target_grants"`
+	EmbedNonce           string             `json:"embed_nonce"`
+	RuntimeGeneration    int64              `json:"runtime_generation"`
+	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
+	UsedAt               pgtype.Timestamptz `json:"used_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
 type HostMember struct {
 	HostID       string             `json:"host_id"`
 	OwnerID      string             `json:"owner_id"`
@@ -2388,6 +2406,47 @@ type WorkspaceSyncNodeRevision struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type WorkspaceSyncProjectSource struct {
+	SourceBindingID      string      `json:"source_binding_id"`
+	OwnerID              string      `json:"owner_id"`
+	ClientInstallationID string      `json:"client_installation_id"`
+	WorkspaceID          string      `json:"workspace_id"`
+	FolderID             string      `json:"folder_id"`
+	HostID               string      `json:"host_id"`
+	BindingVersion       int64       `json:"binding_version"`
+	State                string      `json:"state"`
+	LastAppliedSessionID pgtype.Text `json:"last_applied_session_id"`
+	// Target revision of last_applied_session_id, never the Host current revision.
+	LastAppliedTargetRevision pgtype.Int8        `json:"last_applied_target_revision"`
+	LastAppliedManifestSha256 []byte             `json:"last_applied_manifest_sha256"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkspaceSyncProjectUploadApplication struct {
+	WorkspaceID          string `json:"workspace_id"`
+	SessionID            string `json:"session_id"`
+	OwnerID              string `json:"owner_id"`
+	FolderID             string `json:"folder_id"`
+	SourceBindingID      string `json:"source_binding_id"`
+	SourceBindingVersion int64  `json:"source_binding_version"`
+	// PC source baseline read when this upload was planned; commit compares it with workspace_sync_project_sources.last_applied_session_id before writing.
+	SourceBaselineSessionID pgtype.Text `json:"source_baseline_session_id"`
+	HostID                  string      `json:"host_id"`
+	WorkspaceBindingVersion int64       `json:"workspace_binding_version"`
+	TargetRevision          int64       `json:"target_revision"`
+	State                   string      `json:"state"`
+	RuntimeGeneration       pgtype.Int8 `json:"runtime_generation"`
+	// Host-reported applied revision; a value above target_revision is accepted only after application-layer revision lineage and affected-path verification.
+	AppliedRevision pgtype.Int8        `json:"applied_revision"`
+	SyncState       pgtype.Text        `json:"sync_state"`
+	ManifestSha256  []byte             `json:"manifest_sha256"`
+	ReceiptSha256   []byte             `json:"receipt_sha256"`
+	Impacts         []byte             `json:"impacts"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type WorkspaceSyncReceiveBlock struct {
 	ReservationID string `json:"reservation_id"`
 	WorkspaceID   string `json:"workspace_id"`
@@ -2476,6 +2535,8 @@ type WorkspaceSyncSession struct {
 	TaskHubOperationKey        pgtype.Text        `json:"task_hub_operation_key"`
 	FolderID                   pgtype.Text        `json:"folder_id"`
 	FolderBaselineRevision     pgtype.Int8        `json:"folder_baseline_revision"`
+	SourceBindingID            pgtype.Text        `json:"source_binding_id"`
+	SourceBaselineSessionID    pgtype.Text        `json:"source_baseline_session_id"`
 }
 
 type WorkspaceSyncSessionBlock struct {

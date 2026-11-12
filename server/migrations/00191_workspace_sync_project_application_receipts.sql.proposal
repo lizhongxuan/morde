@@ -1,0 +1,152 @@
+-- Superseded proposal; the executable migration is 00191_workspace_sync_project_source_receipts.sql.
+-- Retained only as a local review artifact and is not loaded by the migration runner.
+-- +goose Up
+-- Legacy last_upload_revision values only prove that the server committed a
+-- Workspace revision. They are not evidence that a Host applied a PC snapshot.
+-- Leave every existing project source without a deletion baseline.
+ALTER TABLE workspace_sync_sessions
+  ADD CONSTRAINT workspace_sync_sessions_workspace_id_id_owner_id_unique
+    UNIQUE (workspace_id, id, owner_id);
+
+CREATE TABLE workspace_sync_project_sources (
+  owner_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source_binding_id uuid NOT NULL,
+  client_installation_id text NOT NULL,
+  workspace_id text NOT NULL,
+  host_id text NOT NULL,
+  folder_id text NOT NULL,
+  binding_version bigint NOT NULL CHECK (binding_version > 0),
+  last_applied_session_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (owner_id, source_binding_id),
+  UNIQUE (owner_id, source_binding_id, workspace_id, host_id, folder_id, binding_version),
+  FOREIGN KEY (client_installation_id, owner_id)
+    REFERENCES client_installations(id, owner_id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, owner_id)
+    REFERENCES workspaces(id, owner_id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, owner_id, folder_id)
+    REFERENCES workspace_sync_folders(workspace_id, owner_id, folder_id)
+);
+
+CREATE TABLE workspace_sync_project_applications (
+  workspace_id text NOT NULL,
+  session_id text NOT NULL,
+  owner_id text NOT NULL,
+  source_binding_id uuid NOT NULL,
+  host_id text NOT NULL,
+  folder_id text NOT NULL,
+  binding_version bigint NOT NULL CHECK (binding_version > 0),
+  runtime_generation bigint NOT NULL CHECK (runtime_generation > 0),
+  target_revision bigint NOT NULL CHECK (target_revision >= 0),
+  manifest_sha256 bytea NOT NULL CHECK (octet_length(manifest_sha256) = 32),
+  status text NOT NULL CHECK (status IN ('pending_apply', 'applied', 'conflict', 'unknown')),
+  applied_revision bigint CHECK (applied_revision >= 0),
+  impact_total integer NOT NULL DEFAULT 0 CHECK (impact_total >= 0),
+  impact_applied integer NOT NULL DEFAULT 0 CHECK (impact_applied >= 0),
+  impact_conflict integer NOT NULL DEFAULT 0 CHECK (impact_conflict >= 0),
+  impact_unknown integer NOT NULL DEFAULT 0 CHECK (impact_unknown >= 0),
+  impact_items jsonb NOT NULL DEFAULT '[]'::jsonb
+    CHECK (jsonb_typeof(impact_items) = 'array' AND jsonb_array_length(impact_items) <= 100),
+  receipt_sha256 bytea CHECK (receipt_sha256 IS NULL OR octet_length(receipt_sha256) = 32),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workspace_id, session_id),
+  UNIQUE (owner_id, source_binding_id, session_id),
+  FOREIGN KEY (workspace_id, session_id, owner_id)
+    REFERENCES workspace_sync_sessions(workspace_id, id, owner_id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, owner_id)
+    REFERENCES workspaces(id, owner_id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, owner_id, folder_id)
+    REFERENCES workspace_sync_folders(workspace_id, owner_id, folder_id),
+  FOREIGN KEY (workspace_id, target_revision)
+    REFERENCES workspace_revisions(workspace_id, revision),
+  FOREIGN KEY (owner_id, source_binding_id, workspace_id, host_id, folder_id, binding_version)
+    REFERENCES workspace_sync_project_sources(owner_id, source_binding_id, workspace_id, host_id, folder_id, binding_version),
+  CHECK (impact_applied + impact_conflict + impact_unknown = impact_total),
+  CHECK ((status = 'applied') = (applied_revision IS NOT NULL)),
+  CHECK (applied_revision IS NULL OR applied_revision = target_revision),
+  CHECK (status <> 'applied' OR
+    (impact_total = impact_applied AND impact_conflict = 0 AND impact_unknown = 0))
+);
+
+ALTER TABLE workspace_sync_project_sources
+  ADD CONSTRAINT workspace_sync_project_source_baseline_fk
+    FOREIGN KEY (owner_id, source_binding_id, last_applied_session_id)
+    REFERENCES workspace_sync_project_applications(owner_id, source_binding_id, session_id);
+
+CREATE INDEX workspace_sync_project_applications_pending
+  ON workspace_sync_project_applications(host_id, runtime_generation, workspace_id, binding_version, created_at)
+  WHERE status = 'pending_apply';
+CREATE INDEX workspace_sync_project_applications_source
+  ON workspace_sync_project_applications(owner_id, source_binding_id, target_revision DESC);
+
+-- A source remains tied to the installation and target where it was created.
+-- Only the applied-session pointer may move, and only to a newer verified receipt.
+-- +goose StatementBegin
+CREATE FUNCTION enforce_workspace_sync_project_source_transition() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  previous_revision bigint;
+  next_revision bigint;
+BEGIN
+  IF ROW(NEW.owner_id, NEW.source_binding_id, NEW.client_installation_id,
+         NEW.workspace_id, NEW.host_id, NEW.folder_id, NEW.binding_version)
+     IS DISTINCT FROM
+     ROW(OLD.owner_id, OLD.source_binding_id, OLD.client_installation_id,
+         OLD.workspace_id, OLD.host_id, OLD.folder_id, OLD.binding_version) THEN
+    RAISE EXCEPTION 'Workspace project source binding is immutable';
+  END IF;
+  IF NEW.last_applied_session_id IS NULL AND OLD.last_applied_session_id IS NOT NULL THEN
+    RAISE EXCEPTION 'Workspace project source baseline cannot move backwards';
+  END IF;
+  IF NEW.last_applied_session_id IS DISTINCT FROM OLD.last_applied_session_id
+     AND NEW.last_applied_session_id IS NOT NULL THEN
+    SELECT target_revision INTO next_revision
+    FROM workspace_sync_project_applications
+    WHERE owner_id = NEW.owner_id
+      AND source_binding_id = NEW.source_binding_id
+      AND session_id = NEW.last_applied_session_id
+      AND status = 'applied';
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Workspace project source baseline requires an applied Host receipt';
+    END IF;
+    IF OLD.last_applied_session_id IS NOT NULL THEN
+      SELECT target_revision INTO previous_revision
+      FROM workspace_sync_project_applications
+      WHERE owner_id = OLD.owner_id
+        AND source_binding_id = OLD.source_binding_id
+        AND session_id = OLD.last_applied_session_id;
+      IF next_revision <= previous_revision THEN
+        RAISE EXCEPTION 'Workspace project source baseline must advance monotonically';
+      END IF;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+-- +goose StatementEnd
+CREATE TRIGGER workspace_sync_project_source_transition
+BEFORE UPDATE ON workspace_sync_project_sources
+FOR EACH ROW EXECUTE FUNCTION enforce_workspace_sync_project_source_transition();
+
+-- +goose Down
+-- +goose StatementBegin
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM workspace_sync_project_applications)
+     OR EXISTS (SELECT 1 FROM workspace_sync_project_sources) THEN
+    RAISE EXCEPTION 'cannot roll back Workspace project application receipts or source bindings';
+  END IF;
+END $$;
+-- +goose StatementEnd
+
+DROP TRIGGER workspace_sync_project_source_transition ON workspace_sync_project_sources;
+DROP FUNCTION enforce_workspace_sync_project_source_transition();
+DROP INDEX workspace_sync_project_applications_source;
+DROP INDEX workspace_sync_project_applications_pending;
+ALTER TABLE workspace_sync_project_sources
+  DROP CONSTRAINT workspace_sync_project_source_baseline_fk;
+DROP TABLE workspace_sync_project_applications;
+DROP TABLE workspace_sync_project_sources;
+ALTER TABLE workspace_sync_sessions
+  DROP CONSTRAINT workspace_sync_sessions_workspace_id_id_owner_id_unique;

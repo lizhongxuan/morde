@@ -1558,7 +1558,7 @@ export interface paths {
         put?: never;
         /**
          * Plan an upload, missing-only download, merge, or live synchronization batch
-         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion. Requests with folder_id are explicit PC-to-cloud project uploads; only the owning Portal Session or an installation-bound Sync credential (chd_) is authorized. Platform API keys and restricted Client credentials are rejected for project uploads. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
+         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; the same Idempotency-Key and canonical request return the original session, while a different request body conflicts. Omitted files never imply deletion. Requests with folder_id are explicit PC-to-cloud project uploads and must include source_binding_id; the authenticated principal supplies the verified client installation identity. The server accepts only one complete relative source manifest, derives the cloud path and safe deletion plan, and never trusts client installation, Host, Workspace, path, scope, or delete-list claims. Old sessions and last_upload_revision values do not prove PC ownership; old project sessions receive no deletion baseline. SyncSession.state=completed confirms only server commit; Host application is tracked separately. GET exposes a session-bound host_application projection, and only a verified receipt for the recorded Host, Workspace binding version, exact target_revision and authenticated Host runtime generation can confirm application. Receipt handling rechecks the current Host generation, binding version, and authorization in the committing transaction. An applied_revision above target_revision is accepted only when the server verifies revision lineage and the affected project paths; a larger numeric revision alone never proves application. An unresolved application prevents a different destructive project upload; retries with the original idempotency key recover the original session. Only an installation-bound session/client credential is authorized. Platform API keys and credentials without a verified installation are rejected. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
          */
         post: operations["createWorkspaceSyncSession"];
         delete?: never;
@@ -1767,7 +1767,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read the current workspace replica snapshot for a Host runtime */
+        /**
+         * Read the current workspace replica snapshot for a Host runtime
+         * @description Returns this authenticated Host generation's current Workspace bindings plus session-specific PC project uploads in pending_apply state. Each reference contains metadata only; the Host fetches the existing sync session and its blocks through the normal authorized transfer API. There is at most one unresolved application per registered project folder; conflict and unknown outcomes remain visible through the sync-session projection.
+         */
         get: operations["listHostReplicaBindings"];
         put?: never;
         post?: never;
@@ -1883,8 +1886,37 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge a revision applied by a completed sync session */
+        /**
+         * Acknowledge a revision applied by a completed sync session
+         * @description Host Runtime identity is bound by host_id, runtime generation, workspace_id, and binding_version. The request must name a completed Host download/bidirectional session whose target revision equals applied_revision. This Workspace-level receipt does not acknowledge a PC project upload; a larger numeric revision alone is not proof of project application. Use the project session-specific receipt endpoint.
+         */
         post: operations["recordHostReplicaAppliedRevision"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/host-replicas/{host_id}/generations/{generation}/workspaces/{workspace_id}/bindings/{binding_version}/project-uploads/{session_id}/applied": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                workspace_id: components["schemas"]["WorkspaceId"];
+                binding_version: number;
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record application of one PC project upload
+         * @description The Host Runtime credential and path bind the authenticated Host and the generation observed with this receipt. The server rechecks that this is still the current Host generation and verifies owner authorization, Workspace, active binding version, source binding, session target revision and complete manifest digest in the committing transaction. The identical receipt is idempotent; a different receipt conflicts. Only a complete verified target may be applied; partial application remains conflict or unknown. An applied_revision above target_revision may be accepted only after server-side revision-lineage and affected-path verification; a larger number alone never confirms this session. Workspace desired/applied revision equality alone never confirms this session.
+         */
+        post: operations["recordHostProjectUploadApplication"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5969,6 +6001,19 @@ export interface components {
             /** @enum {string} */
             sync_state: "healthy" | "conflict";
             sync_conflicts: string[];
+            /** @description Up to 1000 oldest-first project upload applications in pending_apply state bound to this Workspace binding. There is at most one unresolved application per registered project folder; resolved applications are omitted from this poll list, while conflict and unknown outcomes remain visible through the sync-session projection. Entries are metadata only and contain no file content; later polls expose subsequent pending work as receipts leave this list. */
+            project_upload_applications: components["schemas"]["HostProjectUploadApplicationReference"][];
+        };
+        HostProjectUploadApplicationReference: {
+            session_id: string;
+            /** Format: uuid */
+            source_binding_id: string;
+            /** @description Workspace-relative project directory derived by the server. */
+            project_path: string;
+            /** Format: int64 */
+            target_revision: number;
+            /** @description SHA-256 of the complete source manifest fixed for this session. */
+            manifest_sha256: string;
         };
         HostReplicaBindings: {
             /** Format: int64 */
@@ -6587,8 +6632,13 @@ export interface components {
             accepted_at?: string;
         };
         CreateSyncSessionRequest: {
-            /** @description Optional registered project folder for an explicit PC-to-cloud upload. When present the client sends paths relative to its selected local folder */
+            /** @description Optional registered project folder for an explicit PC-to-cloud upload. When present */
             folder_id?: string;
+            /**
+             * Format: uuid
+             * @description Stable random source identity kept by Desktop. Required only with folder_id. The authenticated principal supplies the installation ID; this value does not claim an installation or grant a new source ownership. A different source ID for an already-bound project conflicts until explicit source migration is supported.
+             */
+            source_binding_id?: string;
             /** @enum {string} */
             direction: "upload" | "download" | "bidirectional";
             /** @enum {string} */
@@ -6610,7 +6660,7 @@ export interface components {
             deleted_directories?: string[];
             /** @description Advance this replica's durable cursor only after this session is applied and committed. */
             ack_cursor?: string | null;
-        };
+        } & unknown;
         SyncConflict: {
             path: string;
             /** @enum {string} */
@@ -6826,11 +6876,76 @@ export interface components {
             transfer_blocks: components["schemas"]["SyncTransferBlock"][];
             download_actions: components["schemas"]["WorkspaceSyncDownloadAction"][];
             conflicts: components["schemas"]["SyncConflict"][];
+            /** @description Present for project uploads with a durable Host application record. This is separate from state=completed, which confirms only server commit. */
+            host_application?: components["schemas"]["WorkspaceSyncHostApplication"];
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
         };
+        WorkspaceSyncHostApplication: {
+            /** @enum {string} */
+            status: "pending_apply" | "applied" | "conflict" | "unknown";
+            host_id: components["schemas"]["HostId"];
+            /** Format: int64 */
+            workspace_binding_version: number;
+            /**
+             * Format: int64
+             * @description Must equal the parent sync session target_revision.
+             */
+            target_revision: number;
+            /** @description SHA-256 of the complete PC source manifest recorded for this session. */
+            manifest_sha256: string;
+            /**
+             * Format: int64
+             * @description Authenticated Host runtime generation that produced a verified application receipt; null until observed and never inferred from a stale response.
+             */
+            runtime_generation?: number | null;
+            /**
+             * Format: int64
+             * @description Must be at least target_revision for status=applied. A larger revision is accepted only after the server verifies revision lineage and affected project paths; numeric ordering alone is not proof.
+             */
+            applied_revision?: number | null;
+            /**
+             * @description Current Workspace binding health observed with the receipt.
+             * @enum {string|null}
+             */
+            sync_state?: "healthy" | "conflict" | null;
+            /** @description Only affected or unverified project-relative paths; never absolute paths or a client-provided delete list. */
+            impacts: components["schemas"]["WorkspaceSyncHostApplicationImpact"][];
+        } & unknown;
+        WorkspaceSyncHostApplicationImpact: {
+            /** @description Relative to the selected project root. */
+            path: string;
+            /** @enum {string} */
+            state: "applied" | "conflict" | "unknown";
+            /** @description Bounded implementation-defined safe reason; never includes a local absolute path or user file content. */
+            reason?: string;
+        };
+        HostProjectUploadApplicationReport: {
+            /** Format: uuid */
+            source_binding_id: string;
+            /**
+             * Format: int64
+             * @description Must equal the parent session's target_revision.
+             */
+            target_revision: number;
+            /** @description Must equal the complete source manifest digest fixed for this session. */
+            manifest_sha256: string;
+            /**
+             * @description Applied requires applied_revision at least target_revision
+             * @enum {string}
+             */
+            status: "applied" | "conflict" | "unknown";
+            /**
+             * Format: int64
+             * @description Must be at least target_revision for status=applied; a larger numeric value alone is not proof and remains unconfirmed without server-side lineage and path verification.
+             */
+            applied_revision?: number | null;
+            /** @enum {string|null} */
+            sync_state?: "healthy" | "conflict" | null;
+            impacts: components["schemas"]["WorkspaceSyncHostApplicationImpact"][];
+        } & unknown;
         Template: {
             id: string;
             name: string;
@@ -8489,7 +8604,7 @@ export interface components {
             status: components["schemas"]["TaskStatus"];
             unsettled_operation_ids: components["schemas"]["OperationId"][];
         };
-        /** @description Media-generation progress uses the existing task.operation and task.waiting_user events. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
+        /** @description Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
         TaskEvent: {
             task_id: components["schemas"]["TaskId"];
             sequence: number;
@@ -12297,6 +12412,42 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    recordHostProjectUploadApplication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                workspace_id: components["schemas"]["WorkspaceId"];
+                binding_version: number;
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HostProjectUploadApplicationReport"];
+            };
+        };
+        responses: {
+            /** @description Durable session-specific Host application receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceSyncHostApplication"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };

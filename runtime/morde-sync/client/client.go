@@ -34,13 +34,14 @@ const (
 )
 
 var (
-	workspaceIDPattern  = regexp.MustCompile(`^w[a-z0-9]{7}$`)
-	syncFolderIDPattern = regexp.MustCompile(`^morde-[a-f0-9]{32}$`)
-	sessionIDPattern    = regexp.MustCompile(`^p[a-z0-9]{7}$`)
-	taskIDPattern       = regexp.MustCompile(`^q[a-z0-9]{7}$`)
-	taskOperationKey    = regexp.MustCompile(`^agent:[a-f0-9]{64}$`)
-	digestPattern       = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	idempotencyPattern  = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
+	workspaceIDPattern     = regexp.MustCompile(`^w[a-z0-9]{7}$`)
+	syncFolderIDPattern    = regexp.MustCompile(`^morde-[a-f0-9]{32}$`)
+	sourceBindingIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	sessionIDPattern       = regexp.MustCompile(`^p[a-z0-9]{7}$`)
+	taskIDPattern          = regexp.MustCompile(`^q[a-z0-9]{7}$`)
+	taskOperationKey       = regexp.MustCompile(`^agent:[a-f0-9]{64}$`)
+	digestPattern          = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	idempotencyPattern     = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
 )
 
 // Client uses a workspace-scoped bearer credential. The token is never placed
@@ -74,6 +75,7 @@ func New(baseURL, bearerToken string, transport *http.Client) (*Client, error) {
 type SyncOptions struct {
 	WorkspaceID           string
 	FolderID              string // Optional registered project folder for a manual upload.
+	SourceBindingID       string // Stable local source identity required for a project upload.
 	Directory             string
 	Direction             string // upload, download, or bidirectional; defaults to bidirectional.
 	Policy                string // fill_missing, compare_merge, or live; defaults to fill_missing.
@@ -231,8 +233,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 			return Result{}, errors.New("sync session ID is invalid")
 		}
 		saved, err = readResumeMetadata(directory, options.WorkspaceID)
-		if err == nil && (saved.SessionID != options.SessionID || saved.Directory != directory || saved.WorkspaceID != options.WorkspaceID || saved.FolderID != options.FolderID ||
-			saved.TaskID != options.TaskID || saved.TaskHubOperationKey != options.TaskHubOperationKey) {
+		if err == nil && !savedSessionMatchesRequest(saved, options, directory) {
 			err = errors.New("saved sync metadata does not match the requested workspace, directory, and session")
 		}
 		if err == nil && mordesync.ValidateManifest(saved.Baseline) != nil {
@@ -293,7 +294,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 			return Result{}, previousErr
 		}
 		if previousErr == nil {
-			if previous.FolderID != options.FolderID {
+			if previous.FolderID != options.FolderID || previous.SourceBindingID != options.SourceBindingID {
 				return Result{}, errors.New("a previous sync operation belongs to another project folder; resolve it before starting a new operation")
 			}
 			if previous.SessionID == "" && (previous.TaskID != options.TaskID || previous.TaskHubOperationKey != options.TaskHubOperationKey) {
@@ -332,7 +333,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 				}
 			} else if options.IdempotencyNamespace != "" {
 				key, err = derivedCreateKey(options.IdempotencyNamespace, c.baseURL.String(), directory,
-					options.WorkspaceID, options.FolderID, direction, policy, baseRevision, options.Scope, local, options.DeletedPaths, options.DeletedDirectories, options.AckCursor,
+					options.WorkspaceID, options.FolderID, options.SourceBindingID, direction, policy, baseRevision, options.Scope, local, options.DeletedPaths, options.DeletedDirectories, options.AckCursor,
 					options.TaskID, options.TaskHubOperationKey)
 				if err == nil && previousErr == nil && previous.SessionID == "" && key != previous.IdempotencyKey {
 					return Result{}, errors.New("a previous create has an unknown outcome for another handoff, Portal, or directory; resolve it before retrying")
@@ -345,7 +346,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 				key, err = randomIdempotencyKey()
 			}
 			if err == nil {
-				saved = resumeMetadata{Version: 1, WorkspaceID: options.WorkspaceID, FolderID: options.FolderID, Directory: directory,
+				saved = resumeMetadata{Version: 1, WorkspaceID: options.WorkspaceID, FolderID: options.FolderID, SourceBindingID: options.SourceBindingID, Directory: directory,
 					Direction: direction, Policy: policy, BaseRevision: baseRevision, Scope: append([]string(nil), options.Scope...),
 					TaskID: options.TaskID, TaskHubOperationKey: options.TaskHubOperationKey,
 					DeletedPaths: append([]string(nil), options.DeletedPaths...), DeletedDirectories: append([]string(nil), options.DeletedDirectories...), AckCursor: cloneStringPointer(options.AckCursor),
@@ -353,7 +354,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 				err = writeResumeMetadata(directory, saved)
 			}
 			if err == nil {
-				session, err = c.createSession(ctx, options.WorkspaceID, options.FolderID, direction, policy, baseRevision, options.Scope, local, options.DeletedPaths, options.DeletedDirectories, options.AckCursor,
+				session, err = c.createSession(ctx, options.WorkspaceID, options.FolderID, options.SourceBindingID, direction, policy, baseRevision, options.Scope, local, options.DeletedPaths, options.DeletedDirectories, options.AckCursor,
 					options.TaskID, options.TaskHubOperationKey, key)
 				if session.ID != "" {
 					saved.SessionID = session.ID
@@ -363,7 +364,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 					}
 				} else if isDefiniteQuotaRejection(err) {
 					// A durable server rejection makes this key terminal; retain only enough local state to rotate it.
-					saved = resumeMetadata{Version: 1, WorkspaceID: options.WorkspaceID, Directory: directory,
+					saved = resumeMetadata{Version: 1, WorkspaceID: options.WorkspaceID, FolderID: saved.FolderID, SourceBindingID: saved.SourceBindingID, Directory: directory,
 						TaskID: saved.TaskID, TaskHubOperationKey: saved.TaskHubOperationKey,
 						IdempotencyKey: saved.IdempotencyKey, CreateQuotaRejected: true}
 					if saveErr := writeResumeMetadata(directory, saved); saveErr != nil {
@@ -562,10 +563,13 @@ func (c *Client) validateOptions(ctx context.Context, options SyncOptions) error
 	if options.BaseRevision != nil && *options.BaseRevision < 0 {
 		return errors.New("base revision cannot be negative")
 	}
-	if options.FolderID != "" && (!syncFolderIDPattern.MatchString(options.FolderID) || options.Direction != "upload" || options.Policy != "compare_merge" ||
+	if options.FolderID != "" && (!syncFolderIDPattern.MatchString(options.FolderID) || !sourceBindingIDPattern.MatchString(options.SourceBindingID) || options.Direction != "upload" || options.Policy != "compare_merge" ||
 		options.BaseRevision == nil || *options.BaseRevision != 0 || len(options.Scope) != 0 || len(options.DeletedPaths) != 0 ||
 		len(options.DeletedDirectories) != 0 || options.AckCursor != nil || options.TaskID != "" || options.TaskHubOperationKey != "") {
-		return errors.New("project folder sync requires an unscoped compare-merge upload from revision zero")
+		return errors.New("project folder sync requires a source binding and unscoped compare-merge upload from revision zero")
+	}
+	if options.FolderID == "" && options.SourceBindingID != "" {
+		return errors.New("source binding ID requires a project folder")
 	}
 	if err := mordesync.ValidateManifest(options.Baseline); err != nil {
 		return fmt.Errorf("sync baseline is invalid: %w", err)
@@ -623,8 +627,8 @@ func (c *Client) latestRevision(ctx context.Context, workspaceID string) (int64,
 	return page.Revision, nil
 }
 
-func (c *Client) createSession(ctx context.Context, workspaceID, folderID, direction, policy string, baseRevision int64, scope []string, manifest mordesync.Manifest, deletedPaths, deletedDirectories []string, ackCursor *string, taskID, taskOperationKey, key string) (SyncSession, error) {
-	data, err := createSessionPayload(folderID, direction, policy, baseRevision, scope, manifest, deletedPaths, deletedDirectories, ackCursor, taskID, taskOperationKey)
+func (c *Client) createSession(ctx context.Context, workspaceID, folderID, sourceBindingID, direction, policy string, baseRevision int64, scope []string, manifest mordesync.Manifest, deletedPaths, deletedDirectories []string, ackCursor *string, taskID, taskOperationKey, key string) (SyncSession, error) {
+	data, err := createSessionPayload(folderID, sourceBindingID, direction, policy, baseRevision, scope, manifest, deletedPaths, deletedDirectories, ackCursor, taskID, taskOperationKey)
 	if err != nil {
 		return SyncSession{}, err
 	}
@@ -634,12 +638,12 @@ func (c *Client) createSession(ctx context.Context, workspaceID, folderID, direc
 	return session, err
 }
 
-func createSessionPayload(folderID, direction, policy string, baseRevision int64, scope []string, manifest mordesync.Manifest, deletedPaths, deletedDirectories []string, ackCursor *string, taskID, taskOperationKey string) ([]byte, error) {
+func createSessionPayload(folderID, sourceBindingID, direction, policy string, baseRevision int64, scope []string, manifest mordesync.Manifest, deletedPaths, deletedDirectories []string, ackCursor *string, taskID, taskOperationKey string) ([]byte, error) {
 	files := make([]workspaceFile, 0, len(manifest.Files))
 	for _, file := range manifest.Files {
 		files = append(files, toWorkspaceFile(file))
 	}
-	request := createSessionRequest{FolderID: folderID, Direction: direction, Policy: policy, BaseRevision: baseRevision, Scope: scope, Files: files,
+	request := createSessionRequest{FolderID: folderID, SourceBindingID: sourceBindingID, Direction: direction, Policy: policy, BaseRevision: baseRevision, Scope: scope, Files: files,
 		EmptyDirectories: append([]string{}, manifest.EmptyDirectories...), Directories: make([]workspaceDirectory, 0, len(manifest.Directories)), DeletedPaths: append([]string(nil), deletedPaths...),
 		DeletedDirectories: append([]string(nil), deletedDirectories...), AckCursor: cloneStringPointer(ackCursor),
 		TaskID: taskID, TaskHubOperationKey: taskOperationKey}
@@ -656,8 +660,8 @@ func createSessionPayload(folderID, direction, policy string, baseRevision int64
 	return data, nil
 }
 
-func derivedCreateKey(namespace, portalURL, directory, workspaceID, folderID, direction, policy string, baseRevision int64, scope []string, manifest mordesync.Manifest, deletedPaths, deletedDirectories []string, ackCursor *string, taskID, taskOperationKey string) (string, error) {
-	request, err := createSessionPayload(folderID, direction, policy, baseRevision, scope, manifest, deletedPaths, deletedDirectories, ackCursor, taskID, taskOperationKey)
+func derivedCreateKey(namespace, portalURL, directory, workspaceID, folderID, sourceBindingID, direction, policy string, baseRevision int64, scope []string, manifest mordesync.Manifest, deletedPaths, deletedDirectories []string, ackCursor *string, taskID, taskOperationKey string) (string, error) {
+	request, err := createSessionPayload(folderID, sourceBindingID, direction, policy, baseRevision, scope, manifest, deletedPaths, deletedDirectories, ackCursor, taskID, taskOperationKey)
 	if err != nil {
 		return "", err
 	}
@@ -1634,6 +1638,7 @@ type workspaceManifest struct {
 
 type createSessionRequest struct {
 	FolderID            string               `json:"folder_id,omitempty"`
+	SourceBindingID     string               `json:"source_binding_id,omitempty"`
 	Direction           string               `json:"direction"`
 	Policy              string               `json:"policy"`
 	BaseRevision        int64                `json:"base_revision"`
@@ -2648,6 +2653,7 @@ type resumeMetadata struct {
 	Version              int                `json:"version"`
 	WorkspaceID          string             `json:"workspace_id"`
 	FolderID             string             `json:"folder_id,omitempty"`
+	SourceBindingID      string             `json:"source_binding_id,omitempty"`
 	Directory            string             `json:"directory"`
 	SessionID            string             `json:"session_id,omitempty"`
 	Direction            string             `json:"direction"`
@@ -2666,6 +2672,12 @@ type resumeMetadata struct {
 	CreateQuotaRejected  bool               `json:"create_quota_rejected,omitempty"`
 	State                string             `json:"state,omitempty"`
 	Manifest             mordesync.Manifest `json:"manifest"`
+}
+
+func savedSessionMatchesRequest(saved resumeMetadata, options SyncOptions, directory string) bool {
+	return saved.SessionID == options.SessionID && saved.Directory == directory && saved.WorkspaceID == options.WorkspaceID &&
+		saved.FolderID == options.FolderID && saved.SourceBindingID == options.SourceBindingID &&
+		saved.TaskID == options.TaskID && saved.TaskHubOperationKey == options.TaskHubOperationKey
 }
 
 func effectiveSavedPolicy(metadata resumeMetadata) string {
@@ -2771,7 +2783,8 @@ func readResumeMetadata(directory, workspaceID string) (resumeMetadata, error) {
 		return resumeMetadata{}, fmt.Errorf("decode sync metadata: %w", err)
 	}
 	if metadata.Version != 1 || metadata.WorkspaceID != workspaceID || metadata.Directory != directory ||
-		metadata.FolderID != "" && !syncFolderIDPattern.MatchString(metadata.FolderID) || metadata.IdempotencyKey == "" ||
+		metadata.FolderID != "" && !syncFolderIDPattern.MatchString(metadata.FolderID) ||
+		metadata.SourceBindingID != "" && !sourceBindingIDPattern.MatchString(metadata.SourceBindingID) || metadata.IdempotencyKey == "" ||
 		(metadata.CommitIdempotencyKey != "" && !idempotencyPattern.MatchString(metadata.CommitIdempotencyKey)) {
 		return resumeMetadata{}, errors.New("sync metadata does not match the requested workspace")
 	}

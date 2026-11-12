@@ -37,6 +37,26 @@ func (currentHistoryTestTaskStore) LoadDeferredTaskTarget(context.Context, task.
 	return app.DeferredTaskTarget{}, false, nil
 }
 
+type currentHistoryTestAuthorization struct{ value task.Authorization }
+
+func (currentHistoryTestAuthorization) AuthorizeTaskAction(context.Context, string, identity.Kind, string, string, []identity.Scope, identity.Scope) error {
+	return nil
+}
+
+func (a currentHistoryTestAuthorization) AuthorizeTaskExecution(_ context.Context, principal identity.Principal, _ string,
+	required identity.Scope) (task.Authorization, error) {
+	if !principal.HasScope(required) {
+		return task.Authorization{}, domain.NewError(domain.CodeForbidden, "task scope is unavailable")
+	}
+	return a.value, nil
+}
+
+type currentHistoryTestFenceReader struct{}
+
+func (currentHistoryTestFenceReader) ReadTaskFence(context.Context, string, string) (app.AgentHostFence, error) {
+	return app.AgentHostFence{}, nil
+}
+
 func (r conversationSummaryTestGatewayResolver) ResolveGatewayEndpoint(context.Context, string, string, bool, bool) (app.ModelGatewayEndpoint, error) {
 	return app.ModelGatewayEndpoint{Endpoint: app.ModelEndpoint{BaseURL: "http://127.0.0.1", ModelID: "test"}, Version: r.version, Personal: true}, nil
 }
@@ -331,7 +351,13 @@ func TestTaskCurrentConversationHistorySearchRunsThroughBroker(t *testing.T) {
 	if err != nil || !found || claimed.ConversationContext == nil || claimed.ConversationContext.Summary == nil {
 		t.Fatalf("claim Task with a fixed summary: found=%t context=%+v err=%v", found, claimed.ConversationContext, err)
 	}
-	broker, err := app.NewCloudDSHToolBroker(currentHistoryTestTaskStore{f.store}, &app.RuntimeToolExecutor{}, nil, nil)
+	taskStore := currentHistoryTestTaskStore{f.store}
+	runtime, err := app.NewRuntimeToolExecutor(taskStore, currentHistoryTestAuthorization{value: f.authorization},
+		currentHistoryTestFenceReader{}, &app.RuntimeControl{}, &app.WorkspaceSyncService{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := app.NewCloudDSHToolBroker(taskStore, runtime, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +373,7 @@ func TestTaskCurrentConversationHistorySearchRunsThroughBroker(t *testing.T) {
 		t.Fatal("current conversation history tool was not exposed to the fixed-context Task")
 	}
 	result, err := broker.Execute(context.Background(), claimed, app.ModelToolCall{CallID: "call_current_history_postgres",
-		Name: "morde_current_conversation_history_search", Arguments: `{"query":"earlier conversation fact","limit":3}`})
+		Name: "morde_current_conversation_history_search", Arguments: `{"query":"earlier conversation fact","limit":3,"cursor":null}`})
 	if err != nil || result.Status != app.AgentToolSucceeded {
 		t.Fatalf("current history tool result=%+v err=%v", result, err)
 	}

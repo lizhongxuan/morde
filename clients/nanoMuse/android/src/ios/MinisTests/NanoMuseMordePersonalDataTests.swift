@@ -31,6 +31,25 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         XCTAssertFalse(NanoMuseMordeProfileSyncPreference.canFlush(syncEnabled: false, scopeKey: scope))
     }
 
+    func testProfileRefreshUsesNewerCloudRevisionWithoutReplacingAnUnsavedDraft() {
+        let baseline = NanoMuseMordeProfileDraft(name: "Muse", description: "", style: "muse")
+        let remote = NanoMuseMordeProfileDraft(name: "Morde", description: "Remote", style: "flat")
+        let localDraft = NanoMuseMordeProfileDraft(name: "Local", description: "My draft", style: "muse")
+
+        XCTAssertTrue(NanoMuseMordeProfileRefreshPolicy.shouldApply(
+            remoteRevision: 2, currentRevision: 1, remoteDraft: remote,
+            currentDraft: baseline, baselineDraft: baseline))
+        XCTAssertFalse(NanoMuseMordeProfileRefreshPolicy.shouldApply(
+            remoteRevision: 1, currentRevision: 1, remoteDraft: remote,
+            currentDraft: baseline, baselineDraft: baseline))
+        XCTAssertFalse(NanoMuseMordeProfileRefreshPolicy.shouldApply(
+            remoteRevision: 2, currentRevision: 1, remoteDraft: remote,
+            currentDraft: localDraft, baselineDraft: baseline))
+        XCTAssertTrue(NanoMuseMordeProfileRefreshPolicy.shouldApply(
+            remoteRevision: 2, currentRevision: 1, remoteDraft: localDraft,
+            currentDraft: localDraft, baselineDraft: baseline))
+    }
+
     @MainActor func testIncrementalChangesKeepRevisionsMonotonicAndApplyDeletion() throws {
         let old = MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 3,
                                            body: .object(["content": .string("current")]))

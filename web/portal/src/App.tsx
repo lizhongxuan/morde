@@ -3,7 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router';
 import { AuthProvider } from './app/auth';
 import { AdminGuard, RouteGuard } from './app/RouteGuard';
 import { ToastProvider } from './app/toast';
-import { PortalLayout } from './components/PortalLayout';
+import { PortalLayout, PortalNavigationHistoryProvider } from './components/PortalLayout';
 import { AccountSettings } from './routes/AccountSettings';
 import { GoalsAndSchedules } from './routes/GoalsAndSchedules';
 import { ApiKeys } from './routes/ApiKeys';
@@ -109,7 +109,7 @@ function AdminRoutes() {
 export default function App() {
   return <QueryClientProvider client={queryClient}>
     <ToastProvider>
-      <BrowserRouter><RecoverablePageBoundary homePath="/assistant" homeLabel="返回助手"><AuthProvider><UserRoutes /></AuthProvider></RecoverablePageBoundary></BrowserRouter>
+      <BrowserRouter><PortalNavigationHistoryProvider><RecoverablePageBoundary homePath="/assistant" homeLabel="返回助手"><AuthProvider><UserRoutes /></AuthProvider></RecoverablePageBoundary></PortalNavigationHistoryProvider></BrowserRouter>
     </ToastProvider>
   </QueryClientProvider>;
 }

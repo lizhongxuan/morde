@@ -671,7 +671,7 @@ func serve(ctx context.Context, configPath string) error {
 		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
-			hubService, workerSuffix, logger)
+			hubService, workerSuffix, serviceInstanceID, dataKey, logger)
 		if workerErr != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
 		}
@@ -720,7 +720,7 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	embedTicketExchanger, ok := hostSharing.(app.HostEmbedTicketExchanger)
 	if !ok {
-		return fmt.Errorf("Host embed ticket exchange is unavailable")
+		return fmt.Errorf("host embed ticket exchange is unavailable")
 	}
 	gatewayHandler, err := gateway.New(gateway.Deps{
 		Config: cfg.Gateway, Domains: cfg.Domains, Security: cfg.Security,
@@ -903,7 +903,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
-	workerID string, logger *zap.Logger) (*cloudDSHTaskWorkerBundle, error) {
+	workerID, serviceInstanceID string, historyCursorKey []byte, logger *zap.Logger) (*cloudDSHTaskWorkerBundle, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -948,6 +948,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	tools, err := app.NewCloudDSHToolBrokerWithPersonalDataAndSchedules(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(),
 		recordCapture, personalData, personalSync, goals, personalFiles, projects, schedules, hubService)
 	if err != nil {
+		return nil, err
+	}
+	if err := tools.SetHistorySearchCursorSigning(serviceInstanceID, historyCursorKey); err != nil {
 		return nil, err
 	}
 	if cfg.BuiltinSearch.Enabled {

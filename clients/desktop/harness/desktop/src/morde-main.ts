@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync 
 import { lstat, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type ProjectSyncFolder, type WebSession } from "./morde-core";
-import { checkedDirectory, MordeSync, pathsOverlap, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type SyncCheckpoint } from "./morde-sync";
+import { checkedDirectory, MordeSync, pathsOverlap, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 
 app.setName("Morde");
@@ -71,6 +71,7 @@ type LiveSyncRecord = {
 };
 type ProjectMapping = {
   selectionID: string;
+  sourceBindingID: string;
   hostId: string;
   workspaceId: string;
   projectName: string;
@@ -225,7 +226,14 @@ async function checkedProjectDirectory(directory: string, workspaceId: string, e
     ...projectMappings.filter((item) => item.selectionID !== exceptSelectionID).map(projectAsMapping),
     { workspaceId: "", directory: app.getPath("userData"), dev: "", ino: "" },
   ];
-  const candidate = await checkedDirectory(directory, protectedMappings);
+  let candidate: Mapping;
+  try { candidate = await checkedDirectory(directory, protectedMappings); }
+  catch (error) {
+    if (["ENOENT", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      throw new Error("项目根目录无法访问；请重新选择，未开始上传。");
+    }
+    throw error;
+  }
   const candidateRecoveryRoot = await checkedPreservedRoot(candidate.directory);
   if (await pathsOverlap(candidate.directory, candidateRecoveryRoot)) throw new Error("项目目录与本地安全副本目录重叠");
   for (const other of protectedMappings) {
@@ -544,6 +552,9 @@ function publicPortalProjectState(): unknown {
       mode: "project_upload",
       ...(projectUploadCheckpoint.projectSelectionID ? { projectSelectionID: projectUploadCheckpoint.projectSelectionID } : {}),
       ...(projectUploadCheckpoint.projectName ? { projectName: projectUploadCheckpoint.projectName } : {}),
+      ...(projectUploadCheckpoint.sessionId ? { sessionId: projectUploadCheckpoint.sessionId } : {}),
+      ...(projectUploadCheckpoint.sessionState ? { sessionState: projectUploadCheckpoint.sessionState } : {}),
+      ...(projectUploadCheckpoint.hostApplicationStatus ? { hostApplicationStatus: projectUploadCheckpoint.hostApplicationStatus } : {}),
     } : null,
     syncRecovery: projectRecovery,
   };
@@ -596,6 +607,12 @@ function validHandoffRecord(value: unknown): value is HandoffRecord {
 }
 
 function validProjectMapping(value: unknown): value is ProjectMapping {
+  return validProjectMappingFields(value, true);
+}
+
+type LegacyProjectMapping = Omit<ProjectMapping, "sourceBindingID">;
+
+function validProjectMappingFields(value: unknown, requireSourceBinding: boolean): value is ProjectMapping | LegacyProjectMapping {
   if (!value || typeof value !== "object") return false;
   const mapping = value as Partial<ProjectMapping>;
   try { normalizedProjectName(mapping.projectName); }
@@ -605,6 +622,7 @@ function validProjectMapping(value: unknown): value is ProjectMapping {
     typeof mapping.workspaceId === "string" && /^w[a-z0-9]{7}$/.test(mapping.workspaceId) &&
     typeof mapping.directory === "string" && isAbsolute(mapping.directory) && resolve(mapping.directory) === mapping.directory &&
     typeof mapping.dev === "string" && /^\d+$/.test(mapping.dev) && typeof mapping.ino === "string" && /^\d+$/.test(mapping.ino) &&
+    (mapping.sourceBindingID === undefined ? !requireSourceBinding : typeof mapping.sourceBindingID === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(mapping.sourceBindingID)) &&
     (mapping.folderId === undefined || typeof mapping.folderId === "string" && /^morde-[a-f0-9]{32}$/.test(mapping.folderId)) &&
     typeof mapping.registrationKey === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mapping.registrationKey);
 }
@@ -831,9 +849,15 @@ function loadProfile(auth: Credentials): void {
   try {
     const raw = readOptional(projectMappingFile);
     if (raw !== null) {
-      const saved = JSON.parse(raw) as ProjectMapping[];
-      if (!Array.isArray(saved) || !saved.every(validProjectMapping) || new Set(saved.map((item) => item.selectionID)).size !== saved.length) throw new Error("Invalid project mapping");
-      projectMappings = saved;
+      const saved = JSON.parse(raw) as unknown;
+      if (!Array.isArray(saved) || !saved.every((item) => validProjectMappingFields(item, false))) throw new Error("Invalid project mapping");
+      const upgraded = saved.map((item) => "sourceBindingID" in item ? item as ProjectMapping : { ...item as LegacyProjectMapping, sourceBindingID: randomUUID() });
+      if (!upgraded.every(validProjectMapping) || new Set(upgraded.map((item) => item.selectionID)).size !== upgraded.length ||
+        new Set(upgraded.map((item) => item.sourceBindingID)).size !== upgraded.length) throw new Error("Invalid project mapping");
+      projectMappings = upgraded;
+      if (upgraded.some((item, index) => !("sourceBindingID" in saved[index]!))) {
+        savePrivate(projectMappingFile, JSON.stringify(upgraded));
+      }
     }
   } catch { profileError ??= "本机项目同步配置无法读取；项目同步已暂停，请检查本机安全存储。"; }
   try {
@@ -841,7 +865,12 @@ function loadProfile(auth: Credentials): void {
     if (raw !== null) {
       const saved = JSON.parse(raw) as SyncCheckpoint;
       if (!saved || saved.serviceInstanceID !== auth.serviceInstanceID || saved.installationId !== auth.installationId || !/^w[a-z0-9]{7}$/.test(saved.workspaceId) || typeof saved.directory !== "string" || typeof saved.dev !== "string" || typeof saved.ino !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(saved.idempotencyKey) || !["upload", "download", "bidirectional", "live_sync", "handoff_checkpoint", "project_upload"].includes(saved.mode) || (saved.sessionId && !/^p[a-z0-9]{7}$/.test(saved.sessionId)) || (saved.childPid !== undefined && (!Number.isSafeInteger(saved.childPid) || saved.childPid <= 0)) || (saved.handoffTarget !== undefined && (saved.mode !== "handoff_checkpoint" || !["desktop", "cloud_workspace"].includes(saved.handoffTarget))) ||
-        (saved.mode === "project_upload" && (typeof saved.projectSelectionID !== "string" || !/^[0-9a-f-]{36}$/i.test(saved.projectSelectionID) || typeof saved.hostId !== "string" || !/^h[a-z0-9]{7}$/.test(saved.hostId) || typeof saved.folderId !== "string" || !/^morde-[a-f0-9]{32}$/.test(saved.folderId) || typeof saved.projectName !== "string"))) throw new Error("Invalid sync recovery point");
+        (saved.sessionState !== undefined && (saved.mode !== "project_upload" || !["running", "completed", "conflict", "cancelled", "failed", "expired"].includes(saved.sessionState))) ||
+        (saved.hostApplicationStatus !== undefined && (saved.mode !== "project_upload" || !["pending_apply", "applied", "conflict", "unknown"].includes(saved.hostApplicationStatus))) ||
+        (saved.mode === "project_upload" && saved.sessionState === "completed" && !saved.sessionId) ||
+        (saved.mode === "project_upload" && (typeof saved.projectSelectionID !== "string" || !/^[0-9a-f-]{36}$/i.test(saved.projectSelectionID) ||
+          (saved.sourceBindingID !== undefined && (typeof saved.sourceBindingID !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(saved.sourceBindingID))) ||
+          typeof saved.hostId !== "string" || !/^h[a-z0-9]{7}$/.test(saved.hostId) || typeof saved.folderId !== "string" || !/^morde-[a-f0-9]{32}$/.test(saved.folderId) || typeof saved.projectName !== "string"))) throw new Error("Invalid sync recovery point");
       syncCheckpoint = { ...saved, scope: validateSyncScope(saved.scope === undefined ? [] : saved.scope), ...(saved.mode === "handoff_checkpoint" ? { handoffTarget: saved.handoffTarget ?? "cloud_workspace" } : {}) };
     }
   } catch {
@@ -1387,6 +1416,9 @@ function publicState(): unknown {
     mappings: credentials ? mappings.map(publicMapping) : [], projectMappings: credentials ? projectMappings.map(publicProjectMapping) : [], syncState: sync.snapshot(),
     syncCheckpoint: credentials && syncCheckpoint ? { workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, installationId: syncCheckpoint.installationId, scope: syncCheckpoint.scope,
       ...(syncCheckpoint.projectSelectionID ? { projectSelectionID: syncCheckpoint.projectSelectionID, projectName: syncCheckpoint.projectName } : {}),
+      ...(syncCheckpoint.mode === "project_upload" && syncCheckpoint.sessionId ? { sessionId: syncCheckpoint.sessionId } : {}),
+      ...(syncCheckpoint.mode === "project_upload" && syncCheckpoint.sessionState ? { sessionState: syncCheckpoint.sessionState } : {}),
+      ...(syncCheckpoint.mode === "project_upload" && syncCheckpoint.hostApplicationStatus ? { hostApplicationStatus: syncCheckpoint.hostApplicationStatus } : {}),
       ...(syncCheckpoint.handoffTarget ? { handoffTarget: syncCheckpoint.handoffTarget } : {}) } : null,
     syncRecovery: credentials ? syncRecoveryView() : null,
     liveSyncCapability: credentials ? liveSyncCapability : "disabled",
@@ -1493,13 +1525,16 @@ async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: un
     const candidate = await checkedProjectDirectory(picked.filePaths[0], workspaceID, previous?.selectionID);
     if (credentials !== auth || sync.snapshot() !== "idle" || syncCheckpoint) throw new Error("本机授权或同步状态已变化，请重新选择");
     await assertNoLiveSyncForDirectory(candidate.directory, workspaceID);
+    const sameSource = Boolean(previous && previous.directory === candidate.directory && previous.dev === candidate.dev && previous.ino === candidate.ino);
     const mapping: ProjectMapping = {
-      selectionID: previous?.selectionID ?? randomUUID(), hostId: hostID, workspaceId: workspaceID, projectName,
+      selectionID: sameSource ? previous!.selectionID : randomUUID(),
+      sourceBindingID: sameSource ? previous!.sourceBindingID : randomUUID(),
+      hostId: hostID, workspaceId: workspaceID, projectName,
       directory: candidate.directory, dev: candidate.dev, ino: candidate.ino,
       ...(previous?.folderId ? { folderId: previous.folderId } : {}),
       registrationKey: previous?.registrationKey ?? randomUUID(),
     };
-    const next = [...projectMappings.filter((item) => item.selectionID !== mapping.selectionID), mapping];
+    const next = [...projectMappings.filter((item) => item.hostId !== hostID || item.workspaceId !== workspaceID || item.projectName !== projectName), mapping];
     savePrivate(profileFile("project-mappings"), JSON.stringify(next));
     projectMappings = next;
     notifyState();
@@ -1540,18 +1575,102 @@ async function ensureProjectFolder(auth: Credentials, mapping: ProjectMapping, p
   return folder;
 }
 
-async function projectHostApplyStatus(auth: Credentials, hostID: string, workspaceID: string): Promise<{ state: "applied" | "pending_apply"; desiredRevision?: number; appliedRevision?: number }> {
+type ProjectHostApplicationView = {
+  status: ProjectHostApplicationStatus;
+  targetRevision?: number;
+  appliedRevision?: number;
+  impacts: { path: string; state: "applied" | "conflict" | "unknown"; reason?: string }[];
+};
+
+function projectHostApplicationImpacts(value: unknown): ProjectHostApplicationView["impacts"] | null {
+  if (!Array.isArray(value) || value.length > 100) return null;
+  const impacts: ProjectHostApplicationView["impacts"] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const impact = raw as Record<string, unknown>;
+    if (typeof impact.path !== "string" || impact.path.length > 4096 || /[\u0000-\u001f\u007f]/.test(impact.path)) return null;
+    if (impact.path !== ".") {
+      try { validateSyncScope([impact.path]); } catch { return null; }
+    }
+    if (!["applied", "conflict", "unknown"].includes(String(impact.state)) || seen.has(impact.path) ||
+      impact.reason !== undefined && (typeof impact.reason !== "string" || !/^[a-z0-9_]{1,64}$/.test(impact.reason))) return null;
+    seen.add(impact.path);
+    impacts.push({ path: impact.path, state: impact.state as "applied" | "conflict" | "unknown",
+      ...(typeof impact.reason === "string" ? { reason: impact.reason } : {}) });
+  }
+  return impacts;
+}
+
+function unknownProjectHostApplication(): ProjectHostApplicationView {
+  return { status: "unknown", impacts: [] };
+}
+
+async function readProjectHostApplication(auth: Credentials, mapping: ProjectMapping, sessionID: string,
+  expectedFolderID: string): Promise<ProjectHostApplicationView> {
+  if (!auth.syncCredential || credentialExpired(auth.syncExpiresAt) || credentials !== auth || activeProfile !== profileID(auth)) {
+    return unknownProjectHostApplication();
+  }
   try {
-    const host = await api.host(hostID) as Record<string, unknown>;
-    if (credentials !== auth || host.id !== hostID || !Array.isArray(host.workspaces)) return { state: "pending_apply" };
-    const binding = host.workspaces.map((item) => item as Record<string, unknown>).find((item) => (item.workspace as Record<string, unknown> | undefined)?.id === workspaceID);
-    const desired = binding?.desired_revision, applied = binding?.applied_revision;
-    const valid = Number.isSafeInteger(desired) && Number(desired) >= 0 && Number.isSafeInteger(applied) && Number(applied) >= 0;
+    const workspaceID = checkedId("workspace", mapping.workspaceId);
+    if (!/^p[a-z0-9]{7}$/.test(sessionID)) return unknownProjectHostApplication();
+    const validSessionID = sessionID;
+    const response = await fetch(`${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/${validSessionID}`, {
+      headers: { authorization: `Bearer ${auth.syncCredential}`, accept: "application/json" },
+      cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok || credentials !== auth) return unknownProjectHostApplication();
+    const session = await response.json() as Record<string, unknown>;
+    const targetRevision = session?.target_revision;
+    if (session?.id !== sessionID || session.workspace_id !== mapping.workspaceId || session.folder_id !== expectedFolderID ||
+      session.direction !== "upload" || session.state !== "completed" || !Number.isSafeInteger(targetRevision) || Number(targetRevision) < 0) {
+      return unknownProjectHostApplication();
+    }
+    const hostApplication = session.host_application as Record<string, unknown> | null;
+    if (!hostApplication || Array.isArray(hostApplication)) return unknownProjectHostApplication();
+    const status = hostApplication.status;
+    const manifest = hostApplication.manifest_sha256;
+    const bindingVersion = hostApplication.workspace_binding_version;
+    const impacts = projectHostApplicationImpacts(hostApplication.impacts);
+    if (!(["pending_apply", "applied", "conflict", "unknown"].includes(String(status))) ||
+      typeof manifest !== "string" || !/^[a-f0-9]{64}$/.test(manifest) || !Number.isSafeInteger(bindingVersion) || Number(bindingVersion) < 1 ||
+      hostApplication.host_id !== mapping.hostId || hostApplication.target_revision !== targetRevision || impacts === null) {
+      return unknownProjectHostApplication();
+    }
+    const runtimeGeneration = hostApplication.runtime_generation;
+    const appliedRevision = hostApplication.applied_revision;
+    const syncState = hostApplication.sync_state;
+    if (!(runtimeGeneration === null || Number.isSafeInteger(runtimeGeneration) && Number(runtimeGeneration) > 0) ||
+      !(appliedRevision === null || Number.isSafeInteger(appliedRevision) && Number(appliedRevision) >= 0) ||
+      !(syncState === null || syncState === "healthy" || syncState === "conflict")) {
+      return unknownProjectHostApplication();
+    }
+    const { workspaceBinding } = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
+    const currentBindingVersion = workspaceBinding.binding_version;
+    if (credentials !== auth || !Number.isSafeInteger(currentBindingVersion) || Number(currentBindingVersion) !== Number(bindingVersion)) {
+      return unknownProjectHostApplication();
+    }
+    if (status === "applied") {
+      const currentAppliedRevision = workspaceBinding.applied_revision;
+      if (runtimeGeneration === null || appliedRevision === null || Number(appliedRevision) < Number(targetRevision) ||
+        syncState !== "healthy" || impacts.length !== 0 || !Number.isSafeInteger(currentAppliedRevision) ||
+        Number(currentAppliedRevision) < Number(appliedRevision)) return unknownProjectHostApplication();
+    }
     return {
-      state: host.state === "running" && binding?.state === "active" && valid && Number(applied) >= Number(desired) ? "applied" : "pending_apply",
-      ...(valid ? { desiredRevision: Number(desired), appliedRevision: Number(applied) } : {}),
+      status: status as ProjectHostApplicationStatus,
+      targetRevision: Number(targetRevision),
+      ...(Number.isSafeInteger(appliedRevision) ? { appliedRevision: Number(appliedRevision) } : {}),
+      impacts,
     };
-  } catch { return { state: "pending_apply" }; }
+  } catch {
+    return unknownProjectHostApplication();
+  }
+}
+
+function safeHostDisplayName(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const display = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 120);
+  return display || fallback;
 }
 
 async function uploadProject(selectionIDInput: unknown, projectNameInput: unknown): Promise<unknown> {
@@ -1559,6 +1678,44 @@ async function uploadProject(selectionIDInput: unknown, projectNameInput: unknow
   projectUploadInProgress = true;
   try { return await performProjectUpload(selectionIDInput, projectNameInput); }
   finally { projectUploadInProgress = false; }
+}
+
+async function resolveCompletedProjectUpload(auth: Credentials, mapping: ProjectMapping, checkpoint: SyncCheckpoint): Promise<unknown> {
+  if (!checkpoint.sessionId || !checkpoint.folderId || checkpoint.mode !== "project_upload") {
+    throw new Error("项目上传恢复点缺少 session 身份；恢复点已保留，状态待核验");
+  }
+  const application = await readProjectHostApplication(auth, mapping, checkpoint.sessionId, checkpoint.folderId);
+  checkpoint.sessionState = "completed";
+  checkpoint.hostApplicationStatus = application.status;
+  if (application.status === "unknown") {
+    syncRecoveryWarning = { state: "unknown", workspaceId: checkpoint.workspaceId, mode: "project_upload", message: "目标电脑的本次应用回执暂时无法核实；项目恢复点已保留。" };
+  } else {
+    syncRecoveryWarning = null;
+  }
+  try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(checkpoint)); }
+  catch {
+    syncRecoveryWarning = { state: "unknown", workspaceId: checkpoint.workspaceId, mode: "project_upload", message: "应用状态已读取，但本机恢复点保存状态未知；请保留并检查恢复点。" };
+  }
+  if (application.status === "applied") {
+    try {
+      removeSyncCheckpointFile();
+      syncCheckpoint = null;
+      syncRecoveryWarning = null;
+    } catch {
+      // The receipt is authoritative even if clearing this local recovery file fails.
+    }
+  }
+  notifyState();
+  return {
+    session: { id: checkpoint.sessionId, workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: "completed" },
+    conflicts: [], cloudStatus: "confirmed", hostStatus: application.status,
+    hostApplication: {
+      status: application.status,
+      ...(application.targetRevision !== undefined ? { targetRevision: application.targetRevision } : {}),
+      ...(application.appliedRevision !== undefined ? { appliedRevision: application.appliedRevision } : {}),
+      impacts: application.impacts,
+    },
+  };
 }
 
 async function performProjectUpload(selectionIDInput: unknown, projectNameInput: unknown): Promise<unknown> {
@@ -1572,18 +1729,27 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
   if (!auth || !activeProfile || activeProfile !== profileID(auth) || !mapping) throw new Error("先选择本机项目文件夹");
   if (mapping.folderId && mapping.projectName !== projectName) throw new Error("项目名已绑定到云端目录；如需更名，请重新选择文件夹并创建新项目目录");
   if (sync.snapshot() !== "idle" || childMayStillRun(syncCheckpoint)) throw new Error("先停止并核对已有的同步操作");
+  if (syncCheckpoint?.mode === "project_upload" && !syncCheckpoint.sourceBindingID) {
+    throw new Error("旧版项目同步恢复点没有来源身份；恢复点已保留，请先处理后再选择项目目录");
+  }
   if (syncCheckpoint && (syncCheckpoint.mode !== "project_upload" || syncCheckpoint.projectSelectionID !== selectionID ||
     syncCheckpoint.hostId !== mapping.hostId || syncCheckpoint.folderId !== mapping.folderId || syncCheckpoint.projectName !== projectName ||
+    syncCheckpoint.sourceBindingID !== mapping.sourceBindingID ||
     syncCheckpoint.workspaceId !== mapping.workspaceId || syncCheckpoint.directory !== mapping.directory ||
     syncCheckpoint.dev !== mapping.dev || syncCheckpoint.ino !== mapping.ino)) {
     throw new Error("另一个同步恢复点仍待处理，请先恢复或明确放弃");
   }
+  if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.sessionState === "completed") {
+    return resolveCompletedProjectUpload(auth, mapping, syncCheckpoint);
+  }
   await api.requireProjectUploadCapability();
+  const selectedTarget = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
+  const selectedHostName = safeHostDisplayName(selectedTarget.host.name, mapping.hostId);
   const confirmation = await dialog.showMessageBox(mainWindow!, {
     type: "warning", buttons: ["上传项目", "取消"], defaultId: 1, cancelId: 1,
     title: "单向上传项目文件夹",
-    message: "将“" + publicDirectoryName(mapping.directory) + "”上传到“" + projectName + "”",
-    detail: "目标：~/workspace/project/" + projectName + "\n范围：上传所选本机文件夹的全部文件和子目录，并保留相对路径。只从本机上传，云端变化不会下载到本机。继续后，只有上次成功同步的内容才可能按同步基线处理删除与冲突。",
+    message: `将“${publicDirectoryName(mapping.directory)}”上传到云端电脑“${selectedHostName}”的项目“${projectName}”`,
+    detail: `目标电脑：${selectedHostName}（${mapping.hostId}）\n目标路径：~/workspace/project/${projectName}\n同步范围：完整扫描所选本机根目录下的全部文件和子目录，并保留相对路径。根目录或任何范围内文件、目录不可访问时，整次扫描失败并保留恢复点；不会静默跳过，也不会把不可访问内容视为删除。\n只从本机上传，云端变化不会下载到本机；删除只依据此前 Host 已确认的本机来源快照，不影响云端独立新增内容。`,
     noLink: true,
   });
   if (confirmation.response !== 0) return { cancelled: true };
@@ -1591,6 +1757,10 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
   await confirmProjectMapping(mapping);
   await assertNoLiveSyncForDirectory(mapping.directory, mapping.workspaceId);
   if (workspaceSyncProfile?.bindings[mapping.workspaceId]?.enabled) throw new Error("先暂停此工作区已有的固定同步绑定");
+  const beforeFolderRegistration = await checkedProjectDirectory(mapping.directory, mapping.workspaceId, mapping.selectionID);
+  if (beforeFolderRegistration.directory !== mapping.directory || beforeFolderRegistration.dev !== mapping.dev || beforeFolderRegistration.ino !== mapping.ino) {
+    throw new Error("项目文件夹身份已变化，请重新选择");
+  }
   const folder = await ensureProjectFolder(auth, mapping, projectName);
   const currentMapping = projectMappings.find((item) => item.selectionID === selectionID);
   if (!currentMapping || currentMapping.folderId !== folder.folderID) throw new Error("本机项目目录映射保存状态未确认");
@@ -1602,7 +1772,8 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
     syncCheckpoint = {
       serviceInstanceID: auth.serviceInstanceID, installationId: auth.installationId, workspaceId: currentMapping.workspaceId,
       directory: currentMapping.directory, dev: currentMapping.dev, ino: currentMapping.ino, mode: "project_upload", scope: [],
-      projectSelectionID: selectionID, hostId: currentMapping.hostId, folderId: folder.folderID, projectName,
+      projectSelectionID: selectionID, sourceBindingID: currentMapping.sourceBindingID,
+      hostId: currentMapping.hostId, folderId: folder.folderID, projectName,
       idempotencyKey: randomUUID(),
     };
     try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(syncCheckpoint)); }
@@ -1627,17 +1798,36 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
     session.folder_id !== folder.folderID || !["running", "completed", "conflict", "cancelled", "failed", "expired"].includes(String(session.state)) || conflicts === null) {
     throw new Error("Project upload result is unknown; the recovery point was retained");
   }
+  if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.sessionId && syncCheckpoint.sessionId !== session.id) {
+    throw new Error("Project upload returned a different session than its recovery point; the recovery point was retained");
+  }
   if (session.state === "completed" && conflicts.length === 0) {
-    removeSyncCheckpointFile();
-    syncCheckpoint = null;
+    if (!syncCheckpoint || syncCheckpoint.mode !== "project_upload") throw new Error("Project upload recovery point is missing");
+    syncCheckpoint.sessionId = session.id;
+    syncCheckpoint.sessionState = "completed";
+    syncCheckpoint.hostApplicationStatus = "pending_apply";
+    delete syncCheckpoint.childPid;
+    try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(syncCheckpoint)); }
+    catch {
+      syncRecoveryWarning = { state: "unknown", workspaceId: syncCheckpoint.workspaceId, mode: "project_upload", message: "云端已提交，但目标电脑回执恢复点保存状态未知；本次状态待核验。" };
+      notifyState();
+      throw new Error("Project upload committed, but its Host receipt recovery point could not be confirmed");
+    }
     syncRecoveryWarning = null;
     notifyState();
-    const hostStatus = await projectHostApplyStatus(auth, currentMapping.hostId, currentMapping.workspaceId);
-    return {
-      session: { id: session.id, workspace_id: currentMapping.workspaceId, folder_id: folder.folderID, state: "completed" }, conflicts,
-      cloudStatus: "confirmed", hostStatus: hostStatus.state,
-      ...(hostStatus.desiredRevision !== undefined ? { desiredRevision: hostStatus.desiredRevision, appliedRevision: hostStatus.appliedRevision } : {}),
-    };
+    return resolveCompletedProjectUpload(auth, currentMapping, syncCheckpoint);
+  }
+  if (session.state === "running" && syncCheckpoint?.mode === "project_upload") {
+    syncCheckpoint.sessionId = session.id;
+    syncCheckpoint.sessionState = "running";
+    delete syncCheckpoint.hostApplicationStatus;
+    try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(syncCheckpoint)); }
+    catch {
+      syncRecoveryWarning = { state: "unknown", workspaceId: syncCheckpoint.workspaceId, mode: "project_upload", message: "上传仍在处理中，但 session 恢复点保存状态未知；请保留本机目录。" };
+      notifyState();
+      throw new Error("Project upload is still running, but its recovery point could not be confirmed");
+    }
+    notifyState();
   }
   if (session.state !== "running") {
     // morde-sync removes local session metadata after a terminal response. Keep
@@ -2481,6 +2671,9 @@ function register(): void {
     if (profileError) throw new Error(profileError);
     if (sync.snapshot() === "running") throw new Error("Stop sync before discarding its recovery point");
     if (childMayStillRun(syncCheckpoint)) throw new Error("A prior sync process may still hold this folder");
+    if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.sessionState === "completed" && syncCheckpoint.hostApplicationStatus !== "applied") {
+      throw new Error("目标电脑的本次应用回执尚未确认；项目上传恢复点必须保留");
+    }
     if (!sync.discardCheckpoint(syncCheckpoint)) throw new Error("A prior sync process may still hold this folder");
     if (syncCheckpoint?.mode === "handoff_checkpoint" && handoffRecord?.id === syncCheckpoint.idempotencyKey) {
       try { saveHandoffRecord(null); }

@@ -311,6 +311,14 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let pathMonitor = NWPathMonitor()
 
+    private var personalDataRoot: URL {
+#if MORDE_STANDALONE
+        MordePersonalStorage.root
+#else
+        NanoMuseDirs.root
+#endif
+    }
+
     private init() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
@@ -326,7 +334,7 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
             .sink { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    await self.refresh(root: NanoMuseDirs.root)
+                    await self.refresh(root: self.personalDataRoot)
                 }
             }
             .store(in: &cancellables)
@@ -340,7 +348,7 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
     private func foregrounded() async {
         isForeground = true
         updateRefreshLoop()
-        if networkIsOnline { await refresh(root: NanoMuseDirs.root) }
+        if networkIsOnline { await refresh(root: personalDataRoot) }
     }
 
     private func backgrounded() {
@@ -354,7 +362,7 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
         guard wasOnline != isOnline else { return }
         networkIsOnline = isOnline
         updateRefreshLoop()
-        if isForeground, isOnline, !wasOnline { await refresh(root: NanoMuseDirs.root) }
+        if isForeground, isOnline, !wasOnline { await refresh(root: personalDataRoot) }
     }
 
     private func updateRefreshLoop() {
@@ -365,13 +373,19 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
                 guard !Task.isCancelled, let self else { return }
-                await self.refresh(root: NanoMuseDirs.root)
+                await self.refresh(root: self.personalDataRoot)
             }
         }
     }
 
     func object(_ type: String, _ id: String) -> MordePersonalSyncObject? { objects[type]?[id] }
+    func object(_ type: String, _ id: String, scopeKey: String) -> MordePersonalSyncObject? {
+        guard loadedScope == scopeKey else { return nil }
+        return object(type, id)
+    }
     func values(_ type: String) -> [MordePersonalSyncObject] { Array(objects[type, default: [:]].values) }
+
+    func refresh() async { await refresh(root: personalDataRoot) }
 
     func refresh(root: URL) async {
         guard !isLoading else { refreshQueued = true; return }
@@ -402,7 +416,7 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
                 catch is MordePersonalRevisionConflict { /* Keep reading the cloud snapshot while the user resolves it. */ }
             }
             if let changeSequence {
-                try await refreshChanges(after: changeSequence, scope: scope, authorization: auth)
+                try await refreshChanges(afterSequence: changeSequence, scope: scope, authorization: auth)
             } else {
                 try await refreshSnapshot(scope: scope, authorization: auth)
             }

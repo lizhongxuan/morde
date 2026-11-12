@@ -48,6 +48,11 @@ var errCloudDSHModelResultUnavailable = errors.New("dsh model result is unavaila
 
 var errCloudDSHConnectionInterrupted = errors.New("dsh connection ended before a verified result")
 
+// errCloudDSHBackgroundOutputPending asks the task worker to reclaim the Task
+// after its lease expires so a completed parent checkpoint can resume with a
+// server-authored prompt to read durable background-job output.
+var errCloudDSHBackgroundOutputPending = errors.New("dsh background job output has not been consumed")
+
 type cloudDSHModelFailureCategory interface {
 	ModelFailureCategory() string
 }
@@ -554,7 +559,8 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	cancelCause(context.Canceled)
 	<-renewDone
 	// A disconnected child is reclaimed from its durable checkpoint; the operation ledger decides whether a tool can be replayed.
-	if err != nil && !errors.Is(err, errCloudDSHConnectionInterrupted) && !errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
+	if err != nil && !errors.Is(err, errCloudDSHConnectionInterrupted) && !errors.Is(err, errCloudDSHBackgroundOutputPending) &&
+		!errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
 		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -736,11 +742,16 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		"job_cancel_result": {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "job_id", "status"},
 		"model_cancel":      {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
 		"settled":           {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "state", "through_seq"},
-		"failed":            {"type", "code"},
+		"failed":            {"type", "code", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
 	}
 	required, ok := fields[frame.Type]
 	if !ok || len(keys) != len(required) {
-		return cloudDSHFrame{}, errors.New("unsupported dsh frame fields")
+		keyNames := make([]string, 0, len(keys))
+		for key := range keys {
+			keyNames = append(keyNames, key)
+		}
+		sort.Strings(keyNames)
+		return cloudDSHFrame{}, fmt.Errorf("unsupported dsh frame fields: type=%q keys=%v", frame.Type, keyNames)
 	}
 	for _, name := range required {
 		if _, ok := keys[name]; !ok {

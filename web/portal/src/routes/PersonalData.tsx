@@ -49,6 +49,9 @@ function personalAPIFor(serviceInstanceID: string | undefined, actorID: string |
       type as Parameters<typeof portalApi.replacePersonalObject>[0], id, baseRevision,
       body as Parameters<typeof portalApi.replacePersonalObject>[3], key, actorID, serviceInstanceID,
     ),
+    deletePersonalObject: (type, id, baseRevision, key) => portalApi.deletePersonalObject(
+      type as Parameters<typeof portalApi.deletePersonalObject>[0], id, baseRevision, key, serviceInstanceID, actorID,
+    ),
     createPersonalAttachmentUpload: (body, key) => portalApi.createPersonalAttachmentUpload(
       body as Parameters<typeof portalApi.createPersonalAttachmentUpload>[0], key, serviceInstanceID, actorID,
     ),
@@ -56,6 +59,7 @@ function personalAPIFor(serviceInstanceID: string | undefined, actorID: string |
       uploadID, sequence, body, sha256, serviceInstanceID, actorID,
     ),
     commitPersonalAttachment: (uploadID, key) => portalApi.commitPersonalAttachment(uploadID, key, serviceInstanceID, actorID),
+    cancelPersonalAttachmentUpload: (uploadID) => portalApi.cancelPersonalAttachmentUpload(uploadID, serviceInstanceID, actorID),
   };
 }
 

@@ -30,6 +30,7 @@
 		A31D0F040000000000000004 /* MordePortalNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F040000000000000003 /* MordePortalNavigation.swift */; };
 		A31D0F050000000000000001 /* MordeHubRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F050000000000000002 /* MordeHubRelay.swift */; };
 		A31D0F060000000000000001 /* MordeDesignNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F060000000000000002 /* MordeDesignNavigation.swift */; };
+		A31D0F070000000000000001 /* MordeHostStatusProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F070000000000000002 /* MordeHostStatusProjection.swift */; };
 		AA0838A02F3B941A00049557 /* AboutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0838A12F3B941A00049557 /* AboutView.swift */; };
 		AA0838CC2F3B941A00049557 /* StorageManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0838CD2F3B941A00049557 /* StorageManagementView.swift */; };
 		AA0838D02F3B941A00049557 /* CurrentRoot.m in Sources */ = {isa = PBXBuildFile; fileRef = AA0838D12F3B941A00049557 /* CurrentRoot.m */; };
@@ -498,6 +499,7 @@
 		A31D0F040000000000000003 /* MordePortalNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordePortalNavigation.swift; sourceTree = "<group>"; };
 		A31D0F050000000000000002 /* MordeHubRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeHubRelay.swift; sourceTree = "<group>"; };
 		A31D0F060000000000000002 /* MordeDesignNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeDesignNavigation.swift; sourceTree = "<group>"; };
+		A31D0F070000000000000002 /* MordeHostStatusProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeHostStatusProjection.swift; sourceTree = "<group>"; };
 		AA0838A12F3B941A00049557 /* AboutView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AboutView.swift; sourceTree = "<group>"; };
 		AA0838BE2F3B941A00049557 /* RootfsManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootfsManagementView.swift; sourceTree = "<group>"; };
 		AA0838BF2F3B941A00049557 /* RootfsResetButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootfsResetButton.swift; sourceTree = "<group>"; };
@@ -1183,6 +1185,7 @@
 				A31D0F030000000000000002 /* MordeApp.swift */,
 				A31D0F060000000000000002 /* MordeDesignNavigation.swift */,
 				A31D0F030000000000000004 /* MordeCredentialExpiry.swift */,
+				A31D0F070000000000000002 /* MordeHostStatusProjection.swift */,
 				A31D0F040000000000000001 /* MordeWorkspaceTransfer.swift */,
 				A31D0F040000000000000003 /* MordePortalNavigation.swift */,
 				A31D0F050000000000000002 /* MordeHubRelay.swift */,
@@ -2545,6 +2548,7 @@
 				A31D0F030000000000000001 /* MordeApp.swift in Sources */,
 				A31D0F060000000000000001 /* MordeDesignNavigation.swift in Sources */,
 				A31D0F030000000000000003 /* MordeCredentialExpiry.swift in Sources */,
+				A31D0F070000000000000001 /* MordeHostStatusProjection.swift in Sources */,
 				A31D0F040000000000000002 /* MordeWorkspaceTransfer.swift in Sources */,
 				A31D0F040000000000000004 /* MordePortalNavigation.swift in Sources */,
 				A31D0F050000000000000001 /* MordeHubRelay.swift in Sources */,

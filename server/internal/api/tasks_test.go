@@ -1169,7 +1169,7 @@ func TestConversationActiveTasksResumeEachTaskFromItsOwnEventCursor(t *testing.T
 		cancel()
 		resumed := resumeEvents[item.ID]
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "id: "+strconv.FormatInt(resumed.Sequence, 10)) ||
-			!strings.Contains(response.Body.String(), `"delta":"resumed answer"`) ||
+			strings.Contains(response.Body.String(), "resumed answer") ||
 			service.resumedTaskIDs[i] != item.ID || service.resumeAfter[i] != item.EventSequence {
 			t.Fatalf("resume task %s after %d: status=%d target=%v cursor=%v body=%s", item.ID, item.EventSequence,
 				response.Code, service.resumedTaskIDs, service.resumeAfter, response.Body.String())
@@ -1266,7 +1266,7 @@ func TestTaskEventsStreamOrderedSSEAndClearsWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestTaskEventsResumeAfterLastEventIDAndStreamsAssistantDelta(t *testing.T) {
+func TestTaskEventsResumeAfterLastEventIDWithoutStreamingAssistantContent(t *testing.T) {
 	service := &taskServiceStub{events: []task.Event{{
 		TaskID: "q1234567", Sequence: 8, Type: "task.message",
 		Payload:   []byte(`{"role":"assistant","message_id":"m1234567","turn_id":"s1234567","delta":"Hello "}`),
@@ -1287,10 +1287,41 @@ func TestTaskEventsResumeAfterLastEventIDAndStreamsAssistantDelta(t *testing.T) 
 	if response.Code != http.StatusOK || service.eventAfter != 7 {
 		t.Fatalf("status=%d after=%d body=%s", response.Code, service.eventAfter, response.Body.String())
 	}
-	for _, expected := range []string{"id: 8", "event: task.message", `"message_id":"m1234567"`, `"delta":"Hello "`} {
+	for _, expected := range []string{"id: 8", "event: task.message", `"message_id":"m1234567"`} {
 		if !strings.Contains(response.Body.String(), expected) {
 			t.Errorf("resumed SSE response missing %q: %s", expected, response.Body.String())
 		}
+	}
+	if strings.Contains(response.Body.String(), "Hello ") || strings.Contains(response.Body.String(), `"delta"`) {
+		t.Fatalf("unreviewed assistant content was exposed in SSE: %s", response.Body.String())
+	}
+}
+
+func TestTaskEventsPreserveUnknownSafeEnvelopeWithEmptyPayload(t *testing.T) {
+	service := &taskServiceStub{events: []task.Event{{
+		TaskID: "q1234567", Sequence: 9, Type: "task.future_update",
+		Payload:   []byte(`{"secret":"must not be forwarded","status":"future"}`),
+		CreatedAt: time.Now().UTC(),
+	}}}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=8", nil)
+	requestContext, cancel := context.WithCancel(request.Context())
+	request = request.WithContext(requestContext)
+	timer := time.AfterFunc(25*time.Millisecond, cancel)
+	defer func() {
+		timer.Stop()
+		cancel()
+	}()
+	response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	engine.ServeHTTP(response, request)
+	body := response.Body.String()
+	for _, expected := range []string{"id: 9", "event: task.future_update", `"sequence":9`, `"type":"task.future_update"`, `"payload":{}`} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("unknown event SSE response missing %q: %s", expected, body)
+		}
+	}
+	if response.Code != http.StatusOK || service.eventAfter != 8 || strings.Contains(body, "must not be forwarded") || strings.Contains(body, `"status":"future"`) {
+		t.Fatalf("unknown event was rejected or payload leaked: status=%d after=%d body=%s", response.Code, service.eventAfter, body)
 	}
 }
 
@@ -1451,6 +1482,51 @@ func TestTaskStepEventSanitizationFailsClosedOnUnexpectedShapes(t *testing.T) {
 	}
 }
 
+func TestTaskEventPayloadsExposeOnlyTypeAllowlistedFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		typeName  string
+		payload   string
+		allowed   []string
+		forbidden []string
+	}{
+		{"status", "task.status", `{"status":"running","reason":"retry","lease_version":8,"secret":"hidden"}`, []string{"status", "reason"}, []string{"lease_version", "secret"}},
+		{"step", "task.step", `{"step_id":"s1234567","status":"running","tool":"file_read","title":"Reading files","summary":"Inspecting authorized project files","detail":{"usage_known":true,"output":"private output","secret":"hidden"},"text":"private text"}`, []string{"step_id", "status", "tool", "title", "summary", "detail"}, []string{"text", "secret"}},
+		{"operation", "task.operation", `{"operation_id":"o1234567","status":"unknown","requires_reconciliation":true,"provider_url":"https://private.invalid"}`, []string{"operation_id", "status", "requires_reconciliation"}, []string{"provider_url"}},
+		{"message", "task.message", `{"role":"assistant","message_id":"m1234567","done":true,"delta":"draft text","content":"unreviewed result"}`, []string{"role", "message_id", "done"}, []string{"delta", "content"}},
+		{"batch item", "task.batch_item", `{"batch_item_id":"b1234567","status":"failed","attempt":2,"result":"private result","error":"private error"}`, []string{"batch_item_id", "status", "attempt"}, []string{"result", "error"}},
+		{"artifact", "task.artifact", `{"artifact_id":"a1234567","path":"report.txt","sha256":"abc","data_base64":"private bytes"}`, []string{"artifact_id", "path", "sha256"}, []string{"data_base64"}},
+		{"waiting user", "task.waiting_user", `{"status":"waiting_user","reason":"approval_required","detail":{"content":"private approval"}}`, []string{"status", "reason"}, []string{"detail"}},
+		{"response", "task.response", `{"decision":"approve","status":"queued","pending_id":"r1234567","answer":"private answer"}`, []string{"decision", "status", "pending_id"}, []string{"answer"}},
+		{"result", "task.result", `{"status":"completed","reason":"done","result":"unreviewed result","error":"private error"}`, []string{"status", "reason"}, []string{"result", "error"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := publicTaskEventPayload(task.Event{Type: test.typeName, Payload: []byte(test.payload)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]json.RawMessage
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatalf("public payload is invalid JSON: %v", err)
+			}
+			for _, key := range test.allowed {
+				if _, ok := decoded[key]; !ok {
+					t.Errorf("allowlisted field %q was removed: %s", key, payload)
+				}
+			}
+			for _, key := range test.forbidden {
+				if _, ok := decoded[key]; ok || strings.Contains(string(payload), key) {
+					t.Errorf("private field %q survived projection: %s", key, payload)
+				}
+			}
+			if test.typeName == "task.step" && !strings.Contains(string(payload), `"usage_known":true`) {
+				t.Errorf("safe step detail was removed: %s", payload)
+			}
+		})
+	}
+}
+
 func TestTaskEventsRejectInvalidBatchBeforeStartingSSE(t *testing.T) {
 	now := time.Now().UTC()
 	service := &taskServiceStub{events: []task.Event{
@@ -1462,6 +1538,14 @@ func TestTaskEventsRejectInvalidBatchBeforeStartingSSE(t *testing.T) {
 	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=0", nil))
 	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "id: 1") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	service.events = []task.Event{{
+		TaskID: "q1234567", Sequence: 1, Type: "task.future\r\nid: 99", Payload: []byte(`{"secret":"hidden"}`), CreatedAt: now,
+	}}
+	response = &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=0", nil))
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "id: 1") {
+		t.Fatalf("unsafe event type was written to SSE: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

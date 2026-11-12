@@ -260,7 +260,7 @@ func (g *gateway) authenticateEmbed(c *gin.Context, raw string) bool {
 	c.Set(hostRefKey, ref)
 	c.Set(principalKey, principal)
 	c.Set("gateway.embed_claims", claims)
-	c.Set("gateway.member", owner == false)
+	c.Set("gateway.member", !owner)
 	c.Set("gateway.member_permission", string(required))
 	c.Set("gateway.member_view", required == host.PermissionDesktopView)
 	c.Set("gateway.embed_required_permission", string(required))

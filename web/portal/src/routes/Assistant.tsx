@@ -164,6 +164,29 @@ export function assistantRecentConversationKey(serviceInstanceID: string, userID
   return `morde.assistant.recentConversation.v1:${serviceInstanceID}:${userID}`;
 }
 
+export function assistantMainConversationCacheKey(userID: string): string {
+  return `morde.assistant.mainConversation.v1:${window.location.origin}:${userID}`;
+}
+
+type CachedMainConversation = { conversationID: string; serviceInstanceID: string | null };
+
+function readMainConversationCache(key: string): CachedMainConversation | null {
+  try {
+    const value: unknown = JSON.parse(window.localStorage.getItem(key) ?? 'null');
+    if (!value || typeof value !== 'object' || !('conversationID' in value) || typeof value.conversationID !== 'string' ||
+      !value.conversationID || value.conversationID.length > 200 || !('serviceInstanceID' in value) ||
+      (value.serviceInstanceID !== null && typeof value.serviceInstanceID !== 'string')) return null;
+    return { conversationID: value.conversationID, serviceInstanceID: value.serviceInstanceID };
+  } catch { return null; }
+}
+
+function writeMainConversationCache(key: string, value: CachedMainConversation | null): void {
+  try {
+    if (value) window.localStorage.setItem(key, JSON.stringify(value));
+    else window.localStorage.removeItem(key);
+  } catch { /* the current page can still use its in-memory conversation */ }
+}
+
 export function resolveTaskObservationURL(ticket: string, hostURL: string, hostID: string, portalHostname = window.location.hostname): string {
   let host: URL;
   try { host = new URL(hostURL); } catch { throw new Error('服务器返回了无效的 Workbench 地址。'); }
@@ -521,7 +544,7 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
 
 export function Assistant() {
   const client = useQueryClient();
-  const { notify, dismiss } = useToast();
+  const { notify, dismiss, overlayRegion } = useToast();
   const { user } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
@@ -530,6 +553,26 @@ export function Assistant() {
     : null;
   const ideaPrompt = typeof navigationIdea?.ideaPrompt === 'string' ? navigationIdea.ideaPrompt : '';
   const hasNavigationIdea = typeof navigationIdea?.ideaID === 'string' && Boolean(navigationIdea.ideaID) && Boolean(ideaPrompt);
+  useLayoutEffect(() => {
+    if (!overlayRegion) return;
+    const composer = document.querySelector<HTMLElement>('.assistant-page .assistant-composer');
+    if (!composer) return;
+    const updateToastPosition = () => {
+      const clearance = Math.ceil(window.innerHeight - composer.getBoundingClientRect().top + 12);
+      overlayRegion.style.setProperty('--toast-bottom-inset', `${Math.max(20, clearance)}px`);
+    };
+    updateToastPosition();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updateToastPosition);
+    observer?.observe(composer);
+    window.addEventListener('resize', updateToastPosition);
+    window.visualViewport?.addEventListener('resize', updateToastPosition);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', updateToastPosition);
+      window.visualViewport?.removeEventListener('resize', updateToastPosition);
+      overlayRegion.style.removeProperty('--toast-bottom-inset');
+    };
+  }, [overlayRegion]);
   const [conversationSelection, setConversationSelection] = useState<{ scope: string; id: string | null } | null>(null);
   const [composerDraftError, setComposerDraftError] = useState<string | null>(null);
   const [hydratedComposerDraftKey, setHydratedComposerDraftKey] = useState<string | null>(null);
@@ -617,6 +660,14 @@ export function Assistant() {
     queryKey: ['main-conversation', user?.id], queryFn: portalApi.mainConversation,
     enabled: Boolean(user), retry: false,
   });
+  const mainConversationCacheKey = user ? assistantMainConversationCacheKey(user.id) : null;
+  const cachedMainConversation = useQuery({
+    queryKey: ['assistant-main-conversation-cache', mainConversationCacheKey],
+    queryFn: () => mainConversationCacheKey ? readMainConversationCache(mainConversationCacheKey) : null,
+    enabled: Boolean(mainConversationCacheKey),
+    initialData: () => mainConversationCacheKey ? readMainConversationCache(mainConversationCacheKey) : null,
+    staleTime: Infinity,
+  });
   const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000 });
   const mcpConnectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const availableModels = useQuery({ queryKey: ['available-models'], queryFn: portalApi.availableModels });
@@ -658,7 +709,25 @@ export function Assistant() {
   });
   const conversationScope = `${capabilities.data?.service_instance_id ?? window.location.origin}:${user?.id ?? 'anonymous'}`;
   const scopedConversationSelection = conversationSelection?.scope === conversationScope ? conversationSelection : null;
-  const mainConversationID = mainConversation.data?.status === 'ready' ? mainConversation.data.conversation_id : null;
+  const cachedMainConversationID = cachedMainConversation.data && (!capabilities.data?.service_instance_id ||
+    cachedMainConversation.data.serviceInstanceID === capabilities.data.service_instance_id)
+    ? cachedMainConversation.data.conversationID : null;
+  const mainConversationID = mainConversation.data?.status === 'ready' ? mainConversation.data.conversation_id
+    : mainConversation.data && !mainConversation.isError ? null : cachedMainConversationID;
+  useEffect(() => {
+    if (!mainConversationCacheKey) return;
+    if (mainConversation.data?.status === 'ready' && mainConversation.data.conversation_id) {
+      const next = { conversationID: mainConversation.data.conversation_id,
+        serviceInstanceID: capabilities.data?.service_instance_id ?? cachedMainConversation.data?.serviceInstanceID ?? null };
+      if (cachedMainConversation.data?.conversationID !== next.conversationID || cachedMainConversation.data.serviceInstanceID !== next.serviceInstanceID) {
+        writeMainConversationCache(mainConversationCacheKey, next);
+        client.setQueryData(['assistant-main-conversation-cache', mainConversationCacheKey], next);
+      }
+    } else if (mainConversation.data && !mainConversation.isError && cachedMainConversation.data) {
+      writeMainConversationCache(mainConversationCacheKey, null);
+      client.setQueryData(['assistant-main-conversation-cache', mainConversationCacheKey], null);
+    }
+  }, [cachedMainConversation.data, capabilities.data?.service_instance_id, client, mainConversation.data, mainConversation.isError, mainConversationCacheKey]);
   const recentConversationID = recentConversation.data && conversationsData.some((item) => item.id === recentConversation.data)
     ? recentConversation.data : null;
   const selectedConversationValue = scopedConversationSelection?.id;
@@ -1686,6 +1755,12 @@ export function Assistant() {
       <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
     </button>
   </div>;
+  const renderCachedMainConversation = () => mainConversationID ? <div className="conversation-row conversation-row-main" key={mainConversationID}>
+    <button type="button" className={`conversation-item ${conversationID === mainConversationID ? 'is-selected' : ''}`}
+      onClick={() => selectConversationID(mainConversationID)}>
+      <strong>主会话</strong><small>最近记录</small>
+    </button>
+  </div> : null;
 
   const submitClarification = (event: FormEvent<HTMLFormElement>, task: Task) => {
     event.preventDefault();
@@ -2059,7 +2134,7 @@ export function Assistant() {
   return <section className="assistant-page">
     {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-warning" role="status">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</p>}
     {mainConversation.isPending && <p className="notice notice-info" role="status">正在读取服务端主会话…</p>}
-    {mainConversation.isError && !showConsolidatedNetworkError && <div className="notice notice-warning" role="status">当前服务尚未提供主会话接口。你仍可查看和使用会话列表，但本机最近记录不会被当作主会话。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></div>}
+    {mainConversation.isError && !showConsolidatedNetworkError && <FloatingError role="alert">无法刷新服务端主会话{cachedMainConversationID ? '，已保留上次记录' : '，请重试'}。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></FloatingError>}
     {mainConversation.data?.status === 'uninitialized' && <p className="notice notice-info" role="status">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</p>}
     {capabilities.isPending && <p className="notice notice-info" role="status">正在检查服务能力…</p>}
     {capabilities.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></FloatingError>}
@@ -2075,34 +2150,31 @@ export function Assistant() {
           <button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); }}><MordeIcon name="refresh" /></button>
         </div>
         <div id="conversation-history" className="assistant-history-content">
-          {conversations.isPending ? <p className="muted" role="status">正在加载对话…</p> : conversations.isError && !conversations.data
-            ? showConsolidatedNetworkError ? <p className="muted">对话列表暂不可用</p>
-              : <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.refetch()}>重试</button></FloatingError>
-            : <>
-              {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
-                : mainConversationDetail.isError ? <FloatingError className="error-inline" role="alert">无法读取主会话：{errorDetails(mainConversationDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void mainConversationDetail.refetch()}>重试</button></FloatingError>
-                  : <p className="muted" role="status">正在读取主会话…</p>)}
-              <div className="conversation-group">
-                <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
-                  <summary>旁聊</summary>
-                  <div className="conversation-list">
-                    {localComposerDrafts.slice(0, visibleSideConversationCount).map(renderLocalDraftItem)}
-                    {sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}
-                  </div>
-                  {composerDrafts.isError && <FloatingError className="error-inline" role="alert">未发送草稿暂不可用：{errorDetails(composerDrafts.error).message}
-                    <button type="button" className="button button-small button-secondary" onClick={() => void composerDrafts.refetch()}>重试</button></FloatingError>}
-                  {composerDraftError && <FloatingError className="error-inline" role="alert">草稿保存状态：{composerDraftError}</FloatingError>}
-                  {conversations.isFetchNextPageError && <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></FloatingError>}
-                  {(sideConversations.length > visibleSideConversationCount || localComposerDrafts.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
-                    disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
-                    {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
-                  </button>}
-                  {!sideConversations.length && !localComposerDrafts.length && !conversations.hasNextPage && !composerDrafts.isPending && <p className="muted assistant-sidebar-empty">还没有旁聊。</p>}
-                  {composerDrafts.isPending && !localComposerDrafts.length && <p className="muted assistant-sidebar-empty" role="status">正在读取未发送草稿…</p>}
-                </details>
-                <button type="button" className="button button-secondary conversation-new" aria-label="新建旁聊" title="新建旁聊" onClick={startNew}>+</button>
+          {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
+            : renderCachedMainConversation())}
+          {!mainConversationID && mainConversation.isPending && <p className="muted" role="status">正在读取主会话…</p>}
+          {conversations.isPending && !conversations.data && <p className="muted" role="status">正在读取旁聊…</p>}
+          {conversations.isError && !conversations.data && <p className="muted" role="status">旁聊历史暂不可用</p>}
+          <div className="conversation-group">
+            <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
+              <summary>旁聊</summary>
+              <div className="conversation-list">
+                {localComposerDrafts.slice(0, visibleSideConversationCount).map(renderLocalDraftItem)}
+                {sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}
               </div>
-            </>}
+              {composerDrafts.isError && <FloatingError className="error-inline" role="alert">未发送草稿暂不可用：{errorDetails(composerDrafts.error).message}
+                <button type="button" className="button button-small button-secondary" onClick={() => void composerDrafts.refetch()}>重试</button></FloatingError>}
+              {composerDraftError && <FloatingError className="error-inline" role="alert">草稿保存状态：{composerDraftError}</FloatingError>}
+              {conversations.isFetchNextPageError && <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></FloatingError>}
+              {(sideConversations.length > visibleSideConversationCount || localComposerDrafts.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
+                disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
+                {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
+              </button>}
+              {!conversations.isError && conversations.isSuccess && !sideConversations.length && !localComposerDrafts.length && !conversations.hasNextPage && !composerDrafts.isPending && <p className="muted assistant-sidebar-empty">还没有旁聊。</p>}
+              {composerDrafts.isPending && !localComposerDrafts.length && <p className="muted assistant-sidebar-empty" role="status">正在读取未发送草稿…</p>}
+            </details>
+            <button type="button" className="button button-secondary conversation-new" aria-label="新建旁聊" title="新建旁聊" onClick={startNew}>+</button>
+          </div>
           <p className="assistant-sidebar-hint">主会话保留日常交流，旁聊可用于单独讨论。</p>
         </div>
       </aside>
@@ -2388,7 +2460,7 @@ export function Assistant() {
           </div>
           {sharedHosts.isError && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
             <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
-          {computerPanelError && <p className="notice notice-warning" role="status">{computerPanelError}</p>}
+          {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
           {!conversationID && <p className="muted">新旁聊创建后，才能把电脑连接到该会话。</p>}
           {selectedComputerHost && selectedComputerHost.state !== 'running' && <p className="muted">此电脑当前未运行，启动后才能连接。</p>}
           {selectedComputerHost && !selectedComputerTargets.length && <p className="muted">此电脑没有可嵌入的授权功能。</p>}

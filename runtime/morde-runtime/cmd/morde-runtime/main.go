@@ -163,10 +163,10 @@ func run() error {
 		if shell, shellErr := runtimeactions.NewShellHandler(runtimeactions.ShellOptions{DefaultWorkDir: workspacePath}); shellErr == nil {
 			handlers = append(handlers, shell)
 		} else {
-			_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: shell capability unavailable")
+			_, _ = fmt.Fprintln(os.Stderr, shellCapabilityUnavailableDiagnostic(runtimeactions.ShellFailureCategoryOf(shellErr)))
 		}
 	} else {
-		_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: shell capability unavailable")
+		_, _ = fmt.Fprintln(os.Stderr, shellCapabilityUnavailableDiagnostic(runtimeactions.ShellFailureWorkspaceProbe))
 	}
 	desktop, desktopErr := runtime_desktop.NewHandlers(runtime_desktop.Options{})
 	if desktopErr == nil {
@@ -311,6 +311,19 @@ func run() error {
 		managerClosed = true
 		return nil
 	}
+}
+
+func shellCapabilityUnavailableDiagnostic(category runtimeactions.ShellFailureCategory) string {
+	code := "other"
+	switch category {
+	case runtimeactions.ShellFailureCgroup:
+		code = "cgroup"
+	case runtimeactions.ShellFailureRequiredTool:
+		code = "required_tool"
+	case runtimeactions.ShellFailureWorkspaceProbe:
+		code = "workspace_or_probe"
+	}
+	return "morde-runtime: shell capability unavailable reason=" + code
 }
 
 func validHostID(value string) bool {

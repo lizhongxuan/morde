@@ -4,6 +4,14 @@ import type { components, operations } from '../api/schema';
 
 type AuditQuery = NonNullable<operations['listAuditLogs']['parameters']['query']>;
 
+function personalIdentityHeaders(serviceInstanceID?: string, actorID?: string) {
+  if (Boolean(serviceInstanceID) !== Boolean(actorID)) throw new Error('个人数据操作必须同时提供服务实例和账号身份。');
+  return serviceInstanceID && actorID ? {
+    'X-Morde-Service-Instance-ID': serviceInstanceID,
+    'X-Morde-Actor-ID': actorID,
+  } : {};
+}
+
 export type HostMemberPermission = components['schemas']['HostMemberPermission'];
 export type HostMember = components['schemas']['HostMember'];
 export type SharedHost = components['schemas']['SharedHost'];
@@ -300,10 +308,13 @@ export const portalApi = {
   })),
   deletePersonalObject: async (
     type: components['schemas']['PersonalMutationObjectType'], id: string, baseRevision: number,
-    idempotencyKey = newIdempotencyKey(),
-  ) => unwrapApiResponse(await api.DELETE('/api/personal-data/{type}/{id}', {
-    params: { path: { type, id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { base_revision: baseRevision },
-  })),
+    idempotencyKey = newIdempotencyKey(), serviceInstanceID?: string, actorID?: string,
+  ) => {
+    const identity = personalIdentityHeaders(serviceInstanceID, actorID);
+    return unwrapApiResponse(await api.DELETE('/api/personal-data/{type}/{id}', {
+      params: { path: { type, id }, header: { 'Idempotency-Key': idempotencyKey, ...identity } }, body: { base_revision: baseRevision },
+    }));
+  },
   personalDataQuota: async () => unwrapApiResponse(await api.GET('/api/personal-data/quota')),
   createPersonalAttachmentUpload: async (
     body: components['schemas']['PersonalAttachmentUploadRequest'], idempotencyKey = newIdempotencyKey(), serviceInstanceID?: string, actorID?: string,
@@ -323,7 +334,12 @@ export const portalApi = {
     params: { path: { upload_id: uploadID }, header: { 'Idempotency-Key': idempotencyKey } },
     headers: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) },
   })),
-  cancelPersonalAttachmentUpload: async (uploadID: string) => unwrapApiResponse(await api.DELETE('/api/personal-data/uploads/{upload_id}', { params: { path: { upload_id: uploadID } } })),
+  cancelPersonalAttachmentUpload: async (uploadID: string, serviceInstanceID?: string, actorID?: string) => {
+    const identity = personalIdentityHeaders(serviceInstanceID, actorID);
+    return unwrapApiResponse(await api.DELETE('/api/personal-data/uploads/{upload_id}', {
+      params: { path: { upload_id: uploadID }, ...(Object.keys(identity).length ? { header: identity } : {}) },
+    }));
+  },
   personalAttachment: async (attachmentID: string): Promise<Blob> => {
     const response = await requestFetch(`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`);
     if (!response.ok) await throwResponseError(response);

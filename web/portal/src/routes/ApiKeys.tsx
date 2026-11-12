@@ -40,9 +40,11 @@ export function ApiKeys() {
     return () => window.clearInterval(timer);
   }, []);
   const create = useMutation({
-    mutationFn: portalApi.createApiKey,
-    onSuccess: (result) => {
-      setSecret(result);
+    mutationFn: async (body: Parameters<typeof portalApi.createApiKey>[0]) => {
+      const result = await portalApi.createApiKey(body);
+      setSecret({ key: result.key, expires_at: result.expires_at });
+    },
+    onSuccess: () => {
       setName('');
       setTtl('');
       setShowCreate(false);
@@ -112,6 +114,6 @@ export function ApiKeys() {
     </div>}
     </section>
     {removing && <ConfirmDialog title="吊销 API Key" description={`“${removing.name || removing.id}”吊销后，后续请求会被拒绝；已经发出的外部操作仍可能完成。此操作不可撤销。`} confirmLabel="吊销 Key" danger busy={remove.isPending} onClose={() => setRemoving(null)} onConfirm={() => remove.mutate(removing.id)} />}
-    {secret && <OnceSecretDialog title="API Key 已创建" secret={secret.key} expiresAt={formatDate(secret.expires_at)} onClose={() => setSecret(null)} />}
+    {secret && <OnceSecretDialog title="API Key 已创建" secret={secret.key} expiresAt={formatDate(secret.expires_at)} onClose={() => { setSecret(null); create.reset(); }} />}
   </section>;
 }

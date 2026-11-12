@@ -31,5 +31,8 @@
     "electron-builder": "^26.18.0",
     "typescript": "^5.6.0"
   },
-  "author": "Morde contributors"
+  "author": "Morde contributors",
+  "dependencies": {
+    "electron-updater": "6.8.12"
+  }
 }

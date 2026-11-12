@@ -21,6 +21,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/storage/workspacefs"
 	storepostgres "morde/server/internal/store/postgres"
 )
 
@@ -325,7 +326,28 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 		claimed.ConversationContext.Summary == nil || claimed.ConversationContext.Summary.Version != 4 {
 		t.Fatalf("new Task did not receive the latest fixed summary: found=%t task=%+v err=%v", found, claimed, err)
 	}
-	toolBroker, err := app.NewCloudDSHToolBroker(conversationContextE2ETaskStore{store}, &app.RuntimeToolExecutor{}, nil, nil)
+	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "workspace-blocks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close local Workspace blocks: %v", err)
+		}
+	}()
+	workspaceSync, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeControl, err := app.NewRuntimeControl(store, f01SandboxRouter{endpoint: "https://unused.invalid"}, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeTools, err := app.NewRuntimeToolExecutor(store, credentials, runtimeControl, runtimeControl, workspaceSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolBroker, err := app.NewCloudDSHToolBroker(conversationContextE2ETaskStore{store}, runtimeTools, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,6 +34,16 @@ const (
 
 const syncIDAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 
+var projectSourceBindingIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+func ValidProjectSourceBindingID(value string) bool {
+	return projectSourceBindingIDPattern.MatchString(value)
+}
+
+func ValidProjectManifestSHA256(value string) bool {
+	return sha256Pattern.MatchString(value)
+}
+
 func NewSyncSessionID() (string, error) {
 	var id [8]byte
 	id[0] = 'p'
@@ -322,6 +332,7 @@ type CreateSyncSession struct {
 	Policy              SyncPolicy    `json:"policy"`
 	BaseRevision        int64         `json:"base_revision"`
 	FolderID            string        `json:"folder_id,omitempty"`
+	SourceBindingID     string        `json:"source_binding_id,omitempty"`
 	TaskID              string        `json:"task_id,omitempty"`
 	TaskHubOperationKey string        `json:"task_hub_operation_key,omitempty"`
 	Scope               []string      `json:"scope,omitempty"`
@@ -424,45 +435,74 @@ func ValidateDownloadAction(value DownloadAction) error {
 }
 
 type SyncSession struct {
-	ID                         string           `json:"id"`
-	WorkspaceID                string           `json:"workspace_id"`
-	FolderID                   string           `json:"folder_id,omitempty"`
-	OwnerID                    string           `json:"-"`
-	ReplicaID                  string           `json:"-"`
-	TaskID                     string           `json:"-"`
-	TaskHubOperationKey        string           `json:"-"`
-	Direction                  SyncDirection    `json:"direction"`
-	Policy                     SyncPolicy       `json:"policy"`
-	State                      SyncState        `json:"state"`
-	BaseRevision               int64            `json:"base_revision"`
-	FolderBaselineRevision     *int64           `json:"-"`
-	TargetRevision             int64            `json:"target_revision"`
-	PinnedRevision             int64            `json:"-"`
-	Stage                      SyncStage        `json:"stage"`
-	PlannedBytes               int64            `json:"planned_bytes"`
-	ConfirmedBytes             int64            `json:"confirmed_bytes"`
-	TransferBlocks             []TransferBlock  `json:"transfer_blocks"`
-	DownloadActions            []DownloadAction `json:"download_actions"`
-	Conflicts                  []Conflict       `json:"conflicts"`
-	Files                      []File           `json:"-"`
-	Directories                []Directory      `json:"-"`
-	UploadFiles                []File           `json:"-"`
-	DownloadFiles              []File           `json:"-"`
-	UploadDirectories          []Directory      `json:"-"`
-	DownloadDirectories        []Directory      `json:"-"`
-	Scope                      []string         `json:"-"`
-	DeletedPaths               []string         `json:"-"`
-	EmptyDirectories           []string         `json:"-"`
-	UploadEmptyDirectories     []string         `json:"-"`
-	DownloadEmptyDirectories   []string         `json:"-"`
-	DeletedDirectories         []string         `json:"-"`
-	UploadDeletedDirectories   []string         `json:"-"`
-	DownloadDeletedDirectories []string         `json:"-"`
-	UploadDeletedPaths         []string         `json:"-"`
-	DownloadDeletedPaths       []string         `json:"-"`
-	AckCursor                  *string          `json:"-"`
-	CreatedAt                  time.Time        `json:"created_at"`
-	UpdatedAt                  time.Time        `json:"updated_at"`
+	ID                         string               `json:"id"`
+	WorkspaceID                string               `json:"workspace_id"`
+	FolderID                   string               `json:"folder_id,omitempty"`
+	SourceBindingID            string               `json:"-"`
+	SourceBaselineSessionID    string               `json:"-"`
+	OwnerID                    string               `json:"-"`
+	ReplicaID                  string               `json:"-"`
+	TaskID                     string               `json:"-"`
+	TaskHubOperationKey        string               `json:"-"`
+	Direction                  SyncDirection        `json:"direction"`
+	Policy                     SyncPolicy           `json:"policy"`
+	State                      SyncState            `json:"state"`
+	BaseRevision               int64                `json:"base_revision"`
+	FolderBaselineRevision     *int64               `json:"-"`
+	TargetRevision             int64                `json:"target_revision"`
+	PinnedRevision             int64                `json:"-"`
+	Stage                      SyncStage            `json:"stage"`
+	PlannedBytes               int64                `json:"planned_bytes"`
+	ConfirmedBytes             int64                `json:"confirmed_bytes"`
+	TransferBlocks             []TransferBlock      `json:"transfer_blocks"`
+	DownloadActions            []DownloadAction     `json:"download_actions"`
+	Conflicts                  []Conflict           `json:"conflicts"`
+	HostApplication            *SyncHostApplication `json:"host_application,omitempty"`
+	Files                      []File               `json:"-"`
+	Directories                []Directory          `json:"-"`
+	UploadFiles                []File               `json:"-"`
+	DownloadFiles              []File               `json:"-"`
+	UploadDirectories          []Directory          `json:"-"`
+	DownloadDirectories        []Directory          `json:"-"`
+	Scope                      []string             `json:"-"`
+	DeletedPaths               []string             `json:"-"`
+	EmptyDirectories           []string             `json:"-"`
+	UploadEmptyDirectories     []string             `json:"-"`
+	DownloadEmptyDirectories   []string             `json:"-"`
+	DeletedDirectories         []string             `json:"-"`
+	UploadDeletedDirectories   []string             `json:"-"`
+	DownloadDeletedDirectories []string             `json:"-"`
+	UploadDeletedPaths         []string             `json:"-"`
+	DownloadDeletedPaths       []string             `json:"-"`
+	AckCursor                  *string              `json:"-"`
+	CreatedAt                  time.Time            `json:"created_at"`
+	UpdatedAt                  time.Time            `json:"updated_at"`
+}
+
+type SyncHostApplicationImpact struct {
+	Path   string `json:"path"`
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type SyncHostApplication struct {
+	Status                  string                      `json:"status"`
+	HostID                  string                      `json:"host_id"`
+	WorkspaceBindingVersion int64                       `json:"workspace_binding_version"`
+	TargetRevision          int64                       `json:"target_revision"`
+	ManifestSHA256          string                      `json:"manifest_sha256"`
+	RuntimeGeneration       *int64                      `json:"runtime_generation"`
+	AppliedRevision         *int64                      `json:"applied_revision"`
+	SyncState               *BindingSyncState           `json:"sync_state"`
+	Impacts                 []SyncHostApplicationImpact `json:"impacts"`
+}
+
+type PendingProjectUploadApplication struct {
+	SessionID       string `json:"session_id"`
+	SourceBindingID string `json:"source_binding_id"`
+	ProjectPath     string `json:"project_path"`
+	TargetRevision  int64  `json:"target_revision"`
+	ManifestSHA256  string `json:"manifest_sha256"`
 }
 
 type DeviceSyncProgress struct {
@@ -1229,6 +1269,9 @@ func ValidateRelativePath(value string) error {
 func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 	if !value.Direction.Valid() || !value.Policy.Valid() || value.BaseRevision < 0 {
 		return errors.New("sync direction, policy, or base revision is invalid")
+	}
+	if value.FolderID == "" && value.SourceBindingID != "" || value.FolderID != "" && !ValidProjectSourceBindingID(value.SourceBindingID) {
+		return errors.New("project source binding identity is invalid")
 	}
 	if (value.TaskID == "") != (value.TaskHubOperationKey == "") {
 		return errors.New("task sync association requires both task_id and task_hub_operation_key")

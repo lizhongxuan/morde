@@ -80,7 +80,7 @@ type ShellHandler struct {
 // limits, and prevent setuid privilege gains for gem.
 func NewShellHandler(options ShellOptions) (*ShellHandler, error) {
 	if os.Geteuid() != 0 {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureOther)
 	}
 	if options.CgroupRoot == "" {
 		options.CgroupRoot = defaultCgroupRoot
@@ -111,60 +111,60 @@ func NewShellHandler(options ShellOptions) (*ShellHandler, error) {
 	}
 	workDir, err := filepath.EvalSymlinks(options.DefaultWorkDir)
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 	workInfo, err := os.Stat(workDir)
 	if err != nil || !workInfo.IsDir() {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 
 	root, err := filepath.EvalSymlinks(options.CgroupRoot)
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureCgroup)
 	}
 	var fs syscall.Statfs_t
 	if err := syscall.Statfs(root, &fs); err != nil || uint64(fs.Type) != cgroup2SuperMagic {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureCgroup)
 	}
 	base := filepath.Join(root, cgroupName)
 	if err := makeTrustedCgroupDir(base); err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureCgroup)
 	}
 	if err := enableResourceControllers(base); err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureCgroup)
 	}
 	setpriv, err := findTrustedSetpriv()
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureRequiredTool)
 	}
 	bwrap, err := findTrustedBubblewrap()
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureRequiredTool)
 	}
 	bwrapBase, err := bubblewrapBaseArguments()
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureRequiredTool)
 	}
 	setsid, err := findTrustedExecutable([]string{"/usr/bin/setsid", "/bin/setsid"})
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureRequiredTool)
 	}
 	credential, _, err := gemCredential()
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureOther)
 	}
 	rootInfo, err := os.Lstat(workDir)
 	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 	workspaceRoot, err := os.OpenRoot(workDir)
 	if err != nil {
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 	openedRootInfo, err := workspaceRoot.Stat(".")
 	if err != nil || !os.SameFile(rootInfo, openedRootInfo) {
 		_ = workspaceRoot.Close()
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 	handler := &ShellHandler{
 		basePath: base, bwrapPath: bwrap, bwrapBase: bwrapBase, setprivPath: setpriv,
@@ -177,7 +177,7 @@ func NewShellHandler(options ShellOptions) (*ShellHandler, error) {
 	// removes detached descendants in this exact container.
 	if err := handler.probe(); err != nil {
 		_ = workspaceRoot.Close()
-		return nil, ErrProcessDomainUnavailable
+		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 	return handler, nil
 }

@@ -1386,6 +1386,116 @@ test('runs a background child beside the parent and exposes durable job status t
   assert.equal(frames.filter(frame => frame.type === 'settled').at(-1)?.state, 'completed_candidate')
 })
 
+test('runs two background children concurrently and the parent consumes both settled results', async () => {
+  const childIDs = ['child_parallel_1', 'child_parallel_2']
+  const childByCall = new Map([['call_background_1', childIDs[0]], ['call_background_2', childIDs[1]]])
+  const tools = [delegateTool, fileReadTool, ...jobTools].sort((left, right) => left.name.localeCompare(right.name))
+  const throughBySession = new Map([[start.session_id, -1], ...childIDs.map(id => [id, -1])])
+  const childModels = new Map()
+  const settled = new Set()
+  let parentModels = 0
+  let waitingParentModel
+  const sendModel = (proc, frame, text, call) => {
+    const chunks = call ? [
+      { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: JSON.stringify(call.arguments) },
+      { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ] : [
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text },
+      { type: 'block-end', index: 0, block: { type: 'text', text } },
+      { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]
+    chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const sendFirstResultRead = () => {
+    if (!waitingParentModel || settled.size !== 2) return
+    const frame = waitingParentModel
+    waitingParentModel = undefined
+    sendModel(frame.proc, frame.model, '', { id: 'call_output_1', name: jobOutputTool.name,
+      arguments: { job_id: childIDs[0], after_seq: -1 } })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools })
+    if (frame.type === 'checkpoint') {
+      const previous = throughBySession.get(frame.session_id) ?? -1
+      assert.equal(frame.from_seq, previous + 1)
+      throughBySession.set(frame.session_id, frame.through_seq)
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      parentModels += 1
+      if (parentModels === 1 || parentModels === 2) {
+        const index = parentModels
+        sendModel(proc, frame, '', { id: `call_background_${index}`, name: delegateTool.name,
+          arguments: { title: `Background task ${index}`, objective: `Finish child ${index}.`, tool_names: ['file_read'], run_in_background: true } })
+      } else if (parentModels === 3) {
+        waitingParentModel = { proc, model: frame }
+        sendFirstResultRead()
+      } else if (parentModels === 4) {
+        const firstResult = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_output_1')
+        assert.match(firstResult?.content[0]?.text ?? '', /child result one/)
+        sendModel(proc, frame, '', { id: 'call_output_2', name: jobOutputTool.name,
+          arguments: { job_id: childIDs[1], after_seq: -1 } })
+      } else {
+        const results = frame.request.messages.filter(message => message.role === 'tool' &&
+          ['call_output_1', 'call_output_2'].includes(message.toolCallId))
+        assert.equal(results.length, 2)
+        assert.match(results[0].content[0].text, /child result one/)
+        assert.match(results[1].content[0].text, /child result two/)
+        assert.equal(settled.size, 2)
+        sendModel(proc, frame, 'Both delegated results were reviewed and summarized.', undefined)
+      }
+    }
+    if (frame.type === 'model' && childIDs.includes(frame.session_id)) {
+      assert.deepEqual(frame.request.tools, [fileReadTool])
+      childModels.set(frame.session_id, frame)
+      if (childModels.size === 2) {
+        assert.equal(settled.size, 0, 'both children must be in flight before either settles')
+        for (const [sessionID, model] of childModels) {
+          replyWithText(proc, model, sessionID === childIDs[0] ? 'child result one' : 'child result two')
+        }
+      }
+    }
+    if (frame.type === 'child_create') {
+      const sessionID = childByCall.get(frame.call_id)
+      assert.ok(sessionID)
+      send(proc, {
+        type: 'child_session', call_id: frame.call_id, ...taskFence(start), session_id: sessionID,
+        parent_session_id: frame.session_id, objective: frame.arguments.objective,
+        tools: [fileReadTool], checkpoint_through_seq: -1, checkpoint_sha256: '',
+        step_status: 'running', summary: '',
+      })
+    }
+    if (frame.type === 'tool_call' && frame.name === jobOutputTool.name) {
+      const index = frame.arguments.job_id === childIDs[0] ? 1 : 2
+      const result = index === 1 ? 'child result one' : 'child result two'
+      assert.ok(settled.has(frame.arguments.job_id), 'parent may only read a durably settled result')
+      send(proc, { type: 'tool_result', id: frame.id, ...taskFence(frame), session_id: frame.session_id,
+        call_id: frame.call_id, status: 'succeeded',
+        output: JSON.stringify({ job_id: frame.arguments.job_id, status: 'succeeded', next_cursor: 4, output: result }) })
+    }
+    if (frame.type === 'child_settle') {
+      assert.equal(frame.status, 'succeeded')
+      assert.equal(frame.summary, frame.session_id === childIDs[0] ? 'child result one' : 'child result two')
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      settled.add(frame.session_id)
+      sendFirstResultRead()
+    }
+  })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(parentModels, 5)
+  assert.equal(childModels.size, 2)
+  assert.equal(settled.size, 2)
+  assert.equal(frames.filter(frame => frame.type === 'child_create').length, 2)
+  assert.equal(frames.filter(frame => frame.type === 'child_settle').length, 2)
+  assert.equal(frames.filter(frame => frame.type === 'tool_call' && frame.name === jobOutputTool.name).length, 2)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
 test('does not settle the parent while a background child outcome is unknown', async () => {
   const childIdentity = {
     task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
@@ -1550,6 +1660,37 @@ test('replays an interrupted delegate using the stored child summary, and fails 
   assert.notEqual(unknown.code, 0)
   assert.equal(unknown.modelCalls, 0)
   assert.equal(unknown.frames.some(frame => frame.type === 'tool_call' || frame.type === 'child_settle' || frame.type === 'model'), false)
+})
+
+test('replayed background delegation returns a durable handle and fails closed when unknown', async () => {
+  const argumentsValue = { title: 'Inspect notes', objective: 'Read notes.txt and summarize it.', tool_names: ['file_read'], run_in_background: true }
+  const pages = await captureInterruptedDelegateSession(argumentsValue)
+  const childSession = (frame, step_status, summary) => ({
+    type: 'child_session', call_id: frame.call_id,
+    task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+    generation: frame.generation, authorization_version: frame.authorization_version,
+    session_id: 'child_789', parent_session_id: frame.session_id,
+    objective: frame.arguments.objective, tools: [fileReadTool],
+    checkpoint_through_seq: -1, checkpoint_sha256: '', step_status, summary,
+  })
+  const completed = await resumeSession(pages, {
+    tools: [delegateTool, fileReadTool, ...jobTools],
+    onChildCreate: frame => childSession(frame, 'succeeded', 'Persisted child summary.'),
+  })
+  assert.equal(completed.code, 0, `frames: ${completed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(completed.frames.some(frame => frame.type === 'child_settle'), false)
+  const result = completed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_delegate_1')
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    job_id: 'child_789', status: 'succeeded',
+  })
+
+  const unknown = await resumeSession(pages, {
+    tools: [delegateTool, fileReadTool, ...jobTools],
+    onChildCreate: frame => childSession(frame, 'unknown', ''),
+  })
+  assert.notEqual(unknown.code, 0)
+  assert.equal(unknown.modelCalls, 0)
+  assert.equal(unknown.frames.some(frame => frame.type === 'child_settle' || frame.type === 'model'), false)
 })
 
 test('resumes an interrupted child from its own checkpoint before settling the parent delegate', async () => {
@@ -1799,10 +1940,10 @@ test('refuses invalid UTF-8 in a worker frame', async () => {
   assert.equal(frames.some(frame => frame.type === 'checkpoint' || frame.type === 'model'), false)
 })
 
-async function captureSession({ interrupt = false } = {}) {
+async function captureSession({ interrupt = false, tools = [] } = {}) {
   const pages = []
   const { child, frames } = launch((frame, proc) => {
-    if (frame.type === 'ready') send(proc, start)
+    if (frame.type === 'ready') send(proc, { ...start, tools })
     if (frame.type === 'checkpoint') {
       pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
       send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
@@ -1863,7 +2004,9 @@ async function captureInterruptedToolSession(tool, argumentsJSON = '{"workspace_
   return pages
 }
 
-async function captureInterruptedDelegateSession() {
+async function captureInterruptedDelegateSession(argumentsValue = {
+  title: 'Inspect notes', objective: 'Read notes.txt and summarize it.', tool_names: ['file_read'],
+}) {
   const pages = []
   const { child, frames } = launch((frame, proc) => {
     if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool] })
@@ -1874,7 +2017,7 @@ async function captureInterruptedDelegateSession() {
     if (frame.type === 'model') {
       const chunks = [
         { type: 'tool-call-delta', index: 0, id: 'call_delegate_1', name: delegateTool.name,
-          argumentsDelta: '{"title":"Inspect notes","objective":"Read notes.txt and summarize it.","tool_names":["file_read"]}' },
+          argumentsDelta: JSON.stringify(argumentsValue) },
         { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
         { type: 'finish', reason: { kind: 'tool-calls' } },
       ]
@@ -2225,7 +2368,7 @@ function checkpointPage(request, page) {
     from_seq: page.from_seq, through_seq: page.through_seq, payload: page.payload, sha256: page.sha256 }
 }
 
-async function resumeSession(pages, { alterStart = value => value, alterPage = value => value, stopRead = false, refuseCheckpoint = false, withholdToolResult = false, onToolCall, onChildCreate, checkpointPagesBySession, tools = [], deliveries = [] } = {}) {
+async function resumeSession(pages, { alterStart = value => value, alterPage = value => value, stopRead = false, refuseCheckpoint = false, withholdToolResult = false, onToolCall, onChildCreate, onModel, checkpointPagesBySession, tools = [], deliveries = [] } = {}) {
   const emitted = []
   const offsets = []
   const modelRequests = []
@@ -2277,6 +2420,10 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
     if (frame.type === 'model') {
       modelCalls += 1
       modelRequests.push(frame.request)
+      if (onModel) {
+        onModel(frame, proc, modelCalls)
+        return
+      }
       const chunks = [
         { type: 'block-start', index: 0, blockType: 'text' },
         { type: 'text-delta', index: 0, text: 'resumed answer' },
@@ -2300,6 +2447,63 @@ test('restores a completed dsh session from verified pages without replaying the
   assert.equal(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
   assert.equal(result.frames.find(frame => frame.type === 'settled')?.session_id, start.session_id)
   assert.equal(result.frames.some(frame => frame.type === 'model'), false)
+})
+
+test('runs a trusted background-job continuation after restoring a completed task session', async () => {
+  const continuationPrompt = 'Read the settled background job output before completing this Task.'
+  const pages = await captureSession({ tools: jobTools })
+  const callID = 'call_job_output_resume'
+  const jobID = 'child_background_1'
+  const result = await resumeSession(pages, {
+    tools: jobTools,
+    alterStart: value => ({ ...value, prompt: continuationPrompt }),
+    onModel(frame, proc, callIndex) {
+      if (callIndex === 1) {
+        assert.ok(frame.request.messages.some(message => message.role === 'user' &&
+          message.content.some(block => block.type === 'text' && block.text === continuationPrompt)))
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: callID, name: jobOutputTool.name,
+            argumentsDelta: JSON.stringify({ job_id: jobID, after_seq: -1 }) },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+        return
+      }
+      const output = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === callID)
+      assert.ok(output)
+      assert.match(output.content[0].text, /settled result text/)
+      replyWithText(proc, frame, 'I reviewed the settled job result.')
+    },
+    onToolCall(frame) {
+      assert.equal(frame.name, jobOutputTool.name)
+      assert.deepEqual(frame.arguments, { job_id: jobID, after_seq: -1 })
+      return { status: 'succeeded', output: JSON.stringify({ job_id: jobID, status: 'succeeded', next_cursor: 6, output: 'settled result text' }) }
+    },
+  })
+  assert.equal(validStart({ ...resumedStart(pages, jobTools), prompt: continuationPrompt }), true)
+  assert.equal(validStart({ ...resumedStart(pages), prompt: continuationPrompt }), false)
+  assert.equal(result.code, 0, `frames: ${result.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(result.modelCalls, 2)
+  assert.equal(result.frames.filter(frame => frame.type === 'tool_call' && frame.name === jobOutputTool.name).length, 1)
+  assert.equal(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+  const events = result.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+  assert.equal(events.filter(event => event.type === 'tool/call' && event.data.callId === callID).length, 1)
+  assert.equal(events.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === callID).length, 1)
+  assert.equal(events.filter(event => event.type === 'user/message' && event.data.source?.plugin === 'morde-context' &&
+    event.data.content?.some(block => block.text === continuationPrompt)).length, 1)
+
+  const openTurnPages = await captureInterruptedToolSession(fileReadTool, '{"workspace_id":"w1234567","path":"notes.txt"}')
+  const openTurn = await resumeSession(openTurnPages, {
+    tools: [fileReadTool, ...jobTools].sort((left, right) => left.name.localeCompare(right.name)),
+    alterStart: value => ({ ...value, prompt: continuationPrompt }),
+  })
+  assert.notEqual(openTurn.code, 0, 'a server continuation prompt must not replace an open-turn recovery')
+  assert.equal(openTurn.modelCalls, 0)
+  const openTurnEvents = openTurn.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+  assert.equal(openTurnEvents.some(event => event.type === 'user/message' && event.data.source?.plugin === 'morde-context' &&
+    event.data.content?.some(block => block.text === continuationPrompt)), false)
 })
 
 test('restores a completed 0.2.0-rc.2 checkpoint on the upgraded DSH runtime', async () => {

@@ -492,7 +492,7 @@ func (c *Client) validatePendingHandoffKey(options LiveSyncOptions, directory st
 		return errors.New("workspace has an unfinished session for another handoff; resume that handoff before starting this one")
 	}
 	expected, err := derivedCreateKey(options.IdempotencyKey, c.baseURL.String(), directory, options.WorkspaceID,
-		pending.FolderID, pending.Direction, effectiveSavedPolicy(pending), pending.BaseRevision, pending.Scope, pending.Manifest,
+		pending.FolderID, pending.SourceBindingID, pending.Direction, effectiveSavedPolicy(pending), pending.BaseRevision, pending.Scope, pending.Manifest,
 		pending.DeletedPaths, pending.DeletedDirectories, pending.AckCursor, pending.TaskID, pending.TaskHubOperationKey)
 	if err != nil {
 		return err

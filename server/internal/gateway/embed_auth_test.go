@@ -114,7 +114,11 @@ func TestEmbeddedActivityLeaseClosesOnAuthorizationRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer guard.Close()
+	defer func() {
+		if err := guard.Close(); err != nil {
+			t.Errorf("close Host activity lease: %v", err)
+		}
+	}()
 	verifier.mu.Lock()
 	verifier.embedRevoked = true
 	verifier.mu.Unlock()

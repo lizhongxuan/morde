@@ -561,18 +561,62 @@ struct NanoMuseMordePersonalSyncSection: View {
     }
 }
 
+struct NanoMuseMordeProfileDraft: Equatable, Sendable {
+    let name: String
+    let description: String
+    let style: String
+
+    static let empty = NanoMuseMordeProfileDraft(name: "Muse", description: "", style: "muse")
+
+    init(name: String, description: String, style: String) {
+        self.name = name
+        self.description = description
+        self.style = style
+    }
+
+    init(_ body: MordePersonalProfileBody) {
+        self.init(name: body.name, description: body.description ?? "", style: body.style ?? "muse")
+    }
+}
+
+enum NanoMuseMordeProfileRefreshPolicy {
+    static func shouldApply(remoteRevision: Int64, currentRevision: Int64,
+                            remoteDraft: NanoMuseMordeProfileDraft,
+                            currentDraft: NanoMuseMordeProfileDraft,
+                            baselineDraft: NanoMuseMordeProfileDraft) -> Bool {
+        remoteRevision > currentRevision && (currentDraft == baselineDraft || currentDraft == remoteDraft)
+    }
+}
+
 struct NanoMuseMordeProfileView: View {
     @ObservedObject private var authorization = MordeShellAuthorization.shared
     @ObservedObject private var sync = NanoMuseMordeProfileSync.shared
+    @ObservedObject private var personal = NanoMuseMordePersonalContentStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var name = "Muse"
     @State private var description = ""
     @State private var style = "muse"
     @State private var revision: Int64 = 0
+    @State private var baselineDraft = NanoMuseMordeProfileDraft.empty
+    @State private var loadedScope: String?
+    @State private var observedProfileObject: MordePersonalSyncObject?
     @State private var isLoading = false
     @State private var isSaving = false
+    @State private var discardDraftBeforeReload = false
+    @State private var remoteProfileChanged = false
     @State private var error: String?
     @State private var saved = false
+
+    private var currentDraft: NanoMuseMordeProfileDraft {
+        NanoMuseMordeProfileDraft(name: name, description: description, style: style)
+    }
+
+    private var hasUnsavedChanges: Bool { currentDraft != baselineDraft }
+
+    private var cloudProfile: MordePersonalSyncObject? {
+        guard let scope = authorization.personalDataScopeKey else { return nil }
+        return personal.object("profile", "default", scopeKey: scope)
+    }
 
     var body: some View {
         Form {
@@ -593,7 +637,12 @@ struct NanoMuseMordeProfileView: View {
             }
             Section {
                 if isLoading { ProgressView(AppLocalized("Loading Morde profile…")) }
-                else { Button(AppLocalized("Reload cloud profile")) { Task { await load() } } }
+                else { Button(AppLocalized("Reload cloud profile")) { requestReload() } }
+                if remoteProfileChanged {
+                    Label(AppLocalized("Cloud profile changed. Your unsaved edits are preserved."), systemImage: "arrow.triangle.2.circlepath")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 if sync.pending != nil {
                     Label(sync.syncEnabled ? AppLocalized("Profile change is waiting to sync.") : AppLocalized("Sync is paused; this profile change stays on this device."), systemImage: "clock")
                         .font(.footnote)
@@ -614,37 +663,112 @@ struct NanoMuseMordeProfileView: View {
             }
         }
         .task(id: authorization.personalDataScopeKey) { await load() }
+        .nmOnChange(of: cloudProfile) { object in
+            if let object {
+                observedProfileObject = object
+                applyCloudProfile(object)
+            } else if observedProfileObject != nil {
+                observedProfileObject = nil
+                removeCloudProfile()
+            }
+        }
+        .confirmationDialog(AppLocalized("Discard unsaved changes and reload the cloud profile?"),
+                            isPresented: $discardDraftBeforeReload, titleVisibility: .visible) {
+            Button(AppLocalized("Discard and reload"), role: .destructive) {
+                Task { await load(discardingDraft: true) }
+            }
+            Button(AppLocalized("Cancel"), role: .cancel) {}
+        }
+    }
+
+    private func requestReload() {
+        if hasUnsavedChanges {
+            discardDraftBeforeReload = true
+        } else {
+            Task { await load() }
+        }
     }
 
     @MainActor
-    private func load() async {
+    private func load(discardingDraft: Bool = false) async {
         guard authorization.signedIn, let scope = authorization.personalDataScopeKey else {
+            loadedScope = nil
             name = "Muse"
             description = ""
+            style = "muse"
             revision = 0
+            baselineDraft = .empty
+            observedProfileObject = nil
+            remoteProfileChanged = false
             return
         }
+        if loadedScope != scope {
+            loadedScope = scope
+            name = "Muse"
+            description = ""
+            style = "muse"
+            revision = 0
+            baselineDraft = .empty
+            observedProfileObject = nil
+            remoteProfileChanged = false
+            error = nil
+            saved = false
+        }
+        guard discardingDraft || !hasUnsavedChanges else { return }
         isLoading = true
         error = nil
         sync.refresh()
-        do {
-            let profile = try await authorization.personalProfile()
-            guard authorization.personalDataScopeKey == scope else { return }
-            if let profile {
-                name = profile.body.name
-                description = profile.body.description ?? ""
-                style = profile.body.style ?? "muse"
-                revision = profile.revision
-            } else {
-                name = "Muse"
-                description = ""
-                style = "muse"
-                revision = 0
-            }
-        } catch {
-            if authorization.personalDataScopeKey == scope { self.error = error.localizedDescription }
+        await personal.refresh()
+        guard authorization.personalDataScopeKey == scope else { isLoading = false; return }
+        if let object = cloudProfile {
+            observedProfileObject = object
+            applyCloudProfile(object, discardingDraft: discardingDraft)
+        } else if let refreshError = personal.error {
+            error = refreshError
+        } else if discardingDraft || revision == 0 {
+            name = "Muse"
+            description = ""
+            style = "muse"
+            revision = 0
+            baselineDraft = .empty
+            observedProfileObject = nil
+            remoteProfileChanged = false
         }
         isLoading = false
+    }
+
+    @MainActor
+    private func applyCloudProfile(_ object: MordePersonalSyncObject, discardingDraft: Bool = false) {
+        guard object.object_type == "profile", object.object_id == "default",
+              let body = try? object.decodeBody(MordePersonalProfileBody.self) else { return }
+        let remoteDraft = NanoMuseMordeProfileDraft(body)
+        guard discardingDraft || NanoMuseMordeProfileRefreshPolicy.shouldApply(
+            remoteRevision: object.revision, currentRevision: revision, remoteDraft: remoteDraft,
+            currentDraft: currentDraft, baselineDraft: baselineDraft) else {
+            remoteProfileChanged = true
+            return
+        }
+        name = remoteDraft.name
+        description = remoteDraft.description
+        style = remoteDraft.style
+        revision = object.revision
+        baselineDraft = remoteDraft
+        remoteProfileChanged = false
+        error = nil
+    }
+
+    @MainActor
+    private func removeCloudProfile() {
+        guard !hasUnsavedChanges else {
+            remoteProfileChanged = true
+            return
+        }
+        name = "Muse"
+        description = ""
+        style = "muse"
+        revision = 0
+        baselineDraft = .empty
+        remoteProfileChanged = false
     }
 
     private func save() {

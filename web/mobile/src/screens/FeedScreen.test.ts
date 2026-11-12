@@ -66,6 +66,7 @@ describe("Feed request recovery", () => {
 
     const error = failure(`${owner} unavailable`);
     expect(error, "the failed section must offer a retry").toBeDefined();
+    expect(error!.findAllByType("div").some((node) => String(node.props.className).includes("fixed"))).toBe(true);
     const before = owners.map((name) => vi.mocked(api[name]).mock.calls.length);
     await act(async () => { error!.findByType("button").props.onClick(); });
 

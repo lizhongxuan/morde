@@ -58,7 +58,8 @@ export function Hosts() {
   const [listSelection, setListSelection] = useState<{ mode: 'owned' | 'shared'; hash: string } | null>(null);
   const hosts = useQuery({
     queryKey: ['hosts'], queryFn: portalApi.hosts,
-    refetchInterval: (query) => query.state.data?.items.some((host) => unsettled.has(host.state)) ? 3000 : query.state.data?.items.length ? 30000 : false,
+    refetchInterval: (query) => query.state.data?.items.some((host) => unsettled.has(host.state)) ? 3000 : query.state.data?.items.length ? 12000 : false,
+    refetchIntervalInBackground: false,
   });
   const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences, retry: false });
   const ownedHosts = hosts.data?.items.filter((host) => host.owner_id === user?.id) ?? [];
@@ -320,6 +321,7 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
   const copyHelpID = `host-copy-help-${host.id}`;
   const hasWorkspaceBinding = host.workspaces.some((binding) => binding.state !== 'detached');
   const selectedWorkspace = bindableWorkspaces.find((workspace) => workspace.id === workspaceID);
+  const runtimeState = host.workspace_runtime_online === true ? '在线' : host.workspace_runtime_online === false ? '离线' : '未知';
   return <article className="host-card host-card-compact" id={`host-${host.id}`}>
     <div className="host-card-heading"><div><h2>{host.name || '未命名主机'}</h2><p className="muted mono">{host.id} · {host.template_id}</p></div><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
     <div className="host-quick-facts" aria-label="电脑概要">
@@ -360,6 +362,8 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
         <small className="table-sub">旧数据迁移状态未知</small>
       </div>
       <div><span>运行状态</span><strong>{hostReasonLabel[host.state_reason] || host.state_reason || (host.state === 'running' ? '运行正常' : host.state === 'stopped' ? '可恢复' : '等待状态更新')}</strong></div>
+      <div><span>Workspace Runtime</span><strong>{runtimeState}</strong><small className="table-sub">最近观测：{host.workspace_runtime_last_seen_at ? formatDate(host.workspace_runtime_last_seen_at) : '未知'}</small></div>
+      <div><span>桌面连接</span><strong>由 noVNC 工作台单独检测</strong></div>
     </div>
     {canBindWorkspace && !hasWorkspaceBinding && <form onSubmit={(event) => { event.preventDefault(); if (selectedWorkspace) onBindWorkspace(selectedWorkspace); }} className="host-workspace-bind">
       <label htmlFor={`bind-workspace-${host.id}`}>恢复前关联已有云端文件</label>

@@ -1175,7 +1175,7 @@ describe("portal mock durable tasks", () => {
     const path = `/api/conversations/${conversation.id}/messages`;
     const headers = { "content-type": "application/json", "Idempotency-Key": "first-message-1",
       "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" };
-    const body = { client_message_id: "first-message-1", content: "第一条" };
+    const body = { client_message_id: "first-message-1", content: "第一条", time_zone: "Asia/Shanghai" };
     const first = await api(path, { ...json("POST", body), headers });
     const result = await first.json() as { message: { id: string; sequence: number; task_id?: string; client_message_id: string; delivery_status: string; routing_status: string }; replayed: boolean };
     expect(first.status).toBe(202);
@@ -1186,6 +1186,8 @@ describe("portal mock durable tasks", () => {
     expect(await replay.json()).toMatchObject({ message: { id: result.message.id }, replayed: true });
     expect((await api(path, { ...json("POST", { ...body, content: "变化" }), headers })).status).toBe(409);
     expect((await api(path, { ...json("POST", { ...body, mode: "new", model_id: "pmodel01" }), headers })).status).toBe(400);
+    expect((await api(path, { ...json("POST", { ...body, client_message_id: "invalid-time-zone-01", time_zone: "not/a-zone" }),
+      headers: { ...headers, "Idempotency-Key": "invalid-time-zone-01" } })).status).toBe(400);
     expect((await api(path, { ...json("POST", { ...body, input_revision: 5 }), headers })).status).toBe(400);
     expect((await api(`${path}?client_message_id=${body.client_message_id}`, { headers })).status).toBe(200);
     const secondBody = { client_message_id: "second-message-1", content: "第二条" };
@@ -1228,7 +1230,7 @@ describe("portal mock durable tasks", () => {
       const headers = { ...identityHeaders, "content-type": "application/json", "Idempotency-Key": target.clientID };
       const init = {
         total_bytes: bytes.length, total_chunks: totalChunks, sha256: createHash("sha256").update(bytes).digest("hex"),
-        previous_client_message_id: "previous-message-01", model_id: "pmodel01",
+        previous_client_message_id: "previous-message-01", model_id: "pmodel01", time_zone: "Asia/Shanghai",
       };
       const initialized = await api(uploadPath, { ...json("PUT", init), headers });
       expect(initialized.status).toBe(200);
@@ -1237,6 +1239,11 @@ describe("portal mock durable tasks", () => {
       expect(initReplay.status).toBe(200);
       expect((await initReplay.json() as { received_sequences: number[] }).received_sequences).toEqual([]);
       expect((await api(uploadPath, { ...json("PUT", { ...init, model_id: "different-model" }), headers })).status).toBe(409);
+      const invalidZoneID = target.clientID + "-invalid-zone";
+      expect((await api(`${target.path}/message-uploads/${invalidZoneID}`, {
+        ...json("PUT", { ...init, time_zone: "not/a-zone" }),
+        headers: { ...identityHeaders, "content-type": "application/json", "Idempotency-Key": invalidZoneID },
+      })).status).toBe(400);
 
       const sendChunk = async (sequence: number) => {
         const chunk = bytes.subarray(sequence * chunkSize, Math.min((sequence + 1) * chunkSize, bytes.length));

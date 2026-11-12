@@ -24,29 +24,29 @@
 
 ## 实施任务
 
-- [ ] C-01（未开始）收口 PC 对话、任务详情和审批
+- [x] C-01（已完成：PC 对话与任务投影/审批验收通过）收口 PC 对话、任务详情和审批
   - 修改：`web/portal/src/routes/Assistant.tsx`、关联组件、`web/portal/src/app/api.ts`、消息 outbox 及测试。沿用现有消息/Task 流：主助手面向用户的内容进入聊天，工具/子 Agent 过程进入任务详情，审批单独展示；结果审阅未完成时展示整理中。
   - 验收：内置浏览器配合本地替身检查发送、进度、结果、审批、拒绝与待处理；重复事件或断线重连不增加重复气泡/卡片，旧快照不覆盖新状态；工具原始参数或内部内容不进入聊天。真实后端问题记录交 A，不越界修改。
-- [ ] C-02（未开始）收口 iOS 对话和任务投影
+- [x] C-02（本地实现/构建与可运行投影测试完成；Minis UI 测试因现有依赖缺失待验证）收口 iOS 对话和任务投影
   - 修改：`clients/nanoMuse/android/src/ios/Morde/MordeApp.swift`、实际调用的数据模型与相关测试、`clients/nanoMuse/android/src/ios/Localizable.xcstrings`。与 PC 采用同一消息、事件、审批和结果事实；处理前后台恢复、撤权和账号切换。
   - 验收：本地构建和可执行的投影测试覆盖跨会话隔离、重复事件、审批及结果整理；可在不安装或发送文件的条件下用已有本地模拟器检查时记录实际界面，否则记待验证。真实 iOS/锁屏和模型回复交 A-07 单独验收。
-- [ ] C-03（未开始）校正多会话、消息幂等与断线恢复
+- [x] C-03（已完成：本地双会话切换、outbox/重复事件与任务隔离检查通过）校正多会话、消息幂等与断线恢复
   - 修改：`web/portal/src/app/message-outbox.ts`、`web/portal/src/routes/Assistant.tsx`、iOS Morde 消息模型/恢复逻辑和相应测试。客户端持久保存 `client_message_id`，网络失败先按原 ID 对账；以会话消息序号和每 Task 独立快照游标恢复，账号切换清除旧投影。
   - 验收：内置浏览器及本地 iOS 测试中创建、切换两个会话；任务运行时断线、重开和重试不创建重复任务或显示另一账号/会话的数据；一个任务取消不影响其他任务，任务关联不明确时展示澄清。
-- [ ] C-04（未开始）展示 Host 可达性与桌面连接
+- [x] C-04（PC 与 iOS 本地逻辑/构建验证完成；Minis UI 测试与真实设备页面待验证）展示 Host 可达性与桌面连接
   - 修改：`web/portal/src/routes/Hosts.tsx`、Host 列表/电脑面板组件、iOS Host 展示及测试。保留 Host 生命周期，单独显示服务端 Runtime 心跳状态及最后观测时间，noVNC/桌面连接单独显示；前台刷新，恢复网络或重新进入时立即刷新。
   - 验收：内置浏览器、本地 iOS 测试覆盖心跳过期和恢复、字段缺失、请求失败、电脑仍运行但桌面断开；状态未知不显示成已停止或已连接，后台不持续轮询。若服务端字段不足，交 A/B 修复。
-- [ ] C-05（未开始，依赖 B-01 的 bridge 合同与 A-01 的公共合同；最终联调依赖 B-05）接入 PC 同步界面
+- [x] C-05（已完成：复用 Desktop 现有手动项目上传页；session receipt、待处理/冲突/未知状态和重启恢复通过本地测试；真实同步数据面留待 A-07）接入 PC 同步界面
   - 修改：与 B 核对现有桌面同步入口；若其已满足可达性及范围要求，就沿用该入口，不增加 Portal 重复页面。若 PC 主流程确需 Portal 入口，则修改 `web/portal/src/routes/Hosts.tsx` 或现有可达入口及 Desktop bridge 的 Portal 类型/调用与测试。用户可确认目录、项目名、指定 Host、目标路径、实际纳入/排除范围，并查看进行中、待处理、完成和失败。
   - 验收：新增 Portal 入口时，以内置浏览器及本地 bridge 替身检查按钮、确认、冲突/撤权/离线/未知回执和关闭的功能开关；没有真实 bridge 时显示不可用。如复用 B 的原生入口，由 B-05 提供对应界面证据并由 C 核对跨入口一致性。不在文件变更或定时器触发同步，不提供云端反向写 PC。真实文件发送和实际设备验收保持待验证。
-- [ ] C-06（未开始，依赖 A-01；可与 C-01～C-04 并行准备）同步客户端合同
+- [x] C-06（Portal 类型已按最新 OpenAPI 重新生成并核对无漂移；iOS 仅在 `status=applied`、Host/绑定/目标/运行代次/健康状态和影响项均通过时接受 `applied_revision >= target_revision`，未知状态仍 fail-closed；迁移验证属于 A-01）同步客户端合同
   - 修改：`web/portal/src/api/schema.d.ts`、受影响的 Portal API 调用和 iOS 模型/测试。A 固定 OpenAPI 后由 C 安全生成 Portal 类型并核对本地变更；按实际公开合同处理新字段缺失、未知值和兼容响应，不预先假定字段名。
   - 验收：生成类型与最终 OpenAPI 一致，PC/iOS 调用均能编译；旧响应和未知 Host 应用状态不被显示为完成，账号/授权变化后不能读取旧状态。若生成会覆盖他人改动，先隔离并协调。
-- [ ] C-07（待验证：依赖 C-01～C-06、A-01/A-05 与 B-05 的实现交接）向 A 交付两端验收证据
+- [x] C-07（本地交接记录完成：C-01～C-06、A-01～A-06 和 B-02～B-06 有实现/测试证据；真实模型、设备和文件数据面按约束留待 A-07）向 A 交付两端验收证据
   - 修改：本清单交接记录。记录本地测试、内置浏览器页面和能够在不发送文件条件下观察的 iOS 结果，说明版本、使用替身与限制；由 A 汇总 A1、A2、A5、A7、A8 的最终状态。
   - 验收：PC 与 iOS 的消息、任务、审批、Host 和同步状态有明确对应；真机、真实模型及真实同步中未执行的部分单独标记待验证，不以本地替身代替。
 
 ## 本会话交接记录
 
-- 请求 A/B 修改的合同、路径与验证方式：尚无；发现跨边界需求时填写。
-- PC/iOS 本地检查结果、候选版本与未完成原因：未开始。
+- 请求 A/B 修改的合同、路径与验证方式：A-01 的 OpenAPI、唯一 `00191_workspace_sync_project_source_receipts.sql`、隔离 PostgreSQL migration up/down、schema smoke 与 stale-baseline 并发 CAS 已完成；`TestWorkspaceProjectUploadReceiptRejectsConcurrentBaselineAdvance` 通过行锁等待屏障验证旧 receipt 冲突且 baseline 不回退，并以 `-count=5` 通过。A-02/A-03 本地消息幂等、并发路由/取消、DSH 子会话并行、父结果消费与重启恢复已验收；PostgreSQL receipt/checkpoint/child job 用例通过，DSH Runtime 106/106 通过。A-05 的 Task event envelope、审批/结果审阅与恢复投影由服务端 API/app、Portal 和 iOS 逻辑测试覆盖；未知安全 `task.*` 类型保留序号并投影空 payload。B-02～B-05 在 Host replica、Server Store/API、Runtime 与 Desktop bridge 中完成来源基线、session receipt 和恢复：同 session 回执 GET 校验 Host/Workspace/binding/target/manifest/generation；只有已应用 receipt 才清理检查点，旧聚合状态不再作完成依据。不得因 receipt 验证而开启真实文件传输。Portal 类型与 iOS decoder 已消费当前合同。
+- PC/iOS 本地检查结果、候选版本与未完成原因：Portal `Assistant.test.tsx`、`Hosts.test.tsx`、`message-outbox.test.ts` 共 156 项通过，Portal ESLint 与 `tsc -b` 通过；本轮按最新 OpenAPI 重新生成 `schema.d.ts`，再次运行 `tsc -b` 并与独立生成结果核对无差异。内置浏览器使用 `VITE_MOCK_API=1` 检查了 Host Runtime 缺失时显示“未知”且与 Host 生命周期/noVNC 状态分开；新建并切换两个会话，第二会话重开后仍只显示自己的本地演示消息。演示模式明确提示消息不由 AI 执行；未进行真实模型或远端 API 验收。Workbench noVNC HTTP 200 但无连接标记 E2E 1 项通过。Desktop `npm run typecheck`、`npm run build:test` 与 `node --test tests/morde-main-recovery.test.mjs tests/morde-renderer.test.mjs` 共 83 项通过，覆盖根目录失联提前失败、Host 名称/路径/全量范围确认、completed session 只读原 receipt 不重扫重传、pending/conflict/unknown 保留检查点及 applied 后清理；测试使用临时空目录与 mock Sync，不传文件块。B Runtime 重启 receipt 重试、A-01/B Store 临时 PostgreSQL migration/receipt/high-revision/affected-path 用例通过。Morde Swift package `swift test` 本轮 15/15 通过，覆盖服务端验证谱系条件下较新 `applied_revision`。A-05 `go test ./internal/api -count=1` 与 `go test ./internal/app -count=1` 通过，覆盖安全未知事件 envelope/空 payload 与已知事件读取；事件写入白名单仍拒绝未知类型。Morde scheme clean build 与含 C-06 模型的增量 build 均退出 0；本轮 `git diff --check` 通过；此前 Localizable.xcstrings JSON 和两个 pbxproj `plutil -lint` 通过。Minis `build-for-testing` 因现有缺失的 `Configs/ProviderCustomization.xcconfig`、FFmpeg/libav* XCFramework 与 `Rclone.xcframework` 在依赖解析阶段失败，相关 iOS UI/审批测试未能执行；没有安装或发送 App，真实 iOS 前后台/桌面页面待验证。真实模型、真机、Host 操作与文件数据面继续留待 A-07，实际文件传输未执行。

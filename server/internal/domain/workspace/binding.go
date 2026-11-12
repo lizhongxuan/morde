@@ -27,19 +27,20 @@ const (
 )
 
 type Binding struct {
-	ID              string
-	OwnerID         string
-	HostID          string
-	Workspace       Workspace
-	Directory       string
-	State           BindingState
-	BindingVersion  int64
-	DesiredRevision int64
-	AppliedRevision int64
-	SyncState       BindingSyncState
-	SyncConflicts   []string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID                        string
+	OwnerID                   string
+	HostID                    string
+	Workspace                 Workspace
+	Directory                 string
+	State                     BindingState
+	BindingVersion            int64
+	DesiredRevision           int64
+	AppliedRevision           int64
+	SyncState                 BindingSyncState
+	SyncConflicts             []string
+	ProjectUploadApplications []PendingProjectUploadApplication
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 func ValidateBindingSyncStatus(state BindingSyncState, conflicts []string) error {

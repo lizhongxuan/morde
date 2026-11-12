@@ -36,6 +36,8 @@ struct MIFResourcePageState: Equatable {
         let name: String
         let scope: Scope
         let status: Status
+        let runtimeStatus: MIFHostRuntimeStatus
+        let runtimeLastSeenAt: Date?
         let workspaceSummary: String?
         let canOpen: Bool
         let control: Control?
@@ -102,6 +104,28 @@ struct MIFResourcePageState: Equatable {
     let defaultTarget: DefaultTarget
     let hosts: [Host]
     let workspaces: [Workspace]
+}
+
+extension MIFHostRuntimeStatus {
+    var localizedTitle: String {
+        switch self {
+        case .online: AppLocalized("online")
+        case .offline: AppLocalized("Offline")
+        case .unknown: AppLocalized("Status unknown")
+        }
+    }
+}
+
+extension MIFDesktopConnectionStatus {
+    var localizedTitle: String {
+        switch self {
+        case .unknown: AppLocalized("Status unknown")
+        case .connecting: AppLocalized("Connecting…")
+        case .connected: AppLocalized("Connected")
+        case .disconnected: AppLocalized("Offline")
+        case .failed: AppLocalized("Failed")
+        }
+    }
 }
 
 enum MIFResourceControlAction: String, Hashable {
@@ -477,6 +501,7 @@ struct MIFResourceRoom: View {
                         .padding(.top, 1)
 
                         if host.scope == .owned {
+                            runtimeStatus(host)
                             controlStatus(host)
                                 .padding(.top, 1)
                         }
@@ -543,6 +568,24 @@ struct MIFResourceRoom: View {
                 .accessibilityIdentifier("morde.resources.host.share.\(host.id)")
             }
         }
+    }
+
+    private func runtimeStatus(_ host: MIFResourcePageState.Host) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label("\(AppLocalized("Agent Runtime")) · \(host.runtimeStatus.localizedTitle)",
+                  systemImage: "antenna.radiowaves.left.and.right")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(host.runtimeStatus == .offline ? Color.orange : rowStatusColor)
+                .accessibilityIdentifier("morde.resources.host.runtime.\(host.id)")
+            if let lastSeenAt = host.runtimeLastSeenAt {
+                Text(String(format: AppLocalized("Last seen: %@"),
+                            lastSeenAt.formatted(date: .abbreviated, time: .shortened)))
+                    .font(.caption)
+                    .foregroundStyle(rowStatusColor)
+                    .accessibilityIdentifier("morde.resources.host.runtimeLastSeen.\(host.id)")
+            }
+        }
+        .padding(.top, 1)
     }
 
     @ViewBuilder

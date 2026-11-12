@@ -55,7 +55,7 @@ func TestTaskLinkedSyncRequiresAndPreservesItsFence(t *testing.T) {
 	if err := (&Client{}).validateOptions(context.Background(), options); err != nil {
 		t.Fatalf("valid Task sync options rejected: %v", err)
 	}
-	data, err := createSessionPayload("", options.Direction, options.Policy, baseRevision, options.Scope,
+	data, err := createSessionPayload("", "", options.Direction, options.Policy, baseRevision, options.Scope,
 		mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{}}, nil, nil, nil,
 		options.TaskID, options.TaskHubOperationKey)
 	if err != nil {
@@ -77,6 +77,7 @@ func TestTaskLinkedSyncRequiresAndPreservesItsFence(t *testing.T) {
 
 func TestProjectFolderSyncUsesUnscopedUploadSession(t *testing.T) {
 	const folderID = "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const sourceBindingID = "12345678-1234-4234-8234-123456789abc"
 	baseRevision := int64(0)
 	created := false
 	writeSession := func(w http.ResponseWriter, status int, session SyncSession) {
@@ -94,7 +95,7 @@ func TestProjectFolderSyncUsesUnscopedUploadSession(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			if request.FolderID != folderID || request.Direction != "upload" || request.Policy != "compare_merge" || request.BaseRevision != 0 ||
+			if request.FolderID != folderID || request.SourceBindingID != sourceBindingID || request.Direction != "upload" || request.Policy != "compare_merge" || request.BaseRevision != 0 ||
 				len(request.Scope) != 0 || len(request.Files) != 0 || len(request.EmptyDirectories) != 0 || len(request.DeletedPaths) != 0 || len(request.DeletedDirectories) != 0 {
 				t.Errorf("project upload request must contain only an empty local manifest and folder identity: %+v", request)
 			}
@@ -119,24 +120,99 @@ func TestProjectFolderSyncUsesUnscopedUploadSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.Sync(context.Background(), SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(),
+	result, err := client.Sync(context.Background(), SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(),
 		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{}})
 	if err != nil || !created || result.Session.State != "completed" || result.Session.FolderID != folderID {
 		t.Fatalf("project upload result = %+v, created=%v, err=%v", result, created, err)
 	}
 
 	invalid := []SyncOptions{
-		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "bidirectional", Policy: "compare_merge", BaseRevision: &baseRevision},
-		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "live", BaseRevision: &baseRevision},
-		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge"},
-		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{"src"}},
-		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, DeletedPaths: []string{"old.txt"}},
-		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, DeletedDirectories: []string{"old-directory"}},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(), Direction: "bidirectional", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(), Direction: "upload", Policy: "live", BaseRevision: &baseRevision},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge"},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{"src"}},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, DeletedPaths: []string{"old.txt"}},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, DeletedDirectories: []string{"old-directory"}},
+		{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: "not-a-uuid", Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: "12345678-1234-4234-8234-123456789ABC", Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
 	}
 	for _, options := range invalid {
 		if err := client.validateOptions(context.Background(), options); err == nil {
 			t.Fatalf("project folder sync accepted invalid options: %+v", options)
 		}
+	}
+	if err := client.validateOptions(context.Background(), SyncOptions{WorkspaceID: testWorkspace, Directory: t.TempDir(),
+		SourceBindingID: sourceBindingID, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision}); err == nil {
+		t.Fatal("non-project sync accepted source_binding_id")
+	}
+}
+
+func TestProjectSourceBindingIsInCreateBodyAndIdempotencyKey(t *testing.T) {
+	const folderID = "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const sourceA = "12345678-1234-4234-8234-123456789abc"
+	const sourceB = "12345678-1234-4234-8234-123456789abd"
+	empty := mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{}, Directories: []mordesync.Directory{}}
+	projectBody, err := createSessionPayload(folderID, sourceA, "upload", "compare_merge", 0, nil, empty, nil, nil, nil, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projectRequest map[string]json.RawMessage
+	if err := json.Unmarshal(projectBody, &projectRequest); err != nil {
+		t.Fatal(err)
+	}
+	var gotSource string
+	if err := json.Unmarshal(projectRequest["source_binding_id"], &gotSource); err != nil || gotSource != sourceA {
+		t.Fatalf("project source_binding_id = %q, err=%v", gotSource, err)
+	}
+	nonProjectBody, err := createSessionPayload("", "", "upload", "compare_merge", 0, nil, empty, nil, nil, nil, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonProjectRequest map[string]json.RawMessage
+	if err := json.Unmarshal(nonProjectBody, &nonProjectRequest); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := nonProjectRequest["source_binding_id"]; exists {
+		t.Fatal("non-project request contains source_binding_id")
+	}
+	keyA, err := derivedCreateKey("project-upload", "https://morde.example", "/project", testWorkspace, folderID, sourceA,
+		"upload", "compare_merge", 0, nil, empty, nil, nil, nil, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := derivedCreateKey("project-upload", "https://morde.example", "/project", testWorkspace, folderID, sourceB,
+		"upload", "compare_merge", 0, nil, empty, nil, nil, nil, "", "")
+	if err != nil || keyA == keyB {
+		t.Fatalf("different source bindings reused idempotency key %q (other=%q), err=%v", keyA, keyB, err)
+	}
+}
+
+func TestProjectSourceBindingPersistsAndIsPartOfResumeIdentity(t *testing.T) {
+	const folderID = "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const sourceA = "12345678-1234-4234-8234-123456789abc"
+	const sourceB = "12345678-1234-4234-8234-123456789abd"
+	directory, err := canonicalDirectory(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{}, Directories: []mordesync.Directory{}}
+	if err := writeResumeMetadata(directory, resumeMetadata{Version: 1, WorkspaceID: testWorkspace, FolderID: folderID,
+		SourceBindingID: sourceA, Directory: directory, SessionID: testSession, Direction: "upload", Policy: "compare_merge",
+		IdempotencyKey: "project-upload", Scope: []string{}, Manifest: empty}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := readResumeMetadata(directory, testWorkspace)
+	if err != nil || saved.SourceBindingID != sourceA {
+		t.Fatalf("saved source binding = %q, err=%v", saved.SourceBindingID, err)
+	}
+	options := SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceA, Directory: directory, SessionID: testSession}
+	if !savedSessionMatchesRequest(saved, options, directory) {
+		t.Fatal("saved source binding did not match its original resume request")
+	}
+	options.SourceBindingID = sourceB
+	if savedSessionMatchesRequest(saved, options, directory) {
+		t.Fatal("another source binding matched the saved project session")
 	}
 }
 
@@ -168,7 +244,7 @@ func TestProjectUploadRejectsCloudToLocalSessionActions(t *testing.T) {
 					http.Error(w, "invalid request", http.StatusBadRequest)
 					return
 				}
-				if request.FolderID != folderID || request.Direction != "upload" || request.Policy != "compare_merge" || request.BaseRevision != 0 ||
+				if request.FolderID != folderID || request.SourceBindingID != "12345678-1234-4234-8234-123456789abc" || request.Direction != "upload" || request.Policy != "compare_merge" || request.BaseRevision != 0 ||
 					len(request.Scope) != 0 || len(request.Files) != 0 || len(request.EmptyDirectories) != 0 || len(request.DeletedPaths) != 0 || len(request.DeletedDirectories) != 0 {
 					t.Errorf("project upload request must contain only an empty local manifest and folder identity: %+v", request)
 				}
@@ -184,7 +260,7 @@ func TestProjectUploadRejectsCloudToLocalSessionActions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = client.Sync(context.Background(), SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, Directory: t.TempDir(),
+			_, err = client.Sync(context.Background(), SyncOptions{WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc", Directory: t.TempDir(),
 				Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{}})
 			if err == nil || !strings.Contains(err.Error(), "project upload session unexpectedly contains") {
 				t.Fatalf("project upload accepted cloud-to-local session actions: %v", err)
@@ -316,7 +392,7 @@ func TestWorkspaceFileMappingPreservesSymlinkTargetWithoutBlocks(t *testing.T) {
 
 func TestClientEmptyDirectoryProtocolAndRecovery(t *testing.T) {
 	t.Run("create payload and action shape", func(t *testing.T) {
-		data, err := createSessionPayload("", "bidirectional", "live", 7, nil,
+		data, err := createSessionPayload("", "", "bidirectional", "live", 7, nil,
 			mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{"reports/empty"}},
 			[]string{"old.txt"}, []string{"old-directory"}, nil, "", "")
 		if err != nil {

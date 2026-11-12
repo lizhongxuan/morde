@@ -57,11 +57,31 @@ final class MIFResourceViewsTests: XCTestCase {
     func testSharedHostNeverOffersControlActions() {
         let host = MIFResourcePageState.Host(
             id: "h1234567", name: "Shared", scope: .sharedReadOnly, status: .running,
+            runtimeStatus: .unknown, runtimeLastSeenAt: nil,
             workspaceSummary: nil, canOpen: true,
             control: control(canTakeOver: true, canReturnToAI: true),
             error: nil)
 
         XCTAssertTrue(MIFResourcePageRules.controlActions(for: host).isEmpty)
+    }
+
+    func testHostRuntimeProjectionKeepsMissingHeartbeatUnknownAndMapsRecovery() {
+        XCTAssertEqual(MIFHostRuntimeStatus(online: nil), .unknown)
+        XCTAssertEqual(MIFHostRuntimeStatus(online: false), .offline)
+        XCTAssertEqual(MIFHostRuntimeStatus(online: true), .online)
+        XCTAssertEqual(MIFHostRuntimeStatus(online: nil).localizedTitle, AppLocalized("Status unknown"))
+
+        let heartbeatSequence = ([false, true, nil] as [Bool?]).map { MIFHostRuntimeStatus(online: $0) }
+        XCTAssertEqual(heartbeatSequence, [.offline, .online, .unknown])
+    }
+
+    func testDesktopConnectionProjectionNeverTreatsUnknownAsConnected() {
+        XCTAssertEqual(MIFDesktopConnectionStatus(scriptValue: "connected"), .connected)
+        XCTAssertEqual(MIFDesktopConnectionStatus(scriptValue: "connecting"), .connecting)
+        XCTAssertEqual(MIFDesktopConnectionStatus(scriptValue: "disconnected"), .disconnected)
+        XCTAssertEqual(MIFDesktopConnectionStatus(scriptValue: "failed"), .failed)
+        XCTAssertEqual(MIFDesktopConnectionStatus(scriptValue: "unexpected"), .unknown)
+        XCTAssertNotEqual(MIFDesktopConnectionStatus(scriptValue: "unexpected"), .connected)
     }
 
     func testUnknownOrTransitioningControlOffersNoActions() {
@@ -82,6 +102,8 @@ final class MIFResourceViewsTests: XCTestCase {
         XCTAssertTrue(MIFResourcePageRules.controlActions(for: failed).isEmpty)
         XCTAssertTrue(MIFResourcePageRules.controlActions(for: starting).isEmpty)
         XCTAssertTrue(MIFResourcePageRules.controlActions(for: stopped).isEmpty)
+        XCTAssertEqual(stopped.runtimeStatus, .unknown,
+                       "Host lifecycle must not be used to infer Runtime heartbeat state")
         XCTAssertTrue(MIFResourcePageRules.controlActions(for: unknownHostStatus).isEmpty)
     }
 
@@ -131,6 +153,7 @@ final class MIFResourceViewsTests: XCTestCase {
     ) -> MIFResourcePageState.Host {
         MIFResourcePageState.Host(
             id: "h1234567", name: "Owned", scope: .owned, status: status,
+            runtimeStatus: .unknown, runtimeLastSeenAt: nil,
             workspaceSummary: nil, canOpen: true, control: control, error: nil)
     }
 

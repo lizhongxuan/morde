@@ -1,4 +1,5 @@
-import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useLayoutEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 
 type ToastAction = { label: string; onClick: () => void };
@@ -12,7 +13,19 @@ const ToastContext = createContext<ToastContextValue | null>(null);
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<Toast[]>([]);
-  const [overlayRegion, setOverlayRegion] = useState<HTMLDivElement | null>(null);
+  const [overlayRegion] = useState<HTMLDivElement | null>(() => {
+    if (typeof document === 'undefined') return null;
+    const region = document.createElement('div');
+    region.className = 'toast-region';
+    region.setAttribute('aria-live', 'polite');
+    region.setAttribute('aria-relevant', 'additions');
+    return region;
+  });
+  useLayoutEffect(() => {
+    if (!overlayRegion) return;
+    document.body.append(overlayRegion);
+    return () => overlayRegion.remove();
+  }, [overlayRegion]);
   const dismiss = useCallback((id: number) => setItems((current) => current.filter((item) => item.id !== id)), []);
   const notify = useCallback((message: string, kind: Toast['kind'] = 'info', action?: ToastAction) => {
     const id = Date.now() + Math.random();
@@ -23,9 +36,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const value = useMemo(() => ({ notify, dismiss, overlayRegion }), [notify, dismiss, overlayRegion]);
   return <ToastContext.Provider value={value}>
     {children}
-    <div className="toast-region" ref={setOverlayRegion} aria-live="polite" aria-relevant="additions">
-      {items.map((item) => <div className={`toast toast-${item.kind}`} key={item.id} role={item.kind === 'error' ? 'alert' : 'status'}>{item.message}{item.action && <button type="button" className="button button-small button-secondary" onClick={item.action.onClick}>{item.action.label}</button>}<button type="button" className="icon-button" aria-label="关闭通知" onClick={() => dismiss(item.id)}>×</button></div>)}
-    </div>
+    {overlayRegion && createPortal(items.map((item) => <div className={`toast toast-${item.kind}`} key={item.id} role={item.kind === 'error' ? 'alert' : 'status'}>{item.message}{item.action && <button type="button" className="button button-small button-secondary" onClick={item.action.onClick}>{item.action.label}</button>}<button type="button" className="icon-button" aria-label="关闭通知" onClick={() => dismiss(item.id)}>×</button></div>), overlayRegion)}
   </ToastContext.Provider>;
 }
 

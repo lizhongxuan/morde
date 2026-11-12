@@ -52512,6 +52512,65 @@
         }
       }
     },
+    "Desktop connection" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desktopverbindung"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desktop connection"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conexión de escritorio"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connexion du bureau"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デスクトップ接続"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "데스크톱 연결"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подключение к рабочему столу"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "桌面连接"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "桌面連線"
+          }
+        }
+      }
+    },
     "Desktop control" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -122246,6 +122305,48 @@
             "value" : "重新載入"
           }
         }
+      }
+    },
+    "Cloud profile changed. Your unsaved edits are preserved." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Das Cloud-Profil wurde geändert. Deine nicht gespeicherten Änderungen bleiben erhalten." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud profile changed. Your unsaved edits are preserved." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El perfil en la nube cambió. Se conservan tus cambios sin guardar." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le profil cloud a changé. Vos modifications non enregistrées sont conservées." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドプロフィールが更新されました。未保存の編集内容は保持されています。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 프로필이 변경되었습니다. 저장하지 않은 수정 사항은 유지됩니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Облачный профиль изменён. Несохранённые изменения сохранены." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "云端个人资料已更改。你的未保存编辑仍会保留。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "雲端個人資料已變更。未儲存的編輯仍會保留。" } }
+      }
+    },
+    "Discard and reload" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Verwerfen und neu laden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Discard and reload" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Descartar y volver a cargar" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Ignorer et recharger" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "破棄して再読み込み" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "버리고 새로고침" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отбросить и перезагрузить" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "放弃并重新加载" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "捨棄並重新載入" } }
+      }
+    },
+    "Discard unsaved changes and reload the cloud profile?" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Nicht gespeicherte Änderungen verwerfen und das Cloud-Profil neu laden?" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Discard unsaved changes and reload the cloud profile?" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "¿Descartar los cambios sin guardar y volver a cargar el perfil en la nube?" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Ignorer les modifications non enregistrées et recharger le profil cloud ?" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "未保存の変更を破棄してクラウドプロフィールを再読み込みしますか？" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "저장하지 않은 변경 사항을 버리고 클라우드 프로필을 새로고침할까요?" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отбросить несохранённые изменения и перезагрузить облачный профиль?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "放弃未保存的更改并重新加载云端个人资料？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "捨棄未儲存的變更並重新載入雲端個人資料嗎？" } }
       }
     },
     "Reload cloud profile" : {

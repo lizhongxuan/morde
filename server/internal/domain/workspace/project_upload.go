@@ -1,9 +1,68 @@
 package workspace
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
+
+type HostProjectUploadApplicationReport struct {
+	SourceBindingID string                      `json:"source_binding_id"`
+	TargetRevision  int64                       `json:"target_revision"`
+	ManifestSHA256  string                      `json:"manifest_sha256"`
+	Status          string                      `json:"status"`
+	AppliedRevision *int64                      `json:"applied_revision"`
+	SyncState       *BindingSyncState           `json:"sync_state"`
+	Impacts         []SyncHostApplicationImpact `json:"impacts"`
+}
+
+func ValidateHostProjectUploadApplicationReport(value HostProjectUploadApplicationReport) error {
+	if !ValidProjectSourceBindingID(value.SourceBindingID) || value.TargetRevision < 0 ||
+		!ValidProjectManifestSHA256(value.ManifestSHA256) || value.Status != "applied" && value.Status != "conflict" && value.Status != "unknown" ||
+		value.Impacts == nil ||
+		len(value.Impacts) > 100 {
+		return fmt.Errorf("host project upload application receipt is invalid")
+	}
+	if value.Status == "applied" && (value.AppliedRevision == nil || *value.AppliedRevision < value.TargetRevision ||
+		value.SyncState == nil || *value.SyncState != BindingSyncHealthy || len(value.Impacts) != 0) {
+		return fmt.Errorf("applied host project upload receipt is incomplete")
+	}
+	if value.AppliedRevision != nil && *value.AppliedRevision < 0 ||
+		value.SyncState != nil && *value.SyncState != BindingSyncHealthy && *value.SyncState != BindingSyncConflict {
+		return fmt.Errorf("host project upload application status is invalid")
+	}
+	seen := make(map[string]struct{}, len(value.Impacts))
+	for _, impact := range value.Impacts {
+		if impact.Path != "." && ValidateRelativePath(impact.Path) != nil ||
+			impact.State != "applied" && impact.State != "conflict" && impact.State != "unknown" ||
+			!validHostProjectApplicationReason(impact.Reason) {
+			return fmt.Errorf("host project upload application impact is invalid")
+		}
+		if _, exists := seen[impact.Path]; exists {
+			return fmt.Errorf("host project upload application impacts contain duplicates")
+		}
+		seen[impact.Path] = struct{}{}
+	}
+	return nil
+}
+
+func validHostProjectApplicationReason(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return true
+}
 
 // PrepareProjectUploadSnapshot maps a complete local project manifest beneath
 // the server-registered project path. Client scope and delete lists are not
@@ -156,6 +215,49 @@ func ProjectSnapshotDeletions(folderRoot string, baselineFiles []File, baselineE
 		}
 	}
 	return uniqueStrings(deletedFiles), uniqueStrings(deletedDirectories), nil
+}
+
+// ProjectManifestSHA256 hashes a canonical complete source snapshot for Host
+// application receipts. The caller supplies only the server-prefixed manifest.
+func ProjectManifestSHA256(folderRoot string, files []File, emptyDirectories []string, directories []Directory) (string, error) {
+	if ValidateRelativePath(folderRoot) != nil {
+		return "", fmt.Errorf("project manifest root is invalid")
+	}
+	canonicalFiles := append([]File(nil), files...)
+	sort.Slice(canonicalFiles, func(i, j int) bool {
+		return strings.ToLower(canonicalFiles[i].Path) < strings.ToLower(canonicalFiles[j].Path)
+	})
+	for _, file := range canonicalFiles {
+		if err := ValidateFile(file); err != nil || !inScope(strings.ToLower(file.Path), []string{folderRoot}) {
+			return "", fmt.Errorf("project manifest contains an invalid file")
+		}
+	}
+	canonicalEmptyDirectories := append([]string(nil), emptyDirectories...)
+	for _, directory := range canonicalEmptyDirectories {
+		if ValidateRelativePath(directory) != nil || !inDirectoryScope(strings.ToLower(directory), []string{folderRoot}) {
+			return "", fmt.Errorf("project manifest contains an invalid directory")
+		}
+	}
+	sort.Strings(canonicalEmptyDirectories)
+	canonicalDirectories := append([]Directory(nil), directories...)
+	for _, directory := range canonicalDirectories {
+		if ValidateDirectory(directory, true) != nil || !inDirectoryScope(strings.ToLower(directory.Path), []string{folderRoot}) {
+			return "", fmt.Errorf("project manifest contains invalid directory metadata")
+		}
+	}
+	sort.Slice(canonicalDirectories, func(i, j int) bool {
+		return strings.ToLower(canonicalDirectories[i].Path) < strings.ToLower(canonicalDirectories[j].Path)
+	})
+	encoded, err := json.Marshal(struct {
+		Files            []File      `json:"files"`
+		EmptyDirectories []string    `json:"empty_directories"`
+		Directories      []Directory `json:"directories"`
+	}{canonicalFiles, canonicalEmptyDirectories, canonicalDirectories})
+	if err != nil {
+		return "", fmt.Errorf("encode project manifest: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func uniqueStrings(values []string) []string {

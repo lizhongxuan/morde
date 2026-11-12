@@ -194,7 +194,8 @@ finished_at=CASE WHEN $2 IN ('completed','failed') THEN clock_timestamp() ELSE N
 	recent, err = store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewRecent,
 		app.PageRequest{Limit: 1, Cursor: recent.NextCursor})
 	if err != nil || len(recent.Items) != 1 || recent.NextCursor != "" || recentIDs[recent.Items[0].ID] ||
-		!(recentIDs[first.Task.ID] && recent.Items[0].ID == results[1].Task.ID || recentIDs[results[1].Task.ID] && recent.Items[0].ID == first.Task.ID) {
+		(!recentIDs[first.Task.ID] || recent.Items[0].ID != results[1].Task.ID) &&
+			(!recentIDs[results[1].Task.ID] || recent.Items[0].ID != first.Task.ID) {
 		t.Fatalf("second recent task page = %+v, seen=%v, err=%v", recent, recentIDs, err)
 	}
 }

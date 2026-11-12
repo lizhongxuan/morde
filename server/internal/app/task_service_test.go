@@ -931,7 +931,7 @@ func TestTaskServiceListHidesTasksWithoutHostReadAccess(t *testing.T) {
 	}
 }
 
-func TestTaskServiceListEventsRejectsInvalidStoredSequence(t *testing.T) {
+func TestTaskServiceListEventsValidatesEnvelopeAndAllowsUnknownType(t *testing.T) {
 	store := &taskStoreStub{
 		details: TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}},
 		events:  []task.Event{{TaskID: "q1234567", Sequence: 4, Type: "task.status", Payload: []byte(`{}`), CreatedAt: time.Now()}},
@@ -945,9 +945,14 @@ func TestTaskServiceListEventsRejectsInvalidStoredSequence(t *testing.T) {
 		t.Fatalf("event sequence gap returned %v", err)
 	}
 	store.events = []task.Event{{TaskID: "q1234567", Sequence: 1, Type: "task.unknown", Payload: []byte(`{}`), CreatedAt: time.Now()}}
+	page, err := service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 0, 50)
+	if err != nil || len(page.Items) != 1 || page.Items[0].Type != "task.unknown" || page.Items[0].Sequence != 1 {
+		t.Fatalf("safe unknown event envelope was rejected or changed: page=%#v err=%v", page, err)
+	}
+	store.events = []task.Event{{TaskID: "q1234567", Sequence: 1, Type: "task.future\r\nid: 99", Payload: []byte(`{"secret":"hidden"}`), CreatedAt: time.Now()}}
 	_, err = service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 0, 50)
 	if domain.CodeOf(err) != domain.CodeInternal {
-		t.Fatalf("unknown event type returned %v", err)
+		t.Fatalf("unsafe unknown event type returned %v", err)
 	}
 }
 

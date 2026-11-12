@@ -1572,7 +1572,7 @@ test('project upload registers only folder metadata and reports a stopped Host a
   const folderID = 'morde-0123456789abcdef0123456789abcdef';
   const host = {
     id: 'h1234567', name: 'offline computer', owner_id: 'u1234567', state: 'stopped',
-    workspaces: [{ state: 'active', desired_revision: 8, applied_revision: 6,
+    workspaces: [{ state: 'active', binding_version: 2, desired_revision: 9, applied_revision: 6,
       workspace: { id: 'w1234567', name: 'workspace', state: 'ready' } }],
   };
   let projectFolder = {
@@ -1581,6 +1581,7 @@ test('project upload registers only folder metadata and reports a stopped Host a
   };
   const calls = [];
   let registered = false;
+  let receiptStatus = 'pending_apply';
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url);
     calls.push({ url: path, options });
@@ -1589,6 +1590,15 @@ test('project upload registers only folder metadata and reports a stopped Host a
     if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
     if (path.endsWith('/api/hosts')) return json({ items: [host, { ...host, id: 'h7654321', owner_id: 'u7654321' }] });
     if (path.endsWith('/api/hosts/h1234567')) return json(host);
+    if (path.endsWith('/api/workspaces/w1234567/sync-sessions/p2345678')) return json({
+      id: 'p2345678', workspace_id: 'w1234567', folder_id: folderID, direction: 'upload', state: 'completed', target_revision: 8,
+      host_application: {
+        status: receiptStatus, host_id: 'h1234567', workspace_binding_version: 2, target_revision: 8,
+        manifest_sha256: 'a'.repeat(64), runtime_generation: receiptStatus === 'pending_apply' ? null : 7,
+        applied_revision: receiptStatus === 'pending_apply' ? null : 9,
+        sync_state: receiptStatus === 'pending_apply' ? null : 'healthy', impacts: [],
+      },
+    });
     if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });
     if (path.endsWith('/api/hosts/h1234567/sync-folders') && options.method === 'POST') {
       registered = true;
@@ -1600,7 +1610,7 @@ test('project upload registers only folder metadata and reports a stopped Host a
   const syncCalls = [];
   Sync.prototype.run = async function (_auth, mapping, mode, scope, checkpoint, _authorized, confirmMapping) {
     await confirmMapping?.();
-    syncCalls.push({ workspaceId: mapping.workspaceId, mode, scope, folderId: checkpoint.folderId, hostId: checkpoint.hostId,
+    syncCalls.push({ workspaceId: mapping.workspaceId, mode, scope, folderId: checkpoint.folderId, hostId: checkpoint.hostId, sourceBindingID: checkpoint.sourceBindingID,
       idempotencyKey: checkpoint.idempotencyKey, sessionId: checkpoint.sessionId });
     if (syncCalls.length === 1) {
       this.update('running', { session_id: 'p1234567', stage: 'compare' });
@@ -1611,6 +1621,8 @@ test('project upload registers only folder metadata and reports a stopped Host a
   };
   const h = harness(auth);
   h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
+  let confirmation;
+  h.dialog.showMessageBox = async (_window, options) => { confirmation = options; return { response: 0 }; };
   try {
     await h.ready();
     const targets = await h.invoke('morde:project-upload-targets');
@@ -1621,7 +1633,14 @@ test('project upload registers only folder metadata and reports a stopped Host a
       selectionID: selection.selectionID, hostId: 'h1234567', workspaceId: 'w1234567',
       projectName: 'demo', directoryName: 'demo',
     });
+    const sameDirectory = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
+    assert.equal(sameDirectory.selectionID, selection.selectionID, 'reselecting the same local directory keeps its private source identity');
     const conflict = await h.invoke('morde:project-upload', selection.selectionID, 'demo');
+    assert.match(confirmation.message, /offline computer/);
+    assert.match(confirmation.detail, /目标电脑：offline computer（h1234567）/);
+    assert.match(confirmation.detail, /完整扫描所选本机根目录/);
+    assert.match(confirmation.detail, /整次扫描失败并保留恢复点/);
+    assert.match(confirmation.detail, /不会把不可访问内容视为删除/);
     assert.equal(conflict.session.state, 'conflict');
     assert.equal(conflict.cloudStatus, 'pending');
     assert.deepEqual(conflict.conflicts.map((item) => item.path), ['existing-folder']);
@@ -1636,6 +1655,14 @@ test('project upload registers only folder metadata and reports a stopped Host a
     assert.equal(result.cloudStatus, 'confirmed');
     assert.equal(result.hostStatus, 'pending_apply');
     assert.equal(syncCalls.length, 2);
+    let checkpoint = (await h.invoke('morde:state')).syncCheckpoint;
+    assert.equal(checkpoint.sessionId, 'p2345678');
+    assert.equal(checkpoint.sessionState, 'completed');
+    assert.equal(checkpoint.hostApplicationStatus, 'pending_apply');
+    assert.deepEqual(result.hostApplication.impacts, []);
+    await assert.rejects(h.invoke('morde:sync-discard'), /回执尚未确认/);
+    assert.match(syncCalls[0].sourceBindingID, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.equal(syncCalls[1].sourceBindingID, syncCalls[0].sourceBindingID);
     assert.deepEqual(syncCalls.map(({ workspaceId, mode, scope, folderId, hostId }) => ({ workspaceId, mode, scope, folderId, hostId })), [
       { workspaceId: 'w1234567', mode: 'project_upload', scope: [], folderId: folderID, hostId: 'h1234567' },
       { workspaceId: 'w1234567', mode: 'project_upload', scope: [], folderId: folderID, hostId: 'h1234567' },
@@ -1647,7 +1674,18 @@ test('project upload registers only folder metadata and reports a stopped Host a
     assert.deepEqual(JSON.parse(registration.options.body), { project_name: 'demo' });
     assert.equal(registration.options.headers.cookie, 'ch_portal=portal-session');
     assert.equal(calls.some((call) => /start|launch/.test(call.url)), false);
+    const receiptCalls = calls.filter((call) => call.url.endsWith('/api/workspaces/w1234567/sync-sessions/p2345678'));
+    assert.equal(receiptCalls.length, 1);
+    assert.equal(receiptCalls[0].options.headers.authorization, 'Bearer sync-secret');
+    assert.equal((await h.invoke('morde:state')).syncCheckpoint.hostApplicationStatus, 'pending_apply');
+    receiptStatus = 'applied';
+    host.workspaces[0].applied_revision = 9;
+    const checked = await h.invoke('morde:project-upload', selection.selectionID, 'demo');
+    assert.equal(checked.hostStatus, 'applied');
+    assert.equal(checked.hostApplication.appliedRevision, 9);
+    assert.equal(syncCalls.length, 2, 'checking a completed session reads its receipt without starting another scan/upload');
     assert.equal((await h.invoke('morde:state')).syncCheckpoint, null);
+    assert.equal(calls.filter((call) => call.url.endsWith('/api/workspaces/w1234567/sync-sessions/p2345678')).length, 2);
     assert.equal(readFileSync(profileFile(h, auth, 'project-mappings'), 'utf8').includes(directory), true);
     assert.equal(JSON.stringify(targets).includes(directory), false);
     assert.equal(info.isDirectory(), true);
@@ -1656,6 +1694,37 @@ test('project upload registers only folder metadata and reports a stopped Host a
     globalThis.fetch = originalFetch;
     h.cleanup();
     rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy project mappings receive a private source binding before reuse', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => loginFetch(url);
+  const appRoot = mkdtempSync(join(tmpdir(), 'morde-desktop-legacy-project-'));
+  const userData = join(appRoot, 'Morde Client');
+  const directory = join(appRoot, 'legacy-demo');
+  mkdirSync(userData, { recursive: true });
+  mkdirSync(directory);
+  const info = statSync(directory, { bigint: true });
+  const profileID = createHash('sha256').update(`${auth.origin}\0${auth.serviceInstanceID}\0${auth.accountName}\0${auth.installationId}`).digest('hex');
+  writeFileSync(join(userData, 'credentials.bin'), JSON.stringify({ version: 2, credentials: auth }));
+  writeFileSync(join(userData, `project-mappings-${profileID}.json`), JSON.stringify([{
+    selectionID: '12345678-1234-4234-8234-123456789abc', hostId: 'h1234567', workspaceId: 'w1234567',
+    projectName: 'legacy-demo', directory, dev: info.dev.toString(), ino: info.ino.toString(),
+    registrationKey: '22345678-1234-4234-8234-123456789abc',
+  }]));
+  const h = harness(null, appRoot);
+  try {
+    await h.ready();
+    const state = await h.invoke('morde:state');
+    assert.equal(state.projectMappings.length, 1);
+    assert.equal('sourceBindingID' in state.projectMappings[0], false, 'the opaque source ID must stay in the private main process');
+    const saved = JSON.parse(readFileSync(profileFile(h, auth, 'project-mappings'), 'utf8'));
+    assert.match(saved[0].sourceBindingID, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup(false);
+    rmSync(appRoot, { recursive: true, force: true });
   }
 });
 
@@ -1670,18 +1739,28 @@ test('project upload resumes the same confirmed session after desktop restart', 
   const folderID = 'morde-abcdef0123456789abcdef0123456789';
   const host = {
     id: 'h1234567', name: 'stopped computer', owner_id: 'u1234567', state: 'stopped',
-    workspaces: [{ state: 'active', desired_revision: 3, applied_revision: 2,
+    workspaces: [{ state: 'active', binding_version: 4, desired_revision: 3, applied_revision: 2,
       workspace: { id: 'w1234567', name: 'workspace', state: 'ready' } }],
   };
   const folder = { folder_id: folderID, workspace_id: 'w1234567', folder_kind: 'project', project_name: 'demo',
     relative_path: 'project/demo', state: 'pending_node', sync_available: false };
   let registered = false;
+  let receiptStatus = 'pending_apply';
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url);
     if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
       supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
     if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
     if (path.endsWith('/api/hosts/h1234567')) return json(host);
+    if (path.endsWith('/api/workspaces/w1234567/sync-sessions/p1234567')) return json({
+      id: 'p1234567', workspace_id: 'w1234567', folder_id: folderID, direction: 'upload', state: 'completed', target_revision: 3,
+      host_application: {
+        status: receiptStatus, host_id: 'h1234567', workspace_binding_version: 4, target_revision: 3,
+        manifest_sha256: 'b'.repeat(64), runtime_generation: receiptStatus === 'pending_apply' ? null : 9,
+        applied_revision: receiptStatus === 'pending_apply' ? null : 3,
+        sync_state: receiptStatus === 'pending_apply' ? null : 'healthy', impacts: [],
+      },
+    });
     if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });
     if (path.endsWith('/api/hosts/h1234567/sync-folders') && options.method === 'POST') {
       registered = true;
@@ -1694,6 +1773,7 @@ test('project upload resumes the same confirmed session after desktop restart', 
   Sync.prototype.run = async function (_auth, mapping, mode, scope, checkpoint, _authorized, confirmMapping) {
     await confirmMapping?.();
     runs.push({ hostId: checkpoint.hostId, workspaceId: mapping.workspaceId, folderId: checkpoint.folderId,
+      sourceBindingID: checkpoint.sourceBindingID,
       selectionID: checkpoint.projectSelectionID, projectName: checkpoint.projectName, idempotencyKey: checkpoint.idempotencyKey,
       sessionId: checkpoint.sessionId, mode, scope });
     this.update('running', { session_id: 'p1234567', stage: 'transfer' });
@@ -1710,6 +1790,7 @@ test('project upload resumes the same confirmed session after desktop restart', 
     const saved = JSON.parse(readFileSync(profileFile(first, auth, 'sync-checkpoint'), 'utf8'));
     assert.equal(saved.mode, 'project_upload');
     assert.equal(saved.folderId, folderID);
+    assert.match(saved.sourceBindingID, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     assert.equal(saved.sessionId, 'p1234567');
     assert.equal(saved.projectSelectionID, selection.selectionID);
     first.cleanup(false);
@@ -1721,12 +1802,20 @@ test('project upload resumes the same confirmed session after desktop restart', 
     assert.equal(recovered.syncCheckpoint.mode, 'project_upload');
     const result = await second.invoke('morde:project-upload', selection.selectionID, 'demo');
     assert.equal(result.cloudStatus, 'confirmed');
+    assert.equal(result.hostStatus, 'pending_apply');
     assert.equal(result.session.id, 'p1234567');
     assert.equal(runs.length, 2);
     assert.equal(runs[1].sessionId, 'p1234567');
     assert.equal(runs[1].idempotencyKey, runs[0].idempotencyKey);
     assert.equal(runs[1].folderId, runs[0].folderId);
+    assert.equal(runs[1].sourceBindingID, runs[0].sourceBindingID);
     assert.equal(runs[1].selectionID, runs[0].selectionID);
+    assert.equal((await second.invoke('morde:state')).syncCheckpoint.hostApplicationStatus, 'pending_apply');
+    receiptStatus = 'applied';
+    host.workspaces[0].applied_revision = 3;
+    const checked = await second.invoke('morde:project-upload', selection.selectionID, 'demo');
+    assert.equal(checked.hostStatus, 'applied');
+    assert.equal(runs.length, 2, 'restart receipt check must not repeat the completed project upload');
     assert.equal((await second.invoke('morde:state')).syncCheckpoint, null);
   } finally {
     Sync.prototype.run = originalRun;
@@ -1772,6 +1861,49 @@ test('project upload rejects a replaced local directory before registration or t
     await assert.rejects(h.invoke('morde:project-upload', selection.selectionID, 'demo'), /身份已变化/);
     assert.equal(syncStarted, false);
     assert.equal(calls.some((call) => call.method === 'POST' && call.path.endsWith('/sync-folders')), false, 'changed directory must be rejected before cloud folder registration');
+  } finally {
+    Sync.prototype.run = originalRun;
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('project upload keeps a missing local root from becoming an empty upload', async () => {
+  const originalFetch = globalThis.fetch;
+  const Sync = require('../out/morde-sync.js').MordeSync;
+  const originalRun = Sync.prototype.run;
+  const projectRoot = mkdtempSync(join(homedir(), 'morde-project-missing-empty-'));
+  const directory = join(projectRoot, 'demo');
+  mkdirSync(directory);
+  const host = { id: 'h1234567', name: 'computer', owner_id: 'u1234567', state: 'running',
+    workspaces: [{ state: 'active', binding_version: 2, workspace: { id: 'w1234567', state: 'ready' } }] };
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    calls.push({ path, method: options.method || 'GET' });
+    if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
+      supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
+    if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
+    if (path.endsWith('/api/hosts/h1234567')) return json(host);
+    if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });
+    if (path.endsWith('/api/hosts/h1234567/sync-folders')) return json({ items: [] });
+    throw new Error('unexpected metadata request ' + path);
+  };
+  let syncStarted = false;
+  Sync.prototype.run = async () => { syncStarted = true; throw new Error('sync must not start for a missing local folder'); };
+  const h = harness(auth);
+  h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
+  h.dialog.showMessageBox = async () => ({ response: 0 });
+  try {
+    await h.ready();
+    const selection = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
+    rmSync(directory, { recursive: true, force: true });
+    await assert.rejects(h.invoke('morde:project-upload', selection.selectionID, 'demo'), /项目根目录无法访问/);
+    assert.equal(syncStarted, false);
+    assert.equal(calls.some((call) => call.method === 'POST' && call.path.endsWith('/sync-folders')), false,
+      'a missing local root must be detected before cloud folder registration');
+    assert.equal((await h.invoke('morde:state')).syncCheckpoint, null);
   } finally {
     Sync.prototype.run = originalRun;
     globalThis.fetch = originalFetch;

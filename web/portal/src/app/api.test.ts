@@ -91,6 +91,42 @@ describe('typed Portal API client', () => {
     expect(request?.headers.get('X-Morde-Actor-ID')).toBe('actor-id');
   });
 
+  it('fences personal-data deletion and upload cancellation to the stored account and service identities', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request
+        ? new Request(input, init)
+        : new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      requests.push(request);
+      return request.method === 'DELETE' && new URL(request.url).pathname.endsWith('/uploads/pu_12345678')
+        ? new Response(null, { status: 204 })
+        : Response.json({ result_revision: 4, account_change_sequence: 18 });
+    }));
+
+    await portalApi.deletePersonalObject('profile', 'default', 3, 'personal-delete-001', 'instance-a', 'u1234567');
+    await portalApi.cancelPersonalAttachmentUpload('pu_12345678', 'instance-a', 'u1234567');
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['DELETE', '/api/personal-data/profile/default'],
+      ['DELETE', '/api/personal-data/uploads/pu_12345678'],
+    ]);
+    expect(requests[0]?.headers.get('Idempotency-Key')).toBe('personal-delete-001');
+    expect(await requests[0]!.json()).toEqual({ base_revision: 3 });
+    expect(requests.every((request) => request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a'
+      && request.headers.get('X-Morde-Actor-ID') === 'u1234567')).toBe(true);
+  });
+
+  it('rejects partially supplied personal-data identity before sending a request', async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(portalApi.deletePersonalObject('profile', 'default', 0, 'personal-delete-002', 'instance-a'))
+      .rejects.toThrow('个人数据操作必须同时提供服务实例和账号身份。');
+    await expect(portalApi.cancelPersonalAttachmentUpload('pu_12345678', undefined, 'u1234567'))
+      .rejects.toThrow('个人数据操作必须同时提供服务实例和账号身份。');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('accepts empty 202 message-processing retries with the correct personal or project scope', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

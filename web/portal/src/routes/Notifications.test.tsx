@@ -43,6 +43,20 @@ describe('Notifications', () => {
     expect(screen.queryByText(unread.summary!)).not.toBeInTheDocument();
   });
 
+  it('keeps notification content hidden after a permission error and retries loading', async () => {
+    const list = vi.spyOn(portalApi, 'notifications')
+      .mockRejectedValueOnce(Object.assign(new Error('当前账号无权读取通知'), { status: 403 }))
+      .mockResolvedValue({ items: [unread], next_cursor: null });
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('当前账号无权读取通知');
+    expect(screen.queryByText(unread.summary!)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重试' }));
+    expect(await screen.findByText(unread.summary!)).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
   it('filters unread notifications through the API', async () => {
     const list = vi.spyOn(portalApi, 'notifications').mockResolvedValue({ items: [unread], next_cursor: null });
     const user = userEvent.setup();

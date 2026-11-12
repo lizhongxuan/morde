@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,6 +24,212 @@ type replicaTestManager struct {
 	snapshots    []contract.SetWorkspaceBindingsRequest
 	deletions    []contract.DeleteTaskWorkspaceViewRequest
 	deleteErr    error
+}
+
+func TestProjectUploadApplicationsReportOnlyVerifiedAppliedOrKnownConflict(t *testing.T) {
+	const hostID = "h1234567"
+	const sourceBindingID = "12345678-1234-4234-8234-123456789abc"
+	manifest := strings.Repeat("a", 64)
+	type receipt struct {
+		workspaceID string
+		path        string
+		body        projectUploadAppliedRequest
+	}
+	var receipts []receipt
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer bootstrap" {
+			http.Error(w, "unexpected request", http.StatusUnauthorized)
+			return
+		}
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 12 || parts[0] != "api" || parts[1] != "host-replicas" || parts[2] != hostID ||
+			parts[3] != "generations" || parts[4] != "2" || parts[5] != "workspaces" ||
+			parts[7] != "bindings" || parts[8] != "1" || parts[9] != "project-uploads" ||
+			!validReplicaSessionID(parts[10]) || parts[11] != "applied" {
+			http.Error(w, "unexpected receipt path", http.StatusNotFound)
+			return
+		}
+		var body projectUploadAppliedRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			http.Error(w, "invalid receipt", http.StatusBadRequest)
+			return
+		}
+		workspaceID := parts[6]
+		receipts = append(receipts, receipt{workspaceID: workspaceID, path: r.URL.Path, body: body})
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	controller, err := New(Options{
+		HostID: hostID, Generation: 2, PortalURL: server.URL, BootstrapCredential: "bootstrap",
+		WorkspaceRoot: t.TempDir(), Manager: &replicaTestManager{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeApplication := func(sessionID string) []projectUploadApplication {
+		return []projectUploadApplication{{
+			SessionID: sessionID, SourceBindingID: sourceBindingID, ProjectPath: "project/demo",
+			TargetRevision: 8, ManifestSHA256: manifest,
+		}}
+	}
+	items := map[string]replicaItem{
+		"w1234567": {WorkspaceID: "w1234567", State: "active", SyncState: "healthy", BindingVersion: 1, AppliedRevision: 8, ProjectUploadApplications: makeApplication("p1234567")},
+		"w2345678": {WorkspaceID: "w2345678", State: "active", SyncState: "healthy", BindingVersion: 1, AppliedRevision: 9, ProjectUploadApplications: makeApplication("p2345678")},
+		"w3456789": {WorkspaceID: "w3456789", State: "active", SyncState: "healthy", BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p3456789")},
+		"w4567890": {
+			WorkspaceID: "w4567890", State: "active", SyncState: "conflict", SyncConflicts: []string{
+				"project/demo/src/main.go", "project/demo/src/main.go", "project/demo", "project/other/keep.txt", "outside.txt",
+			}, BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p4567890"),
+		},
+	}
+	if err := controller.applyProjectUploadApplications(context.Background(), items); err != nil {
+		t.Fatalf("apply project upload applications: %v", err)
+	}
+	if len(receipts) != 3 {
+		t.Fatalf("reported %d applications, want exact, high, and conflict only: %#v", len(receipts), receipts)
+	}
+	got := make(map[string]receipt, len(receipts))
+	for _, value := range receipts {
+		got[value.workspaceID] = value
+	}
+	if _, exists := got["w3456789"]; exists {
+		t.Fatal("reported application before the target revision was applied")
+	}
+	for _, test := range []struct {
+		workspaceID     string
+		sessionID       string
+		status          string
+		syncState       string
+		appliedRevision int64
+		impacts         []string
+	}{
+		{"w1234567", "p1234567", "applied", "healthy", 8, []string{}},
+		{"w2345678", "p2345678", "applied", "healthy", 9, []string{}},
+		{"w4567890", "p4567890", "conflict", "conflict", 0, []string{"src/main.go"}},
+	} {
+		value, exists := got[test.workspaceID]
+		if !exists {
+			t.Fatalf("missing receipt for %s", test.workspaceID)
+		}
+		wantPath := "/api/host-replicas/" + hostID + "/generations/2/workspaces/" + test.workspaceID +
+			"/bindings/1/project-uploads/" + test.sessionID + "/applied"
+		if value.path != wantPath {
+			t.Fatalf("receipt path for %s = %q, want %q", test.workspaceID, value.path, wantPath)
+		}
+		if value.body.SourceBindingID != sourceBindingID || value.body.TargetRevision != 8 || value.body.ManifestSHA256 != manifest ||
+			value.body.Status != test.status || value.body.SyncState == nil || *value.body.SyncState != test.syncState || len(value.body.Impacts) != len(test.impacts) {
+			t.Fatalf("receipt for %s = %#v", test.workspaceID, value.body)
+		}
+		if test.status == "applied" {
+			if value.body.AppliedRevision == nil || *value.body.AppliedRevision != test.appliedRevision {
+				t.Fatalf("applied receipt for %s has applied_revision %#v, want %d", test.workspaceID, value.body.AppliedRevision, test.appliedRevision)
+			}
+		} else if value.body.AppliedRevision != nil {
+			t.Fatalf("non-applied receipt for %s included an applied_revision: %d", test.workspaceID, *value.body.AppliedRevision)
+		}
+		gotImpacts := make([]string, 0, len(value.body.Impacts))
+		for _, impact := range value.body.Impacts {
+			if impact.State != "conflict" || impact.Reason != "workspace_conflict" {
+				t.Fatalf("receipt impact for %s = %#v", test.workspaceID, impact)
+			}
+			gotImpacts = append(gotImpacts, impact.Path)
+		}
+		if strings.Join(gotImpacts, ",") != strings.Join(test.impacts, ",") {
+			t.Fatalf("receipt impacts for %s = %#v, want %#v", test.workspaceID, gotImpacts, test.impacts)
+		}
+	}
+}
+
+func TestProjectUploadApplicationValidationRejectsUnsafeIdentityAndPaths(t *testing.T) {
+	valid := projectUploadApplication{
+		SessionID: "p1234567", SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+		ProjectPath: "project/demo", TargetRevision: 0, ManifestSHA256: strings.Repeat("a", 64),
+	}
+	if !validProjectUploadApplication(valid) {
+		t.Fatal("valid revision-zero project application was rejected")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*projectUploadApplication)
+	}{
+		{"session traversal", func(value *projectUploadApplication) { value.SessionID = "p123/567" }},
+		{"invalid source binding", func(value *projectUploadApplication) { value.SourceBindingID = "not-a-binding" }},
+		{"workspace escape", func(value *projectUploadApplication) { value.ProjectPath = "project/../secret" }},
+		{"outside project tree", func(value *projectUploadApplication) { value.ProjectPath = "secrets/key" }},
+		{"negative revision", func(value *projectUploadApplication) { value.TargetRevision = -1 }},
+		{"invalid manifest digest", func(value *projectUploadApplication) { value.ManifestSHA256 = strings.Repeat("A", 64) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := valid
+			test.mutate(&value)
+			if validProjectUploadApplication(value) {
+				t.Fatalf("accepted invalid project application: %#v", value)
+			}
+		})
+	}
+}
+
+func TestProjectUploadApplicationRetriesIdenticallyAfterLostResponseAndRestart(t *testing.T) {
+	const hostID = "h1234567"
+	var attempts int
+	var paths, bodies []string
+	var savedPath, savedBody string
+	var committed int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read receipt body: %v", err)
+			return
+		}
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, string(body))
+		attempts++
+		if attempts == 1 {
+			savedPath, savedBody = r.URL.Path, string(body)
+			committed++
+			http.Error(w, "response lost after commit", http.StatusServiceUnavailable)
+			return
+		}
+		if r.URL.Path != savedPath || string(body) != savedBody {
+			http.Error(w, "non-idempotent retry", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	controller, err := New(Options{
+		HostID: hostID, Generation: 2, PortalURL: server.URL, BootstrapCredential: "bootstrap",
+		WorkspaceRoot: t.TempDir(), Manager: &replicaTestManager{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := replicaItem{
+		WorkspaceID: "w1234567", State: "active", SyncState: "healthy", BindingVersion: 3, AppliedRevision: 8,
+		ProjectUploadApplications: []projectUploadApplication{{
+			SessionID: "p1234567", SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+			ProjectPath: "project/demo", TargetRevision: 8, ManifestSHA256: strings.Repeat("b", 64),
+		}},
+	}
+	items := map[string]replicaItem{item.WorkspaceID: item}
+	if err := controller.applyProjectUploadApplications(context.Background(), items); err == nil {
+		t.Fatal("first application receipt unexpectedly succeeded")
+	}
+	restarted, err := New(Options{
+		HostID: hostID, Generation: 2, PortalURL: server.URL, BootstrapCredential: "bootstrap",
+		WorkspaceRoot: t.TempDir(), Manager: &replicaTestManager{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.applyProjectUploadApplications(context.Background(), items); err != nil {
+		t.Fatalf("retry application receipt after Runtime restart: %v", err)
+	}
+	if attempts != 2 || committed != 1 || paths[0] != paths[1] || bodies[0] != bodies[1] {
+		t.Fatalf("retry changed receipt or duplicated commit: attempts=%d commits=%d paths=%q bodies=%q", attempts, committed, paths, bodies)
+	}
 }
 
 func (m *replicaTestManager) Capabilities(contract.CapabilitiesRequest) (contract.CapabilitiesResponse, error) {

@@ -31,6 +31,44 @@ var (
 	ErrShellOperationCancelled  = errors.New("shell operation cancelled")
 )
 
+type ShellFailureCategory string
+
+const (
+	ShellFailureOther          ShellFailureCategory = "other"
+	ShellFailureCgroup         ShellFailureCategory = "cgroup"
+	ShellFailureRequiredTool   ShellFailureCategory = "required_tool"
+	ShellFailureWorkspaceProbe ShellFailureCategory = "workspace_or_probe"
+)
+
+type shellStartupFailure struct{ category ShellFailureCategory }
+
+func (e *shellStartupFailure) Error() string { return ErrProcessDomainUnavailable.Error() }
+
+func (e *shellStartupFailure) Unwrap() error { return ErrProcessDomainUnavailable }
+
+func shellStartupUnavailable(category ShellFailureCategory) error {
+	switch category {
+	case ShellFailureCgroup, ShellFailureRequiredTool, ShellFailureWorkspaceProbe:
+		return &shellStartupFailure{category: category}
+	default:
+		return &shellStartupFailure{category: ShellFailureOther}
+	}
+}
+
+// ShellFailureCategoryOf returns only a static startup category; it never exposes the underlying failure text.
+func ShellFailureCategoryOf(err error) ShellFailureCategory {
+	var failure *shellStartupFailure
+	if !errors.As(err, &failure) {
+		return ShellFailureOther
+	}
+	switch failure.category {
+	case ShellFailureCgroup, ShellFailureRequiredTool, ShellFailureWorkspaceProbe:
+		return failure.category
+	default:
+		return ShellFailureOther
+	}
+}
+
 // ShellOptions bounds a shell handler and points it at the delegated cgroup v2
 // mount. The action always runs as the fixed, non-root gem account.
 type ShellOptions struct {

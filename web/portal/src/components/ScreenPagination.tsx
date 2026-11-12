@@ -56,10 +56,14 @@ export function ScreenPagination<T>({
   const viewportRef = useRef<HTMLDivElement>(null);
   const anchorToken = useRef<string | null>(null);
   const previousKeys = useRef<string[]>([]);
+  const previousKeySignature = useRef<string | null>(null);
+  const previousRangeSignature = useRef<string | null>(null);
   const [measuredHeights, setMeasuredHeights] = useState<ReadonlyMap<string, number>>(() => new Map());
   const [viewportHeight, setViewportHeight] = useState(0);
   const [overflowItemKeys, setOverflowItemKeys] = useState<ReadonlySet<string>>(() => new Set());
   const [page, setPage] = useState(0);
+
+  if (items.length === 0 && page !== 0) setPage(0);
 
   const keys = useMemo(() => items.map((item) => token(getKey(item))), [items, getKey]);
   const keySignature = JSON.stringify(keys);
@@ -96,20 +100,36 @@ export function ScreenPagination<T>({
   const currentRange = ranges[currentPage];
 
   useLayoutEffect(() => {
-    if (previousKeys.current.length === keys.length && previousKeys.current.every((key, index) => key === keys[index])) return;
+    const keysChanged = previousKeySignature.current !== keySignature;
+    const rangesChanged = previousRangeSignature.current !== rangeSignature;
+    if (!keysChanged && !rangesChanged) return;
+
+    const oldKeys = previousKeys.current;
     previousKeys.current = keys;
-    if (!anchorToken.current) return;
+    previousKeySignature.current = keySignature;
+    previousRangeSignature.current = rangeSignature;
+    if (!keys.length) {
+      anchorToken.current = null;
+      return;
+    }
+
+    if (!anchorToken.current) {
+      anchorToken.current = keys[ranges[currentPage]?.start ?? 0] ?? null;
+      return;
+    }
+
     const index = keys.indexOf(anchorToken.current);
     if (index >= 0) {
       const nextPage = findPage(ranges, index);
-      setPage(nextPage);
-      anchorToken.current = keys[ranges[nextPage]?.start ?? index] ?? anchorToken.current;
+      if (nextPage !== currentPage) setPage(nextPage);
     } else {
-      const nextPage = Math.min(currentPage, Math.max(0, pageCount - 1));
-      setPage(nextPage);
-      anchorToken.current = keys[ranges[nextPage]?.start ?? 0] ?? null;
+      const oldAnchorIndex = oldKeys.indexOf(anchorToken.current);
+      const fallbackIndex = Math.min(Math.max(oldAnchorIndex >= 0 ? oldAnchorIndex : currentRange?.start ?? 0, 0), keys.length - 1);
+      const nextPage = findPage(ranges, fallbackIndex);
+      if (nextPage !== currentPage) setPage(nextPage);
+      anchorToken.current = keys[ranges[nextPage]?.start ?? fallbackIndex] ?? null;
     }
-  }, [keySignature, keys, ranges, rangeSignature, currentPage, pageCount]);
+  }, [keySignature, keys, ranges, rangeSignature, currentPage, currentRange, pageCount]);
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
@@ -154,7 +174,24 @@ export function ScreenPagination<T>({
 
   function onKeyDown(event: KeyboardEvent<HTMLElement>) {
     const target = event.target;
-    if (target instanceof HTMLElement && target.closest('input, textarea, select, button, a, [contenteditable="true"], [data-screen-pagination-scroll]')) return;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.closest('input, textarea, select, button, a, [contenteditable="true"]')) return;
+    const scrollRegion = target.closest<HTMLElement>('[data-screen-pagination-scroll]');
+    if (scrollRegion) {
+      const maxScrollTop = Math.max(0, scrollRegion.scrollHeight - scrollRegion.clientHeight);
+      const pageStep = Math.max(40, Math.floor(scrollRegion.clientHeight * 0.9));
+      const nextScrollTop = event.key === 'ArrowDown' ? scrollRegion.scrollTop + 40
+        : event.key === 'ArrowUp' ? scrollRegion.scrollTop - 40
+          : event.key === 'PageDown' || event.key === ' ' || event.key === 'Spacebar' ? scrollRegion.scrollTop + pageStep
+            : event.key === 'PageUp' ? scrollRegion.scrollTop - pageStep
+              : event.key === 'Home' ? 0
+                : event.key === 'End' ? maxScrollTop : null;
+      if (nextScrollTop !== null) {
+        event.preventDefault();
+        scrollRegion.scrollTop = Math.min(maxScrollTop, Math.max(0, nextScrollTop));
+      }
+      return;
+    }
     if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
       event.preventDefault();
       goToPage(currentPage - 1);

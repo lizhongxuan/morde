@@ -25,6 +25,12 @@ type hostReplicaService struct {
 	sealer     *Sealer
 }
 
+type hostReplicaProjectUploadApplicationStore interface {
+	ListPendingWorkspaceSyncProjectUploadApplications(context.Context, string, string, int64) ([]workspace.PendingProjectUploadApplication, error)
+	RecordWorkspaceSyncProjectUploadApplication(context.Context, identity.Principal, string, int64, string,
+		workspace.HostProjectUploadApplicationReport) (workspace.SyncHostApplication, error)
+}
+
 func NewHostReplicaService(hosts HostStore, workspaces WorkspaceStore, users UserStore, sealer *Sealer) (HostReplicaService, error) {
 	if hosts == nil || workspaces == nil || users == nil || sealer == nil {
 		return nil, errors.New("host replica dependencies are required")
@@ -157,7 +163,38 @@ func (s *hostReplicaService) ListBindings(ctx context.Context, principal identit
 	if activeCount != 1 {
 		return nil, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
 	}
+	projectApplications, ok := s.workspaces.(hostReplicaProjectUploadApplicationStore)
+	if !ok {
+		return nil, domain.NewError(domain.CodeUnsupported, "Host project upload application queue is unavailable")
+	}
+	for index := range bindings {
+		if bindings[index].State == workspace.BindingDetached || bindings[index].State == workspace.BindingFailed {
+			continue
+		}
+		pending, err := projectApplications.ListPendingWorkspaceSyncProjectUploadApplications(ctx, principal.HostScope,
+			bindings[index].Workspace.ID, bindings[index].BindingVersion)
+		if err != nil {
+			return nil, err
+		}
+		bindings[index].ProjectUploadApplications = pending
+	}
 	return bindings, nil
+}
+
+func (s *hostReplicaService) RecordProjectUploadApplication(ctx context.Context, principal identity.Principal,
+	workspaceID string, bindingVersion int64, sessionID string, report workspace.HostProjectUploadApplicationReport) (workspace.SyncHostApplication, error) {
+	if principal.ReplicaWorkspaceID != workspaceID || principal.BindingVersion != bindingVersion ||
+		!workspace.ValidSessionID(sessionID) || workspace.ValidateHostProjectUploadApplicationReport(report) != nil {
+		return workspace.SyncHostApplication{}, domain.InvalidArgument("project_upload_application", "Host project upload application report is invalid")
+	}
+	if err := s.verifyPrincipal(ctx, principal); err != nil {
+		return workspace.SyncHostApplication{}, err
+	}
+	store, ok := s.workspaces.(hostReplicaProjectUploadApplicationStore)
+	if !ok {
+		return workspace.SyncHostApplication{}, domain.NewError(domain.CodeUnsupported, "Host project upload application receipts are unavailable")
+	}
+	return store.RecordWorkspaceSyncProjectUploadApplication(ctx, principal, workspaceID, bindingVersion, sessionID, report)
 }
 
 func (s *hostReplicaService) CredentialForBinding(ctx context.Context, principal identity.Principal, workspaceID string, bindingVersion int64) (string, error) {

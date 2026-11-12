@@ -21,6 +21,8 @@ import (
 type CloudDSHToolBroker struct {
 	store                    TaskStore
 	runtime                  *RuntimeToolExecutor
+	historyCursorKey         []byte
+	historyCursorInstanceID  string
 	recordCapture            *RecordCaptureService
 	mcpCredentials           MCPConnectorCredentialProvider
 	mcpClient                MCPConnectorToolClient
@@ -35,6 +37,20 @@ type CloudDSHToolBroker struct {
 	goals                    *GoalService
 	schedules                *ScheduleService
 	projectContext           *ProjectService
+}
+
+// SetHistorySearchCursorSigning configures stable, service-bound signatures
+// for paged current-conversation history search results.
+func (b *CloudDSHToolBroker) SetHistorySearchCursorSigning(serviceInstanceID string, dataKey []byte) error {
+	if b == nil || !domain.ValidServiceInstanceID(serviceInstanceID) || len(dataKey) != 32 {
+		return domain.InvalidArgument("history_cursor_signing", "history cursor signing configuration is invalid")
+	}
+	if len(b.historyCursorKey) > 0 && (b.historyCursorInstanceID != serviceInstanceID || !bytes.Equal(b.historyCursorKey, dataKey)) {
+		return domain.NewError(domain.CodeInvalidState, "history cursor signing configuration cannot be replaced")
+	}
+	b.historyCursorInstanceID = serviceInstanceID
+	b.historyCursorKey = append([]byte(nil), dataKey...)
+	return nil
 }
 
 type CloudDSHTaskCompletion struct {

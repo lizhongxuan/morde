@@ -743,7 +743,7 @@ func TestStdioProjectUploadParamsRequireFixedUnscopedContract(t *testing.T) {
 	baseRevision := int64(0)
 	params := syncParams{
 		BaseURL: "http://127.0.0.1", BearerToken: testBearerToken, WorkspaceID: testWorkspaceID,
-		FolderID: "morde-0123456789abcdef0123456789abcdef", Directory: "/tmp/empty-project",
+		FolderID: "morde-0123456789abcdef0123456789abcdef", SourceBindingID: "12345678-1234-4234-8234-123456789abc", Directory: "/tmp/empty-project",
 		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision,
 	}
 	if err := validateSyncParams(params); err != nil {
@@ -760,11 +760,27 @@ func TestStdioProjectUploadParamsRequireFixedUnscopedContract(t *testing.T) {
 			Directory: params.Directory, Direction: "upload", Policy: "compare_merge"},
 		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID,
 			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{"src"}},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID,
+			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: "not-a-uuid",
+			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789ABC",
+			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
 	}
 	for _, value := range invalid {
 		if err := validateSyncParams(value); err == nil {
 			t.Fatalf("invalid project upload metadata accepted: %+v", value)
 		}
+	}
+	ordinary := params
+	ordinary.FolderID = ""
+	ordinary.SourceBindingID = ""
+	if err := validateSyncParams(ordinary); err != nil {
+		t.Fatalf("non-project sync rejected: %v", err)
+	}
+	ordinary.SourceBindingID = params.SourceBindingID
+	if err := validateSyncParams(ordinary); err == nil {
+		t.Fatal("non-project sync accepted source_binding_id")
 	}
 }
 

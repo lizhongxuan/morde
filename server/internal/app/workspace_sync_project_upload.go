@@ -18,6 +18,10 @@ type workspaceSyncProjectFolderStore interface {
 	CheckWorkspaceSyncProjectFolderAccess(context.Context, identity.Principal, string, string) error
 }
 
+type workspaceSyncProjectSourceStore interface {
+	GetWorkspaceSyncProjectUploadBaseline(context.Context, identity.Principal, string, string, string) (*workspace.SyncSession, error)
+}
+
 func (s *WorkspaceSyncService) authorizeSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID string) (workspace.Workspace, workspace.SyncSession, error) {
 	if !workspace.ValidSessionID(sessionID) {
 		return workspace.Workspace{}, workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
@@ -57,6 +61,9 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 	if !s.projectUploadEnabled {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "project upload is unavailable")
 	}
+	if principal.Kind != identity.KindDevice || !domain.ValidClientInstallationID(principal.ClientInstallationID) {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "project upload requires an installation-bound sync credential")
+	}
 	originalRequest := request
 	folders, ok := s.store.(workspaceSyncProjectFolderStore)
 	if !ok {
@@ -93,15 +100,11 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 	if value.State != workspace.StateReady {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace is not available for synchronization")
 	}
-	if folder.LastUploadRevision != nil && *folder.LastUploadRevision > value.Revision {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceConflict, "project folder baseline is ahead of the workspace")
+	sourceStore, ok := s.store.(workspaceSyncProjectSourceStore)
+	if !ok {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "project source baseline reader is unavailable")
 	}
-	baseRevision := value.Revision
-	if folder.LastUploadRevision != nil {
-		baseRevision = *folder.LastUploadRevision
-	}
-	command.BaseRevision = baseRevision
-	baseFiles, baseEmptyDirectories, baseDirectories, err := s.readManifest(ctx, value.OwnerID, workspaceID, baseRevision, command.Scope)
+	baseline, err := sourceStore.GetWorkspaceSyncProjectUploadBaseline(ctx, principal, workspaceID, folder.FolderID, request.SourceBindingID)
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
@@ -109,11 +112,25 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
+	baseFiles, baseEmptyDirectories, baseDirectories := []workspace.File{}, []string{}, []workspace.Directory{}
+	baselineSessionID := ""
+	if baseline != nil {
+		if baseline.SourceBindingID != request.SourceBindingID || baseline.FolderID != folder.FolderID ||
+			baseline.State != workspace.SyncCompleted || baseline.Direction != workspace.SyncUpload || baseline.Policy != workspace.SyncCompareMerge ||
+			len(baseline.Scope) != 1 || baseline.Scope[0] != folder.RelativePath {
+			return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "saved project source baseline is invalid")
+		}
+		baseFiles = append(baseFiles, baseline.Files...)
+		baseEmptyDirectories = append(baseEmptyDirectories, baseline.EmptyDirectories...)
+		baseDirectories = append(baseDirectories, baseline.Directories...)
+		baselineSessionID = baseline.ID
+	}
+	command.BaseRevision = value.Revision
 	plan := workspace.SyncPlan{}
-	if folder.LastUploadRevision == nil && hasProjectDestinationContents(folder.RelativePath, currentFiles, currentEmptyDirectories, currentDirectories) {
+	if baseline == nil && hasProjectDestinationContents(folder.RelativePath, currentFiles, currentEmptyDirectories, currentDirectories) {
 		plan = projectDestinationConflictPlan(command, currentFiles, currentEmptyDirectories, currentDirectories)
 	} else {
-		if folder.LastUploadRevision != nil {
+		if baseline != nil {
 			command.DeletedPaths, command.DeletedDirectories, err = workspace.ProjectSnapshotDeletions(folder.RelativePath,
 				baseFiles, baseEmptyDirectories, baseDirectories, command)
 			if err != nil {
@@ -149,9 +166,10 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 		return workspace.SyncSession{}, fmt.Errorf("generate workspace sync session: %w", err)
 	}
 	session := workspace.SyncSession{
-		ID: sessionID, WorkspaceID: workspaceID, FolderID: folder.FolderID, FolderBaselineRevision: cloneInt64Pointer(folder.LastUploadRevision),
-		OwnerID: value.OwnerID, ReplicaID: syncReplicaID(principal), Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
-		State: workspace.SyncPlanned, BaseRevision: baseRevision, TargetRevision: value.Revision, PinnedRevision: value.Revision,
+		ID: sessionID, WorkspaceID: workspaceID, FolderID: folder.FolderID, SourceBindingID: command.SourceBindingID,
+		SourceBaselineSessionID: baselineSessionID,
+		OwnerID:                 value.OwnerID, ReplicaID: syncReplicaID(principal), Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		State: workspace.SyncPlanned, BaseRevision: value.Revision, TargetRevision: value.Revision, PinnedRevision: value.Revision,
 		Stage: workspace.SyncStageCompare, PlannedBytes: plannedBytes, Conflicts: plan.Conflicts,
 		Files: append([]workspace.File(nil), command.Files...), Directories: append([]workspace.Directory(nil), command.Directories...),
 		UploadFiles: plan.UploadFiles, UploadDirectories: plan.UploadDirectories,
@@ -324,14 +342,6 @@ func emptyWorkspaceSyncPlan() workspace.SyncPlan {
 		Conflicts: []workspace.Conflict{}, UploadBlocks: []workspace.Chunk{},
 		DownloadBlocks: []workspace.Chunk{}, RequiredBlocks: []workspace.Chunk{},
 	}
-}
-
-func cloneInt64Pointer(value *int64) *int64 {
-	if value == nil {
-		return nil
-	}
-	copy := *value
-	return &copy
 }
 
 func stringPointer(value string) *string { return &value }

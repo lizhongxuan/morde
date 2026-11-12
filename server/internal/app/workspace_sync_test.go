@@ -22,6 +22,7 @@ type syncServiceStore struct {
 	workspace                                workspace.Workspace
 	binding                                  workspace.Binding
 	projectFolders                           map[string]workspace.SyncFolder
+	projectUploadBaselines                   map[string]workspace.SyncSession
 	projectUploadCreateReplays               map[string]syncCreateReplay
 	snapshots                                map[int64][]workspace.File
 	directorySnapshots                       map[int64][]workspace.Directory
@@ -79,8 +80,9 @@ func (lock syncServiceBlockLock) Release(context.Context) error {
 func newSyncServiceStore() *syncServiceStore {
 	return &syncServiceStore{
 		workspace:      workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", Name: "test", State: workspace.StateReady, QuotaBytes: 1 << 30},
-		projectFolders: map[string]workspace.SyncFolder{}, projectUploadCreateReplays: map[string]syncCreateReplay{},
-		snapshots: map[int64][]workspace.File{0: {}}, directorySnapshots: map[int64][]workspace.Directory{0: {}}, emptyDirectorySnapshots: map[int64][]string{0: {}},
+		projectFolders: map[string]workspace.SyncFolder{}, projectUploadBaselines: map[string]workspace.SyncSession{},
+		projectUploadCreateReplays: map[string]syncCreateReplay{},
+		snapshots:                  map[int64][]workspace.File{0: {}}, directorySnapshots: map[int64][]workspace.Directory{0: {}}, emptyDirectorySnapshots: map[int64][]string{0: {}},
 		sessions: map[string]workspace.SyncSession{}, commitReceipts: map[string]WorkspaceSyncCommitReceipt{},
 		blocks: map[string][]workspace.TransferBlock{}, changes: []workspace.Change{},
 		taskWorkspacePublishReceipts: map[string]TaskWorkspacePublishReceipt{}, taskWorkspacePublishCommands: map[string]TaskWorkspacePublishCommand{},
@@ -187,6 +189,21 @@ func (s *syncServiceStore) GetWorkspaceSyncFolder(_ context.Context, principal i
 		return workspace.SyncFolder{}, domain.NewError(domain.CodeNotFound, "workspace sync folder not found")
 	}
 	return folder, nil
+}
+
+func (s *syncServiceStore) GetWorkspaceSyncProjectUploadBaseline(_ context.Context, principal identity.Principal,
+	workspaceID, folderID, sourceBindingID string) (*workspace.SyncSession, error) {
+	if principal.Kind != identity.KindDevice || principal.UserID != s.workspace.OwnerID || workspaceID != s.workspace.ID {
+		return nil, domain.NewError(domain.CodeForbidden, "project source is unavailable")
+	}
+	if _, err := s.GetWorkspaceSyncFolder(context.Background(), principal, workspaceID, folderID); err != nil {
+		return nil, err
+	}
+	baseline, ok := s.projectUploadBaselines[sourceBindingID]
+	if !ok {
+		return nil, nil
+	}
+	return &baseline, nil
 }
 
 func (s *syncServiceStore) CheckWorkspaceSyncProjectFolderAccess(_ context.Context, principal identity.Principal, workspaceID, folderID string) error {

@@ -587,15 +587,22 @@ function projectCheckpointMatches(checkpoint, selection) {
     checkpoint.hostId === selection.hostId && checkpoint.folderId === selection.folderId &&
     checkpoint.projectName === selection.projectName;
 }
+function projectHasVerifiedAppliedReceipt(result) {
+  const receipt = result?.hostApplication;
+  return result?.session?.state === 'completed' && result.cloudStatus === 'confirmed' && result.hostStatus === 'applied' &&
+    receipt?.status === 'applied' && Number.isSafeInteger(receipt.targetRevision) && receipt.targetRevision >= 0 &&
+    Number.isSafeInteger(receipt.appliedRevision) && receipt.appliedRevision >= receipt.targetRevision &&
+    Array.isArray(receipt.impacts) && receipt.impacts.length === 0;
+}
 function projectStatusText(result) {
   if (!result || result.cancelled) return '已取消；没有开始上传。';
   if (result.session?.state === 'completed' && result.cloudStatus === 'confirmed') {
-    if (result.hostStatus === 'applied') {
-      return '云端已确认；电脑已应用 revision ' + (result.appliedRevision ?? result.desiredRevision ?? '未知') + '。';
+    if (projectHasVerifiedAppliedReceipt(result)) {
+      return '云端已确认；目标电脑已应用本次项目 revision ' + (result.hostApplication?.appliedRevision ?? '未知') + '。';
     }
-    const revision = Number.isSafeInteger(result.desiredRevision)
-      ? '（电脑 applied ' + result.appliedRevision + ' / desired ' + result.desiredRevision + '）' : '';
-    return '云端已确认；电脑待应用或待核验' + revision + '。关机电脑不会自动启动。';
+    if (result.hostApplication?.status === 'conflict') return '云端已确认；目标电脑应用存在冲突，恢复点已保留。';
+    if (result.hostApplication?.status === 'unknown' || result.hostStatus === 'unknown') return '云端已确认；目标电脑应用结果未知，恢复点已保留。';
+    return '云端已确认；等待目标电脑应用本次项目。';
   }
   const messages = {
     running: '上传仍在处理中，恢复点已保留。',
@@ -607,6 +614,11 @@ function projectStatusText(result) {
   };
   return messages[result.session?.state] || '上传状态待确认。';
 }
+function projectStatusClass(result) {
+  if (projectHasVerifiedAppliedReceipt(result)) return 'success';
+  if (result?.session?.state === 'completed' && result.cloudStatus === 'confirmed' && result.hostApplication?.status === 'pending_apply') return 'muted';
+  return 'error';
+}
 async function startProjectUpload(selection, projectName, statusElement, uploadButton) {
   if (!selection) { message('先选择本机项目文件夹。', true); return; }
   projectUploadBusy = true;
@@ -617,11 +629,17 @@ async function startProjectUpload(selection, projectName, statusElement, uploadB
   try {
     const result = await api.uploadProject(selection.selectionID, projectName);
     projectUploadResult = result;
-    if (statusElement) statusElement.replaceChildren(text('p', projectStatusText(result), result?.hostStatus === 'applied' ? 'success' : result?.session?.state === 'completed' ? 'muted' : 'error'));
+    if (statusElement) statusElement.replaceChildren(text('p', projectStatusText(result), projectStatusClass(result)));
     if (Array.isArray(result?.conflicts) && result.conflicts.length) {
       const list = text('ul', '');
       for (const conflict of result.conflicts.slice(0, 8)) list.append(text('li', relativeConflictPath(conflict)));
       statusElement?.append(text('strong', '发现冲突 ' + result.conflicts.length + ' 项'), list);
+    }
+    const hostImpacts = Array.isArray(result?.hostApplication?.impacts) ? result.hostApplication.impacts : [];
+    if (hostImpacts.length) {
+      const list = text('ul', '');
+      for (const impact of hostImpacts.slice(0, 8)) list.append(text('li', relativeConflictPath(impact)));
+      statusElement?.append(text('strong', '目标电脑影响项 ' + hostImpacts.length + ' 项（仅显示相对路径）'), list);
     }
     const nextState = await api.state();
     if (nextState?.authenticated && nextState.view === 'sync') {
@@ -656,6 +674,17 @@ async function renderProjectUpload(current = state) {
     if (state !== current) return;
     const unavailable = text('p', errorMessage(error), 'muted');
     unavailable.setAttribute?.('role', 'status');
+    const checkpoint = current.syncCheckpoint;
+    const savedSelection = checkpoint?.mode === 'project_upload' && checkpoint.sessionState === 'completed'
+      ? current.projectMappings?.find((item) => item.selectionID === checkpoint.projectSelectionID) : null;
+    if (savedSelection) {
+      const statusElement = text('div', '', 'sync-status');
+      statusElement.append(text('p', '服务端已提交 session；可单独读取目标电脑回执，不会重新扫描或上传。', 'muted'));
+      const check = button('检查目标电脑应用状态', () => startProjectUpload(savedSelection, checkpoint.projectName, statusElement, check));
+      check.disabled = projectUploadBusy || current.syncState === 'running';
+      root.replaceChildren(unavailable, statusElement, check);
+      return;
+    }
     root.replaceChildren(unavailable);
     if (current.syncCheckpoint?.mode === 'project_upload') {
       root.append(text('p', '项目上传恢复点仍待处理：' + (current.syncCheckpoint.projectName || current.syncCheckpoint.workspaceId) + '。能力重新开放后可恢复，或在下方明确放弃。', 'error'));
@@ -720,23 +749,40 @@ async function renderProjectUpload(current = state) {
     const statusElement = text('div', '', 'sync-status');
     projectUploadProgress = text('p', '', 'muted');
     statusElement.append(projectUploadProgress);
+    const checkpoint = current.syncCheckpoint;
+    const matchingCheckpoint = projectCheckpointMatches(checkpoint, projectSelection);
     if (projectUploadError) statusElement.append(text('p', projectUploadError, 'error'));
     if (projectUploadResult) {
-      statusElement.append(text('p', projectStatusText(projectUploadResult), projectUploadResult?.hostStatus === 'applied' ? 'success' : projectUploadResult?.session?.state === 'completed' ? 'muted' : 'error'));
+      statusElement.append(text('p', projectStatusText(projectUploadResult), projectStatusClass(projectUploadResult)));
       if (Array.isArray(projectUploadResult?.conflicts) && projectUploadResult.conflicts.length) {
         const list = text('ul', '');
         for (const conflict of projectUploadResult.conflicts.slice(0, 8)) list.append(text('li', relativeConflictPath(conflict)));
         statusElement.append(text('strong', '发现冲突 ' + projectUploadResult.conflicts.length + ' 项'), list);
       }
+      const hostImpacts = Array.isArray(projectUploadResult?.hostApplication?.impacts) ? projectUploadResult.hostApplication.impacts : [];
+      if (hostImpacts.length) {
+        const list = text('ul', '');
+        for (const impact of hostImpacts.slice(0, 8)) list.append(text('li', relativeConflictPath(impact)));
+        statusElement.append(text('strong', '目标电脑影响项 ' + hostImpacts.length + ' 项（仅显示相对路径）'), list);
+      }
+    } else if (matchingCheckpoint && checkpoint.sessionState === 'completed') {
+      const labels = {
+        applied: '目标电脑已应用本次项目；恢复点等待本机清理。',
+        pending_apply: '云端已确认；等待目标电脑应用本次项目。',
+        conflict: '目标电脑应用存在冲突；项目恢复点已保留。',
+        unknown: '目标电脑应用结果未知；项目恢复点已保留。',
+      };
+      statusElement.append(text('p', labels[checkpoint.hostApplicationStatus] || '目标电脑应用回执待核验。', checkpoint.hostApplicationStatus === 'conflict' || checkpoint.hostApplicationStatus === 'unknown' ? 'error' : 'muted'));
     }
-    const checkpoint = current.syncCheckpoint;
-    const matchingCheckpoint = projectCheckpointMatches(checkpoint, projectSelection);
-    const upload = button(matchingCheckpoint ? '恢复项目上传' : '单向上传到云端电脑', () => startProjectUpload(projectSelection, projectName.value, statusElement, upload));
-    upload.disabled = projectUploadBusy || current.syncState === 'running' || current.syncRecovery?.state === 'unknown' ||
+    const checkingReceipt = matchingCheckpoint && checkpoint.sessionState === 'completed' && Boolean(checkpoint.sessionId);
+    const upload = button(checkingReceipt ? '检查目标电脑应用状态' : matchingCheckpoint ? '恢复项目上传' : '单向上传到云端电脑', () => startProjectUpload(projectSelection, projectName.value, statusElement, upload));
+    upload.disabled = projectUploadBusy || current.syncState === 'running' || current.syncRecovery?.state === 'unknown' && !checkingReceipt ||
       Boolean(checkpoint && !matchingCheckpoint) || !projectSelection ||
       projectSelection.hostId !== target.hostId || projectSelection.workspaceId !== target.workspaceId;
     panel.append(chosen, nameLabel, selectionLabel, upload, statusElement);
-    if (matchingCheckpoint) panel.append(text('p', '检测到未确认的上传恢复点；恢复会使用同一云端目录和本机文件夹身份。', 'muted'));
+    if (matchingCheckpoint) panel.append(text('p', checkingReceipt
+      ? '服务端已提交此 session；按钮只读取本次 Host 回执，不会重新扫描或上传。回执确认为 applied 前会保留恢复点。'
+      : '检测到未确认的上传恢复点；恢复会使用同一云端目录和本机文件夹身份。', 'muted'));
   } else if (current.syncCheckpoint?.mode === 'project_upload') {
     panel.append(text('p', '存在项目上传恢复点；当前目标不可用，恢复点已保留。', 'error'));
   }
@@ -773,11 +819,14 @@ async function renderWorkspaces() {
   if (running) root.append(text('p', '旧版同步进程仍在运行。', 'muted'), stopSyncButton());
   else if (state.syncCheckpoint) {
     const warning = text('div', '', 'card');
-    const recoveryMessage = state.syncRecovery?.state === 'unknown'
+    const unresolvedProjectReceipt = state.syncCheckpoint.mode === 'project_upload' && state.syncCheckpoint.sessionState === 'completed' && state.syncCheckpoint.hostApplicationStatus !== 'applied';
+    const recoveryMessage = unresolvedProjectReceipt
+      ? '项目 session 已由云端提交，但目标电脑本次应用回执尚未确认为 applied；为避免重复或丢失恢复依据，恢复点必须保留。'
+      : state.syncRecovery?.state === 'unknown'
       ? `${state.syncRecovery.message || '同步恢复状态未知。'} 请检查本机状态后再处理恢复点。`
       : `上次 ${state.syncCheckpoint.workspaceId} 的 ${state.syncCheckpoint.mode} 尚待恢复。只能在原云端文件目录、模式和本机目录身份下继续；也可以明确放弃恢复点。`;
     warning.append(text('p', recoveryMessage, 'error'));
-    warning.append(button('明确放弃恢复点', discardSyncCheckpoint));
+    if (!unresolvedProjectReceipt) warning.append(button('明确放弃恢复点', discardSyncCheckpoint));
     root.append(warning);
   } else if (state.syncRecovery && state.syncRecovery.state !== 'pending') {
     root.append(text('p', state.syncRecovery.message || '本机同步恢复状态未知；同步未启动或已暂停。', 'error'));

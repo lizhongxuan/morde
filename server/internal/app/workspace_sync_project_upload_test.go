@@ -10,6 +10,8 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
+const projectUploadTestSourceBindingID = "12345678-1234-4234-8234-123456789abc"
+
 func TestProjectUploadIsClosedByDefault(t *testing.T) {
 	store := newSyncServiceStore()
 	folderID := "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -51,7 +53,7 @@ func TestProjectUploadGateBlocksChunkAndCommitForExistingSession(t *testing.T) {
 	}
 	digest := strings.Repeat("a", 64)
 	session, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
-		FolderID: folderID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		FolderID: folderID, SourceBindingID: projectUploadTestSourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
 		Files: []workspace.File{{Path: "main.go", SizeBytes: 1, SHA256: digest, Mode: 0o644,
 			Chunks: []workspace.Chunk{{SHA256: digest, SizeBytes: 1}}}},
 	}, "project-upload-disable-after-create")
@@ -86,7 +88,7 @@ func TestProjectUploadCreateReplayUsesOriginalRequestAfterBaselineAdvances(t *te
 		ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
 	}
 	request := workspace.CreateSyncSession{
-		FolderID: folderID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		FolderID: folderID, SourceBindingID: projectUploadTestSourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
 		Files: []workspace.File{}, EmptyDirectories: []string{"empty"},
 	}
 	first, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, request, "project-upload-create-retry")
@@ -116,6 +118,52 @@ func TestProjectUploadCreateReplayUsesOriginalRequestAfterBaselineAdvances(t *te
 	}
 	if replayed.ID != first.ID || replayed.FolderID != first.FolderID || len(store.sessions) != 1 {
 		t.Fatalf("project upload retry = %#v; original session %q, stored sessions %d", replayed, first.ID, len(store.sessions))
+	}
+}
+
+func TestProjectUploadBaselineComesFromHostConfirmedSourceNotWorkspaceRevision(t *testing.T) {
+	store := newSyncServiceStore()
+	folderID := "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	root := "project/demo"
+	store.projectFolders[folderID] = workspace.SyncFolder{
+		FolderID: folderID, WorkspaceID: store.workspace.ID, OwnerID: store.workspace.OwnerID,
+		Kind: workspace.SyncFolderKindProject, ProjectName: "demo", RelativePath: root, State: "active",
+	}
+	store.workspace.Revision = 3
+	digestA, digestCloud := strings.Repeat("a", 64), strings.Repeat("c", 64)
+	chunkA := workspace.Chunk{SHA256: digestA, SizeBytes: 1}
+	baselineFile := workspace.File{Path: root + "/a.go", SHA256: digestA, SizeBytes: 1, Mode: 0o644, Chunks: []workspace.Chunk{chunkA}}
+	cloudOnly := workspace.File{Path: root + "/cloud-only.txt", SHA256: digestCloud, SizeBytes: 1, Mode: 0o644,
+		Chunks: []workspace.Chunk{{SHA256: digestCloud, SizeBytes: 1}}}
+	store.projectUploadBaselines[projectUploadTestSourceBindingID] = workspace.SyncSession{
+		ID: "p1234567", WorkspaceID: store.workspace.ID, OwnerID: store.workspace.OwnerID, FolderID: folderID,
+		SourceBindingID: projectUploadTestSourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		State: workspace.SyncCompleted, Scope: []string{root}, Files: []workspace.File{baselineFile},
+		Directories: []workspace.Directory{{Path: root}},
+	}
+	store.snapshots[3] = []workspace.File{baselineFile, cloudOnly}
+	store.directorySnapshots[3] = []workspace.Directory{{Path: root}}
+	store.emptyDirectorySnapshots[3] = []string{}
+	service, err := NewWorkspaceSyncServiceWithOptions(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40,
+		WorkspaceSyncOptions{ProjectUploadEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: "t1234567",
+		ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	session, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
+		FolderID: folderID, SourceBindingID: projectUploadTestSourceBindingID,
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		Files: []workspace.File{{Path: "a.go", SHA256: digestA, SizeBytes: 1, Mode: 0o644, Chunks: []workspace.Chunk{chunkA}}},
+	}, "project-upload-keeps-cloud-only-content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.BaseRevision != store.workspace.Revision || session.SourceBaselineSessionID != "p1234567" ||
+		len(session.DeletedPaths) != 0 || len(session.UploadDeletedPaths) != 0 || len(session.UploadFiles) != 0 {
+		t.Fatalf("project upload treated a Workspace-only file as source-owned: %#v", session)
 	}
 }
 

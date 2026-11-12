@@ -319,4 +319,13 @@ func (s *hostReplicaWorkspaceStoreTest) SetWorkspaceBindingSyncStatusForHost(ctx
 	return s.SetWorkspaceBindingSyncStatus(ctx, hostID, workspaceID, expectedVersion, state, conflicts)
 }
 
+func (s *hostReplicaWorkspaceStoreTest) ListPendingWorkspaceSyncProjectUploadApplications(context.Context, string, string, int64) ([]workspace.PendingProjectUploadApplication, error) {
+	return []workspace.PendingProjectUploadApplication{}, nil
+}
+
+func (s *hostReplicaWorkspaceStoreTest) RecordWorkspaceSyncProjectUploadApplication(context.Context, identity.Principal, string,
+	int64, string, workspace.HostProjectUploadApplicationReport) (workspace.SyncHostApplication, error) {
+	return workspace.SyncHostApplication{}, domain.NewError(domain.CodeUnsupported, "test project upload receipt is unused")
+}
+
 var _ HostReplicaWorkspaceStore = (*hostReplicaWorkspaceStoreTest)(nil)

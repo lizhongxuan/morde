@@ -262,6 +262,46 @@ describe('Hosts', () => {
     expect(screen.getByLabelText('恢复前关联已有云端文件')).toBeInTheDocument();
   });
 
+  it('shows Workspace Runtime heartbeat separately from Host and noVNC desktop status', async () => {
+    const host: Host = {
+      ...ownedHost,
+      workspace_runtime_online: false,
+      workspace_runtime_last_seen_at: '2026-11-12T08:30:00Z',
+    };
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    const card = await waitFor(() => {
+      const item = document.getElementById(`host-${host.id}`);
+      if (!item) throw new Error('Host card not rendered');
+      return item;
+    });
+    await openHostDetails(user, host.id);
+    const runtime = within(card).getByText('Workspace Runtime').parentElement;
+    expect(runtime).toHaveTextContent('离线');
+    expect(runtime).toHaveTextContent('最近观测：');
+    expect(within(card).getByText('运行中')).toBeInTheDocument();
+    expect(within(card).getByText('桌面连接').parentElement).toHaveTextContent('由 noVNC 工作台单独检测');
+  });
+
+  it('keeps missing Runtime fields unknown', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    const card = await waitFor(() => {
+      const item = document.getElementById(`host-${ownedHost.id}`);
+      if (!item) throw new Error('Host card not rendered');
+      return item;
+    });
+    await openHostDetails(user, ownedHost.id);
+    expect(within(card).getByText('Workspace Runtime').parentElement).toHaveTextContent('未知');
+    expect(within(card).getByText('桌面连接').parentElement).toHaveTextContent('由 noVNC 工作台单独检测');
+  });
+
   it('binds one ready Workspace to a stopped legacy host before enabling restore', async () => {
     const stoppedHost = { ...ownedHost, state: 'stopped' as const, workspaces: [] };
     const workspace = {
@@ -436,6 +476,36 @@ describe('Hosts', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
     expect(hosts).toHaveBeenCalledTimes(2);
     await expect(hosts.mock.results[1]!.value).resolves.toMatchObject({ items: [expect.objectContaining({ state: 'running' })] });
+  });
+
+  it('refreshes the Runtime heartbeat while visible and pauses in the background', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const visibility = Object.getOwnPropertyDescriptor(document, 'visibilityState');
+    let visibilityState: DocumentVisibilityState = 'visible';
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibilityState });
+    const host: Host = { ...ownedHost, workspace_runtime_online: true };
+    const hosts = vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    try {
+      expect(await screen.findByRole('button', { name: `查看云端电脑 ${host.name}` })).toBeEnabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+      expect(hosts).toHaveBeenCalledTimes(2);
+
+      visibilityState = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+      expect(hosts).toHaveBeenCalledTimes(2);
+
+      visibilityState = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+      expect(hosts).toHaveBeenCalledTimes(3);
+    } finally {
+      if (visibility) Object.defineProperty(document, 'visibilityState', visibility);
+      else Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    }
   });
 
   it('loads owner-managed sharing grants only after opening the manager', async () => {

@@ -4281,6 +4281,8 @@ private struct MordeHost: Decodable, Identifiable {
     let owner_id: String?
     let state: String
     let url: URL
+    let workspace_runtime_online: Bool?
+    let workspace_runtime_last_seen_at: String?
     let control_state: String?
     let workspaces: [MordeWorkspaceBinding]?
 }
@@ -5434,6 +5436,7 @@ private struct MordeWorkspaceSyncSession: Decodable {
     let transfer_blocks: [MordeWorkspaceSyncBlock]
     let download_actions: [MordeWorkspaceDownloadAction]
     let conflicts: [MordeWorkspaceSyncConflict]
+    let host_application: MordeWorkspaceSyncHostApplication?
 }
 private struct MordeWorkspaceSyncConflict: Decodable {
     let path: String
@@ -6011,6 +6014,7 @@ private struct MordeIndependentSendTarget {
     @Published private var verifiedServiceInstanceID: String?
     @Published var user: MordeMe?
     @Published var hosts: [MordeHost] = []
+    @Published private(set) var hostRuntimeDataAvailable = false
     @Published var sharedHosts: [MordeSharedHost] = []
     @Published var workspaces: [MordeWorkspace] = []
     @Published var pendingWorkspaceShareToken: String?
@@ -6174,6 +6178,7 @@ private struct MordeIndependentSendTarget {
     private var installationLookupKey: String?
     private var resourceLoadGeneration = UUID()
     private var resourceLoadIsInProgress = false
+    private var hostRuntimeStatusLoadGeneration: UUID?
     private var conversationLoadGeneration = UUID()
     private var conversationMessagesRefreshGeneration = UUID()
     private var conversationLoadMoreGeneration = UUID()
@@ -6650,6 +6655,8 @@ private struct MordeIndependentSendTarget {
     private func beginResourceLoad() -> UUID {
         let generation = UUID()
         resourceLoadGeneration = generation
+        hostRuntimeStatusLoadGeneration = nil
+        hostRuntimeDataAvailable = false
         hosts = []; sharedHosts = []; workspaces = []; models = []
         defaultModelConfigured = false; defaultModelID = nil; selectedModelID = nil; personalModelIDs = []
         conversations = []; conversationNextCursor = nil; tasks = []; notifications = []
@@ -8131,6 +8138,8 @@ private struct MordeIndependentSendTarget {
         hostRestoreInFlightID = nil
         hostControlActionGeneration = UUID()
         user = nil; hosts = []; sharedHosts = []; workspaces = []; models = []
+        hostRuntimeStatusLoadGeneration = nil
+        hostRuntimeDataAvailable = false
         defaultModelConfigured = false; defaultModelID = nil; selectedModelID = nil; personalModelIDs = []
         modelConfigurationStatus = "unknown"; modelConfigurationCheckedAt = nil
         pendingMessages = []
@@ -11360,11 +11369,19 @@ private struct MordeIndependentSendTarget {
         guard !Task.isCancelled, signedIn, let scope = currentDataScope else { return }
         let generation = resourceLoadGeneration
         resourceLoadIsInProgress = true
+        hostRuntimeStatusLoadGeneration = nil
+        hostRuntimeDataAvailable = false
         defer { if generation == resourceLoadGeneration { resourceLoadIsInProgress = false } }
         await loadResource(.hosts, generation: generation, fetch: {
             let page: MordePage<MordeHost> = try await self.call("/api/hosts")
             return page.items
-        }, apply: { self.hosts = $0 }, clear: { self.hosts = [] })
+        }, apply: {
+            self.hosts = $0
+            self.hostRuntimeDataAvailable = true
+        }, clear: {
+            self.hosts = []
+            self.hostRuntimeDataAvailable = false
+        })
         await loadResource(.sharedHosts, generation: generation, fetch: {
             let page: MordePage<MordeSharedHost> = try await self.call("/api/shared-hosts")
             return page.items
@@ -11376,6 +11393,32 @@ private struct MordeIndependentSendTarget {
         guard scope == currentDataScope, generation == resourceLoadGeneration else { return }
         await loadDefaultHostPreference()
         await refreshHostControls()
+    }
+
+    func refreshHostRuntimeStatus() async {
+        while resourceLoadIsInProgress && !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard !Task.isCancelled, signedIn, let scope = currentDataScope else { return }
+        let generation = resourceLoadGeneration
+        let requestID = UUID()
+        hostRuntimeStatusLoadGeneration = requestID
+        do {
+            let page: MordePage<MordeHost> = try await call("/api/hosts")
+            guard !Task.isCancelled, scope == currentDataScope,
+                  generation == resourceLoadGeneration,
+                  hostRuntimeStatusLoadGeneration == requestID else { return }
+            hosts = page.items
+            hostRuntimeDataAvailable = true
+            hostRuntimeStatusLoadGeneration = nil
+            setResourceState(.loaded, for: .hosts)
+        } catch {
+            guard !Task.isCancelled, scope == currentDataScope,
+                  generation == resourceLoadGeneration,
+                  hostRuntimeStatusLoadGeneration == requestID else { return }
+            hostRuntimeDataAvailable = false
+            hostRuntimeStatusLoadGeneration = nil
+        }
     }
 
     func load() async {
@@ -11443,7 +11486,13 @@ private struct MordeIndependentSendTarget {
             await loadResource(.hosts, generation: generation, fetch: {
                 let page: MordePage<MordeHost> = try await self.call("/api/hosts")
                 return page.items
-            }, apply: { self.hosts = $0 }, clear: { self.hosts = [] })
+            }, apply: {
+                self.hosts = $0
+                self.hostRuntimeDataAvailable = true
+            }, clear: {
+                self.hosts = []
+                self.hostRuntimeDataAvailable = false
+            })
             await loadResource(.sharedHosts, generation: generation, fetch: {
                 let page: MordePage<MordeSharedHost> = try await self.call("/api/shared-hosts")
                 return page.items
@@ -12981,8 +13030,13 @@ struct MIFConversationDrawerItem: Identifiable {
             } else {
                 workspaceSummary = "电脑文件状态未知"
             }
+            let runtimeOnline = client.hostRuntimeDataAvailable ? host.workspace_runtime_online : nil
+            let runtimeLastSeenAt = client.hostRuntimeDataAvailable
+                ? Self.runtimeDate(host.workspace_runtime_last_seen_at) : nil
             return MIFResourcePageState.Host(
                 id: host.id, name: host.name, scope: .owned, status: Self.status(host.state),
+                runtimeStatus: MIFHostRuntimeStatus(online: runtimeOnline),
+                runtimeLastSeenAt: runtimeLastSeenAt,
                 workspaceSummary: workspaceSummary,
                 canOpen: client.canOpenHost(host), control: control(for: host),
                 error: client.hostOpenErrors[host.id])
@@ -12994,6 +13048,7 @@ struct MIFConversationDrawerItem: Identifiable {
                 (hasView ? .sharedReadOnly : .sharedUnavailable)
             return MIFResourcePageState.Host(
                 id: host.id, name: host.name, scope: scope, status: Self.status(host.state),
+                runtimeStatus: .unknown, runtimeLastSeenAt: nil,
                 workspaceSummary: nil, canOpen: host.state == "running" && hasView,
                 control: nil, error: client.hostOpenErrors[host.id])
         }
@@ -13064,6 +13119,7 @@ struct MIFConversationDrawerItem: Identifiable {
         guard !Task.isCancelled else { return }
         await client.refreshResourceLists()
     }
+    func refreshHostRuntimeStatus() async { await client.refreshHostRuntimeStatus() }
     func loadIfNeeded() async {
         guard client.signedIn else { return }
         while (client.isLoadingResources || isResourceListLoading) && !Task.isCancelled {
@@ -13139,6 +13195,15 @@ struct MIFConversationDrawerItem: Identifiable {
         case "deleted": .deleted
         default: .unknown
         }
+    }
+
+    private static func runtimeDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
     }
 }
 
@@ -15241,6 +15306,7 @@ private enum MIFResourceSheetDestination: Identifiable, Equatable {
 
 /// The Morde resource room hosted inside nanoMuse's existing four-tab shell.
 struct MIFResourcesRoot: View {
+    @Environment(\.scenePhase) private var scenePhase
     private let chrome: NanoMuseRoomChrome?
     private let onMenu: (() -> Void)?
     private let onOpenHost: ((MIFResourcePageState.Host) -> Void)?
@@ -15248,6 +15314,7 @@ struct MIFResourcesRoot: View {
     @State private var workspaceFilesID: String?
     @State private var hostSharingID: String?
     @State private var libraryPresented = false
+    @State private var isVisible = false
 
     init(chrome: NanoMuseRoomChrome? = nil, onMenu: (() -> Void)? = nil,
          onOpenHost: ((MIFResourcePageState.Host) -> Void)? = nil) {
@@ -15258,6 +15325,15 @@ struct MIFResourcesRoot: View {
 
     private var workspaceNavigationPresented: Binding<Bool> {
         Binding(get: { workspaceFilesID != nil }, set: { if !$0 { workspaceFilesID = nil } })
+    }
+
+    private var shouldRefreshHostRuntime: Bool {
+        isVisible && scenePhase == .active && store.scopeKey != nil && store.hostURL == nil &&
+            workspaceFilesID == nil && hostSharingID == nil && !libraryPresented
+    }
+
+    private var hostRuntimeRefreshTaskID: String {
+        "\(store.scopeKey ?? "signed-out"):\(scenePhase == .active):\(isVisible):\(store.hostURL == nil):\(workspaceFilesID == nil):\(hostSharingID == nil):\(!libraryPresented)"
     }
 
     private var sheetDestination: Binding<MIFResourceSheetDestination?> {
@@ -15289,6 +15365,17 @@ struct MIFResourcesRoot: View {
             control: { id, action in Task { await store.control(id, action: action) } },
             openWorkspaceFiles: { workspaceFilesID = $0 }))
             .task(id: store.scopeKey) { await store.loadIfNeeded() }
+            .task(id: hostRuntimeRefreshTaskID) {
+                guard shouldRefreshHostRuntime else { return }
+                await store.refreshHostRuntimeStatus()
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 12_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    await store.refreshHostRuntimeStatus()
+                }
+            }
+            .onAppear { isVisible = true }
+            .onDisappear { isVisible = false }
             .navigationDestination(isPresented: workspaceNavigationPresented) {
                 if let id = workspaceFilesID {
                     MordeWorkspaceFilesView(initialWorkspaceID: id)
@@ -19111,6 +19198,7 @@ private struct MordeComputerDesignRoom: View {
     let onClose: () -> Void
     let onOpenWorkspace: (String) -> Void
     @State private var pageLoadState: MordeHostPageLoadState = .loading
+    @State private var desktopConnectionStatus: MIFDesktopConnectionStatus = .unknown
     @State private var hostWebView: WKWebView?
     @State private var screenshotPreview: UIImage?
     @State private var showsScreenshotPreview = false
@@ -19298,6 +19386,16 @@ private struct MordeComputerDesignRoom: View {
                         .minimumScaleFactor(0.8)
                         .foregroundStyle(.white.opacity(0.58))
                         .accessibilityIdentifier("morde.computer.subtitle")
+                    HStack(spacing: 4) {
+                        Text(AppLocalized("Desktop connection"))
+                        Text("·")
+                        Text(desktopConnectionStatus.localizedTitle)
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(desktopConnectionStatus == .connected
+                        ? Color.green : (desktopConnectionStatus == .disconnected || desktopConnectionStatus == .failed
+                            ? Color.orange : Color.white.opacity(0.66)))
+                    .accessibilityIdentifier("morde.computer.desktopConnection")
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 64)
@@ -19375,6 +19473,7 @@ private struct MordeComputerDesignRoom: View {
                                       usesLocalWorkbenchFixture: ProcessInfo.processInfo.arguments.contains("-morde.localHostWorkbenchFixture"),
                                       onWebViewReady: { hostWebView = $0 },
                                       onPageLoadStateChange: { pageLoadState = $0 },
+                                      onDesktopConnectionStateChange: { desktopConnectionStatus = $0 },
                                       onOpenWorkspace: openBoundWorkspace)
                             .accessibilityIdentifier("morde.computer.webview")
                         if pageLoadState == .loading {
@@ -19501,6 +19600,7 @@ private struct MordeHostView: UIViewRepresentable {
     var usesLocalWorkbenchFixture = false
     var onWebViewReady: ((WKWebView?) -> Void)? = nil
     var onPageLoadStateChange: ((MordeHostPageLoadState) -> Void)? = nil
+    var onDesktopConnectionStateChange: ((MIFDesktopConnectionStatus) -> Void)? = nil
     var onOpenWorkspace: (() -> Void)? = nil
 
     private static let iOSShellCSS = """
@@ -19583,6 +19683,76 @@ private struct MordeHostView: UIViewRepresentable {
     })();
     """
 
+    private static let iOSDesktopConnectionScript = """
+    (() => {
+      const channel = window.webkit?.messageHandlers?.mordeDesktopConnection;
+      if (!channel || window.top !== window) return;
+      let frame = null;
+      let remoteDocument = null;
+      let rootObserver = null;
+      let status = 'unknown';
+      let connectedBefore = false;
+      let timeout = null;
+      const report = (next) => {
+        if (next === status) return;
+        status = next;
+        channel.postMessage(next);
+        if (timeout) clearTimeout(timeout);
+        timeout = null;
+        if (next === 'connecting') {
+          timeout = setTimeout(() => {
+            timeout = null;
+            if (status === 'connecting') report('failed');
+          }, 15000);
+        }
+      };
+      const inspect = () => {
+        let root = null;
+        try { root = frame?.contentDocument?.documentElement || null; } catch (_) { report('unknown'); return; }
+        if (!root) { report('connecting'); return; }
+        if (root.classList.contains('noVNC_connected')) {
+          connectedBefore = true;
+          report('connected');
+        } else if (root.classList.contains('noVNC_connecting') || root.classList.contains('noVNC_reconnecting')) {
+          report('connecting');
+        } else if (connectedBefore) {
+          report('disconnected');
+        } else {
+          report('connecting');
+        }
+      };
+      const attach = () => {
+        if (!frame) { report('unknown'); return; }
+        let document = null;
+        try { document = frame.contentDocument; } catch (_) { report('unknown'); return; }
+        if (!document) { report('connecting'); return; }
+        if (document !== remoteDocument) {
+          rootObserver?.disconnect();
+          remoteDocument = document;
+          rootObserver = new MutationObserver(inspect);
+          if (document.documentElement) {
+            rootObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+          }
+        }
+        inspect();
+      };
+      const findFrame = () => {
+        const next = document.querySelector('iframe[title="遠端桌面"], iframe[title="远程桌面"]');
+        if (next !== frame) {
+          rootObserver?.disconnect();
+          rootObserver = null;
+          remoteDocument = null;
+          frame = next;
+          if (frame) frame.addEventListener('load', attach);
+          else { report('unknown'); return; }
+        }
+        attach();
+      };
+      new MutationObserver(findFrame).observe(document.documentElement, { childList: true, subtree: true });
+      findFrame();
+    })();
+    """
+
     #if DEBUG
     private static let localWorkbenchFixtureHTML = """
     <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta charset="utf-8">
@@ -19628,7 +19798,7 @@ private struct MordeHostView: UIViewRepresentable {
         <div class="browser-tabbar"><div class="browser-tab"><span>新标签页</span> ×</div><span class="new-tab">＋</span></div>
         <div class="browser-nav"><button aria-label="后退">‹</button><button aria-label="前进">›</button><button aria-label="刷新">↻</button><div class="browser-address"><span class="search-mark">G</span><span>输入网址或搜索，回车打开</span></div></div>
         <div class="page-placeholder"><span class="device-symbol"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9.5 20.5h5M12 16.5v4"/></svg></span><b>新标签页</b><p>接管后可以点、可以打字</p></div>
-      </div></div></div>
+      </div></div><iframe title="远程桌面" srcdoc="<!doctype html><html class='noVNC_connected'></html>" style="display:none"></iframe></div>
       <div class="mobile-control-footer"><button>接管控制权</button></div><span class="mobile-status-badge">你正在操作</span>
     </main></body></html>
     """
@@ -19646,6 +19816,10 @@ private struct MordeHostView: UIViewRepresentable {
                     injectionTime: .atDocumentEnd, forMainFrameOnly: true))
                 configuration.userContentController.add(context.coordinator, name: "mordeOpenWorkspace")
             }
+            configuration.userContentController.addUserScript(WKUserScript(
+                source: Self.iOSDesktopConnectionScript,
+                injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+            configuration.userContentController.add(context.coordinator, name: "mordeDesktopConnection")
         }
         let web = WKWebView(frame: .zero, configuration: configuration)
         if mordeIOSShell {
@@ -19669,44 +19843,55 @@ private struct MordeHostView: UIViewRepresentable {
     }
     func updateUIView(_ uiView: WKWebView, context: Context) {
         context.coordinator.onPageLoadStateChange = onPageLoadStateChange
+        context.coordinator.onDesktopConnectionStateChange = onDesktopConnectionStateChange
         context.coordinator.onOpenWorkspace = onOpenWorkspace
     }
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         uiView.stopLoading()
         coordinator.cancelDownloads()
         uiView.configuration.userContentController.removeScriptMessageHandler(forName: "mordeOpenWorkspace")
+        uiView.configuration.userContentController.removeScriptMessageHandler(forName: "mordeDesktopConnection")
         uiView.navigationDelegate = nil
         uiView.uiDelegate = nil
     }
     func makeCoordinator() -> Coordinator {
         Coordinator(origin: url, onPageLoadStateChange: onPageLoadStateChange,
+                    onDesktopConnectionStateChange: onDesktopConnectionStateChange,
                     onOpenWorkspace: onOpenWorkspace)
     }
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
         let origin: URL
         var onPageLoadStateChange: ((MordeHostPageLoadState) -> Void)?
+        var onDesktopConnectionStateChange: ((MIFDesktopConnectionStatus) -> Void)?
         var onOpenWorkspace: (() -> Void)?
         private var activeDownloads: [ObjectIdentifier: WKDownload] = [:]
         private var downloadDestinations: [ObjectIdentifier: URL] = [:]
         private var downloadPartials: [ObjectIdentifier: URL] = [:]
 
         init(origin: URL, onPageLoadStateChange: ((MordeHostPageLoadState) -> Void)?,
+             onDesktopConnectionStateChange: ((MIFDesktopConnectionStatus) -> Void)?,
              onOpenWorkspace: (() -> Void)?) {
             self.origin = origin
             self.onPageLoadStateChange = onPageLoadStateChange
+            self.onDesktopConnectionStateChange = onDesktopConnectionStateChange
             self.onOpenWorkspace = onOpenWorkspace
         }
 
         func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
-            guard message.name == "mordeOpenWorkspace", message.body as? String == "open",
-                  message.frameInfo.isMainFrame,
+            guard message.frameInfo.isMainFrame,
                   isAllowedMordeHostNavigation(message.frameInfo.request.url, relativeTo: origin) else { return }
-            DispatchQueue.main.async { self.onOpenWorkspace?() }
+            if message.name == "mordeDesktopConnection", let value = message.body as? String {
+                let status = MIFDesktopConnectionStatus(scriptValue: value)
+                DispatchQueue.main.async { self.onDesktopConnectionStateChange?(status) }
+            } else if message.name == "mordeOpenWorkspace", message.body as? String == "open" {
+                DispatchQueue.main.async { self.onOpenWorkspace?() }
+            }
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             onPageLoadStateChange?(.loading)
+            onDesktopConnectionStateChange?(.connecting)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -19716,10 +19901,12 @@ private struct MordeHostView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
                      withError error: Error) {
             onPageLoadStateChange?(.failed)
+            onDesktopConnectionStateChange?(.failed)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             onPageLoadStateChange?(.failed)
+            onDesktopConnectionStateChange?(.failed)
         }
 
         func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,

@@ -51,7 +51,7 @@ function useFeedRequest<T>(request: () => Promise<T>, version: string) {
 
 function FeedRequestError({ label, request }: { label: string; request: { error: string | null; retry: () => void } }) {
   if (!request.error) return null;
-  return <div role="alert" aria-label={label}><LoadError message={request.error} onRetry={request.retry} /></div>;
+  return <LoadError label={label} message={request.error} onRetry={request.retry} />;
 }
 
 /**

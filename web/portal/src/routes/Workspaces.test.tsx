@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -109,6 +109,19 @@ describe('Workspaces', () => {
     expect(screen.getByRole('article', { name: `工作区 ${workspace.name}` })).toBeVisible();
     expect(screen.getByText(/开发电脑 · 运行中/)).toBeVisible();
     expect(screen.getByText('docs/long-conflict-name-4.md')).toBeVisible();
+  });
+
+  it('shows host-read failures outside the page and retries without leaving it', async () => {
+    vi.mocked(portalApi.hosts).mockRejectedValueOnce(new Error('电脑列表暂不可用')).mockResolvedValue({ items: [] });
+    const user = userEvent.setup();
+    renderWorkspaces();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('无法读取主机绑定状态');
+    expect(alert).toHaveTextContent('电脑列表暂不可用');
+    expect(alert.closest('.toast-region')?.parentElement).toBe(document.body);
+    await user.click(within(alert).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(screen.queryByText(/无法读取主机绑定状态/)).not.toBeInTheDocument());
   });
 
   it('explains an initial workspace is waiting for its creating host, not a file transfer', async () => {

@@ -713,7 +713,7 @@ function UserProjects() {
     {!showProjectDetails && <section className="connection-section" aria-labelledby="project-invitations-title">
       <div className="connection-section-heading"><div><h2 id="project-invitations-title">发给我的项目邀请</h2><p className="muted">邀请响应只提供项目 ID、邀请人 ID 和角色；服务端没有返回名称或邮箱。</p></div></div>
       {invitationsQuery.isPending ? <p role="status">正在读取邀请…</p> : invitationsQuery.isError ? <FloatingError className="error-inline" role="alert">读取邀请失败：{errorDetails(invitationsQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void invitationsQuery.refetch()}>重试</button></FloatingError> : !invitations.length ? <p className="muted">没有收到邀请。</p> : <ScreenPagination
-        ariaLabel="收到的项目邀请" items={invitations} getKey={(invitation) => invitation.id} estimatedItemHeight={86} height={300}
+        ariaLabel="收到的项目邀请" items={invitations} getKey={(invitation) => invitation.id} estimatedItemHeight={86} height={Math.min(300, Math.max(110, invitations.length * 108))}
         renderItem={(invitation) => <article className="schedule-card">
           <div className="schedule-card-heading"><div><h3>项目 {invitation.project_id}</h3><p className="muted">邀请人 {invitation.inviter_id} · {roleLabel(invitation.role)} · v{invitation.version}</p></div><span className="status">{invitationStateLabel(invitation)}</span></div>
           {invitation.state === 'pending' && <button type="button" className="button button-secondary" disabled={Boolean(pendingAction)} onClick={() => acceptInvitation(invitation)}>{pendingAction === `accept-invitation:${invitation.id}` ? '正在接受…' : '接受邀请'}</button>}

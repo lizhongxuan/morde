@@ -12,11 +12,14 @@ describe('ToastProvider', () => {
   it('shows persistent actions in its fixed notification region', async () => {
     const user = userEvent.setup();
     const retry = vi.fn();
-    render(<ToastProvider><TriggerActionToast action={retry} /></ToastProvider>);
+    render(<main data-testid="page-layout"><ToastProvider><TriggerActionToast action={retry} /></ToastProvider></main>);
 
     await user.click(screen.getByRole('button', { name: '显示错误' }));
     const alert = screen.getByRole('alert');
-    expect(alert.closest('.toast-region')).toBeInTheDocument();
+    const region = alert.closest('.toast-region');
+    expect(region).toBeInTheDocument();
+    expect(region?.parentElement).toBe(document.body);
+    expect(screen.getByTestId('page-layout')).not.toContainElement(alert);
     await user.click(screen.getByRole('button', { name: '重试' }));
 
     expect(retry).toHaveBeenCalledOnce();

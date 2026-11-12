@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -534,9 +535,13 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 		if ownerID != value.OwnerID || state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
+		var projectFolder *workspace.SyncFolder
 		if value.FolderID == "" {
 			if value.FolderBaselineRevision != nil {
 				return domain.InvalidArgument("sync_session", "workspace root session has a project folder baseline")
+			}
+			if value.SourceBindingID != "" || value.SourceBaselineSessionID != "" {
+				return domain.InvalidArgument("sync_session", "workspace root session has a project source binding")
 			}
 			if err := requireWorkspaceRootSyncTarget(ctx, tx, ownerID, value.WorkspaceID); err != nil {
 				return err
@@ -552,6 +557,7 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			if err := validateWorkspaceSyncProjectUploadBaseline(value, folder); err != nil {
 				return err
 			}
+			projectFolder = &folder
 		}
 		if readOnly && value.Direction != workspace.SyncDownload {
 			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
@@ -590,6 +596,11 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			}
 			replayed = true
 			return nil
+		}
+		if projectFolder != nil {
+			if err := ensureWorkspaceSyncProjectSourceTx(ctx, tx, value, deviceAccess, *projectFolder); err != nil {
+				return err
+			}
 		}
 		if hostScoped {
 			if hostOwner != value.OwnerID || hostGeneration != hostReplica.generation ||
@@ -1423,7 +1434,14 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			result, replayed = stored.Result, true
 			return nil
 		}
-		if projectFolder != nil && !workspaceSyncSessionBaselineMatches(row, *projectFolder) {
+		projectBaselineMatches := true
+		if projectFolder != nil {
+			projectBaselineMatches, err = workspaceSyncSessionBaselineMatches(ctx, tx, row, *projectFolder)
+			if err != nil {
+				return err
+			}
+		}
+		if projectFolder != nil && !projectBaselineMatches {
 			if err := finishWorkspaceSyncProjectBaselineConflict(ctx, tx, q, row, *projectFolder, currentRevision, idempotency, &result); err != nil {
 				return err
 			}
@@ -1674,6 +1692,27 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			}
 			directoryMutations = append(directoryMutations, syncDirectoryMutation{path: current, delete: true})
 		}
+		if projectFolder != nil && len(conflicts) > 0 {
+			conflictJSON, err := json.Marshal(nonNilConflicts(conflicts))
+			if err != nil {
+				return fmt.Errorf("encode conflicted project upload: %w", err)
+			}
+			if err := q.SetWorkspaceSyncSessionState(ctx, sqlcgen.SetWorkspaceSyncSessionStateParams{
+				WorkspaceID: workspaceID, ID: sessionID, State: string(workspace.SyncConflict),
+				Stage: string(workspace.SyncStageComplete), Conflicts: conflictJSON, TargetRevision: currentRevision,
+			}); err != nil {
+				return fmt.Errorf("finish conflicted project upload without applying mutations: %w", err)
+			}
+			finalRow, err := q.GetWorkspaceSyncSession(ctx, sqlcgen.GetWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
+			if err != nil {
+				return fmt.Errorf("read conflicted project upload: %w", err)
+			}
+			result, err = syncSessionDomain(ctx, tx, q, finalRow)
+			if err != nil {
+				return err
+			}
+			return saveWorkspaceSyncCommitSuccess(ctx, tx, idempotency)
+		}
 		if err := ensureWorkspaceMutationsBlockUsageStored(ctx, tx, workspaceID, mutations); err != nil {
 			return err
 		}
@@ -1740,6 +1779,18 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 		}); err != nil {
 			return fmt.Errorf("finish workspace sync session: %w", err)
 		}
+		if state == workspace.SyncCompleted && projectFolder != nil {
+			projectReceiptSession := directorySession
+			projectReceiptSession.Scope = nonNilStrings(row.Scope)
+			projectReceiptSession.Files, err = decodeWorkspaceFiles(row.Files)
+			if err != nil {
+				return err
+			}
+			projectReceiptSession.EmptyDirectories = nonNilStrings(row.EmptyDirectories)
+			if err := createWorkspaceSyncProjectUploadApplication(ctx, tx, row, *projectFolder, targetRevision, projectReceiptSession); err != nil {
+				return err
+			}
+		}
 		if state == workspace.SyncCompleted && row.AckCursor.Valid {
 			cursor, err := workspace.DecodeChangeCursor(row.AckCursor.String)
 			if err != nil || cursor.Revision > targetRevision {
@@ -1761,12 +1812,6 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 			return err
 		}
 		if result.State == workspace.SyncCompleted {
-			if projectFolder != nil {
-				if err := advanceWorkspaceSyncProjectUploadBaseline(ctx, tx, row.OwnerID, workspaceID, row.FolderID.String,
-					row.FolderBaselineRevision, targetRevision); err != nil {
-					return err
-				}
-			}
 			if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, workspaceID, targetRevision); err != nil {
 				return err
 			}
@@ -1886,12 +1931,13 @@ func validateSyncSession(value workspace.SyncSession) error {
 		return domain.InvalidArgument("sync_session", "workspace sync session fields are invalid")
 	}
 	if value.FolderID == "" {
-		if value.FolderBaselineRevision != nil {
+		if value.FolderBaselineRevision != nil || value.SourceBindingID != "" || value.SourceBaselineSessionID != "" {
 			return domain.InvalidArgument("sync_session", "workspace sync folder baseline is invalid")
 		}
 	} else if !workspace.ValidSyncFolderID(value.FolderID) || value.Direction != workspace.SyncUpload ||
 		value.Policy != workspace.SyncCompareMerge || len(value.Scope) != 1 || value.TaskID != "" || value.TaskHubOperationKey != "" ||
-		value.FolderBaselineRevision != nil && *value.FolderBaselineRevision < 0 {
+		!workspace.ValidProjectSourceBindingID(value.SourceBindingID) || value.FolderBaselineRevision != nil ||
+		value.SourceBaselineSessionID != "" && (!workspace.ValidSessionID(value.SourceBaselineSessionID) || value.SourceBaselineSessionID == value.ID) {
 		return domain.InvalidArgument("sync_session", "project upload session fields are invalid")
 	}
 	if value.TaskID != "" && (!domain.ValidTaskID(value.TaskID) || len(value.TaskHubOperationKey) == 0 || len(value.TaskHubOperationKey) > 512 ||
@@ -1900,7 +1946,8 @@ func validateSyncSession(value workspace.SyncSession) error {
 		return domain.InvalidArgument("sync_session", "Task-linked workspace sync fields are invalid")
 	}
 	if err := workspace.ValidateCreateSyncSession(workspace.CreateSyncSession{
-		Direction: value.Direction, Policy: value.Policy, BaseRevision: value.BaseRevision, Scope: value.Scope,
+		Direction: value.Direction, Policy: value.Policy, BaseRevision: value.BaseRevision, FolderID: value.FolderID,
+		SourceBindingID: value.SourceBindingID, Scope: value.Scope,
 		TaskID: value.TaskID, TaskHubOperationKey: value.TaskHubOperationKey,
 		Files: value.Files, EmptyDirectories: value.EmptyDirectories,
 		DeletedPaths: value.DeletedPaths, DeletedDirectories: value.DeletedDirectories, AckCursor: value.AckCursor,
@@ -2140,6 +2187,9 @@ func workspaceSyncSessionParams(value workspace.SyncSession) (sqlcgen.CreateWork
 		TaskID:              pgtype.Text{String: value.TaskID, Valid: value.TaskID != ""},
 		TaskHubOperationKey: pgtype.Text{String: value.TaskHubOperationKey, Valid: value.TaskHubOperationKey != ""},
 		FolderID:            pgtype.Text{String: value.FolderID, Valid: value.FolderID != ""},
+		SourceBindingID:     pgtype.Text{String: value.SourceBindingID, Valid: value.SourceBindingID != ""},
+		SourceBaselineSessionID: pgtype.Text{String: value.SourceBaselineSessionID,
+			Valid: value.SourceBaselineSessionID != ""},
 		FolderBaselineRevision: func() pgtype.Int8 {
 			if value.FolderBaselineRevision == nil {
 				return pgtype.Int8{}
@@ -2228,6 +2278,12 @@ func syncSessionDomain(ctx context.Context, tx pgx.Tx, q *sqlcgen.Queries, row s
 	if row.FolderBaselineRevision.Valid {
 		value.FolderBaselineRevision = &row.FolderBaselineRevision.Int64
 	}
+	if row.SourceBindingID.Valid {
+		value.SourceBindingID = row.SourceBindingID.String
+	}
+	if row.SourceBaselineSessionID.Valid {
+		value.SourceBaselineSessionID = row.SourceBaselineSessionID.String
+	}
 	if row.TaskID.Valid {
 		value.TaskID = row.TaskID.String
 	}
@@ -2252,6 +2308,11 @@ func syncSessionDomain(ctx context.Context, tx pgx.Tx, q *sqlcgen.Queries, row s
 		value.AckCursor = &row.AckCursor.String
 	}
 	value.CreatedAt, value.UpdatedAt = row.CreatedAt.Time, row.UpdatedAt.Time
+	if row.SourceBindingID.Valid {
+		if err := loadWorkspaceSyncProjectHostApplication(ctx, tx, row, &value); err != nil {
+			return workspace.SyncSession{}, err
+		}
+	}
 	blocks, err := q.ListWorkspaceSyncTransferBlocks(ctx, sqlcgen.ListWorkspaceSyncTransferBlocksParams{WorkspaceID: row.WorkspaceID, SessionID: row.ID})
 	if err != nil {
 		return workspace.SyncSession{}, fmt.Errorf("list workspace sync session blocks: %w", err)
@@ -2283,6 +2344,53 @@ func syncSessionDomain(ctx context.Context, tx pgx.Tx, q *sqlcgen.Queries, row s
 		})
 	}
 	return value, nil
+}
+
+func loadWorkspaceSyncProjectHostApplication(ctx context.Context, tx pgx.Tx, row sqlcgen.WorkspaceSyncSession,
+	value *workspace.SyncSession) error {
+	var state, hostID string
+	var bindingVersion, targetRevision int64
+	var manifestSHA256, encodedImpacts []byte
+	var generation, appliedRevision pgtype.Int8
+	var syncState pgtype.Text
+	err := tx.QueryRow(ctx, `SELECT state,host_id,workspace_binding_version,target_revision,manifest_sha256,
+runtime_generation,applied_revision,sync_state,impacts
+FROM workspace_sync_project_upload_applications WHERE workspace_id=$1 AND session_id=$2`, row.WorkspaceID, row.ID).
+		Scan(&state, &hostID, &bindingVersion, &targetRevision, &manifestSHA256, &generation, &appliedRevision, &syncState, &encodedImpacts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load Host project upload application receipt: %w", err)
+	}
+	if len(manifestSHA256) != 32 {
+		return domain.NewError(domain.CodeInternal, "stored Host project upload manifest digest is invalid")
+	}
+	var impacts []workspace.SyncHostApplicationImpact
+	if err := json.Unmarshal(encodedImpacts, &impacts); err != nil {
+		return fmt.Errorf("decode Host project upload impacts: %w", err)
+	}
+	if impacts == nil {
+		impacts = []workspace.SyncHostApplicationImpact{}
+	}
+	application := &workspace.SyncHostApplication{
+		Status: state, HostID: hostID, WorkspaceBindingVersion: bindingVersion,
+		TargetRevision: targetRevision, ManifestSHA256: hex.EncodeToString(manifestSHA256), Impacts: impacts,
+	}
+	if generation.Valid {
+		value := generation.Int64
+		application.RuntimeGeneration = &value
+	}
+	if appliedRevision.Valid {
+		value := appliedRevision.Int64
+		application.AppliedRevision = &value
+	}
+	if syncState.Valid {
+		value := workspace.BindingSyncState(syncState.String)
+		application.SyncState = &value
+	}
+	value.HostApplication = application
+	return nil
 }
 
 func workspaceFileFromRow(path string, size int64, digest string, mode int32, kind string, symlinkTarget pgtype.Text,

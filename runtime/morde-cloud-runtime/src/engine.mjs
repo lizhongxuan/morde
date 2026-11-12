@@ -34,6 +34,7 @@ const JOB_GET_TOOL = 'dsh_job_get'
 const JOB_OUTPUT_TOOL = 'dsh_job_output'
 const JOB_CANCEL_TOOL = 'dsh_job_cancel'
 const JOB_TOOLS = new Set([JOB_LIST_TOOL, JOB_GET_TOOL, JOB_OUTPUT_TOOL, JOB_CANCEL_TOOL])
+const JOB_STATUSES = new Set(['queued', 'running', 'cancelling', 'waiting_user', 'succeeded', 'cancelled', 'failed', 'unknown'])
 const MAX_DELEGATE_TITLE_BYTES = 256
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const MAX_CHILD_SUMMARY_BYTES = 1024 * 1024
@@ -412,6 +413,13 @@ function validDelegateArguments(args, appTools) {
     name !== CLARIFICATION_TOOL && name !== DELEGATE_TOOL && !JOB_TOOLS.has(name) && available.has(name) && !names.has(name) && names.add(name))
 }
 
+function validBackgroundJobHandle(output, sessionID) {
+  if (typeof output !== 'string') return false
+  let handle
+  try { handle = JSON.parse(output) } catch { return false }
+  return isObject(handle) && exactKeys(handle, ['job_id', 'status']) && handle.job_id === sessionID && JOB_STATUSES.has(handle.status)
+}
+
 function validJobTool(tool) {
   if (!tool || !JOB_TOOLS.has(tool.name) || !validToolDefinition(tool)) return false
   const properties = tool.parameters.properties
@@ -552,7 +560,10 @@ export function validStart(frame) {
     }
   }
   if (frame.resume === true) {
-    if (frame.prompt !== undefined || !Number.isSafeInteger(frame.checkpoint_through_seq) || frame.checkpoint_through_seq < 0 || !DIGEST.test(frame.checkpoint_sha256)) return false
+    if ((frame.prompt !== undefined && (typeof frame.prompt !== 'string' || !frame.prompt.trim() ||
+        !frame.prompt.isWellFormed() || frame.prompt.includes('\0') || Buffer.byteLength(frame.prompt) > MAX_CHECKPOINT_PAYLOAD_BYTES / 2 ||
+        jobTools.length !== JOB_TOOLS.size)) || !Number.isSafeInteger(frame.checkpoint_through_seq) ||
+        frame.checkpoint_through_seq < 0 || !DIGEST.test(frame.checkpoint_sha256)) return false
   } else {
     if (frame.checkpoint_through_seq !== undefined || frame.checkpoint_sha256 !== undefined) return false
     if (frame.initial_message === undefined && !(coordinator && frame.purpose === 'compaction') &&
@@ -767,7 +778,7 @@ class DurableSession {
       let resultText
       let resultImages
       if (call.name === DELEGATE_TOOL) {
-        const result = await this.executeDelegate?.(this, call.id, call.args, signal)
+        const result = await this.executeDelegate?.(this, call.id, call.args, signal, call.resultText)
         if (!result) throw new Error('delegated child recovery is unavailable')
         resultText = result.status === 'failed' ? `Tool failed: ${result.output}` : result.output
         resultImages = result.images
@@ -1172,7 +1183,7 @@ export async function runAgent(ipc, frame) {
     return job.status === 'cancelled' ? 'cancelled' : job.status
   }
 
-  async function runDelegation(parentDurable, parentAgent, callID, argumentsValue, signal) {
+  async function runDelegation(parentDurable, parentAgent, callID, argumentsValue, signal, recordedOutput) {
     if (!validDelegateArguments(argumentsValue, appTools)) throw new Error('delegated task arguments are invalid')
     const ownerKey = `${parentDurable.identity.session_id}\0${callID}`
     const existing = delegatedCalls.get(ownerKey)
@@ -1183,13 +1194,21 @@ export async function runAgent(ipc, frame) {
       const response = await ipc.createChild(parentDurable.identity, parentDurable.through, callID, argumentsValue, signal)
       const child = validateChildSession(response, parentDurable.identity, callID, argumentsValue, appTools)
       if (argumentsValue.run_in_background === true) {
+        if (recordedOutput !== undefined) {
+          if (!validBackgroundJobHandle(recordedOutput, child.identity.session_id)) {
+            throw new Error('checkpointed background job handle is invalid')
+          }
+          return { status: 'succeeded', output: recordedOutput, images: [] }
+        }
         if (response.step_status === 'running') {
           const childOwner = childOwners.get(child.identity.session_id)
           if (childOwner && childOwner !== ownerKey) throw new Error('child session is already owned by another call')
           const job = startBackgroundJob(child, callID, argumentsValue, parentAgent)
           await Promise.race([job.started.promise, job.promise])
+          return { status: 'succeeded', output: JSON.stringify({ job_id: child.identity.session_id, status: 'running' }), images: [] }
         }
-        return { status: 'succeeded', output: JSON.stringify({ job_id: child.identity.session_id, status: 'running' }), images: [] }
+        if (response.step_status === 'unknown') throw new Error('delegated task outcome is unknown')
+        return { status: 'succeeded', output: JSON.stringify({ job_id: child.identity.session_id, status: response.step_status }), images: [] }
       }
       if (response.step_status === 'unknown') throw new Error('delegated task outcome is unknown')
       if (response.step_status === 'succeeded' || response.step_status === 'failed') {
@@ -1212,7 +1231,8 @@ export async function runAgent(ipc, frame) {
     }
   }
 
-  durable.executeDelegate = (parentDurable, callID, args, signal) => runDelegation(parentDurable, undefined, callID, args, signal)
+  durable.executeDelegate = (parentDurable, callID, args, signal, recordedOutput) =>
+    runDelegation(parentDurable, undefined, callID, args, signal, recordedOutput)
   class WorkerModel extends LlmAdapter {
     async resolveModel(provider, model) {
       if (provider !== 'morde' || model !== frame.model) throw new Error('model route is not authorized')
@@ -1343,6 +1363,10 @@ export async function runAgent(ipc, frame) {
       }))
     })
     let revisionMessages = frame.revision_messages ?? []
+    const continuationAlreadyQueued = frame.prompt !== undefined &&
+      [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message =>
+        message?.source?.kind === 'plugin' && message.source.plugin === 'morde-context' &&
+        message.content?.length === 1 && message.content[0]?.type === 'text' && message.content[0].text === frame.prompt)
     const stageRevisionMessages = deliveries => {
       const byID = new Map(deliveries.map(message => [message.message_id, message]))
       for (const event of agent.session.snapshotEvents()) {
@@ -1388,6 +1412,9 @@ export async function runAgent(ipc, frame) {
     }
     if (frame.resume === true) {
       if (!recovery || (!recovery.completed && recovery.openTurn === null && !durable.recoveryHasInbox && revisionMessages.length === 0)) throw new Error('checkpoint tail is not safely resumable')
+      if (frame.prompt !== undefined && (!recovery.completed || recovery.openTurn !== null)) {
+        throw new Error('server continuation requires a completed checkpoint')
+      }
       await agent.whenIdle()
       if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
       if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('session recovery did not remain idle')
@@ -1397,7 +1424,19 @@ export async function runAgent(ipc, frame) {
         await agent.whenIdle()
         if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
         if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('revised task did not remain idle')
-      } else if (!recovery.completed || (durable.recoveryHasInbox && agent.inbox.hasPending)) {
+      }
+      if (frame.prompt !== undefined && !continuationAlreadyQueued) {
+        // A completed checkpoint cannot naturally enter another turn. The
+        // trusted worker may supply an internal continuation prompt when a
+        // durable background-job result still needs to be read by the parent.
+        agent.followup(createUserMessage({
+          content: [{ type: 'text', text: frame.prompt }],
+          source: { kind: 'plugin', plugin: 'morde-context' },
+        }))
+        await agent.whenIdle()
+        if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
+        if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('session continuation did not remain idle')
+      } else if (revisionMessages.length === 0 && (!recovery.completed || (durable.recoveryHasInbox && agent.inbox.hasPending))) {
         agent.followup(createUserMessage({
           content: [{ type: 'text', text: 'Continue the existing task from the last verified checkpoint. Do not repeat completed tool actions; use their recorded results. Process any user message already queued in the session inbox.' }],
           source: { kind: 'user' },

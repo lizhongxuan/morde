@@ -22,15 +22,16 @@ type hostReplicaBindingsResponse struct {
 }
 
 type hostReplicaBindingResponse struct {
-	WorkspaceID     string                     `json:"workspace_id"`
-	SyncCredential  string                     `json:"sync_credential,omitempty"`
-	Directory       string                     `json:"directory"`
-	State           workspace.BindingState     `json:"state"`
-	BindingVersion  int64                      `json:"binding_version"`
-	DesiredRevision int64                      `json:"desired_revision"`
-	AppliedRevision int64                      `json:"applied_revision"`
-	SyncState       workspace.BindingSyncState `json:"sync_state"`
-	SyncConflicts   []string                   `json:"sync_conflicts"`
+	WorkspaceID               string                                      `json:"workspace_id"`
+	SyncCredential            string                                      `json:"sync_credential,omitempty"`
+	Directory                 string                                      `json:"directory"`
+	State                     workspace.BindingState                      `json:"state"`
+	BindingVersion            int64                                       `json:"binding_version"`
+	DesiredRevision           int64                                       `json:"desired_revision"`
+	AppliedRevision           int64                                       `json:"applied_revision"`
+	SyncState                 workspace.BindingSyncState                  `json:"sync_state"`
+	SyncConflicts             []string                                    `json:"sync_conflicts"`
+	ProjectUploadApplications []workspace.PendingProjectUploadApplication `json:"project_upload_applications"`
 }
 
 type hostReplicaAppliedRequest struct {
@@ -45,6 +46,11 @@ type hostReplicaCheckpointRequest struct {
 type hostReplicaSyncStatusRequest struct {
 	State     workspace.BindingSyncState `json:"state"`
 	Conflicts []string                   `json:"conflicts"`
+}
+
+type hostProjectUploadApplicationRecorder interface {
+	RecordProjectUploadApplication(context.Context, identity.Principal, string, int64, string,
+		workspace.HostProjectUploadApplicationReport) (workspace.SyncHostApplication, error)
 }
 
 type hostTaskWorkspaceViewDeletionsResponse struct {
@@ -71,6 +77,7 @@ func (h *api) registerHostReplicaRoutes(engine *gin.Engine) {
 	group.POST("/tasks/:task_id/workspace-view-deletions/:request_id/applied", h.completeTaskWorkspaceViewDeletion)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/sync-status", h.authenticateHostReplicaBinding, h.reportHostReplicaWorkspaceSyncStatus)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/applied", h.authenticateHostReplicaBinding, h.recordHostReplicaAppliedRevision)
+	group.POST("/workspaces/:workspace_id/bindings/:binding_version/project-uploads/:session_id/applied", h.authenticateHostReplicaBinding, h.recordHostProjectUploadApplication)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/activate", h.authenticateHostReplicaBinding, h.activateHostReplicaBinding)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/detached", h.authenticateHostReplicaBinding, h.completeHostReplicaUnbinding)
 }
@@ -223,10 +230,32 @@ func (h *api) listHostReplicaBindings(c *gin.Context) {
 			writeError(c, domain.NewError(domain.CodeInternal, "Host workspace binding is inconsistent"))
 			return
 		}
+		if len(binding.ProjectUploadApplications) > 1000 {
+			writeError(c, domain.NewError(domain.CodeInternal, "Host project upload application queue is inconsistent"))
+			return
+		}
+		seenProjectApplications := make(map[string]struct{}, len(binding.ProjectUploadApplications))
+		for _, application := range binding.ProjectUploadApplications {
+			projectName := strings.TrimPrefix(application.ProjectPath, "project/")
+			if !workspace.ValidSessionID(application.SessionID) || !workspace.ValidProjectSourceBindingID(application.SourceBindingID) ||
+				application.ProjectPath == projectName || strings.Contains(projectName, "/") ||
+				workspace.ValidateSyncProjectFolderName(projectName) != nil ||
+				workspace.ValidateRelativePath(application.ProjectPath) != nil || application.TargetRevision < 0 ||
+				!workspace.ValidProjectManifestSHA256(application.ManifestSHA256) {
+				writeError(c, domain.NewError(domain.CodeInternal, "Host project upload application queue is inconsistent"))
+				return
+			}
+			if _, exists := seenProjectApplications[application.SessionID]; exists {
+				writeError(c, domain.NewError(domain.CodeInternal, "Host project upload application queue contains duplicates"))
+				return
+			}
+			seenProjectApplications[application.SessionID] = struct{}{}
+		}
 		item := hostReplicaBindingResponse{
 			WorkspaceID: binding.Workspace.ID, Directory: binding.Directory, State: binding.State,
 			BindingVersion: binding.BindingVersion, DesiredRevision: binding.DesiredRevision, AppliedRevision: binding.AppliedRevision,
 			SyncState: binding.SyncState, SyncConflicts: append([]string{}, binding.SyncConflicts...),
+			ProjectUploadApplications: append([]workspace.PendingProjectUploadApplication{}, binding.ProjectUploadApplications...),
 		}
 		if binding.State == workspace.BindingPreparing || binding.State == workspace.BindingActive || binding.State == workspace.BindingUnbinding {
 			item.SyncCredential, err = h.deps.HostReplicas.CredentialForBinding(c.Request.Context(), principal, binding.Workspace.ID, binding.BindingVersion)
@@ -313,6 +342,41 @@ func (h *api) recordHostReplicaAppliedRevision(c *gin.Context) {
 		BindingVersion: binding.BindingVersion, DesiredRevision: binding.DesiredRevision, AppliedRevision: binding.AppliedRevision,
 		SyncState: binding.SyncState, SyncConflicts: append([]string{}, binding.SyncConflicts...),
 	})
+}
+
+func (h *api) recordHostProjectUploadApplication(c *gin.Context) {
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	sessionID, ok := safeIDParam(c, "session_id", "session_id", workspace.ValidSessionID)
+	if !ok {
+		return
+	}
+	var report workspace.HostProjectUploadApplicationReport
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&report); err != nil || workspace.ValidateHostProjectUploadApplicationReport(report) != nil {
+		writeError(c, domain.InvalidArgument("project_upload_application", "Host project upload application report is invalid"))
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeError(c, domain.InvalidArgument("project_upload_application", "request body must contain exactly one value"))
+		return
+	}
+	service, ok := h.deps.HostReplicas.(hostProjectUploadApplicationRecorder)
+	if !ok {
+		serviceUnavailable(c)
+		return
+	}
+	application, err := service.RecordProjectUploadApplication(c.Request.Context(), principal,
+		principal.ReplicaWorkspaceID, principal.BindingVersion, sessionID, report)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, application)
 }
 
 func (h *api) activateHostReplicaBinding(c *gin.Context) {

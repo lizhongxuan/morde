@@ -588,13 +588,19 @@ function canAccessModel(user: User, model: ModelConnection): boolean {
   return model.shared || modelConnectionOwners.get(model.id) === user.id;
 }
 
+function isIanaTimeZone(value: unknown): boolean {
+  if (typeof value !== "string" || !value) return false;
+  try { new Intl.DateTimeFormat("en", { timeZone: value }); return true; } catch { return false; }
+}
+
 function isAutoMessageBody(value: unknown): value is components["schemas"]["AcceptConversationMessageRequest"] {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const body = value as Record<string, unknown>;
   const allowed = ["client_message_id", "previous_client_message_id", "reference_task_id", "model_id", "host_id", "workspace_id",
-    "application_id", "mcp_connector_ids", "client_attachment_ids", "content", "budget"];
+    "application_id", "mcp_connector_ids", "client_attachment_ids", "content", "time_zone", "budget"];
   if (Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.client_message_id !== "string"
     || !/^[A-Za-z0-9._~-]{8,128}$/.test(body.client_message_id) || typeof body.content !== "string") return false;
+  if (body.time_zone !== undefined && !isIanaTimeZone(body.time_zone)) return false;
   const attachmentIDs = body.client_attachment_ids;
   if (attachmentIDs !== undefined && (!Array.isArray(attachmentIDs) || attachmentIDs.length > 16
     || attachmentIDs.some((item) => typeof item !== "string" || !/^[A-Za-z0-9._~-]{8,128}$/.test(item))
@@ -605,7 +611,7 @@ function isAutoMessageBody(value: unknown): value is components["schemas"]["Acce
 const messageUploadChunkBytes = 16 * 1024;
 const messageUploadMaxBytes = 8 * 1024 * 1024;
 const messageMetadataFields = ["previous_client_message_id", "reference_task_id", "model_id", "host_id", "workspace_id",
-  "application_id", "mcp_connector_ids", "client_attachment_ids", "budget"] as const;
+  "application_id", "mcp_connector_ids", "client_attachment_ids", "time_zone", "budget"] as const;
 
 function canonicalJSON(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJSON).join(",")}]`;
@@ -640,6 +646,7 @@ function validMessageUploadInit(value: unknown): value is components["schemas"][
     const item = body[field];
     if (item !== undefined && (typeof item !== "string" || !item.length || item.length > (field === "model_id" ? 256 : field === "application_id" ? 64 : 128))) return false;
   }
+  if (body.time_zone !== undefined && !isIanaTimeZone(body.time_zone)) return false;
   for (const field of ["mcp_connector_ids", "client_attachment_ids"] as const) {
     const items = body[field];
     if (items !== undefined && (!Array.isArray(items) || items.length > 16 || items.some((item) => typeof item !== "string"
@@ -2073,6 +2080,12 @@ export const handlers = [
   }),
   http.post("/api/hosts/:hostId/renew", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state === "deleting") return failure("invalid_state", "主机正在删除", 409, { state: host.state }); host.expires_at = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(); return json(host); }),
   http.post("/api/hosts/:hostId/enter", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state === "deleting") return failure("invalid_state", "主机正在删除", 409, { state: host.state }); const url = new URL("/__ch/auth", host.url); url.searchParams.set("t", `mock-${host.id}-${Date.now()}`); return json({ url: url.href, expires_at: new Date(Date.now() + 60_000).toISOString() }); }),
+  http.post("/api/hosts/:hostId/embed-tickets", ({ params, cookies }) => {
+    const host = findHost(String(params.hostId), sessionUser(cookies)!);
+    if (!host) return failure("not_found", "主机不存在", 404);
+    if (host.state !== "running") return failure("invalid_state", "主机尚未运行", 409);
+    return failure("not_supported", "本地演示模式无法连接真实云端电脑。", 501);
+  }),
   http.get("/api/workspaces", ({ cookies }) => { const user = sessionUser(cookies)!; completeDeletions(); return json({ items: workspaces.filter((workspace) => workspaceOwners.get(workspace.id) === user.id && workspace.state !== "deleted") }); }),
   http.get("/api/workspaces/:workspaceId/manifest", ({ params, request, cookies }) => {
     const user = sessionUser(cookies);

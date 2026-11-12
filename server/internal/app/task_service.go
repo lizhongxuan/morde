@@ -755,7 +755,7 @@ func (s *TaskService) ListEvents(ctx context.Context, principal identity.Princip
 	previous := after
 	for _, event := range page.Items {
 		if event.TaskID != id || event.Sequence < 1 || event.Sequence != previous+1 ||
-			!validTaskEventType(event.Type) || !json.Valid(event.Payload) || event.CreatedAt.IsZero() {
+			!validTaskEventReadType(event.Type) || !json.Valid(event.Payload) || event.CreatedAt.IsZero() {
 			return TaskEventPage{}, domain.NewError(domain.CodeInternal, "stored task events are invalid")
 		}
 		previous = event.Sequence
@@ -906,4 +906,24 @@ func validTaskEventType(value string) bool {
 	default:
 		return false
 	}
+}
+
+func validTaskEventReadType(value string) bool {
+	if validTaskEventType(value) {
+		return true
+	}
+	if len(value) > 128 || !strings.HasPrefix(value, "task.") {
+		return false
+	}
+	name := strings.TrimPrefix(value, "task.")
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '_' && char != '.' && char != '-' {
+			return false
+		}
+	}
+	return true
 }

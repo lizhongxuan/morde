@@ -183,7 +183,7 @@ func createEmbedTestTicket(t *testing.T, store *Store, hostID, conversationID, a
 		TicketHash: hash[:], HostID: hostID, ConversationID: conversationID, ActorID: actorID,
 		PortalTokenID: tokenID, ClientInstallationID: installationID, ServiceInstanceID: hostEmbedTestInstanceID,
 		PortalOrigin: "https://portal.example.test", InitialTarget: target, EmbedNonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		TargetGrants: []app.HostEmbedTargetGrant{{Target: target, PermissionCeiling: ceiling}},
+		TargetGrants:      []app.HostEmbedTargetGrant{{Target: target, PermissionCeiling: ceiling}},
 		RuntimeGeneration: 3, ExpiresAt: time.Now().UTC().Add(time.Minute),
 	}
 	if err := store.CreateHostEmbedTicket(context.Background(), value); err != nil {

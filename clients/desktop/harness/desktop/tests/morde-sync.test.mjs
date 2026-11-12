@@ -62,6 +62,7 @@ process.stdin.once('data', chunk => {
     const checkpoint = {
       serviceInstanceID: '12345678-1234-4234-8234-123456789abc', installationId: 'i1234567',
       ...mapping, mode: 'project_upload', scope: [], projectSelectionID: '123e4567-e89b-42d3-a456-426614174000',
+      sourceBindingID: '12345678-1234-4234-8234-123456789abd',
       hostId: 'h1234567', folderId: folderID, projectName: 'demo', idempotencyKey: 'project-upload-key',
     };
     const sync = new MordeSync(() => binary, () => {});

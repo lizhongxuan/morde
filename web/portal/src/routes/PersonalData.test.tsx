@@ -176,6 +176,23 @@ describe('PersonalData', () => {
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
   });
 
+  it('cancels a stale personal attachment upload with the confirmed account and service identity', async () => {
+    const store = new PersonalDataStore(currentUser.id, window.location.origin, undefined, 'service-personal-test');
+    const attachment = await store.queueAttachment({
+      objectID: 'library-stale-upload', name: 'stale.txt', kind: 'artifact', mediaType: 'text/plain',
+      sizeBytes: 0, sha256: '0'.repeat(64), blob: new Blob([]), baseRevision: 0,
+    });
+    await store.saveUploadID(attachment.id, 'pu_stale-upload');
+    await store.markAttachmentConflict(attachment.id, '上传版本已变化', true);
+    renderPage();
+
+    await waitFor(() => expect(apiMocks.cancelUpload).toHaveBeenCalledWith(
+      'pu_stale-upload', 'service-personal-test', currentUser.id,
+    ));
+    expect(apiMocks.createUpload).not.toHaveBeenCalled();
+    expect(apiMocks.putChunk).not.toHaveBeenCalled();
+  });
+
   it('keeps previous-instance drafts out of automatic sync and offers explicit import using the current revision', async () => {
     const user = userEvent.setup();
     const oldStore = new PersonalDataStore(currentUser.id, window.location.origin, undefined, 'service-old');
@@ -216,7 +233,9 @@ describe('PersonalData', () => {
     expect(apiMocks.delete).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole('button', { name: '确认并提交删除' }));
-    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith('profile', 'default', 4, expect.any(String)));
+    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith(
+      'profile', 'default', 4, expect.any(String), 'service-personal-test', currentUser.id,
+    ));
     expect((await oldStore.read()).outbox[0]).toMatchObject({ id: oldDraft.id, key: oldDraft.key, status: 'conflict', resolutionQueued: true });
   });
 
@@ -373,7 +392,9 @@ describe('PersonalData', () => {
     await user.click(screen.getByRole('link', { name: '记忆' }));
     await user.click(screen.getByRole('button', { name: '删除' }));
 
-    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith('memory', 'm_saved02', 7, expect.any(String)));
+    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith(
+      'memory', 'm_saved02', 7, expect.any(String), 'service-personal-test', currentUser.id,
+    ));
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
   });
 
@@ -404,7 +425,9 @@ describe('PersonalData', () => {
     await user.click(screen.getByRole('link', { name: 'AI 个性' }));
     expect(screen.getByLabelText('SOUL 内容')).toHaveValue('Use short answers.');
     await user.click(screen.getByRole('button', { name: '删除个人人格' }));
-    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith('soul', 'default', 3, expect.any(String)));
+    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith(
+      'soul', 'default', 3, expect.any(String), 'service-personal-test', currentUser.id,
+    ));
   });
 
   it('carries an idea into Assistant route state without putting prompt text in the URL or submitting a task', async () => {
