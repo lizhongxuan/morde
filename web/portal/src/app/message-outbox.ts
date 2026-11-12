@@ -97,6 +97,7 @@ export function outboxReceiptRequest(message: PendingConversationMessage): compo
     ...(source.previous_client_message_id ? { previous_client_message_id: source.previous_client_message_id } : {}),
     ...(source.reference_task_id ? { reference_task_id: source.reference_task_id } : {}),
     ...(source.model_id ? { model_id: source.model_id } : {}),
+    ...(source.time_zone ? { time_zone: source.time_zone } : {}),
     ...(source.host_id ? { host_id: source.host_id } : {}),
     ...(source.workspace_id ? { workspace_id: source.workspace_id } : {}),
     ...(source.change_task_target ? { change_task_target: true } : {}),

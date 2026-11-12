@@ -1,7 +1,9 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
+import { errorDetails } from '../app/api';
 import { formatBytes, formatDate } from '../app/format';
 import { desktopCapabilityNames, getDesktopDownloads } from '../app/desktopDownloads';
+import { FloatingError } from '../components/FloatingError';
 
 const platformNames = {
   'macos:arm64': 'macOS · Apple 芯片',
@@ -16,16 +18,15 @@ export function Downloads() {
   return <main className="download-page">
     <div className="download-container">
       <header className="download-topbar">
-        <Link className="brand" to="/login"><span className="brand-mark">M</span><span>Morde 云端电脑</span></Link>
+        <Link className="brand" to="/login"><span className="morde-brand-mark" aria-hidden="true">M</span><span>Morde 云端电脑</span></Link>
         <Link className="button button-secondary" to="/login">登录</Link>
       </header>
 
       <section aria-labelledby="download-heading">
-        <p className="eyebrow">MORDE DESKTOP</p>
         <h1 id="download-heading">下载 Morde Desktop</h1>
         <p className="download-intro">在电脑上选择本地项目文件夹，与 Morde 工作区同步；你的 AI 工具仍可使用本地文件。</p>
         {downloads.isPending && <p className="loading-card" role="status">正在读取可用版本…</p>}
-        {downloads.isError && <div className="error-card" role="alert"><span>{downloads.error instanceof Error ? downloads.error.message : '暂时无法读取安装包列表'}</span><button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button></div>}
+        {downloads.isError && <FloatingError className="error-card" role="alert"><span>{errorDetails(downloads.error).message}</span><button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button></FloatingError>}
         {downloads.isSuccess && downloads.data.artifacts.length === 0 && <section className="empty-card download-empty"><h2>当前还没有可下载版本</h2><p>管理员发布桌面安装包后，这里会显示对应电脑的下载入口。</p></section>}
         {downloads.isSuccess && downloads.data.artifacts.length > 0 && <>
           <p className="download-version">版本 {downloads.data.version}</p>

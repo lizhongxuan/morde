@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { downloadFile, listFiles, MAX_UPLOAD_BYTES, readFile, uploadFile, writeFile, type AioFile } from '../app/fileApi';
 import { runShell } from '../app/aio';
 import { shellQuote } from '../util/shellQuote';
+import FloatingError from './FloatingError';
 
 const INITIAL_PATH = '/home/gem/workspace';
 
@@ -337,7 +338,7 @@ export default function FileManager() {
       </div>
 
       {message && <p className="success-text" role="status">{message}</p>}
-      {error && <p className="error-text" role="alert">{error}</p>}
+      {error && <FloatingError>{error}</FloatingError>}
 
       <div className="file-layout">
         <div className="file-list-wrap">

@@ -11,6 +11,7 @@ const host: GatewayHost = {
   state: 'running',
   expires_at: null,
   workspaces: [],
+  embed_targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'],
 };
 const control: GatewayControl = {
   host_id: host.id,
@@ -36,6 +37,14 @@ function mockWorkbenchApi() {
   vi.spyOn(gatewayApi, 'host').mockResolvedValue(host);
   vi.spyOn(gatewayApi, 'control').mockResolvedValue(control);
   vi.spyOn(gatewayApi, 'workspaces').mockResolvedValue({ items: [] });
+}
+
+function showEmbeddedWorkbench(nonce: string) {
+  act(() => window.dispatchEvent(new MessageEvent('message', {
+    origin: 'https://portal.example.test',
+    source: window,
+    data: { channel: 'morde.workbench.embed', version: 1, type: 'init', nonce, conversation_id: 'c1234567', visible: true },
+  })));
 }
 
 afterEach(() => {
@@ -88,7 +97,7 @@ describe('Workbench MVP navigation', () => {
     expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
     expect(gatewayApi.host).not.toHaveBeenCalled();
     expect(gatewayApi.control).not.toHaveBeenCalled();
-    expect(gatewayApi.workspaces).toHaveBeenCalledOnce();
+    await waitFor(() => expect(gatewayApi.workspaces).toHaveBeenCalledOnce());
   });
 
   it('scopes embedded messages to the referrer, source and nonce, then refreshes control on resume', async () => {
@@ -132,6 +141,53 @@ describe('Workbench MVP navigation', () => {
     expect(screen.queryByRole('button', { name: 'Workspace' })).not.toBeInTheDocument();
     expect([...container.querySelectorAll<HTMLButtonElement>('.tab-button')].map((button) => button.dataset.tab))
       .toEqual(['browser', 'terminal', 'files', 'vscode']);
+  });
+
+  it('shows only server-authorized embed targets and falls back when the requested tab is not authorized', async () => {
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
+    vi.mocked(gatewayApi.host).mockResolvedValue({ ...host, embed_targets: ['browser', 'terminal'] });
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'a'.repeat(32)}&tab=workspace`);
+    render(<Workbench />);
+    showEmbeddedWorkbench('a'.repeat(32));
+
+    const browser = await screen.findByRole('button', { name: '浏览器' });
+    expect(browser).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('button', { name: '终端' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '文件' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Workspace' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'VS Code' })).not.toBeInTheDocument();
+    expect(gatewayApi.control).toHaveBeenCalled();
+    expect(gatewayApi.workspaces).not.toHaveBeenCalled();
+  });
+
+  it('keeps the complete authorized tab bar when Workspace is the requested embedded tab', async () => {
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
+    vi.mocked(gatewayApi.host).mockResolvedValue({ ...host, embed_targets: ['browser', 'workspace', 'files'] });
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'w'.repeat(32)}&tab=workspace`);
+    render(<Workbench />);
+    showEmbeddedWorkbench('w'.repeat(32));
+
+    expect(await screen.findByRole('button', { name: '浏览器' })).toBeVisible();
+    const files = screen.getByRole('button', { name: '文件' });
+    expect(files).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('button', { name: '浏览器' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '终端' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'VS Code' })).not.toBeInTheDocument();
+    await waitFor(() => expect(gatewayApi.workspaces).toHaveBeenCalledOnce());
+    expect(gatewayApi.control).toHaveBeenCalled();
+  });
+
+  it('does not query desktop control APIs when no embed target grants browser access', async () => {
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
+    vi.mocked(gatewayApi.host).mockResolvedValue({ ...host, embed_targets: ['workspace'] });
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'s'.repeat(32)}&tab=workspace`);
+    render(<Workbench />);
+    showEmbeddedWorkbench('s'.repeat(32));
+
+    expect(await screen.findByRole('button', { name: '文件' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '文件' })).toHaveAttribute('aria-current', 'page');
+    expect(gatewayApi.control).not.toHaveBeenCalled();
+    await waitFor(() => expect(gatewayApi.workspaces).toHaveBeenCalledOnce());
   });
 
   it('keeps renewing the current user lease while the embedded panel is hidden', async () => {

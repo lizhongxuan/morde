@@ -72,14 +72,14 @@ func TestConversationMessageUploadCarriesExplicitTaskTargetChange(t *testing.T) 
 		"/api/conversations/c1234567/message-uploads/client-message-001",
 		"/api/projects/j1234567/conversations/c1234567/message-uploads/client-message-001",
 	} {
-		request := httptest.NewRequest(http.MethodPut, path, strings.NewReader(`{"total_bytes":1,"total_chunks":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","change_task_target":true}`))
+		request := httptest.NewRequest(http.MethodPut, path, strings.NewReader(`{"total_bytes":1,"total_chunks":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","change_task_target":true,"time_zone":"Asia/Shanghai"}`))
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", "client-message-001")
 		request.Header.Set("X-Morde-Actor-ID", "u1234567")
 		request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
-		if response.Code != http.StatusOK || !service.command.ChangeTaskTarget {
+		if response.Code != http.StatusOK || !service.command.ChangeTaskTarget || service.command.TimeZone != "Asia/Shanghai" {
 			t.Fatalf("initialize %s: status=%d body=%s target-change=%t", path, response.Code, response.Body.String(), service.command.ChangeTaskTarget)
 		}
 	}

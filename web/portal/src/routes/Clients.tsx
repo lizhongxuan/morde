@@ -4,7 +4,9 @@ import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { ScreenPagination } from '../components/ScreenPagination';
 import { Link } from 'react-router';
+import { FloatingError } from '../components/FloatingError';
 
 type Client = Awaited<ReturnType<typeof portalApi.clients>>['items'][number];
 const platformName: Record<string, string> = { desktop: '电脑', android: 'Android', ios: 'iOS' };
@@ -33,8 +35,15 @@ export function Clients() {
   return <section className="design-panel">
     <div className="design-panel-header"><div><h2>已登录设备</h2><p>管理已登录的电脑和手机。</p></div><Link className="button button-secondary" to="/download">下载客户端</Link></div>
     {clients.isPending ? <div className="loading-card" role="status">正在加载客户端…</div>
-      : clients.isError ? <div className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></div>
+      : clients.isError ? <FloatingError className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></FloatingError>
         : !clients.data.items.length ? <div className="empty-card compact"><p>还没有已登录的客户端。请在 Morde 电脑或手机应用使用账号密码登录。</p></div>
-          : <div className="device-manager-list">{clients.data.items.map((client) => <ClientCard key={client.id} client={client} refresh={refresh} />)}</div>}
+          : <ScreenPagination
+            items={clients.data.items}
+            getKey={(client) => client.id}
+            estimatedItemHeight={148}
+            height="min(56dvh, 560px)"
+            ariaLabel="已登录客户端"
+            renderItem={(client) => <ClientCard client={client} refresh={refresh} />}
+          />}
   </section>;
 }

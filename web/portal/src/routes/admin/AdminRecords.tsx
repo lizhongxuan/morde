@@ -6,6 +6,7 @@ import { useAuth } from '../../app/auth';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes, formatDate } from '../../app/format';
 import { useToast } from '../../app/toast';
+import { FloatingError } from '../../components/FloatingError';
 
 type Purpose = 'full_record' | 'training_contribution';
 type Capability = 'view' | 'attachment' | 'export' | 'delete';
@@ -34,7 +35,7 @@ function showDownload(blob: Blob, fileName: string) {
 }
 
 function RecordsError({ error, retry }: { error: unknown; retry: () => void }) {
-  return <div className="error-card" role="alert">{errorDetails(error).message}<button type="button" className="button button-secondary" onClick={retry}>重试</button></div>;
+  return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button type="button" className="button button-secondary" onClick={retry}>重试</button></FloatingError>;
 }
 
 function ConsentStatus({ consent }: { consent: Access['consents'][number] }) {

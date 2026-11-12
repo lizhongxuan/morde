@@ -18,6 +18,66 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "library_item", id: "../item"))
     }
 
+    func testLegacySyncPauseDoesNotDisableCloudReads() {
+        let scope = String(repeating: "e", count: 64)
+        let suiteName = "NanoMuseMordePersonalDataTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        NanoMuseMordeProfileSyncPreference.setEnabled(false, scopeKey: scope, defaults: defaults)
+
+        XCTAssertFalse(NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope, defaults: defaults))
+        XCTAssertTrue(NanoMuseMordeProfileSyncPreference.canRead(scopeKey: scope))
+        XCTAssertFalse(NanoMuseMordeProfileSyncPreference.canFlush(syncEnabled: false, scopeKey: scope))
+    }
+
+    @MainActor func testIncrementalChangesKeepRevisionsMonotonicAndApplyDeletion() throws {
+        let old = MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 3,
+                                           body: .object(["content": .string("current")]))
+        var objects = ["memory": ["global": old]]
+
+        try NanoMuseMordePersonalContentStore.apply(
+            MordePersonalChange(change_sequence: 8, object_type: "memory", object_id: "global",
+                               revision: 2, operation: "upsert", mutation_id: nil),
+            item: MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 2,
+                                          body: .object(["content": .string("stale")])), to: &objects)
+        XCTAssertEqual(objects["memory"]?["global"], old)
+
+        try NanoMuseMordePersonalContentStore.apply(
+            MordePersonalChange(change_sequence: 9, object_type: "memory", object_id: "global",
+                               revision: 4, operation: "delete", mutation_id: nil), item: nil, to: &objects)
+        XCTAssertNil(objects["memory"]?["global"])
+
+        try NanoMuseMordePersonalContentStore.apply(
+            MordePersonalChange(change_sequence: 10, object_type: "memory", object_id: "global",
+                               revision: 5, operation: "upsert", mutation_id: nil),
+            item: MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 5,
+                                          body: .object(["content": .string("restored")])), to: &objects)
+        XCTAssertEqual(objects["memory"]?["global"]?.revision, 5)
+    }
+
+    @MainActor func testIncrementalUpsertRejectsMismatchedObjectIdentity() {
+        var objects: [String: [String: MordePersonalSyncObject]] = [:]
+        let change = MordePersonalChange(change_sequence: 1, object_type: "memory", object_id: "global",
+                                         revision: 2, operation: "upsert", mutation_id: nil)
+        XCTAssertThrowsError(try NanoMuseMordePersonalContentStore.apply(
+            change,
+            item: MordePersonalSyncObject(object_type: "memory", object_id: "user", revision: 2,
+                                          body: .object(["content": .string("wrong object")])), to: &objects))
+        XCTAssertTrue(objects.isEmpty)
+    }
+
+    @MainActor func testIncrementalUpsertRead404RemovesStaleCurrentObject() throws {
+        var objects = ["memory": ["global": MordePersonalSyncObject(
+            object_type: "memory", object_id: "global", revision: 4,
+            body: .object(["content": .string("was current")]))]]
+        try NanoMuseMordePersonalContentStore.apply(
+            MordePersonalChange(change_sequence: 5, object_type: "memory", object_id: "global",
+                               revision: 3, operation: "upsert", mutation_id: nil),
+            item: nil, to: &objects)
+        XCTAssertNil(objects["memory"]?["global"])
+    }
+
     func testGenericOutboxIsAccountScopedAndNeverOverwritesPending() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

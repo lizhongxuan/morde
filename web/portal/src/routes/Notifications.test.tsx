@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -52,6 +52,34 @@ describe('Notifications', () => {
     await user.click(screen.getByRole('button', { name: '未读' }));
     await waitFor(() => expect(list).toHaveBeenLastCalledWith(undefined, true));
     expect(screen.getByRole('button', { name: '未读' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('paginates loaded notifications and keeps mark-read actions on the selected page', async () => {
+    const secondUnread = { ...unread, id: 'n7654321', task_id: 'q7654321', summary: '第二页未读通知。' };
+    let rows = [unread, secondUnread];
+    vi.spyOn(portalApi, 'notifications').mockImplementation(async () => ({ items: [...rows], next_cursor: null }));
+    vi.spyOn(portalApi, 'markNotificationRead').mockImplementation(async (id) => {
+      rows = rows.map((item) => item.id === id ? { ...item, read_at: timestamp } : item);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByText('需要补充任务信息。')).toBeInTheDocument();
+    const pagination = screen.getByRole('navigation', { name: '通知列表分页' });
+    const firstRow = screen.getByText('需要补充任务信息。').closest<HTMLElement>('.screen-pagination__item')!;
+    const secondRow = screen.getByText('第二页未读通知。').closest<HTMLElement>('.screen-pagination__item')!;
+    expect(firstRow).not.toHaveAttribute('hidden');
+    expect(secondRow).toHaveAttribute('hidden');
+
+    await user.click(within(pagination).getByRole('button', { name: '下一页' }));
+    expect(firstRow).toHaveAttribute('hidden');
+    expect(secondRow).not.toHaveAttribute('hidden');
+    await user.click(within(secondRow).getByRole('button', { name: '标记已读' }));
+
+    await waitFor(() => expect(within(secondRow).getByText('已读')).toBeInTheDocument());
+    expect(within(secondRow).queryByRole('button', { name: '标记已读' })).not.toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: '通知列表分页' })).toBeInTheDocument();
   });
 
   it('keeps loaded notifications visible when loading another page fails', async () => {

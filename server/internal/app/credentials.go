@@ -274,6 +274,29 @@ func (s *CredentialService) VerifySession(ctx context.Context, raw string) (iden
 	return s.verify(ctx, raw, identity.KindSession)
 }
 
+// ValidateHostEmbedCredential checks that the credential which established an
+// embedded Host session is still active without granting it any additional scope.
+func (s *CredentialService) ValidateHostEmbedCredential(ctx context.Context, tokenID, actorID, installationID string) error {
+	if s == nil || s.tokens == nil || s.users == nil || ctx == nil || !domain.ValidTokenID(tokenID) || !domain.ValidUserID(actorID) ||
+		(installationID != "" && !domain.ValidClientInstallationID(installationID)) {
+		return domain.NewError(domain.CodeUnauthenticated, "embedded Host credential is unavailable")
+	}
+	token, err := s.tokens.GetTokenByID(ctx, tokenID)
+	if err != nil || token.ID != tokenID || token.OwnerID != actorID ||
+		(token.Kind != identity.KindSession && token.Kind != identity.KindClient) || token.RevokedAt != nil ||
+		!token.ExpiresAt.After(time.Now()) || token.ClientInstallationID != installationID {
+		return domain.NewError(domain.CodeUnauthenticated, "embedded Host credential is unavailable")
+	}
+	user, err := s.users.GetUserByID(ctx, actorID)
+	if err != nil || user.ID != actorID || user.Status != identity.StatusApproved {
+		return domain.NewError(domain.CodeUnauthenticated, "embedded Host credential is unavailable")
+	}
+	if token.Kind == identity.KindClient && installationID == "" || installationID != "" && !s.clientInstallationActive(ctx, installationID, actorID) {
+		return domain.NewError(domain.CodeUnauthenticated, "embedded Host installation is unavailable")
+	}
+	return nil
+}
+
 func (s *CredentialService) VerifyAPIKey(ctx context.Context, raw string) (identity.Principal, error) {
 	return s.verify(ctx, raw, identity.KindAPIKey)
 }

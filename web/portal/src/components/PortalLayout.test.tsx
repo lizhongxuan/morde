@@ -1,14 +1,14 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PortalLayout } from './PortalLayout';
 import { ToastProvider } from '../app/toast';
 
-const portalLayoutAuthState = vi.hoisted(() => ({ role: 'user' as string }));
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: portalLayoutAuthState.role }, signOut: vi.fn() }) }));
+const portalLayoutAuthState = vi.hoisted(() => ({ role: 'user' as string, signOut: vi.fn() }));
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: portalLayoutAuthState.role }, signOut: portalLayoutAuthState.signOut }) }));
 
 describe('PortalLayout', () => {
-  afterEach(() => { cleanup(); portalLayoutAuthState.role = 'user'; localStorage.removeItem('morde:pc-context-sidebar-collapsed'); });
+  afterEach(() => { cleanup(); portalLayoutAuthState.role = 'user'; portalLayoutAuthState.signOut.mockReset(); localStorage.removeItem('morde:pc-context-sidebar-collapsed'); });
 
   it('provides the shared top controls and links to the same-origin mobile app', () => {
     render(<ToastProvider><MemoryRouter initialEntries={['/hosts']}><PortalLayout /></MemoryRouter></ToastProvider>);
@@ -27,6 +27,38 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '项目' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '工作区' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
+  });
+
+  it.each(['/notifications', '/projects', '/workspaces'])('does not render a sidebar toggle without a context sidebar on %s', (path) => {
+    const { container } = render(<ToastProvider><MemoryRouter initialEntries={[path]}><PortalLayout /></MemoryRouter></ToastProvider>);
+    expect(container.querySelector('#context-sidebar')).toBeNull();
+    expect(screen.queryByRole('button', { name: /侧边栏/ })).not.toBeInTheDocument();
+    expect(container.querySelector('.assistant-page')).toBeNull();
+  });
+
+  it('keeps settings and logout inside the account menu and confirms before signing out', () => {
+    const { container } = render(<ToastProvider><MemoryRouter initialEntries={['/assistant']}><PortalLayout /></MemoryRouter></ToastProvider>);
+    const accountMenu = container.querySelector('details.morde-account-menu') as HTMLDetailsElement;
+    expect(container.querySelector('.morde-sidebar-bottom > .morde-nav-link')).toBeNull();
+    expect(accountMenu.querySelector('a[href="/connections"]')).toBeInTheDocument();
+    expect(accountMenu.querySelector('.morde-profile-logout')).toBeInTheDocument();
+    expect(accountMenu.open).toBe(false);
+
+    fireEvent.click(accountMenu.querySelector('summary')!);
+    expect(accountMenu.open).toBe(true);
+    fireEvent.click(accountMenu.querySelector('.morde-profile-logout')!);
+    const dialog = screen.getByRole('dialog', { name: '退出登录' });
+    expect(portalLayoutAuthState.signOut).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole('button', { name: '退出登录' }));
+    expect(portalLayoutAuthState.signOut).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the administration entry inside the account menu', () => {
+    portalLayoutAuthState.role = 'super_admin';
+    const { container } = render(<ToastProvider><MemoryRouter initialEntries={['/assistant']}><PortalLayout /></MemoryRouter></ToastProvider>);
+    expect(screen.getByRole('link', { name: '切换至管理后台' })).not.toBeVisible();
+    fireEvent.click(container.querySelector('.morde-account-menu > summary')!);
+    expect(screen.getByRole('link', { name: '切换至管理后台' })).toHaveAttribute('href', '/admin/');
   });
 
   it('aligns page categories below the top bar and selects personal-data sections', () => {

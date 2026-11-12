@@ -2,13 +2,56 @@ package app
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 )
+
+func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
+	receivedAt := time.Date(2026, 11, 12, 3, 4, 5, 0, time.UTC)
+	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "现在几点？",
+		TimeZone: "Asia/Shanghai", ServerReceivedAt: receivedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input["reference_time"] != "2026-11-12T11:04:05+08:00" || input["time_zone"] != "Asia/Shanghai" || input["time_zone_provided"] != true {
+		t.Fatalf("localized server receipt time missing: %+v", input)
+	}
+	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "server received") ||
+		!strings.Contains(request.Instructions, "must not create a Task") {
+		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
+	}
+}
+
+func TestConversationRouteModelRequestUsesUTCWhenTimeZoneMissing(t *testing.T) {
+	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "现在几点？",
+		ServerReceivedAt: time.Date(2026, 11, 12, 3, 4, 5, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input["reference_time"] != "2026-11-12T03:04:05Z" || input["time_zone_provided"] != false {
+		t.Fatalf("missing time zone did not use explicit UTC reference: %+v", input)
+	}
+	if _, exists := input["time_zone"]; exists {
+		t.Fatalf("missing time zone was misrepresented: %+v", input)
+	}
+	if _, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "现在几点？", TimeZone: "invalid/zone"}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("invalid route time zone accepted: %v", err)
+	}
+}
 
 func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 	candidates := []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 4}}

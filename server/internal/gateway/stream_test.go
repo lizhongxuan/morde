@@ -386,6 +386,135 @@ func TestRevokingMemberClosesExistingDesktopWebSocket(t *testing.T) {
 	}
 }
 
+func TestRevokingPortalCredentialClosesExistingEmbeddedDesktopWebSocket(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(websocketEcho))
+	defer upstream.Close()
+	handler, g, _, verifier, _ := newTestDeps(t, app.Upstream{BaseURL: upstream.URL, APIKey: "aio-secret"})
+	g.deps.ServiceInstanceID = testServiceInstanceID
+	g.memberAuthorizationCheckInterval = 20 * time.Millisecond
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	connection, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = connection.Close() }()
+	if err := connection.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	nonce := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	claims := embedClaims{HostID: testHostID, ActorID: testUserID, PortalTokenID: "t1234567", ConversationID: "c1234567",
+		ServiceInstanceID: testServiceInstanceID, PortalOrigin: "https://portal.example.test", InitialTarget: app.HostEmbedTargetBrowser,
+		TargetGrants: []app.HostEmbedTargetGrant{{Target: app.HostEmbedTargetBrowser, PermissionCeiling: host.PermissionDesktopControl}},
+		EmbedNonce:   nonce, RuntimeGeneration: 1, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	cookie := g.signEmbedClaims(claims)
+	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	_, err = fmt.Fprintf(connection,
+		"GET /ws HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\nOrigin: https://%s\r\nCookie: %s=%s\r\n\r\n",
+		hostAuthority(), key, hostAuthority(), embedCookieName, cookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(connection)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
+		t.Fatalf("embedded websocket handshake = %q, %v", status, err)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	verifier.mu.Lock()
+	verifier.embedRevoked = true
+	verifier.mu.Unlock()
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("embedded websocket remained open after Portal credential revocation")
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("embedded websocket was not closed after Portal credential revocation")
+		}
+	}
+	verifier.mu.Lock()
+	defer verifier.mu.Unlock()
+	if verifier.embedChecks < 2 {
+		t.Fatalf("credential checks = %d, want handshake and periodic Portal revocation checks", verifier.embedChecks)
+	}
+}
+
+func TestRevokingPortalCredentialClosesExistingEmbeddedTerminalWebSocket(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(websocketEcho))
+	defer upstream.Close()
+	handler, g, runtime, verifier, _ := newTestDeps(t, app.Upstream{BaseURL: upstream.URL, APIKey: "aio-secret"})
+	runtime.ref.ControlState = host.ControlUser
+	g.deps.ServiceInstanceID = testServiceInstanceID
+	g.memberAuthorizationCheckInterval = 20 * time.Millisecond
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	connection, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = connection.Close() }()
+	if err := connection.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	nonce := "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	claims := embedClaims{HostID: testHostID, ActorID: testUserID, PortalTokenID: "t1234567", ConversationID: "c1234567",
+		ServiceInstanceID: testServiceInstanceID, PortalOrigin: "https://portal.example.test", InitialTarget: app.HostEmbedTargetTerminal,
+		TargetGrants: []app.HostEmbedTargetGrant{{Target: app.HostEmbedTargetTerminal, PermissionCeiling: host.PermissionTerminalControl}},
+		EmbedNonce:   nonce, RuntimeGeneration: 1, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	cookie := g.signEmbedClaims(claims)
+	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	_, err = fmt.Fprintf(connection,
+		"GET /v1/shell/ws?session_id=terminal-session HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\nOrigin: https://%s\r\nCookie: %s=%s\r\n\r\n",
+		hostAuthority(), key, hostAuthority(), embedCookieName, cookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(connection)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
+		t.Fatalf("embedded terminal websocket handshake = %q, %v", status, err)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	verifier.mu.Lock()
+	verifier.embedRevoked = true
+	verifier.mu.Unlock()
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("embedded terminal websocket remained open after Portal credential revocation")
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("embedded terminal websocket was not closed after Portal credential revocation")
+		}
+	}
+	verifier.mu.Lock()
+	defer verifier.mu.Unlock()
+	if verifier.embedChecks < 2 {
+		t.Fatalf("credential checks = %d, want handshake and periodic Portal revocation checks", verifier.embedChecks)
+	}
+}
+
 func TestRevokingClientClosesExistingDesktopWebSocketWithinFiveSeconds(t *testing.T) {
 	if hostMemberAuthorizationCheckInterval+hostAuthorizationCheckTimeout >= 5*time.Second {
 		t.Fatal("authorization polling and timeout exceed the five-second revocation budget")

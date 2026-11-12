@@ -6,6 +6,7 @@ import { ApiError } from '../api/client';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
 import { useToast } from '../app/toast';
+import { FloatingError } from '../components/FloatingError';
 
 type HostCreateInput = { name?: string; workspace_mode: 'new' | 'existing' | 'automatic'; workspace_ids: string[] };
 type PendingHostCreate = {
@@ -135,10 +136,10 @@ export function NewHost() {
   };
 
   if (hosts.isPending) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
-  if (hosts.isError) return <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>;
-  if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <div className="notice notice-warning" role="alert">已达到云端电脑数量上限</div>;
+  if (hosts.isError) return <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>;
+  if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <FloatingError>已达到云端电脑数量上限</FloatingError>;
   return <section>
-    {recoveryError && <div className="notice notice-warning" role="alert">无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></div>}
+    {recoveryError && <FloatingError>无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></FloatingError>}
     <form className="form-card form-stack" onSubmit={submit}>
       <div className="design-panel-header"><div><h2>基本配置</h2><p>使用管理员为你设置的规格。</p></div><Link className="button button-secondary" to="/hosts">← 返回云端电脑</Link></div>
       {recoveryPending && !create.isPending && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会用相同请求编号核对结果；若已在主机列表确认，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}

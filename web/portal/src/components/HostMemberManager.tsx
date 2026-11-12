@@ -6,6 +6,7 @@ import type { HostMember, HostMemberPermission } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { ConfirmDialog } from './ConfirmDialog';
+import { FloatingError } from './FloatingError';
 
 const permissionOptions: { value: HostMemberPermission; title: string; description: string }[] = [
   { value: 'desktop:view', title: '查看桌面', description: '只能查看画面，不能点击或输入。' },
@@ -96,7 +97,7 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
               aria-describedby={`host-member-user-help-${hostId}`}
             />
             <small id={`host-member-user-help-${hostId}`} className="muted">请输入现有 Morde 账号 ID（u 加 7 位小写字母或数字）；账号是否存在由服务端验证。</small>
-            {userID && !validUserID(userID) && <p className="form-error" role="alert">账号 ID 格式应为 u 加 7 位小写字母或数字。</p>}
+            {userID && !validUserID(userID) && <FloatingError>账号 ID 格式应为 u 加 7 位小写字母或数字。</FloatingError>}
           </div>
         </div>
         <fieldset className="fieldset">
@@ -126,7 +127,7 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
       </form>
 
       {members.isPending ? <div className="loading-card" role="status">正在加载共享成员…</div>
-        : members.isError ? <div className="error-card" role="alert">{errorDetails(members.error).message}<button type="button" className="button button-secondary" onClick={() => void members.refetch()}>重试</button></div>
+        : members.isError ? <FloatingError className="error-card" role="alert">{errorDetails(members.error).message}<button type="button" className="button button-secondary" onClick={() => void members.refetch()}>重试</button></FloatingError>
           : !members.data.items.length ? <div className="empty-card compact"><p>还没有共享成员。</p></div>
             : <div className="device-manager-list">{members.data.items.map((member) => (
               <article className="device-manager-card" key={member.user_id}>

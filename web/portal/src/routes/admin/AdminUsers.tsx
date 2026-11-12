@@ -5,6 +5,7 @@ import { errorDetails, portalApi } from '../../app/api';
 import { formatCpu, formatDate, formatMemory } from '../../app/format';
 import { useAuth } from '../../app/auth';
 import { useToast } from '../../app/toast';
+import { FloatingError } from '../../components/FloatingError';
 
 type AccountStatus = 'pending' | 'rejected' | 'approved' | 'disabled';
 type AdminUser = Awaited<ReturnType<typeof portalApi.adminUsers>>['items'][number];
@@ -90,6 +91,6 @@ export function AdminUsers() {
         <button className="button button-secondary button-small" type="button" disabled={offset + query.data.items.length >= query.data.total || query.isFetching} onClick={() => setOffset(offset + query.data.limit)}>下一页</button></div>
     </nav>}
     {query.isPending && <div className="loading-card">正在加载用户…</div>}
-    {query.isError && <div className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
   </section>;
 }

@@ -996,7 +996,7 @@ func TestHealthMCPAndPortalStaticRoutes(t *testing.T) {
 	assertError(t, requestWithCookie(router, http.MethodGet, "/mcp", &http.Cookie{Name: portalCookieName, Value: sessionCredential()}, ""), http.StatusUnauthorized, "unauthenticated")
 
 	portal := requestHTML(router, "/hosts/new")
-	if portal.Code != http.StatusOK || !strings.Contains(portal.Body.String(), "<title>portal</title>") || portal.Header().Get("Content-Security-Policy") != portalCSP || portal.Header().Get("X-Content-Type-Options") != "nosniff" || portal.Header().Get("Cache-Control") != "no-cache" {
+	if portal.Code != http.StatusOK || !strings.Contains(portal.Body.String(), "<title>portal</title>") || portal.Header().Get("Content-Security-Policy") != portalCSP+"; frame-src 'self' https://*.example-hosts.test" || portal.Header().Get("X-Content-Type-Options") != "nosniff" || portal.Header().Get("Cache-Control") != "no-cache" {
 		t.Fatalf("portal SPA response = %d headers=%v body=%q", portal.Code, portal.Header(), portal.Body)
 	}
 	admin := requestHTML(router, "/admin/workspaces/"+testWorkspaceID)

@@ -1280,6 +1280,67 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/hosts/{id}/embed-tickets:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    post:
+      tags: [Host sharing]
+      operationId: issueHostEmbedTicket
+      summary: Issue a short-lived one-time ticket for an embedded Host view
+      description: Requires an authenticated Portal session or installation-bound native client credential (platform API keys are rejected), access to the supplied conversation, and current permission for the selected Host targets. The server binds the ticket to the authenticated user, Portal credential, optional client installation, conversation, Host, exact per-target permission ceilings, random embed nonce, current runtime generation, service instance, and exact configured Portal Origin. The exchange URL is server-generated for that Host and has no query string; the ticket is returned separately and stored hash-only. Ticket responses are not cacheable.
+      security:
+        - portalSession: []
+        - clientCredential: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [conversation_id, target, targets]
+              properties:
+                conversation_id: { $ref: '#/components/schemas/ConversationId' }
+                target:
+                  type: string
+                  enum: [browser, terminal, workspace, files, vscode]
+                  description: Initial Workbench view; it must be included in targets.
+                targets:
+                  type: array
+                  minItems: 1
+                  maxItems: 5
+                  uniqueItems: true
+                  items: { type: string, enum: [browser, terminal, workspace, files, vscode] }
+                  description: Requested tabs. The server returns only currently authorized targets; files and VS Code remain owner-only under existing Gateway rules.
+      responses:
+        '201':
+          description: Short-lived, single-use Host embed ticket
+          headers:
+            Cache-Control: { schema: { type: string, const: 'no-store, private' } }
+            Pragma: { schema: { type: string, const: no-cache } }
+            Expires: { schema: { type: string, const: '0' } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [exchange_url, ticket, embed_nonce, targets, expires_at]
+                properties:
+                  exchange_url: { type: string, format: uri, description: Absolute URL of the fixed Host-only exchange path; contains no credential, query, or fragment. }
+                  ticket: { type: string, minLength: 43, maxLength: 43, description: Temporary credential; submit only in the exchange request body. }
+                  embed_nonce: { type: string, minLength: 32, maxLength: 32, description: Random value bound to the ticket and used by the parent/Workbench embed handshake. }
+                  targets:
+                    type: array
+                    minItems: 1
+                    maxItems: 5
+                    items: { type: string, enum: [browser, terminal, workspace, files, vscode] }
+                    description: Server-authorized target tabs bound to this ticket.
+                  expires_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/hosts/{id}/members:
     parameters:
       - $ref: '#/components/parameters/HostId'
@@ -10857,6 +10918,7 @@ components:
         change_task_target: { type: boolean, description: Explicitly apply the supplied host_id, workspace_id, and application_id as changes to the referenced Task target. Omission means false, so changing the composer selection does not retarget existing work. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, maxLength: 256, description: Optional routing hint; a server default may be selected asynchronously. }
+        time_zone: { type: string, maxLength: 64, description: Optional IANA time-zone identifier captured when the user sends the message. }
         content: { type: string, maxLength: 32768 }
         mcp_connector_ids:
           type: array
@@ -10954,6 +11016,7 @@ components:
         change_task_target: { type: boolean, description: Explicitly apply the supplied host_id, workspace_id, and application_id as changes to the referenced Task target. Omission means false, so changing the composer selection does not retarget existing work. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
+        time_zone: { type: string, maxLength: 64, description: Optional IANA time-zone identifier captured when the user sends the message. }
         mcp_connector_ids: { type: array, maxItems: 16, uniqueItems: true, items: { $ref: '#/components/schemas/MCPConnectorId' } }
         client_attachment_ids: { type: array, maxItems: 16, uniqueItems: true, items: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
         budget:

@@ -90,3 +90,37 @@ func TestConversationReceiptValidatesIdentityAndAllowsAttachmentOnly(t *testing.
 		t.Fatalf("another account accessed personal conversation = %v", err)
 	}
 }
+
+func TestConversationReceiptValidatesAndFingerprintsTimeZone(t *testing.T) {
+	principal := taskTestPrincipal()
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+		"c1234567": {ID: "c1234567", OwnerID: principal.UserID},
+	}}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := AcceptConversationMessageCommand{ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+		ClientMessageID: "message-timezone", IdempotencyKey: "message-timezone", Content: "现在几点？", TimeZone: "Asia/Shanghai"}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.receipts[0].Input.TimeZone; got != "Asia/Shanghai" {
+		t.Fatalf("time zone was not persisted: %q", got)
+	}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); err != nil ||
+		!bytes.Equal(store.receipts[0].RequestHash, store.receipts[1].RequestHash) {
+		t.Fatalf("identical time-zone retry changed its fingerprint: %v", err)
+	}
+	command.TimeZone = "America/Los_Angeles"
+	if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); err != nil ||
+		bytes.Equal(store.receipts[0].RequestHash, store.receipts[2].RequestHash) {
+		t.Fatalf("changed time zone reused its fingerprint: %v", err)
+	}
+	for _, invalid := range []string{"Local", "../etc/passwd", " Asia/Shanghai", "unknown/time-zone"} {
+		command.TimeZone = invalid
+		if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Errorf("invalid time zone %q was accepted: %v", invalid, err)
+		}
+	}
+}

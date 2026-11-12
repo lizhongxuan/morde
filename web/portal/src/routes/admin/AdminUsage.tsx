@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
+import { FloatingError } from '../../components/FloatingError';
 
 type UsageDays = 7 | 30 | 90;
 type UsageData = Awaited<ReturnType<typeof portalApi.adminUsage>>;
@@ -13,10 +14,10 @@ function percent(numerator: number, denominator: number) {
 }
 
 function UsageError({ error, retry }: { error: unknown; retry: () => void }) {
-  return <div className="error-card" role="alert">
+  return <FloatingError className="error-card" role="alert">
     {errorDetails(error).message}
     <button type="button" className="button button-secondary" onClick={retry}>重试</button>
-  </div>;
+  </FloatingError>;
 }
 
 function UsageMetrics({ data }: { data: UsageData }) {

@@ -127,6 +127,7 @@ let preservedOperationInProgress = false;
 let exitReady = false;
 let quitInProgress = false;
 const hostWindows = new Set<BrowserWindow>();
+const hostWorkbenchReturnHandlers = new Map<WebContents, () => boolean>();
 const api = new MordeAPI(() => credentials, () => app.getVersion());
 const syncBinary = () => app.isPackaged ? join(process.resourcesPath, "bin", process.platform === "win32" ? "morde-sync.exe" : "morde-sync") : process.env.MORDE_SYNC_BINARY || "";
 const workspaceNode = new MordeSyncthingNode(() => app.isPackaged
@@ -467,14 +468,35 @@ function sendSyncState(state: string, progress?: unknown, message?: string): voi
   const checkpoint = syncCheckpoint;
   const safeState = ["running", "idle", "shutdown_unknown"].includes(state) ? state : "unknown";
   const safeProgress = publicSyncProgress(progress);
-  mainWindow?.webContents.send("morde:sync-state", {
+  const payload = {
     state: safeState,
     workspaceId: checkpoint?.workspaceId ?? null,
     mode: checkpoint?.mode ?? null,
     ...(safeProgress ? { progress: safeProgress } : {}),
     ...(message ? { message } : {}),
     ...(syncRecoveryWarning ? { recovery: syncRecoveryWarning } : {}),
-  });
+  };
+  mainWindow?.webContents.send("morde:sync-state", payload);
+  const auth = credentials;
+  if (auth && webView && isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)) {
+    const portalCheckpoint = checkpoint?.mode === "project_upload" ? checkpoint : null;
+    const recovery = syncRecoveryView();
+    webView.webContents.send("morde:portal-sync-state", {
+      state: portalCheckpoint ? safeState : "idle",
+      workspaceId: portalCheckpoint?.workspaceId ?? null,
+      mode: portalCheckpoint ? "project_upload" : null,
+      ...(portalCheckpoint && safeProgress ? { progress: safeProgress } : {}),
+      ...(portalCheckpoint && message ? { message: safePortalProjectMessage(message) } : {}),
+      ...(portalCheckpoint && recovery?.mode === "project_upload" ? {
+        recovery: {
+          state: recovery.state,
+          mode: "project_upload",
+          ...(recovery.workspaceId ? { workspaceId: recovery.workspaceId } : {}),
+          ...(recovery.message ? { message: safePortalProjectMessage(recovery.message) } : {}),
+        },
+      } : {}),
+    });
+  }
 }
 
 function publicSyncConflicts(value: unknown): { path: string; reason?: string }[] | null {
@@ -501,6 +523,30 @@ function syncRecoveryView(): { state: "pending" | "unknown" | "failed"; workspac
   }
   if (profileError) return { state: "unknown", message: "本机同步状态无法读取；本机同步已暂停。" };
   return null;
+}
+
+function publicPortalProjectState(): unknown {
+  if (credentials && credentialExpired(credentials.clientExpiresAt)) clearAuthorization();
+  const projectUploadCheckpoint = credentials && syncCheckpoint?.mode === "project_upload" ? syncCheckpoint : null;
+  const recovery = credentials ? syncRecoveryView() : null;
+  const projectRecovery = recovery?.mode === "project_upload" ? {
+    state: recovery.state,
+    mode: "project_upload" as const,
+    ...(recovery.workspaceId ? { workspaceId: recovery.workspaceId } : {}),
+    ...(recovery.message ? { message: safePortalProjectMessage(recovery.message) } : {}),
+  } : null;
+  const snapshot = sync.snapshot();
+  return {
+    projectMappings: credentials ? projectMappings.map(publicProjectMapping) : [],
+    syncState: projectUploadCheckpoint && ["idle", "running", "shutdown_unknown"].includes(snapshot) ? snapshot : "idle",
+    syncCheckpoint: projectUploadCheckpoint ? {
+      workspaceId: projectUploadCheckpoint.workspaceId,
+      mode: "project_upload",
+      ...(projectUploadCheckpoint.projectSelectionID ? { projectSelectionID: projectUploadCheckpoint.projectSelectionID } : {}),
+      ...(projectUploadCheckpoint.projectName ? { projectName: projectUploadCheckpoint.projectName } : {}),
+    } : null,
+    syncRecovery: projectRecovery,
+  };
 }
 
 function markSyncRecoveryUnknown(message: string): void {
@@ -1357,7 +1403,14 @@ function publicState(): unknown {
   };
 }
 
-function notifyState(): void { mainWindow?.webContents.send("morde:state", publicState()); }
+function notifyState(): void {
+  const state = publicState();
+  mainWindow?.webContents.send("morde:state", state);
+  const auth = credentials;
+  if (auth && webView && isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)) {
+    webView.webContents.send("morde:portal-state", publicPortalProjectState());
+  }
+}
 function clearTimer(timer: NodeJS.Timeout | null): null { if (timer) clearTimeout(timer); return null; }
 function closeHostWindows(): void { for (const window of hostWindows) window.close(); }
 
@@ -1672,6 +1725,34 @@ function scheduleAuthorizationCheck(): void {
 function sameOriginURL(value: string, origin: string): URL | null {
   try { const url = new URL(value); return url.origin === origin && !url.username && !url.password ? url : null; } catch { return null; }
 }
+
+function isTrustedPortalBridgePage(value: string, origin: string): boolean {
+  const url = sameOriginURL(value, origin);
+  if (!url || !["/hosts", "/workspaces"].includes(url.pathname)) return false;
+  if (url.pathname === "/hosts") {
+    return !url.search && (!url.hash || /^#host-h[a-z0-9]{7}$/.test(url.hash));
+  }
+  return !url.hash && [...url.searchParams.keys()].every((key) => key === "host") && url.searchParams.getAll("host").length <= 1 &&
+    (!url.searchParams.has("host") || /^h[a-z0-9]{7}$/.test(url.searchParams.get("host") ?? ""));
+}
+
+function isTrustedHostWorkbenchPage(value: string, origin: string): boolean {
+  const url = sameOriginURL(value, origin);
+  if (!url || url.pathname !== "/__ch/wb/" || url.hash) return false;
+  return [...url.searchParams.keys()].every((key) => key === "tab") && url.searchParams.getAll("tab").length <= 1 &&
+    (!url.searchParams.has("tab") || url.searchParams.get("tab") === "workspace");
+}
+
+function preloadArguments(mode: "portal" | "host-workbench", inherited?: string[]): string[] {
+  return [...(inherited ?? []).filter((argument) => !argument.startsWith("--morde-preload-mode=")), `--morde-preload-mode=${mode}`];
+}
+
+function trustedPortalBridgeEvent(event: { sender: WebContents; senderFrame: { url: string } | null }, auth: Credentials): boolean {
+  const contents = webView?.webContents;
+  return Boolean(contents && !contents.isDestroyed() && credentials === auth && event.sender === contents &&
+    event.senderFrame === event.sender.mainFrame && isTrustedPortalBridgePage(event.sender.getURL(), auth.origin));
+}
+
 const documentLoadOptions = { extraHeaders: "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
 function installDocumentErrorRecovery(partition: Session, origin?: string): (contents: WebContents, fallbackURL: string, fallbackLabel: string) => (value: string) => boolean {
   type RecoveryPage = { contents: WebContents; fallbackURL: string; fallbackLabel: string; recoveryPageURL: string | null; blockedDocumentURL: string | null };
@@ -1776,12 +1857,20 @@ async function hostOrigin(id: string, shared: boolean, serviceOrigin: string): P
 
 function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string | null }, auth: Credentials, isRecoveryPage: (value: string) => boolean): void {
   hostWindows.add(win);
-  win.on("closed", () => hostWindows.delete(win));
   let allowedGateway: string | null = null;
   const returnToMain = () => {
     if (!win.isDestroyed()) win.close();
     if (credentials === auth && mainWindow && !mainWindow.isDestroyed()) { showView("web"); mainWindow.focus(); }
   };
+  hostWorkbenchReturnHandlers.set(win.webContents, () => {
+    if (credentials !== auth || !allowedGateway || !isTrustedHostWorkbenchPage(win.webContents.getURL(), allowedGateway)) return false;
+    returnToMain();
+    return true;
+  });
+  win.on("closed", () => {
+    hostWindows.delete(win);
+    hostWorkbenchReturnHandlers.delete(win.webContents);
+  });
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (event, value) => {
     if (isRecoveryPage(value)) return;
@@ -1875,7 +1964,10 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
   await refreshWebSession(auth, initial);
   if (credentials !== auth || mainWindow !== owner || owner.isDestroyed() || webPartition !== partition) return;
   if (!webView) {
-    const content = new WebContentsView({ webPreferences: { session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+    const content = new WebContentsView({ webPreferences: {
+      session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
+      preload: join(__dirname, "morde-preload.js"), additionalArguments: preloadArguments("portal"),
+    } });
     webView = content;
     const registerDocumentRecovery = installDocumentErrorRecovery(partition);
     const isRecoveryPage = registerDocumentRecovery(content.webContents, assistantURL, "返回助手");
@@ -1888,7 +1980,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
       const entry = hostEntryURL(details.url, auth.origin);
       if (!entry || credentials !== auth) {
         if (details.url === "about:blank" && credentials === auth) return { action: "allow", createWindow: (options) => {
-          const win = new BrowserWindow({ ...options, width: 960, height: 720, title: "Morde Task Observation", webPreferences: { ...options.webPreferences, session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+          const win = new BrowserWindow({ ...options, width: 960, height: 720, title: "Morde Task Observation", webPreferences: { ...options.webPreferences, preload: undefined, additionalArguments: [], session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
           const isObservationRecoveryPage = registerDocumentRecovery(win.webContents, assistantURL, "返回助手");
           guardTaskObservationWindow(win, auth, isObservationRecoveryPage);
           return win.webContents;
@@ -1898,7 +1990,12 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
         return { action: "deny" };
       }
       return { action: "allow", createWindow: (options) => {
-        const win = new BrowserWindow({ ...options, width: 1280, height: 800, title: "Morde Host", webPreferences: { ...options.webPreferences, session: webPartition!, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+        const win = new BrowserWindow({ ...options, width: 1280, height: 800, title: "Morde Host", webPreferences: {
+          ...options.webPreferences,
+          preload: join(__dirname, "morde-preload.js"),
+          additionalArguments: preloadArguments("host-workbench", options.webPreferences?.additionalArguments),
+          session: webPartition!, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
+        } });
         const isHostRecoveryPage = registerDocumentRecovery(win.webContents, `${auth.origin}/hosts`, "返回助手");
         guardHostWindow(win, entry, auth, isHostRecoveryPage);
         return win.webContents;
@@ -2104,6 +2201,19 @@ function safeRendererErrorMessage(error: unknown): string {
   return redactPrivateValues(error instanceof Error ? error.message : "Morde request failed");
 }
 
+function safePortalProjectMessage(value: string): string {
+  let message = safeRendererErrorMessage(new Error(value));
+  const privateValues = [
+    credentials?.origin,
+    credentials?.accountName,
+    credentials?.installationId,
+    ...projectMappings.map((mapping) => mapping.directory),
+    ...(syncCheckpoint?.mode === "project_upload" ? [syncCheckpoint.directory] : []),
+  ].filter((item): item is string => typeof item === "string" && item.length > 0).sort((left, right) => right.length - left.length);
+  for (const item of privateValues) message = message.split(item).join("[本机路径或标识已隐藏]");
+  return message;
+}
+
 function sendError(error: unknown): never {
   const message = safeRendererErrorMessage(error);
   if (message.includes("Authorization expired or revoked")) clearAuthorization();
@@ -2119,7 +2229,25 @@ function handler<T extends unknown[]>(channel: string, fn: (...args: T) => Promi
   });
 }
 
+function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown): void {
+  ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+    const auth = credentials;
+    if (!auth || !trustedPortalBridgeEvent(event, auth)) throw new Error("Invalid Portal window or route");
+    if (logoutInProgress) throw new Error("Sign-out is in progress");
+    if (credentialExpired(auth.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
+    try { return await fn(...args); } catch (error) { return sendError(error); }
+  });
+}
+
 function register(): void {
+  ipcMain.handle("morde:return-to-portal-hosts", async (event) => {
+    const returnToPortalHosts = hostWorkbenchReturnHandlers.get(event.sender);
+    if (!returnToPortalHosts || event.senderFrame !== event.sender.mainFrame || event.sender.isDestroyed()) {
+      throw new Error("Invalid Host Workbench window");
+    }
+    if (!returnToPortalHosts()) throw new Error("Host Workbench is not on a trusted page or its authorization changed");
+    return { returned: true };
+  });
   handler("morde:state", () => publicState());
   handler("morde:login", login);
   handler("morde:logout", logout);
@@ -2155,6 +2283,10 @@ function register(): void {
   handler("morde:project-upload-targets", listProjectUploadTargets);
   handler("morde:project-select-directory", selectProjectDirectory);
   handler("morde:project-upload", uploadProject);
+  portalBridgeHandler("morde:portal-state", () => publicPortalProjectState());
+  portalBridgeHandler("morde:portal-project-upload-targets", listProjectUploadTargets);
+  portalBridgeHandler("morde:portal-project-select-directory", selectProjectDirectory);
+  portalBridgeHandler("morde:portal-project-upload", uploadProject);
   handler("morde:workspace-sync-toggle", setWorkspaceSyncEnabled);
   handler("morde:live-sync-start", startLiveSync);
   handler("morde:live-sync-stop", stopLiveSync);
@@ -2386,10 +2518,15 @@ function register(): void {
 }
 
 function makeWindow(): BrowserWindow {
-  const win = new BrowserWindow({ width: 1120, height: 760, minWidth: 720, minHeight: 520, title: "Morde", show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, preload: join(__dirname, "morde-preload.js") } });
+  const win = new BrowserWindow({ width: 1120, height: 760, minWidth: 720, minHeight: 520, title: "Morde", show: false, frame: true, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, preload: join(__dirname, "morde-preload.js") } });
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (event) => event.preventDefault());
   win.on("resize", positionWeb);
+  win.on("maximize", positionWeb);
+  win.on("unmaximize", positionWeb);
+  win.on("restore", positionWeb);
+  win.on("enter-full-screen", positionWeb);
+  win.on("leave-full-screen", positionWeb);
   void win.loadFile(join(__dirname, "../resources/morde.html"));
   win.once("ready-to-show", () => win.show());
   win.on("closed", () => { detachWeb(); mainWindow = null; });

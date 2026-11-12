@@ -1,6 +1,29 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 const call = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
+const listen = (channel: string, listener: (value: unknown) => void) => {
+  if (typeof listener !== "function") return () => undefined;
+  const callback = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
+  ipcRenderer.on(channel, callback);
+  return () => ipcRenderer.off(channel, callback);
+};
+
+const mode = process.argv.find((argument) => argument.startsWith("--morde-preload-mode="))?.slice("--morde-preload-mode=".length);
+
+if (mode === "portal") {
+  contextBridge.exposeInMainWorld("morde", {
+    projectUploadTargets: () => call("morde:portal-project-upload-targets"),
+    selectProjectDirectory: (hostId: string, workspaceId: string) => call("morde:portal-project-select-directory", hostId, workspaceId),
+    uploadProject: (selectionId: string, projectName: string) => call("morde:portal-project-upload", selectionId, projectName),
+    state: () => call("morde:portal-state"),
+    onState: (listener: (value: unknown) => void) => listen("morde:portal-state", listener),
+    onSync: (listener: (value: unknown) => void) => listen("morde:portal-sync-state", listener),
+  });
+} else if (mode === "host-workbench") {
+  contextBridge.exposeInMainWorld("morde", {
+    returnToPortalHosts: () => call("morde:return-to-portal-hosts"),
+  });
+} else {
 const bridge = {
   state: () => call("morde:state"),
   login: (origin: string, name: string, password: string) => call("morde:login", origin, name, password),
@@ -21,9 +44,10 @@ const bridge = {
   preserved: (id: string) => call("morde:preserved-list", id),
   restorePreserved: (id: string, preservedId: string) => call("morde:preserved-restore", id, preservedId),
   deletePreserved: (id: string, preservedId: string) => call("morde:preserved-delete", id, preservedId),
-  onState: (listener: (value: unknown) => void) => { const cb = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value); ipcRenderer.on("morde:state", cb); return () => ipcRenderer.off("morde:state", cb); },
-  onLiveSync: (listener: (value: unknown) => void) => { const cb = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value); ipcRenderer.on("morde:live-sync-state", cb); return () => ipcRenderer.off("morde:live-sync-state", cb); },
-  onSync: (listener: (value: unknown) => void) => { const cb = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value); ipcRenderer.on("morde:sync-state", cb); return () => ipcRenderer.off("morde:sync-state", cb); },
+  onState: (listener: (value: unknown) => void) => listen("morde:state", listener),
+  onLiveSync: (listener: (value: unknown) => void) => listen("morde:live-sync-state", listener),
+  onSync: (listener: (value: unknown) => void) => listen("morde:sync-state", listener),
 };
 
 contextBridge.exposeInMainWorld("morde", bridge);
+}

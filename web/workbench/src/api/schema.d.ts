@@ -460,7 +460,7 @@ export interface paths {
         put?: never;
         /**
          * Create a host
-         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host must bind exactly one owned, ready Workspace using workspace_ids; the same ownership and availability checks apply to Portal Sessions, API keys, and internal creation paths. Reuse the Idempotency-Key only to retry the exact normalized request.
+         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host binds exactly one owned, ready Workspace. Portal Sessions may omit workspace_ids to let the server select an available Workspace; API keys and Client credentials must provide one authorized Workspace ID. Reuse the Idempotency-Key only to retry the exact normalized request.
          */
         post: operations["createHost"];
         delete?: never;
@@ -490,6 +490,28 @@ export interface paths {
          * @description API keys require current account ownership of this host. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
          */
         delete: operations["deleteHost"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/hosts/{id}/copies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create an independent Host from a stopped Host
+         * @description Portal owner sessions only. The source must be safely stopped and have exactly one healthy Workspace binding at the requested confirmed revision, with no unresolved conflicts or in-flight writers. Morde copies that Workspace revision and atomically creates a new Host bound to the copy. The new Host receives fresh runtime identity and credentials; source runtime/profile/apps, tasks, credentials, and sync device/folder associations are not copied. Ambiguous metadata or copy outcomes fail closed and preserve the reservation for idempotent recovery.
+         */
+        post: operations["copyHost"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -883,6 +905,28 @@ export interface paths {
          * @description Portal sessions and native client credentials may enter a host they own. Administrators may view and manage other hosts but cannot enter them. A native client ticket binds the resulting Gateway cookie to its revocable installation.
          */
         post: operations["enterHost"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/hosts/{id}/embed-tickets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue a short-lived one-time ticket for an embedded Host view
+         * @description Requires an authenticated Portal session or installation-bound native client credential (platform API keys are rejected), access to the supplied conversation, and current permission for the selected Host target. The server binds the ticket to the authenticated user, Portal credential, optional client installation, conversation, Host, target permission ceiling, current runtime generation, service instance, and exact configured Portal Origin. The exchange URL is server-generated for that Host and has no query string; the ticket is returned separately and stored hash-only. Ticket responses are not cacheable. The Gateway exchange route and embedded session are completed by the subsequent embedded-session task.
+         */
+        post: operations["issueHostEmbedTicket"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1438,7 +1482,7 @@ export interface paths {
         };
         /**
          * Read active desktop synchronization progress
-         * @description Portal sessions only. Returns the current Workspace revision, committed logical bytes, configured quota, remaining committed capacity, quota admission state, and only the latest active session for each currently authorized device. Quota state is available below the limit, full at the limit, and over_quota above it; shrinking and deletion remain allowed when full or over quota. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted. Usage is based on committed explicit sync revisions and is not yet a ledger for direct Syncthing writes.
+         * @description Portal sessions only. Returns the current Workspace revision, committed logical bytes, configured quota, remaining committed capacity, quota admission state, and only the latest active session for each currently authorized device. Optional folder_id selects a registered folder. Project folders do not enter Syncthing desired state, so this endpoint has no project peer progress; use the project's sync session for manual upload status. Quota state is available below the limit, full at the limit, and over_quota above it; shrinking and deletion remain allowed when full or over quota. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted. Usage is based on committed explicit sync revisions and is not yet a ledger for direct Syncthing writes.
          */
         get: operations["listDeviceWorkspaceSyncProgress"];
         put?: never;
@@ -1462,7 +1506,7 @@ export interface paths {
         put?: never;
         /**
          * Start a Syncthing device registration proof
-         * @description Desktop client credential only. The certificate is public DER encoded as base64; the service derives and verifies its Syncthing Device ID, then returns a five-minute signing payload bound to this Workspace and installation. Sign the decoded signing_payload bytes with the certificate private key. At most eight challenges may be outstanding per installation. This endpoint does not enable synchronization; the folder remains pending until a server node is provisioned.
+         * @description Desktop client credential only. The certificate is public DER encoded as base64; the service derives and verifies its Syncthing Device ID, then returns a five-minute signing payload bound to this Workspace, installation, and optional registered project folder and relative path. Omitting folder_id preserves the legacy Workspace-root proof. Sign the decoded signing_payload bytes with the certificate private key. At most eight challenges may be outstanding per installation. Project uploads use the installation-bound sync credential and folder_id directly; this Syncthing proof does not configure or enable project folder synchronization.
          */
         post: operations["createWorkspaceSyncDeviceChallenge"];
         delete?: never;
@@ -1488,7 +1532,7 @@ export interface paths {
         put?: never;
         /**
          * Register a proven Syncthing device for a Workspace
-         * @description Desktop client credential only. The proof is single-use, bound to the current installation, and idempotent by key. Success returns the authorized server node ID and pinned private relay URI after the node config is applied.
+         * @description Desktop client credential only. The proof is single-use, bound to the current installation and optional folder_id, and idempotent by key. Omitting folder_id preserves the legacy Workspace-root registration. Project-folder Syncthing registration returns workspace_unavailable before consuming the challenge or changing device/node state; manual project uploads do not use this endpoint. Root registration returns the authorized server node ID and pinned private relay URI after the node config is applied.
          */
         post: operations["registerWorkspaceSyncDevice"];
         /**
@@ -1514,7 +1558,7 @@ export interface paths {
         put?: never;
         /**
          * Plan an upload, missing-only download, merge, or live synchronization batch
-         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
+         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion. Requests with folder_id are explicit PC-to-cloud project uploads; only the owning Portal Session or an installation-bound Sync credential (chd_) is authorized. Platform API keys and restricted Client credentials are rejected for project uploads. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
          */
         post: operations["createWorkspaceSyncSession"];
         delete?: never;
@@ -1681,6 +1725,32 @@ export interface paths {
          * @description The server creates the workspace directory under the Host-level workspace root and requests the current revision. Directory paths are never accepted from the caller.
          */
         post: operations["bindWorkspaceToHost"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/hosts/{id}/sync-folders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List sync folders registered for a cloud computer
+         * @description Portal Session only. Returns folder identities and server-owned relative paths for the Host's active Workspace binding. Project folders remain outside Syncthing desired state and report sync_available=false; they are available as targets for explicit PC-to-cloud sync sessions using folder_id. A registered project folder and the legacy Workspace-root folder are mutually exclusive during this compatibility phase.
+         */
+        get: operations["listHostWorkspaceSyncFolders"];
+        put?: never;
+        /**
+         * Register a project folder for a cloud computer
+         * @description Portal Session only. The server derives Workspace ownership and the relative path project/{project_name}; callers cannot set a server path. Names are normalized to Unicode NFC and must be one portable path segment. Idempotency-Key protects retries. A Workspace with an existing legacy root mapping cannot register a project folder. Registration stores metadata only; manual project uploads use the existing chunk/session API and do not create a Syncthing project binding.
+         */
+        post: operations["registerHostWorkspaceSyncFolder"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2045,6 +2115,22 @@ export interface paths {
         get: operations["getMainConversation"];
         /** Select an owned personal conversation as the main conversation */
         put: operations["setMainConversation"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/main-conversation/ensure": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
         /**
          * Idempotently initialize the current user's main conversation
          * @description Creates and binds a conversation only when no usable personal history candidate exists; ambiguous legacy history returns selection_required without modifying or merging it.
@@ -2396,7 +2482,7 @@ export interface paths {
         put?: never;
         /**
          * Accept a message in a shared project conversation
-         * @description Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. The Idempotency-Key must equal client_message_id.
+         * @description Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. Set change_task_target=true only when an instruction explicitly changes the target of a referenced Task; otherwise host_id, workspace_id, and application_id are selection hints for new work and do not retarget that Task. The Idempotency-Key must equal client_message_id.
          */
         post: operations["acceptProjectConversationMessage"];
         delete?: never;
@@ -3133,8 +3219,8 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List visible active tasks in this conversation */
-        get: operations["listConversationActiveTasks"];
+        /** List active or recently finished tasks in this conversation */
+        get: operations["listConversationTasks"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3157,7 +3243,7 @@ export interface paths {
         put?: never;
         /**
          * Accept a message in a personal conversation
-         * @description Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The Idempotency-Key must equal client_message_id.
+         * @description Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. Set change_task_target=true only when an instruction explicitly changes the target of a referenced Task; otherwise host_id, workspace_id, and application_id are selection hints for new work and do not retarget that Task. The Idempotency-Key must equal client_message_id.
          */
         post: operations["acceptConversationMessage"];
         delete?: never;
@@ -3337,6 +3423,187 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a Task-bound PC file fetch status
+         * @description Portal Session only. The response is a safe status projection and never includes the PC transfer ticket or its hash. Missing and unauthorized Task fetches are hidden as not_found.
+         */
+        get: operations["getTaskFileFetch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List file fetches for an owned Task
+         * @description Portal Session only. Returns the newest 16 safe fetch projections, including retained-copy state and deletion time. No transfer ticket or ticket hash is returned.
+         */
+        get: operations["listTaskFileFetches"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Pin a PC file manifest and reserve staging quota */
+        post: operations["submitTaskFileFetchManifest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/chunks/{sequence}": {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Store one idempotent PC file chunk */
+        put: operations["putTaskFileFetchChunk"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify all chunks and atomically publish the retained copy */
+        post: operations["commitTaskFileFetch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/abort": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a PC file fetch after local authorization changes
+         * @description PC file-fetch ticket only. Serializes with commit; unfinished transfers fail closed and discard all staging bytes, while a committed copy remains retained under the existing owner policy. Repeated aborts are safe.
+         */
+        post: operations["abortTaskFileFetch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel an in-progress or waiting file fetch
+         * @description Task-owner Portal Session only. Revokes the ticket and removes all staging chunks in the same serialized transition. Completed fetches cannot be cancelled.
+         */
+        post: operations["cancelTaskFileFetch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/file-fetches/{fetch_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download an active retained Task file copy
+         * @description Task-owner Portal Session only. Returns original bytes after size and SHA-256 integrity verification; deleted or expired copies are unavailable.
+         */
+        get: operations["getTaskFileFetchContent"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a retained Task file copy
+         * @description Task-owner Portal Session only. Idempotently deletes cloud-retained bytes and preserves a deleted_at tombstone; the PC source file and Task history are unaffected.
+         */
+        delete: operations["deleteTaskFileFetchContent"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3887,6 +4154,26 @@ export interface paths {
         get: operations["getPersonalAttachment"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/office-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview plain text from a user-selected Office document
+         * @description Requires an approved portal session or active Client credential. This manual operation accepts only DOCX, XLSX, or PPTX bytes up to 16 MiB, extracts bounded plain text in memory, and neither stores the document nor creates a task or model call. Responses are private and non-cacheable.
+         */
+        post: operations["previewPersonalOfficeText"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5290,6 +5577,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Verified model context capacity from the provider's model documentation; omitted means unknown and disables compaction. */
+            context_window_tokens?: number;
             api_key: string;
             /**
              * @description Shared connections require an administrator; authorization is checked by the server.
@@ -5305,6 +5594,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Verified model context capacity from the provider's model documentation; omitted preserves it only when the endpoint is unchanged. */
+            context_window_tokens?: number;
             /** @description Omit or send an empty string to keep the current key; a non-empty value replaces it. */
             api_key?: string;
         };
@@ -5328,6 +5619,8 @@ export interface components {
             /** Format: uri */
             base_url: string;
             model_name: string;
+            /** @description Unknown until the owner or administrator supplies a verified model capacity. */
+            context_window_tokens?: number | null;
             shared: boolean;
             has_api_key: boolean;
             capabilities: components["schemas"]["ModelConnectionCapabilities"];
@@ -6222,6 +6515,29 @@ export interface components {
             state: "completed";
             replayed: boolean;
         };
+        HostCopyRequest: {
+            name: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+        };
+        HostCopyResult: {
+            source_host_id: components["schemas"]["HostId"];
+            source_workspace_id: components["schemas"]["WorkspaceId"];
+            host: components["schemas"]["Host"];
+            workspace: {
+                id: components["schemas"]["WorkspaceId"];
+                name: string;
+                /** Format: int64 */
+                revision: number;
+                /** @enum {string} */
+                state: "ready";
+            };
+            /** Format: int64 */
+            source_revision: number;
+            /** @enum {string} */
+            state: "completed";
+            replayed: boolean;
+        };
         WorkspaceFileOperationRequest: {
             /** @enum {string} */
             action: "rename" | "move" | "delete";
@@ -6271,6 +6587,8 @@ export interface components {
             accepted_at?: string;
         };
         CreateSyncSessionRequest: {
+            /** @description Optional registered project folder for an explicit PC-to-cloud upload. When present the client sends paths relative to its selected local folder */
+            folder_id?: string;
             /** @enum {string} */
             direction: "upload" | "download" | "bidirectional";
             /** @enum {string} */
@@ -6399,6 +6717,8 @@ export interface components {
             need_files: number;
         };
         CreateWorkspaceSyncDeviceChallengeRequest: {
+            /** @description Omit for the legacy Workspace-root folder; project proofs bind this registered folder ID and its server-owned relative path. */
+            folder_id?: string;
             device_id: string;
             /**
              * Format: byte
@@ -6409,6 +6729,12 @@ export interface components {
         WorkspaceSyncDeviceChallenge: {
             id: string;
             device_id: string;
+            /** @description Omitted for the legacy Workspace-root proof. */
+            folder_id?: string;
+            /** @enum {string} */
+            folder_kind: "workspace_root" | "project";
+            /** @description Server-owned sync target relative to the cloud computer's workspace root; '.' for the legacy root. */
+            relative_path: string;
             /** Format: byte */
             nonce: string;
             /**
@@ -6420,6 +6746,8 @@ export interface components {
             expires_at: string;
         };
         RegisterWorkspaceSyncDeviceRequest: {
+            /** @description Must match the folder ID returned by the signed challenge; omit for a legacy root registration. */
+            folder_id?: string;
             challenge_id: string;
             /**
              * Format: byte
@@ -6433,6 +6761,12 @@ export interface components {
             client_installation_id: components["schemas"]["ClientInstallationId"];
             device_id: string;
             folder_id: string;
+            /** @enum {string} */
+            folder_kind: "workspace_root" | "project";
+            /** @description Server-owned target relative to the cloud computer's workspace root. */
+            relative_path: string;
+            /** @description False for project folders until their node path and receive pipeline are supported. */
+            sync_available: boolean;
             /** @description Returned only by registration; certificate identity of the server Syncthing node. */
             server_device_id?: string;
             /**
@@ -6447,9 +6781,32 @@ export interface components {
             /** Format: date-time */
             revoked_at?: string | null;
         };
+        CreateWorkspaceSyncFolderRequest: {
+            /** @description One portable directory segment; the server normalizes it to Unicode NFC. */
+            project_name: string;
+        };
+        WorkspaceSyncFolder: {
+            folder_id: string;
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** @enum {string} */
+            folder_kind: "workspace_root" | "project";
+            project_name?: string;
+            /** @description Server-owned path relative to the cloud computer's workspace root. */
+            relative_path: string;
+            /** @enum {string} */
+            state: "pending_node" | "active" | "revoked";
+            /** @description Whether this folder is configured for the managed Syncthing node. Project folders remain false; manual folder-scoped uploads use CreateSyncSession with folder_id. */
+            sync_available: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
         SyncSession: {
             id: string;
             workspace_id: components["schemas"]["WorkspaceId"];
+            /** @description Present for a manual project upload; the server-owned scope is the registered project folder. */
+            folder_id?: string;
             /** @enum {string} */
             direction: "upload" | "download" | "bidirectional";
             /** @enum {string} */
@@ -6908,6 +7265,9 @@ export interface components {
             account_change_sequence: number;
             replay: boolean;
         };
+        PersonalOfficePreviewResponse: {
+            text: string;
+        };
         PersonalHistoryImportMessage: {
             source_message_id: string;
             /** @enum {string} */
@@ -7078,7 +7438,8 @@ export interface components {
         };
         CreateHostRequest: {
             name?: string;
-            workspace_ids: components["schemas"]["WorkspaceId"][];
+            /** @description Required for API keys and Client credentials. Portal Sessions may omit it for server-side Workspace selection. */
+            workspace_ids?: components["schemas"]["WorkspaceId"][];
         };
         CreateAPIKeyRequest: {
             name: string;
@@ -7441,7 +7802,7 @@ export interface components {
             /** @description Present only for source=task. */
             task_id?: components["schemas"]["TaskId"];
             /** @enum {string} */
-            source: "client" | "chat" | "task" | "route";
+            source: "client" | "chat" | "task" | "route" | "compaction";
             model_id: components["schemas"]["ModelConnectionId"];
             /** Format: int64 */
             rate_version: number;
@@ -7608,9 +7969,13 @@ export interface components {
             reference_task_id?: components["schemas"]["TaskId"];
             host_id?: components["schemas"]["HostId"];
             workspace_id?: components["schemas"]["WorkspaceId"];
+            /** @description Explicitly apply the supplied host_id */
+            change_task_target?: boolean;
             application_id?: string;
             /** @description Optional routing hint; a server default may be selected asynchronously. */
             model_id?: string;
+            /** @description Optional IANA time-zone identifier captured when the user sends the message. */
+            time_zone?: string;
             content: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             client_attachment_ids?: string[];
@@ -7686,8 +8051,12 @@ export interface components {
             reference_task_id?: components["schemas"]["TaskId"];
             host_id?: components["schemas"]["HostId"];
             workspace_id?: components["schemas"]["WorkspaceId"];
+            /** @description Explicitly apply the supplied host_id */
+            change_task_target?: boolean;
             application_id?: string;
             model_id?: string;
+            /** @description Optional IANA time-zone identifier captured when the user sends the message. */
+            time_zone?: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             client_attachment_ids?: string[];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
@@ -7708,6 +8077,8 @@ export interface components {
         };
         /** @enum {string} */
         TaskStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "cancelling" | "completed" | "failed" | "cancelled";
+        /** @enum {string} */
+        TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
         TaskBudgetRequest: {
             active_seconds: number;
             tool_calls: number;
@@ -7722,6 +8093,33 @@ export interface components {
             active_seconds: number;
             tool_calls: number;
             model_tokens: number | null;
+        };
+        TaskDependency: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            required_revision: number;
+            task_status: components["schemas"]["TaskStatus"];
+            satisfied: boolean;
+        };
+        TaskChildJob: {
+            /** @description Opaque DSH child session identifier; it is not an independently authorized Task. */
+            job_id: string;
+            task_step_id: components["schemas"]["StepId"];
+            title: string;
+            /** Format: int64 */
+            task_revision: number;
+            status: components["schemas"]["TaskStepStatus"];
+        };
+        TaskResultReview: {
+            /** @enum {string} */
+            state: "pending" | "processing" | "published" | "failed";
+            source_task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            source_task_revision: number;
+            /** Format: int64 */
+            source_event_sequence: number;
+            trigger_message_id?: components["schemas"]["MessageId"] | null;
+            reply_message_id: components["schemas"]["MessageId"] | null;
         };
         TaskSummary: {
             id: components["schemas"]["TaskId"];
@@ -7765,6 +8163,9 @@ export interface components {
             completed_step_count: number;
             budget: components["schemas"]["TaskBudget"];
             usage: components["schemas"]["TaskUsage"];
+            dependencies: components["schemas"]["TaskDependency"][];
+            child_jobs: components["schemas"]["TaskChildJob"][];
+            result_review: components["schemas"]["TaskResultReview"] | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -7775,8 +8176,7 @@ export interface components {
             sequence: number;
             /** @enum {string} */
             kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "progress" | "result";
-            /** @enum {string} */
-            status: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
+            status: components["schemas"]["TaskStepStatus"];
             title: string;
             summary: string;
             /** Format: date-time */
@@ -7845,6 +8245,96 @@ export interface components {
             /** Format: date-time */
             safe_after: string;
             unsettled_operation_ids: components["schemas"]["OperationId"][];
+        };
+        /** @description Task-owner Portal Session projection of a PC file fetch. source_directory_name is an optional safe basename used only for display; it contains no root path and grants no access. It contains no transfer ticket or ticket hash. A completed fetch stays completed after its retained copy is deleted or expires; content_state reports the separate copy lifecycle and parse_status reports model delivery separately from transfer completion. */
+        TaskFileFetch: {
+            fetch_id: components["schemas"]["OperationId"];
+            task_id: components["schemas"]["TaskId"];
+            source_installation_id: components["schemas"]["ClientInstallationId"];
+            source_device_name: string;
+            /** @description Safe basename of the selected root; null before the PC confirms its manifest or for legacy records. */
+            source_directory_name: string | null;
+            /** @description Relative to the PC's current authorized root. */
+            relative_path: string;
+            /** Format: int64 */
+            task_revision: number;
+            source_version: string | null;
+            source_sha256: string | null;
+            /** @enum {string|null} */
+            media_type: "text/plain" | "text/markdown" | "text/csv" | "application/json" | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "application/pdf" | null;
+            /** Format: int64 */
+            size_bytes: number | null;
+            /** Format: int64 */
+            confirmed_bytes: number;
+            /** @enum {string} */
+            status: "queued" | "waiting_device" | "transferring" | "verifying" | "completed" | "cancelling" | "cancelled" | "failed";
+            /** @enum {string|null} */
+            waiting_reason: "device_offline" | null;
+            /**
+             * @description Sanitized failure category; never contains raw PC errors or filesystem paths.
+             * @enum {string|null}
+             */
+            failure_reason: "access_denied" | "source_changed" | "file_unavailable" | "limit_exceeded" | "unsupported" | "source_unavailable" | "transfer_failed" | null;
+            content_id: components["schemas"]["OperationId"] | null;
+            /** Format: date-time */
+            expires_at: string | null;
+            /** @enum {string} */
+            content_state: "none" | "retained" | "deleted" | "expired";
+            /** @enum {string} */
+            parse_status: "pending" | "extracted" | "raw_only" | "failed" | "unavailable";
+            /** @enum {string|null} */
+            parse_error: "invalid_encoding" | "invalid_document" | "result_too_large" | "content_unavailable" | "integrity_failed" | null;
+            /** Format: date-time */
+            deleted_at: string | null;
+        };
+        TaskFileFetchList: {
+            items: components["schemas"]["TaskFileFetch"][];
+        };
+        TaskFileFetchManifestRequest: {
+            source_version: string;
+            source_sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+            /** @enum {string} */
+            media_type: "text/plain" | "text/markdown" | "text/csv" | "application/json" | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "application/pdf";
+            /** @description Safe basename of the selected PC root; not a path and not used for authorization. */
+            source_directory_name: string;
+        };
+        TaskFileFetchManifestReceipt: {
+            fetch_id: components["schemas"]["OperationId"];
+            source_version: string;
+            /** @enum {string} */
+            status: "transferring" | "verifying" | "completed";
+            confirmed_sequences: number[];
+        };
+        TaskFileFetchChunkReceipt: {
+            fetch_id: components["schemas"]["OperationId"];
+            sequence: number;
+            /** Format: int64 */
+            confirmed_bytes: number;
+            replayed: boolean;
+        };
+        TaskFileFetchCommitRequest: {
+            source_version: string;
+            source_sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+        };
+        TaskFileFetchCommitReceipt: {
+            fetch_id: components["schemas"]["OperationId"];
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            target_grant_version: number;
+            /** @constant */
+            status: "completed";
+            source_version: string;
+            source_sha256: string;
+            /** Format: int64 */
+            size_bytes: number;
+            content_id: components["schemas"]["OperationId"];
+            /** Format: date-time */
+            expires_at: string;
         };
         /** @description The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text. */
         TaskAssistantMessage: {
@@ -7939,6 +8429,11 @@ export interface components {
         ConversationActiveTaskPage: {
             items: components["schemas"]["ConversationActiveTask"][];
             next_cursor: string | null;
+            /**
+             * Format: int64
+             * @description Number of visible tasks in this conversation awaiting the current user.
+             */
+            pending_count: number;
         };
         /** @description Text-only Task input. No image, video or audio attachment field is accepted. If task_media_generation is advertised, the server may generate image, video or speech outputs through verified media-capable connections; uploaded media and cloud speech recognition remain unavailable. */
         SubmitTaskRequest: {
@@ -7957,11 +8452,15 @@ export interface components {
             key: string;
             input: string;
         };
-        /** @description retry_batch_item requires batch_item_id only; pause, resume and cancel require expected_status only. */
+        /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. */
         TaskActionRequest: {
             /** @enum {string} */
             action: "retry_batch_item" | "pause" | "resume" | "cancel";
             expected_status?: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            expected_current_revision?: number;
+            /** Format: int64 */
+            expected_desired_revision?: number;
             batch_item_id?: components["schemas"]["BatchItemId"];
         };
         TaskWorkspaceViewDeletionRequest: {
@@ -8139,7 +8638,7 @@ export interface components {
         /** @description Request digests and prompt or response content are not returned. */
         AdminModelCall: {
             /** @enum {string} */
-            source: "client" | "chat" | "task" | "route" | "probe";
+            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
             call_id: string;
             model_id: string;
             provider_model: string;
@@ -9472,6 +9971,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             413: components["responses"]["RequestTooLarge"];
@@ -9528,6 +10028,51 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    copyHost: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HostCopyRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed Host copy returned for an idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostCopyResult"];
+                };
+            };
+            /** @description New Host and its independent copied Workspace */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostCopyResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -10073,6 +10618,58 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    issueHostEmbedTicket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    conversation_id: components["schemas"]["ConversationId"];
+                    /**
+                     * @description Initial Workbench view. browser requires desktop:view (desktop:control also qualifies); terminal requires terminal:control; workspace requires workspace:file:read. The ticket permission ceiling cannot be increased by switching views.
+                     * @enum {string}
+                     */
+                    target: "browser" | "terminal" | "workspace";
+                };
+            };
+        };
+        responses: {
+            /** @description Short-lived, single-use Host embed ticket */
+            201: {
+                headers: {
+                    "Cache-Control"?: "no-store, private";
+                    Pragma?: "no-cache";
+                    Expires?: "0";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /**
+                         * Format: uri
+                         * @description Absolute URL of the fixed Host-only exchange path; contains no credential
+                         */
+                        exchange_url: string;
+                        /** @description Temporary credential; submit only in the exchange request body. */
+                        ticket: string;
+                        /** Format: date-time */
+                        expires_at: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     listHostMembers: {
         parameters: {
             query?: never;
@@ -10536,8 +11133,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "Idempotency-Key": string;
             };
             path: {
                 id: components["parameters"]["WorkspaceId"];
@@ -10981,7 +11577,9 @@ export interface operations {
     };
     listDeviceWorkspaceSyncProgress: {
         parameters: {
-            query?: never;
+            query?: {
+                folder_id?: string;
+            };
             header?: never;
             path: {
                 id: components["parameters"]["WorkspaceId"];
@@ -11411,6 +12009,69 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listHostWorkspaceSyncFolders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registered sync folders */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["WorkspaceSyncFolder"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    registerHostWorkspaceSyncFolder: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWorkspaceSyncFolderRequest"];
+            };
+        };
+        responses: {
+            /** @description Registered project folder metadata */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceSyncFolder"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
@@ -12703,7 +13364,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Active task page and task event cursors */
+            /** @description Task page for the selected active or recent view, with task event cursors and a pending count. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14074,6 +14735,8 @@ export interface operations {
     listConversations: {
         parameters: {
             query?: {
+                /** @description Case-insensitive literal search over conversation titles across the caller's authorized conversation set. */
+                q?: string;
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];
@@ -14162,9 +14825,11 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listConversationActiveTasks: {
+    listConversationTasks: {
         parameters: {
             query?: {
+                /** @description Task status view. Defaults to active. */
+                view?: "active" | "recent";
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];
@@ -14559,6 +15224,266 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current fetch status and confirmed transfer progress */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetch"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listTaskFileFetches: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Task file fetch records */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    submitTaskFileFetchManifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskFileFetchManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Pinned manifest with confirmed chunk sequences for safe resume */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchManifestReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putTaskFileFetchChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Durable confirmation of this chunk and aggregate progress */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchChunkReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskFileFetchCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description Safe receipt for the durable committed copy */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetchCommitReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    abortTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Staging cleared or the fetch was already terminal */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelTaskFileFetch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled fetch projection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskFileFetch"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskFileFetchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified retained file bytes; response is private and non-cacheable. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "X-Content-Type-Options"?: "nosniff";
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                    "text/markdown": string;
+                    "text/csv": string;
+                    "application/json": string;
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": string;
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": string;
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": string;
+                    "application/pdf": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteTaskFileFetchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                fetch_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Copy deleted or was already deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     getTaskMediaPreview: {
         parameters: {
             query?: never;
@@ -14745,6 +15670,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -15595,6 +16521,39 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    previewPersonalOfficeText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": string;
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": string;
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": string;
+            };
+        };
+        responses: {
+            /** @description Bounded plain text extracted from the document */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "X-Content-Type-Options"?: "nosniff";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalOfficePreviewResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -17506,7 +18465,7 @@ export interface operations {
                         items: {
                             owner_id: components["schemas"]["UserId"];
                             /** @enum {string} */
-                            source: "client" | "chat" | "task" | "route" | "probe";
+                            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
                             call_id: string;
                             model_id: string;
                             provider_model: string;
@@ -17539,7 +18498,7 @@ export interface operations {
                 "application/json": {
                     owner_id: components["schemas"]["UserId"];
                     /** @enum {string} */
-                    source: "client" | "chat" | "task" | "route" | "probe";
+                    source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
                     call_id: string;
                     /** Format: int64 */
                     input_tokens: number;

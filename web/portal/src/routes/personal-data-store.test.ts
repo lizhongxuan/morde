@@ -1,17 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createMemoryPersonalDataStorage,
-  getPersonalDataSyncEnabled,
-  getPersonalDataSyncStatus,
   PersonalDataStore,
+  personalDataLegacyScopeKey,
   personalDataScopeKey,
-  personalDataSyncSettingKey,
-  setPersonalDataSyncEnabled,
   sha256Hex,
-  subscribePersonalDataSyncEnabled,
   subscribePersonalDataSyncStatus,
   synchronizePersonalData,
   type PersonalDataAPI,
+  type PersonalDataSyncStatus,
   type PersonalObject,
 } from './personal-data-store';
 
@@ -34,8 +31,27 @@ function api(overrides: Partial<PersonalDataAPI> = {}): PersonalDataAPI {
   };
 }
 
-function makeStore(userID: string, origin = 'https://portal.example.test') {
-  return new PersonalDataStore(userID, origin, createMemoryPersonalDataStorage());
+function makeLocks(): LockManager {
+  const tails = new Map<string, Promise<void>>();
+  return {
+    request: async <T>(name: string, _options: LockOptions, callback: (lock: Lock | null) => T | PromiseLike<T>): Promise<T> => {
+      const previous = tails.get(name) ?? Promise.resolve();
+      let release!: () => void;
+      const current = new Promise<void>((resolve) => { release = resolve; });
+      const tail = previous.then(() => current);
+      tails.set(name, tail);
+      await previous;
+      try { return await callback({ name, mode: 'exclusive' } as Lock); }
+      finally {
+        release();
+        if (tails.get(name) === tail) tails.delete(name);
+      }
+    },
+  } as unknown as LockManager;
+}
+
+function makeStore(userID: string, origin = 'https://portal.example.test', storage = createMemoryPersonalDataStorage(), serviceInstanceID = 'service-test') {
+  return new PersonalDataStore(userID, origin, storage, serviceInstanceID);
 }
 
 function profile(revision: number, name: string): PersonalObject {
@@ -45,75 +61,187 @@ function profile(revision: number, name: string): PersonalObject {
   };
 }
 
+const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+
+beforeEach(() => {
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: makeLocks() });
+});
+
 afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
+  if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks);
+  else Reflect.deleteProperty(navigator, 'locks');
 });
 
 describe('PersonalDataStore', () => {
-  it('isolates persistent state and sync settings by service origin and user ID', async () => {
+  it('isolates persistent state by service origin and user ID', async () => {
     const storage = createMemoryPersonalDataStorage();
-    const storeA = new PersonalDataStore('u_alice', 'https://one.example.test/path', storage);
-    const storeB = new PersonalDataStore('u_alice', 'https://two.example.test', storage);
-    const storeC = new PersonalDataStore('u_bob', 'https://one.example.test', storage);
+    const storeA = new PersonalDataStore('u_alice', 'https://one.example.test/path', storage, 'instance-a');
+    const storeB = new PersonalDataStore('u_alice', 'https://two.example.test', storage, 'instance-a');
+    const storeC = new PersonalDataStore('u_bob', 'https://one.example.test', storage, 'instance-a');
     await storeA.queueReplace('memory', 'global', { content: 'local note' });
 
     expect(personalDataScopeKey('https://one.example.test/path', 'u_alice')).not.toBe(personalDataScopeKey('https://two.example.test', 'u_alice'));
     expect((await storeA.read()).outbox).toHaveLength(1);
     expect((await storeB.read()).outbox).toHaveLength(0);
     expect((await storeC.read()).outbox).toHaveLength(0);
-
-    expect(getPersonalDataSyncEnabled('u_alice', 'https://one.example.test')).toBe(true);
-    expect(personalDataSyncSettingKey('u_alice', 'https://one.example.test')).not.toBe(personalDataSyncSettingKey('u_alice', 'https://two.example.test'));
-    setPersonalDataSyncEnabled('u_alice', false, 'https://one.example.test');
-    expect(getPersonalDataSyncEnabled('u_alice', 'https://one.example.test')).toBe(false);
-    expect(getPersonalDataSyncEnabled('u_alice', 'https://two.example.test')).toBe(true);
-    expect(getPersonalDataSyncEnabled('u_bob', 'https://one.example.test')).toBe(true);
   });
 
-  it('notifies same-tab sync-setting subscribers', () => {
-    const listener = vi.fn();
-    const unsubscribe = subscribePersonalDataSyncEnabled('u_subscriber', listener, 'https://portal.example.test');
-    setPersonalDataSyncEnabled('u_subscriber', false, 'https://portal.example.test');
-    setPersonalDataSyncEnabled('u_subscriber', true, 'https://portal.example.test');
-    unsubscribe();
-    setPersonalDataSyncEnabled('u_subscriber', false, 'https://portal.example.test');
-    expect(listener.mock.calls.map(([enabled]) => enabled)).toEqual([false, true]);
+  it('isolates one origin and user when the service instance changes and quarantines the old drafts', async () => {
+    const storage = createMemoryPersonalDataStorage();
+    const old = new PersonalDataStore('u_instance_change', 'https://portal.example.test', storage, 'instance-old');
+    const current = new PersonalDataStore('u_instance_change', 'https://portal.example.test', storage, 'instance-new');
+    await old.applySnapshot([profile(7, 'Old confirmed profile')], 21);
+    const draft = await old.queueReplace('profile', 'default', { name: 'Old unsent draft', avatar: 'dragon' });
+    const blob = new Blob(['kept bytes'], { type: 'text/plain' });
+    await old.queueLibraryAttachment({
+      objectID: 'library-old', name: 'kept.txt', kind: 'artifact', mediaType: blob.type,
+      sizeBytes: blob.size, sha256: 'b'.repeat(64), blob,
+    }, { name: 'kept.txt', kind: 'artifact', mime: blob.type, size_bytes: blob.size });
+
+    expect((await current.read()).snapshotComplete).toBe(false);
+    expect((await current.read()).outbox).toHaveLength(0);
+    await current.quarantineOtherInstanceDrafts();
+    const oldState = await old.read();
+    const candidates = await current.otherInstanceDraftScopes();
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.serviceInstanceID).toBe('instance-old');
+    expect(oldState.cursor.afterSequence).toBe(21);
+    expect(oldState.outbox[0]).toMatchObject({ id: draft.id, key: draft.key, status: 'conflict', body: { name: 'Old unsent draft' } });
+    expect(oldState.attachments[0]).toMatchObject({ status: 'conflict', blob, createKey: expect.any(String), commitKey: expect.any(String) });
+  });
+
+  it('finds and preserves drafts stored under the pre-instance scope', async () => {
+    const storage = createMemoryPersonalDataStorage();
+    const origin = 'https://portal.example.test';
+    const oldScope = personalDataLegacyScopeKey(origin, 'u_legacy_scope');
+    await storage.update(oldScope, (state) => {
+      state.outbox.push({ id: 'legacy-mutation', key: 'legacy-idempotency-key', objectType: 'profile', objectID: 'default',
+        baseRevision: 3, body: { name: 'Legacy draft' }, operation: 'replace', status: 'pending', createdAt: 1 });
+      return state;
+    });
+    const current = new PersonalDataStore('u_legacy_scope', origin, storage, 'instance-current');
+
+    await current.quarantineOtherInstanceDrafts();
+
+    const candidates = await current.otherInstanceDraftScopes();
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({ scope: oldScope, serviceInstanceID: null });
+    expect(candidates[0]?.state.outbox[0]).toMatchObject({ id: 'legacy-mutation', key: 'legacy-idempotency-key', status: 'conflict', body: { name: 'Legacy draft' } });
+  });
+
+  it('serializes drains from two tabs that share the same account and service-instance lock', async () => {
+    const storage = createMemoryPersonalDataStorage();
+    const firstTab = new PersonalDataStore('u_two_tabs', 'https://portal.example.test', storage, 'instance-shared');
+    const secondTab = new PersonalDataStore('u_two_tabs', 'https://portal.example.test', storage, 'instance-shared');
+    let releaseSnapshot!: (value: { watermark: number; items: PersonalObject[]; next_cursor: null }) => void;
+    const snapshotBlocked = new Promise<{ watermark: number; items: PersonalObject[]; next_cursor: null }>((resolve) => { releaseSnapshot = resolve; });
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    const enter = () => { activeCalls += 1; maxActiveCalls = Math.max(maxActiveCalls, activeCalls); };
+    const leave = () => { activeCalls -= 1; };
+    const firstAPI = api({
+      personalDataSnapshot: vi.fn(async () => { enter(); try { return await snapshotBlocked; } finally { leave(); } }),
+      personalDataChanges: vi.fn(async (after) => { enter(); try { return { items: [], through_sequence: after, next_after_sequence: after, has_more: false }; } finally { leave(); } }),
+    });
+    const secondAPI = api({
+      personalDataSnapshot: vi.fn(async () => { enter(); try { return { watermark: 0, items: [], next_cursor: null }; } finally { leave(); } }),
+      personalDataChanges: vi.fn(async (after) => { enter(); try { return { items: [], through_sequence: after, next_after_sequence: after, has_more: false }; } finally { leave(); } }),
+    });
+    const firstDrain = synchronizePersonalData(firstTab, firstAPI);
+    await vi.waitFor(() => expect(firstAPI.personalDataSnapshot).toHaveBeenCalledTimes(1));
+    const secondDrain = synchronizePersonalData(secondTab, secondAPI);
+    await Promise.resolve();
+    expect(secondAPI.personalDataSnapshot).not.toHaveBeenCalled();
+    expect(secondAPI.personalDataChanges).not.toHaveBeenCalled();
+    releaseSnapshot({ watermark: 0, items: [], next_cursor: null });
+    await Promise.all([firstDrain, secondDrain]);
+
+    expect(maxActiveCalls).toBe(1);
+    expect(firstAPI.personalDataSnapshot).toHaveBeenCalledTimes(1);
+    expect(secondAPI.personalDataSnapshot).not.toHaveBeenCalled();
+    expect(secondAPI.personalDataChanges).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed without Web Locks and keeps the pending draft unchanged', async () => {
+    const store = makeStore('u_no_web_locks');
+    const pending = await store.queueReplace('profile', 'default', { name: 'Do not lose me', avatar: 'dragon' });
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined });
+    const activeAPI = api();
+    await synchronizePersonalData(store, activeAPI);
+
+    const state = await store.read();
+    expect(state.outbox).toHaveLength(1);
+    expect(state.outbox[0]).toMatchObject({ id: pending.id, key: pending.key, status: 'pending', body: { name: 'Do not lose me' } });
+    expect(state.syncError).toMatch(/不支持跨标签页安全同步/);
+    expect(activeAPI.personalDataSnapshot).not.toHaveBeenCalled();
+    expect(activeAPI.replacePersonalObject).not.toHaveBeenCalled();
+  });
+
+  it('copies an old draft to the confirmed current version only after explicit selection and retains original blobs and keys', async () => {
+    const storage = createMemoryPersonalDataStorage();
+    const old = new PersonalDataStore('u_import_old', 'https://portal.example.test', storage, 'instance-old');
+    const current = new PersonalDataStore('u_import_old', 'https://portal.example.test', storage, 'instance-new');
+    await old.queueLibraryAttachment({
+      objectID: 'library-entry', name: 'old.txt', kind: 'artifact', mediaType: 'text/plain',
+      sizeBytes: 8, sha256: 'c'.repeat(64), blob: new Blob(['old file']),
+    }, { name: 'old.txt', kind: 'artifact', mime: 'text/plain', size_bytes: 8 });
+    const oldStateBefore = await old.read();
+    const oldMutation = oldStateBefore.outbox[0]!;
+    const oldAttachment = oldStateBefore.attachments[0]!;
+    await old.applySnapshot([profile(2, 'Old remote')], 2);
+    await current.applySnapshot([profile(5, 'New service remote')], 12);
+    await current.quarantineOtherInstanceDrafts();
+
+    const importedMutation = await current.importOtherInstanceMutation(old.scope, oldMutation.id);
+    expect(importedMutation.baseRevision).toBe(0);
+    expect(importedMutation.body?.name).toBe('old.txt');
+    expect(importedMutation.key).not.toBe(oldMutation.key);
+    expect(await current.importOtherInstanceMutation(old.scope, oldMutation.id)).toEqual(importedMutation);
+    const importedAttachment = await current.importOtherInstanceAttachment(old.scope, oldAttachment.id);
+    expect(importedAttachment).toMatchObject({ status: 'pending', dependsOnKey: importedMutation.key, uploadID: undefined, blob: oldAttachment.blob });
+    expect(importedAttachment.createKey).not.toBe(oldAttachment.createKey);
+    expect(importedAttachment.commitKey).not.toBe(oldAttachment.commitKey);
+    expect(await current.importOtherInstanceAttachment(old.scope, oldAttachment.id)).toEqual(importedAttachment);
+
+    const currentState = await current.read();
+    const oldState = await old.read();
+    expect(currentState.outbox.filter((item) => item.migrationSource?.id === oldMutation.id)).toHaveLength(1);
+    expect(currentState.attachments.filter((item) => item.migrationSource?.id === oldAttachment.id)).toHaveLength(1);
+    expect(oldState.outbox[0]).toMatchObject({ id: oldMutation.id, key: oldMutation.key, status: 'conflict', resolutionQueued: true });
+    expect(oldState.attachments[0]).toMatchObject({ id: oldAttachment.id, createKey: oldAttachment.createKey, commitKey: oldAttachment.commitKey, status: 'conflict', resolutionQueued: true });
   });
 
   it('reports an explicit unknown status when IndexedDB is unavailable', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB');
     Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: undefined });
     try {
-      const status = await new Promise<Awaited<ReturnType<typeof getPersonalDataSyncStatus>>>((resolve) => {
+      const status = await new Promise<PersonalDataSyncStatus>((resolve) => {
         let unsubscribe: () => void = () => undefined;
         unsubscribe = subscribePersonalDataSyncStatus('u_no_storage', (next) => {
           if (next.error) { unsubscribe(); resolve(next); }
         }, 'https://portal.example.test');
       });
-      expect(status).toEqual({ enabled: true, pendingCount: null, conflictCount: null, error: '无法读取本地个人数据同步状态。' });
+      expect(status).toEqual({ pendingCount: null, conflictCount: null, error: '无法读取本地个人数据同步状态。' });
     } finally {
       if (descriptor) Object.defineProperty(globalThis, 'indexedDB', descriptor);
       else Reflect.deleteProperty(globalThis, 'indexedDB');
     }
   });
 
-  it('keeps local drafts while sync is disabled and retries the exact same idempotency key', async () => {
-    const store = makeStore('u_offline');
+  it('ignores the legacy pause setting and retries the exact same idempotency key', async () => {
+    const userID = 'u_legacy_pause';
+    const store = makeStore(userID);
     await store.queueReplace('profile', 'default', { name: 'Draft', avatar: 'dragon' });
-    setPersonalDataSyncEnabled('u_offline', false, store.serviceOrigin);
-    const pausedAPI = api();
-
-    await synchronizePersonalData(store, pausedAPI);
-    expect(pausedAPI.personalDataSnapshot).not.toHaveBeenCalled();
-    expect((await store.read()).outbox).toHaveLength(1);
-
-    setPersonalDataSyncEnabled('u_offline', true, store.serviceOrigin);
+    const legacySettingKey = `morde.personal-data.sync.v1:${encodeURIComponent(new URL(store.serviceOrigin).origin)}:${encodeURIComponent(userID)}`;
+    localStorage.setItem(legacySettingKey, 'false');
     const replace = vi.fn()
       .mockRejectedValueOnce(new Error('network disconnected'))
       .mockResolvedValueOnce({ result_revision: 1, account_change_sequence: 1 });
     const activeAPI = api({ replacePersonalObject: replace });
     await synchronizePersonalData(store, activeAPI);
+    expect(activeAPI.personalDataSnapshot).toHaveBeenCalledTimes(1);
     const savedKey = replace.mock.calls[0]?.[4];
     expect(savedKey).toBeTruthy();
     expect((await store.read()).outbox).toHaveLength(1);

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { gatewayApi, type GatewayWorkspaceBinding, type GatewayWorkspaceDiff, type GatewayWorkspaceManifest } from '../api/gateway';
+import FloatingError from './FloatingError';
 
 const REFRESH_INTERVAL_MS = 5000;
 const MANIFEST_PAGE_SIZE = 500;
@@ -579,7 +580,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
         </button>
       </div>
 
-      {bindingState?.error ? <p className="panel-error" role="alert">工作区状态暂不可用：{bindingState.error}</p>
+      {bindingState?.error ? <FloatingError>工作区状态暂不可用：{bindingState.error}</FloatingError>
         : !bindingState ? <p className="panel-loading" role="status">正在读取 Workspace 状态…</p>
           : !bindings.length ? <p className="panel-loading" role="status">此电脑没有可访问的工作区。</p>
             : binding && (
@@ -611,7 +612,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                   </div>
                   {!bindingReady && <p className="panel-loading" role="status">Host binding、同步或 revision 未就绪；历史差异暂不可读。</p>}
                   {bindingReady && !diffSelectionValid && <p className="panel-loading" role="status">请输入两个不同且不大于 Host 已应用 revision {binding.applied_revision} 的非负整数。</p>}
-                  {workspaceDiff?.error && <p className="panel-error" role="alert">{workspaceDiff.error}</p>}
+                  {workspaceDiff?.error && <FloatingError>{workspaceDiff.error}</FloatingError>}
                   {workspaceDiff?.loading && <p role="status">正在读取 revision {fromRevision} → {toRevision}…</p>}
                   {workspaceDiff?.result && <>
                     <p role="status">revision {workspaceDiff.result.from_revision} → {workspaceDiff.result.to_revision}，共 {workspaceDiff.result.changes.length} 条路径差异。</p>
@@ -641,7 +642,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                   <button className="button button-secondary" type="button" onClick={() => void runMockRevisionPreview()} disabled={mockPreview?.loading}>
                     {mockPreview?.loading ? '正在读取 manifest 元数据…' : '生成本机 Mock 差异与回滚预演'}
                   </button>
-                  {mockPreview?.error && <p className="panel-error" role="alert">{mockPreview.error}</p>}
+                  {mockPreview?.error && <FloatingError>{mockPreview.error}</FloatingError>}
                 </section>}
                 {mockPreviewEnabled && !bindingReady && <p className="panel-loading" role="status">本机 Mock 差异与回滚预演要求 Workspace 与 Host revision 已同步就绪；当前未就绪，预演已停用。</p>}
                 {mockPreview?.result && <section className="workspace-sync-status" aria-label="本机 Mock 回滚预演" role="status">
@@ -665,11 +666,8 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                   <button className="button button-secondary" type="button" onClick={() => setMockPreviewState({ ...mockPreview, confirmingRestore: true, restoreResult: undefined })}>
                     本机 Mock 模拟回滚…
                   </button>
-                  {mockPreview.restoreResult && <p role={mockPreview.restoreResult === 'success' ? 'status' : 'alert'}>
-                    {mockPreview.restoreResult === 'success'
-                      ? '本机预演模拟恢复成功；没有发送写请求，Workspace 与本机文件均未改变。'
-                      : '本机预演模拟服务端返回版本冲突；没有发送写请求，Workspace 与本机文件均未改变。'}
-                  </p>}
+                  {mockPreview.restoreResult === 'success' && <p role="status">本机预演模拟恢复成功；没有发送写请求，Workspace 与本机文件均未改变。</p>}
+                  {mockPreview.restoreResult === 'conflict' && <FloatingError>本机预演模拟服务端返回版本冲突；没有发送写请求，Workspace 与本机文件均未改变。</FloatingError>}
                   {mockPreview.confirmingRestore && <section className="workspace-sync-status" aria-labelledby="mock-restore-title">
                     <h3 id="mock-restore-title">确认本机 Mock 回滚</h3>
                     <p>模拟以当前 revision {mockPreview.result.currentRevision} 为预期版本，从 v{mockPreview.result.targetRevision} 恢复。此处不会调用 API、修改 Workspace 或本机文件。</p>
@@ -679,7 +677,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                   </section>}
                 </section>}
                 {!validWorkspaceID(binding.workspace.id) || binding.directory !== binding.workspace.id
-                  ? <p className="panel-error" role="alert">工作区绑定目录无效，已阻止文件访问。</p>
+                  ? <FloatingError>工作区绑定目录无效，已阻止文件访问。</FloatingError>
                   : !withinQuota(binding) ? <p className="panel-loading" role="status">工作区用量超出或配额状态无效；文件暂不显示。</p>
                     : !bindingReady ? <p className="panel-loading" role="status">工作区尚未就绪、存在同步冲突或 Host revision 未追上；文件暂不显示。</p>
                       : (
@@ -687,7 +685,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                           <p className="workspace-browser-path" aria-label="当前工作区路径">
                             {binding.workspace.name}{segments.map((segment) => ` / ${segment}`)}
                           </p>
-                          {(fileError || downloadError) && <p className="panel-error" role="alert">{fileError || downloadError}</p>}
+                          {(fileError || downloadError) && <FloatingError>{fileError || downloadError}</FloatingError>}
                           {notice && <p className="notice" role="status">{notice}</p>}
                           <div className="file-list-wrap">
                             <table className="file-table">

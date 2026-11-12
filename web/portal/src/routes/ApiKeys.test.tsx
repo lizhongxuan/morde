@@ -55,4 +55,25 @@ describe('ApiKeys', () => {
     expect(await screen.findByText('已吊销')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '吊销 API Key 已吊销密钥' })).not.toBeInTheDocument();
   });
+
+  it('paginates key metadata without exposing key secrets in the list', async () => {
+    const items = ['key-one', 'key-two', 'key-three'].map((id) => ({
+      id, name: id, expires_at: '2027-10-22T08:00:00Z', last_used_at: null,
+      revoked: false, created_at: '2026-10-22T08:00:00Z',
+    })).map((item, index) => ({ ...item, ...(index === 0 ? { key: 'chk_hidden_secret' } : {}) }));
+    vi.spyOn(portalApi, 'apiKeys').mockResolvedValue({ items } as Awaited<ReturnType<typeof portalApi.apiKeys>>);
+    renderPage();
+
+    expect(await screen.findByRole('article', { name: 'API Key key-one' })).toBeInTheDocument();
+    expect(screen.queryByRole('article', { name: 'API Key key-two' })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('chk_hidden_secret');
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '下一页' }));
+    expect(await screen.findByRole('article', { name: 'API Key key-two' })).toBeInTheDocument();
+    expect(screen.queryByRole('article', { name: 'API Key key-one' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('article', { name: 'API Key key-three' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '吊销 API Key key-two' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('吊销后，后续请求会被拒绝');
+  });
 });

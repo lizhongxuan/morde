@@ -1,0 +1,81 @@
+.assistant-page .task-panel-heading {
+  min-height: 44px;
+  padding: 7px 12px;
+}
+
+.assistant-page .task-panel-tabs {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.assistant-page .task-panel-tabs button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #718096;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.assistant-page .task-panel-tabs button.is-selected {
+  border-color: #dbe9ff;
+  color: #0969e6;
+  background: #edf5ff;
+  font-weight: 650;
+}
+
+.assistant-page .task-panel-list {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.assistant-page .task-panel-pagination {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.assistant-page .task-panel-pagination .screen-pagination__viewport {
+  min-height: 0;
+}
+
+.assistant-page .task-panel-files {
+  gap: 8px;
+}
+
+.assistant-page .task-panel-files .task-panel-pagination {
+  height: 0;
+}
+
+.assistant-page .task-file-card {
+  min-width: 0;
+  padding: 10px 11px;
+  display: grid;
+  gap: 5px;
+  border: 1px solid #e7ebf2;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.assistant-page .task-file-card strong,
+.assistant-page .task-file-card small {
+  overflow-wrap: anywhere;
+}
+
+.assistant-page .task-file-card small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.assistant-page .task-file-card a {
+  width: fit-content;
+  color: #315fd0;
+  font-size: 12px;
+  font-weight: 650;
+}

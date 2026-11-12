@@ -4,6 +4,7 @@ import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes } from '../../app/format';
+import { FloatingError } from '../../components/FloatingError';
 
 const formatPolicyState = (enabled: boolean) => enabled ? '已开启' : '已关闭';
 type Draft = { tokenLimit: string; maxConcurrent: string };
@@ -108,7 +109,7 @@ export function AdminSettings() {
 
   return <section className="admin-content">
     {query.isPending ? <div className="loading-card" role="status">正在加载平台设置…</div>
-      : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={refresh}>重试</button></div>
+      : query.isError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={refresh}>重试</button></FloatingError>
         : data && budget && <>
           <section className="admin-detail-section" aria-labelledby="admin-settings-policy-heading">
             <div className="design-panel-header"><h2 id="admin-settings-policy-heading">账户规则</h2><button type="button" className="button button-secondary" disabled={query.isFetching || modelsQuery.isFetching} onClick={refresh}>{query.isFetching || modelsQuery.isFetching ? '正在刷新…' : '刷新数据'}</button></div>
@@ -123,7 +124,7 @@ export function AdminSettings() {
             <h2 id="admin-settings-model-budget-heading">新用户默认模型额度</h2>
             {budget.configured
               ? <p className="notice notice-info" role="status">当前默认值：{budget.token_limit.toLocaleString()} tokens · 并发 {budget.max_concurrent} · 版本 v{budget.version}</p>
-              : <p className="notice notice-warning" role="alert">尚未配置默认额度。新账号仍可通过审核并使用个人模型；使用平台模型前需要配置额度。</p>}
+              : <FloatingError>尚未配置默认额度。新账号仍可通过审核并使用个人模型；使用平台模型前需要配置额度。</FloatingError>}
             <p className="muted">仅在账号首次从待审核或已拒绝变为已通过时创建模型额度，不影响已有账号，也不会因禁用后恢复而重置。</p>
             <form className="form-card form-stack" onSubmit={submitBudget}>
               <label htmlFor="admin-default-model-token-limit">Token 额度</label>
@@ -135,8 +136,8 @@ export function AdminSettings() {
                 {conflicted && <button className="button button-secondary" type="button" disabled={query.isFetching} onClick={refresh}>刷新配置并放弃当前草稿</button>}
               </div>
             </form>
-            {validationError && <p className="notice notice-warning" role="alert">{validationError}</p>}
-            {saveError && <p className="notice notice-warning" role="alert">{saveError}</p>}
+            {validationError && <FloatingError>{validationError}</FloatingError>}
+            {saveError && <FloatingError className="error-inline" role="alert">{saveError}</FloatingError>}
             {saved && <p className="notice notice-success" role="status">默认模型额度已保存。</p>}
           </section>
 
@@ -144,9 +145,9 @@ export function AdminSettings() {
             <h2 id="admin-settings-model-default-heading">Cloud Agent 默认模型</h2>
             {modelDefault?.configured && modelDefaultValue && selectedModelAvailable
               ? <p className="notice notice-info" role="status">当前默认模型：{modelCandidates.find((model) => model.id === modelDefaultValue)?.name} · 版本 v{modelDefault.version}</p>
-              : <p className="notice notice-warning" role="alert">{modelDefault?.model_id ? `默认模型 ${modelDefault.model_id} 尚不可用或未通过检查。` : '尚未配置默认模型。'}用户仍可选择已检查的个人模型或共享模型。</p>}
+              : <FloatingError>{modelDefault?.model_id ? `默认模型 ${modelDefault.model_id} 尚不可用或未通过检查。` : '尚未配置默认模型。'}用户仍可选择已检查的个人模型或共享模型。</FloatingError>}
             <p className="muted">默认项只能指向管理员共享连接；用户也可以自行选择其他可用模型。</p>
-            {modelsQuery.isError && <p className="notice notice-warning" role="alert">{errorDetails(modelsQuery.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void modelsQuery.refetch()}>重试读取模型</button></p>}
+            {modelsQuery.isError && <FloatingError className="error-inline" role="alert">{errorDetails(modelsQuery.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void modelsQuery.refetch()}>重试读取模型</button></FloatingError>}
             <form className="form-card form-stack" onSubmit={submitModelDefault}>
               <label htmlFor="admin-default-model-connection">默认模型连接</label>
               <select id="admin-default-model-connection" value={modelDefaultValue} disabled={modelsQuery.isPending || modelDefaultConflicted} onChange={(event) => { setModelDefaultDraft(event.target.value); setModelDefaultError(''); setModelDefaultSaved(false); }}>
@@ -160,7 +161,7 @@ export function AdminSettings() {
                 {modelDefaultConflicted && <button type="button" className="button button-secondary" disabled={query.isFetching} onClick={refresh}>刷新配置并放弃当前草稿</button>}
               </div>
             </form>
-            {modelDefaultError && <p className="notice notice-warning" role="alert">{modelDefaultError}</p>}
+            {modelDefaultError && <FloatingError>{modelDefaultError}</FloatingError>}
             {modelDefaultSaved && <p className="notice notice-success" role="status">默认模型已保存。</p>}
           </section>
 

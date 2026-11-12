@@ -27,6 +27,15 @@
 
 .screen-pagination__item { min-width: 0; }
 .screen-pagination__item[hidden] { display: none !important; }
+.screen-pagination__item--overflow {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+.screen-pagination__item--overflow::-webkit-scrollbar { display: none; }
+.screen-pagination__item--overflow:focus-visible { outline: 2px solid #9bbcff; outline-offset: -2px; border-radius: 8px; }
 
 .screen-pagination__controls {
   min-width: 0;

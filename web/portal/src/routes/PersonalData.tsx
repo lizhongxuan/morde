@@ -1,16 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router';
 import { newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
+import { ScreenPagination } from '../components/ScreenPagination';
+import './PersonalData.css';
 import { ideasFromFeedPreferences, personalIdeas } from '../data/ideas';
 import {
-  getPersonalDataSyncEnabled,
   PersonalDataStore,
   personalObjectKey,
-  setPersonalDataSyncEnabled,
   sha256Hex,
-  subscribePersonalDataSyncEnabled,
   synchronizePersonalData,
   type PersonalDataAPI,
   type PersonalDataState,
@@ -18,6 +18,7 @@ import {
   type PersonalObjectBody,
   type PersonalObjectType,
 } from './personal-data-store';
+import { FloatingError } from '../components/FloatingError';
 
 type Section = 'profile' | 'soul' | 'memory' | 'feed' | 'ideas' | 'library' | 'preferences';
 type ProfileBody = { name: string; avatar: 'dragon' | 'emoji'; emoji?: string; color?: string; description?: string; style?: string };
@@ -39,7 +40,24 @@ const profileStyles = [
   ['watercolor', '水彩'], ['pixel', '像素'], ['line', '线稿'], ['sticker', '贴纸'],
 ] as const;
 
-const personalAPI = portalApi as unknown as PersonalDataAPI;
+function personalAPIFor(serviceInstanceID: string | undefined, actorID: string | undefined): PersonalDataAPI {
+  const base = portalApi as unknown as PersonalDataAPI;
+  if (!serviceInstanceID || !actorID) return base;
+  return {
+    ...base,
+    replacePersonalObject: (type, id, baseRevision, body, key) => portalApi.replacePersonalObject(
+      type as Parameters<typeof portalApi.replacePersonalObject>[0], id, baseRevision,
+      body as Parameters<typeof portalApi.replacePersonalObject>[3], key, actorID, serviceInstanceID,
+    ),
+    createPersonalAttachmentUpload: (body, key) => portalApi.createPersonalAttachmentUpload(
+      body as Parameters<typeof portalApi.createPersonalAttachmentUpload>[0], key, serviceInstanceID, actorID,
+    ),
+    putPersonalAttachmentChunk: (uploadID, sequence, body, sha256) => portalApi.putPersonalAttachmentChunk(
+      uploadID, sequence, body, sha256, serviceInstanceID, actorID,
+    ),
+    commitPersonalAttachment: (uploadID, key) => portalApi.commitPersonalAttachment(uploadID, key, serviceInstanceID, actorID),
+  };
+}
 
 function objectsWithDrafts(state: PersonalDataState): PersonalObject[] {
   const objects = new Map(Object.entries(state.objects));
@@ -131,13 +149,17 @@ export function PersonalData() {
   const { user } = useAuth();
   const location = useLocation();
   const userID = user?.id;
-  const store = useMemo(() => userID ? new PersonalDataStore(userID) : null, [userID]);
+  const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
+  const serviceInstanceID = capabilities.data?.service_instance_id;
+  const personalAPI = useMemo(() => personalAPIFor(serviceInstanceID, userID), [serviceInstanceID, userID]);
+  const store = useMemo(() => userID ? new PersonalDataStore(userID, window.location.origin, undefined, serviceInstanceID) : null, [userID, serviceInstanceID]);
   const [state, setState] = useState<PersonalDataState | null>(null);
+  const [otherInstanceDrafts, setOtherInstanceDrafts] = useState<Array<{ scope: string; serviceInstanceID: string | null; state: PersonalDataState }>>([]);
   const requestedSection = new URLSearchParams(location.search).get('section');
   const activeSection: Section = sections.some((section) => section.id === requestedSection) ? requestedSection as Section : 'profile';
   const [localError, setLocalError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [syncEnabled, setSyncEnabled] = useState(() => user ? getPersonalDataSyncEnabled(user.id) : true);
+  const [confirmOldDelete, setConfirmOldDelete] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [quota, setQuota] = useState<{ used_bytes: number; remaining_bytes: number; quota_bytes: number; max_attachment_bytes: number } | null>(null);
   const [quotaError, setQuotaError] = useState<string | null>(null);
@@ -147,24 +169,40 @@ export function PersonalData() {
   const [feedBody, setFeedBody] = useState('');
   const [libraryKind, setLibraryKind] = useState<'artifact' | 'media'>('artifact');
   const syncingRef = useRef(false);
+  const syncRequestedRef = useRef(false);
+
+  const refreshOtherInstanceDrafts = useCallback(async () => {
+    if (!store || !serviceInstanceID) { setOtherInstanceDrafts([]); return; }
+    try {
+      await store.quarantineOtherInstanceDrafts();
+      setOtherInstanceDrafts(await store.otherInstanceDraftScopes());
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '无法读取其他服务实例保留的草稿。');
+    }
+  }, [store, serviceInstanceID]);
 
   const refreshLocal = useCallback(async () => {
     if (!store) return;
     try {
       setState(await store.read());
       setLocalError(null);
+      await refreshOtherInstanceDrafts();
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : '无法读取本地个人数据。');
     }
-  }, [store]);
+  }, [store, refreshOtherInstanceDrafts]);
 
   const sync = useCallback(async () => {
-    if (!store || !getPersonalDataSyncEnabled(store.userID, store.serviceOrigin) || syncingRef.current) return;
+    if (!store || !serviceInstanceID) return;
+    if (syncingRef.current) {
+      syncRequestedRef.current = true;
+      return;
+    }
     syncingRef.current = true;
     setSyncing(true);
     try {
       await synchronizePersonalData(store, personalAPI);
-      if (getPersonalDataSyncEnabled(store.userID, store.serviceOrigin) && (typeof navigator === 'undefined' || navigator.onLine)) {
+      if (serviceInstanceID && (typeof navigator === 'undefined' || navigator.onLine)) {
         try {
           const result = await personalAPI.personalDataQuota();
           setQuota({ used_bytes: result.used_bytes, remaining_bytes: result.remaining_bytes, quota_bytes: result.quota_bytes, max_attachment_bytes: result.max_attachment_bytes });
@@ -177,35 +215,33 @@ export function PersonalData() {
       syncingRef.current = false;
       setSyncing(false);
       await refreshLocal();
+      if (syncRequestedRef.current) {
+        syncRequestedRef.current = false;
+        void sync();
+      }
     }
-  }, [store, refreshLocal]);
+  }, [store, refreshLocal, personalAPI, serviceInstanceID]);
 
   useEffect(() => {
     if (!store) return undefined;
     let alive = true;
     const unsubscribeStore = store.subscribe((next) => { if (alive) setState(next); });
-    const unsubscribeSetting = subscribePersonalDataSyncEnabled(store.userID, (enabled) => {
-      if (!alive) return;
-      setSyncEnabled(enabled);
-      if (enabled) void sync();
-    }, store.serviceOrigin);
-    const onOnline = () => { if (getPersonalDataSyncEnabled(store.userID, store.serviceOrigin)) void sync(); };
+    const onOnline = () => { void sync(); };
     window.addEventListener('online', onOnline);
     void store.read().then((next) => {
       if (!alive) return;
       setState(next);
       setLocalError(null);
-      if (getPersonalDataSyncEnabled(store.userID, store.serviceOrigin)) void sync();
+      void refreshOtherInstanceDrafts().finally(() => { if (alive) void sync(); });
     }).catch((error: unknown) => {
       if (alive) setLocalError(error instanceof Error ? error.message : '无法读取本地个人数据。');
     });
     return () => {
       alive = false;
       unsubscribeStore();
-      unsubscribeSetting();
       window.removeEventListener('online', onOnline);
     };
-  }, [store, sync]);
+  }, [store, sync, refreshOtherInstanceDrafts]);
 
   const allObjects = useMemo(() => state ? objectsWithDrafts(state) : [], [state]);
   const goalSuggestions = useMemo(() => goalSuggestionsFrom(allObjects), [allObjects]);
@@ -223,60 +259,81 @@ export function PersonalData() {
   const goalFollowupsEnabled = goalFollowupsSetting?.body.enabled === true;
   const goalFollowupsSettingPending = state?.outbox.some((item) => item.objectType === 'skill_setting' && item.objectID === 'builtin_goal_followups' && !item.resolutionQueued) ?? false;
   const feedObjects = allObjects.filter((item) => item.object_type === 'feed_post').sort((a, b) => asString(b.body.created_at).localeCompare(asString(a.body.created_at)));
-  const ideaMarks = new Map(allObjects.filter((item) => item.object_type === 'idea_mark').map((item) => [item.object_id, asString(item.body.state)]));
+  const ideaMarks = useMemo(() => new Map(allObjects.filter((item) => item.object_type === 'idea_mark').map((item) => [item.object_id, asString(item.body.state)])), [allObjects]);
   const libraryObjects = allObjects.filter((item) => item.object_type === 'library_item');
   const feedPreference = objectOf<{ content: string }>(allObjects, 'feed_preferences', 'default');
   const preferenceIdeas = useMemo(() => ideasFromFeedPreferences(feedPreference?.body.content ?? ''), [feedPreference?.body.content]);
+  const ideaCards = useMemo(() => [
+    ...(ideasEnabled ? preferenceIdeas.map((idea) => ({
+      id: `preference-${idea.id}`, kind: 'preference' as const, title: idea.title, emoji: idea.emoji,
+      body: idea.body, source: '来自你保存的动态偏好', prompt: idea.prompt, ideaID: idea.id,
+    })) : []),
+    ...(ideasEnabled ? goalSuggestions.map((idea) => ({
+      id: `goal-${idea.id}`, kind: 'goal' as const, title: idea.title, emoji: '🎯',
+      body: `${idea.stepLabel}：${idea.stepTitle}`, source: '来自你的目标进度', prompt: idea.prompt, ideaID: `goal-${idea.id}`,
+    })) : []),
+    ...personalIdeas.flatMap((group) => group.ideas.map((idea) => ({
+      id: idea.id, kind: 'curated' as const, title: idea.title, emoji: idea.emoji,
+      body: idea.body, source: ideaMarks.get(idea.id) === 'saved' ? '已收藏' : ideaMarks.get(idea.id) === 'dismissed' ? '已忽略' : group.title,
+      prompt: idea.prompt, ideaID: idea.id, mark: ideaMarks.get(idea.id),
+    }))),
+  ], [ideasEnabled, preferenceIdeas, goalSuggestions, ideaMarks]);
   const conflicts = useMemo(() => state?.outbox.filter((item) => item.status === 'conflict' && !item.resolutionQueued) ?? [], [state?.outbox]);
   const archivedConflicts = useMemo(() => state?.outbox.filter((item) => item.status === 'conflict' && item.resolutionQueued) ?? [], [state?.outbox]);
   const pendingCount = (state?.outbox.filter((item) => item.status === 'pending').length ?? 0) + (state?.attachments.filter((item) => item.status === 'pending').length ?? 0);
-  const remoteLoading = Boolean(state && syncEnabled && !state.snapshotComplete && !state.syncError && (typeof navigator === 'undefined' || navigator.onLine));
+  const remoteLoading = Boolean(state && !state.snapshotComplete && !state.syncError && (typeof navigator === 'undefined' || navigator.onLine));
 
-  const saveObject = useCallback(async (type: PersonalObjectType, id: string, body: PersonalObjectBody) => {
-    if (!store) return;
+  const saveObject = useCallback(async (type: PersonalObjectType, id: string, body: PersonalObjectBody): Promise<boolean> => {
+    if (!store) return false;
     setActionError(null);
     try {
       const conflict = conflicts.find((entry) => entry.objectType === type && entry.objectID === id);
       if (conflict) await store.rebaseDraft(conflict.id, body);
       else await store.queueReplace(type, id, body);
-      if (syncEnabled) void sync();
+      void sync();
+      return true;
     } catch (error) {
       setActionError(error instanceof Error ? error.message : '无法保存个人数据。');
+      return false;
     }
-  }, [store, conflicts, syncEnabled, sync]);
+  }, [store, conflicts, sync]);
 
   const deleteObject = useCallback(async (type: PersonalObjectType, id: string) => {
     if (!store) return;
     setActionError(null);
     try {
       await store.queueDelete(type, id);
-      if (syncEnabled) void sync();
+      void sync();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : '无法删除个人数据。');
     }
-  }, [store, syncEnabled, sync]);
+  }, [store, sync]);
 
-  const addMemory = (event: FormEvent<HTMLFormElement>) => {
+  const addMemory = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const content = memoryContent.trim();
     if (!content) return;
     const ids = new Set(memoryObjects.map((item) => item.object_id));
     const id = randomMemoryID(ids);
-    void saveObject('memory', id, { content, ...(memoryCategory.trim() ? { category: memoryCategory.trim() } : {}) });
-    setMemoryContent('');
-    setMemoryCategory('');
+    const saved = await saveObject('memory', id, { content, ...(memoryCategory.trim() ? { category: memoryCategory.trim() } : {}) });
+    if (saved) {
+      setMemoryContent('');
+      setMemoryCategory('');
+    }
   };
 
-  const addFeedPost = (event: FormEvent<HTMLFormElement>) => {
+  const addFeedPost = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const title = feedTitle.trim();
     const body = feedBody.trim();
     if (!title || !body) return;
-    void saveObject('feed_post', newIdempotencyKey(), {
+    const saved = await saveObject('feed_post', newIdempotencyKey(), {
       title, type: 'note', created_at: new Date().toISOString(), liked: false, body,
     });
-    setFeedTitle('');
-    setFeedBody('');
+    if (saved) {
+      setFeedTitle('');
+      setFeedBody('');
+    }
   };
 
   const saveFeedPreferences = (content: string) => {
@@ -302,7 +359,7 @@ export function PersonalData() {
       }
       if (file.type.length > 128) throw new Error('文件媒体类型过长，无法保存。');
       if (quota && file.size > quota.max_attachment_bytes) throw new Error(`单个附件不能超过 ${formatBytes(quota.max_attachment_bytes)}。`);
-      if (syncEnabled && quota && file.size > quota.remaining_bytes) throw new Error('附件空间不足，请先清理资源库内容。');
+      if (quota && file.size > quota.remaining_bytes) throw new Error('附件空间不足，请先清理资源库内容。');
       const kind: LibraryBody['kind'] = target ? (target.body.kind === 'media' ? 'media' : 'artifact') : libraryKind;
       const objectID = target?.object_id ?? newIdempotencyKey();
       const mediaType = file.type || 'application/octet-stream';
@@ -319,7 +376,7 @@ export function PersonalData() {
           objectID, name: file.name, kind, mediaType, sizeBytes: file.size, sha256: digest, blob: file, baseRevision,
         });
       }
-      if (syncEnabled) void sync();
+      void sync();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : '无法保存附件草稿。');
     }
@@ -345,7 +402,7 @@ export function PersonalData() {
     if (!store) return;
     try {
       await store.rebaseDraft(mutationID);
-      if (syncEnabled) void sync();
+      void sync();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : '无法基于当前版本保存草稿。');
     }
@@ -360,34 +417,49 @@ export function PersonalData() {
     }
     try {
       await store.rebaseAttachment(id, remote.revision);
-      if (syncEnabled) void sync();
+      void sync();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : '无法重新排队附件。');
     }
   };
 
+  const importOldMutation = async (sourceScope: string, mutationID: string) => {
+    if (!store) return;
+    try {
+      await store.importOtherInstanceMutation(sourceScope, mutationID);
+      await refreshLocal();
+      void sync();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '无法将旧服务草稿复制到当前服务。');
+    }
+  };
+
+  const importOldAttachment = async (sourceScope: string, attachmentID: string) => {
+    if (!store) return;
+    try {
+      await store.importOtherInstanceAttachment(sourceScope, attachmentID);
+      await refreshLocal();
+      void sync();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '无法将旧服务附件复制到当前服务。');
+    }
+  };
+
   if (!user) return <section><div className="loading-card" role="status">正在读取账号…</div></section>;
 
-  return <section className="personal-data-page design-panel">
+  return <section className="personal-data-page design-panel" data-layout="viewport-fit">
     <div className="design-panel-header">
       <div><h2>我的数据</h2><p>管理个人资料、AI 个性、记忆、动态、灵感和资源库。</p></div>
-      <div className="inline-actions">
-      <label className="checkbox-row personal-sync-toggle"><input type="checkbox" checked={syncEnabled} onChange={(event) => {
-        const enabled = event.target.checked;
-        setPersonalDataSyncEnabled(user.id, enabled, store?.serviceOrigin);
-        setSyncEnabled(enabled);
-        if (enabled) void sync();
-      }} />同步到 Morde</label>
-      <button type="button" className="button button-secondary" disabled={!syncEnabled || syncing} onClick={() => void sync()}>{syncing ? '同步中…' : '立即同步'}</button>
-      </div>
     </div>
     <div className="connection-section-heading personal-sync-status" aria-live="polite">
-      <p className="muted">{syncing ? '正在同步个人数据…' : syncEnabled ? '同步已开启' : '同步已关闭；本地数据会继续保留'} · {pendingCount} 项待同步 · {conflicts.length} 条冲突草稿</p>
+      <p className="muted">{syncing ? '正在更新云端数据…' : state?.syncError ? '云端更新待重试' : '保存后自动更新云端'} · {pendingCount} 项待提交 · {conflicts.length} 条冲突草稿</p>
     </div>
 
-    {localError && <div className="error-card" role="alert">{localError}<button type="button" className="button button-secondary" onClick={() => void refreshLocal()}>重试</button></div>}
-    {state?.syncError && <div className="error-card" role="alert">同步未完成：{state.syncError} 本地草稿和附件仍保留。<button type="button" className="button button-secondary" disabled={!syncEnabled || syncing} onClick={() => void sync()}>重试同步</button></div>}
-    {actionError && <div className="error-inline" role="alert">{actionError}<button type="button" className="icon-button" aria-label="关闭提示" onClick={() => setActionError(null)}>×</button></div>}
+    {!serviceInstanceID && <p className="notice notice-warning" role="status">正在确认服务实例；此期间新保存内容只会保存在本机，不会提交到未确认的服务。</p>}
+
+    {localError && <FloatingError className="error-card" role="alert">{localError}<button type="button" className="button button-secondary" onClick={() => void refreshLocal()}>重试</button></FloatingError>}
+    {state?.syncError && <FloatingError className="error-card" role="alert">云端更新未完成：{state.syncError} 本地草稿和附件仍保留。<button type="button" className="button button-secondary" disabled={syncing} onClick={() => void sync()}>重试保存</button></FloatingError>}
+    {actionError && <FloatingError className="error-inline" role="alert">{actionError}</FloatingError>}
     {!state && !localError && <div className="loading-card" role="status">正在读取本地个人数据…</div>}
 
     {!!conflicts.length && <section className="notice notice-warning" aria-label="保留的冲突草稿">
@@ -409,10 +481,44 @@ export function PersonalData() {
       </li>)}</ul>
     </details>}
 
+    {!!otherInstanceDrafts.length && <section className="notice notice-warning" aria-label="其他服务实例保留的草稿">
+      <h2>其他服务实例保留的草稿</h2>
+      <p>这些内容来自旧版或其他服务实例，不会自动上传。逐项查看后，你可以选择把副本按当前服务已确认的版本重新排队；旧服务中的删除草稿会要求再次确认。原草稿和附件会保留在旧范围。</p>
+      {otherInstanceDrafts.map((candidate) => <details key={candidate.scope}>
+        <summary>{candidate.serviceInstanceID ? `服务实例 ${candidate.serviceInstanceID.slice(0, 8)}` : '旧版或尚未确认服务'} · {candidate.state.outbox.length} 条草稿 · {candidate.state.attachments.length} 个附件</summary>
+        <ul>{candidate.state.outbox.map((item) => {
+          const confirmationKey = `${candidate.scope}\u0000${item.id}`;
+          return <li key={item.id}>
+            <strong>{item.objectType} / {item.objectID}</strong> · {item.operation === 'delete' ? '删除' : '修改'} · {item.message ?? '已保留'}
+            {item.body && <pre>{JSON.stringify(item.body).slice(0, 240)}</pre>}
+            {item.resolutionQueued ? <span>已在当前服务另存，原草稿仍保留</span>
+              : item.operation === 'delete' ? confirmOldDelete === confirmationKey
+                ? <div className="notice notice-warning" role="group" aria-label={`确认在当前服务重试删除 ${item.objectID}`}>
+                  <p>这会按当前服务已确认的版本重新执行删除；原服务草稿仍保留。</p>
+                  <div className="inline-actions">
+                    <button type="button" className="button button-small button-secondary" onClick={() => setConfirmOldDelete(null)}>取消</button>
+                    <button type="button" className="button button-small button-danger-quiet" disabled={!state?.snapshotComplete || syncing || !serviceInstanceID}
+                      onClick={() => { setConfirmOldDelete(null); void importOldMutation(candidate.scope, item.id); }}>确认并提交删除</button>
+                  </div>
+                </div>
+                : <button type="button" className="button button-small button-secondary" disabled={!state?.snapshotComplete || syncing || !serviceInstanceID}
+                  onClick={() => setConfirmOldDelete(confirmationKey)}>在当前服务重试删除</button>
+                : <button type="button" className="button button-small button-secondary" disabled={!state?.snapshotComplete || syncing || !serviceInstanceID}
+                  onClick={() => void importOldMutation(candidate.scope, item.id)}>复制到当前服务并提交</button>}
+          </li>;
+        })}{candidate.state.attachments.map((item) => <li key={item.id}>
+          <strong>{item.name}</strong> · {formatBytes(item.sizeBytes)} · {item.message ?? '已保留'}
+          {item.resolutionQueued ? <span>已在当前服务另存，原附件仍保留</span>
+            : <button type="button" className="button button-small button-secondary" disabled={!state?.snapshotComplete || syncing || !serviceInstanceID || Boolean(item.cancelUploadPending)}
+              onClick={() => void importOldAttachment(candidate.scope, item.id)}>复制到当前服务并上传</button>}
+        </li>)}</ul>
+      </details>)}
+    </section>}
+
     {remoteLoading && <div className="loading-card" role="status">正在读取服务端个人数据；本地草稿仍可离线访问。</div>}
 
     {state && !remoteLoading && activeSection === 'profile' && <section className="connection-section" aria-labelledby="personal-profile-title">
-      <div className="connection-section-heading"><div><h2 id="personal-profile-title">个人资料</h2><p className="muted">这里只保存服务端允许的资料字段。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-profile-title" className="sr-only">个人资料</h2><p className="muted">这里只保存服务端允许的资料字段。</p></div></div>
       {!profileObject && <p className="empty-card">还没有个人资料。保存后会创建默认资料。</p>}
       <ProfileEditor key={`${profileObject?.revision ?? 0}:${JSON.stringify(profileObject?.body ?? null)}`} value={profileObject} fallbackName={user?.name ?? ''}
         hasConflict={conflicts.some((item) => item.objectType === 'profile' && item.objectID === 'default')}
@@ -420,7 +526,7 @@ export function PersonalData() {
     </section>}
 
     {state && !remoteLoading && activeSection === 'soul' && <section className="connection-section" aria-labelledby="personal-soul-title">
-      <div className="connection-section-heading"><div><h2 id="personal-soul-title">AI 个性</h2><p className="muted">Morde 默认人格由系统提供。这里可以为个人对话设置专属偏好；项目对话不会读取个人 SOUL。删除个人版本会恢复系统默认人格。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-soul-title" className="sr-only">AI 个性</h2><p className="muted">Morde 默认人格由系统提供。这里可以为个人对话设置专属偏好；项目对话不会读取个人 SOUL。删除个人版本会恢复系统默认人格。</p></div></div>
       <SoulEditor key={`${soulObject?.revision ?? 0}:${JSON.stringify(soulObject?.body ?? null)}`} value={soulObject}
         hasConflict={conflicts.some((item) => item.objectType === 'soul' && item.objectID === 'default')}
         onSave={(body) => void saveObject('soul', 'default', body as unknown as PersonalObjectBody)}
@@ -428,9 +534,9 @@ export function PersonalData() {
     </section>}
 
     {state && !remoteLoading && activeSection === 'memory' && <section className="connection-section" aria-labelledby="personal-memory-title">
-      <div className="connection-section-heading"><div><h2 id="personal-memory-title">记忆</h2><p className="muted">默认开启后，Morde 可在个人对话中按需检索有限的历史片段和已保存记忆；不会注入完整历史。项目对话不会读取个人记忆。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-memory-title" className="sr-only">记忆</h2><p className="muted">默认开启后，Morde 可在个人对话中按需检索有限的历史片段和已保存记忆；不会注入完整历史。项目对话不会读取个人记忆。</p></div></div>
       <label className="checkbox-row"><input type="checkbox" checked={memoryEnabled}
-        disabled={!syncEnabled || !state.snapshotComplete || syncing || memorySettingPending}
+        disabled={!state.snapshotComplete || syncing || memorySettingPending}
         onChange={(event) => void saveObject('skill_setting', 'builtin_memory', { enabled: event.target.checked })} />允许 AI 使用个人记忆</label>
       <p className="muted">{memorySettingPending ? '设置正在同步，服务端确认后生效。' : '默认开启；关闭后，个人对话不会读取历史片段或已保存记忆。修改和删除在服务端同步成功后生效。'}</p>
       <form className="form-card form-stack" onSubmit={addMemory}>
@@ -438,76 +544,71 @@ export function PersonalData() {
         <label>分类（可选）<input value={memoryCategory} maxLength={64} onChange={(event) => setMemoryCategory(event.target.value)} /></label>
         <button className="button button-primary" type="submit">保存记忆</button>
       </form>
-      {memoryObjects.length === 0 ? <p className="empty-card">还没有记忆。</p> : <ul className="personal-object-list">{memoryObjects.map((item) => <MemoryRow key={`${item.object_id}:${item.revision}:${JSON.stringify(item.body)}`} item={item} onSave={(body) => void saveObject('memory', item.object_id, body)} onDelete={() => void deleteObject('memory', item.object_id)} />)}</ul>}
+      {memoryObjects.length === 0 ? <p className="empty-card">还没有记忆。</p> : <ScreenPagination
+        items={memoryObjects} getKey={(item) => item.object_id} estimatedItemHeight={156} height={300}
+        ariaLabel="已保存记忆" className="personal-data-pager"
+        renderItem={(item) => <MemoryRow key={`${item.object_id}:${item.revision}:${JSON.stringify(item.body)}`} item={item}
+          onSave={(body) => void saveObject('memory', item.object_id, body)} onDelete={() => void deleteObject('memory', item.object_id)} />}
+      />}
     </section>}
 
     {state && !remoteLoading && activeSection === 'feed' && <section className="connection-section" aria-labelledby="personal-feed-title">
-      <div className="connection-section-heading"><div><h2 id="personal-feed-title">动态</h2><p className="muted">个人动态保存在 feed_post 对象中；偏好设置与动态分开保存。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-feed-title" className="sr-only">动态</h2><p className="muted">个人动态保存在 feed_post 对象中；偏好设置与动态分开保存。</p></div></div>
       <form className="form-card form-stack" onSubmit={addFeedPost}>
         <label>新增动态标题<input value={feedTitle} maxLength={200} required onChange={(event) => setFeedTitle(event.target.value)} /></label>
         <label>内容<textarea value={feedBody} maxLength={65536} required onChange={(event) => setFeedBody(event.target.value)} /></label>
         <button className="button button-primary" type="submit">发布到个人动态</button>
       </form>
-      {feedObjects.length === 0 ? <p className="empty-card">还没有动态。</p> : <ul className="personal-object-list">{feedObjects.map((item) => {
+      {feedObjects.length === 0 ? <p className="empty-card">还没有动态。</p> : <ScreenPagination
+        items={feedObjects} getKey={(item) => item.object_id} estimatedItemHeight={132} height={300}
+        ariaLabel="个人动态" className="personal-data-pager"
+        renderItem={(item) => {
         const body = item.body as FeedPostBody;
-        return <li className="model-connection-card" key={item.object_id}>
+        return <article className="model-connection-card" key={item.object_id}>
           <div className="model-connection-main"><h3>{body.title}</h3><p className="muted">{body.created_at ? new Date(body.created_at).toLocaleString() : '时间未知'} · {body.type}</p><p>{body.body}</p></div>
           <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => void saveObject('feed_post', item.object_id, { ...body, liked: !body.liked })}>{body.liked ? '取消喜欢' : '喜欢'}</button><button type="button" className="button button-secondary" onClick={() => void deleteObject('feed_post', item.object_id)}>删除</button></div>
-        </li>;
-      })}</ul>}
+        </article>;
+      }}
+      />}
     </section>}
 
     {state && !remoteLoading && activeSection === 'preferences' && <section className="connection-section" aria-labelledby="personal-preferences-title">
-      <div className="connection-section-heading"><div><h2 id="personal-preferences-title">偏好</h2><p className="muted">设置你希望关注的动态内容。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-preferences-title" className="sr-only">偏好</h2><p className="muted">设置你希望关注的动态内容。</p></div></div>
       <FeedPreferencesEditor key={feedPreference?.body.content ?? 'empty'} initialContent={feedPreference?.body.content ?? ''} onSave={saveFeedPreferences} />
     </section>}
 
     {state && !remoteLoading && activeSection === 'ideas' && <section className="connection-section" aria-labelledby="personal-ideas-title">
-      <div className="connection-section-heading"><div><h2 id="personal-ideas-title">灵感</h2><p className="muted">建议基于当前账号的目标、关注偏好和 Morde 内置目录生成；点选后会预填助手，不会自动提交任务。</p></div></div>
-      <section className="form-card form-stack" aria-labelledby="goal-followups-title">
+      <div className="connection-section-heading"><div><h2 id="personal-ideas-title" className="sr-only">灵感</h2><p className="muted">建议基于当前账号的目标、关注偏好和 Morde 内置目录生成；点选后会预填助手，不会自动提交任务。</p></div></div>
+      <section className="personal-data-setting" aria-labelledby="goal-followups-title">
         <h3 id="goal-followups-title">目标受阻自动跟进</h3>
         <label className="checkbox-row"><input type="checkbox" checked={goalFollowupsEnabled}
-          disabled={!syncEnabled || !state.snapshotComplete || syncing || goalFollowupsSettingPending}
+          disabled={!state.snapshotComplete || syncing || goalFollowupsSettingPending}
           onChange={(event) => void saveObject('skill_setting', 'builtin_goal_followups', { enabled: event.target.checked })} />自动分析新受阻的目标</label>
-        <p className="muted">默认关闭。开启后，目标步骤首次变为受阻时，Morde 会创建一个无电脑目标的一次性后台分析任务，使用当前账号的默认模型和只读工具，并给你下一步建议；不会修改目标、创建计划、发送外部消息或操作电脑。执行服务未运行时，任务会排队等待服务启动。关闭后不会创建新的跟进任务。{goalFollowupsSettingPending ? '设置正在同步，服务端确认后生效。' : '修改在服务端确认后生效。'}</p>
+        <details><summary>查看功能说明</summary><p className="muted">默认关闭。开启后，目标步骤首次变为受阻时，Morde 会创建一个无电脑目标的一次性后台分析任务，使用当前账号的默认模型和只读工具，并给你下一步建议；不会修改目标、创建计划、发送外部消息或操作电脑。执行服务未运行时，任务会排队等待服务启动。关闭后不会创建新的跟进任务。{goalFollowupsSettingPending ? '设置正在同步，服务端确认后生效。' : '修改在服务端确认后生效。'}</p></details>
       </section>
       <label className="checkbox-row"><input type="checkbox" checked={ideasEnabled}
-        disabled={!syncEnabled || !state.snapshotComplete || syncing || ideasSettingPending}
+        disabled={!state.snapshotComplete || syncing || ideasSettingPending}
         onChange={(event) => void saveObject('skill_setting', 'builtin_ideas', { enabled: event.target.checked })} />显示个性化建议</label>
-      <p className="muted">只控制灵感页中根据你的目标和关注偏好生成的建议；不会在后台自动创建任务，也不影响已设置的计划和通知。{ideasSettingPending ? '设置正在同步，服务端确认后生效。' : '修改在服务端确认后生效。'}</p>
-      {ideasEnabled && preferenceIdeas.length > 0 && <section aria-label="根据我的关注偏好生成的搜索建议">
-        <h3>根据你的关注主题</h3><ul className="personal-object-list">{preferenceIdeas.map((idea) => (
-          <li className="model-connection-card" key={idea.id}>
-            <div className="model-connection-main"><h3>{idea.emoji} {idea.title}</h3><p>{idea.body}</p><small className="muted">来自你保存的动态偏好</small></div>
-            <div className="inline-actions"><Link className="button button-primary" to="/assistant" state={{ ideaID: idea.id, ideaPrompt: idea.prompt }}>按主题搜索</Link></div>
-          </li>
-        ))}</ul>
-      </section>}
-      {ideasEnabled && goalSuggestions.length > 0 && <section aria-label="根据我的目标生成的建议">
-        <h3>继续你的目标</h3><ul className="personal-object-list">{goalSuggestions.map((idea) => (
-          <li className="model-connection-card" key={`goal-${idea.id}`}>
-            <div className="model-connection-main"><h3>🎯 {idea.title}</h3><p>{idea.stepLabel}：{idea.stepTitle}</p><small className="muted">来自你的目标进度</small></div>
-            <div className="inline-actions"><Link className="button button-primary" to="/assistant" state={{ ideaID: `goal-${idea.id}`, ideaPrompt: idea.prompt }}>继续目标</Link></div>
-          </li>
-        ))}</ul>
-      </section>}
-      {personalIdeas.map((group) => <section key={group.id} aria-label={group.title}>
-        <h3>{group.title}</h3><ul className="personal-object-list">{group.ideas.map((idea) => {
-          const mark = ideaMarks.get(idea.id);
-          return <li className="model-connection-card" key={idea.id}>
-            <div className="model-connection-main"><h3>{idea.emoji} {idea.title}</h3><p>{idea.body}</p><small className="muted">{mark === 'saved' ? '已收藏' : mark === 'dismissed' ? '已忽略' : '尚未标记'}</small></div>
-            <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => toggleIdea(idea.id)}>{mark === 'saved' ? '取消收藏' : '收藏'}</button>
-              {mark !== 'dismissed' && <button type="button" className="button button-secondary" onClick={() => void saveObject('idea_mark', idea.id, { state: 'dismissed' })}>忽略</button>}
-              <Link className="button button-primary" to="/assistant" state={{ ideaID: idea.id, ideaPrompt: idea.prompt }}>带入助手</Link></div>
-          </li>;
-        })}</ul>
-      </section>)}
+      <details className="personal-data-setting-help"><summary>个性化建议说明</summary><p className="muted">只控制灵感页中根据你的目标和关注偏好生成的建议；不会在后台自动创建任务，也不影响已设置的计划和通知。{ideasSettingPending ? '设置正在同步，服务端确认后生效。' : '修改在服务端确认后生效。'}</p></details>
+      {ideaCards.length > 0 && <ScreenPagination
+        items={ideaCards} getKey={(idea) => idea.id} estimatedItemHeight={112} height={260}
+        ariaLabel="灵感建议" className="personal-data-pager personal-ideas-pager"
+        renderItem={(idea) => <article className="model-connection-card" key={idea.id}>
+          <div className="model-connection-main"><h3>{idea.emoji} {idea.title}</h3><p>{idea.body}</p><small className="muted">{idea.source}</small></div>
+          <div className="inline-actions">{idea.kind === 'curated' && <>
+            <button type="button" className="button button-secondary" onClick={() => toggleIdea(idea.ideaID)}>{idea.mark === 'saved' ? '取消收藏' : '收藏'}</button>
+            {idea.mark !== 'dismissed' && <button type="button" className="button button-secondary" onClick={() => void saveObject('idea_mark', idea.ideaID, { state: 'dismissed' })}>忽略</button>}
+          </>}
+            <Link className="button button-primary" to="/assistant" state={{ ideaID: idea.ideaID, ideaPrompt: idea.prompt }}>{idea.kind === 'preference' ? '按主题搜索' : idea.kind === 'goal' ? '继续目标' : '带入助手'}</Link>
+          </div>
+        </article>}
+      />}
     </section>}
 
     {state && !remoteLoading && activeSection === 'library' && <section className="connection-section" aria-labelledby="personal-library-title">
-      <div className="connection-section-heading"><div><h2 id="personal-library-title">资源库</h2><p className="muted">附件字节保存在本机离线队列；联网后按 4 MiB 分块上传。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-library-title" className="sr-only">资源库</h2><p className="muted">附件字节保存在本机离线队列；联网后按 4 MiB 分块上传。</p></div></div>
       {quota && <p className="notice notice-info" role="status">附件空间已用 {formatBytes(quota.used_bytes)} / {formatBytes(quota.quota_bytes)}，剩余 {formatBytes(quota.remaining_bytes)}；单个附件上限 {formatBytes(quota.max_attachment_bytes)}。</p>}
-      {quotaError && <div className="error-inline" role="alert">无法读取附件空间：{quotaError}<button type="button" className="button button-small button-secondary" onClick={() => void sync()}>重试</button></div>}
+      {quotaError && <FloatingError className="error-inline" role="alert">无法读取附件空间：{quotaError}<button type="button" className="button button-small button-secondary" onClick={() => void sync()}>重试</button></FloatingError>}
       <form className="form-card form-stack" onSubmit={(event) => event.preventDefault()}>
         <label>资源类型<select value={libraryKind} onChange={(event) => setLibraryKind(event.target.value as LibraryBody['kind'])}><option value="artifact">文档/产物</option><option value="media">媒体</option></select></label>
         <label>上传新资源<input type="file" onChange={(event) => {
@@ -516,12 +617,15 @@ export function PersonalData() {
           event.currentTarget.value = '';
         }} /></label>
       </form>
-      {libraryObjects.length === 0 ? <p className="empty-card">资源库还是空的。可以先添加本机文件。</p> : <ul className="personal-object-list">{libraryObjects.map((item) => {
+      {libraryObjects.length === 0 ? <p className="empty-card">资源库还是空的。可以先添加本机文件。</p> : <ScreenPagination
+        items={libraryObjects} getKey={(item) => item.object_id} estimatedItemHeight={96} height={300}
+        ariaLabel="个人资源库" className="personal-data-pager"
+        renderItem={(item) => {
         const body = item.body as LibraryBody;
         const attachment = state.attachments.find((entry) => entry.objectID === item.object_id);
-        return <li className="model-connection-card" key={item.object_id}>
+        return <article className="model-connection-card" key={item.object_id}>
           <div className="model-connection-main"><h3>{body.name}</h3><p className="muted">{body.kind === 'media' ? '媒体' : '文档/产物'} · {formatBytes(body.size_bytes ?? 0)} · {body.mime ?? '未知格式'}</p>
-            {attachment && <p role="status">{attachment.status === 'conflict' ? `附件冲突：${attachment.message ?? '草稿已保留'}` : `附件已保存在本机，${syncEnabled ? '等待上传或正在上传' : '同步关闭时不会上传'}`}</p>}</div>
+            {attachment && <p role="status">{attachment.status === 'conflict' ? `附件冲突：${attachment.message ?? '草稿已保留'}` : '附件已保存在本机，等待提交或正在提交'}</p>}</div>
           <div className="inline-actions">{body.attachment_id && <button type="button" className="button button-secondary" onClick={() => void downloadAttachment(item as PersonalObject & { body: LibraryBody })}>下载附件</button>}
             {!body.attachment_id && !attachment && <label className="button button-secondary">添加附件<input className="sr-only" type="file" onChange={(event) => {
               const file = event.currentTarget.files?.[0];
@@ -529,8 +633,9 @@ export function PersonalData() {
               event.currentTarget.value = '';
             }} /></label>}
             <button type="button" className="button button-secondary" onClick={() => void deleteObject('library_item', item.object_id)}>删除</button></div>
-        </li>;
-      })}</ul>}
+        </article>;
+      }}
+      />}
       {!!state.attachments.filter((item) => item.status === 'conflict').length && <section className="notice notice-warning"><h3>附件草稿冲突</h3>{state.attachments.filter((item) => item.status === 'conflict').map((item) => <p key={item.id}>{item.name}：{item.message} <button type="button" className="button button-small button-secondary" onClick={() => void rebaseAttachment(item.id, item.objectID)}>保留草稿并基于远端重试</button></p>)}</section>}
     </section>}
   </section>;
@@ -608,10 +713,10 @@ function SoulEditor({ value, hasConflict, onSave, onDelete, onInvalid }: {
 function MemoryRow({ item, onSave, onDelete }: { item: PersonalObject; onSave: (body: MemoryBody) => void; onDelete: () => void }) {
   const [content, setContent] = useState(asString(item.body.content));
   const [category, setCategory] = useState(asString(item.body.category));
-  return <li className="model-connection-card">
+  return <article className="model-connection-card">
     <div className="model-connection-main"><label>记忆内容<textarea value={content} maxLength={65536} onChange={(event) => setContent(event.target.value)} /></label><label>分类<input value={category} maxLength={64} onChange={(event) => setCategory(event.target.value)} /></label></div>
     <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => onSave({ content: content.trim(), ...(category.trim() ? { category: category.trim() } : {}) })}>保存修改</button><button type="button" className="button button-secondary" onClick={onDelete}>删除</button></div>
-  </li>;
+  </article>;
 }
 
 export default PersonalData;

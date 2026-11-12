@@ -7,6 +7,8 @@ type AuditQuery = NonNullable<operations['listAuditLogs']['parameters']['query']
 export type HostMemberPermission = components['schemas']['HostMemberPermission'];
 export type HostMember = components['schemas']['HostMember'];
 export type SharedHost = components['schemas']['SharedHost'];
+export type HostEmbedTicketRequest = operations['issueHostEmbedTicket']['requestBody']['content']['application/json'];
+export type HostEmbedTicket = operations['issueHostEmbedTicket']['responses'][201]['content']['application/json'];
 export type MainConversation = {
   status: 'ready' | 'uninitialized' | 'selection_required';
   conversation_id: string | null;
@@ -76,6 +78,8 @@ export const portalApi = {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
   enterHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/enter', { params: { path: { id } } })),
+  issueHostEmbedTicket: async (id: string, body: HostEmbedTicketRequest): Promise<HostEmbedTicket> =>
+    unwrapApiResponse(await api.POST('/api/hosts/{id}/embed-tickets', { params: { path: { id } }, body })),
   hostControl: async (id: string) => unwrapApiResponse(await api.GET('/api/hosts/{id}/control', { params: { path: { id } } })),
   hostControlAction: async (id: string, body: components['schemas']['ControlActionRequest']) => unwrapApiResponse(await api.POST('/api/hosts/{id}/control/actions', { params: { path: { id } }, body })),
   renewHostControlLease: async (id: string, expectedControlVersion: number) => unwrapApiResponse(await api.POST('/api/hosts/{id}/control/lease/renew', {
@@ -195,16 +199,16 @@ export const portalApi = {
           ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) },
     }));
   },
-  conversationTasks: async (id: string): Promise<components['schemas']['ConversationActiveTaskPage']> => {
+  conversationTasks: async (id: string, options: { view?: 'active' | 'recent' } = {}): Promise<components['schemas']['ConversationActiveTaskPage']> => {
     const items: components['schemas']['ConversationActiveTask'][] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
     for (let page = 0; page < 1000; page += 1) {
       const result = unwrapApiResponse(await api.GET('/api/conversations/{id}/tasks', {
-        params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } },
+        params: { path: { id }, query: { limit: 100, ...(options.view ? { view: options.view } : {}), ...(cursor ? { cursor } : {}) } },
       }));
       items.push(...result.items);
-      if (!result.next_cursor) return { items, next_cursor: null };
+      if (!result.next_cursor) return { items, next_cursor: null, pending_count: result.pending_count };
       if (seen.has(result.next_cursor)) throw new Error('任务分页游标重复，无法继续读取');
       seen.add(result.next_cursor);
       cursor = result.next_cursor;

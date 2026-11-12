@@ -2,12 +2,13 @@ import { Link, useParams } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes, formatDate } from '../../app/format';
+import { FloatingError } from '../../components/FloatingError';
 
 export function AdminWorkspaceDetail() {
   const { id = '' } = useParams();
   const query = useQuery({ queryKey: ['admin', 'workspace', id], queryFn: () => portalApi.adminWorkspace(id) });
   if (query.isPending) return <div className="loading-card" role="status">正在读取工作区…</div>;
-  if (query.isError) return <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>;
+  if (query.isError) return <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>;
   const workspace = query.data;
 
   return <section>

@@ -2,8 +2,8 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } f
 import type { FormEvent } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
-import type { ConversationDeliveryStatus } from '../app/api';
+import { enterHostInNewTab, errorDetails, newIdempotencyKey, portalApi } from '../app/api';
+import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission } from '../app/api';
 import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview, K2TaskDependency } from '../app/k2-task-projection';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
@@ -21,20 +21,56 @@ import { useToast } from '../app/toast';
 import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { ChatMarkdown } from '../components/ChatMarkdown';
 import { MordeIcon } from '../components/MordeIcon';
+import { ScreenPagination } from '../components/ScreenPagination';
 import { sha256Hex } from './personal-data-store';
 import { extractAssistantPDFText } from './assistant-pdf';
+import { assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
+import type { AssistantComposerDraft } from './assistant-drafts';
+import './AssistantSidebar.css';
+import { FloatingError } from '../components/FloatingError';
 
 type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items'][number];
 type ConversationMessage = Awaited<ReturnType<typeof portalApi.conversationMessages>>['items'][number];
+type ConversationMessagePage = Awaited<ReturnType<typeof portalApi.conversationMessages>>;
+type ConversationMessagesData = { pages: ConversationMessagePage[]; pageParams: unknown[] };
 type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
+type TaskArtifact = Task['artifacts'][number];
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
+type ComputerHostOption = { id: string; name: string; url: string; state: string; owned: boolean; permissions: HostMemberPermission[] };
+type ComputerEmbedSession = {
+  conversationID: string;
+  hostID: string;
+  hostOrigin: string;
+  exchangeURL: string;
+  nonce: string;
+  ticket?: string;
+  targets: HostEmbedTicket['targets'];
+  status: 'requesting' | 'submitting' | 'loading' | 'ready' | 'error';
+  error?: string;
+};
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
   snapshotStatus?: 'streaming' | 'completed' | 'interrupted';
 };
-type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string };
-type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string } | { status: 'error'; message: string };
+type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string; needsPreparation?: boolean; preparationCancelled?: boolean };
+type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string };
+
+function hostEmbedTargetPlan(host: ComputerHostOption): HostEmbedTicketRequest['targets'] {
+  if (host.owned) return ['browser', 'terminal', 'workspace', 'files', 'vscode'];
+  const has = (permission: HostMemberPermission) => host.permissions.includes(permission);
+  const targets: HostEmbedTicketRequest['targets'] = [];
+  if (has('desktop:view') || has('desktop:control')) targets.push('browser');
+  // Embedded terminal needs a user control lease as well as terminal permission.
+  if (has('terminal:control') && has('desktop:control')) targets.push('terminal');
+  if (has('workspace:file:read')) targets.push('workspace');
+  return targets;
+}
+
+function hostEmbedInitialTarget(targets: HostEmbedTicketRequest['targets']): HostEmbedTicketRequest['target'] | null {
+  return targets.includes('browser') ? 'browser' : targets.includes('terminal') ? 'terminal'
+    : targets.includes('workspace') ? 'workspace' : null;
+}
 
 const assistantAttachmentTypes = new Set([
   'image/jpeg', 'image/png', 'text/plain',
@@ -101,19 +137,27 @@ function sortAssistantMessages(messages: AssistantDisplayMessage[]): AssistantDi
     left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id));
 }
 
-async function conversationHistory(conversationID: string): Promise<{ items: ConversationMessage[]; next_cursor: null }> {
-  const items = new Map<string, ConversationMessage>();
-  const seen = new Set<string>();
-  let cursor: string | undefined;
-  for (let page = 0; page < 1000; page += 1) {
-    const result = await portalApi.conversationMessages(conversationID, cursor);
-    for (const message of result.items) if (!items.has(message.id)) items.set(message.id, message);
-    if (!result.next_cursor) return { items: [...items.values()], next_cursor: null };
-    if (seen.has(result.next_cursor)) throw new Error('消息分页游标重复，无法继续读取。');
-    seen.add(result.next_cursor);
-    cursor = result.next_cursor;
-  }
-  throw new Error('消息页数超过读取上限。');
+function flattenConversationPages(data: ConversationMessagesData | undefined): ConversationMessage[] {
+  const unique = new Map<string, ConversationMessage>();
+  for (const page of data?.pages ?? []) for (const message of page.items) unique.set(message.id, message);
+  return [...unique.values()].sort((left, right) => left.sequence - right.sequence ||
+    left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id));
+}
+
+function appendConversationReceipt(data: ConversationMessagesData | undefined, receipt: ConversationMessage): ConversationMessagesData | undefined {
+  if (!data?.pages.length || data.pages.some((page) => page.items.some((item) => item.id === receipt.id))) return data;
+  const [latest, ...older] = data.pages;
+  if (!latest) return data;
+  return { ...data, pages: [{ ...latest, items: [...latest.items, receipt].sort((left, right) => left.sequence - right.sequence) }, ...older] };
+}
+
+function browserIanaTimeZone(): string | undefined {
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!zone) return undefined;
+    new Intl.DateTimeFormat('en', { timeZone: zone });
+    return zone;
+  } catch { return undefined; }
 }
 
 export function assistantRecentConversationKey(serviceInstanceID: string, userID: string): string {
@@ -210,6 +254,9 @@ const taskFileFetchStatusLabel: Record<TaskFileFetch['status'], string> = {
 const taskFileFetchContentStateLabel: Record<TaskFileFetch['content_state'], string> = {
   none: '无副本', retained: '保留中', deleted: '已删除', expired: '已到期',
 };
+type ConversationFileItem =
+  | { kind: 'attachment'; key: string; attachmentID: string; messageID: string; index: number; createdAt: string }
+  | { kind: 'artifact'; key: string; taskID: string; taskTitle: string; artifact: TaskArtifact };
 // shortcut: stream four tasks per tab; the rest use 1.5s snapshot polling until task events are multiplexed.
 const maxTaskEventStreams = 4;
 function resolveTaskSnapshotStatus(task: Task | undefined, status: AssistantDisplayMessage['snapshotStatus']): AssistantDisplayMessage['snapshotStatus'] {
@@ -344,15 +391,6 @@ const taskStatusLabel: Record<Task['status'], string> = {
   cancelling: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止',
 };
 
-type TaskActivityGroup = 'waiting' | 'active' | 'paused' | 'recent' | 'unknown';
-function taskActivityGroup(status: string): TaskActivityGroup {
-  if (status === 'waiting_user') return 'waiting';
-  if (status === 'paused') return 'paused';
-  if (['queued', 'running', 'pausing', 'cancelling'].includes(status)) return 'active';
-  if (['completed', 'failed', 'cancelled'].includes(status)) return 'recent';
-  return 'unknown';
-}
-
 function taskActivityStatusText(summary: TaskSummary, task?: Task): string {
   const status = task?.status ?? summary.status;
   if (status === 'completed' && ['pending', 'processing'].includes(summary.result_review?.state ?? '')) return '回复整理中';
@@ -483,7 +521,7 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
 
 export function Assistant() {
   const client = useQueryClient();
-  const { notify } = useToast();
+  const { notify, dismiss } = useToast();
   const { user } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
@@ -493,6 +531,8 @@ export function Assistant() {
   const ideaPrompt = typeof navigationIdea?.ideaPrompt === 'string' ? navigationIdea.ideaPrompt : '';
   const hasNavigationIdea = typeof navigationIdea?.ideaID === 'string' && Boolean(navigationIdea.ideaID) && Boolean(ideaPrompt);
   const [conversationSelection, setConversationSelection] = useState<{ scope: string; id: string | null } | null>(null);
+  const [composerDraftError, setComposerDraftError] = useState<string | null>(null);
+  const [hydratedComposerDraftKey, setHydratedComposerDraftKey] = useState<string | null>(null);
   const [hostSelection, setHostSelection] = useState<string | null>(null);
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
@@ -505,19 +545,41 @@ export function Assistant() {
   const [taskSupplementDrafts, setTaskSupplementDrafts] = useState<Record<string, string>>({});
   const [supplementTaskID, setSupplementTaskID] = useState<string | null>(null);
   const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
-  const [taskPanelFilter, setTaskPanelFilter] = useState<'all' | 'conversation'>('all');
+  const [taskPanelTab, setTaskPanelTab] = useState<'tasks' | 'files' | 'computer'>('tasks');
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
+  const [computerHostID, setComputerHostID] = useState<string | null>(null);
+  const [computerEmbed, setComputerEmbed] = useState<ComputerEmbedSession | null>(null);
+  const [computerControlExpanded, setComputerControlExpanded] = useState(false);
+  const [computerConnecting, setComputerConnecting] = useState(false);
+  const [computerPanelError, setComputerPanelError] = useState('');
+  const computerFrame = useRef<HTMLIFrameElement>(null);
+  const computerEmbedRef = useRef<ComputerEmbedSession | null>(null);
+  const computerRequestGeneration = useRef(0);
+  const submittedEmbedNonce = useRef<string | null>(null);
+  const initializedEmbedNonce = useRef<string | null>(null);
+  useLayoutEffect(() => { computerEmbedRef.current = computerEmbed; }, [computerEmbed]);
+  const postComputerVisibility = useCallback((visible: boolean) => {
+    const session = computerEmbedRef.current;
+    if (!session || initializedEmbedNonce.current !== session.nonce) return;
+    computerFrame.current?.contentWindow?.postMessage({
+      channel: 'morde.workbench.embed', version: 1, type: 'visibility', nonce: session.nonce, visible,
+    }, session.hostOrigin);
+  }, []);
   const taskCardButtons = useRef(new Map<string, HTMLButtonElement>());
   const [sideConversationsOpen, setSideConversationsOpen] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [historyPageLoadVersion, setHistoryPageLoadVersion] = useState(0);
   const [openingTaskID, setOpeningTaskID] = useState('');
   const [taskObservationError, setTaskObservationError] = useState<{ taskID: string; message: string } | null>(null);
   const taskObservationRequest = useRef(false);
   const pendingMessageSave = useRef<Promise<void>>(Promise.resolve());
   const savingMessageRef = useRef(false);
   const preparingAttachmentCountRef = useRef(0);
-  const composerGeneration = useRef(0);
-  const pdfPreparationControllers = useRef(new Set<AbortController>());
+  const attachmentPreparationCounts = useRef(new Map<string, number>());
+  const attachmentPreparationGenerations = useRef(new Map<string, number>());
+  const pdfPreparationControllers = useRef(new Map<string, Set<AbortController>>());
+  const preparingAttachmentIDsByDraft = useRef(new Map<string, Set<string>>());
+  const preparingAttachmentIDs = useRef(new Set<string>());
   const sendingMessageIDs = useRef(new Set<string>());
   const receiptOrder = useRef(new MessageReceiptOrder());
   const newConversationKey = useRef<string | null>(null);
@@ -525,10 +587,15 @@ export function Assistant() {
   const ensureMainKey = useRef<{ userID: string; key: string } | null>(null);
   const ensureAttemptedUserID = useRef<string | null>(null);
   const conversationView = useRef<HTMLDivElement>(null);
+  const olderMessagesAnchor = useRef<{ height: number; top: number } | null>(null);
+  const activeComposerDraftIdentity = useRef<string | null>(null);
+  const composerDraftWrite = useRef<Promise<void>>(Promise.resolve());
+  const activeDraftLoad = useRef<string | null>(null);
+  const localConversationKeyRef = useRef<string | null>(null);
   const taskPanelToggle = useRef<HTMLButtonElement>(null);
   const followConversation = useRef(true);
   useEffect(() => () => {
-    for (const controller of pdfPreparationControllers.current) controller.abort();
+    for (const controllers of pdfPreparationControllers.current.values()) for (const controller of controllers) controller.abort();
     pdfPreparationControllers.current.clear();
   }, []);
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
@@ -557,6 +624,10 @@ export function Assistant() {
   const hosts = useQuery({
     queryKey: ['assistant-hosts'], queryFn: portalApi.hosts,
     refetchInterval: (query) => query.state.data?.items.some((host) => ['creating', 'stopping', 'deleting'].includes(host.state)) ? 3000 : 30000,
+  });
+  const sharedHosts = useQuery({
+    queryKey: ['assistant-shared-hosts'], queryFn: portalApi.sharedHosts,
+    enabled: taskPanelOpen && taskPanelTab === 'computer',
   });
   const execution = useQuery({ queryKey: ['execution-control'], queryFn: portalApi.execution, refetchInterval: 15000,
     enabled: capabilities.data?.supported_features.includes('cloud_tasks') === true });
@@ -590,10 +661,165 @@ export function Assistant() {
   const mainConversationID = mainConversation.data?.status === 'ready' ? mainConversation.data.conversation_id : null;
   const recentConversationID = recentConversation.data && conversationsData.some((item) => item.id === recentConversation.data)
     ? recentConversation.data : null;
-  const conversationID = scopedConversationSelection ? scopedConversationSelection.id : mainConversationID;
+  const selectedConversationValue = scopedConversationSelection?.id;
+  const selectedLocalDraftKey = selectedConversationValue?.startsWith('local:') ? selectedConversationValue.slice('local:'.length) : null;
+  const conversationID = selectedConversationValue === undefined ? mainConversationID
+    : selectedLocalDraftKey ? null : selectedConversationValue;
   const setConversationID = (id: string | null) => setConversationSelection({ scope: conversationScope, id });
   const selectedConversation = useRef(conversationID);
-  useLayoutEffect(() => { selectedConversation.current = conversationID; }, [conversationID]);
+  useLayoutEffect(() => {
+    selectedConversation.current = conversationID;
+    localConversationKeyRef.current = selectedLocalDraftKey;
+  }, [conversationID, selectedLocalDraftKey]);
+  const composerDraftScope = user?.id && capabilities.data?.service_instance_id
+    ? assistantComposerDraftScope(capabilities.data.service_instance_id, user.id) : null;
+  const composerDraftID = selectedLocalDraftKey ? `local:${selectedLocalDraftKey}` : conversationID;
+  const composerDraftIdentity = composerDraftScope && composerDraftID
+    ? JSON.stringify([composerDraftScope, composerDraftID]) : null;
+  const composerDrafts = useQuery({
+    queryKey: ['assistant-composer-drafts', composerDraftScope],
+    queryFn: () => assistantDraftStorage.list(composerDraftScope!),
+    enabled: Boolean(composerDraftScope), retry: false, staleTime: 30_000,
+  });
+  const localComposerDrafts = (composerDrafts.data ?? []).filter((draft) => draft.conversationID === null && draft.id.startsWith('local:'))
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  const latestComposerDraft = useRef<{ scope: string; identity: string; draft: AssistantComposerDraft } | null>(null);
+  const composerDraftSnapshots = useRef(new Map<string, { scope: string; draft: AssistantComposerDraft }>());
+  const composerDraftSnapshotsByIdentity = composerDraftSnapshots.current;
+  const composerInputSnapshot = useRef({ content, attachments: composerAttachments.length });
+  const draftSnapshot: AssistantComposerDraft | null = composerDraftScope && composerDraftID ? {
+    id: composerDraftID,
+    conversationID: selectedLocalDraftKey ? null : conversationID,
+    content, modelID, hostID: hostSelection ?? '', mcpConnectorIDs: [...mcpConnectorIDs],
+    attachments: composerAttachments.map((item) => {
+      const preview = officePreviews[item.id];
+      return {
+        id: item.id, name: item.file.name, ...(item.displayName ? { displayName: item.displayName } : {}),
+        mediaType: assistantFileMediaType(item.file), blob: item.file, objectID: item.objectID, objectKey: item.objectKey,
+        uploadKey: item.uploadKey, commitKey: item.commitKey, ...(item.attachmentID ? { attachmentID: item.attachmentID } : {}),
+        ...(item.needsPreparation ? { needsPreparation: true } : {}), ...(item.preparationCancelled ? { preparationCancelled: true } : {}),
+        ...(preview?.status === 'ready' ? { previewText: preview.text } : {}),
+      };
+    }),
+    updatedAt: Date.now(),
+  } : null;
+  useLayoutEffect(() => {
+    activeComposerDraftIdentity.current = composerDraftIdentity;
+    latestComposerDraft.current = draftSnapshot && composerDraftScope && composerDraftIdentity
+      ? { scope: composerDraftScope, identity: composerDraftIdentity, draft: draftSnapshot } : null;
+    composerInputSnapshot.current = { content, attachments: composerAttachments.length };
+    if (draftSnapshot && composerDraftScope && composerDraftIdentity) {
+      composerDraftSnapshotsByIdentity.set(composerDraftIdentity, { scope: composerDraftScope, draft: draftSnapshot });
+    }
+  });
+  useLayoutEffect(() => {
+    const count = composerDraftIdentity ? attachmentPreparationCounts.current.get(composerDraftIdentity) ?? 0 : 0;
+    preparingAttachmentCountRef.current = count;
+    setPreparingAttachmentCount(count);
+  }, [composerDraftIdentity]);
+  const persistComposerDraft = useCallback(async (scope: string, draft: AssistantComposerDraft) => {
+    const identity = JSON.stringify([scope, draft.id]);
+    client.setQueryData<AssistantComposerDraft[]>(['assistant-composer-drafts', scope], (previous) => {
+      const next = (previous ?? []).filter((item) => item.id !== draft.id);
+      return [...next, draft].sort((left, right) => right.updatedAt - left.updatedAt);
+    });
+    const write = composerDraftWrite.current.then(() => assistantDraftStorage.put(scope, draft));
+    composerDraftWrite.current = write.catch(() => undefined);
+    try {
+      await write;
+      setComposerDraftError(null);
+      return identity;
+    } catch (error) {
+      setComposerDraftError(errorDetails(error).message);
+      throw error;
+    }
+  }, [client]);
+  const persistActiveComposerDraft = useCallback(async () => {
+    const current = latestComposerDraft.current;
+    if (!current) return;
+    try { await persistComposerDraft(current.scope, current.draft); } catch { /* the memory fallback retains this page's draft */ }
+  }, [persistComposerDraft]);
+  const restoreComposerDraft = useCallback((draft: AssistantComposerDraft | null, scope: string, id: string) => {
+    setContent(draft?.content ?? '');
+    setModelID(draft?.modelID ?? '');
+    setHostSelection(draft?.hostID || null);
+    setMcpConnectorIDs(draft?.mcpConnectorIDs ?? []);
+    const attachments: ComposerAttachment[] = [];
+    const previews: Record<string, OfficePreviewState> = {};
+    for (const item of draft?.attachments ?? []) {
+      try {
+        if (!(item.blob instanceof Blob)) throw new Error('附件原文件不可用。');
+        attachments.push({ id: item.id, file: new File([item.blob], item.name, { type: item.mediaType }),
+          ...(item.displayName ? { displayName: item.displayName } : {}), objectID: item.objectID,
+          objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
+          ...(item.attachmentID ? { attachmentID: item.attachmentID } : {}), ...(item.needsPreparation ? { needsPreparation: true } : {}),
+          ...(item.preparationCancelled ? { preparationCancelled: true } : {}) });
+        if (item.previewText !== undefined) previews[item.id] = { status: 'ready', text: item.previewText };
+      } catch {
+        setComposerDraftError('部分附件原文件已不可用；草稿文字和其他附件仍已保留，请重新选择该文件。');
+      }
+    }
+    setComposerAttachments(attachments);
+    setOfficePreviews(previews);
+    const identity = JSON.stringify([scope, id]);
+    activeDraftLoad.current = identity;
+    setHydratedComposerDraftKey(identity);
+  }, []);
+  useEffect(() => {
+    if (!composerDraftScope || !composerDraftID || !composerDraftIdentity) {
+      activeDraftLoad.current = null;
+      setHydratedComposerDraftKey(null);
+      return;
+    }
+    if (activeDraftLoad.current === composerDraftIdentity && hydratedComposerDraftKey === composerDraftIdentity) return;
+    const previousIdentity = activeDraftLoad.current;
+    const preserveUnboundInput = previousIdentity === null && (composerInputSnapshot.current.content || composerInputSnapshot.current.attachments > 0);
+    activeDraftLoad.current = composerDraftIdentity;
+    let cancelled = false;
+    if (previousIdentity !== null) {
+      setContent('');
+      setModelID('');
+      setHostSelection(null);
+      setMcpConnectorIDs([]);
+      setComposerAttachments([]);
+      setOfficePreviews({});
+    }
+    setHydratedComposerDraftKey(null);
+    void assistantDraftStorage.get(composerDraftScope, composerDraftID).then((draft) => {
+      if (cancelled || activeDraftLoad.current !== composerDraftIdentity) return;
+      if (draft) restoreComposerDraft(draft, composerDraftScope, composerDraftID);
+      else {
+        if (!preserveUnboundInput) {
+          setContent('');
+          setModelID('');
+          setHostSelection(null);
+          setMcpConnectorIDs([]);
+          setComposerAttachments([]);
+          setOfficePreviews({});
+        }
+        setHydratedComposerDraftKey(composerDraftIdentity);
+      }
+      setComposerDraftError(null);
+    }).catch((error) => {
+      if (cancelled || activeDraftLoad.current !== composerDraftIdentity) return;
+      setComposerDraftError(errorDetails(error).message);
+      setHydratedComposerDraftKey(composerDraftIdentity);
+    });
+    return () => {
+      cancelled = true;
+      const previous = composerDraftSnapshotsByIdentity.get(composerDraftIdentity);
+      if (previous) void persistComposerDraft(previous.scope, previous.draft).catch(() => undefined);
+    };
+  }, [composerDraftID, composerDraftIdentity, composerDraftScope, composerDraftSnapshotsByIdentity, hydratedComposerDraftKey, persistComposerDraft, restoreComposerDraft]);
+  useEffect(() => {
+    if (!composerDraftScope || !composerDraftIdentity || hydratedComposerDraftKey !== composerDraftIdentity) return;
+    const snapshot = latestComposerDraft.current;
+    if (!snapshot || snapshot.identity !== composerDraftIdentity) return;
+    const timer = window.setTimeout(() => {
+      void persistComposerDraft(snapshot.scope, snapshot.draft).catch(() => undefined);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [composerDraftIdentity, composerDraftScope, content, modelID, hostSelection, mcpConnectorIDs, composerAttachments, officePreviews, hydratedComposerDraftKey, persistComposerDraft]);
   const conversationDetail = useQuery({
     queryKey: ['conversation', conversationID],
     queryFn: () => portalApi.conversation(conversationID!),
@@ -606,41 +832,41 @@ export function Assistant() {
   });
   const mainConversationItem = conversationsData.find((item) => item.id === mainConversationID) ?? mainConversationDetail.data;
   const sideConversations = conversationsData.filter((item) => item.id !== mainConversationID);
-  const messages = useQuery({
+  const messages = useInfiniteQuery({
     queryKey: ['conversation-messages', conversationID],
-    queryFn: () => conversationHistory(conversationID!),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => portalApi.conversationMessages(conversationID!, pageParam),
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
     enabled: Boolean(conversationID),
-    refetchInterval: (query) => query.state.data?.items.some((item) =>
-      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'waiting_adjustment') ? 2000 : false,
+    refetchInterval: (query) => query.state.data?.pages.some((page) => page.items.some((item) =>
+      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'waiting_adjustment')) ? 2000 : false,
   });
+  const conversationMessageItems = flattenConversationPages(messages.data);
   const conversationTasks = useQuery({
     queryKey: ['conversation-tasks', conversationID],
     queryFn: () => portalApi.conversationTasks(conversationID!),
     enabled: Boolean(conversationID),
     refetchInterval: 5000,
   });
-  const accountTasksEnabled = Boolean(user?.id && capabilities.data?.service_instance_id);
-  const accountTasks = useQuery({
-    queryKey: ['assistant-account-tasks', capabilities.data?.service_instance_id, user?.id],
-    queryFn: () => portalApi.tasks(),
-    enabled: accountTasksEnabled,
+  const recentConversationTasks = useQuery({
+    queryKey: ['conversation-tasks', conversationID, 'recent'],
+    queryFn: () => portalApi.conversationTasks(conversationID!, { view: 'recent' }),
+    enabled: Boolean(conversationID) && taskPanelOpen,
     refetchInterval: 30000,
   });
-  const accountTaskIDs = accountTasks.data?.items.map((item) => item.id) ?? [];
   const taskIDs = [...new Set([
-    ...accountTaskIDs,
     ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
-    ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
+    ...(recentConversationTasks.data?.items.map((item) => item.id) ?? []),
+    ...conversationMessageItems.flatMap((message) => message.task_id ? [message.task_id] : []),
   ])];
   const currentConversationTaskIDs = new Set([
     ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
-    ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
+    ...(recentConversationTasks.data?.items.map((item) => item.id) ?? []),
+    ...conversationMessageItems.flatMap((message) => message.task_id ? [message.task_id] : []),
   ]);
-  const activeAccountTaskIDs = new Set((accountTasks.data?.items ?? [])
-    .filter((item) => !terminalTaskStatuses.has(item.status)).map((item) => item.id));
   const taskQueries = useQueries({ queries: taskIDs.map((id) => ({
     queryKey: ['task', id], queryFn: () => portalApi.task(id),
-    enabled: currentConversationTaskIDs.has(id) || (taskPanelOpen && activeAccountTaskIDs.has(id)) || taskDetailTaskID === id,
+    enabled: currentConversationTaskIDs.has(id) || taskDetailTaskID === id,
     refetchInterval: (query: { state: { data: Task | undefined } }) => query.state.data?.result_message_pending ? 1000
       : query.state.data && terminalTaskStatuses.has(query.state.data.status) ? false
         : query.state.data && query.state.data.conversation_id !== conversationID ? 5000 : 1500,
@@ -657,34 +883,29 @@ export function Assistant() {
   const allTasks = taskQueries.flatMap((query) => query.data ? [query.data] : []);
   const tasks = allTasks.filter((task) => task.conversation_id === conversationID);
   const allTasksByID = new Map(allTasks.map((task) => [task.id, task]));
-  const accountTaskByID = new Map((accountTasks.data?.items ?? []).map((item) => [item.id, item]));
-  const taskPanelIDs = [...new Set([...accountTaskIDs,
+  const taskPanelIDs = [...new Set([
     ...(conversationTasks.data?.items.map((item) => item.id) ?? []),
-    ...(messages.data?.items.flatMap((message) => message.task_id ? [message.task_id] : []) ?? []),
+    ...(recentConversationTasks.data?.items.map((item) => item.id) ?? []),
+    ...conversationMessageItems.flatMap((message) => message.task_id ? [message.task_id] : []),
   ])];
   const taskPanelTasks = taskPanelIDs.flatMap((id) => {
-    const summary = accountTaskByID.get(id) ?? conversationTasks.data?.items.find((item) => item.id === id) ?? allTasksByID.get(id);
+    const summary = conversationTasks.data?.items.find((item) => item.id === id) ?? recentConversationTasks.data?.items.find((item) => item.id === id) ?? allTasksByID.get(id);
     return summary ? [summary] : [];
   }).sort((left, right) => Date.parse(allTasksByID.get(right.id)?.updated_at ?? right.updated_at) -
     Date.parse(allTasksByID.get(left.id)?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id));
-  const taskStatusForSummary = (item: TaskSummary) => allTasksByID.get(item.id)?.status ?? item.status;
-  const visibleTaskPanelTasks = taskPanelFilter === 'conversation'
-    ? taskPanelTasks.filter((item) => item.conversation_id === conversationID) : taskPanelTasks;
-  const taskProgressReadError = taskQueries.some((query, index) => query.isError &&
-    (activeAccountTaskIDs.has(taskIDs[index] ?? '') || currentConversationTaskIDs.has(taskIDs[index] ?? '')));
-  const taskPanelGroups = ([
-    { id: 'waiting', title: '待你处理', items: [] },
-    { id: 'active', title: '进行中', items: [] },
-    { id: 'paused', title: '已暂停', items: [] },
-    { id: 'recent', title: '最近结束', items: [] },
-    { id: 'unknown', title: '状态待确认', items: [] },
-  ] as const).map((group) => ({ ...group, items: visibleTaskPanelTasks.filter((item) => taskActivityGroup(taskStatusForSummary(item)) === group.id) }));
-  const pendingTaskCount = accountTasks.isSuccess && !taskProgressReadError
-    ? accountTasks.data.items.filter((item) => taskStatusForSummary(item) === 'waiting_user').length : null;
-  const activeTaskCount = accountTasks.isSuccess && !taskProgressReadError
-    ? accountTasks.data.items.filter((item) => ['queued', 'running', 'pausing', 'cancelling'].includes(taskStatusForSummary(item))).length : null;
+  const taskProgressReadError = taskQueries.some((query, index) => query.isError && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
+  const visibleTaskPanelTasks = taskPanelTasks.filter((item) => item.conversation_id === conversationID);
+  const conversationFiles: ConversationFileItem[] = [
+    ...conversationMessageItems.flatMap((item) => (item.attachment_ids ?? []).map((attachmentID, index) => ({
+      kind: 'attachment' as const, key: `attachment:${item.id}:${attachmentID}`, attachmentID,
+      messageID: item.id, index: index + 1, createdAt: item.created_at,
+    }))),
+    ...tasks.flatMap((item) => item.artifacts.map((artifact) => ({ kind: 'artifact' as const,
+      key: `artifact:${item.id}:${artifact.id}`, taskID: item.id, taskTitle: item.objective || '未命名任务', artifact }))),
+  ];
+  const pendingTaskCount = conversationTasks.isSuccess && !taskProgressReadError ? conversationTasks.data.pending_count : null;
   const resultsAwaitingMessages = tasks.some((task) => task.result_message_pending || (task.result_message_published &&
-    !messages.data?.items.some((message) => message.sources?.some((source) => source.task_id === task.id &&
+    !conversationMessageItems.some((message) => message.sources?.some((source) => source.task_id === task.id &&
       source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence))));
   useEffect(() => {
     if (!conversationID || !resultsAwaitingMessages) return;
@@ -705,11 +926,23 @@ export function Assistant() {
     { failed: Boolean(conversationID) && conversationDetail.isError, error: conversationDetail.error, retry: () => conversationDetail.refetch() },
     { failed: Boolean(conversationID) && messages.isError, error: messages.error, retry: () => messages.refetch() },
     { failed: Boolean(conversationID) && conversationTasks.isError, error: conversationTasks.error, retry: () => conversationTasks.refetch() },
-    { failed: Boolean(user?.id) && accountTasks.isError, error: accountTasks.error, retry: () => accountTasks.refetch() },
     ...taskQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
   ].filter((item) => item.failed && isTransientNetworkError(item.error));
   const showConsolidatedNetworkError = networkReadFailures.length > 1;
-  const retryNetworkReads = () => { void Promise.all(networkReadFailures.map((item) => item.retry())); };
+  const networkReadFailuresRef = useRef(networkReadFailures);
+  useEffect(() => { networkReadFailuresRef.current = networkReadFailures; }, [networkReadFailures]);
+  const retryNetworkReads = useCallback(() => { void Promise.all(networkReadFailuresRef.current.map((item) => item.retry())); }, []);
+  const networkErrorToastID = useRef<number | null>(null);
+  useEffect(() => {
+    if (!showConsolidatedNetworkError) {
+      if (networkErrorToastID.current !== null) dismiss(networkErrorToastID.current);
+      networkErrorToastID.current = null;
+      return;
+    }
+    if (networkErrorToastID.current === null) {
+      networkErrorToastID.current = notify('网络异常，部分对话数据暂时无法读取。', 'error', { label: '重试', onClick: retryNetworkReads });
+    }
+  }, [dismiss, notify, retryNetworkReads, showConsolidatedNetworkError]);
   const selected = conversationsData.find((item) => item.id === conversationID) ?? conversationDetail.data;
   const readyModels = models.data?.items.filter((item) => item.checked_at && item.capabilities.text) ?? [];
   const modelConfigurationKnown = models.isSuccess && !models.isStale;
@@ -731,6 +964,56 @@ export function Assistant() {
   const hostItems = hosts.data?.items ?? [];
   const selectedHost = hostItems.find((host) => host.id === preferredHostID);
   const hostIsReady = selectedHost?.state === 'running' && selectedHost.control_state === 'ai';
+  const computerHostOptions: ComputerHostOption[] = [
+    ...hostItems.map((host) => ({ id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: true, permissions: [] })),
+    ...(sharedHosts.data?.items ?? []).map((host) => ({
+      id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: false, permissions: host.permissions,
+    })),
+  ];
+  const computerHostSelection = computerHostID ?? hostSelection ?? preferences.data?.default_host_id ?? null;
+  const selectedComputerHost = computerHostSelection === null ? computerHostOptions[0]
+    : computerHostOptions.find((host) => host.id === computerHostSelection);
+  const selectedComputerTargets = selectedComputerHost ? hostEmbedTargetPlan(selectedComputerHost) : [];
+  const selectedComputerInitialTarget = hostEmbedInitialTarget(selectedComputerTargets);
+  const requestComputerEmbed = async () => {
+    if (!selectedComputerHost || !conversationID || !selectedComputerInitialTarget || computerConnecting) {
+      if (!conversationID) setComputerPanelError('先发送一条消息创建当前旁聊，再连接云端电脑。');
+      else if (!selectedComputerHost) setComputerPanelError('请选择一台有权限访问的云端电脑。');
+      else if (!selectedComputerInitialTarget) setComputerPanelError('当前账号没有此电脑的可用工作台权限。');
+      return;
+    }
+    const generation = ++computerRequestGeneration.current;
+    setComputerConnecting(true);
+    setComputerPanelError('');
+    setComputerEmbed(null);
+    setComputerControlExpanded(false);
+    try {
+      const issued = await portalApi.issueHostEmbedTicket(selectedComputerHost.id, {
+        conversation_id: conversationID, target: selectedComputerInitialTarget, targets: selectedComputerTargets,
+      });
+      if (generation !== computerRequestGeneration.current) return;
+      const hostURL = new URL(selectedComputerHost.url);
+      const exchangeURL = new URL(issued.exchange_url);
+      const allowedTargets = new Set(selectedComputerTargets);
+      const validTargets = issued.targets.length > 0 && issued.targets.every((target) => allowedTargets.has(target));
+      if (hostURL.username || hostURL.password || exchangeURL.origin !== hostURL.origin ||
+        exchangeURL.pathname !== '/__ch/embed-auth' || exchangeURL.search || exchangeURL.hash ||
+        exchangeURL.username || exchangeURL.password || !/^[\w-]{43}$/.test(issued.ticket) ||
+        !/^[\w-]{32}$/.test(issued.embed_nonce) || !validTargets || !issued.targets.includes(selectedComputerInitialTarget)) {
+        throw new Error('电脑连接凭据或授权范围无效，请刷新后重试。');
+      }
+      setComputerHostID(selectedComputerHost.id);
+      setComputerEmbed({
+        conversationID, hostID: selectedComputerHost.id, hostOrigin: hostURL.origin,
+        exchangeURL: exchangeURL.toString(), nonce: issued.embed_nonce, ticket: issued.ticket,
+        targets: issued.targets, status: 'submitting',
+      });
+    } catch (error) {
+      if (generation === computerRequestGeneration.current) setComputerPanelError(errorDetails(error).message || '连接云端电脑失败，请重试。');
+    } finally {
+      if (generation === computerRequestGeneration.current) setComputerConnecting(false);
+    }
+  };
   async function openTaskObservation(task: Task, host: Host) {
     if (taskObservationRequest.current) return;
     const popup = window.open('about:blank', '_blank');
@@ -756,8 +1039,18 @@ export function Assistant() {
       setOpeningTaskID('');
     }
   }
-  const displayMessages = mergeTaskAssistantMessages(messages.data?.items ?? [], tasks);
+  const displayMessages = mergeTaskAssistantMessages(conversationMessageItems, tasks);
   const latestDisplayMessageContent = displayMessages.at(-1)?.content;
+  const loadOlderMessages = async () => {
+    const view = conversationView.current;
+    if (!view || !messages.hasNextPage || messages.isFetchingNextPage) return;
+    olderMessagesAnchor.current = { height: view.scrollHeight, top: view.scrollTop };
+    followConversation.current = false;
+    setShowJumpToLatest(true);
+    const result = await messages.fetchNextPage();
+    if (result.isFetchNextPageError) olderMessagesAnchor.current = null;
+    else setHistoryPageLoadVersion((version) => version + 1);
+  };
   const submissionModelID = readyModels.some((item) => item.id === effectiveModelID) ? effectiveModelID : '';
   const taskActionKey = (scope: string, fingerprint: string) => {
     const previous = pendingTaskActions.current.get(scope);
@@ -817,7 +1110,26 @@ export function Assistant() {
         await outbox.bindConversation(scope, message.actorID, message.conversationCreateKey, targetID);
         checkScope();
         message = { ...message, conversationID: targetID };
-        if (!selectedConversation.current && activeOutboxScope.current === scope) setConversationID(targetID);
+        const localDraftID = `local:${message.conversationCreateKey}`;
+        if (localConversationKeyRef.current === message.conversationCreateKey) await persistActiveComposerDraft();
+        try {
+          const localDraft = await assistantDraftStorage.get(scope, localDraftID);
+          if (localDraft) {
+            const migratedDraft = { ...localDraft, id: targetID, conversationID: targetID, updatedAt: Date.now() };
+            await persistComposerDraft(scope, migratedDraft);
+            await assistantDraftStorage.remove(scope, localDraftID);
+            client.setQueryData<AssistantComposerDraft[]>(['assistant-composer-drafts', scope], (previous) =>
+              (previous ?? []).filter((item) => item.id !== localDraftID));
+          }
+        } catch (error) {
+          setComposerDraftError(errorDetails(error).message);
+        }
+        if (localConversationKeyRef.current === message.conversationCreateKey && activeOutboxScope.current === scope) {
+          newConversationKey.current = null;
+          activeDraftLoad.current = JSON.stringify([scope, targetID]);
+          setHydratedComposerDraftKey(activeDraftLoad.current);
+          setConversationID(targetID);
+        }
       }
 
       if (reconcile || message.status === 'accepted' || message.status === 'unknown') {
@@ -830,10 +1142,7 @@ export function Assistant() {
           message = { ...message, messageID: receipt.id, status: 'accepted' };
           finishReceipt(true);
           await outbox.change(scope, id, (current) => ({ ...current, messageID: receipt.id, status: 'accepted', error: undefined }));
-          client.setQueryData<{ items: ConversationMessage[]; next_cursor: string | null }>(
-            ['conversation-messages', targetID], (previous) => previous?.items.some((item) => item.id === receipt.id)
-              ? previous : { items: [...(previous?.items ?? []), receipt], next_cursor: previous?.next_cursor ?? null },
-          );
+          client.setQueryData<ConversationMessagesData>(['conversation-messages', targetID], (previous) => appendConversationReceipt(previous, receipt));
         }
       }
 
@@ -863,10 +1172,7 @@ export function Assistant() {
         message = { ...message, messageID: receipt.id, status: 'accepted' };
         finishReceipt(true);
         await outbox.change(scope, id, (current) => ({ ...current, messageID: receipt.id, status: 'accepted', error: undefined }));
-        client.setQueryData<{ items: ConversationMessage[]; next_cursor: string | null }>(
-          ['conversation-messages', targetID], (previous) => previous?.items.some((item) => item.id === receipt.id)
-            ? previous : { items: [...(previous?.items ?? []), receipt], next_cursor: previous?.next_cursor ?? null },
-        );
+        client.setQueryData<ConversationMessagesData>(['conversation-messages', targetID], (previous) => appendConversationReceipt(previous, receipt));
       }
       if (recentConversationKey && activeOutboxScope.current === scope) {
         writeRecentConversation(recentConversationKey, targetID);
@@ -994,45 +1300,74 @@ export function Assistant() {
   });
 
   const cancelComposerAttachmentPreparation = () => {
-    composerGeneration.current += 1;
-    for (const controller of pdfPreparationControllers.current) controller.abort();
-    pdfPreparationControllers.current.clear();
+    const identity = activeComposerDraftIdentity.current;
+    if (!identity) return;
+    attachmentPreparationGenerations.current.set(identity, (attachmentPreparationGenerations.current.get(identity) ?? 0) + 1);
+    for (const controller of pdfPreparationControllers.current.get(identity) ?? []) controller.abort();
+    pdfPreparationControllers.current.delete(identity);
+    for (const id of preparingAttachmentIDsByDraft.current.get(identity) ?? []) preparingAttachmentIDs.current.delete(id);
+    preparingAttachmentIDsByDraft.current.delete(identity);
+    attachmentPreparationCounts.current.set(identity, 0);
     preparingAttachmentCountRef.current = 0;
     setPreparingAttachmentCount(0);
+    setComposerAttachments((current) => current.map((item) => item.needsPreparation
+      ? { ...item, preparationCancelled: true } : item));
+    const current = latestComposerDraft.current;
+    if (current?.identity === identity) {
+      const draft = { ...current.draft,
+        attachments: current.draft.attachments.map((item) => item.needsPreparation ? { ...item, preparationCancelled: true } : item),
+        updatedAt: Date.now(),
+      };
+      latestComposerDraft.current = { ...current, draft };
+      composerDraftSnapshotsByIdentity.set(identity, { scope: current.scope, draft });
+      void persistComposerDraft(current.scope, draft).catch(() => undefined);
+    }
   };
 
-  const addComposerFiles = async (fileList: FileList | null) => {
-    if (!fileList) return;
-    const incoming = Array.from(fileList);
-    const available = Math.max(0, 16 - composerAttachments.length - preparingAttachmentCountRef.current);
-    const selected = incoming.slice(0, available);
-    const generation = composerGeneration.current;
+  const prepareComposerAttachmentItems = useCallback(async (items: ComposerAttachment[], scope: string | null, draftID: string | null) => {
+    const pending = items.filter((item) => item.needsPreparation && !preparingAttachmentIDs.current.has(item.id));
+    if (!pending.length) return;
+    const identity = scope && draftID ? JSON.stringify([scope, draftID]) : null;
+    const preparationKey = identity ?? `unscoped:${draftID ?? 'composer'}`;
+    const generation = attachmentPreparationGenerations.current.get(preparationKey) ?? 0;
     const controller = new AbortController();
-    pdfPreparationControllers.current.add(controller);
-    preparingAttachmentCountRef.current += selected.length;
-    setPreparingAttachmentCount(preparingAttachmentCountRef.current);
-    const accepted: ComposerAttachment[] = [];
+    const controllers = pdfPreparationControllers.current.get(preparationKey) ?? new Set<AbortController>();
+    controllers.add(controller);
+    pdfPreparationControllers.current.set(preparationKey, controllers);
+    const ids = preparingAttachmentIDsByDraft.current.get(preparationKey) ?? new Set<string>();
+    for (const item of pending) { preparingAttachmentIDs.current.add(item.id); ids.add(item.id); }
+    preparingAttachmentIDsByDraft.current.set(preparationKey, ids);
+    const currentCount = (attachmentPreparationCounts.current.get(preparationKey) ?? 0) + pending.length;
+    attachmentPreparationCounts.current.set(preparationKey, currentCount);
+    if (identity && activeComposerDraftIdentity.current === identity) {
+      preparingAttachmentCountRef.current = currentCount;
+      setPreparingAttachmentCount(currentCount);
+    }
+    const accepted = new Map<string, ComposerAttachment>();
+    const rejected = new Set<string>();
     try {
-      for (const file of selected) {
-        if (controller.signal.aborted || generation !== composerGeneration.current) break;
+      for (const item of pending) {
+        if (controller.signal.aborted || generation !== (attachmentPreparationGenerations.current.get(preparationKey) ?? 0)) break;
+        const file = item.file;
         const mediaType = assistantFileMediaType(file);
         const unsafeName = !file.name || file.name === '.' || file.name === '..' || [...file.name].length > 255 ||
           file.name.includes('/') || file.name.includes('\\') || [...file.name].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
         if (unsafeName) {
           notify('附件文件名无效。', 'error');
+          rejected.add(item.id);
           continue;
         }
         let preparedFile = file;
-        let displayName: string | undefined;
+        let displayName = item.displayName;
         if (mediaType === 'application/pdf') {
           try {
             const extractedText = await extractAssistantPDFText(file, controller.signal);
-            if (generation !== composerGeneration.current) continue;
+            if (controller.signal.aborted || generation !== (attachmentPreparationGenerations.current.get(preparationKey) ?? 0)) break;
             const safeDerivedName = `${Array.from(file.name).slice(0, 250).join('')}.txt`;
             preparedFile = new File([extractedText], safeDerivedName, { type: 'text/plain', lastModified: file.lastModified });
             displayName = `${file.name} · 已提取文字`;
           } catch (error) {
-            if (generation === composerGeneration.current && !(error instanceof Error && error.name === 'AbortError')) {
+            if (generation === (attachmentPreparationGenerations.current.get(preparationKey) ?? 0) && !(error instanceof Error && error.name === 'AbortError')) {
               notify(`${file.name}：${error instanceof Error ? error.message : '无法读取 PDF。'}`, 'error');
             }
             continue;
@@ -1041,19 +1376,87 @@ export function Assistant() {
         const fileError = assistantFileError(preparedFile, assistantFileMediaType(preparedFile));
         if (fileError) {
           notify(`${file.name}：${fileError}`, 'error');
+          rejected.add(item.id);
           continue;
         }
-        const id = newIdempotencyKey();
-        accepted.push({ id, file: preparedFile, ...(displayName ? { displayName } : {}), objectID: `chat-${id}`,
-          objectKey: newIdempotencyKey(), uploadKey: newIdempotencyKey(), commitKey: newIdempotencyKey() });
+        accepted.set(item.id, { ...item, needsPreparation: undefined, preparationCancelled: undefined, file: preparedFile, ...(displayName ? { displayName } : {}) });
       }
     } finally {
-      pdfPreparationControllers.current.delete(controller);
-      preparingAttachmentCountRef.current = Math.max(0, preparingAttachmentCountRef.current - selected.length);
-      setPreparingAttachmentCount(preparingAttachmentCountRef.current);
+      controllers.delete(controller);
+      if (!controllers.size) pdfPreparationControllers.current.delete(preparationKey);
+      const activeIDs = preparingAttachmentIDsByDraft.current.get(preparationKey);
+      for (const item of pending) { preparingAttachmentIDs.current.delete(item.id); activeIDs?.delete(item.id); }
+      if (activeIDs && !activeIDs.size) preparingAttachmentIDsByDraft.current.delete(preparationKey);
+      const nextCount = Math.max(0, (attachmentPreparationCounts.current.get(preparationKey) ?? 0) - pending.length);
+      attachmentPreparationCounts.current.set(preparationKey, nextCount);
+      if (identity && activeComposerDraftIdentity.current === identity) {
+        preparingAttachmentCountRef.current = nextCount;
+        setPreparingAttachmentCount(nextCount);
+      }
+    }
+    if (generation === (attachmentPreparationGenerations.current.get(preparationKey) ?? 0)) {
+      const targetLocalKey = draftID?.startsWith('local:') ? draftID.slice('local:'.length) : null;
+      const isCurrent = draftID ? targetLocalKey ? localConversationKeyRef.current === targetLocalKey : selectedConversation.current === draftID : false;
+      if (isCurrent && (accepted.size || rejected.size)) {
+        setComposerAttachments((current) => current.filter((item) => !rejected.has(item.id)).map((item) => accepted.get(item.id) ?? item));
+      }
+      if (scope && draftID) {
+        try {
+          const stored = await assistantDraftStorage.get(scope, draftID);
+          if (stored) {
+            const attachments = stored.attachments.flatMap((item) => {
+              if (rejected.has(item.id)) return [];
+              const ready = accepted.get(item.id);
+              if (!ready) return [item];
+              return [{ ...item, name: ready.file.name, ...(ready.displayName ? { displayName: ready.displayName } : {}),
+                mediaType: assistantFileMediaType(ready.file), blob: ready.file, needsPreparation: undefined, preparationCancelled: undefined }];
+            });
+            await persistComposerDraft(scope, { ...stored, attachments, updatedAt: Date.now() });
+          }
+        } catch (error) { setComposerDraftError(errorDetails(error).message); }
+      }
+    }
+  }, [notify, persistComposerDraft]);
+
+  const addComposerFiles = async (fileList: FileList | null) => {
+    if (!fileList) return;
+    if (!conversationID && !selectedLocalDraftKey) ensureLocalConversationKey();
+    const incoming = Array.from(fileList);
+    const available = Math.max(0, 16 - composerAttachments.length - preparingAttachmentCountRef.current);
+    const selected = incoming.slice(0, available);
+    const localKey = selectedLocalDraftKey ?? localConversationKeyRef.current ?? newConversationKey.current;
+    const draftID = conversationID ?? (localKey ? `local:${localKey}` : null);
+    const scope = composerDraftScope;
+    const staged = selected.map((file) => {
+      const id = newIdempotencyKey();
+      return { id, file, objectID: `chat-${id}`, objectKey: newIdempotencyKey(), uploadKey: newIdempotencyKey(),
+        commitKey: newIdempotencyKey(), needsPreparation: true } satisfies ComposerAttachment;
+    });
+    if (staged.length && draftID) {
+      const targetIdentity = scope ? JSON.stringify([scope, draftID]) : null;
+      const active = latestComposerDraft.current;
+      const base = targetIdentity && active?.identity === targetIdentity ? active.draft : {
+        id: draftID, conversationID: draftID.startsWith('local:') ? null : draftID, content, modelID,
+        hostID: hostSelection ?? '', mcpConnectorIDs: [...mcpConnectorIDs],
+        attachments: composerAttachments.map((item) => ({ id: item.id, name: item.file.name, mediaType: assistantFileMediaType(item.file),
+          blob: item.file, objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
+          ...(item.attachmentID ? { attachmentID: item.attachmentID } : {}), ...(item.needsPreparation ? { needsPreparation: true } : {}),
+          ...(item.preparationCancelled ? { preparationCancelled: true } : {}) })),
+        updatedAt: Date.now(),
+      } satisfies AssistantComposerDraft;
+      if (scope) {
+        try {
+          await persistComposerDraft(scope, { ...base, attachments: [...base.attachments, ...staged.map((item) => ({
+            id: item.id, name: item.file.name, mediaType: assistantFileMediaType(item.file), blob: item.file,
+            objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
+            needsPreparation: true,
+          }))], updatedAt: Date.now() });
+        } catch { /* the resilient draft store keeps the staged file in memory */ }
+      }
+      setComposerAttachments((current) => [...current, ...staged]);
+      void prepareComposerAttachmentItems(staged, scope, draftID);
     }
     if (incoming.length > available) notify('每条消息最多添加 16 个附件。', 'error');
-    if (generation === composerGeneration.current && accepted.length) setComposerAttachments((current) => [...current, ...accepted]);
   };
 
   const previewOfficeAttachment = async (item: ComposerAttachment) => {
@@ -1064,16 +1467,22 @@ export function Assistant() {
       const text = await portalApi.previewPersonalOfficeText(item.file, mediaType);
       setOfficePreviews((current) => ({ ...current, [item.id]: { status: 'ready', text } }));
     } catch (error) {
-      setOfficePreviews((current) => ({ ...current, [item.id]: { status: 'error', message: errorDetails(error).message } }));
+      setOfficePreviews((current) => {
+        const next = { ...current };
+        delete next[item.id];
+        return next;
+      });
+      notify(`${item.file.name} 预览失败：${errorDetails(error).message}`, 'error');
     }
   };
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (savingMessageRef.current || preparingAttachmentCountRef.current > 0) return;
+    if (savingMessageRef.current || preparingAttachmentCountRef.current > 0 || composerAttachments.some((item) => item.needsPreparation)) return;
     const text = content;
     if (!text.trim() && !composerAttachments.length) return;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
+    const timeZone = browserIanaTimeZone();
     if (new TextEncoder().encode(effectiveText).length > maxMessageBytes) {
       notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
       return;
@@ -1082,8 +1491,8 @@ export function Assistant() {
       return;
     }
     const id = newIdempotencyKey();
-    if (!conversationID && !newConversationKey.current) newConversationKey.current = newIdempotencyKey();
-    const createKey = conversationID ? undefined : newConversationKey.current ?? undefined;
+    if (!conversationID && !newConversationKey.current) newConversationKey.current = selectedLocalDraftKey ?? newIdempotencyKey();
+    const createKey = conversationID ? undefined : selectedLocalDraftKey ?? newConversationKey.current ?? undefined;
     const attachments: PendingMessageAttachment[] = composerAttachments.map((item) => ({
       id: item.id, name: item.file.name, mediaType: assistantFileMediaType(item.file), blob: item.file,
       objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
@@ -1096,6 +1505,7 @@ export function Assistant() {
         actorID: user?.id ?? '',
         request: {
           client_message_id: id, content: effectiveText,
+          ...(timeZone ? { time_zone: timeZone } : {}),
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
           ...(hostSelection ? { host_id: hostSelection } : {}),
           ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
@@ -1105,7 +1515,7 @@ export function Assistant() {
         ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
         attachments, status: 'pending', createdAt: Date.now(),
       };
-      const serverPredecessor = latestConversationClientMessageID(messages.data?.items);
+      const serverPredecessor = latestConversationClientMessageID(conversationMessageItems);
       const entry = await outbox.enqueue(message, serverPredecessor);
       if (activeOutboxScope.current === entry.scope) {
         setContent((current) => current === text ? '' : current);
@@ -1125,6 +1535,82 @@ export function Assistant() {
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
 
+  const ensureLocalConversationKey = () => {
+    if (conversationID) return null;
+    const key = selectedLocalDraftKey ?? newConversationKey.current ?? newIdempotencyKey();
+    newConversationKey.current = key;
+    if (!selectedLocalDraftKey) {
+      const localID = `local:${key}`;
+      setConversationID(localID);
+      localConversationKeyRef.current = key;
+      if (composerDraftScope) {
+        const identity = JSON.stringify([composerDraftScope, localID]);
+        activeDraftLoad.current = identity;
+        setHydratedComposerDraftKey(identity);
+      }
+    }
+    return key;
+  };
+
+  const startNew = async () => {
+    if (!composerDraftScope && (content || composerAttachments.length)) {
+      notify('账号或服务身份尚未确认；当前草稿仍留在此页面，请待服务恢复后再切换。', 'error');
+      return;
+    }
+    await persistActiveComposerDraft();
+    const key = newIdempotencyKey();
+    const id = `local:${key}`;
+    newConversationKey.current = key;
+    localConversationKeyRef.current = key;
+    setConversationID(id);
+    setModelID('');
+    setHostSelection(null);
+    setMcpConnectorIDs([]);
+    setContent('');
+    setComposerAttachments([]);
+    setOfficePreviews({});
+    if (composerDraftScope) restoreComposerDraft(null, composerDraftScope, id);
+    if (recentConversationKey) {
+      writeRecentConversation(recentConversationKey, null);
+      client.setQueryData(['assistant-recent-conversation', recentConversationKey], null);
+    }
+  };
+
+  const selectConversationID = async (id: string) => {
+    if (!composerDraftScope && (content || composerAttachments.length)) {
+      notify('账号或服务身份尚未确认；当前草稿仍留在此页面，请待服务恢复后再切换。', 'error');
+      return;
+    }
+    await persistActiveComposerDraft();
+    const isLocalDraft = id.startsWith('local:');
+    if (composerDraftScope) {
+      let draft: AssistantComposerDraft | null;
+      try { draft = await assistantDraftStorage.get(composerDraftScope, id); }
+      catch (error) {
+        setComposerDraftError(errorDetails(error).message);
+        notify('无法恢复目标会话草稿；当前输入仍已保留。', 'error');
+        return;
+      }
+      restoreComposerDraft(draft, composerDraftScope, id);
+    } else {
+      setContent('');
+      setModelID('');
+      setHostSelection(null);
+      setMcpConnectorIDs([]);
+      setComposerAttachments([]);
+      setOfficePreviews({});
+    }
+    newConversationKey.current = isLocalDraft ? id.slice('local:'.length) : null;
+    localConversationKeyRef.current = isLocalDraft ? id.slice('local:'.length) : null;
+    setConversationID(id);
+    if (recentConversationKey && !isLocalDraft) {
+      writeRecentConversation(recentConversationKey, id);
+      client.setQueryData(['assistant-recent-conversation', recentConversationKey], id);
+    }
+  };
+
+  const selectLocalDraft = (draft: AssistantComposerDraft) => { void selectConversationID(draft.id); };
+
   const submitTaskSupplement = (event: FormEvent<HTMLFormElement>, task: Task) => {
     event.preventDefault();
     const text = (taskSupplementDrafts[task.id] ?? '').trim();
@@ -1138,7 +1624,7 @@ export function Assistant() {
     setSavingMessage(true);
     const previous = pendingMessageSave.current.then(async () => {
       const targetMessages = task.conversation_id === conversationID && messages.data
-        ? messages.data.items : (await conversationHistory(task.conversation_id)).items;
+        ? conversationMessageItems : (await portalApi.conversationMessages(task.conversation_id)).items;
       const pending: PendingConversationMessage = {
         actorID: user?.id ?? '',
         request: { client_message_id: id, content: text, reference_task_id: task.id },
@@ -1170,43 +1656,27 @@ export function Assistant() {
       key: taskActionKey(actionScope, fingerprint) });
   };
 
-  const startNew = () => {
-    cancelComposerAttachmentPreparation();
-    newConversationKey.current = null;
-    setConversationID(null);
-    setMcpConnectorIDs([]);
-    setContent('');
-    setComposerAttachments([]);
-    setOfficePreviews({});
-    if (recentConversationKey) {
-      writeRecentConversation(recentConversationKey, null);
-      client.setQueryData(['assistant-recent-conversation', recentConversationKey], null);
-    }
-  };
-
-  const selectConversationID = (id: string) => {
-    cancelComposerAttachmentPreparation();
-    setConversationID(id);
-    setContent('');
-    setComposerAttachments([]);
-    setOfficePreviews({});
-    if (recentConversationKey) {
-      writeRecentConversation(recentConversationKey, id);
-      client.setQueryData(['assistant-recent-conversation', recentConversationKey], id);
-    }
-  };
   const selectConversation = (item: Conversation) => selectConversationID(item.id);
   const showMoreSideConversations = async () => {
-    const targetCount = Math.min(sideConversations.length, visibleSideConversationCount) + 5;
+    const targetCount = Math.min(Math.max(sideConversations.length, localComposerDrafts.length), visibleSideConversationCount) + 5;
     let result = conversations;
     let loadedSideCount = sideConversations.length;
-    while (loadedSideCount < targetCount && result.hasNextPage) {
+    while (loadedSideCount < Math.min(targetCount, sideConversations.length + 5) && result.hasNextPage) {
       result = await conversations.fetchNextPage();
       loadedSideCount = new Set((result.data?.pages.flatMap((page) => page.items) ?? [])
         .filter((item) => item.id !== mainConversationID).map((item) => item.id)).size;
       if (result.isFetchNextPageError) break;
     }
     setVisibleSideConversationCount(targetCount);
+  };
+  const renderLocalDraftItem = (draft: AssistantComposerDraft) => {
+    const title = draft.content.trim().split('\n')[0]?.slice(0, 42) || '新旁聊草稿';
+    return <div className="conversation-row" key={draft.id}>
+      <button type="button" className={`conversation-item ${selectedLocalDraftKey && draft.id === `local:${selectedLocalDraftKey}` ? 'is-selected' : ''}`}
+        aria-label={`恢复草稿：${title}`} onClick={() => selectLocalDraft(draft)}>
+        <strong>{title}</strong><small>未发送草稿 · {new Date(draft.updatedAt).toLocaleString()}</small>
+      </button>
+    </div>;
   };
   const renderConversationItem = (item: Conversation, isMain = false) => <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`} key={item.id}>
     <button type="button" className={`conversation-item ${conversationID === item.id ? 'is-selected' : ''}`}
@@ -1229,25 +1699,122 @@ export function Assistant() {
   };
 
   const finishedTaskIDs = tasks.filter((task) => terminalTaskStatuses.has(task.status)).map((task) => task.id).join(',');
-  useEffect(() => { followConversation.current = true; }, [conversationID]);
+  useEffect(() => {
+    olderMessagesAnchor.current = null;
+    followConversation.current = true;
+    setTaskDetailTaskID(null);
+    setTaskPanelTab('tasks');
+    postComputerVisibility(false);
+    computerRequestGeneration.current += 1;
+    setComputerConnecting(false);
+    setComputerEmbed(null);
+    setComputerControlExpanded(false);
+    setComputerHostID(null);
+    setComputerPanelError('');
+  }, [conversationID, postComputerVisibility]);
+  useEffect(() => {
+    const session = computerEmbed;
+    if (!session || session.status !== 'submitting' || !session.ticket) return;
+    const ticket = session.ticket;
+    const frame = computerFrame.current;
+    if (!frame || submittedEmbedNonce.current === session.nonce) return;
+    submittedEmbedNonce.current = session.nonce;
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.enctype = 'application/x-www-form-urlencoded';
+    form.action = session.exchangeURL;
+    form.target = frame.name;
+    form.hidden = true;
+    const fields: [string, string][] = [['ticket', ticket], ['embed_nonce', session.nonce]];
+    for (const [name, value] of fields) {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = name;
+      input.value = value;
+      form.append(input);
+    }
+    document.body.append(form);
+    try {
+      form.submit();
+      setComputerEmbed((current) => current?.nonce === session.nonce
+        ? { ...current, ticket: undefined, status: 'loading' } : current);
+    } catch {
+      submittedEmbedNonce.current = null;
+      setComputerEmbed((current) => current?.nonce === session.nonce
+        ? { ...current, ticket: undefined, status: 'error', error: '无法提交电脑连接请求。' } : current);
+    } finally {
+      form.remove();
+    }
+  }, [computerEmbed]);
+  useEffect(() => {
+    const session = computerEmbed;
+    if (!session) return;
+    const send = (type: 'init' | 'visibility', visible: boolean) => {
+      computerFrame.current?.contentWindow?.postMessage({
+        channel: 'morde.workbench.embed', version: 1, type, nonce: session.nonce,
+        ...(type === 'init' ? { conversation_id: session.conversationID } : {}), visible,
+      }, session.hostOrigin);
+    };
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.origin !== session.hostOrigin || event.source !== computerFrame.current?.contentWindow ||
+        !event.data || typeof event.data !== 'object') return;
+      const message = event.data as Record<string, unknown>;
+      if (message.channel !== 'morde.workbench.embed' || message.version !== 1 || message.nonce !== session.nonce) return;
+      if (message.type === 'ready') {
+        initializedEmbedNonce.current = session.nonce;
+        send('init', taskPanelOpen && taskPanelTab === 'computer');
+      } else if (message.type === 'state' && message.conversation_id === session.conversationID &&
+        message.host_id === session.hostID && message.workbench_ready === true) {
+        if (message.control_state === 'user' && message.control_lease_active === true && message.control_lease_held_by_me === true) {
+          setComputerControlExpanded(true);
+        } else if (message.control_state === 'ai' && message.control_lease_active === false && message.control_lease_held_by_me === false) {
+          setComputerControlExpanded(false);
+        }
+        setComputerEmbed((current) => current?.nonce === session.nonce ? { ...current, status: 'ready' } : current);
+      }
+    };
+    window.addEventListener('message', onMessage);
+    if (initializedEmbedNonce.current === session.nonce) send('visibility', taskPanelOpen && taskPanelTab === 'computer');
+    return () => window.removeEventListener('message', onMessage);
+  }, [computerEmbed, taskPanelOpen, taskPanelTab]);
+  useEffect(() => {
+    if (!computerEmbed || computerEmbed.status !== 'loading') return;
+    const nonce = computerEmbed.nonce;
+    const timer = window.setTimeout(() => setComputerEmbed((current) => current?.nonce === nonce && current.status === 'loading'
+      ? { ...current, status: 'error', error: '工作台没有在预期时间内就绪，请重试或在独立窗口打开。' } : current), 30_000);
+    return () => window.clearTimeout(timer);
+  }, [computerEmbed]);
   useEffect(() => {
     if (!taskPanelOpen) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      postComputerVisibility(false);
+      computerRequestGeneration.current += 1;
+      setComputerConnecting(false);
+      setComputerEmbed(null);
+      setComputerControlExpanded(false);
       setTaskPanelOpen(false);
       setTaskDetailTaskID(null);
-      taskPanelToggle.current?.focus();
+      window.requestAnimationFrame(() => taskPanelToggle.current?.focus());
     };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [taskPanelOpen]);
-  useEffect(() => {
+  }, [postComputerVisibility, taskPanelOpen]);
+  useLayoutEffect(() => {
     const view = conversationView.current;
+    const anchor = olderMessagesAnchor.current;
+    if (view && anchor) {
+      view.scrollTop = anchor.top + view.scrollHeight - anchor.height;
+      olderMessagesAnchor.current = null;
+      followConversation.current = false;
+      setShowJumpToLatest(true);
+      return;
+    }
     if (view && followConversation.current) {
       view.scrollTop = view.scrollHeight;
       setShowJumpToLatest(false);
     }
-  }, [conversationID, displayMessages.length, latestDisplayMessageContent, outbox.entries.length]);
+  }, [conversationID, displayMessages.length, latestDisplayMessageContent, outbox.entries.length, historyPageLoadVersion]);
 
   useEffect(() => {
     if (conversationID && finishedTaskIDs) {
@@ -1261,7 +1828,16 @@ export function Assistant() {
     navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
   }, [hasNavigationIdea, location.hash, location.pathname, location.search, navigate]);
 
-  const pendingMessages = outbox.entries.filter(({ message }) => !message.projectID && message.conversationID === conversationID);
+  const pendingMessages = outbox.entries.filter(({ message }) => !message.projectID && (conversationID
+    ? message.conversationID === conversationID
+    : message.conversationID === null && Boolean(selectedLocalDraftKey) && message.conversationCreateKey === selectedLocalDraftKey));
+  const composerDraftReady = !composerDraftIdentity || hydratedComposerDraftKey === composerDraftIdentity;
+  const visibleComposerContent = composerDraftReady ? content : '';
+  const incompleteAttachmentPreparationKey = composerAttachments.filter((item) => item.needsPreparation && !item.preparationCancelled).map((item) => item.id).join(',');
+  useEffect(() => {
+    if (!composerDraftReady || !composerDraftID || !incompleteAttachmentPreparationKey) return;
+    void prepareComposerAttachmentItems(composerAttachments.filter((item) => item.needsPreparation && !item.preparationCancelled), composerDraftScope, composerDraftID);
+  }, [composerAttachments, composerDraftID, composerDraftIdentity, composerDraftReady, composerDraftScope, incompleteAttachmentPreparationKey, prepareComposerAttachmentItems]);
   const renderPendingMessage = (entry: MessageOutboxEntry) => {
     const { message, scope } = entry;
     const alreadyVisible = displayMessages.some((item) => item.client_message_id === message.request.client_message_id);
@@ -1281,11 +1857,10 @@ export function Assistant() {
     const taskQuery = taskQueries[taskIDs.indexOf(summary.id)];
     const taskFileFetchQuery = taskFileFetchQueries[taskIDs.indexOf(summary.id)];
     if (!task) return taskQuery?.isError
-      ? <div className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
-        <button type="button" className="button button-small button-secondary" onClick={() => void taskQuery.refetch()}>重试</button></div>
+      ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
+        <button type="button" className="button button-small button-secondary" onClick={() => void taskQuery.refetch()}>重试</button></FloatingError>
       : <p className="muted" role="status">正在读取任务详情…</p>;
     const busy = !terminalTaskStatuses.has(task.status);
-    const taskConversation = conversationsData.find((item) => item.id === task.conversation_id);
     const k2Read = readK2TaskProjection(task);
     const k2 = k2Read.kind === 'available' ? k2Read.projection : null;
     const review = k2?.result_review ?? null;
@@ -1309,7 +1884,7 @@ export function Assistant() {
     return <section className="task-activity" data-task-id={task.id} aria-label={`任务详情：${task.objective || '未命名任务'}`}>
       <header className="task-activity-heading">
         <div><strong>{task.objective || '未命名任务'}</strong>
-          <small>{taskConversation?.title || '所属会话'} · 更新于 {formatDate(task.updated_at)}</small></div>
+          <small>更新于 {formatDate(task.updated_at)}</small></div>
         <span className={`task-activity-status status-${task.status}`}>{taskActivityStatusText(summary, task)}</span>
       </header>
       {task.pending_request && <section className="notice notice-warning task-detail-attention" aria-label="需要批准的操作">
@@ -1345,10 +1920,10 @@ export function Assistant() {
         <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
       </div>}
       {taskFileFetchQuery?.isPending && !taskFileFetchQuery.data && <p className="muted" role="status">正在核对本机文件读取记录…</p>}
-      {taskFileFetchQuery?.isError && <p className="error-inline task-file-fetch-error" role="alert">
+      {taskFileFetchQuery?.isError && <FloatingError className="error-inline task-file-fetch-error" role="alert">
         {fileFetches.length ? '读取记录暂不可用，以下为最近一次已确认状态。' : '部分任务记录暂不可用，无法确认任务是否读取了本机文件。'}
         <button type="button" className="button button-small button-secondary" onClick={() => void taskFileFetchQuery.refetch()}>重试</button>
-      </p>}
+      </FloatingError>}
       {fileFetches.length > 0 && <section className="task-activity-k2 task-activity-file-fetches" aria-label="读取本机文件">
         <h3>读取本机文件</h3>
         <p>文件副本临时保存在云端供本任务使用；删除副本不会更改本机原文件，也不会撤回任务已读取的内容。</p>
@@ -1376,11 +1951,6 @@ export function Assistant() {
         })}</ul>
       </section>}
       {busy && <div className="inline-actions task-activity-actions">
-        <button type="button" className="button button-small button-secondary" onClick={() => {
-          selectConversationID(task.conversation_id);
-          setTaskDetailTaskID(null);
-          setTaskPanelOpen(false);
-        }}>打开所属会话</button>
         {task.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
           onClick={() => submitTaskControl('resume', task)}>继续任务</button>}
         {['queued', 'running', 'waiting_user'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
@@ -1392,11 +1962,6 @@ export function Assistant() {
           {supplementTaskID === task.id ? '收起补充任务' : '补充任务'}
         </button>
       </div>}
-      {!busy && <div className="inline-actions task-activity-actions"><button type="button" className="button button-small button-secondary" onClick={() => {
-        selectConversationID(task.conversation_id);
-        setTaskDetailTaskID(null);
-        setTaskPanelOpen(false);
-      }}>打开所属会话</button></div>}
       {busy && supplementTaskID === task.id && task.waiting_reason !== 'project_recovery_unavailable' && <form className="task-supplement-form"
         aria-label="补充任务" onSubmit={(event) => submitTaskSupplement(event, task)}>
         <label htmlFor={`task-supplement-${task.id}`}>补充任务内容</label>
@@ -1417,9 +1982,9 @@ export function Assistant() {
           {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
         </span></li>)}
       </ol></details>}
-      {k2Read.kind === 'invalid' && <div className="notice notice-warning" role="alert">
+      {k2Read.kind === 'invalid' && <FloatingError>
         任务协作记录暂不可用；当前仅展示已确认的任务状态和结果。
-      </div>}
+      </FloatingError>}
       {k2?.child_jobs.length ? <section className="task-activity-k2" aria-label="子任务进度">
         <h3>子任务进度</h3><ul>{k2.child_jobs.map((job) => <li key={job.job_id}>
           <span><strong>{job.title || '子任务'}</strong><small>{stepStatus[job.status]}</small></span>
@@ -1447,7 +2012,7 @@ export function Assistant() {
             onClick={() => void openTaskObservation(task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…'
               : task.artifacts.some((artifact) => artifact.verified) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
           : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
-        {taskObservationError?.taskID === task.id && <p className="error-text" role="alert">{taskObservationError.message}</p>}
+        {taskObservationError?.taskID === task.id && <FloatingError>{taskObservationError.message}</FloatingError>}
       </div>}
       <details className="task-detail-diagnostics"><summary>更多信息</summary>
         <p>任务 ID：{task.id}{task.current_revision !== undefined || task.desired_revision !== undefined
@@ -1472,7 +2037,6 @@ export function Assistant() {
 
   const renderTaskSummary = (summary: TaskSummary) => {
     const task = allTasksByID.get(summary.id);
-    const taskConversation = conversationsData.find((item) => item.id === summary.conversation_id);
     const title = task?.objective || summary.objective || '未命名任务';
     const status = task?.status ?? summary.status;
     const updatedAt = task?.updated_at ?? summary.updated_at;
@@ -1484,31 +2048,28 @@ export function Assistant() {
         onClick={() => setTaskDetailTaskID(summary.id)}>
         <span className="task-activity-card-title"><strong>{title}</strong>
           <span className={`task-activity-status status-${status}`}>{taskActivityStatusText(summary, task)}</span></span>
-        <span className="task-activity-card-subtitle">{taskConversation?.title || '所属会话'} · {taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
+        <span className="task-activity-card-subtitle">{taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
         <span className="task-activity-card-footer"><small>更新于 {formatDate(updatedAt)}</small>
           <span>{waiting ? '查看并处理' : '查看详情'} <span aria-hidden="true">›</span></span></span>
       </button>
     </article>;
   };
-  const selectedTaskSummary = taskDetailTaskID
-    ? taskPanelTasks.find((item) => item.id === taskDetailTaskID) ?? allTasksByID.get(taskDetailTaskID) ?? null
-    : null;
+  const selectedTaskSummary = taskDetailTaskID ? taskPanelTasks.find((item) => item.id === taskDetailTaskID) ?? null : null;
 
   return <section className="assistant-page">
-    {showConsolidatedNetworkError && <div className="error-card assistant-network-error" role="alert">网络异常，部分对话数据暂时无法读取。<button type="button" className="button button-secondary" onClick={retryNetworkReads}>重试</button></div>}
     {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-warning" role="status">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</p>}
     {mainConversation.isPending && <p className="notice notice-info" role="status">正在读取服务端主会话…</p>}
     {mainConversation.isError && !showConsolidatedNetworkError && <div className="notice notice-warning" role="status">当前服务尚未提供主会话接口。你仍可查看和使用会话列表，但本机最近记录不会被当作主会话。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></div>}
     {mainConversation.data?.status === 'uninitialized' && <p className="notice notice-info" role="status">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</p>}
     {capabilities.isPending && <p className="notice notice-info" role="status">正在检查服务能力…</p>}
-    {capabilities.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></div>}
+    {capabilities.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></FloatingError>}
     {capabilities.isSuccess && conversationAutoRoutingAvailable === false && <div className="notice notice-warning" role="status">
       服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。
     </div>}
     {capabilities.isSuccess && cloudTasksAvailable === false && <div className="notice notice-warning" role="status">
       云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
     </div>}
-    <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}`}>
+    <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' ? ' assistant-layout-with-computer-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' && computerControlExpanded ? ' assistant-layout-computer-expanded' : ''}`}>
       <aside id="context-sidebar" className="assistant-sidebar" aria-label="对话">
         <div className="assistant-sidebar-heading">
           <button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); }}><MordeIcon name="refresh" /></button>
@@ -1516,45 +2077,49 @@ export function Assistant() {
         <div id="conversation-history" className="assistant-history-content">
           {conversations.isPending ? <p className="muted" role="status">正在加载对话…</p> : conversations.isError && !conversations.data
             ? showConsolidatedNetworkError ? <p className="muted">对话列表暂不可用</p>
-              : <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.refetch()}>重试</button></div>
+              : <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.refetch()}>重试</button></FloatingError>
             : <>
               {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
-                : mainConversationDetail.isError ? <div className="error-inline" role="alert">无法读取主会话：{errorDetails(mainConversationDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void mainConversationDetail.refetch()}>重试</button></div>
+                : mainConversationDetail.isError ? <FloatingError className="error-inline" role="alert">无法读取主会话：{errorDetails(mainConversationDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void mainConversationDetail.refetch()}>重试</button></FloatingError>
                   : <p className="muted" role="status">正在读取主会话…</p>)}
               <div className="conversation-group">
                 <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
-                  <summary>旁路会话</summary>
-                  <div className="conversation-list">{sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}</div>
-                  {conversations.isFetchNextPageError && <div className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></div>}
-                  {(sideConversations.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
+                  <summary>旁聊</summary>
+                  <div className="conversation-list">
+                    {localComposerDrafts.slice(0, visibleSideConversationCount).map(renderLocalDraftItem)}
+                    {sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}
+                  </div>
+                  {composerDrafts.isError && <FloatingError className="error-inline" role="alert">未发送草稿暂不可用：{errorDetails(composerDrafts.error).message}
+                    <button type="button" className="button button-small button-secondary" onClick={() => void composerDrafts.refetch()}>重试</button></FloatingError>}
+                  {composerDraftError && <FloatingError className="error-inline" role="alert">草稿保存状态：{composerDraftError}</FloatingError>}
+                  {conversations.isFetchNextPageError && <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></FloatingError>}
+                  {(sideConversations.length > visibleSideConversationCount || localComposerDrafts.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
                     disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
                     {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
                   </button>}
-                  {!sideConversations.length && !conversations.hasNextPage && <p className="muted assistant-sidebar-empty">还没有旁路会话。</p>}
+                  {!sideConversations.length && !localComposerDrafts.length && !conversations.hasNextPage && !composerDrafts.isPending && <p className="muted assistant-sidebar-empty">还没有旁聊。</p>}
+                  {composerDrafts.isPending && !localComposerDrafts.length && <p className="muted assistant-sidebar-empty" role="status">正在读取未发送草稿…</p>}
                 </details>
-                <button type="button" className="button button-secondary conversation-new" aria-label="新建旁路会话" title="新建旁路会话" onClick={startNew}>+</button>
+                <button type="button" className="button button-secondary conversation-new" aria-label="新建旁聊" title="新建旁聊" onClick={startNew}>+</button>
               </div>
             </>}
-          <p className="assistant-sidebar-hint">主会话保留日常交流，旁路会话可用于单独讨论。</p>
+          <p className="assistant-sidebar-hint">主会话保留日常交流，旁聊可用于单独讨论。</p>
         </div>
       </aside>
       <div className="assistant-main">
         <header className="conversation-view-heading">
           <div className="assistant-chat-title"><span className="assistant-logo assistant-logo-header" aria-hidden="true" /><div>
-            <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selected?.title || (conversationID ? '对话' : '新旁路会话')}</h2>
-            <p>{conversationID && conversationID === mainConversationID ? '你的 moder' : '旁路会话 · 你的 moder'}</p>
+            <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selected?.title || (conversationID ? '对话' : '新旁聊')}</h2>
+            <p>{conversationID && conversationID === mainConversationID ? '你的 moder' : '旁聊 · 你的 moder'}</p>
           </div></div>
-          <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
-            aria-label="任务动态" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
-            aria-expanded={taskPanelOpen} aria-controls="assistant-task-panel"
-            title={pendingTaskCount === null ? '任务动态，待处理数量暂不可用' : `任务动态，${pendingTaskCount} 项等待用户`}
-            onClick={() => setTaskPanelOpen((open) => {
-              if (open) setTaskDetailTaskID(null);
-              return !open;
-            })}>
-            <MordeIcon name="panel" />任务动态{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
+          {!taskPanelOpen && <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
+            aria-label="打开侧边栏" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
+            aria-expanded="false" aria-controls="assistant-task-panel"
+            title={pendingTaskCount === null ? '打开侧边栏' : `打开侧边栏，${pendingTaskCount} 项待处理`}
+            onClick={() => setTaskPanelOpen(true)}>
+            <MordeIcon name="panel" />{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
             {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
-          </button>
+          </button>}
         </header>
         {activePanelTasks.slice(0, maxTaskEventStreams).map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
         <div className={`conversation-view${conversationID ? '' : ' conversation-view-welcome'}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
@@ -1568,9 +2133,14 @@ export function Assistant() {
           </div>{pendingMessages.map(renderPendingMessage)}</> : <>
           {messages.isPending && displayMessages.length === 0 ? <div className="loading-card" role="status">正在加载消息…</div>
             : messages.isError && displayMessages.length === 0 ? showConsolidatedNetworkError ? <div className="loading-card">消息暂不可用</div>
-              : <div className="error-card" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试</button></div>
+              : <FloatingError className="error-card" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>
               : <div className="message-list">
-                {messages.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void messages.refetch()}>重试</button></div>}
+                {messages.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>}
+                {messages.hasNextPage && <div className="conversation-history-load">
+                  {messages.isFetchNextPageError && <FloatingError className="error-inline" role="alert">更早的消息暂不可用：{errorDetails(messages.error).message}</FloatingError>}
+                  <button type="button" className="button button-small button-secondary" disabled={messages.isFetchingNextPage}
+                    onClick={() => void loadOlderMessages()}>{messages.isFetchingNextPage ? '正在加载更早消息…' : messages.isFetchNextPageError ? '重试加载更早消息' : '加载更早消息'}</button>
+                </div>}
                 {displayMessages.map((message, index) => {
                   const messageTask = message.task_id ? tasksByID.get(message.task_id) : undefined;
                   const routingStatus = message.role === 'user' ? routingStatusText(message.routing_status) : null;
@@ -1614,13 +2184,13 @@ export function Assistant() {
               </div>}
           {pendingMessages.map(renderPendingMessage)}
           </>}
-          {models.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取模型：{errorDetails(models.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void models.refetch()}>重试</button></div>}
+          {models.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取模型：{errorDetails(models.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void models.refetch()}>重试</button></FloatingError>}
           {modelConfigurationKnown && models.data?.configuration_status === 'not_configured' && <div className="notice notice-warning assistant-setup-notice" role="status">还没有配置云端模型。<Link to="/connections">配置模型</Link></div>}
           {modelConfigurationKnown && models.data?.configuration_status === 'configured' && !readyModels.length && <div className="notice notice-warning assistant-setup-notice" role="status">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></div>}
-          {outbox.storageError && <div className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</div>}
-          {execution.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></div>}
+          {outbox.storageError && <FloatingError className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</FloatingError>}
+          {execution.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></FloatingError>}
           {execution.data?.state === 'stopping' && <p className="notice notice-warning" role="status">AI 服务正在停止；消息仍可先发送。</p>}
-          {hosts.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取目标电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>}
+          {hosts.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取目标电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
           {preferredHostID && !selectedHost && !hosts.isPending && !hosts.isError && <p className="notice notice-warning" role="status">所选电脑状态待核对；实际使用该目标时会检查权限和状态。</p>}
           {selectedHost && !hostIsReady && <p className="notice notice-warning" role="status">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</p>}
           {showJumpToLatest && conversationID && <div className="assistant-jump-latest"><button type="button" className="button button-secondary"
@@ -1629,16 +2199,24 @@ export function Assistant() {
         </div>
         <section className="assistant-composer" aria-label="发送对话消息">
           <form onSubmit={submit}>
+            {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
+            {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
-            <textarea id="assistant-content" value={content} onChange={(event) => setContent(event.target.value)}
-              placeholder="告诉我你想完成什么…" />
-            {composerAttachments.length > 0 && <div className="assistant-attachment-list" aria-label="待发送附件">
+            <textarea id="assistant-content" value={visibleComposerContent} onChange={(event) => {
+              if (!conversationID) ensureLocalConversationKey();
+              setContent(event.target.value);
+            }} disabled={!composerDraftReady} placeholder="告诉我你想完成什么…" />
+            {composerDraftReady && composerAttachments.length > 0 && <div className="assistant-attachment-list" aria-label="待发送附件">
               {composerAttachments.map((item) => {
                 const mediaType = assistantFileMediaType(item.file);
                 const preview = officePreviews[item.id];
                 return <Fragment key={item.id}>
                   <span className="assistant-attachment-chip">
-                    <span title={item.displayName ?? item.file.name}>{item.displayName ?? item.file.name}{item.attachmentID ? ' · 已准备' : ''}</span>
+                    <span title={item.displayName ?? item.file.name}>{item.displayName ?? item.file.name}{item.attachmentID ? ' · 已准备' : item.needsPreparation ? item.preparationCancelled ? ' · 已暂停读取' : ' · 待读取' : ''}</span>
+                    {item.needsPreparation && <button type="button" className="button button-small button-secondary"
+                      disabled={preparingAttachmentIDs.current.has(item.id)} onClick={() => void prepareComposerAttachmentItems([item], composerDraftScope, composerDraftID)}>
+                      {preparingAttachmentIDs.current.has(item.id) ? '读取中…' : '继续读取'}
+                    </button>}
                     {assistantOfficeAttachmentTypes.has(mediaType) && <button type="button" aria-label={`预览附件 ${item.file.name}`}
                       disabled={preview?.status === 'loading'} style={{ width: 'auto', padding: '0 5px', whiteSpace: 'nowrap' }}
                       onClick={() => void previewOfficeAttachment(item)}>{preview?.status === 'loading' ? '预览中…' : '预览文本'}</button>}
@@ -1652,7 +2230,6 @@ export function Assistant() {
                     }}>×</button>
                   </span>
                   {preview?.status === 'loading' && <span role="status" style={{ flexBasis: '100%' }}>正在提取 {item.file.name} 的文字…</span>}
-                  {preview?.status === 'error' && <span role="alert" style={{ flexBasis: '100%' }}>{item.file.name} 预览失败：{preview.message}</span>}
                   {preview?.status === 'ready' && <pre role="region" aria-label={`文本预览 ${item.file.name}`}
                     style={{ flexBasis: '100%', maxHeight: '12rem', overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0', padding: '8px', border: '1px solid #dce5f4', borderRadius: '6px' }}>
                     {preview.text}</pre>}
@@ -1664,19 +2241,21 @@ export function Assistant() {
                 <label className="assistant-attach-control" title="添加附件">
                   <MordeIcon name="paperclip" /><span className="sr-only">附件</span>
                   <input type="file" aria-label="添加附件" accept=".txt,.jpg,.jpeg,.png,.docx,.xlsx,.pptx,.pdf,text/plain,image/jpeg,image/png,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                    multiple onChange={(event) => { void addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
+                    multiple onChange={(event) => { if (!conversationID) ensureLocalConversationKey(); void addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
                 </label>
-                <AssistantVoiceInput compact onTranscript={(transcript) => setContent((current) => current.trim()
-                  ? `${current.trimEnd()} ${transcript}` : transcript)} />
+                <AssistantVoiceInput compact onTranscript={(transcript) => {
+                  if (!conversationID) ensureLocalConversationKey();
+                  setContent((current) => current.trim() ? `${current.trimEnd()} ${transcript}` : transcript);
+                }} />
               </div>
               <div className="assistant-selectors">
                 <label className="assistant-selector"><MordeIcon name="spark" /><span className="sr-only">AI 模型</span><select aria-label="选择 AI 模型"
-                  value={effectiveModelID} onChange={(event) => setModelID(event.target.value)} disabled={models.isPending}>
+                  value={composerDraftReady ? effectiveModelID : ''} onChange={(event) => setModelID(event.target.value)} disabled={!composerDraftReady || models.isPending}>
                   <option value="">自动选择模型</option>{effectiveModelID && !readyModels.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
                 </select></label>
                 <div className="assistant-target-row">
-                  <label className="assistant-selector"><MordeIcon name="monitor" /><span className="sr-only">目标电脑</span><select aria-label="选择目标电脑" value={selectedHost?.id ?? hostSelection ?? ''}
-                    disabled={hosts.isPending} onChange={(event) => setHostSelection(event.target.value)}>
+                  <label className="assistant-selector"><MordeIcon name="monitor" /><span className="sr-only">目标电脑</span><select aria-label="选择目标电脑" value={composerDraftReady ? selectedHost?.id ?? hostSelection ?? '' : ''}
+                    disabled={!composerDraftReady || hosts.isPending} onChange={(event) => setHostSelection(event.target.value)}>
                     <option value="">无电脑目标</option>
                     {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
                     {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
@@ -1685,44 +2264,56 @@ export function Assistant() {
                 {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
                     <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
-                      <input type="checkbox" checked={mcpConnectorIDs.includes(connector.id)} onChange={(event) => setMcpConnectorIDs((current) => event.target.checked
-                        ? [...new Set([...current, connector.id])] : current.filter((id) => id !== connector.id))} />
+                      <input type="checkbox" checked={composerDraftReady && mcpConnectorIDs.includes(connector.id)} disabled={!composerDraftReady}
+                        onChange={(event) => setMcpConnectorIDs((current) => event.target.checked
+                          ? [...new Set([...current, connector.id])] : current.filter((id) => id !== connector.id))} />
                       <span>{connector.name}</span>
                     </label>)}</div>
                   </fieldset>
                 </details>}
-                {mcpConnectors.isError && !showConsolidatedNetworkError && <div className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></div>}
+                {mcpConnectors.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></FloatingError>}
               </div>
               <div className="assistant-task-actions" role="group" aria-label="发送操作">
                 {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
-                <button className="button button-primary assistant-send" type="submit" disabled={savingMessage || preparingAttachmentCount > 0 || (!content.trim() && !composerAttachments.length)}>
-                  {preparingAttachmentCount > 0 ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
+                <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length)}>
+                  {preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
                 </button>
               </div>
             </div>
           </form>
         </section>
       </div>
-      {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="任务动态">
+      {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="当前会话侧边栏">
         <header className="task-panel-heading">
-          <div><h2>任务动态</h2><span>{pendingTaskCount !== null && activeTaskCount !== null
-            ? `${pendingTaskCount} 项待处理 · ${activeTaskCount} 项进行中`
-            : accountTasks.isError || taskProgressReadError ? '任务状态暂不可用' : '正在读取任务状态…'}</span></div>
+          <nav className="task-panel-tabs" aria-label="侧边栏内容">
+            <button type="button" aria-pressed={taskPanelTab === 'tasks'} className={taskPanelTab === 'tasks' ? 'is-selected' : ''}
+              onClick={() => setTaskPanelTab('tasks')}>任务</button>
+            <button type="button" aria-pressed={taskPanelTab === 'files'} className={taskPanelTab === 'files' ? 'is-selected' : ''}
+              onClick={() => setTaskPanelTab('files')}>文件</button>
+            <button type="button" aria-pressed={taskPanelTab === 'computer'} className={taskPanelTab === 'computer' ? 'is-selected' : ''}
+              onClick={() => setTaskPanelTab('computer')}>云端电脑</button>
+          </nav>
           <div className="inline-actions">
-            <button type="button" className="icon-button" aria-label="刷新任务动态" onClick={() => {
-              void accountTasks.refetch();
+            {taskPanelTab !== 'computer' && <button type="button" className="icon-button" aria-label="刷新当前会话侧边栏" onClick={() => {
               void conversationTasks.refetch();
+              void recentConversationTasks.refetch();
               void client.invalidateQueries({ queryKey: ['task'] });
               if (taskDetailTaskID) void client.invalidateQueries({ queryKey: ['task-file-fetches', taskDetailTaskID] });
-            }}>↻</button>
-            <button type="button" className="icon-button" aria-label="关闭任务动态" onClick={() => {
+            }}>↻</button>}
+            <button type="button" className="icon-button" aria-label="关闭侧边栏" onClick={() => {
+              postComputerVisibility(false);
+              computerRequestGeneration.current += 1;
+              setComputerConnecting(false);
+              setComputerEmbed(null);
+              setComputerControlExpanded(false);
               setTaskPanelOpen(false);
               setTaskDetailTaskID(null);
-              taskPanelToggle.current?.focus();
+              setTaskPanelTab('tasks');
+              window.requestAnimationFrame(() => taskPanelToggle.current?.focus());
             }}>×</button>
           </div>
         </header>
-        {taskDetailTaskID && <div className="task-panel-detail task-panel-list">
+        {taskPanelTab === 'tasks' && taskDetailTaskID && <div className="task-panel-detail task-panel-list">
           <div className="task-panel-detail-nav"><button type="button" className="button button-small button-secondary"
             onClick={() => {
               setTaskDetailTaskID(null);
@@ -1731,35 +2322,102 @@ export function Assistant() {
           {selectedTaskSummary ? renderTaskDetail(selectedTaskSummary)
             : <p className="muted" role="status">此任务已不在当前可见列表中，请刷新任务动态。</p>}
         </div>}
-        <div className="task-panel-list" hidden={Boolean(taskDetailTaskID)}>
-          <div className="task-panel-filters" role="group" aria-label="任务范围">
-            <button type="button" className={taskPanelFilter === 'all' ? 'is-selected' : ''} aria-pressed={taskPanelFilter === 'all'}
-              onClick={() => setTaskPanelFilter('all')}>全部任务</button>
-            <button type="button" className={taskPanelFilter === 'conversation' ? 'is-selected' : ''} aria-pressed={taskPanelFilter === 'conversation'}
-              disabled={!conversationID} onClick={() => setTaskPanelFilter('conversation')}>当前会话</button>
-          </div>
+        {taskPanelTab === 'tasks' && !taskDetailTaskID && <div className="task-panel-list">
           {capabilities.isPending && <p className="muted" role="status">正在确认账号与服务身份…</p>}
-          {!accountTasksEnabled && !capabilities.isPending && <p className="muted" role="status">账号或服务身份尚未确认，任务列表暂不可用。</p>}
-          {accountTasksEnabled && accountTasks.isPending && <p className="muted" role="status">正在读取账号任务…</p>}
-          {accountTasks.isError && <div className="error-inline" role="alert">任务状态暂不可用，当前列表可能不完整。
-            <button type="button" className="button button-small button-secondary" onClick={() => void accountTasks.refetch()}>重试</button></div>}
-          {conversationTasks.isError && !accountTasks.isSuccess && <div className="error-inline" role="alert">当前会话任务状态也暂不可用。
-            <button type="button" className="button button-small button-secondary" onClick={() => void conversationTasks.refetch()}>重试</button></div>}
-          {taskProgressReadError && <div className="error-inline" role="alert">
+          {conversationID && conversationTasks.isPending && !conversationTasks.data && <p className="muted" role="status">正在读取任务…</p>}
+          {conversationTasks.isError && <FloatingError className="error-inline" role="alert">任务状态暂不可用。
+            <button type="button" className="button button-small button-secondary" onClick={() => void conversationTasks.refetch()}>重试</button></FloatingError>}
+          {recentConversationTasks.isError && <FloatingError className="error-inline" role="alert">已结束任务暂不可用。
+            <button type="button" className="button button-small button-secondary" onClick={() => void recentConversationTasks.refetch()}>重试</button></FloatingError>}
+          {taskProgressReadError && <FloatingError className="error-inline" role="alert">
             部分任务进展暂不可用，显示最近一次已确认状态。<button type="button" className="button button-small button-secondary"
-              onClick={() => void client.invalidateQueries({ queryKey: ['task'] })}>重试</button></div>}
-          {!accountTasks.isPending && !accountTasks.isError && !taskProgressReadError && !visibleTaskPanelTasks.length &&
-            <p className="muted">{taskPanelFilter === 'conversation' ? '当前会话还没有任务。' : '还没有任务。'}</p>}
-          {taskPanelGroups.map((group) => !group.items.length ? null : group.id === 'recent'
-            ? <details className="task-panel-group task-panel-group-recent" key={group.id}>
-              <summary>{group.title}<span>{group.items.length}</span></summary>
-              <div className="task-panel-cards">{group.items.map(renderTaskSummary)}</div>
-            </details>
-            : <section className="task-panel-group" key={group.id} aria-label={group.title}>
-              <h3>{group.title}<span>{group.items.length}</span></h3>
-              <div className="task-panel-cards">{group.items.map(renderTaskSummary)}</div>
-            </section>)}
-        </div>
+              onClick={() => void client.invalidateQueries({ queryKey: ['task'] })}>重试</button></FloatingError>}
+          {!conversationID && <p className="muted">开始对话后，这里会显示相关任务。</p>}
+          {conversationID && !conversationTasks.isPending && !recentConversationTasks.isPending && !taskProgressReadError && !visibleTaskPanelTasks.length &&
+            <p className="muted">此会话还没有任务。</p>}
+          {visibleTaskPanelTasks.length > 0 && <ScreenPagination items={visibleTaskPanelTasks} getKey={(item) => item.id}
+            estimatedItemHeight={116} height="100%" ariaLabel="当前会话任务分页" className="task-panel-pagination"
+            renderItem={renderTaskSummary} />}
+        </div>}
+        {taskPanelTab === 'files' && <div className="task-panel-list task-panel-files">
+          {messages.hasNextPage && <button type="button" className="button button-small button-secondary" disabled={messages.isFetchingNextPage}
+            onClick={() => void loadOlderMessages()}>{messages.isFetchingNextPage ? '正在加载更早消息…' : '加载更早消息中的附件'}</button>}
+          {!conversationFiles.length ? <p className="muted">此会话还没有附件或任务成果。</p> : <ScreenPagination items={conversationFiles}
+            getKey={(item) => item.key} estimatedItemHeight={72} height="100%" ariaLabel="当前会话文件分页"
+            renderItem={(item) => item.kind === 'attachment'
+              ? <article className="task-file-card" key={item.key}>
+                <strong>消息附件 {item.index}</strong><small>{formatDate(item.createdAt)}</small>
+                <a href={`/api/personal-data/attachments/${encodeURIComponent(item.attachmentID)}`} download
+                  aria-label={`下载消息附件 ${item.index}`}>下载附件 <span aria-hidden="true">↓</span></a>
+              </article>
+              : <article className="task-file-card" key={item.key}>
+                <strong>{item.artifact.label || '任务成果'}</strong>
+                <small>{item.taskTitle} · {item.artifact.path} · {item.artifact.media_type}
+                  {item.artifact.size_bytes === null ? '' : ` · ${formatBytes(item.artifact.size_bytes)}`}</small>
+                <button type="button" className="button button-small button-secondary" onClick={() => {
+                  setTaskPanelTab('tasks');
+                  setTaskDetailTaskID(item.taskID);
+                }}>查看任务成果</button>
+              </article>} />}
+        </div>}
+        <section className="task-panel-list task-panel-computer" aria-label="当前会话云端电脑" hidden={taskPanelTab !== 'computer'}>
+          <div className="computer-panel-toolbar">
+            <label>云端电脑
+              <select aria-label="选择侧栏云端电脑" value={selectedComputerHost?.id ?? ''} disabled={sharedHosts.isPending || hosts.isPending}
+                onChange={(event) => {
+                  postComputerVisibility(false);
+                  computerRequestGeneration.current += 1;
+                  setComputerConnecting(false);
+                  setComputerEmbed(null);
+                  setComputerControlExpanded(false);
+                  setComputerPanelError('');
+                  setComputerHostID(event.target.value);
+                }}>
+                <option value="">选择有权限访问的电脑</option>
+                {computerHostOptions.map((host) => <option key={host.id} value={host.id}>
+                  {host.name} · {host.owned ? '我的电脑' : '共享电脑'}
+                </option>)}
+              </select>
+            </label>
+            <button type="button" className="button button-primary" disabled={computerConnecting || !selectedComputerHost ||
+              selectedComputerHost.state !== 'running' || !selectedComputerInitialTarget}
+              onClick={() => void requestComputerEmbed()}>
+              {computerConnecting ? '正在连接…' : computerEmbed?.status === 'ready' ? '重新连接'
+                : computerEmbed?.status === 'error' ? '重试连接' : '连接到此会话'}
+            </button>
+          </div>
+          {sharedHosts.isError && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
+            <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
+          {computerPanelError && <p className="notice notice-warning" role="status">{computerPanelError}</p>}
+          {!conversationID && <p className="muted">新旁聊创建后，才能把电脑连接到该会话。</p>}
+          {selectedComputerHost && selectedComputerHost.state !== 'running' && <p className="muted">此电脑当前未运行，启动后才能连接。</p>}
+          {selectedComputerHost && !selectedComputerTargets.length && <p className="muted">此电脑没有可嵌入的授权功能。</p>}
+          {computerEmbed?.conversationID === conversationID && <>
+            <div className="computer-panel-status" role="status" aria-live="polite">
+              {computerEmbed.status === 'ready' ? '工作台已就绪' : computerEmbed.status === 'error'
+                ? computerEmbed.error || '工作台连接失败。' : computerEmbed.status === 'submitting' ? '正在安全连接…' : '正在等待工作台就绪…'}
+              {computerEmbed.status === 'ready' && <small>远程桌面连接和控制状态以工作台内的实时提示为准。</small>}
+              {computerEmbed.status === 'ready' && <small>可用功能：{computerEmbed.targets.map((target) => ({
+                browser: '桌面', terminal: '终端', workspace: 'Workspace', files: '主机文件', vscode: 'VS Code',
+              }[target])).join('、')}</small>}
+              {computerEmbed.status === 'error' && selectedComputerHost && <button type="button" className="button button-small button-secondary"
+                onClick={() => {
+                  try {
+                    const fallbackTarget = selectedComputerHost.owned ? undefined
+                      : selectedComputerInitialTarget === 'browser' ? 'desktop'
+                        : selectedComputerInitialTarget === 'terminal' || selectedComputerInitialTarget === 'workspace'
+                          ? selectedComputerInitialTarget : undefined;
+                    enterHostInNewTab(selectedComputerHost.id, fallbackTarget);
+                  } catch (error) { setComputerPanelError(errorDetails(error).message); }
+                }}>在新窗口打开工作台</button>}
+            </div>
+            <div className="computer-panel-frame">
+              <iframe key={computerEmbed.nonce} ref={computerFrame} name={`morde-cloud-${computerEmbed.nonce}`} title="当前会话云端电脑工作台"
+                src="about:blank" allow="fullscreen" onError={() => setComputerEmbed((current) => current?.nonce === computerEmbed.nonce
+                  ? { ...current, status: 'error', error: '工作台页面加载失败，请重试。' } : current)} />
+            </div>
+          </>}
+        </section>
       </aside>}
     </div>
   </section>;

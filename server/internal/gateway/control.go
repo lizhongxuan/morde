@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"morde/server/internal/app"
 	"morde/server/internal/config"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
@@ -77,6 +78,7 @@ func (g *gateway) consumeTicket(c *gin.Context) {
 
 func (g *gateway) logout(c *gin.Context) {
 	g.clearHostCookie(c)
+	g.clearEmbedCookie(c)
 	c.Status(http.StatusNoContent)
 }
 
@@ -115,7 +117,11 @@ func (g *gateway) workbench(c *gin.Context) {
 		return
 	}
 	defer func() { _ = data.Close() }()
-	c.Header("Content-Security-Policy", "frame-ancestors 'self'")
+	if claims, embedded := g.embedClaimsFrom(c); embedded {
+		c.Header("Content-Security-Policy", "frame-ancestors 'self' "+claims.PortalOrigin)
+	} else {
+		c.Header("Content-Security-Policy", "frame-ancestors 'self'")
+	}
 	c.Header("X-Content-Type-Options", "nosniff")
 	if _, taskObservation := c.Get(taskObservationSessionKey); taskObservation {
 		c.Header("Cache-Control", "no-store")
@@ -138,7 +144,19 @@ func (g *gateway) getHost(c *gin.Context) {
 		httpserver.WriteError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, hostResponseFrom(value, g.deps.Domains))
+	response := hostResponseFrom(value, g.deps.Domains)
+	if claims, embedded := g.embedClaimsFrom(c); embedded {
+		response.EmbedTargets = make([]string, 0, len(claims.TargetGrants))
+		workspaceAllowed := false
+		for _, grant := range claims.TargetGrants {
+			response.EmbedTargets = append(response.EmbedTargets, grant.Target)
+			workspaceAllowed = workspaceAllowed || grant.Target == app.HostEmbedTargetWorkspace
+		}
+		if !workspaceAllowed {
+			response.Workspaces = nil
+		}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (g *gateway) renewHost(c *gin.Context) {
@@ -169,6 +187,7 @@ type hostResponse struct {
 	StateReason  string                     `json:"state_reason"`
 	URL          string                     `json:"url"`
 	Workspaces   []workspaceBindingResponse `json:"workspaces"`
+	EmbedTargets []string                   `json:"embed_targets,omitempty"`
 	Resources    resourcesResponse          `json:"resources"`
 	ExpiresAt    *time.Time                 `json:"expires_at"`
 	LastActiveAt *time.Time                 `json:"last_active_at"`

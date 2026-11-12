@@ -1,0 +1,110 @@
+/* Keep this route inside the app viewport; long record collections page internally. */
+.morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .personal-data-page) {
+  height: 100%;
+  min-height: 0;
+  padding: 6px 12px;
+  display: flex;
+  overflow: hidden;
+}
+
+.morde-page > .personal-data-page.design-panel {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.personal-data-page > .design-panel-header { display: none; }
+.morde-page .personal-data-page .personal-sync-status { flex: 0 0 auto; margin: 0; padding: 0 2px 4px; }
+.personal-data-page .personal-sync-status p { margin: 0; font-size: 10px; line-height: 1.35; }
+
+.personal-data-page > .connection-section {
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 7px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.personal-data-page > .connection-section > .connection-section-heading {
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  flex: 0 0 auto;
+  border: 0;
+}
+
+.personal-data-page > .connection-section > .connection-section-heading p { display: none; }
+.personal-data-page .form-card { width: 100%; margin: 0; padding: 10px; border-radius: 8px; box-shadow: none; }
+.personal-data-page .form-stack { gap: 6px; }
+.personal-data-page .form-stack > label:not(.checkbox-row),
+.personal-data-page .personal-data-pager .model-connection-main > label { min-width: 0; display: grid; gap: 3px; }
+.personal-data-page input:not([type=checkbox]):not([type=radio]),
+.personal-data-page select,
+.personal-data-page textarea { min-height: 30px; padding: 5px 8px; border-radius: 6px; font-size: 12px; }
+.personal-data-page textarea { height: 54px; min-height: 40px; max-height: 110px; resize: vertical; }
+.personal-data-page .form-stack > .button { min-height: 30px; justify-self: end; padding-block: 4px; }
+.personal-data-page .checkbox-row { min-height: 28px; flex: 0 0 auto; gap: 7px; font-size: 11px; }
+.personal-data-page .checkbox-row input { width: 15px; height: 15px; }
+.personal-data-page .muted { margin-block: 2px; font-size: 10px; line-height: 1.4; }
+
+.personal-data-page .personal-data-pager {
+  width: 100%;
+  min-height: 88px;
+  height: auto !important;
+  flex: 1 1 0;
+}
+
+.personal-data-page .screen-pagination__items { gap: 6px; }
+.personal-data-page .model-connection-card { min-width: 0; padding: 8px 10px; align-items: flex-start; gap: 8px; border-radius: 8px; }
+.personal-data-page .model-connection-card h3 { margin: 0; font-size: 12px; }
+.personal-data-page .model-connection-card p { margin: 3px 0; font-size: 11px; line-height: 1.4; }
+.personal-data-page .model-connection-card small { font-size: 10px; }
+.personal-data-page .personal-data-pager .inline-actions { flex: 0 0 auto; gap: 4px; }
+.personal-data-page .personal-data-pager .button { min-height: 27px; padding: 3px 7px; font-size: 10px; }
+.personal-data-page .personal-data-pager .screen-pagination__item--overflow { overflow-y: auto; }
+
+.personal-data-page .personal-data-setting { display: grid; flex: 0 0 auto; gap: 4px; }
+.personal-data-page .personal-data-setting h3 { margin: 0; }
+.personal-data-page .personal-data-setting details,
+.personal-data-page .personal-data-setting-help { flex: 0 0 auto; color: #738198; font-size: 10px; }
+.personal-data-page .personal-data-setting summary { cursor: pointer; }
+.personal-data-page .personal-data-setting details p,
+.personal-data-page .personal-data-setting-help p { max-height: 25dvh; overflow: auto; }
+.personal-data-page .personal-data-setting-help { margin: 0; }
+.personal-data-page .empty-card { margin: 0; padding: 10px; flex: 0 0 auto; }
+
+@media (max-width: 620px) {
+  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .personal-data-page) { padding: 4px 6px; }
+  .personal-data-page { gap: 4px; }
+  .personal-data-page .personal-sync-status { padding-bottom: 2px; }
+  .personal-data-page > .connection-section { gap: 5px; }
+  .personal-data-page .form-card { padding: 8px; }
+  .personal-data-page .form-stack { gap: 4px; }
+  .personal-data-page input:not([type=checkbox]):not([type=radio]),
+  .personal-data-page select { min-height: 28px; padding-block: 4px; }
+  .personal-data-page textarea { height: 44px; min-height: 36px; }
+  .personal-data-page .personal-data-pager .model-connection-card { flex-direction: column; gap: 5px; }
+  .personal-data-page .personal-data-pager .inline-actions { flex-wrap: wrap; }
+}
+
+@media (max-height: 760px) {
+  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .personal-data-page) { padding-block: 4px; }
+  .personal-data-page .form-card { padding-block: 8px; }
+  .personal-data-page .form-stack { gap: 4px; }
+}

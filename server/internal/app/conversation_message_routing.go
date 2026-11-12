@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
@@ -25,6 +26,7 @@ type AcceptConversationMessageCommand struct {
 	WorkspaceID             string
 	ChangeTaskTarget        bool
 	ApplicationID           string
+	TimeZone                string
 	MCPConnectorIDs         []string
 	ClientAttachmentIDs     []string
 	Budget                  task.Budget
@@ -42,6 +44,7 @@ type ConversationRoutingInput struct {
 	WorkspaceID             string      `json:"workspace_id,omitempty"`
 	ChangeTaskTarget        bool        `json:"change_task_target,omitempty"`
 	ApplicationID           string      `json:"application_id,omitempty"`
+	TimeZone                string      `json:"time_zone,omitempty"`
 	MCPConnectorIDs         []string    `json:"mcp_connector_ids,omitempty"`
 	ClientAttachmentIDs     []string    `json:"client_attachment_ids,omitempty"`
 	Budget                  task.Budget `json:"budget"`
@@ -88,6 +91,15 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 	}
 	if command.ApplicationID != "" && !ValidHostApplicationID(command.ApplicationID) {
 		return ConversationMessageReceipt{}, domain.InvalidArgument("application_id", "application is not supported")
+	}
+	if command.TimeZone != "" {
+		if len(command.TimeZone) > 64 || strings.TrimSpace(command.TimeZone) != command.TimeZone ||
+			!utf8.ValidString(command.TimeZone) || strings.ContainsRune(command.TimeZone, '\x00') || command.TimeZone == "Local" {
+			return ConversationMessageReceipt{}, domain.InvalidArgument("time_zone", "time zone must be a valid IANA identifier")
+		}
+		if _, err := time.LoadLocation(command.TimeZone); err != nil {
+			return ConversationMessageReceipt{}, domain.InvalidArgument("time_zone", "time zone must be a valid IANA identifier")
+		}
 	}
 	command.ModelID = strings.TrimSpace(command.ModelID)
 	if len(command.ModelID) > 256 || !utf8.ValidString(command.ModelID) || strings.ContainsRune(command.ModelID, '\x00') {
@@ -140,6 +152,7 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 		ReferenceTaskID: command.ReferenceTaskID, ModelID: command.ModelID, HostID: command.HostID,
 		WorkspaceID: command.WorkspaceID, ChangeTaskTarget: command.ChangeTaskTarget,
 		ApplicationID: command.ApplicationID, MCPConnectorIDs: connectors,
+		TimeZone:            command.TimeZone,
 		ClientAttachmentIDs: append([]string(nil), command.ClientAttachmentIDs...), Budget: budget,
 	}
 	return ConversationMessageReceipt{

@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { portalApi } from '../app/api';
+import { ToastProvider } from '../app/toast';
 import { ChangePassword } from './ChangePassword';
 
 vi.mock('../app/api', async (importOriginal) => {
@@ -14,9 +15,9 @@ vi.mock('../app/api', async (importOriginal) => {
 function renderPage(initialEntry = '/admin/change-password', loginPath = '/admin/login') {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
   client.setQueryData(['auth', 'me'], { id: 'uadmin01', name: 'admin', role: 'super_admin' });
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[initialEntry]}><Routes>
+  render(<ToastProvider><QueryClientProvider client={client}><MemoryRouter initialEntries={[initialEntry]}><Routes>
     <Route path={initialEntry} element={<ChangePassword loginPath={loginPath} />} />
-  </Routes></MemoryRouter></QueryClientProvider>);
+  </Routes></MemoryRouter></QueryClientProvider></ToastProvider>);
   return client;
 }
 
@@ -74,5 +75,11 @@ describe('change password page', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('当前密码不正确');
     expect(screen.getByRole('heading', { name: '修改密码' })).toBeInTheDocument();
+  });
+
+  it('uses the shared Morde logo without mounting the conversation shell', () => {
+    renderPage();
+    expect(document.querySelector('.login-brand .morde-brand-mark')).toBeInTheDocument();
+    expect(document.querySelector('.morde-shell')).not.toBeInTheDocument();
   });
 });

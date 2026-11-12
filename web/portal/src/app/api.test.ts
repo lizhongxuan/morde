@@ -158,6 +158,28 @@ describe('typed Portal API client', () => {
     expect(tab.opener).toBeNull();
   });
 
+  it('requests a one-time conversation-bound Host embed ticket without putting credentials in the URL', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({
+        exchange_url: 'https://h1234567.hosts.example.test/__ch/embed-auth',
+        ticket: 'A'.repeat(43), embed_nonce: 'B'.repeat(32), targets: ['browser', 'workspace'],
+        expires_at: '2026-11-12T03:00:00.000Z',
+      }, { status: 201 });
+    }));
+
+    const result = await portalApi.issueHostEmbedTicket('h1234567', {
+      conversation_id: 'c1234567', target: 'browser', targets: ['browser', 'workspace'],
+    });
+
+    expect([request!.method, new URL(request!.url).pathname, new URL(request!.url).search]).toEqual([
+      'POST', '/api/hosts/h1234567/embed-tickets', '',
+    ]);
+    expect(await request!.json()).toEqual({ conversation_id: 'c1234567', target: 'browser', targets: ['browser', 'workspace'] });
+    expect(result.embed_nonce).toBe('B'.repeat(32));
+  });
+
   it('sends schema-typed requests with request IDs and Cookie credentials', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -553,6 +575,32 @@ describe('typed Portal API client', () => {
     const page = await portalApi.conversationTasks('c1234567');
     expect(page.items.map((item) => item.id)).toEqual(['q1234567', 'q7654321']);
     expect(requests).toEqual(['/api/conversations/c1234567/tasks?limit=100', '/api/conversations/c1234567/tasks?limit=100&cursor=next-page']);
+  });
+
+  it('loads recent tasks for the selected conversation without changing the active default', async () => {
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      requests.push(`${url.pathname}${url.search}`);
+      if (url.searchParams.get('view') === 'recent' && !url.searchParams.has('cursor')) {
+        return Response.json({ items: [{ id: 'q1234567' }], next_cursor: 'recent-next', pending_count: 0 });
+      }
+      if (url.searchParams.get('view') === 'recent') {
+        return Response.json({ items: [{ id: 'q7654321' }], next_cursor: null, pending_count: 0 });
+      }
+      return Response.json({ items: [], next_cursor: null, pending_count: 0 });
+    }));
+
+    const recent = await portalApi.conversationTasks('c1234567', { view: 'recent' });
+    await portalApi.conversationTasks('c1234567');
+
+    expect(recent.items.map((item) => item.id)).toEqual(['q1234567', 'q7654321']);
+    expect(requests).toEqual([
+      '/api/conversations/c1234567/tasks?limit=100&view=recent',
+      '/api/conversations/c1234567/tasks?limit=100&view=recent&cursor=recent-next',
+      '/api/conversations/c1234567/tasks?limit=100',
+    ]);
   });
 
   it('creates a standalone workspace with an idempotency key and deletes hosts without legacy query flags', async () => {

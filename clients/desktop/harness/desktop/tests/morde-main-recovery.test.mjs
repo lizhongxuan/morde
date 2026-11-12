@@ -131,7 +131,8 @@ test('one desktop login stores Client and Sync only, injects an HttpOnly Web coo
     assert.equal(h.partitions.length, 1);
     assert.match(h.partitions[0].name, /^morde-user-/);
     assert.deepEqual(h.partitions[0].cookies.values.map((item) => ({ name: item.name, httpOnly: item.httpOnly, secure: item.secure, sameSite: item.sameSite })), [{ name: 'ch_portal', httpOnly: true, secure: true, sameSite: 'strict' }]);
-    assert.equal(h.views[0].options.webPreferences.preload, undefined);
+    assert.match(h.views[0].options.webPreferences.preload, /morde-preload\.js$/);
+    assert.deepEqual(h.views[0].options.webPreferences.additionalArguments, ['--morde-preload-mode=portal']);
     assert.equal(h.views[0].options.webPreferences.sandbox, true);
     assert.equal(h.windows[0].contentView.attached[0], h.views[0]);
     assert.deepEqual(h.views[0].bounds, { x: 0, y: 0, width: 1120, height: 760 });
@@ -554,7 +555,8 @@ test('Host window checks a one-time ticket against the Host origin before naviga
     assert.equal(contents, win.webContents);
     assert.equal(contents, guest);
     assert.equal(win.options.webPreferences.sandbox, true);
-    assert.equal(win.options.webPreferences.preload, undefined);
+    assert.match(win.options.webPreferences.preload, /morde-preload\.js$/);
+    assert.deepEqual(win.options.webPreferences.additionalArguments, ['--morde-preload-mode=host-workbench']);
     let blocked = false;
     win.webContents.events.get('will-navigate')({ preventDefault() { blocked = true; } }, 'https://evil.example/__ch/auth?t=secret');
     assert.equal(blocked, true);

@@ -56,9 +56,9 @@ export function ScreenPagination<T>({
   const viewportRef = useRef<HTMLDivElement>(null);
   const anchorToken = useRef<string | null>(null);
   const previousKeys = useRef<string[]>([]);
-  const measuredHeights = useRef(new Map<string, number>());
+  const [measuredHeights, setMeasuredHeights] = useState<ReadonlyMap<string, number>>(() => new Map());
   const [viewportHeight, setViewportHeight] = useState(0);
-  const [heightRevision, setHeightRevision] = useState(0);
+  const [overflowItemKeys, setOverflowItemKeys] = useState<ReadonlySet<string>>(() => new Set());
   const [page, setPage] = useState(0);
 
   const keys = useMemo(() => items.map((item) => token(getKey(item))), [items, getKey]);
@@ -70,7 +70,7 @@ export function ScreenPagination<T>({
     let start = 0;
     let used = 0;
     for (let index = 0; index < items.length; index += 1) {
-      const itemHeight = measuredHeights.current.get(keys[index] ?? '') ?? Math.max(1, estimatedItemHeight);
+      const itemHeight = measuredHeights.get(keys[index] ?? '') ?? Math.max(1, estimatedItemHeight);
       const nextHeight = used + (index > start ? gap : 0) + itemHeight;
       if (index > start && nextHeight > available) {
         result.push({ start, end: index });
@@ -82,7 +82,7 @@ export function ScreenPagination<T>({
     }
     result.push({ start, end: items.length });
     return result;
-  }, [items, keys, estimatedItemHeight, gap, height, viewportHeight, heightRevision]);
+  }, [items.length, keys, estimatedItemHeight, gap, height, viewportHeight, measuredHeights]);
   const rangeSignature = ranges.map(({ start, end }) => `${start}:${end}`).join('|');
   const pageByIndex = useMemo(() => {
     const result = Array<number>(items.length).fill(0);
@@ -90,7 +90,7 @@ export function ScreenPagination<T>({
       for (let index = start; index < end; index += 1) result[index] = pageIndex;
     });
     return result;
-  }, [items.length, rangeSignature]);
+  }, [items.length, ranges]);
   const pageCount = ranges.length;
   const currentPage = Math.min(page, Math.max(0, pageCount - 1));
   const currentRange = ranges[currentPage];
@@ -109,35 +109,42 @@ export function ScreenPagination<T>({
       setPage(nextPage);
       anchorToken.current = keys[ranges[nextPage]?.start ?? 0] ?? null;
     }
-  }, [keySignature, ranges, rangeSignature, currentPage, pageCount]);
+  }, [keySignature, keys, ranges, rangeSignature, currentPage, pageCount]);
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    let active = true;
     const updateViewport = () => {
+      if (!active) return;
       const nextHeight = viewport.clientHeight;
       setViewportHeight((current) => Math.abs(current - nextHeight) < 1 ? current : nextHeight);
+      const availableHeight = nextHeight || (typeof height === 'number' ? height : viewportHeight);
+      const nextOverflowKeys = new Set<string>();
+      let heightsChanged = false;
+      const nextMeasuredHeights = new Map(measuredHeights);
       for (const element of viewport.querySelectorAll<HTMLElement>('[data-item-key]')) {
         const itemToken = element.dataset.itemKey;
         if (!itemToken) continue;
-        const nextItemHeight = element.getBoundingClientRect().height;
-        if (nextItemHeight > 0 && Math.abs((measuredHeights.current.get(itemToken) ?? 0) - nextItemHeight) > 1) {
-          measuredHeights.current.set(itemToken, nextItemHeight);
-          setHeightRevision((revision) => revision + 1);
+        const nextItemHeight = Math.max(element.getBoundingClientRect().height, element.scrollHeight);
+        if (availableHeight > 0 && nextItemHeight > availableHeight + 1) nextOverflowKeys.add(itemToken);
+        const measuredHeight = availableHeight > 0 ? Math.min(nextItemHeight, availableHeight) : nextItemHeight;
+        if (measuredHeight > 0 && Math.abs((nextMeasuredHeights.get(itemToken) ?? 0) - measuredHeight) > 1) {
+          nextMeasuredHeights.set(itemToken, measuredHeight);
+          heightsChanged = true;
         }
       }
+      setOverflowItemKeys((current) => current.size === nextOverflowKeys.size
+        && [...current].every((itemToken) => nextOverflowKeys.has(itemToken)) ? current : nextOverflowKeys);
+      if (heightsChanged) setMeasuredHeights(nextMeasuredHeights);
     };
-    updateViewport();
-    if (typeof ResizeObserver === 'undefined') return;
+    queueMicrotask(updateViewport);
+    if (typeof ResizeObserver === 'undefined') return () => { active = false; };
     const observer = new ResizeObserver(() => updateViewport());
     observer.observe(viewport);
     viewport.querySelectorAll('[data-item-key]').forEach((element) => observer.observe(element));
-    return () => observer.disconnect();
-  }, [currentPage, rangeSignature, keySignature]);
-
-  useLayoutEffect(() => {
-    if (pageCount && page >= pageCount) setPage(pageCount - 1);
-  }, [page, pageCount]);
+    return () => { active = false; observer.disconnect(); };
+  }, [currentPage, rangeSignature, keySignature, measuredHeights, height, viewportHeight]);
 
   function goToPage(nextPage: number) {
     const boundedPage = Math.max(0, Math.min(pageCount - 1, nextPage));
@@ -147,7 +154,7 @@ export function ScreenPagination<T>({
 
   function onKeyDown(event: KeyboardEvent<HTMLElement>) {
     const target = event.target;
-    if (target instanceof HTMLElement && target.closest('input, textarea, select, button, a, [contenteditable="true"]')) return;
+    if (target instanceof HTMLElement && target.closest('input, textarea, select, button, a, [contenteditable="true"], [data-screen-pagination-scroll]')) return;
     if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
       event.preventDefault();
       goToPage(currentPage - 1);
@@ -167,7 +174,13 @@ export function ScreenPagination<T>({
       {currentRange ? <div className="screen-pagination__items">
         {items.map((item, index) => {
           const key = keys[index] ?? token(getKey(item));
-          return <div className="screen-pagination__item" data-item-key={key} key={key} hidden={pageByIndex[index] !== currentPage}>
+          const overflowed = overflowItemKeys.has(key);
+          return <div className={`screen-pagination__item${overflowed ? ' screen-pagination__item--overflow' : ''}`}
+            data-item-key={key} data-screen-pagination-scroll={overflowed ? '' : undefined} key={key}
+            hidden={pageByIndex[index] !== currentPage} tabIndex={overflowed ? 0 : undefined}
+            role={overflowed ? 'region' : undefined}
+            aria-label={overflowed ? `${ariaLabel}条目内容，可在此区域内滚动查看` : undefined}
+            style={overflowed ? { maxHeight: `${viewportHeight || (typeof height === 'number' ? height : 0)}px` } : undefined}>
             {renderItem(item, index)}
           </div>;
         })}

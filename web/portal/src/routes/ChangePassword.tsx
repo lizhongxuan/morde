@@ -3,9 +3,12 @@ import type { FormEvent } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
+import { useToast } from '../app/toast';
+import { FloatingError } from '../components/FloatingError';
 
 export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: string }) {
   const client = useQueryClient();
+  const { notify } = useToast();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
@@ -18,7 +21,7 @@ export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: str
       client.setQueryData(['auth', 'me'], null);
       setChanged(true);
     },
-    onError: (reason) => setError(errorDetails(reason).message),
+    onError: (reason) => notify(errorDetails(reason).message, 'error'),
   });
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -30,7 +33,7 @@ export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: str
 
   return <main className="login-page">
     <section className="login-card" aria-labelledby="change-password-heading">
-      <div className="login-brand"><span className="brand-mark">M</span><span>Morde 云端电脑</span></div>
+      <div className="login-brand"><span className="morde-brand-mark" aria-hidden="true">M</span><span>Morde 云端电脑</span></div>
       <h1 id="change-password-heading">{changed ? '密码已修改' : '修改密码'}</h1>
       {changed ? <>
         <p className="notice notice-success" role="status">密码已更新，现有登录会话已退出。请使用新密码重新登录。</p>
@@ -44,7 +47,7 @@ export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: str
           <input id="new-password" name="new_password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
           <label htmlFor="confirm-password">确认新密码</label>
           <input id="confirm-password" name="confirm_password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
-          {error && <div className="form-error" role="alert">{error}</div>}
+          {error && <FloatingError>{error}</FloatingError>}
           <button className="button button-primary button-wide" type="submit" disabled={change.isPending}>{change.isPending ? '正在保存…' : '修改密码'}</button>
         </form>
       </>}

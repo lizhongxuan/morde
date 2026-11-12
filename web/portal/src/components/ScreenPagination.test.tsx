@@ -6,7 +6,7 @@ const items = Array.from({ length: 5 }, (_, index) => ({ id: `row-${index}`, lab
 const emptyItems: typeof items = [];
 
 describe('ScreenPagination', () => {
-  afterEach(cleanup);
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
   it('keeps page controls, hides other pages, and preserves their mounted content', () => {
     render(<ScreenPagination items={items} getKey={(item) => item.id} estimatedItemHeight={30} height={68} renderItem={(item) => <button>{item.label}</button>} />);
@@ -58,6 +58,34 @@ describe('ScreenPagination', () => {
     fireEvent.click(screen.getByRole('button', { name: '上一页' }));
     expect(draft).toBeVisible();
     expect(draft.value).toBe('unsent draft');
+  });
+
+  it('keeps an oversized row reachable without turning its keyboard paging keys into list navigation', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const height = this.classList.contains('screen-pagination__viewport') ? 68
+        : this.dataset.itemKey === 'string:row-0' ? 120
+          : this.hasAttribute('data-item-key') ? 30 : 0;
+      return { x: 0, y: 0, top: 0, right: 100, bottom: height, left: 0, width: 100, height, toJSON: () => ({}) } as DOMRect;
+    });
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains('screen-pagination__viewport') ? 68 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.dataset.itemKey === 'string:row-0' ? 120 : this.clientHeight;
+    });
+
+    render(<ScreenPagination items={items} getKey={(item) => item.id} estimatedItemHeight={30} height={68} renderItem={(item) => <span>{item.label}</span>} />);
+
+    const oversizedRow = screen.getByText('Row 1').closest<HTMLElement>('.screen-pagination__item')!;
+    await waitFor(() => expect(oversizedRow).toHaveAttribute('data-screen-pagination-scroll'));
+    expect(oversizedRow).toHaveAttribute('role', 'region');
+    expect(oversizedRow).toHaveAttribute('tabindex', '0');
+    expect(oversizedRow).toHaveAttribute('aria-label', '分页列表条目内容，可在此区域内滚动查看');
+    expect(oversizedRow).toHaveStyle({ maxHeight: '68px' });
+    expect(screen.getByText('Row 2')).not.toBeVisible();
+
+    fireEvent.keyDown(oversizedRow, { key: 'PageDown' });
+    expect(screen.getByText('Row 2')).not.toBeVisible();
   });
 
   it('shows an empty state when there are no items', () => {

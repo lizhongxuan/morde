@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   gatewayApi,
   type GatewayControl,
@@ -12,6 +12,7 @@ import FileManager from '../components/FileManager';
 import TopBar from '../components/TopBar';
 import TaskObservation from '../components/TaskObservation';
 import WorkspaceBrowser from '../components/WorkspaceBrowser';
+import FloatingError from '../components/FloatingError';
 import { returnToPreviousPage } from './navigation';
 
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
@@ -26,6 +27,25 @@ const primaryTabs: { id: Tab; label: string }[] = [
   { id: 'files', label: '主机文件' },
   { id: 'vscode', label: 'VS Code' },
 ];
+const tabIDs = new Set(primaryTabs.map((tab) => tab.id));
+
+function requestedEmbedTab(search: string): Tab | null {
+  const values = new URLSearchParams(search).getAll('tab');
+  return values.length === 1 && tabIDs.has(values[0] as Tab) ? values[0] as Tab : null;
+}
+
+function authorizedEmbedTargets(host: GatewayHost | null): Set<Tab> {
+  return new Set((host?.embed_targets ?? []).filter((target): target is Tab => tabIDs.has(target as Tab)));
+}
+
+function initialEmbedTab(targets: Set<Tab>, requested: Tab | null): Tab | null {
+  if (requested && targets.has(requested)) return requested;
+  return primaryTabs.find((tab) => targets.has(tab.id))?.id ?? null;
+}
+
+function hasEmbedControlTarget(targets: Set<Tab>): boolean {
+  return targets.has('browser');
+}
 
 function parseEmbedContext(search: string, referrer: string): EmbedContext | null {
   const query = new URLSearchParams(search);
@@ -68,12 +88,15 @@ export default function Workbench() {
   const embedded = embedContext !== null;
   const taskObservationOnly = query.has('task_id');
   const taskObservationID = query.get('task_id') ?? '';
-  const workspaceOnly = query.get('tab') === 'workspace';
+  const workspaceOnly = !embedded && query.get('tab') === 'workspace';
   const hostSessionOnly = workspaceOnly || taskObservationOnly;
   const [host, setHost] = useState<GatewayHost | null>(null);
+  const embedTargets = useMemo(() => authorizedEmbedTargets(host), [host]);
+  const requestedTab = requestedEmbedTab(window.location.search);
+  const initialTab = initialEmbedTab(embedTargets, requestedTab);
   const hostID = host?.id ?? null;
   const [control, setControl] = useState<GatewayControl | null>(null);
-  const [controlLoading, setControlLoading] = useState(!hostSessionOnly);
+  const [controlLoading, setControlLoading] = useState(!hostSessionOnly && !embedded);
   const [controlError, setControlError] = useState('');
   const [controlActionError, setControlActionError] = useState('');
   const [controlActionPending, setControlActionPending] = useState(false);
@@ -82,8 +105,9 @@ export default function Workbench() {
   const [pageRetry, setPageRetry] = useState(0);
   const [embedVisible, setEmbedVisible] = useState(!embedded);
   const [embedConversationID, setEmbedConversationID] = useState<string | null>(null);
-  const [active, setActive] = useState<Tab>(() => hostSessionOnly ? 'workspace' : 'browser');
-  const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(hostSessionOnly ? ['workspace'] : ['browser']));
+  const [active, setActive] = useState<Tab>(() => hostSessionOnly ? 'workspace' : requestedTab ?? 'browser');
+  const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(hostSessionOnly ? ['workspace'] : embedded ? [] : ['browser']));
+  const loadedTabs = useMemo(() => initialTab ? new Set([...loaded, initialTab]) : loaded, [initialTab, loaded]);
   const [browserStatus, setBrowserStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'failed'>('connecting');
   const [browserReconnect, setBrowserReconnect] = useState(0);
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
@@ -127,6 +151,7 @@ export default function Workbench() {
   }, []);
 
   const reloadControl = useCallback(async () => {
+    if (embedded && !hasEmbedControlTarget(embedTargets)) return;
     setControlLoading(true);
     try {
       applyControl(await gatewayApi.control());
@@ -135,7 +160,7 @@ export default function Workbench() {
     } finally {
       setControlLoading(false);
     }
-  }, [applyControl]);
+  }, [applyControl, embedTargets, embedded]);
 
   useEffect(() => {
     if (!embedContext) return;
@@ -173,32 +198,50 @@ export default function Workbench() {
       nonce: embedContext.nonce,
       conversation_id: embedConversationID,
       host_id: hostID,
-      workbench_ready: !pageError && (hostSessionOnly || (hostID !== null && !controlLoading)),
+      workbench_ready: !pageError && (hostSessionOnly || (hostID !== null && !controlLoading && (!embedded || initialTab !== null))),
       remote_desktop: browserStatus,
       control_state: control?.control_state ?? 'unknown',
       control_lease_active: control?.control_lease_active ?? false,
       control_lease_held_by_me: control?.control_lease_held_by_me ?? false,
     }, embedContext.origin);
   }, [browserStatus, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_state,
-    controlLoading, embedContext, embedConversationID, hostID, hostSessionOnly, pageError]);
+    controlLoading, embedContext, embedConversationID, embedded, hostID, hostSessionOnly, initialTab, pageError]);
 
   useEffect(() => {
     if (hostSessionOnly) return;
     let current = true;
+    const loadControl = () => {
+      setControlLoading(true);
+      void gatewayApi.control()
+        .then((value) => current && applyControl(value))
+        .catch((error: unknown) => current && setControlError(messageOf(error)))
+        .finally(() => current && setControlLoading(false));
+    };
+    if (!embedded) loadControl();
     gatewayApi.host()
-      .then((value) => current && setHost(value))
+      .then((value) => {
+        if (!current) return;
+        setHost(value);
+        if (embedded) {
+          const targets = authorizedEmbedTargets(value);
+          if (hasEmbedControlTarget(targets)) loadControl();
+          else {
+            setControl(null);
+            setControlError('');
+            setControlLoading(false);
+          }
+        }
+      })
       .catch((error: unknown) => current && setPageError(messageOf(error)));
-    gatewayApi.control()
-      .then((value) => current && applyControl(value))
-      .catch((error: unknown) => current && setControlError(messageOf(error)))
-      .finally(() => current && setControlLoading(false));
     return () => {
       current = false;
     };
-  }, [applyControl, hostSessionOnly, pageRetry]);
+  }, [applyControl, embedded, hostSessionOnly, pageRetry]);
+
+  const controlSessionOnly = hostSessionOnly || (embedded && !hasEmbedControlTarget(embedTargets));
 
   useEffect(() => {
-    if (hostSessionOnly) return;
+    if (controlSessionOnly) return;
     const transition = control?.control_state === 'taking_over' || control?.control_state === 'returning';
     const interval = (controlActionPending || (transition && !control?.active_transition?.failure_reason)) ? 1000 : 3000;
     let current = true;
@@ -215,10 +258,10 @@ export default function Workbench() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, hostSessionOnly]);
+  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, controlSessionOnly]);
 
   useEffect(() => {
-    if (hostSessionOnly || !control?.control_lease_active || !control.control_lease_held_by_me) return;
+    if (controlSessionOnly || !control?.control_lease_active || !control.control_lease_held_by_me) return;
     const timer = window.setInterval(() => {
       if (leaseRenewalRef.current) return;
       leaseRenewalRef.current = true;
@@ -232,7 +275,7 @@ export default function Workbench() {
         .finally(() => { leaseRenewalRef.current = false; });
     }, 10_000);
     return () => window.clearInterval(timer);
-  }, [applyControl, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_version, hostSessionOnly]);
+  }, [applyControl, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_version, controlSessionOnly]);
 
   const stopBrowserWatch = useCallback(() => {
     browserObserverRef.current?.disconnect();
@@ -361,6 +404,7 @@ export default function Workbench() {
   }
 
   function selectTab(tab: Tab) {
+    if (embedded && !embedTargets.has(tab)) return;
     if (tab === 'vscode' && !vscodeAvailable) return;
     setActive(tab);
     setLoaded((previous) => new Set(previous).add(tab));
@@ -411,6 +455,9 @@ export default function Workbench() {
   }
 
   function handleTabClick(tab: Tab) {
+    if (embedded && (tab === 'files'
+      ? !embedTargets.has('files') && !embedTargets.has('workspace')
+      : !embedTargets.has(tab))) return;
     if (suppressTabClickRef.current) {
       clearSuppressedTabClick();
       return;
@@ -623,9 +670,12 @@ export default function Workbench() {
           : control?.control_state === 'user' ? '他人正在操作'
             : control?.control_state === 'taking_over' ? '正在接管'
               : control?.control_state === 'returning' ? '正在交还' : '控制状态未知';
-  const visibleActive = active === 'vscode' && !vscodeAvailable ? 'browser' : active;
+  const authorizedActive = embedded && !embedTargets.has(active) ? initialTab ?? active : active;
+  const visibleActive = authorizedActive === 'vscode' && !vscodeAvailable && !embedded ? 'browser' : authorizedActive;
   const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace')
-    : embedded ? primaryTabs.filter((tab) => tab.id !== 'workspace') : primaryTabs;
+    : embedded ? host ? primaryTabs.filter((tab) => tab.id !== 'workspace' && (tab.id === 'files'
+      ? embedTargets.has('files') || embedTargets.has('workspace')
+      : embedTargets.has(tab.id))) : [] : primaryTabs;
   if (taskObservationOnly) return <TaskObservation key={taskObservationID} taskID={taskObservationID} />;
   return (
     <main className={`workbench-app${workspaceOnly ? ' is-workspace-only' : ''}${embedded ? ' is-embedded' : ''}${embedded && !embedVisible ? ' is-embedded-hidden' : ''}`}
@@ -646,6 +696,8 @@ export default function Workbench() {
         onRetryControl={reloadControl}
       />}
       {notice && <p className={`notice${noticeKind === 'error' ? ' notice-error' : ''}`} role={noticeKind === 'error' ? 'alert' : 'status'}>{notice}</p>}
+      {embedded && !host && !pageError && <p className="panel-loading" role="status">正在确认工作台权限…</p>}
+      {embedded && host && !embedTargets.size && !pageError && <p className="panel-loading" role="status">此会话没有可用的电脑功能。</p>}
       {pageError ? (
         <section className="page-message page-error" role="alert">
           <span className="page-error-mark" aria-hidden="true">!</span>
@@ -661,7 +713,7 @@ export default function Workbench() {
         </section>
       ) : (
         <>
-          <nav ref={workbenchTabsRef} className="workbench-tabs" aria-label="工作台功能">
+          {(!embedded || host) && <nav ref={workbenchTabsRef} className="workbench-tabs" aria-label="工作台功能">
             <div className="primary-tabs">
               {visibleTabs.map((tab) => {
                 const menu: MobileMenu = tab.id === 'browser' || tab.id === 'terminal' || tab.id === 'files' ? tab.id : null;
@@ -748,16 +800,16 @@ export default function Workbench() {
                   <button type="button" role="menuitem" disabled={!terminalAvailable || terminalRequestPending} onClick={() => runMobileMenuAction(() => void createNewTerminalSession())}>新建终端</button>
                 ) : (
                   <>
-                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('workspace'))}>Workspace</button>
-                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('files'))}>主机文件</button>
+                    {(!embedded || embedTargets.has('workspace')) && <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('workspace'))}>Workspace</button>}
+                    {(!embedded || embedTargets.has('files')) && <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('files'))}>主机文件</button>}
                     {!embedded && <button type="button" role="menuitem" disabled={!vscodeAvailable} onClick={() => runMobileMenuAction(() => selectTab('vscode'))}>VS Code</button>}
                   </>
                 )}
               </div>
             )}
-          </nav>
+          </nav>}
           <div className="workbench-content">
-            {loaded.has('browser') && (
+            {loadedTabs.has('browser') && (
               <div ref={browserPanelRef} className="tab-panel tab-panel-browser" aria-hidden={visibleActive !== 'browser'} inert={visibleActive !== 'browser'}>
                 {browserStatus !== 'connected' && (
                   <div className="connection-overlay" role={browserStatus === 'failed' || browserStatus === 'disconnected' ? 'alert' : 'status'}>
@@ -795,15 +847,15 @@ export default function Workbench() {
                 )}
               </div>
             )}
-            {loaded.has('terminal') && (
+            {loadedTabs.has('terminal') && (
               <div className="tab-panel tab-panel-terminal" aria-hidden={visibleActive !== 'terminal'} inert={visibleActive !== 'terminal'}>
                 {terminalError ? (
-                  <div className="panel-error" role="alert">
-                    <p>{terminalError}</p>
+                  <FloatingError>
+                    {terminalError}
                     <button className="button button-secondary" type="button" onClick={() => setTerminalError('')}>
                       重新连接
                     </button>
-                  </div>
+                  </FloatingError>
                 ) : terminalAvailable && terminalSession?.state === 'ready' ? (
                   <>
                     {visibleActive === 'terminal' && (
@@ -816,18 +868,18 @@ export default function Workbench() {
                     {visibleActive === 'terminal' && <iframe title="主机终端" src={terminalSession.url} />}
                   </>
                 ) : terminalAvailable && (terminalSession?.state === 'unknown' || terminalSession?.state === 'interrupted') ? (
-                  <div className="panel-error" role="alert">
-                    <p>{terminalSession.state === 'unknown'
+                  <FloatingError>
+                    {terminalSession.state === 'unknown'
                       ? '原终端的创建结果不确定，可能仍有命令在运行。系统不会自动创建第二个终端。'
-                      : '原终端会话已中断或无法恢复。若原命令可能仍在运行，请先核实状态；系统不会自动创建第二个终端。'}</p>
+                      : '原终端会话已中断或无法恢复。若原命令可能仍在运行，请先核实状态；系统不会自动创建第二个终端。'}
                     <button className="button button-secondary" type="button" disabled={terminalRequestPending} onClick={() => void createNewTerminalSession()}>
                       新建终端
                     </button>
-                  </div>
+                  </FloatingError>
                 ) : terminalAvailable && terminalSession?.state === 'creating' ? (
                   <p className="panel-loading" role="status">终端正在创建，确认就绪后会自动连接…</p>
                 ) : controlError ? (
-                  <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
+                  <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
                 ) : terminalAvailable ? (
                   <p className="panel-loading" role="status">正在连接终端…</p>
                 ) : (
@@ -835,26 +887,26 @@ export default function Workbench() {
                 )}
               </div>
             )}
-            {loaded.has('files') && (
+            {loadedTabs.has('files') && (
               <div className="tab-panel tab-panel-files" aria-hidden={visibleActive !== 'files'} inert={visibleActive !== 'files'}>
                 {vscodeAvailable
                   ? <FileManager />
                   : controlError
-                    ? <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
+                    ? <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
                     : <p className="panel-loading" role="status">请先接管电脑后使用文件。</p>}
               </div>
             )}
-            {loaded.has('workspace') && (
+            {loadedTabs.has('workspace') && (
               <div className="tab-panel tab-panel-workspace" aria-hidden={visibleActive !== 'workspace'} inert={visibleActive !== 'workspace'}>
                 <WorkspaceBrowser active={visibleActive === 'workspace'} />
               </div>
             )}
-            {loaded.has('vscode') && (
+            {loadedTabs.has('vscode') && (
               <div className="tab-panel tab-panel-vscode" aria-hidden={visibleActive !== 'vscode'} inert={visibleActive !== 'vscode'}>
                 {vscodeAvailable
                   ? <iframe title="VSCode" src="/code-server/" />
                   : controlError
-                    ? <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
+                    ? <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
                     : <p className="panel-loading" role="status">请先接管电脑后使用 VSCode。</p>}
               </div>
             )}

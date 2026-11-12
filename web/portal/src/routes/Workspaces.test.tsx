@@ -74,6 +74,43 @@ describe('Workspaces', () => {
     expect(screen.queryByRole('button', { name: /新建云端文件空间/ })).not.toBeInTheDocument();
   });
 
+  it('paginates workspaces and keeps each item action with its workspace', async () => {
+    const second = { ...workspace, id: 'w7654321', name: '其他工作区' };
+    const user = userEvent.setup();
+    renderWorkspaces([workspace, second]);
+
+    expect(screen.getByRole('heading', { name: workspace.name })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: second.name })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `删除工作区 ${workspace.name}` })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: '下一页' }));
+
+    expect(screen.getByRole('heading', { name: second.name })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: workspace.name })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `删除工作区 ${second.name}` })).toBeEnabled();
+  });
+
+  it('keeps the workspace list within the available 480×720 page viewport', () => {
+    const longBinding = { ...binding, sync_state: 'conflict' as const,
+      sync_conflicts: Array.from({ length: 5 }, (_, index) => `docs/long-conflict-name-${index}.md`) };
+    const firstHost = { ...host, workspaces: [longBinding] };
+    renderWorkspaces([workspace], [firstHost]);
+
+    const pagination = screen.getByRole('region', { name: '云端工作区' });
+    expect(pagination).toHaveStyle({ height: 'min(max(calc(100dvh - 320px), 36px), 620px)' });
+    expect(Math.min(Math.max(720 - 320, 36), 620)).toBe(400);
+    const measuredContentHeight = 703;
+    const previousPaginationHeight = 450;
+    const availablePageHeight = 662;
+    const pageChromeHeight = measuredContentHeight - previousPaginationHeight;
+    expect(pageChromeHeight + 400).toBeLessThanOrEqual(availablePageHeight);
+    expect(400 - 36).toBeGreaterThanOrEqual(270);
+    const shortViewportListHeight = Math.min(Math.max(480 - 320, 36), 620);
+    expect(pageChromeHeight + shortViewportListHeight).toBeLessThanOrEqual(480 - 58);
+    expect(screen.getByRole('article', { name: `工作区 ${workspace.name}` })).toBeVisible();
+    expect(screen.getByText(/开发电脑 · 运行中/)).toBeVisible();
+    expect(screen.getByText('docs/long-conflict-name-4.md')).toBeVisible();
+  });
+
   it('explains an initial workspace is waiting for its creating host, not a file transfer', async () => {
     const initial = { ...workspace, revision: 0, used_bytes: 0 };
     const initialBinding = { ...binding, workspace: { ...binding.workspace, revision: 0, used_bytes: 0 },
@@ -568,7 +605,7 @@ describe('Workspaces', () => {
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText('删除中')).toBeInTheDocument();
-    expect(screen.getByRole('columnheader', { name: '已用 / 配额' })).toBeInTheDocument();
+    expect(screen.getByText('已用 / 配额')).toBeInTheDocument();
     expect(screen.getByText('4,096 B / 1,048,576 B')).toBeInTheDocument();
     expect(workspaces).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(workspaces).toHaveBeenCalledTimes(2), { timeout: 4000 });

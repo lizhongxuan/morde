@@ -3,9 +3,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
@@ -71,6 +73,52 @@ func TestConversationRouteGatewayAccountsForTextOnlyDecisionAndRecoversIt(t *tes
 	value.Content = "different"
 	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("mismatched message was accepted: %v", err)
+	}
+}
+
+func TestConversationRouteGatewayKeepsJokesAndTimeAsTasklessReplies(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		message string
+		reply   string
+	}{
+		{name: "joke", message: "讲个笑话", reply: "为什么程序员喜欢黑暗？因为光会产生 bug。"},
+		{name: "time", message: "现在几点了？", reply: "现在是 09:00。"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim, value := routeGatewayFixture()
+			claim.Message.Content, value.Content = test.message, test.message
+			value.TimeZone = "Asia/Shanghai"
+			value.ServerReceivedAt = time.Date(2026, 11, 12, 1, 0, 0, 0, time.UTC)
+			store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+			client := &modelGatewayClientTest{response: ModelResponse{
+				Text:       `{"action":"reply","task_id":"","question":"","reply":"` + test.reply + `"}`,
+				StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3},
+			}}
+			service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
+			if err != nil || decision.Action != ConversationRouteReply || decision.Reply != test.reply || client.calls != 1 ||
+				store.decision == nil || store.decision.Action != ConversationRouteReply || store.reservation.Task != nil ||
+				len(client.request.Tools) != 0 || !strings.Contains(client.request.Instructions, "jokes, and simple questions") {
+				t.Fatalf("ordinary conversation did not remain a taskless reply: decision=%+v err=%v calls=%d", decision, err, client.calls)
+			}
+			var input struct {
+				Message          string `json:"message"`
+				ReferenceTime    string `json:"reference_time"`
+				TimeZone         string `json:"time_zone"`
+				TimeZoneProvided bool   `json:"time_zone_provided"`
+			}
+			if err := json.Unmarshal([]byte(client.request.Input[0].Text), &input); err != nil {
+				t.Fatal(err)
+			}
+			if input.Message != test.message || input.ReferenceTime != "2026-11-12T09:00:00+08:00" ||
+				input.TimeZone != "Asia/Shanghai" || !input.TimeZoneProvided {
+				t.Fatalf("route model received incorrect source time: %+v", input)
+			}
+		})
 	}
 }
 

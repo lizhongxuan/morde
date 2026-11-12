@@ -4,12 +4,17 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 import { useToast } from '../app/toast';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { ScreenPagination } from '../components/ScreenPagination';
+import { FloatingError } from '../components/FloatingError';
 
 type Connector = Awaited<ReturnType<typeof portalApi.mcpConnectors>>['items'][number];
 type ConnectorDraft = { name: string; endpointURL: string; credentialJSON: string };
 type OAuthSetup = { connector: Connector; developerURL: string; redirectURI: string; clientID: string; clientSecret: string };
 type OAuthFlow = { connector: Connector; popup: Window; redirectURI: string; credentialVersion: number };
 const blankDraft: ConnectorDraft = { name: '', endpointURL: '', credentialJSON: '' };
+function connectorListHeight(itemCount: number) {
+  return itemCount <= 2 ? 'min(38dvh, 440px)' : 'min(56dvh, 560px)';
+}
 const connectorPresets = {
   custom: { name: '', endpointURL: '', kind: 'custom' },
   github: { name: 'GitHub', endpointURL: 'https://api.githubcopilot.com/mcp/', kind: 'github' },
@@ -24,6 +29,17 @@ const connectorPresets = {
   google_classroom: { name: 'Google Classroom', endpointURL: 'https://classroommcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
 } as const;
 
+function connectorAddressLabel(value: string) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password) return '服务地址待核对';
+    const address = `${url.host}${url.pathname === '/' ? '' : url.pathname}`;
+    return address.length > 100 ? `${address.slice(0, 97)}…` : address;
+  } catch {
+    return '服务地址待核对';
+  }
+}
+
 function requireHTTPSURL(value: string, label: string): string {
   try {
     const url = new URL(value);
@@ -36,7 +52,8 @@ function requireHTTPSURL(value: string, label: string): string {
 
 function parseCredential(text: string): Record<string, unknown> | undefined {
   if (!text.trim()) return undefined;
-  const parsed: unknown = JSON.parse(text);
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { throw new Error('凭据 JSON 格式无效。'); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('凭据必须是 JSON 对象。');
   return parsed as Record<string, unknown>;
 }
@@ -94,7 +111,7 @@ export function MCPConnectorsPanel() {
       setShowCreate(false);
       await refresh();
       notify('MCP 工具连接已保存。请启用后再用于新任务。', 'success');
-    } catch (error) { notify(error instanceof Error ? error.message : '凭据 JSON 无效。', 'error'); }
+    } catch (error) { notify(errorDetails(error).message, 'error'); }
     finally { setCreating(false); }
   };
   const submitEdit = (event: FormEvent<HTMLFormElement>) => {
@@ -115,7 +132,7 @@ export function MCPConnectorsPanel() {
       setRotating(null);
       await refresh();
       notify('MCP 凭据已加密保存。', 'success');
-    } catch (error) { notify(error instanceof Error ? error.message : '凭据 JSON 无效。', 'error'); }
+    } catch (error) { notify(errorDetails(error).message, 'error'); }
     finally { setSavingCredential(false); }
   };
   const startOAuth = async (connector: Connector, client?: { client_id?: string; client_secret?: string }) => {
@@ -218,6 +235,19 @@ export function MCPConnectorsPanel() {
     };
   }, [client, notify, oauthFlow]);
 
+  const renderConnector = (connector: Connector) => <article className="model-connection-card">
+    <div className="model-connection-main"><div className="model-connection-title"><h3>{connector.name}</h3><span className={`capability ${connector.enabled ? 'capability-yes' : 'capability-no'}`}>{connector.enabled ? '已启用' : '已停用'}</span><span className="capability capability-no">{connector.has_credential ? '凭据已保存' : '无凭据'}</span></div>
+      <p className="muted" title={connectorAddressLabel(connector.endpoint_url)}>{connectorAddressLabel(connector.endpoint_url)}</p><small className="muted">仅用于之后创建的任务；已开始的任务权限保持不变。</small>
+    </div>
+    <div className="model-connection-actions">
+      <button type="button" className="button button-secondary button-small" disabled={Boolean(oauthFlow) || oauthStartingID !== null} onClick={() => { setOAuthSetup(null); void startOAuth(connector); }}>{connector.has_credential ? '重新授权 OAuth' : 'OAuth 授权'}</button>
+      <button type="button" className="button button-secondary button-small" disabled={setEnabled.isPending} onClick={() => setEnabled.mutate({ connector, enabled: !connector.enabled })}>{connector.enabled ? '停用' : '启用'}</button>
+      <button type="button" className="button button-secondary button-small" onClick={() => { setEditing(connector); setEditDraft({ name: connector.name, endpointURL: connector.endpoint_url }); }}>编辑</button>
+      <button type="button" className="button button-secondary button-small" onClick={() => { setRotating(connector); setCredentialJSON(''); }}>更新凭据</button>
+      <button type="button" className="button button-danger-quiet button-small" onClick={() => setRemoving(connector)}>删除</button>
+    </div>
+  </article>;
+
   return <section className="connection-section" aria-labelledby="mcp-connectors-title">
     <div className="connection-section-heading"><div><h2 id="mcp-connectors-title">MCP 工具连接</h2><p className="muted">连接你信任的 MCP 服务；启用的连接只会授权给你之后新建的任务。地址仅支持 HTTPS 公网服务。</p></div>
       <button type="button" className="button button-primary" aria-expanded={showCreate} disabled={creating} onClick={() => setShowCreate((open) => !open)}>{showCreate ? '收起' : '＋ 添加工具连接'}</button>
@@ -244,20 +274,18 @@ export function MCPConnectorsPanel() {
       <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={() => { setShowCreate(false); setDraft(blankDraft); setPresetID('custom'); setGithubToken(''); }}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
     </form>}
     {connectors.isPending ? <div className="loading-card" role="status">正在读取工具连接…</div>
-      : connectors.isError ? <div className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></div>
+      : connectors.isError ? <FloatingError className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>
         : !connectors.data.items.length ? <div className="empty-card connection-empty"><h3>尚未添加 MCP 工具</h3><p>连接器可在发送任务时按需授权，未选择的连接不会提供给任务。</p></div>
-          : <div className="model-connection-list">{connectors.data.items.map((connector) => <article className="model-connection-card" key={connector.id}>
-            <div className="model-connection-main"><div className="model-connection-title"><h3>{connector.name}</h3><span className={`capability ${connector.enabled ? 'capability-yes' : 'capability-no'}`}>{connector.enabled ? '已启用' : '已停用'}</span><span className="capability capability-no">{connector.has_credential ? '凭据已保存' : '无凭据'}</span></div>
-              <p className="muted">{connector.endpoint_url}</p><small className="muted">仅用于之后创建的任务；已开始的任务权限保持不变。</small>
-            </div>
-            <div className="model-connection-actions">
-              <button type="button" className="button button-secondary button-small" disabled={Boolean(oauthFlow) || oauthStartingID !== null} onClick={() => { setOAuthSetup(null); void startOAuth(connector); }}>{connector.has_credential ? '重新授权 OAuth' : 'OAuth 授权'}</button>
-              <button type="button" className="button button-secondary button-small" disabled={setEnabled.isPending} onClick={() => setEnabled.mutate({ connector, enabled: !connector.enabled })}>{connector.enabled ? '停用' : '启用'}</button>
-              <button type="button" className="button button-secondary button-small" onClick={() => { setEditing(connector); setEditDraft({ name: connector.name, endpointURL: connector.endpoint_url }); }}>编辑</button>
-              <button type="button" className="button button-secondary button-small" onClick={() => { setRotating(connector); setCredentialJSON(''); }}>更新凭据</button>
-              <button type="button" className="button button-danger-quiet button-small" onClick={() => setRemoving(connector)}>删除</button>
-            </div>
-          </article>)}</div>}
+        : connectors.data.items.length === 1 ? <div className="model-connection-list">{renderConnector(connectors.data.items[0]!)}</div>
+          : <ScreenPagination
+            items={connectors.data.items}
+            getKey={(connector) => connector.id}
+            estimatedItemHeight={150}
+            height={connectorListHeight(connectors.data.items.length)}
+            ariaLabel="MCP 工具连接列表"
+            className="model-connection-list"
+            renderItem={renderConnector}
+          />}
     {oauthFlow && <div className="loading-card" role="status">正在等待 {oauthFlow.connector.name} 的 OAuth 授权；完成后会自动刷新连接状态。关闭授权窗口可取消。</div>}
     {oauthSetup && <form className="connection-form form-card" aria-label={`配置 ${oauthSetup.connector.name} OAuth 客户端`} onSubmit={submitOAuthSetup}>
       <p>此 MCP 服务需要先创建 OAuth 客户端。请在 <a href={oauthSetup.developerURL} target="_blank" rel="noopener noreferrer">服务商开发者页面</a> 创建后填写客户端信息。</p>

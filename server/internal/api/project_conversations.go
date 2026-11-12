@@ -249,7 +249,7 @@ func acceptProjectConversationMessage(service projectConversationRoutesService) 
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget,
 			MCPConnectorIDs:     request.MCPConnectorIDs,
 			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
-			ModelID: request.ModelID, Content: request.Content, Budget: budget, IdempotencyKey: key,
+			ModelID: request.ModelID, TimeZone: request.TimeZone, Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)

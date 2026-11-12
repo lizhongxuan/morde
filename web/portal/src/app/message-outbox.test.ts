@@ -16,11 +16,18 @@ function entry(request: unknown, attachments = [attachment]): PendingConversatio
 describe('outbox receipt request', () => {
   it('keeps the accepted message, target and attachment slot', () => {
     const original = entry({ client_message_id: 'message-001', content: '完整原文', reference_task_id: 'q1234567',
-      model_id: 'p1234567', workspace_id: 'w1234567', change_task_target: true, client_attachment_ids: [attachment.id] });
+      model_id: 'p1234567', time_zone: 'Asia/Shanghai', workspace_id: 'w1234567', change_task_target: true,
+      client_attachment_ids: [attachment.id] });
     expect(outboxReceiptRequest(original)).toEqual({ client_message_id: 'message-001', content: '完整原文',
-      reference_task_id: 'q1234567', model_id: 'p1234567', workspace_id: 'w1234567', change_task_target: true,
+      reference_task_id: 'q1234567', model_id: 'p1234567', time_zone: 'Asia/Shanghai', workspace_id: 'w1234567', change_task_target: true,
       client_attachment_ids: [attachment.id] });
     expect(original.attachments[0]?.blob).toBe(attachment.blob);
+  });
+
+  it('does not add a time zone to messages persisted before this field existed', () => {
+    expect(outboxReceiptRequest(entry({ client_message_id: 'legacy-message', content: '旧消息' }, []))).toEqual({
+      client_message_id: 'legacy-message', content: '旧消息',
+    });
   });
 
   it('keeps incomplete attachment submissions from losing their slots', () => {

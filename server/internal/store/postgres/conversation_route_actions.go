@@ -219,8 +219,9 @@ WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.role='assistant' AND (
 
 func loadConversationRouteSnapshotInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, lockTasks bool) (app.ConversationRouteSnapshot, error) {
 	value := app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{ActorID: claim.Message.ActorID,
-		Content: claim.Message.Content, ReferenceTaskID: claim.Input.ReferenceTaskID,
-		History: []app.ConversationRouteHistory{}, Candidates: []app.ConversationRouteCandidate{}}}
+		Content: claim.Message.Content, TimeZone: claim.Input.TimeZone, ServerReceivedAt: claim.Message.CreatedAt,
+		ReferenceTaskID: claim.Input.ReferenceTaskID,
+		History:         []app.ConversationRouteHistory{}, Candidates: []app.ConversationRouteCandidate{}}}
 	if claim.Input.ResultReviewID != "" {
 		resultReview, err := loadConversationTaskResultReviewInTx(ctx, tx, claim)
 		if err != nil {

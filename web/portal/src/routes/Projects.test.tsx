@@ -327,6 +327,25 @@ describe('Projects API integration', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('paginates projects and keeps the project action available on later pages', async () => {
+    const projects = Array.from({ length: 4 }, (_, index) => ({
+      ...project, id: `jproject${index + 1}`, name: `项目 ${index + 1}`,
+    }));
+    vi.mocked(projectApi.projects).mockResolvedValue(projects);
+    const user = userEvent.setup();
+    renderProjects();
+
+    expect(await screen.findByRole('button', { name: '查看项目 项目 1' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看项目 项目 4' })).not.toBeInTheDocument();
+    const list = screen.getByRole('region', { name: '项目列表' });
+    await user.click(within(list).getByRole('button', { name: '下一页' }));
+    const lastProject = await within(list).findByRole('button', { name: '查看项目 项目 4' });
+    await user.click(lastProject);
+
+    expect(await screen.findByRole('region', { name: '项目详情' })).toBeInTheDocument();
+    expect(projectApi.getProject).toHaveBeenCalledWith('jproject4');
+  });
+
   it('creates a shared project conversation and selects the returned conversation', async () => {
     let sharedConversations: ProjectConversation[] = [];
     vi.spyOn(projectApi, 'projectConversations').mockImplementation(async () => sharedConversations);
@@ -774,7 +793,7 @@ describe('Projects API integration', () => {
     await user.type(screen.getByLabelText('说明'), '确认已保存版本');
     await user.type(screen.getByLabelText('验收标准（每行一项）'), '版本可读取');
     await user.click(screen.getByRole('button', { name: '创建工作项' }));
-    await screen.findByRole('heading', { name: '部署验收' });
+    await screen.findByText('服务端已创建工作项；没有因此启动 Task。');
     expect(createWorkItem).toHaveBeenCalledWith(project.id, { title: '部署验收', description: '确认已保存版本', acceptance_criteria: ['版本可读取'] }, expect.any(String));
 
     const itemCard = screen.getByRole('heading', { name: '验证发布' }).closest('article');
@@ -799,6 +818,30 @@ describe('Projects API integration', () => {
     expect(delivery).toHaveBeenCalledWith(project.id, workItem.id, { task_id: task.id, workspace_id: 'w0000001', revision: 7, expected_version: 4 }, expect.any(String));
     expect(within(itemCard!).getByText('开放')).toBeInTheDocument();
     expect(within(itemCard!).queryByText(/服务端交付证据/)).not.toBeInTheDocument();
+  });
+
+  it('paginates project work items while keeping actions available on the selected page', async () => {
+    const items = Array.from({ length: 4 }, (_, index) => ({
+      ...workItem, id: `w000000${index + 1}`, title: `工作项 ${index + 1}`,
+    }));
+    vi.mocked(projectApi.workItems).mockResolvedValue(items);
+    const block = vi.spyOn(projectApi, 'blockWorkItem').mockResolvedValue({ ...items[1]!, state: 'blocked', blocked_reason: '等待审批', version: 2 });
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+
+    expect(await screen.findByRole('heading', { name: '工作项 1' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '工作项 2' })).not.toBeInTheDocument();
+    const list = screen.getByRole('region', { name: '项目工作项' });
+    await user.click(within(list).getByRole('button', { name: '下一页' }));
+    const card = screen.getByRole('heading', { name: '工作项 2' }).closest('article');
+    expect(card).not.toBeNull();
+    await user.type(within(card!).getByLabelText('阻塞原因'), '等待审批');
+    await user.click(within(card!).getByRole('button', { name: '阻塞工作项' }));
+
+    await screen.findByText('服务端已确认工作项进入阻塞状态。');
+    expect(block).toHaveBeenCalledWith(project.id, items[1]!.id,
+      { blocked_reason: '等待审批', expected_version: items[1]!.version }, expect.any(String));
   });
 
   it('enables category filters and claims only returned unassigned work items when v2 is advertised', async () => {

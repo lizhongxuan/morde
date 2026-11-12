@@ -3,6 +3,8 @@ import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-q
 import type { components } from '../api/schema';
 import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
+import { ScreenPagination } from '../components/ScreenPagination';
+import { FloatingError } from '../components/FloatingError';
 
 type Notification = components['schemas']['Notification'];
 const kindLabel: Record<Notification['kind'], string> = {
@@ -31,18 +33,26 @@ export function Notifications() {
       <button type="button" className={`button button-small ${unreadOnly ? 'button-secondary' : 'button-primary'}`} aria-pressed={!unreadOnly} onClick={() => setUnreadOnly(false)}>全部</button>
       <button type="button" className={`button button-small ${unreadOnly ? 'button-primary' : 'button-secondary'}`} aria-pressed={unreadOnly} onClick={() => setUnreadOnly(true)}>未读</button>
     </div>
-    {markRead.isError && <p className="form-error notification-error" role="alert">标记已读失败：{errorDetails(markRead.error).message}</p>}
+    {markRead.isError && <FloatingError className="error-inline notification-error" role="alert">标记已读失败：{errorDetails(markRead.error).message}</FloatingError>}
     {notifications.isPending ? <div className="loading-card" role="status">正在加载通知…</div>
-      : notifications.isError && !notifications.data ? <div className="error-card" role="alert">无法读取通知：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.refetch()}>重试</button></div>
+      : notifications.isError && !notifications.data ? <FloatingError className="error-card" role="alert">无法读取通知：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.refetch()}>重试</button></FloatingError>
         : !items.length ? <div className="empty-card"><h2>{unreadOnly ? '没有未读通知' : '还没有通知'}</h2><p>目前没有可查看的历史消息。</p></div>
           : <>
             <p className="muted notification-count">{unreadOnly ? `当前已加载 ${items.length} 条未读通知。` : `当前已加载 ${items.length} 条通知，未读 ${unreadCount} 条。`}</p>
-            <div className="notification-list">{items.map((item) => <article className={`notification-card ${item.read_at ? 'notification-read' : 'notification-unread'}`} key={item.id}>
+            <ScreenPagination
+              items={items}
+              getKey={(item) => item.id}
+              renderItem={(item) => <article className={`notification-card ${item.read_at ? 'notification-read' : 'notification-unread'}`}>
               <header><div><span className={`status ${item.read_at ? 'status-disabled' : 'status-running'}`}><span aria-hidden="true" className="status-dot" />{kindLabel[item.kind]}</span>{item.read_at && <span className="muted">已读</span>}</div><time className="muted" dateTime={item.created_at}>{formatDate(item.created_at)}</time></header>
               <p>{item.redacted || item.summary === null ? '相关内容因当前权限而隐藏。' : item.summary}</p>
               <footer>{!item.read_at && <button type="button" className="button button-quiet button-small" disabled={markRead.isPending} onClick={() => markRead.mutate(item.id)}>标记已读</button>}</footer>
-            </article>)}</div>
-            {notifications.isFetchNextPageError && <div className="error-card notification-pagination-error" role="alert">加载更多通知失败：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.fetchNextPage()}>重试</button></div>}
+            </article>}
+              estimatedItemHeight={150}
+              height="min(50dvh, 560px)"
+              ariaLabel="通知列表"
+              className="notification-list"
+            />
+            {notifications.isFetchNextPageError && <FloatingError className="error-card notification-pagination-error" role="alert">加载更多通知失败：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.fetchNextPage()}>重试</button></FloatingError>}
             {notifications.hasNextPage && !notifications.isFetchNextPageError && <button type="button" className="button button-secondary notification-load-more" disabled={notifications.isFetchingNextPage} onClick={() => void notifications.fetchNextPage()}>{notifications.isFetchingNextPage ? '正在加载…' : '加载更多通知'}</button>}
           </>}
   </section>;

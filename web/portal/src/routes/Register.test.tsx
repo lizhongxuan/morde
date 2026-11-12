@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
 import { AuthProvider } from '../app/auth';
+import { ToastProvider } from '../app/toast';
 import { Login } from './Login';
 import { Register } from './Register';
 
@@ -16,12 +17,12 @@ vi.mock('../app/api', () => ({
 function renderRoute(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData(['auth', 'me'], null);
-  render(<QueryClientProvider client={client}><AuthProvider><MemoryRouter initialEntries={[path]}><Routes>
+  render(<ToastProvider><QueryClientProvider client={client}><AuthProvider><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/register" element={<Register />} />
     <Route path="/login" element={<Login />} />
     <Route path="/assistant" element={<p>助手页面</p>} />
     <Route path="/admin/login" element={<Login defaultTo="/admin/" allowRegister={false} />} />
-  </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
+  </Routes></MemoryRouter></AuthProvider></QueryClientProvider></ToastProvider>);
   return client;
 }
 
@@ -52,7 +53,13 @@ describe('registration page', () => {
     expect(screen.queryByLabelText(/邀请码|短信|手机号/)).not.toBeInTheDocument();
   });
 
-  it('shows form and conflict errors without submitting a mismatched password', async () => {
+  it('uses the Morde logo on the standalone login page without the conversation shell', () => {
+    renderRoute('/login');
+    expect(document.querySelector('.login-brand .morde-brand-mark')).toBeInTheDocument();
+    expect(document.querySelector('.morde-shell')).not.toBeInTheDocument();
+  });
+
+  it('keeps password validation in the form and shows API errors in the fixed notification layer', async () => {
     const user = userEvent.setup();
     renderRoute('/register');
     await user.type(screen.getByRole('textbox', { name: '用户名' }), 'new-user');
@@ -66,7 +73,9 @@ describe('registration page', () => {
     await user.clear(screen.getByLabelText('确认密码'));
     await user.type(screen.getByLabelText('确认密码'), 'secret-pass');
     await user.click(screen.getByRole('button', { name: '注册' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('用户名已被使用，请更换用户名。');
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent('用户名已被使用，请更换用户名。');
+    expect(error.closest('.toast-region')).toBeInTheDocument();
   });
 
   it('keeps registration off the administrator login page', () => {

@@ -5,6 +5,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes, formatCpu, formatDate, formatMemory, hostStateLabel } from '../../app/format';
 import { useToast } from '../../app/toast';
+import { FloatingError } from '../../components/FloatingError';
 
 type AdminUser = Awaited<ReturnType<typeof portalApi.adminUsers>>['items'][number];
 type UnknownModelCall = Awaited<ReturnType<typeof portalApi.adminUnknownModelUsage>>['items'][number];
@@ -127,7 +128,7 @@ function ModelAccountBudgetEditor({ ownerID }: { ownerID: string }) {
       {!query.isPending && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
     {query.isPending && <div className="loading-card" role="status">正在读取模型预算…</div>}
-    {query.isError && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.data && <ModelAccountBudgetForm key={`${query.data.configured}:${query.data.token_limit}:${query.data.max_concurrent}`} ownerID={ownerID} budget={query.data} />}
   </section>;
 }
@@ -184,7 +185,7 @@ function PersonalDataQuotaEditor({ ownerID }: { ownerID: string }) {
       {!query.isPending && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
     {query.isPending && <div className="loading-card" role="status">正在读取个人数据额度…</div>}
-    {query.isError && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.data && <PersonalDataQuotaForm key={`${query.data.version}:${query.data.quota_bytes}:${query.data.max_attachment_bytes}`} ownerID={ownerID} quota={query.data} />}
   </section>;
 }
@@ -203,7 +204,7 @@ function ModelUsageReconciliation({ ownerID }: { ownerID: string }) {
       {opened && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
     {opened && query.isPending && <div className="loading-card" role="status">正在读取待核对记录…</div>}
-    {opened && query.isError && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {opened && query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {opened && query.data && (query.data.items.length === 0
       ? <div className="empty-card compact"><p>没有待核对的模型用量。</p></div>
       : <div className="form-stack">{query.data.items.map((item) => <UnknownModelCallEditor key={`${item.owner_id}:${item.source}:${item.call_id}`} item={item} ownerID={ownerID} />)}</div>)}
@@ -222,12 +223,12 @@ function InstallationHistory({ ownerID }: { ownerID: string }) {
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>Client 安装</h2><p>安装元数据与当前 Portal 进程内的 Hub 在线状态，不含凭证。</p></div></div>
     {query.isPending && <div className="loading-card" role="status">正在读取安装记录…</div>}
-    {query.isError && !query.data && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && !query.data && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !items.length && <div className="empty-card compact"><p>该用户没有 Client 安装记录。</p></div>}
     {!!items.length && <div className="table-wrap"><table><thead><tr><th>安装</th><th>平台</th><th>在线</th><th>创建时间</th><th>最近使用</th><th>撤权时间</th></tr></thead><tbody>
       {items.map((item: Installation) => <tr key={item.id}><td><strong>{item.display_name}</strong><small className="table-sub mono">{item.id}</small></td><td>{item.platform}</td><td>{item.online ? '当前进程在线' : '离线'}</td><td>{formatDate(item.created_at)}</td><td>{item.last_used_at ? formatDate(item.last_used_at) : '无记录'}</td><td>{item.revoked_at ? formatDate(item.revoked_at) : '未撤权'}</td></tr>)}
     </tbody></table></div>}
-    {query.isFetchNextPageError && <div className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></div>}
+    {query.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
     {query.hasNextPage && !query.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多安装'}</button>}
   </section>;
 }
@@ -243,12 +244,12 @@ function AuthorizationHistory({ ownerID }: { ownerID: string }) {
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>客户端授权</h2><p>仅显示已关联到此用户的授权记录；用户码和凭证不会展示。</p></div></div>
     {query.isPending && <div className="loading-card" role="status">正在读取授权记录…</div>}
-    {query.isError && !query.data && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && !query.data && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !items.length && <div className="empty-card compact"><p>没有可归属到该用户的客户端授权记录。</p></div>}
     {!!items.length && <div className="table-wrap"><table><thead><tr><th>授权</th><th>平台</th><th>状态</th><th>创建时间</th><th>到期时间</th><th>认领时间</th></tr></thead><tbody>
       {items.map((item: Authorization) => <tr key={item.id}><td><strong>{item.display_name}</strong><small className="table-sub mono">{item.id}</small></td><td>{item.platform}</td><td>{item.state}</td><td>{formatDate(item.created_at)}</td><td>{formatDate(item.expires_at)}</td><td>{item.claimed_at ? formatDate(item.claimed_at) : '未认领'}</td></tr>)}
     </tbody></table></div>}
-    {query.isFetchNextPageError && <div className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></div>}
+    {query.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
     {query.hasNextPage && !query.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多授权'}</button>}
   </section>;
 }
@@ -264,12 +265,12 @@ function ModelLedgerHistory({ ownerID }: { ownerID: string }) {
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>模型用量账本</h2><p>读取既有 model_call_ledger；只展示模型和计量元数据，不打开请求或响应正文。</p></div></div>
     {query.isPending && <div className="loading-card" role="status">正在读取模型账本…</div>}
-    {query.isError && !query.data && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && !query.data && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !items.length && <div className="empty-card compact"><p>该用户没有模型账本记录。</p></div>}
     {!!items.length && <div className="table-wrap"><table><thead><tr><th>时间</th><th>来源</th><th>模型</th><th>状态</th><th>计量</th></tr></thead><tbody>
       {items.map((item: ModelCall) => <tr key={`${item.source}:${item.call_id}`}><td>{formatDate(item.created_at)}</td><td>{item.source}</td><td><strong>{item.model_id}</strong><small className="table-sub">{item.provider_model}</small></td><td>{item.state}</td><td>{item.input_tokens !== null && item.output_tokens !== null ? `${item.input_tokens} 输入 / ${item.output_tokens} 输出 tokens` : `预留 ${item.reserved_tokens} tokens`}</td></tr>)}
     </tbody></table></div>}
-    {query.isFetchNextPageError && <div className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></div>}
+    {query.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
     {query.hasNextPage && !query.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多账本记录'}</button>}
   </section>;
 }
@@ -280,7 +281,7 @@ function UserEvents({ ownerID }: { ownerID: string }) {
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>账号事件</h2><p>最近 100 条以用户 ID 为目标的审计记录；不展示事件正文。</p></div></div>
     {query.isPending && <div className="loading-card" role="status">正在读取账号事件…</div>}
-    {query.isError && <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>}
+    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !query.data.items.length && <div className="empty-card compact"><p>暂无账号审计事件。</p></div>}
     {!!query.data?.items.length && <div className="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>操作者</th></tr></thead><tbody>
       {query.data.items.map((item) => <tr key={item.id}><td>{formatDate(item.at)}</td><td>{item.action}</td><td className="mono">{item.actor_id || item.actor_kind}</td></tr>)}
@@ -301,7 +302,7 @@ export function AdminUserDetail() {
   if (userQuery.isPending || hosts.isPending || workspaces.isPending) return <div className="loading-card" role="status">正在读取用户信息…</div>;
   if (userQuery.isError || hosts.isError || (workspaces.isError && !workspaces.data)) {
     const error = userQuery.isError ? userQuery.error : hosts.isError ? hosts.error : workspaces.error;
-    return <div className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void userQuery.refetch(); void hosts.refetch(); void workspaces.refetch(); }}>重试</button></div>;
+    return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void userQuery.refetch(); void hosts.refetch(); void workspaces.refetch(); }}>重试</button></FloatingError>;
   }
   const user = userQuery.data;
   if (!user) return <div className="empty-card"><h2>找不到这个用户</h2><p>用户可能已被移除，或当前账号无权查看。</p><Link className="button button-secondary" to="/admin/users">返回用户列表</Link></div>;
@@ -338,7 +339,7 @@ export function AdminUserDetail() {
       {!ownedWorkspaces.length ? <div className="empty-card compact"><p>{workspaces.hasNextPage ? '已加载的记录中暂未找到该用户的工作区，可继续查找。' : '该用户还没有工作区。'}</p></div> : <div className="table-wrap"><table><thead><tr><th>工作区</th><th>状态</th><th>用量</th><th>版本</th><th>绑定电脑</th><th>最近更新</th></tr></thead><tbody>
         {ownedWorkspaces.map((workspace) => <tr key={workspace.id}><td><Link className="admin-table-link" to={`/admin/workspaces/${encodeURIComponent(workspace.id)}`}><strong>{workspace.name || workspace.id}</strong><small className="table-sub mono">{workspace.id}</small></Link></td><td><span className={`status status-${workspace.state}`}>{workspace.state === 'ready' ? '可用' : '删除中'}</span></td><td>{formatBytes(workspace.used_bytes)} / {formatBytes(workspace.quota_bytes)}</td><td>v{workspace.revision}</td><td>{workspace.bindings.length ? workspace.bindings.map((binding) => <Link className="admin-binding-link" to={`/admin/hosts/${encodeURIComponent(binding.host_id)}`} key={binding.host_id}>{binding.host_name || binding.host_id}<small>{binding.state === 'active' && binding.applied_revision === binding.desired_revision ? '已应用' : binding.state === 'preparing' ? '正在应用' : binding.state}</small></Link>) : '未绑定'}</td><td>{formatDate(workspace.updated_at)}</td></tr>)}
       </tbody></table></div>}
-      {workspaces.isFetchNextPageError && <div className="error-card admin-pagination-error" role="alert">{errorDetails(workspaces.error).message}<button className="button button-secondary" type="button" onClick={() => void workspaces.fetchNextPage()}>重试</button></div>}
+      {workspaces.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(workspaces.error).message}<button className="button button-secondary" type="button" onClick={() => void workspaces.fetchNextPage()}>重试</button></FloatingError>}
       {workspaces.hasNextPage && !workspaces.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={workspaces.isFetchingNextPage} onClick={() => void workspaces.fetchNextPage()}>{workspaces.isFetchingNextPage ? '正在加载…' : ownedWorkspaces.length ? '加载更多工作区' : '继续查找工作区'}</button>}
     </section>
     <p className="notice notice-info admin-detail-note">禁用登录不会自动关闭已有云端电脑。</p>

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,6 +81,24 @@ type releaseHostRequest struct {
 	ConfirmProcessTermination bool `json:"confirm_process_termination"`
 }
 
+type issueHostEmbedTicketRequest struct {
+	ConversationID string   `json:"conversation_id"`
+	Target         string   `json:"target"`
+	Targets        []string `json:"targets"`
+}
+
+type hostEmbedTicketResponse struct {
+	ExchangeURL string    `json:"exchange_url"`
+	Ticket      string    `json:"ticket"`
+	EmbedNonce  string    `json:"embed_nonce"`
+	Targets     []string  `json:"targets"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+type hostEmbedTicketIssuer interface {
+	IssueEmbedTicket(context.Context, identity.Principal, app.HostEmbedTicketCommand) (app.HostEmbedTicket, error)
+}
+
 func (h *api) registerHosts(group *gin.RouterGroup) {
 	group.GET("/hosts", h.listHosts)
 	group.GET("/shared-hosts", h.listSharedHosts)
@@ -95,11 +114,87 @@ func (h *api) registerHosts(group *gin.RouterGroup) {
 	group.POST("/hosts/:id/restore", h.restoreHost)
 	group.POST("/hosts/:id/renew", h.renewHost)
 	group.POST("/hosts/:id/enter", h.enterHost)
+	group.POST("/hosts/:id/embed-tickets", h.issueHostEmbedTicket)
 	group.GET("/hosts/:id/preview-auth", h.previewAuth)
 	group.POST("/hosts/:id/observation-ticket", h.issueObservationTicket)
 	group.POST("/hosts/:id/members", h.inviteHostMember)
 	group.GET("/hosts/:id/members", h.listHostMembers)
 	group.DELETE("/hosts/:id/members/:user_id", h.revokeHostMember)
+}
+
+func (h *api) issueHostEmbedTicket(c *gin.Context) {
+	c.Header("Cache-Control", "no-store, private")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
+	if h.deps.HostSharing == nil || h.deps.Conversations == nil {
+		writeError(c, domain.NewError(domain.CodeUnsupported, "embedded Host access is unavailable"))
+		return
+	}
+	issuer, ok := h.deps.HostSharing.(hostEmbedTicketIssuer)
+	if !ok {
+		writeError(c, domain.NewError(domain.CodeUnsupported, "embedded Host access is unavailable"))
+		return
+	}
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	hostID, ok := safeID(c, "id", domain.ValidHostID)
+	if !ok {
+		return
+	}
+	if c.Request.URL.RawQuery != "" {
+		writeError(c, domain.InvalidArgument("query", "embed ticket query parameters are not supported"))
+		return
+	}
+	origin := h.options.HostScheme + "://" + h.options.PortalDomain
+	if c.GetHeader("Origin") != origin {
+		writeError(c, domain.NewError(domain.CodeForbidden, "request origin is not allowed"))
+		return
+	}
+	if !domain.ValidServiceInstanceID(h.options.ServiceInstanceID) {
+		writeError(c, domain.NewError(domain.CodeUnsupported, "embedded Host access is unavailable"))
+		return
+	}
+	var request issueHostEmbedTicketRequest
+	if !decodeStrictJSON(c, &request) {
+		return
+	}
+	if !domain.ValidConversationID(request.ConversationID) || !validHostEmbedTarget(request.Target) {
+		writeError(c, domain.InvalidArgument("request", "embed ticket request is invalid"))
+		return
+	}
+	conversationValue, err := h.deps.Conversations.Get(c.Request.Context(), principal, request.ConversationID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	if conversationValue.ID != request.ConversationID || conversationValue.OwnerID != principal.UserID {
+		writeError(c, domain.NewError(domain.CodeNotFound, "conversation not found"))
+		return
+	}
+	issued, err := issuer.IssueEmbedTicket(c.Request.Context(), principal, app.HostEmbedTicketCommand{
+		HostID: hostID, ConversationID: request.ConversationID, Target: request.Target, Targets: request.Targets,
+		ServiceInstanceID: h.options.ServiceInstanceID, PortalOrigin: origin,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, hostEmbedTicketResponse{
+		ExchangeURL: issued.ExchangeURL, Ticket: issued.Ticket, EmbedNonce: issued.EmbedNonce,
+		Targets: issued.Targets, ExpiresAt: issued.ExpiresAt,
+	})
+}
+
+func validHostEmbedTarget(target string) bool {
+	switch target {
+	case app.HostEmbedTargetBrowser, app.HostEmbedTargetTerminal, app.HostEmbedTargetWorkspace, app.HostEmbedTargetFiles, app.HostEmbedTargetVSCode:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *api) releaseHost(c *gin.Context) {

@@ -15,7 +15,8 @@ export function RecoverableError({
 }) {
   const navigate = useNavigate();
   const goBack = () => {
-    if (window.history.length > 1) navigate(-1);
+    const index = (window.history.state as { idx?: unknown } | null)?.idx;
+    if (typeof index === 'number' && Number.isInteger(index) && index > 0) navigate(-1);
     else navigate(homePath, { replace: true });
   };
   return <main className="loading-page">

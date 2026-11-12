@@ -34,23 +34,25 @@ const (
 )
 
 type Deps struct {
-	Config           config.Gateway
-	Domains          config.Domains
-	Security         config.Security
-	Hosts            app.HostService
-	HostSharing      app.HostSharingService
-	WorkspaceFiles   hostWorkspaceFileService
-	TaskObservation  taskWorkbenchObservationService
-	Control          ControlService
-	Runtime          app.HostRuntime
-	ActivityLeases   app.HostActivityLeaseStore
-	InputPermits     app.HostInputPermitStore
-	TerminalSessions app.TerminalSessionStore
-	TerminalAIO      terminalSessionAIO
-	Auth             app.Verifier
-	Audit            app.AuditWriter
-	Logger           *zap.Logger
-	Metrics          prometheus.Registerer
+	Config            config.Gateway
+	Domains           config.Domains
+	Security          config.Security
+	Hosts             app.HostService
+	HostSharing       app.HostSharingService
+	HostEmbedTickets  app.HostEmbedTicketExchanger
+	ServiceInstanceID string
+	WorkspaceFiles    hostWorkspaceFileService
+	TaskObservation   taskWorkbenchObservationService
+	Control           ControlService
+	Runtime           app.HostRuntime
+	ActivityLeases    app.HostActivityLeaseStore
+	InputPermits      app.HostInputPermitStore
+	TerminalSessions  app.TerminalSessionStore
+	TerminalAIO       terminalSessionAIO
+	Auth              app.Verifier
+	Audit             app.AuditWriter
+	Logger            *zap.Logger
+	Metrics           prometheus.Registerer
 }
 
 type gateway struct {
@@ -132,6 +134,7 @@ func New(d Deps) (http.Handler, error) {
 	g.engine.Use(base...)
 	g.engine.Use(g.parseRequestHost())
 	g.engine.GET("/__ch/auth", g.consumeTicket)
+	g.engine.POST("/__ch/embed-auth", g.exchangeEmbedTicket)
 	if d.TaskObservation != nil {
 		g.engine.GET("/__ch/task-auth", g.exchangeTaskObservationTicket)
 		g.engine.GET("/__ch/api/tasks/:task_id", g.taskObservationReadAuth(), g.getTaskObservationSnapshot)

@@ -3,13 +3,13 @@ import { Link, NavLink, Outlet, useLocation, useNavigate, useNavigationType } fr
 import { useAuth } from '../app/auth';
 import { errorDetails } from '../app/api';
 import { useToast } from '../app/toast';
+import { ConfirmDialog } from './ConfirmDialog';
 import { MordeIcon, type MordeIconName } from './MordeIcon';
 
 const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
   { to: '/assistant', label: '对话', icon: 'spark' },
   { to: '/personal', label: '个人数据', icon: 'user' },
   { to: '/goals', label: '目标与计划', icon: 'target' },
-  { to: '/connections', label: '设置', icon: 'settings' },
 ];
 
 const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
@@ -67,11 +67,13 @@ export function PortalLayout() {
   const location = useLocation();
   const navigationType = useNavigationType();
   const [contextSidebarCollapsed, setContextSidebarCollapsed] = useState(readContextSidebarCollapsed);
+  const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   const routeHistory = useRef([{ key: location.key, url: `${location.pathname}${location.search}${location.hash}` }]);
   const routeHistoryIndex = useRef(0);
   const pageNavigation = pageNavigationFor(location.pathname);
+  const hasCollapsibleSidebar = Boolean(pageNavigation) || location.pathname === '/assistant';
 
   useEffect(() => {
     const current = { key: location.key, url: `${location.pathname}${location.search}${location.hash}` };
@@ -102,16 +104,25 @@ export function PortalLayout() {
       <button type="button" className="morde-top-control" aria-label="返回上一页" title="返回上一页" disabled={!canGoBack} onClick={() => navigate(-1)}><MordeIcon name="back" /></button>
       <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={() => navigate(1)}><MordeIcon name="forward" /></button>
       <span className="morde-top-divider" aria-hidden="true" />
-      <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>
+      {hasCollapsibleSidebar && <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>}
     </div><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><MordeIcon name="monitor" /></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">
-        {primaryLinks.map(({ to, label, icon, end }) => <NavLink className={({ isActive }) => `morde-nav-link${to === '/connections' && ['/connections', '/hosts', '/clients', '/apikeys', '/settings'].includes(location.pathname) ? ' active' : isActive ? ' active' : ''}`} to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
+        {primaryLinks.map(({ to, label, icon, end }) => <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
       </nav>
       <div className="morde-sidebar-bottom">
-        {(user?.role === 'admin' || user?.role === 'super_admin') && <a className="morde-nav-link" href="/admin/" aria-label="切换至管理后台" title="切换至管理后台"><MordeIcon name="link" /><span>切换至管理后台</span></a>}
-        <div className="morde-profile"><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span><strong>{user?.name}</strong><small>PC 用户端</small></span><button className="button button-quiet button-small morde-profile-logout" type="button" onClick={() => void logout()} aria-label="退出登录"><MordeIcon name="logout" /><span>退出</span></button></div>
+        <div className="morde-profile">
+          <details className="morde-account-menu">
+            <summary className="morde-avatar" aria-label="账号菜单" title="账号菜单">{user?.name.slice(0, 1) || 'M'}</summary>
+            <div className="morde-account-menu-popover">
+              <strong>{user?.name}</strong><small>PC 用户端</small>
+              <NavLink to="/connections" className="morde-account-menu-action" aria-label="设置" title="设置"><MordeIcon name="settings" />设置</NavLink>
+              {(user?.role === 'admin' || user?.role === 'super_admin') && <a className="morde-account-menu-action" href="/admin/" aria-label="切换至管理后台"><MordeIcon name="link" />切换至管理后台</a>}
+              <button className="morde-account-menu-action morde-profile-logout" type="button" onClick={() => setLogoutConfirmationOpen(true)} aria-label="退出登录" title="退出登录"><MordeIcon name="logout" />退出登录</button>
+            </div>
+          </details>
+        </div>
       </div>
     </aside>
     {pageNavigation && <aside id="context-sidebar" className="page-navigation" aria-label={`${pageNavigation.title}子菜单`}>
@@ -125,5 +136,6 @@ export function PortalLayout() {
     <main className="morde-main">
       <div id="main-content" className="morde-page" tabIndex={-1}><Outlet /></div>
     </main>
+    {logoutConfirmationOpen && <ConfirmDialog title="退出登录" description="确定要退出 Morde 吗？退出后需要重新登录才能继续使用。" confirmLabel="退出登录" danger onClose={() => setLogoutConfirmationOpen(false)} onConfirm={() => { setLogoutConfirmationOpen(false); void logout(); }} />}
   </div>;
 }

@@ -172,7 +172,7 @@ JOIN task_revision_intents i ON i.message_id=r.message_id WHERE r.message_id=$1`
 		{results[0].Task.ID, "waiting_user"},
 		{results[1].Task.ID, "failed"},
 	} {
-		if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status=$2,waiting_reason=CASE WHEN $2='waiting_user' THEN 'clarification_needed' ELSE NULL END,
+		if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status=$2,waiting_reason=CASE WHEN $2='waiting_user' THEN 'clarification_needed' ELSE '' END,
 finished_at=CASE WHEN $2 IN ('completed','failed') THEN clock_timestamp() ELSE NULL END WHERE id=$1`, update.id, update.status); err != nil {
 			t.Fatalf("set task %s status to %s: %v", update.id, update.status, err)
 		}
@@ -180,6 +180,11 @@ finished_at=CASE WHEN $2 IN ('completed','failed') THEN clock_timestamp() ELSE N
 	active, err := store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewActive, app.PageRequest{Limit: 10})
 	if err != nil || len(active.Items) != 1 || active.Items[0].ID != results[0].Task.ID || active.PendingCountsByHostID[""] != 1 {
 		t.Fatalf("active conversation task view = %+v, err=%v", active, err)
+	}
+	equalCreatedAt := time.Now().UTC().Add(-time.Minute)
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET created_at=$2 WHERE id = ANY($1::text[])`,
+		[]string{first.Task.ID, results[1].Task.ID}, equalCreatedAt); err != nil {
+		t.Fatalf("set equal task timestamps for pagination: %v", err)
 	}
 	recent, err := store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewRecent, app.PageRequest{Limit: 1})
 	if err != nil || len(recent.Items) != 1 || recent.NextCursor == "" {

@@ -37045,6 +37045,20 @@
         }
       }
     },
+    "Cloud personal data could not be refreshed. Local changes are preserved." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Cloud-Personendaten konnten nicht aktualisiert werden. Lokale Änderungen bleiben erhalten." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cloud personal data could not be refreshed. Local changes are preserved." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se pudieron actualizar los datos personales de la nube. Los cambios locales se conservan." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Impossible d’actualiser les données personnelles du cloud. Les modifications locales sont conservées." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "クラウドの個人データを更新できませんでした。ローカルの変更は保持されています。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "클라우드 개인 데이터를 새로 고칠 수 없습니다. 로컬 변경 사항은 보존됩니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось обновить личные данные в облаке. Локальные изменения сохранены." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法刷新云端个人数据，本地修改已保留。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法重新整理雲端個人資料，本機變更已保留。" } }
+      }
+    },
     "Cloud execution is disabled" : {
       "comment" : "Morde cloud execution control",
       "localizations" : {

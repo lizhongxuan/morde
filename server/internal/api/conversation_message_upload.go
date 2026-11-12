@@ -30,6 +30,7 @@ type initializeMessageUploadRequest struct {
 	ClientAttachmentIDs     []string           `json:"client_attachment_ids"`
 	ApplicationID           string             `json:"application_id"`
 	ModelID                 string             `json:"model_id"`
+	TimeZone                string             `json:"time_zone,omitempty"`
 	Budget                  *taskBudgetRequest `json:"budget"`
 }
 
@@ -151,7 +152,7 @@ func registerConversationMessageUploads(group *gin.RouterGroup, service TaskServ
 					ProjectID: scope.ProjectID, ServiceInstanceID: scope.InstanceID, ClientMessageID: scope.ClientID, IdempotencyKey: key,
 					PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
 					HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget, MCPConnectorIDs: request.MCPConnectorIDs,
-					ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID, ModelID: request.ModelID, Budget: budget,
+					ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID, ModelID: request.ModelID, TimeZone: request.TimeZone, Budget: budget,
 				}, TotalBytes: request.TotalBytes, TotalChunks: request.TotalChunks, SHA256: request.SHA256})
 			if err != nil {
 				writeError(c, err)

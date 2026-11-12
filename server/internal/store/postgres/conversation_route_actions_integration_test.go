@@ -292,15 +292,18 @@ func TestConversationRouteDefaultComputerDoesNotChangeRevisionTargetContext(t *t
 func TestConversationRouteDirectReplyIsAtomicAndIdempotent(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
-	claim := f.receive(t, "route-direct-reply-001", "What is 6 times 7?", app.ConversationRoutingInput{})
+	claim := f.receive(t, "route-direct-reply-001", "讲个笑话", app.ConversationRoutingInput{TimeZone: "Asia/Shanghai"})
 	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if snapshot.Context.TimeZone != "Asia/Shanghai" || !snapshot.Context.ServerReceivedAt.Equal(claim.Message.CreatedAt) {
+		t.Fatalf("route snapshot lost receipt time context: %+v claim=%+v", snapshot.Context, claim.Message)
+	}
 	snapshot.Context.ModelID = "p1234567"
-	answer := "42."
+	answer := "程序员最怕什么冷？当然是没有缓存的冷启动。"
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: answer,
-		ModelOutput: `{"action":"reply","task_id":"","question":"","reply":"42."}`}
+		ModelOutput: `{"action":"reply","task_id":"","question":"","reply":"程序员最怕什么冷？当然是没有缓存的冷启动。"}`}
 
 	invalid := []app.ConversationRouteDecision{
 		{Action: app.ConversationRouteReply},

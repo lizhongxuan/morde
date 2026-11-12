@@ -371,10 +371,9 @@
       .platform-preview { gap: 4px; }
       .platform-preview select { min-width: 72px; max-width: 78px; }
     }
-    .page-navigation { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; min-width: 0; padding: 0 10px 11px; border-right: 1px solid var(--line); background: #fafaf9; }
+    .page-navigation { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; min-width: 0; padding: 14px 10px 11px; border-right: 1px solid var(--line); background: #fafaf9; }
     .page-navigation .platform-preview { margin-top: auto; padding: 10px 7px 0; border-top: 1px solid #efefed; }
     .platform-preview label { white-space: nowrap; }
-    .page-nav-title { display: flex; align-items: center; min-height: 60px; padding: 16px 4px 10px; color: #34383e; font-size: 16px; font-weight: 650; }
     .page-nav-tabs { display: flex; flex-direction: column; gap: 3px; }
     .page-nav-tabs button { display: flex; align-items: center; gap: 9px; width: 100%; min-width: 0; min-height: 36px; padding: 8px 9px; border: 0; border-radius: 7px; color: #636973; background: transparent; text-align: left; }
     .page-nav-tabs button:hover { background: #f0f0ee; }
@@ -521,7 +520,6 @@
 
     <aside class="page-navigation" id="pageNavigation" aria-label="页面子菜单" hidden>
       <section data-page-menu="settings">
-        <div class="page-nav-title">设置与授权</div>
         <div class="page-nav-tabs" role="tablist" aria-label="设置分类" aria-orientation="vertical">
           <button class="active" type="button" role="tab" id="tab-settings-models" aria-controls="settings-models" aria-selected="true" data-settings-tab="models"><svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg>模型与工具</button>
           <button type="button" role="tab" id="tab-settings-computers" aria-controls="settings-computers" aria-selected="false" data-settings-tab="computers"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg>云端电脑</button>
@@ -531,7 +529,6 @@
         </div>
       </section>
       <section data-page-menu="personal" hidden>
-        <div class="page-nav-title">个人数据</div>
         <div class="page-nav-tabs" role="tablist" aria-label="个人数据分类" aria-orientation="vertical">
           <button class="active" type="button" role="tab" id="tab-personal-profile" aria-controls="personal-profile" aria-selected="true" data-personal-tab="profile"><svg class="icon" aria-hidden="true"><use href="#i-user"/></svg>个人资料</button>
           <button type="button" role="tab" id="tab-personal-personality" aria-controls="personal-personality" aria-selected="false" data-personal-tab="personality"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg>AI 个性</button>
@@ -543,7 +540,6 @@
         </div>
       </section>
       <section data-page-menu="goals" hidden>
-        <div class="page-nav-title">目标与计划</div>
         <div class="page-nav-tabs" role="tablist" aria-label="目标与计划分类" aria-orientation="vertical">
           <button class="active" type="button" role="tab" id="tab-goal-targets" aria-controls="goal-targets" aria-selected="true" data-goal-tab="targets"><svg class="icon" aria-hidden="true"><use href="#i-target"/></svg>目标</button>
           <button type="button" role="tab" id="tab-goal-schedules" aria-controls="goal-schedules" aria-selected="false" data-goal-tab="schedules"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg>定时计划</button>

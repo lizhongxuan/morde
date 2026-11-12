@@ -151,6 +151,18 @@ type testVerifier struct {
 	ticket        app.Ticket
 	consumed      map[string]int
 	clientRevoked bool
+	embedRevoked  bool
+	embedChecks   int
+}
+
+func (v *testVerifier) ValidateHostEmbedCredential(_ context.Context, tokenID, actorID, installationID string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.embedChecks++
+	if tokenID != "t1234567" || actorID != testUserID || installationID != "" || v.embedRevoked {
+		return identity.ErrInvalidCredential
+	}
+	return nil
 }
 
 type testActivityLeaseStore struct {
@@ -599,7 +611,8 @@ func TestCookieAuthHostAPIAndLogout(t *testing.T) {
 		t.Fatalf("host response has incorrect or private fields: %s", hostResponse.Body.String())
 	}
 	logout := request(handler, http.MethodPost, hostAuthority(), "/__ch/logout", nil, hostCookieName+"="+cookie, "")
-	if logout.Code != http.StatusNoContent || len(logout.Result().Cookies()) != 1 || logout.Result().Cookies()[0].MaxAge != -1 {
+	clearedCookies := logout.Result().Cookies()
+	if logout.Code != http.StatusNoContent || len(clearedCookies) != 2 || clearedCookies[0].MaxAge != -1 || clearedCookies[1].MaxAge != -1 {
 		t.Fatalf("logout response = %d, %#v", logout.Code, logout.Result().Cookies())
 	}
 }

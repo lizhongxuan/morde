@@ -201,7 +201,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 	}
 	if err := w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, decision); err != nil {
-		if claim.Input.ResultReviewID != "" && domain.CodeOf(err) == domain.CodeConflict {
+		if domain.CodeOf(err) == domain.CodeConflict && (claim.Input.ResultReviewID != "" || routeCtx.Err() == nil) {
 			return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 		}
 		if domain.CodeOf(err) == domain.CodeConflict || routeCtx.Err() != nil {

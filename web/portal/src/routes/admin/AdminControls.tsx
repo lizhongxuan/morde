@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatDate } from '../../app/format';
+import { FloatingError } from '../../components/FloatingError';
 
 type ControlsData = Awaited<ReturnType<typeof portalApi.adminControls>>;
 type ControlRule = ControlsData['rules'][number];
@@ -29,10 +30,10 @@ function isConflict(error: unknown) {
 }
 
 function ErrorCard({ error, retry }: { error: unknown; retry: () => void }) {
-  return <div className="error-card" role="alert">
+  return <FloatingError className="error-card" role="alert">
     {errorMessage(error)}
     <button type="button" className="button button-secondary" onClick={retry}>重试</button>
-  </div>;
+  </FloatingError>;
 }
 
 function draftFor(rule: ControlRule): RuleDraft {
@@ -64,7 +65,7 @@ function RuleEditor({
 }) {
   if (confirming) return <div className="notice notice-warning" role="group" aria-label={`确认修改通知规则 ${rule.id}`}>
     <p>确认将规则 #{rule.id} 更新为账号数 {draft.threshold}、{draft.enabled ? '启用' : '停用'}？{draft.rearm ? '并重新武装规则。' : ''}</p>
-    {!!mutationError && <p role="alert">{errorMessage(mutationError)}</p>}
+    {!!mutationError && <FloatingError className="error-inline" role="alert">{errorMessage(mutationError)}</FloatingError>}
     <div className="inline-actions"><button type="button" className="button button-secondary button-small" disabled={pending} onClick={onCancel}>取消</button><button type="button" className="button button-primary button-small" disabled={pending} onClick={onConfirm}>{pending ? '保存中…' : '确认保存'}</button></div>
   </div>;
 
@@ -75,8 +76,8 @@ function RuleEditor({
       <div className="connection-form-wide"><label htmlFor={`control-edit-note-${rule.id}`}>备注</label><input id={`control-edit-note-${rule.id}`} value={draft.note} onChange={(event) => setDraft({ ...draft, note: event.target.value })} /></div>
       {rule.last_fired_at && <label className="connection-form-wide"><input type="checkbox" checked={draft.rearm} onChange={(event) => setDraft({ ...draft, rearm: event.target.checked })} /> 重新武装此规则，允许它再次触发</label>}
     </div>
-    {validationError && <p role="alert" className="form-error">{validationError}</p>}
-    {!!mutationError && <p role="alert" className="form-error">{errorMessage(mutationError)}</p>}
+    {validationError && <FloatingError>{validationError}</FloatingError>}
+    {!!mutationError && <FloatingError className="error-inline" role="alert">{errorMessage(mutationError)}</FloatingError>}
     <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>取消</button><button type="submit" className="button button-primary">继续保存</button></div>
   </form>;
 }
@@ -201,7 +202,7 @@ export function AdminControls() {
   const changeDisabled = versionConflict || !data?.notify_configured || create.isPending || update.isPending || remove.isPending;
 
   return <section className="admin-content">
-    {versionConflict && <div className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></div>}
+    {versionConflict && <FloatingError className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></FloatingError>}
     {notice && <p className="notice notice-info" role="status">{notice}</p>}
 
     {query.isPending ? <div className="loading-card" role="status">正在加载通知规则…</div>
@@ -225,8 +226,8 @@ export function AdminControls() {
                 <div><label htmlFor="admin-control-threshold">账号阈值</label><input id="admin-control-threshold" type="number" min={1} step={1} required value={createDraft.threshold} onChange={(event) => setCreateDraft({ ...createDraft, threshold: event.target.value })} /></div>
                 <div className="connection-form-wide"><label htmlFor="admin-control-note">备注</label><input id="admin-control-note" value={createDraft.note} onChange={(event) => setCreateDraft({ ...createDraft, note: event.target.value })} /></div>
               </div>
-              {createValidationError && <p className="form-error" role="alert">{createValidationError}</p>}
-              {createError && <p className="form-error" role="alert">{createError}</p>}
+              {createValidationError && <FloatingError>{createValidationError}</FloatingError>}
+              {createError && <FloatingError className="error-inline" role="alert">{createError}</FloatingError>}
               <button type="submit" className="button button-primary" disabled={changeDisabled}>继续创建</button>
             </form>
             {createConfirmation && <div className="notice notice-warning" role="group" aria-label="确认创建通知规则">
@@ -248,7 +249,7 @@ export function AdminControls() {
                   {edit?.rule.id === rule.id && <tr><td colSpan={6}><RuleEditor rule={edit.rule} draft={edit.draft} setDraft={(draft) => setEdit({ ...edit, draft })} confirming={edit.confirming} pending={update.isPending} validationError={editValidationError} mutationError={update.error} onSubmit={submitEdit} onConfirm={confirmEdit} onCancel={() => { setEdit(null); update.reset(); }} /></td></tr>}
                   {deleteRule?.id === rule.id && <tr><td colSpan={6}><div className="notice notice-warning" role="group" aria-label={`确认删除通知规则 ${rule.id}`}>
                     <p>确认删除阈值为 {formatNumber(rule.threshold)} 的通知规则？此操作会阻止该规则后续触发。</p>
-                    {remove.isError && <p role="alert">{errorMessage(remove.error)}</p>}
+                    {remove.isError && <FloatingError className="error-inline" role="alert">{errorMessage(remove.error)}</FloatingError>}
                     <div className="inline-actions"><button type="button" className="button button-secondary button-small" disabled={remove.isPending} onClick={() => { setDeleteRule(null); remove.reset(); }}>取消</button><button type="button" className="button button-danger-quiet button-small" disabled={changeDisabled} onClick={() => remove.mutate(rule)}>{remove.isPending ? '正在删除…' : '确认删除'}</button></div>
                   </div></td></tr>}
                 </Fragment>)}

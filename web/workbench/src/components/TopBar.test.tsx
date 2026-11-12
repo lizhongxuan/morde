@@ -16,7 +16,21 @@ const controlProps = {
 describe('TopBar countdown', () => {
   afterEach(() => {
     cleanup();
+    Reflect.deleteProperty(window, 'morde');
     vi.useRealTimers();
+  });
+
+  it('provides a safe return-to-computer-list action only in the standalone Host window', () => {
+    const returnToPortalHosts = vi.fn(() => Promise.resolve({ returned: true }));
+    Object.defineProperty(window, 'morde', { configurable: true, value: { returnToPortalHosts } });
+    const props = { host: null, renewing: false, onRenew: vi.fn(), ...controlProps };
+    const { rerender } = render(<TopBar {...props} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '返回云端电脑' }));
+    expect(returnToPortalHosts).toHaveBeenCalledOnce();
+
+    rerender(<TopBar {...props} embedded />);
+    expect(screen.queryByRole('button', { name: '返回云端电脑' })).not.toBeInTheDocument();
   });
 
   it('updates the remaining time once per second and marks expired hosts', async () => {

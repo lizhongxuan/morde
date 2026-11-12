@@ -986,7 +986,7 @@ func TestConversationMessageRequiresMatchingIdempotencyKey(t *testing.T) {
 
 func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 	service := &taskServiceStub{acceptReplayed: true}
-	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader("{\"client_message_id\":\"message-0001\",\"previous_client_message_id\":\"message-0000\",\"reference_task_id\":\"q1234567\",\"host_id\":\"h1234567\",\"workspace_id\":\"w1234567\",\"change_task_target\":true,\"mcp_connector_ids\":[\"kbbbbbbb\"],\"client_attachment_ids\":[\"client-file-0001\"],\"application_id\":\"wechat\",\"model_id\":\"model-a\",\"content\":\"hello\"}"))
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader("{\"client_message_id\":\"message-0001\",\"previous_client_message_id\":\"message-0000\",\"reference_task_id\":\"q1234567\",\"host_id\":\"h1234567\",\"workspace_id\":\"w1234567\",\"change_task_target\":true,\"mcp_connector_ids\":[\"kbbbbbbb\"],\"client_attachment_ids\":[\"client-file-0001\"],\"application_id\":\"wechat\",\"model_id\":\"model-a\",\"time_zone\":\"Asia/Shanghai\",\"content\":\"hello\"}"))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "message-0001")
 	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
@@ -1003,7 +1003,7 @@ func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 		!service.acceptCommand.ChangeTaskTarget ||
 		len(service.acceptCommand.MCPConnectorIDs) != 1 || service.acceptCommand.MCPConnectorIDs[0] != "kbbbbbbb" ||
 		len(service.acceptCommand.ClientAttachmentIDs) != 1 || service.acceptCommand.ClientAttachmentIDs[0] != "client-file-0001" ||
-		service.acceptCommand.ApplicationID != "wechat" || service.acceptCommand.ModelID != "model-a" ||
+		service.acceptCommand.ApplicationID != "wechat" || service.acceptCommand.ModelID != "model-a" || service.acceptCommand.TimeZone != "Asia/Shanghai" ||
 		service.acceptCommand.Content != "hello" || body.Message.ID != "m1234567" ||
 		body.Message.ClientMessageID != "message-0001" || body.Message.TaskID != "" ||
 		body.Message.ConversationID != "c1234567" || body.Message.RoutingStatus != conversation.RoutingPending ||

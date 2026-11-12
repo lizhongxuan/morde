@@ -38,6 +38,9 @@ func (g *gateway) authenticate(c *gin.Context) bool {
 		writeNotFound(c)
 		return false
 	}
+	if cookie, err := c.Request.Cookie(embedCookieName); err == nil {
+		return g.authenticateEmbed(c, cookie.Value)
+	}
 	if c.GetHeader("Authorization") != "" {
 		g.authFailure(c, "host_cookie")
 		return false
@@ -187,6 +190,9 @@ func validTerminalSessionQuery(request *http.Request) bool {
 }
 
 func (g *gateway) memberAuthorizationCheck(c *gin.Context) func(context.Context) error {
+	if _, embedded := g.embedClaimsFrom(c); embedded {
+		return g.embedAuthorizationCheck(c, hostRefFrom(c), host.Permission(c.GetString("gateway.embed_required_permission")))
+	}
 	memberValue, _ := c.Get("gateway.member")
 	member := memberValue == true
 	permission := host.Permission(c.GetString("gateway.member_permission"))

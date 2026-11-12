@@ -1,0 +1,169 @@
+.morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .hosts-page) {
+  min-height: 0;
+  height: 100%;
+  padding: 10px clamp(10px, 1.5vw, 22px);
+  display: flex;
+  overflow: hidden;
+}
+
+.hosts-page {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.hosts-list-toggle {
+  min-height: 30px;
+  flex: 0 0 auto;
+  gap: 6px;
+  margin: 0;
+}
+
+.hosts-list-toggle .button { min-height: 30px; padding: 4px 10px; }
+
+.hosts-page > .design-panel {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  margin: 0;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.hosts-page .design-panel-header {
+  min-height: 32px;
+  flex: 0 0 auto;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  gap: 6px 10px;
+}
+
+.hosts-page .design-panel-header h2 { font-size: 13px; }
+.hosts-page .design-panel-header p { font-size: 10px; line-height: 1.35; }
+.hosts-page .design-panel-header .button { min-height: 29px; padding: 4px 9px; }
+
+.hosts-page .host-default-settings {
+  flex: 0 0 auto;
+  grid-template-columns: minmax(110px, .45fr) minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 0 0 8px;
+  padding: 6px 8px;
+}
+
+.hosts-page .host-default-settings > label { grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-size: 10px; }
+.hosts-page .host-default-settings select { min-height: 29px; padding-block: 4px; font-size: 11px; }
+.hosts-page .host-default-workspace { gap: 4px 7px; }
+.hosts-page .host-default-workspace span, .hosts-page .host-default-workspace a { font-size: 10px; }
+.hosts-page .host-default-workspace strong { font-size: 11px; }
+
+.hosts-page .screen-pagination {
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 0;
+  height: auto !important;
+}
+
+.hosts-page .screen-pagination__viewport { min-height: 0; overscroll-behavior: contain; }
+.hosts-page .screen-pagination__controls { flex: 0 0 auto; min-height: 31px; padding-top: 3px; }
+.hosts-page .screen-pagination__item--overflow { scrollbar-width: thin; scrollbar-color: #aab7c8 #f2f5f8; }
+.hosts-page .screen-pagination__item--overflow::-webkit-scrollbar { width: 8px; }
+.hosts-page .screen-pagination__item--overflow::-webkit-scrollbar-thumb { border: 2px solid #f2f5f8; border-radius: 8px; background: #aab7c8; }
+
+.hosts-page .host-card-compact {
+  display: grid;
+  gap: 6px;
+  padding: 9px 11px;
+}
+
+.hosts-page .host-card-heading { min-width: 0; gap: 8px; }
+.hosts-page .host-card-heading h2, .hosts-page .host-card-heading h3 { margin: 0; font-size: 12px; line-height: 1.3; }
+.hosts-page .host-card-heading p { margin: 2px 0 0; font-size: 10px; line-height: 1.25; }
+.hosts-page .host-card-heading .status { padding: 3px 6px; font-size: 10px; }
+
+.hosts-page .host-quick-facts {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+  color: #65738a;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.hosts-page .host-quick-facts span { min-width: 0; overflow-wrap: anywhere; }
+.hosts-page .host-primary-actions { min-width: 0; gap: 5px; padding-top: 6px; }
+.hosts-page .host-actions .button { min-height: 27px; padding: 4px 8px; font-size: 10px; white-space: nowrap; }
+.hosts-page .host-more-actions > summary { min-height: 27px; padding: 4px 8px; font-size: 10px; }
+.hosts-page .host-more-actions[open] > div { gap: 5px; padding: 7px; }
+
+.hosts-page .host-action-reason,
+.hosts-page .host-secondary-details {
+  min-width: 0;
+  color: #536078;
+  font-size: 10px;
+}
+
+.hosts-page .host-action-reason > summary,
+.hosts-page .host-secondary-details > summary {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 25px;
+  padding: 4px 8px;
+  display: flex;
+  align-items: center;
+  border: 1px solid #e5eaf1;
+  border-radius: 6px;
+  color: #5e6d84;
+  background: #fbfcfe;
+  font-size: 10px;
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+}
+
+.hosts-page .host-action-reason > summary::-webkit-details-marker,
+.hosts-page .host-secondary-details > summary::-webkit-details-marker { display: none; }
+.hosts-page .host-action-reason > summary::after,
+.hosts-page .host-secondary-details > summary::after { margin-left: 7px; content: '⌄'; }
+.hosts-page .host-action-reason > p { margin: 5px 0 0; color: #65738a; line-height: 1.45; overflow-wrap: anywhere; }
+.hosts-page .host-secondary-content { min-width: 0; display: grid; gap: 8px; padding: 8px 0 0; }
+.hosts-page .host-secondary-content .host-facts { margin: 0; gap: 7px 12px; }
+.hosts-page .host-secondary-content .host-facts span { font-size: 10px; }
+.hosts-page .host-secondary-content .host-facts strong { font-size: 11px; }
+.hosts-page .host-secondary-content .host-control { margin-top: 0; padding: 9px 10px; }
+.hosts-page .host-secondary-content .host-workspace-bind { margin: 0; }
+.hosts-page .host-permissions { margin: 0; color: #65738a; font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.hosts-page .host-shared-control { margin-top: 0; }
+.hosts-page .host-shared-control > .host-control { margin-top: 6px; }
+
+@media (max-width: 620px) {
+  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .hosts-page) { padding: 8px 7px; }
+  .hosts-page { gap: 6px; }
+  .hosts-page > .design-panel { padding: 8px; }
+  .hosts-page .design-panel-header { min-height: 28px; margin-bottom: 6px; padding-bottom: 6px; }
+  .hosts-page .host-default-settings { grid-template-columns: minmax(0, 1fr); gap: 3px; margin-bottom: 6px; padding: 5px 6px; }
+  .hosts-page .host-default-settings > label { grid-template-columns: 88px minmax(0, 1fr); }
+  .hosts-page .host-default-workspace { display: flex; flex-wrap: nowrap; overflow: hidden; }
+  .hosts-page .host-default-workspace strong { min-width: 0; }
+  .hosts-page .host-card-compact { gap: 5px; padding: 8px; }
+  .hosts-page .host-primary-actions { flex-wrap: wrap; }
+  .hosts-page .host-primary-actions > .host-more-actions { margin-left: auto; }
+  .hosts-page .host-secondary-content .host-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-height: 650px) {
+  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .hosts-page) { padding-block: 7px; }
+  .hosts-page { gap: 5px; }
+  .hosts-page > .design-panel { padding-block: 7px; }
+  .hosts-page .design-panel-header { min-height: 27px; margin-bottom: 5px; padding-bottom: 5px; }
+  .hosts-page .host-default-settings { margin-bottom: 5px; padding-block: 4px; }
+  .hosts-page .host-card-compact { gap: 4px; padding-block: 7px; }
+}

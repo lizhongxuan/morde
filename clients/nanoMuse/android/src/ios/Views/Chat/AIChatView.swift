@@ -478,29 +478,31 @@ struct AIChatView: View {
         ZStack {
             // Messages — floating tool preview overlaid at bottom
             messagesArea
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    // Error banner
-                    if let error = vm.errorMessage {
-                        errorBanner(error)
-                    }
-                    // Transient notice (e.g. request-level image budget
-                    // elision). Auto-dismisses after ~4s.
-                    if let notice = vm.transientNotice {
-                        Text(notice)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.black.opacity(0.75))
-                            .onAppear {
-                                let captured = notice
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                                    if vm.transientNotice == captured {
-                                        vm.transientNotice = nil
+                .overlay(alignment: .top) {
+                    VStack(spacing: 0) {
+                        if let error = vm.errorMessage {
+                            errorBanner(error)
+                        }
+                        // Transient notice (e.g. request-level image budget
+                        // elision). Auto-dismisses after ~4s.
+                        if let notice = vm.transientNotice {
+                            Text(notice)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.black.opacity(0.75))
+                                .onAppear {
+                                    let captured = notice
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                                        if vm.transientNotice == captured {
+                                            vm.transientNotice = nil
+                                        }
                                     }
                                 }
-                            }
+                        }
                     }
+                    .padding(.top, (nmTopOverlay > 0 ? topSafeAreaInset + nmTopOverlay : 0) + 8)
                 }
                 // nanoMuse: upstream's `.overlay(alignment: .bottom) { ZStack … }` is one link of the chain,
                 // NanoMuseComposerHost (NanoMuseChatModifiers.swift): the composer column lies over the
@@ -2655,9 +2657,8 @@ struct AIChatView: View {
             // status bar, which UIKit's own safe area handles) and keeps its rows down by
             // `topOverlay`, so they dissolve under the header's scrim instead of ending at a hard
             // edge under the face. A `safeAreaInset` on a UIKit view shortens the view, unlike a
-            // SwiftUI ScrollView, which is why the list needs to ignore it. The chat's own banners
-            // (the error strip, a notice) stay a safe-area inset and lie over the list's top rows
-            // while they show. Without the shell nothing changes.
+            // SwiftUI ScrollView, which is why the list needs to ignore it. Error and transient
+            // notices overlay the list and never change message or composer layout.
             .ignoresSafeArea(.container, edges: nmTopOverlay > 0 ? Edge.Set.top : [])
             // Empty/loading overlay for tap-to-dismiss-keyboard.
             // Placed BEFORE the directory timeline in the ZStack so the

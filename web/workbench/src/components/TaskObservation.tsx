@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayTaskObservationSnapshot } from '../api/gateway';
+import FloatingError from './FloatingError';
 
 type ObservationEvent = { sequence: number; type: string; created_at: string };
 
@@ -165,9 +166,9 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
   return <main className="task-observation" aria-labelledby="task-observation-title">
     <header><p className="eyebrow">Workbench · 只读</p><h1 id="task-observation-title">任务观察</h1>
       <p className="muted">此页面只读取当前 Task 状态、事件和服务端核验过的产物元数据。</p></header>
-    {visibleError && <section className="task-observation-card" role="alert"><p>{visibleError}</p>
+    {visibleError && <FloatingError>{visibleError}
       <button className="button button-secondary" type="button" onClick={retryRead} disabled={invalidTaskID}>重试读取</button>
-    </section>}
+    </FloatingError>}
     {!snapshot && !visibleError && <p className="task-observation-card" role="status">正在验证 Task 观察权限…</p>}
     {snapshot && <>
       <section className="task-observation-card" aria-label="任务状态">

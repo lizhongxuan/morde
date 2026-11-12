@@ -9,6 +9,7 @@ export type GatewayHost = {
   state: 'creating' | 'running' | 'failed' | 'deleting' | 'deleted';
   expires_at: string | null;
   workspaces: GatewayWorkspaceBinding[];
+  embed_targets?: string[];
 };
 
 export type GatewayWorkspaceBinding = {

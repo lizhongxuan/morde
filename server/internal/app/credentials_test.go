@@ -257,6 +257,36 @@ func (s *credentialTokens) RevokeToken(_ context.Context, id, ownerID string) er
 	return nil
 }
 
+func TestValidateHostEmbedCredentialRechecksTokenUserAndInstallation(t *testing.T) {
+	now := time.Now().Add(time.Hour)
+	user := identity.User{ID: "u1234567", Status: identity.StatusApproved}
+	tokens := &credentialTokens{clientActive: true, values: map[string]identity.Token{
+		"t1234567": {ID: "t1234567", OwnerID: user.ID, Kind: identity.KindSession, ExpiresAt: now},
+		"t7654321": {ID: "t7654321", OwnerID: user.ID, Kind: identity.KindClient, ClientInstallationID: "i1234567", ExpiresAt: now},
+	}}
+	service := &CredentialService{users: &credentialUsers{values: map[string]identity.User{user.ID: user}}, tokens: tokens}
+
+	if err := service.ValidateHostEmbedCredential(context.Background(), "t1234567", user.ID, ""); err != nil {
+		t.Fatalf("active session rejected: %v", err)
+	}
+	if err := service.ValidateHostEmbedCredential(context.Background(), "t7654321", user.ID, "i1234567"); err != nil {
+		t.Fatalf("active client rejected: %v", err)
+	}
+
+	revokedAt := time.Now()
+	tokens.values["t1234567"] = identity.Token{ID: "t1234567", OwnerID: user.ID, Kind: identity.KindSession,
+		RevokedAt: &revokedAt, ExpiresAt: now}
+	if err := service.ValidateHostEmbedCredential(context.Background(), "t1234567", user.ID, ""); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("revoked session error = %v, want unauthenticated", err)
+	}
+	tokens.values["t7654321"] = identity.Token{ID: "t7654321", OwnerID: user.ID, Kind: identity.KindClient,
+		ClientInstallationID: "i1234567", ExpiresAt: now}
+	tokens.clientActive = false
+	if err := service.ValidateHostEmbedCredential(context.Background(), "t7654321", user.ID, "i1234567"); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("revoked installation error = %v, want unauthenticated", err)
+	}
+}
+
 func (s *credentialTokens) ConsumeTicket(_ context.Context, id string) (Ticket, error) {
 	value, ok := s.values[id]
 	if !ok || value.Kind != identity.KindTicket || value.UsedAt != nil || value.RevokedAt != nil || !value.ExpiresAt.After(time.Now()) {

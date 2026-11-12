@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../../app/format';
 import { useToast } from '../../app/toast';
+import { FloatingError } from '../../components/FloatingError';
 
 function HostResourceEditor({ id }: { id: string }) {
   const client = useQueryClient();
@@ -22,7 +23,7 @@ function HostResourceEditor({ id }: { id: string }) {
   });
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); save.mutate(); };
   return <section className="admin-detail-section"><h2>电脑规格</h2>
-    {query.isPending ? <div className="loading-card" role="status">正在读取规格…</div> : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div> : current?.update_state !== 'idle' ? <div className="notice notice-warning">上次规格调整仍在核验中，请联系运维核对运行时资源后再调整。</div> : current?.state !== 'stopped' && current?.state !== 'running' ? <div className="notice notice-warning">当前电脑状态不能调整规格。</div> : <form className="form-card form-stack" onSubmit={submit}>
+    {query.isPending ? <div className="loading-card" role="status">正在读取规格…</div> : query.isError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError> : current?.update_state !== 'idle' ? <div className="notice notice-warning">上次规格调整仍在核验中，请联系运维核对运行时资源后再调整。</div> : current?.state !== 'stopped' && current?.state !== 'running' ? <div className="notice notice-warning">当前电脑状态不能调整规格。</div> : <form className="form-card form-stack" onSubmit={submit}>
       <label htmlFor="host-resource-cpu">CPU（毫核）</label><input id="host-resource-cpu" type="number" min="1" required value={cpu ?? String(current.resources.cpu_milli)} onChange={(event) => setCPU(event.target.value)} />
       <label htmlFor="host-resource-memory">内存（MiB）</label><input id="host-resource-memory" type="number" min="1" required value={memory ?? String(current.resources.mem_mib)} onChange={(event) => setMemory(event.target.value)} />
       <div className="form-actions"><button className="button button-primary" disabled={save.isPending} type="submit">{save.isPending ? '保存中…' : '保存规格'}</button></div>
@@ -58,7 +59,7 @@ export function AdminHostDetail() {
   if (hosts.isPending || users.isPending) return <div className="loading-card" role="status">正在读取电脑信息…</div>;
   if (hosts.isError || users.isError) {
     const error = hosts.isError ? hosts.error : users.error;
-    return <div className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void hosts.refetch(); void users.refetch(); }}>重试</button></div>;
+    return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void hosts.refetch(); void users.refetch(); }}>重试</button></FloatingError>;
   }
   const host = hosts.data.items.find((item) => item.id === id);
   if (!host) return <div className="empty-card"><h2>找不到这台电脑</h2><p>电脑可能已被移除，或当前账号无权查看。</p><Link className="button button-secondary" to="/admin/hosts">返回电脑列表</Link></div>;

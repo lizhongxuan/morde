@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { GatewayControl, GatewayHost } from '../api/gateway';
+import { returnToPreviousPage } from '../app/navigation';
+import FloatingError from './FloatingError';
 
 function formatRemaining(expiresAt: string | null, now: number): string {
   if (!expiresAt) return '到期时间未知';
@@ -98,7 +100,8 @@ export default function TopBar({
         </span>}
       </div>
       <div className="top-actions">
-        {controlActionError && <span className="control-error" role="alert">{controlActionError}</span>}
+        {!embedded && <button className="button button-secondary host-return-button" type="button" onClick={returnToPreviousPage}>返回云端电脑</button>}
+        {controlActionError && <FloatingError>{controlActionError}</FloatingError>}
         {controlError && <button className="button button-secondary" type="button" onClick={onRetryControl} disabled={controlLoading}>重试读取</button>}
         {controlActionLabel && (
           <button className={`button${controlActionLabel.includes('接管') ? '' : ' button-secondary'}`} type="button" onClick={onControlAction} disabled={controlActionPending}>

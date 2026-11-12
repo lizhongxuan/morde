@@ -2098,6 +2098,7 @@ struct MordeOutboxMessage: Codable, Equatable, Identifiable {
     var previousClientMessageID: String?
     let content: String
     let modelID: String?
+    let timeZone: String?
     let referenceTaskID: String?
     let hostID: String?
     let workspaceID: String?
@@ -2234,6 +2235,7 @@ enum MordeConversationMessagePayload {
         var fields: [String: Any] = [:]
         if let previous = message.previousClientMessageID { fields["previous_client_message_id"] = previous }
         if let model = message.modelID { fields["model_id"] = model }
+        if let timeZone = message.timeZone { fields["time_zone"] = timeZone }
         if let target = message.referenceTaskID { fields["reference_task_id"] = target }
         if let host = message.hostID { fields["host_id"] = host }
         if let workspace = message.workspaceID { fields["workspace_id"] = workspace }
@@ -2466,10 +2468,13 @@ final class MordeMessageOutbox {
         var snapshot = try read(scope: scope)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let currentTimeZone = TimeZone.current.identifier
+        let timeZone = TimeZone.knownTimeZoneIdentifiers.contains(currentTimeZone) ? currentTimeZone : nil
         let message = MordeOutboxMessage(
             id: UUID().uuidString.lowercased(), scope: scope, conversationID: conversationID, projectID: projectID,
             previousClientMessageID: snapshot.lastMessageIDs[conversationID], content: content,
-            modelID: modelID, referenceTaskID: referenceTaskID, hostID: hostID, workspaceID: workspaceID,
+            modelID: modelID, timeZone: timeZone, referenceTaskID: referenceTaskID,
+            hostID: hostID, workspaceID: workspaceID,
             createdAt: formatter.string(from: Date()),
             attachments: attachmentIDs.map {
                 MordeOutboxAttachment(id: UUID().uuidString.lowercased(), attachmentID: $0, linked: false)

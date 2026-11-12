@@ -92,6 +92,7 @@ type conversationMessageRequest struct {
 	ClientAttachmentIDs     []string           `json:"client_attachment_ids,omitempty"`
 	ApplicationID           string             `json:"application_id,omitempty"`
 	ModelID                 string             `json:"model_id,omitempty"`
+	TimeZone                string             `json:"time_zone,omitempty"`
 	Content                 string             `json:"content"`
 	Budget                  *taskBudgetRequest `json:"budget,omitempty"`
 }
@@ -516,7 +517,7 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget,
 			MCPConnectorIDs:     request.MCPConnectorIDs,
 			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
-			ModelID: request.ModelID, Content: request.Content, Budget: budget, IdempotencyKey: key,
+			ModelID: request.ModelID, TimeZone: request.TimeZone, Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)

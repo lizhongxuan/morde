@@ -718,9 +718,14 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	embedTicketExchanger, ok := hostSharing.(app.HostEmbedTicketExchanger)
+	if !ok {
+		return fmt.Errorf("Host embed ticket exchange is unavailable")
+	}
 	gatewayHandler, err := gateway.New(gateway.Deps{
 		Config: cfg.Gateway, Domains: cfg.Domains, Security: cfg.Security,
-		Hosts: hosts, HostSharing: hostSharing, WorkspaceFiles: workspaceSync, TaskObservation: tasks, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
+		Hosts: hosts, HostSharing: hostSharing, HostEmbedTickets: embedTicketExchanger, ServiceInstanceID: serviceInstanceID,
+		WorkspaceFiles: workspaceSync, TaskObservation: tasks, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
 		TerminalSessions: store, TerminalAIO: aioClient, Auth: credentials, Audit: auditService,
 		Logger: logger, Metrics: registry,
 	})

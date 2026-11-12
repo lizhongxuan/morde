@@ -134,10 +134,24 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(recoveredFirst.id, first.id)
         XCTAssertEqual(recoveredSecond.id, second.id)
         XCTAssertEqual(recoveredSecond.previousClientMessageID, recoveredFirst.id)
+        if let timeZone = recoveredSecond.timeZone {
+            XCTAssertTrue(TimeZone.knownTimeZoneIdentifiers.contains(timeZone))
+        }
 
         let payload = MordeConversationMessagePayload.direct(recoveredSecond)
         XCTAssertEqual(payload["client_message_id"] as? String, recoveredSecond.id)
         XCTAssertEqual(payload["previous_client_message_id"] as? String, recoveredFirst.id)
+        XCTAssertEqual(payload["time_zone"] as? String, recoveredSecond.timeZone)
+        let uploadPayload = MordeConversationMessagePayload.uploadInitialization(recoveredSecond,
+            bytes: Data(recoveredSecond.content.utf8))
+        XCTAssertEqual(uploadPayload["time_zone"] as? String, recoveredSecond.timeZone)
+
+        var legacyFields = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(recoveredSecond)) as? [String: Any])
+        legacyFields.removeValue(forKey: "timeZone")
+        let legacy = try JSONDecoder().decode(MordeOutboxMessage.self,
+            from: JSONSerialization.data(withJSONObject: legacyFields))
+        XCTAssertNil(legacy.timeZone)
+        XCTAssertNil(MordeConversationMessagePayload.direct(legacy)["time_zone"])
 
         let next = try reopenedOutbox.enqueue(scope: scope, conversationID: "c1234567", content: "第三条",
             modelID: nil, attachmentIDs: [])

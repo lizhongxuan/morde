@@ -31,7 +31,7 @@ func TestListConversationsOrdersAndPaginatesByLastActivity(t *testing.T) {
 		updatedAt time.Time
 	}{
 		{oldestCreated.ID, base, base.Add(2 * time.Hour)},
-		{newestCreated.ID, base.Add(2 * time.Hour), base.Add(time.Hour)},
+		{newestCreated.ID, base.Add(2 * time.Hour), base.Add(2 * time.Hour)},
 		{middleCreated.ID, base.Add(time.Hour), base},
 	} {
 		if _, err := store.pool.Exec(ctx, `UPDATE conversations SET created_at=$2,updated_at=$3 WHERE id=$1`, entry.id, entry.createdAt, entry.updatedAt); err != nil {
@@ -40,8 +40,12 @@ func TestListConversationsOrdersAndPaginatesByLastActivity(t *testing.T) {
 	}
 
 	first, err := store.ListConversations(ctx, owner.ID, nil, app.PageRequest{Limit: 2})
+	tiedFirst, tiedSecond := oldestCreated.ID, newestCreated.ID
+	if tiedFirst < tiedSecond {
+		tiedFirst, tiedSecond = tiedSecond, tiedFirst
+	}
 	if err != nil || len(first.Items) != 2 || first.NextCursor == "" ||
-		first.Items[0].ID != oldestCreated.ID || first.Items[1].ID != newestCreated.ID {
+		first.Items[0].ID != tiedFirst || first.Items[1].ID != tiedSecond {
 		t.Fatalf("first activity page = %#v, err=%v", first, err)
 	}
 	second, err := store.ListConversations(ctx, owner.ID, nil, app.PageRequest{Limit: 2, Cursor: first.NextCursor})

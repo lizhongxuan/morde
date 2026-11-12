@@ -13,10 +13,12 @@ import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import { outboxReceiptRequest } from '../app/message-outbox';
 import { ChatMarkdown } from '../components/ChatMarkdown';
+import { ScreenPagination } from '../components/ScreenPagination';
 import { AssistantReplySpeech } from '../components/AssistantReplySpeech';
 import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { projectApi } from '../app/project-api';
 import type { CreateProjectWorkItemRequest, Project, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectRole, ProjectWorkItem, ProjectWorkItemCategory } from '../app/project-api';
+import { FloatingError } from '../components/FloatingError';
 
 type RequestKeyRecord = { fingerprint: string; key: string };
 type ActionNotice = { kind: 'success' | 'error' | 'unknown'; message: string };
@@ -428,7 +430,6 @@ function UserProjects() {
     const content = projectPrompt;
     if (!project || !selectedProjectConversation || !content.trim()) return;
     // Freshness is evaluated when the user submits the form.
-    // eslint-disable-next-line react-hooks/purity
     const now = Date.now();
     if (modelConnectionsQuery.isSuccess && now - modelConnectionsQuery.dataUpdatedAt < 60_000
       && modelConnectionsQuery.data.configuration_status === 'not_configured') {
@@ -445,6 +446,7 @@ function UserProjects() {
         actorID: user?.id ?? '',
         request: {
           client_message_id: id, content,
+          time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
           ...(effectiveProjectModelID ? { model_id: effectiveProjectModelID } : {}),
           ...(projectHostID ? { host_id: projectHostID } : {}),
           ...(projectWorkspaceID ? { workspace_id: projectWorkspaceID } : {}),
@@ -675,21 +677,28 @@ function UserProjects() {
   const canManageWork = Boolean(project && canEditWork);
 
   return <section className="projects-page">
-    {notice && <p className={`notice ${notice.kind === 'success' ? 'notice-success' : 'notice-warning'}`} role={notice.kind === 'error' ? 'alert' : 'status'}>{notice.message}</p>}
+    {notice?.kind === 'error' ? <FloatingError>{notice.message}</FloatingError> : notice && <p className={`notice ${notice.kind === 'success' ? 'notice-success' : 'notice-warning'}`} role="status">{notice.message}</p>}
 
     {!showProjectDetails && <section className="connection-section" aria-labelledby="project-select-title">
       <div className="connection-section-heading"><div><h2 id="project-select-title">我的项目</h2><p className="muted">个人会话仍属于个人，不会随项目成员共享。</p></div><button type="button" className="button button-primary" aria-expanded={showCreateProject} disabled={Boolean(pendingAction)} onClick={() => setShowCreateProject((open) => !open)}>{showCreateProject ? '收起' : '＋ 创建项目'}</button></div>
-      {projectsQuery.isPending ? <p role="status">正在读取项目…</p> : projectsQuery.isError ? <div className="error-card" role="alert">读取项目失败：{errorDetails(projectsQuery.error).message}<button type="button" className="button button-secondary" onClick={() => void projectsQuery.refetch()}>重试</button></div> : <>
-        {projects.length > 0 && <div className="table-wrap"><table><thead><tr><th>项目</th><th>说明</th><th>操作</th></tr></thead><tbody>{projects.map((item) => <tr key={item.id}>
-          <td><strong>{item.name}</strong></td><td>{item.description || '—'}</td><td><button type="button" className="button button-secondary button-small" aria-label={`查看项目 ${item.name}`} disabled={Boolean(pendingAction)} onClick={() => {
+      {projectsQuery.isPending ? <p role="status">正在读取项目…</p> : projectsQuery.isError ? <FloatingError className="error-card" role="alert">读取项目失败：{errorDetails(projectsQuery.error).message}<button type="button" className="button button-secondary" onClick={() => void projectsQuery.refetch()}>重试</button></FloatingError> : <>
+        {projects.length > 0 && <ScreenPagination
+          ariaLabel="项目列表"
+          items={projects}
+          getKey={(item) => item.id}
+          estimatedItemHeight={76}
+          height={300}
+          renderItem={(item) => <article className="schedule-card">
+            <div className="schedule-card-heading"><div><h3>{item.name}</h3><p className="muted">{item.description || '暂无说明'}</p></div><button type="button" className="button button-secondary button-small" aria-label={`查看项目 ${item.name}`} disabled={Boolean(pendingAction)} onClick={() => {
             setSelectedProjectID(item.id);
             setSelectedProjectConversationID('');
             setProjectHostID('');
             setProjectWorkspaceID('');
             setProjectMessageReceipt(null);
             setShowProjectDetails(true);
-          }}>查看项目</button></td>
-        </tr>)}</tbody></table></div>}
+          }}>查看项目</button></div>
+          </article>}
+        />}
         {!projects.length && <div className="empty-card compact"><p>当前账号还没有项目。</p></div>}
       </>}
       {showCreateProject && <form onSubmit={(event) => { event.preventDefault(); createProject(); }} className="form-stack">
@@ -703,19 +712,20 @@ function UserProjects() {
 
     {!showProjectDetails && <section className="connection-section" aria-labelledby="project-invitations-title">
       <div className="connection-section-heading"><div><h2 id="project-invitations-title">发给我的项目邀请</h2><p className="muted">邀请响应只提供项目 ID、邀请人 ID 和角色；服务端没有返回名称或邮箱。</p></div></div>
-      {invitationsQuery.isPending ? <p role="status">正在读取邀请…</p> : invitationsQuery.isError ? <p className="form-error" role="alert">读取邀请失败：{errorDetails(invitationsQuery.error).message}</p> : !invitations.length ? <p className="muted">没有收到邀请。</p> : <div className="schedule-list">
-        {invitations.map((invitation) => <article className="schedule-card" key={invitation.id}>
+      {invitationsQuery.isPending ? <p role="status">正在读取邀请…</p> : invitationsQuery.isError ? <FloatingError className="error-inline" role="alert">读取邀请失败：{errorDetails(invitationsQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void invitationsQuery.refetch()}>重试</button></FloatingError> : !invitations.length ? <p className="muted">没有收到邀请。</p> : <ScreenPagination
+        ariaLabel="收到的项目邀请" items={invitations} getKey={(invitation) => invitation.id} estimatedItemHeight={86} height={300}
+        renderItem={(invitation) => <article className="schedule-card">
           <div className="schedule-card-heading"><div><h3>项目 {invitation.project_id}</h3><p className="muted">邀请人 {invitation.inviter_id} · {roleLabel(invitation.role)} · v{invitation.version}</p></div><span className="status">{invitationStateLabel(invitation)}</span></div>
           {invitation.state === 'pending' && <button type="button" className="button button-secondary" disabled={Boolean(pendingAction)} onClick={() => acceptInvitation(invitation)}>{pendingAction === `accept-invitation:${invitation.id}` ? '正在接受…' : '接受邀请'}</button>}
-        </article>)}
-      </div>}
+        </article>}
+      />}
     </section>}
 
     {showProjectDetails && <section className="design-panel" aria-label="项目详情">
       <div className="design-panel-header"><div><h2>{project?.name || '项目详情'}</h2>{project && <p>{projectStateLabel(project)}</p>}</div><button type="button" className="button button-secondary" disabled={Boolean(pendingAction)} onClick={() => setShowProjectDetails(false)}>← 返回项目</button></div>
       <div className="notice notice-info" role="note">界面只按服务端响应更新；pending、blocked 和 unknown 会保留为服务端状态。工作项创建不会启动 Task；项目共享对话只有在明确提交提示后才排队。</div>
       {projectQuery.isPending && <p role="status">正在读取项目详情…</p>}
-      {projectQuery.isError && <p className="form-error" role="alert">读取项目详情失败：{errorDetails(projectQuery.error).message}</p>}
+      {projectQuery.isError && <FloatingError className="error-inline" role="alert">读取项目详情失败：{errorDetails(projectQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void projectQuery.refetch()}>重试</button></FloatingError>}
     </section>}
 
     {showProjectDetails && project && <>
@@ -728,17 +738,19 @@ function UserProjects() {
           <button type="submit" className="button button-secondary" disabled={!isOwner || !project || Boolean(pendingAction)}>{pendingAction === `invite:${project.id}` ? '正在邀请…' : '创建邀请'}</button>
         </form>
         {!isOwner && <p className="muted">只有当前负责人可以邀请、移除成员、改角色或移交负责人。</p>}
-        {membersQuery.isPending ? <p role="status">正在读取成员…</p> : membersQuery.isError ? <p className="form-error" role="alert">读取成员失败：{errorDetails(membersQuery.error).message}</p> : <div className="schedule-list" aria-label="项目成员">
-          {members.map((member) => <article className="schedule-card" key={member.user_id}>
+        {membersQuery.isPending ? <p role="status">正在读取成员…</p> : membersQuery.isError ? <FloatingError className="error-inline" role="alert">读取成员失败：{errorDetails(membersQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void membersQuery.refetch()}>重试</button></FloatingError> : <>
+          {members.length ? <ScreenPagination
+            ariaLabel="项目成员" items={members} getKey={(member) => member.user_id} estimatedItemHeight={96} height={340}
+            renderItem={(member) => <article className="schedule-card">
             <div className="schedule-card-heading"><div><h3>{member.user_id}</h3><p className="muted">{roleLabel(member.role)} · 成员版本 v{member.version}</p></div><span className={`status ${member.role === 'owner' ? 'status-running' : ''}`}>{roleLabel(member.role)}</span></div>
             {isOwner && member.role !== 'owner' && <div className="schedule-actions">
               <label htmlFor={`role-${member.user_id}`}>角色</label>
               <select id={`role-${member.user_id}`} value={member.role} disabled={Boolean(pendingAction)} onChange={(event) => updateMemberRole(member, event.target.value as Exclude<ProjectRole, 'owner'>)}><option value="member">成员</option><option value="viewer">只读成员</option></select>
               <button type="button" className="button button-danger-quiet" disabled={Boolean(pendingAction)} onClick={() => removeMember(member)}>撤销成员</button>
             </div>}
-          </article>)}
-          {!members.length && <p className="muted">服务端尚未返回成员。</p>}
-        </div>}
+            </article>}
+          /> : <p className="muted">服务端尚未返回成员。</p>}
+        </>}
 
         {isOwner && <div className="inline-form">
           <div><label htmlFor="owner-transfer-target">移交负责人给已接受成员</label><select id="owner-transfer-target" value={ownerTargetID} onChange={(event) => setOwnerTargetID(event.target.value)}>
@@ -750,30 +762,35 @@ function UserProjects() {
         <div className="schedule-list" aria-label="本次页面创建的待处理邀请">
           <h3>本次页面创建的待处理邀请</h3>
           <p className="muted">OpenAPI 没有按项目列出已发邀请的 GET 路由。这里仅显示本次页面拿到 POST 响应的邀请；刷新后无法重建这份列表。</p>
-          {sessionInvitations.map((invitation) => <article className="schedule-card" key={invitation.id}>
+          {sessionInvitations.length ? <ScreenPagination
+            ariaLabel="本页创建的项目邀请" items={sessionInvitations} getKey={(invitation) => invitation.id} estimatedItemHeight={84} height={260}
+            renderItem={(invitation) => <article className="schedule-card">
             <div className="schedule-card-heading"><div><h4>{invitation.invitee_id}</h4><p className="muted">{roleLabel(invitation.role)} · {invitationStateLabel(invitation)} · 邀请版本 v{invitation.version}</p></div></div>
             {invitation.state === 'pending' && <button type="button" className="button button-danger-quiet" disabled={!isOwner || Boolean(pendingAction)} onClick={() => revokeOutgoingInvitation(invitation)}>撤回邀请</button>}
-          </article>)}
+            </article>}
+          /> : null}
           {!sessionInvitations.length && <p className="muted">当前页面尚未创建邀请。</p>}
         </div>
       </section>
 
       <section className="connection-section" aria-labelledby="project-resources-title">
         <div className="connection-section-heading"><div><h2 id="project-resources-title">项目资源关联</h2><p className="muted">关联现有 Host 或 Workspace 不会复制资源，也不会授予项目成员额外权限。</p></div></div>
-        {resourcesQuery.isPending ? <p role="status">正在读取资源关联…</p> : resourcesQuery.isError ? <p className="form-error" role="alert">读取资源关联失败：{errorDetails(resourcesQuery.error).message}</p> : <div className="schedule-list" aria-label="项目资源">
-          {resources.map((resource) => <article className="schedule-card" key={`${resource.kind}:${resource.resource_id}`}>
+        {resourcesQuery.isPending ? <p role="status">正在读取资源关联…</p> : resourcesQuery.isError ? <FloatingError className="error-inline" role="alert">读取资源关联失败：{errorDetails(resourcesQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void resourcesQuery.refetch()}>重试</button></FloatingError> : <>
+          {resources.length ? <ScreenPagination
+            ariaLabel="项目资源" items={resources} getKey={(resource) => `${resource.kind}:${resource.resource_id}`} estimatedItemHeight={92} height={320}
+            renderItem={(resource) => <article className="schedule-card">
             <div className="schedule-card-heading"><div><h3>{displayResource(resource)}</h3><p className="muted">关联版本 v{resource.version}</p></div></div>
             {resource.kind === 'workspace' && <button type="button" className="button button-secondary" onClick={() => setWorkspaceFileView({ projectID, workspaceID: resource.resource_id })}>查看文件目录</button>}
             {isOwner && <button type="button" className="button button-danger-quiet" disabled={Boolean(pendingAction) || !project} onClick={() => removeResource(resource)}>移除关联</button>}
-          </article>)}
-          {!resources.length && <p className="muted">没有当前账号可独立访问的项目资源关联。</p>}
-        </div>}
+            </article>}
+          /> : <p className="muted">没有当前账号可独立访问的项目资源关联。</p>}
+        </>}
         {visibleWorkspaceFileView && <div className="schedule-card" aria-label="Workspace 文件目录">
           <div className="schedule-card-heading"><div><h3>Workspace 文件目录</h3><p className="muted">仅显示已确认版本的路径、大小和权限位；不会读取文件内容。</p></div>
             <button type="button" className="button button-secondary" onClick={() => setWorkspaceFileView(null)}>关闭目录</button>
           </div>
           {workspaceManifestQuery.isPending ? <p role="status">正在读取 Workspace 文件目录…</p>
-            : workspaceManifestQuery.isError ? <p className="form-error" role="alert">读取 Workspace 文件目录失败：{errorDetails(workspaceManifestQuery.error).message}</p>
+            : workspaceManifestQuery.isError ? <FloatingError className="error-inline" role="alert">读取 Workspace 文件目录失败：{errorDetails(workspaceManifestQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void workspaceManifestQuery.refetch()}>重试</button></FloatingError>
               : workspaceManifestQuery.data && <>
                 <p className="muted">Workspace {workspaceManifestQuery.data.workspace_id} · 已确认版本 v{workspaceManifestQuery.data.revision}</p>
                 <ul aria-label="文件与空目录">
@@ -800,7 +817,7 @@ function UserProjects() {
           ? <p className="notice notice-warning" role="note">本机 MSW 只模拟消息接收；不会预留预算、调用模型或读取、写入文件。</p>
           : <p className="notice notice-info" role="note">项目执行和预算以服务端回执为准；消息受理不代表任务已开始或预算已预留。</p>}
         {!projectTaskMock && (projectTaskCapabilitiesQuery.isPending ? <p role="status">正在确认项目模型执行能力…</p>
-            : projectTaskCapabilitiesQuery.isError ? <p className="notice notice-warning" role="alert">无法确认项目模型执行能力，消息仍可先保存在本机。</p>
+            : projectTaskCapabilitiesQuery.isError ? <FloatingError className="error-inline" role="alert">无法确认项目模型执行能力，消息仍可先保存在本机。<button type="button" className="button button-small button-secondary" onClick={() => void projectTaskCapabilitiesQuery.refetch()}>重试</button></FloatingError>
               : !projectTaskExecutionReady && <p className="notice notice-warning" role="note">服务端尚未声明项目模型执行能力；消息仍可先发送或保存在本机。</p>)}
         {!projectTaskMock && projectTaskCapabilitiesQuery.data &&
           !projectTaskCapabilitiesQuery.data.supported_features.includes('conversation_auto_routing_v1') &&
@@ -811,7 +828,7 @@ function UserProjects() {
         </form>
         {!currentMember && !membersQuery.isPending && <p className="muted">只有已接受的项目成员可以创建共享对话或提交提示。</p>}
         {projectConversationsQuery.isPending ? <p role="status">正在读取共享对话…</p>
-          : projectConversationsQuery.isError ? <p className="form-error" role="alert">读取项目共享对话失败：{errorDetails(projectConversationsQuery.error).message}</p>
+          : projectConversationsQuery.isError ? <FloatingError className="error-inline" role="alert">读取项目共享对话失败：{errorDetails(projectConversationsQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void projectConversationsQuery.refetch()}>重试</button></FloatingError>
             : projectConversations.length === 0 ? <p className="muted">项目还没有共享对话；创建后即可向所选模型提交提示。</p> : <>
               <div className="inline-form">
                 <div><label htmlFor="project-conversation-select">共享对话</label><select id="project-conversation-select" value={selectedProjectConversation?.id ?? ''} disabled={Boolean(pendingAction)} onChange={(event) => {
@@ -825,14 +842,17 @@ function UserProjects() {
               <div className="schedule-list" aria-label="项目共享对话历史">
                 <h3>共享历史</h3>
                 {projectConversationMessagesQuery.isPending ? <p role="status">正在读取共享历史…</p>
-                  : projectConversationMessagesQuery.isError ? <p className="form-error" role="alert">读取共享历史失败：{errorDetails(projectConversationMessagesQuery.error).message}</p>
+                  : projectConversationMessagesQuery.isError ? <FloatingError className="error-inline" role="alert">读取共享历史失败：{errorDetails(projectConversationMessagesQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void projectConversationMessagesQuery.refetch()}>重试</button></FloatingError>
                     : !projectConversationMessages.length ? <p className="muted">该共享对话暂无消息。</p>
-                      : projectConversationMessages.map((message) => {
+                      : <ScreenPagination
+                        ariaLabel="项目共享对话消息" items={projectConversationMessages} getKey={(message) => message.id}
+                        estimatedItemHeight={130} height={620}
+                        renderItem={(message) => {
                         const task = message.task_id ? taskByID.get(message.task_id) : undefined;
                         const sources = message.role === 'assistant' ? message.sources ?? [] : [];
                         const sourceContentMatches = sources.length > 0 && sources.every((source) => source.content.length > 0) &&
                           sources.map((source) => source.content).join('\n\n') === message.content;
-                        return <article id={`project-conversation-message-${encodeURIComponent(message.id)}`} className="schedule-card" key={message.id} aria-label="项目对话消息">
+                        return <article id={`project-conversation-message-${encodeURIComponent(message.id)}`} className="schedule-card" aria-label="项目对话消息">
                           <div className="schedule-card-heading"><div><h4>{message.role === 'user' ? '成员提示' : 'AI 回复'}</h4><p className="muted">执行者 {message.actor_id} · 对话创建者 {message.owner_id}</p></div><span className="status">{message.output_status === 'streaming' ? '生成中' : message.output_status === 'interrupted' ? '已中断' : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status)}</span></div>
                           {sourceContentMatches ? <div className="chat-message-source-list">
                             {sources.map((source) => {
@@ -881,11 +901,16 @@ function UserProjects() {
                                 onClick={() => stopProjectTask(task)}>停止此任务</button>}
                           </p>}
                         </article>;
-                      })}
-                {pendingProjectMessages.map(({ scope, message }) => <article className="schedule-card" key={message.request.client_message_id} aria-label="待发送项目消息">
+                      }}
+                      />}
+                {pendingProjectMessages.length > 0 && <ScreenPagination
+                  ariaLabel="待发送项目消息" items={pendingProjectMessages} getKey={({ message }) => message.request.client_message_id}
+                  estimatedItemHeight={96} height={280}
+                  renderItem={({ scope, message }) => <article className="schedule-card" aria-label="待发送项目消息">
                   <p>{message.request.content}</p><p role="status">{message.status === 'sending' ? '正在发送' : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '已保存在本机，等待发送'}{message.error ? `：${message.error}` : ''}</p>
                   {message.status !== 'sending' && <button type="button" className="button button-small button-secondary" onClick={() => void sendProjectMessage({ scope, message }, true)}>核对并重试</button>}
-                </article>)}
+                  </article>}
+                />}
               </div>
               <form onSubmit={(event) => { event.preventDefault(); queueProjectMessage(); }} className="form-stack">
                 <label htmlFor="project-task-model">文本模型</label>
@@ -895,9 +920,9 @@ function UserProjects() {
                   {readyTextModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model_name}</option>)}
                 </select>
                 {modelConnectionsQuery.isPending ? <p role="status">正在读取可用模型…</p>
-                  : modelConnectionsQuery.isError ? <p className="form-error" role="alert">读取模型失败：{errorDetails(modelConnectionsQuery.error).message}</p>
+                  : modelConnectionsQuery.isError ? <FloatingError className="error-inline" role="alert">读取模型失败：{errorDetails(modelConnectionsQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void modelConnectionsQuery.refetch()}>重试</button></FloatingError>
                     : !readyTextModels.length && <p className="muted">当前没有已验证的文字模型；消息可先发送，处理状态以服务端为准。</p>}
-                {outbox.storageError && <p className="form-error" role="alert">本地消息存储不可用：{outbox.storageError}</p>}
+                {outbox.storageError && <FloatingError className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</FloatingError>}
                 <div className="inline-form">
                   <div><label htmlFor="project-task-host">目标电脑（可选）</label><select id="project-task-host" value={projectHostID} disabled={!resourcesQuery.isSuccess || taskHostsQuery.isPending} onChange={(event) => {
                     setProjectHostID(event.target.value);
@@ -933,7 +958,7 @@ function UserProjects() {
 
       <section className="connection-section" aria-labelledby="project-budget-title">
         <div className="connection-section-heading"><div><h2 id="project-budget-title">项目预算与账本</h2><p className="muted">金额使用整数微单位；未知费用按接口状态显示，不在浏览器估算或清零。</p></div></div>
-        {budgetQuery.isPending ? <p role="status">正在读取预算…</p> : budgetQuery.isError ? <p className="form-error" role="alert">读取预算失败：{errorDetails(budgetQuery.error).message}</p> : budget && <>
+        {budgetQuery.isPending ? <p role="status">正在读取预算…</p> : budgetQuery.isError ? <FloatingError className="error-inline" role="alert">读取预算失败：{errorDetails(budgetQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void budgetQuery.refetch()}>重试</button></FloatingError> : budget && <>
           <div className="notice notice-info" role="status">
             {budget.configured ? <>额度 {safeMoney(budget.limit_micros, budget.currency)} · 已结算 {safeMoney(budget.spent_micros, budget.currency)} · 已预留 {safeMoney(budget.reserved_micros, budget.currency)} · 预算版本 v{budget.version}</> : '尚未配置项目预算。'}
             {budget.has_unknown && <strong> 存在未知费用，需等待服务端对账。</strong>}
@@ -949,14 +974,15 @@ function UserProjects() {
           {!isOwner && <p className="muted">只有负责人可以修改预算。</p>}
         </>}
         <h3>服务端账本</h3>
-        {ledgerQuery.isPending ? <p role="status">正在读取账本…</p> : ledgerQuery.isError ? <p className="form-error" role="alert">读取账本失败：{errorDetails(ledgerQuery.error).message}</p> : !ledger.length ? <p className="muted">服务端尚无账本条目。</p> : <div className="schedule-list">
-          {ledger.map((entry) => <article className="schedule-card" key={entry.call_id}>
+        {ledgerQuery.isPending ? <p role="status">正在读取账本…</p> : ledgerQuery.isError ? <FloatingError className="error-inline" role="alert">读取账本失败：{errorDetails(ledgerQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void ledgerQuery.refetch()}>重试</button></FloatingError> : !ledger.length ? <p className="muted">服务端尚无账本条目。</p> : <ScreenPagination
+          ariaLabel="项目账本" items={ledger} getKey={(entry) => entry.call_id} estimatedItemHeight={120} height={340}
+          renderItem={(entry) => <article className="schedule-card">
             <div className="schedule-card-heading"><div><h4>{entry.source} · {entry.model_id}</h4><p className="muted">调用 {entry.call_id} · 执行者 {entry.actor_id} · 费率版本 v{entry.rate_version}</p></div><span className={`status ${entry.status === 'settled' ? 'status-running' : entry.status === 'unknown' ? 'status-failed' : ''}`}>{entry.status}</span></div>
             <p>预留 {safeMoney(entry.reserved_micros, entry.currency)} · 实际 {entry.actual_micros === undefined ? (entry.status === 'unknown' ? '未知' : '未结算') : safeMoney(entry.actual_micros, entry.currency)}</p>
             <p className="muted">预留用量：输入 {entry.reserved_usage.input_tokens.toLocaleString('zh-CN')} / 输出 {entry.reserved_usage.output_tokens.toLocaleString('zh-CN')} tokens · {usageLabel(entry)}</p>
             {entry.task_id && <p className="muted">Task：{entry.task_id}</p>}
-          </article>)}
-        </div>}
+          </article>}
+        />}
       </section>
 
       <section className="connection-section" aria-labelledby="project-work-title">
@@ -975,12 +1001,15 @@ function UserProjects() {
         {projectWorkItemsV2 && <div className="form-actions" role="group" aria-label="工作项筛选">
           {([['all', '全部'], ['bug', '缺陷'], ['request', '需求'], ['unclaimed', '待认领']] as const).map(([filter, label]) => <button key={filter} className={`button button-small ${workItemFilter === filter ? 'button-primary' : 'button-secondary'}`} type="button" aria-pressed={workItemFilter === filter} onClick={() => setWorkItemFilter(filter)}>{label}</button>)}
         </div>}
-        {workItemsQuery.isPending ? <p role="status">正在读取工作项…</p> : workItemsQuery.isError ? <p className="form-error" role="alert">读取工作项失败：{errorDetails(workItemsQuery.error).message}</p> : <div className="schedule-list" aria-label="项目工作项">
-          {visibleWorkItems.map((item) => {
+        {workItemsQuery.isPending ? <p role="status">正在读取工作项…</p> : workItemsQuery.isError ? <FloatingError className="error-inline" role="alert">读取工作项失败：{errorDetails(workItemsQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void workItemsQuery.refetch()}>重试</button></FloatingError> : <>
+          {visibleWorkItems.length ? <ScreenPagination
+            key={workItemFilter} ariaLabel="项目工作项" items={visibleWorkItems} getKey={(item) => item.id}
+            estimatedItemHeight={420} height="min(74dvh, 700px)"
+            renderItem={(item) => {
             const linkedTaskIDs = new Set(item.task_ids);
             const taskCandidates = tasks.filter((task) => !linkedTaskIDs.has(task.id));
             const deliveryChoice = deliveryChoices[item.id] ?? { taskID: item.task_ids[0] ?? '', workspaceID: '', revision: '' };
-            return <article className="schedule-card" key={item.id}>
+            return <article className="schedule-card">
               <div className="schedule-card-heading"><div><h3>{item.title}</h3><p className="muted">{item.id} · 工作项版本 v{item.version} · 负责人 {item.assignee_id ?? '待认领'}</p>{projectWorkItemsV2 && <p className="muted">类型：{workItemCategoryLabel(item.category)}</p>}</div><span className={`status ${item.state === 'open' ? 'status-running' : item.state === 'delivered' ? 'status-completed' : ''}`}>{workItemStateLabel(item)}</span></div>
               {item.description && <p>{item.description}</p>}
               {item.acceptance_criteria.length > 0 && <div><strong>验收标准</strong><ul>{item.acceptance_criteria.map((criterion, index) => <li key={`${index}:${criterion}`}>{criterion}</li>)}</ul></div>}
@@ -1005,7 +1034,7 @@ function UserProjects() {
                   const task = taskByID.get(taskID);
                   return <small key={taskID}>{taskID}{task ? ` · ${task.status} · ${task.objective}` : ' · 当前账号的 Task 列表中不可见'}</small>;
                 }) : <small>没有已关联 Task。</small>}
-                {tasksQuery.isError && <small role="alert">读取 Task 列表失败：{errorDetails(tasksQuery.error).message}</small>}
+                {tasksQuery.isError && <FloatingError className="error-inline" role="alert">读取 Task 列表失败：{errorDetails(tasksQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void tasksQuery.refetch()}>重试</button></FloatingError>}
               </div>
               <div className="inline-form">
                 <div><label htmlFor={`task-link-${item.id}`}>关联已有 Task</label><select id={`task-link-${item.id}`} value={taskChoices[item.id] ?? ''} disabled={!canManageWork || tasksQuery.isPending || Boolean(pendingAction)} onChange={(event) => setTaskChoices((current) => ({ ...current, [item.id]: event.target.value }))}>
@@ -1030,9 +1059,9 @@ function UserProjects() {
               </div>}
               {item.delivery && <p className="notice notice-success">服务端交付证据：Task {item.delivery.task_id} · Workspace {item.delivery.workspace_id} · revision {item.delivery.revision}</p>}
             </article>;
-          })}
-          {!visibleWorkItems.length && <div className="empty-card compact"><p>没有符合条件的工作项。</p></div>}
-        </div>}
+          }}
+          /> : <div className="empty-card compact"><p>没有符合条件的工作项。</p></div>}
+        </>}
       </section>
     </>}
   </section>;

@@ -25,6 +25,7 @@ type routeWorkerStub struct {
 	decision     app.ConversationRouteDecision
 	modelErr     error
 	classifyErr  error
+	applyErr     error
 	applied      []app.ConversationRouteDecision
 	failures     []string
 	deferred     int
@@ -45,6 +46,9 @@ func (s *routeWorkerStub) LoadConversationRouteSnapshot(context.Context, app.Con
 	return s.snapshot, nil
 }
 func (s *routeWorkerStub) ApplyConversationRoute(_ context.Context, _ app.ConversationRouteClaim, snapshot app.ConversationRouteSnapshot, decision app.ConversationRouteDecision) error {
+	if s.applyErr != nil {
+		return s.applyErr
+	}
 	s.snapshot = snapshot
 	s.applied = append(s.applied, decision)
 	return nil
@@ -283,6 +287,25 @@ func TestConversationRouteWorkerFailsStaleContextAfterClassification(t *testing.
 	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 0 || len(stub.failures) != 1 ||
 		stub.failures[0] != "routing_context_unavailable" || len(stub.applied) != 0 {
 		t.Fatalf("stale context should become a recoverable failure: deferred=%d failures=%v applied=%v err=%v", stub.deferred, stub.failures, stub.applied, err)
+	}
+}
+
+func TestConversationRouteWorkerFailsPersistentApplyConflict(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.applyErr = domain.NewError(domain.CodeConflict, "route action context changed")
+	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 0 || len(stub.failures) != 1 ||
+		stub.failures[0] != "routing_context_unavailable" || len(stub.applied) != 0 {
+		t.Fatalf("apply conflict should become a recoverable failure: deferred=%d failures=%v applied=%v err=%v",
+			stub.deferred, stub.failures, stub.applied, err)
+	}
+}
+
+func TestConversationRouteWorkerKeepsApplyLeaseTimeoutRetry(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.claim.LeaseExpiresAt = time.Now().Add(-time.Second)
+	stub.applyErr = context.DeadlineExceeded
+	if _, err := worker.RunOnce(context.Background()); !errors.Is(err, context.DeadlineExceeded) || len(stub.failures) != 0 || len(stub.applied) != 0 {
+		t.Fatalf("lease timeout should remain retryable: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
 	}
 }
 

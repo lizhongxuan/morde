@@ -1,16 +1,17 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
+import { FloatingError } from '../../components/FloatingError';
 
 type QualityDays = 7 | 30 | 90;
 type QualityData = Awaited<ReturnType<typeof portalApi.adminQuality>>;
 const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 
 function QualityError({ error, retry }: { error: unknown; retry: () => void }) {
-  return <div className="error-card" role="alert">
+  return <FloatingError className="error-card" role="alert">
     {errorDetails(error).message}
     <button type="button" className="button button-secondary" onClick={retry}>重试</button>
-  </div>;
+  </FloatingError>;
 }
 
 function QualityAvailability({ data }: { data: QualityData }) {

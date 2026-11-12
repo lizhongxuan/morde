@@ -911,6 +911,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/hosts/{id}/embed-tickets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue a short-lived one-time ticket for an embedded Host view
+         * @description Requires an authenticated Portal session or installation-bound native client credential (platform API keys are rejected), access to the supplied conversation, and current permission for the selected Host targets. The server binds the ticket to the authenticated user, Portal credential, optional client installation, conversation, Host, exact per-target permission ceilings, random embed nonce, current runtime generation, service instance, and exact configured Portal Origin. The exchange URL is server-generated for that Host and has no query string; the ticket is returned separately and stored hash-only. Ticket responses are not cacheable.
+         */
+        post: operations["issueHostEmbedTicket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/hosts/{id}/members": {
         parameters: {
             query?: never;
@@ -7952,6 +7974,8 @@ export interface components {
             application_id?: string;
             /** @description Optional routing hint; a server default may be selected asynchronously. */
             model_id?: string;
+            /** @description Optional IANA time-zone identifier captured when the user sends the message. */
+            time_zone?: string;
             content: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             client_attachment_ids?: string[];
@@ -8031,6 +8055,8 @@ export interface components {
             change_task_target?: boolean;
             application_id?: string;
             model_id?: string;
+            /** @description Optional IANA time-zone identifier captured when the user sends the message. */
+            time_zone?: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             client_attachment_ids?: string[];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
@@ -10587,6 +10613,64 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    issueHostEmbedTicket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    conversation_id: components["schemas"]["ConversationId"];
+                    /**
+                     * @description Initial Workbench view; it must be included in targets.
+                     * @enum {string}
+                     */
+                    target: "browser" | "terminal" | "workspace" | "files" | "vscode";
+                    /** @description Requested tabs. The server returns only currently authorized targets; files and VS Code remain owner-only under existing Gateway rules. */
+                    targets: ("browser" | "terminal" | "workspace" | "files" | "vscode")[];
+                };
+            };
+        };
+        responses: {
+            /** @description Short-lived, single-use Host embed ticket */
+            201: {
+                headers: {
+                    "Cache-Control"?: "no-store, private";
+                    Pragma?: "no-cache";
+                    Expires?: "0";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /**
+                         * Format: uri
+                         * @description Absolute URL of the fixed Host-only exchange path; contains no credential
+                         */
+                        exchange_url: string;
+                        /** @description Temporary credential; submit only in the exchange request body. */
+                        ticket: string;
+                        /** @description Random value bound to the ticket and used by the parent/Workbench embed handshake. */
+                        embed_nonce: string;
+                        /** @description Server-authorized target tabs bound to this ticket. */
+                        targets: ("browser" | "terminal" | "workspace" | "files" | "vscode")[];
+                        /** Format: date-time */
+                        expires_at: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
@@ -13286,7 +13370,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Active task page and task event cursors */
+            /** @description Task page for the selected active or recent view, with task event cursors and a pending count. */
             200: {
                 headers: {
                     [name: string]: unknown;

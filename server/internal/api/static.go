@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -154,7 +155,13 @@ func (h *api) servePortalFile(c *gin.Context, name string) {
 		return
 	}
 	if name == "index.html" || name == "admin/index.html" || name == "app/index.html" {
-		c.Header("Content-Security-Policy", portalCSP)
+		csp := portalCSP
+		if name == "index.html" {
+			if frameSource := hostFrameSource(h.options.HostScheme, h.options.HostSuffix); frameSource != "" {
+				csp += "; frame-src 'self' " + frameSource
+			}
+		}
+		c.Header("Content-Security-Policy", csp)
 		c.Header("Cache-Control", "no-cache")
 	} else {
 		c.Header("Cache-Control", "no-cache")
@@ -169,6 +176,17 @@ func (h *api) servePortalFile(c *gin.Context, name string) {
 		modTime = info.ModTime()
 	}
 	http.ServeContent(c.Writer, c.Request, path.Base(name), modTime, bytes.NewReader(contents))
+}
+
+func hostFrameSource(scheme, suffix string) string {
+	if (scheme != "https" && scheme != "http") || suffix == "" || strings.ContainsAny(suffix, ";' \t\r\n") {
+		return ""
+	}
+	parsed, err := url.Parse(scheme + "://" + suffix)
+	if err != nil || parsed.Host != suffix || parsed.Hostname() == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return scheme + "://*." + parsed.Host
 }
 
 func acceptsHTML(c *gin.Context) bool {

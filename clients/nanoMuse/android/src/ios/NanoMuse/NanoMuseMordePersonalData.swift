@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 import Combine
+import Network
+import UIKit
 
 enum NanoMuseMordeProfileSyncPreference {
     private static func key(for scopeKey: String) -> String? {
@@ -24,6 +26,11 @@ enum NanoMuseMordeProfileSyncPreference {
 
     static func canFlush(syncEnabled: Bool, scopeKey: String?) -> Bool {
         guard syncEnabled, let scopeKey else { return false }
+        return key(for: scopeKey) != nil
+    }
+
+    static func canRead(scopeKey: String?) -> Bool {
+        guard let scopeKey else { return false }
         return key(for: scopeKey) != nil
     }
 }
@@ -295,48 +302,213 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
     @Published private(set) var error: String?
 
     private var loadedScope: String?
-    private init() {}
+    private var changeSequence: Int64?
+    private var isForeground = UIApplication.shared.applicationState == .active
+    private var networkIsOnline = false
+    private var refreshQueued = false
+    private var refreshLoop: Task<Void, Never>?
+    private var observers: [NSObjectProtocol] = []
+    private var cancellables = Set<AnyCancellable>()
+    private let pathMonitor = NWPathMonitor()
+
+    private init() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                             object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in await self?.foregrounded() }
+        })
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                             object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.backgrounded() }
+        })
+        MordeShellAuthorization.shared.$personalDataScopeKey
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.refresh(root: NanoMuseDirs.root)
+                }
+            }
+            .store(in: &cancellables)
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            Task { @MainActor [weak self] in await self?.networkChanged(isOnline: online) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "morde.personal-data-network"))
+    }
+
+    private func foregrounded() async {
+        isForeground = true
+        updateRefreshLoop()
+        if networkIsOnline { await refresh(root: NanoMuseDirs.root) }
+    }
+
+    private func backgrounded() {
+        isForeground = false
+        refreshLoop?.cancel()
+        refreshLoop = nil
+    }
+
+    private func networkChanged(isOnline: Bool) async {
+        let wasOnline = networkIsOnline
+        guard wasOnline != isOnline else { return }
+        networkIsOnline = isOnline
+        updateRefreshLoop()
+        if isForeground, isOnline, !wasOnline { await refresh(root: NanoMuseDirs.root) }
+    }
+
+    private func updateRefreshLoop() {
+        refreshLoop?.cancel()
+        refreshLoop = nil
+        guard isForeground, networkIsOnline else { return }
+        refreshLoop = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                await self.refresh(root: NanoMuseDirs.root)
+            }
+        }
+    }
 
     func object(_ type: String, _ id: String) -> MordePersonalSyncObject? { objects[type]?[id] }
     func values(_ type: String) -> [MordePersonalSyncObject] { Array(objects[type, default: [:]].values) }
 
     func refresh(root: URL) async {
+        guard !isLoading else { refreshQueued = true; return }
+        isLoading = true
+        defer {
+            isLoading = false
+            if refreshQueued {
+                refreshQueued = false
+                Task { @MainActor [weak self] in await self?.refresh(root: root) }
+            }
+        }
         let auth = MordeShellAuthorization.shared
         let scope = auth.personalDataScopeKey
         if loadedScope != scope {
             loadedScope = scope
+            changeSequence = nil
             objects = [:]
             pending = nil
             error = nil
         }
         guard let scope else { syncEnabled = true; return }
         syncEnabled = NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope)
+        guard NanoMuseMordeProfileSyncPreference.canRead(scopeKey: scope) else { return }
         do {
             pending = try NanoMuseMordePersonalDataOutbox.load(scopeKey: scope, root: root)
             if syncEnabled, pending != nil {
                 do { _ = try await flush(scope: scope, root: root) }
                 catch is MordePersonalRevisionConflict { /* Keep reading the cloud snapshot while the user resolves it. */ }
             }
-            guard syncEnabled else { return }
-            isLoading = true
-            defer { isLoading = false }
-            var result: [String: [String: MordePersonalSyncObject]] = [:]
-            var cursor: String?
-            var seen = Set<String>()
-            repeat {
-                let page = try await auth.personalSnapshot(cursor: cursor)
-                for item in page.items where MordePersonalDataContract.syncObjectTypes.contains(item.object_type) {
-                    result[item.object_type, default: [:]][item.object_id] = item
-                }
-                cursor = page.next_cursor
-                if let cursor, !cursor.isEmpty, !seen.insert(cursor).inserted { throw URLError(.cannotParseResponse) }
-            } while cursor?.isEmpty == false
+            if let changeSequence {
+                try await refreshChanges(after: changeSequence, scope: scope, authorization: auth)
+            } else {
+                try await refreshSnapshot(scope: scope, authorization: auth)
+            }
             guard auth.personalDataScopeKey == scope else { return }
-            objects = result
             error = nil
         } catch {
-            if auth.personalDataScopeKey == scope { self.error = error.localizedDescription }
+            if auth.personalDataScopeKey == scope {
+                self.error = "\(AppLocalized("Cloud personal data could not be refreshed. Local changes are preserved.")) \(error.localizedDescription)"
+            }
         }
+    }
+
+    private func refreshSnapshot(scope: String, authorization: MordeShellAuthorization) async throws {
+        var result: [String: [String: MordePersonalSyncObject]] = [:]
+        var cursor: String?
+        var watermark: Int64?
+        var seen = Set<String>()
+        repeat {
+            let page = try await authorization.personalSnapshot(cursor: cursor)
+            if let watermark, watermark != page.watermark { throw URLError(.cannotParseResponse) }
+            watermark = page.watermark
+            for item in page.items where MordePersonalDataContract.syncObjectTypes.contains(item.object_type) {
+                result[item.object_type, default: [:]][item.object_id] = item
+            }
+            cursor = page.next_cursor
+            if let cursor, !cursor.isEmpty, !seen.insert(cursor).inserted { throw URLError(.cannotParseResponse) }
+        } while cursor?.isEmpty == false
+        let baseSequence = watermark ?? 0
+        let (reconciled, sequence) = try await loadChanges(afterSequence: baseSequence, scope: scope,
+                                                            authorization: authorization, startingWith: result)
+        guard authorization.personalDataScopeKey == scope else { return }
+        objects = reconciled
+        changeSequence = sequence
+    }
+
+    private func refreshChanges(afterSequence: Int64, scope: String,
+                                 authorization: MordeShellAuthorization) async throws {
+        let (updated, sequence) = try await loadChanges(afterSequence: afterSequence, scope: scope,
+                                                        authorization: authorization, startingWith: objects)
+        guard authorization.personalDataScopeKey == scope else { return }
+        objects = updated
+        changeSequence = sequence
+    }
+
+    private func loadChanges(afterSequence: Int64, scope: String, authorization: MordeShellAuthorization,
+                             startingWith initialObjects: [String: [String: MordePersonalSyncObject]]) async throws
+        -> ([String: [String: MordePersonalSyncObject]], Int64) {
+        var sequence = afterSequence
+        var throughSequence: Int64?
+        var updated = initialObjects
+        repeat {
+            let page = try await authorization.personalChanges(afterSequence: sequence,
+                                                               throughSequence: throughSequence)
+            guard authorization.personalDataScopeKey == scope else { return (updated, sequence) }
+            if let throughSequence, throughSequence != page.through_sequence {
+                throw URLError(.cannotParseResponse)
+            }
+            throughSequence = page.through_sequence
+            var latestByObject: [String: MordePersonalChange] = [:]
+            for change in page.items {
+                latestByObject["\(change.object_type)\u{0}\(change.object_id)"] = change
+            }
+            for change in latestByObject.values.sorted(by: { $0.change_sequence < $1.change_sequence }) {
+                let item: MordePersonalSyncObject?
+                if change.operation == "upsert" {
+                    item = try await authorization.personalObject(objectType: change.object_type,
+                                                                  objectID: change.object_id)
+                } else {
+                    item = nil
+                }
+                guard authorization.personalDataScopeKey == scope else { return (updated, sequence) }
+                try Self.apply(change, item: item, to: &updated)
+            }
+            guard page.next_after_sequence >= sequence,
+                  !page.has_more || page.next_after_sequence > sequence else {
+                throw URLError(.cannotParseResponse)
+            }
+            sequence = page.next_after_sequence
+            if !page.has_more { break }
+        } while true
+        return (updated, sequence)
+    }
+
+    static func apply(_ change: MordePersonalChange, item: MordePersonalSyncObject?,
+                      to objects: inout [String: [String: MordePersonalSyncObject]]) throws {
+        guard MordePersonalDataContract.syncObjectTypes.contains(change.object_type),
+              MordePersonalDataContract.isValidObjectIdentifier(type: change.object_type, id: change.object_id),
+              change.revision > 0, ["upsert", "delete"].contains(change.operation) else {
+            throw URLError(.cannotParseResponse)
+        }
+        let current = objects[change.object_type]?[change.object_id]
+        if change.operation == "delete" {
+            if current.map({ $0.revision < change.revision }) ?? true {
+                objects[change.object_type]?.removeValue(forKey: change.object_id)
+            }
+            return
+        }
+        // A 404 from the current-object read means a newer delete may have landed after this feed watermark.
+        if item == nil {
+            objects[change.object_type]?.removeValue(forKey: change.object_id)
+            return
+        }
+        if let current, current.revision >= change.revision { return }
+        guard let item, item.object_type == change.object_type, item.object_id == change.object_id,
+              item.revision >= change.revision else { throw URLError(.cannotParseResponse) }
+        objects[change.object_type, default: [:]][change.object_id] = item
     }
 
     @discardableResult

@@ -9,18 +9,12 @@ import { AccountSettings } from './AccountSettings';
 
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1', name: 'Alice', role: 'user' } }) }));
 const personalSyncStore = vi.hoisted(() => ({
-  getEnabled: vi.fn(() => true),
-  setEnabled: vi.fn(),
-  subscribeEnabled: vi.fn((_userID: string, listener: (enabled: boolean) => void) => { listener(true); return vi.fn(); }),
-  subscribeStatus: vi.fn((_userID: string, listener: (status: { enabled: boolean; pendingCount: number; conflictCount: number }) => void) => {
-    listener({ enabled: true, pendingCount: 2, conflictCount: 1 });
+  subscribeStatus: vi.fn((_userID: string, listener: (status: { pendingCount: number; conflictCount: number }) => void) => {
+    listener({ pendingCount: 2, conflictCount: 1 });
     return vi.fn();
   }),
 }));
 vi.mock('./personal-data-store', () => ({
-  getPersonalDataSyncEnabled: personalSyncStore.getEnabled,
-  setPersonalDataSyncEnabled: personalSyncStore.setEnabled,
-  subscribePersonalDataSyncEnabled: personalSyncStore.subscribeEnabled,
   subscribePersonalDataSyncStatus: personalSyncStore.subscribeStatus,
 }));
 
@@ -50,6 +44,7 @@ describe('AccountSettings', () => {
     records: Awaited<ReturnType<typeof portalApi.myRecords>> = { items: [], next_before: '' },
     captureResults: CaptureResult[] = [{ page: emptyCapturePage }],
   ) {
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ service_instance_id: 'service-account-test' } as Awaited<ReturnType<typeof portalApi.capabilities>>);
     vi.spyOn(portalApi, 'personalDataQuota').mockResolvedValue({ owner_id: 'u1', used_bytes: 10, reserved_bytes: 2,
       quota_bytes: 1000, max_attachment_bytes: 500, remaining_bytes: 988, version: 1 });
     vi.spyOn(portalApi, 'myRecords').mockResolvedValue(records);
@@ -80,11 +75,16 @@ describe('AccountSettings', () => {
     expect(screen.getByRole('link', { name: '修改密码' })).toHaveAttribute('href', '/settings/password');
     expect(screen.getByRole('link', { name: '管理客户端' })).toHaveAttribute('href', '/clients');
     expect(screen.queryByRole('heading', { name: '我的邀请码' })).not.toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('tab', { name: '隐私与同意' }));
     expect(await screen.findByRole('checkbox', { name: '允许保存完整会话记录' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: '允许保存训练样本贡献' })).not.toBeChecked();
-    expect(screen.getByRole('checkbox', { name: '同步个人数据到当前账号' })).toBeChecked();
-    expect(screen.getByText(/待同步 2 项 · 冲突 1 项/)).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: '同步个人数据到当前账号' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('tab', { name: '个人数据' }));
+    expect(screen.getByText('保存后自动更新云端；手机连接后会获取最新资料。')).toBeInTheDocument();
+    expect(screen.getByText('待提交 2 项 · 冲突 1 项')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '个人数据' })).toHaveAttribute('href', '/personal');
+    expect(personalSyncStore.subscribeStatus).toHaveBeenCalledWith('u1', expect.any(Function), window.location.origin, 'service-account-test');
   });
 
   it('updates one independent consent and reloads its server state', async () => {
@@ -100,6 +100,7 @@ describe('AccountSettings', () => {
       ] });
     const setConsent = vi.spyOn(portalApi, 'setRecordConsent').mockResolvedValue({ owner_id: 'u1', purpose: 'full_record', enabled: true, version: 1 });
     renderSettings();
+    await user.click(screen.getByRole('tab', { name: '隐私与同意' }));
 
     await user.click(await screen.findByRole('checkbox', { name: '允许保存完整会话记录' }));
     await waitFor(() => expect(setConsent.mock.calls[0]?.[0]).toEqual({ purpose: 'full_record', enabled: true }));
@@ -119,6 +120,7 @@ describe('AccountSettings', () => {
     const deleteRecord = vi.spyOn(portalApi, 'deleteMyRecord').mockResolvedValue({ id: 'l1234567', owner_id: 'u1',
       record_id: 'v1234567', state: 'pending', attempts: 0, requested_at: '2026-11-02T00:00:00Z' });
     renderSettings(records);
+    await user.click(screen.getByRole('tab', { name: '已保存记录' }));
 
     await user.click(await screen.findByRole('button', { name: '删除记录' }));
     expect(screen.getByRole('group', { name: '确认删除记录 v1234567' })).toHaveTextContent('不会删除普通会话或资源库附件');
@@ -129,16 +131,62 @@ describe('AccountSettings', () => {
     expect(await screen.findByText('删除请求已受理；后台清理完成前，记录仍可能短暂显示在列表中。')).toBeInTheDocument();
   });
 
-  it('pauses only personal sync when its setting is switched off', async () => {
+  it('keeps a record confirmation when switching between compact account sections', async () => {
     const user = userEvent.setup();
-    vi.spyOn(portalApi, 'recordConsents').mockResolvedValue({ items: [] });
+    const records = { items: [{ id: 'v7654321', owner_id: 'u1', purpose: 'full_record' as const,
+      kind: 'turn' as const, consent_version: 1, created_at: '2026-11-02T00:00:00Z', expires_at: '2026-12-02T00:00:00Z',
+      payload_bytes: 32, attachment_bytes: 0, attachment_count: 0, state: 'active' as const }], next_before: '' };
+    const deleteRecord = vi.spyOn(portalApi, 'deleteMyRecord');
+    renderSettings(records);
+
+    await user.click(screen.getByRole('tab', { name: '已保存记录' }));
+    await user.click(await screen.findByRole('button', { name: '删除记录' }));
+    expect(screen.getByRole('group', { name: '确认删除记录 v7654321' })).toBeInTheDocument();
+    await user.click(screen.getByRole('tab', { name: '账号' }));
+    await user.click(screen.getByRole('tab', { name: '已保存记录' }));
+
+    expect(screen.getByRole('group', { name: '确认删除记录 v7654321' })).toBeInTheDocument();
+    expect(deleteRecord).not.toHaveBeenCalled();
+  });
+
+  it('uses four item pages for long record lists instead of expanding the page vertically', async () => {
+    const user = userEvent.setup();
+    const recordsQuery = vi.spyOn(portalApi, 'myRecords').mockResolvedValue({ items: [], next_before: '' });
     renderSettings();
 
-    await user.click(await screen.findByRole('checkbox', { name: '同步个人数据到当前账号' }));
+    await user.click(screen.getByRole('tab', { name: '已保存记录' }));
+    await waitFor(() => expect(recordsQuery).toHaveBeenCalledWith({ limit: 4 }));
+    expect(await screen.findByRole('heading', { name: '没有已保存记录' })).toBeInTheDocument();
+  });
 
-    expect(personalSyncStore.setEnabled).toHaveBeenCalledWith('u1', false, window.location.origin);
-    expect(screen.getByText(/同步已暂停/)).toBeInTheDocument();
-    expect(screen.getByText(/待同步内容留在本机/)).toBeInTheDocument();
+  it('moves through four-record pages and keeps the previous page available', async () => {
+    const user = userEvent.setup();
+    const item = (index: number) => ({ id: `v${index.toString().padStart(7, '0')}`, owner_id: 'u1', purpose: 'full_record' as const,
+      kind: 'turn' as const, consent_version: 1, created_at: '2026-11-02T00:00:00Z', expires_at: '2026-12-02T00:00:00Z',
+      payload_bytes: 100 + index, attachment_bytes: 0, attachment_count: 0, state: 'active' as const });
+    renderSettings({ items: [item(0), item(1), item(2), item(3)], next_before: 'page-two' });
+    const recordsQuery = vi.mocked(portalApi.myRecords);
+    recordsQuery.mockResolvedValueOnce({ items: [item(4)], next_before: '' });
+    await user.click(screen.getByRole('tab', { name: '已保存记录' }));
+    const hasRecordBytes = (bytes: string) => screen.getAllByRole('article').some((article) => article.textContent?.includes(bytes));
+
+    await waitFor(() => expect(hasRecordBytes('100 B')).toBe(true));
+    await user.click(screen.getByRole('button', { name: '下一页' }));
+    await waitFor(() => expect(hasRecordBytes('104 B')).toBe(true));
+    expect(hasRecordBytes('100 B')).toBe(false);
+    expect(recordsQuery).toHaveBeenLastCalledWith({ limit: 4, before_id: 'page-two' });
+    await user.click(screen.getByRole('button', { name: '上一页' }));
+    await waitFor(() => expect(hasRecordBytes('100 B')).toBe(true));
+    expect(hasRecordBytes('104 B')).toBe(false);
+  });
+
+  it('shows read-only personal save status without a pause control', async () => {
+    vi.spyOn(portalApi, 'recordConsents').mockResolvedValue({ items: [] });
+    renderSettings();
+    await userEvent.setup().click(screen.getByRole('tab', { name: '个人数据' }));
+
+    expect(await screen.findByText('待提交 2 项 · 冲突 1 项')).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: '同步个人数据到当前账号' })).not.toBeInTheDocument();
   });
 
   it('shows task capture statuses as metadata with safe failure-code labels', async () => {
@@ -162,6 +210,7 @@ describe('AccountSettings', () => {
       next_before: '',
     } as unknown as CapturePage;
     renderSettings(undefined, [{ page }]);
+    await userEvent.setup().click(screen.getByRole('tab', { name: '记录状态' }));
 
     await screen.findAllByText('等待持久化');
     const section = await screen.findByRole('region', { name: '任务记录采集状态' });
@@ -181,6 +230,7 @@ describe('AccountSettings', () => {
     let resolvePage!: (page: CapturePage) => void;
     const page = new Promise<CapturePage>((resolve) => { resolvePage = resolve; });
     renderSettings(undefined, [{ promise: page }]);
+    await userEvent.setup().click(screen.getByRole('tab', { name: '记录状态' }));
 
     expect(screen.getByText('正在读取任务记录状态…')).toBeInTheDocument();
     await act(async () => { resolvePage(emptyCapturePage); await page; });
@@ -190,6 +240,7 @@ describe('AccountSettings', () => {
   it('shows a retry action when task capture statuses fail to load', async () => {
     vi.spyOn(portalApi, 'recordConsents').mockResolvedValue({ items: [] });
     renderSettings(undefined, [{ error: new Error('状态读取失败') }]);
+    await userEvent.setup().click(screen.getByRole('tab', { name: '记录状态' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('状态读取失败');
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
@@ -201,6 +252,7 @@ describe('AccountSettings', () => {
     const pending = { items: [captureStatus('j1234567', 'leased')], next_before: '' };
     const stored = { items: [captureStatus('j1234567', 'stored')], next_before: '' };
     const { captureStatuses } = renderSettings(undefined, [{ page: pending }, { page: stored }]);
+    await userEvent.setup().click(screen.getByRole('tab', { name: '记录状态' }));
 
     expect(await screen.findByText('等待持久化')).toBeInTheDocument();
     expect(captureStatuses).toHaveBeenCalledTimes(1);

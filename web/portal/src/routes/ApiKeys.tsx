@@ -6,6 +6,8 @@ import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { OnceSecretDialog } from '../components/OnceSecretDialog';
+import { ScreenPagination } from '../components/ScreenPagination';
+import { FloatingError } from '../components/FloatingError';
 
 type ApiKey = {
   id: string;
@@ -15,6 +17,8 @@ type ApiKey = {
   revoked: boolean;
   created_at: string;
 };
+
+const apiKeyGridColumns = 'minmax(140px, 1.2fr) repeat(5, minmax(88px, 1fr)) auto';
 
 export function ApiKeys() {
   const client = useQueryClient();
@@ -66,8 +70,7 @@ export function ApiKeys() {
     <section className="connection-section mcp-connection-section" aria-labelledby="mcp-connection-title">
       <div className="connection-section-heading"><div><h2 id="mcp-connection-title">连接 AI 对话工具</h2><p className="muted">接入后，AI 可以在你的账号权限范围内使用云端电脑。</p></div></div>
       <div className="mcp-endpoint"><div><span>本实例 MCP 地址</span><code>{mcpURL}</code></div><button type="button" className="button button-secondary" onClick={() => void copyEndpoint()}>复制地址</button></div>
-      <ol className="mcp-setup-steps"><li><strong>创建 API Key</strong><span>无需逐项选择电脑或权限，访问范围随账号当前授权变化。</span></li><li><strong>把地址和 Key 配到 AI 客户端</strong><span>Key 只在创建时显示一次。请保存在客户端的密钥管理或环境变量中。</span></li></ol>
-      <div className="notice notice-info">吊销 API Key 后，后续 MCP 请求会被拒绝。</div>
+      <p className="mcp-setup-summary">创建 API Key 后，在 AI 客户端配置地址和密钥。权限随账号授权变化；密钥仅创建时显示，吊销后后续请求会被拒绝。</p>
     </section>
     <section className="design-panel" aria-labelledby="api-key-list-title">
     <div className="design-panel-header"><div><h2 id="api-key-list-title">我的密钥</h2><p>创建后自动获得当前账号可用的权限。</p></div><button type="button" className="button button-primary" aria-expanded={showCreate} disabled={create.isPending} onClick={() => setShowCreate((open) => !open)}>{showCreate ? '收起' : '＋ 创建 API Key'}</button></div>
@@ -82,18 +85,31 @@ export function ApiKeys() {
       </button>
     </form>}
 
-    {keys.isPending ? <div className="loading-card">正在加载…</div> : keys.isError ? <div className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></div> : !keys.data?.items.length ? <div className="empty-card compact"><p>尚未创建 API Key。</p></div> : <div className="table-wrap"><table><thead><tr><th>名称</th><th>权限</th><th>创建时间</th><th>最近使用</th><th>过期时间</th><th>状态</th><th>操作</th></tr></thead><tbody>
-      {keys.data.items.map((key) => {
-        const expired = now > 0 && Date.parse(key.expires_at) <= now;
-        return <tr key={key.id}>
-          <td><strong>{key.name || '未命名'}</strong><small className="table-sub mono">{key.id}</small></td>
-          <td>账号当前可用权限</td>
-          <td>{formatDate(key.created_at)}</td><td>{formatDate(key.last_used_at)}</td><td>{formatDate(key.expires_at)}</td>
-          <td>{key.revoked ? '已吊销' : expired ? '已过期' : '有效'}</td>
-          <td>{key.revoked ? '—' : <button type="button" className="button button-danger-quiet button-small" aria-label={`吊销 API Key ${key.name || key.id}`} onClick={() => setRemoving(key)}>吊销</button>}</td>
-        </tr>;
-      })}
-    </tbody></table></div>}
+    {keys.isPending ? <div className="loading-card">正在加载…</div> : keys.isError ? <FloatingError className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError> : !keys.data?.items.length ? <div className="empty-card compact"><p>尚未创建 API Key。</p></div> : <div className="table-wrap" style={{ padding: '0 10px' }}>
+      <div aria-hidden="true" style={{ display: 'grid', gridTemplateColumns: apiKeyGridColumns, gap: 12, minWidth: 850, padding: '10px 8px', borderBottom: '1px solid #e9edf2', color: '#8793a4', background: '#fafbfc', fontSize: 10, fontWeight: 700 }}>
+        <span>名称</span><span>权限</span><span>创建时间</span><span>最近使用</span><span>过期时间</span><span>状态</span><span>操作</span>
+      </div>
+      <ScreenPagination
+        items={keys.data.items}
+        getKey={(key) => key.id}
+        estimatedItemHeight={60}
+        height="min(22dvh, 160px)"
+        gap={0}
+        ariaLabel="API Key 列表"
+        renderItem={(key) => {
+          const expired = now > 0 && Date.parse(key.expires_at) <= now;
+          return <article aria-label={`API Key ${key.name || key.id}`} style={{ display: 'grid', gridTemplateColumns: apiKeyGridColumns, gap: 12, alignItems: 'center', minWidth: 850, minHeight: 60, padding: '8px', borderBottom: '1px solid #e9edf2', fontSize: 12 }}>
+            <div><span className="sr-only">名称 </span><strong>{key.name || '未命名'}</strong><small className="table-sub mono"><span className="sr-only">ID </span>{key.id}</small></div>
+            <span><span className="sr-only">权限 </span>账号当前可用权限</span>
+            <span><span className="sr-only">创建时间 </span>{formatDate(key.created_at)}</span>
+            <span><span className="sr-only">最近使用 </span>{formatDate(key.last_used_at)}</span>
+            <span><span className="sr-only">过期时间 </span>{formatDate(key.expires_at)}</span>
+            <span><span className="sr-only">状态 </span>{key.revoked ? '已吊销' : expired ? '已过期' : '有效'}</span>
+            <span><span className="sr-only">操作 </span>{key.revoked ? '—' : <button type="button" className="button button-danger-quiet button-small" aria-label={`吊销 API Key ${key.name || key.id}`} onClick={() => setRemoving(key)}>吊销</button>}</span>
+          </article>;
+        }}
+      />
+    </div>}
     </section>
     {removing && <ConfirmDialog title="吊销 API Key" description={`“${removing.name || removing.id}”吊销后，后续请求会被拒绝；已经发出的外部操作仍可能完成。此操作不可撤销。`} confirmLabel="吊销 Key" danger busy={remove.isPending} onClose={() => setRemoving(null)} onConfirm={() => remove.mutate(removing.id)} />}
     {secret && <OnceSecretDialog title="API Key 已创建" secret={secret.key} expiresAt={formatDate(secret.expires_at)} onClose={() => setSecret(null)} />}

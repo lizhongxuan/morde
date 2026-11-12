@@ -2,10 +2,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter, Route, Routes } from 'react-router';
 import type { components } from '../api/schema';
 import { api, ApiError } from '../api/client';
 import { portalApi } from '../app/api';
+import { ToastProvider } from '../app/toast';
+import { PortalLayout } from '../components/PortalLayout';
 import { GoalsAndSchedules } from './GoalsAndSchedules';
+
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: 'user' }, signOut: async () => {} }) }));
 
 const goal: components['schemas']['PersonalObject'] = {
   object_type: 'goal', object_id: 'goal_1', revision: 4,
@@ -25,7 +30,9 @@ describe('GoalsAndSchedules', () => {
 
   function renderPage() {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    return render(<QueryClientProvider client={queryClient}><GoalsAndSchedules /></QueryClientProvider>);
+    return render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter initialEntries={['/goals']}><Routes>
+      <Route element={<PortalLayout />}><Route path="/goals" element={<GoalsAndSchedules />} /></Route>
+    </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
   }
 
   function mockAvailableModels() {
@@ -47,6 +54,7 @@ describe('GoalsAndSchedules', () => {
   }
 
   it('shows cloud goals and schedule states', async () => {
+    const user = userEvent.setup();
     vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [goal], next_cursor: null });
     vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [schedule], next_cursor: '' });
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
@@ -56,6 +64,7 @@ describe('GoalsAndSchedules', () => {
     expect(await screen.findByRole('heading', { level: 3, name: '完成迁移' })).toBeInTheDocument();
     expect(screen.queryByText(/旧 nanoMuse/)).not.toBeInTheDocument();
     expect(screen.queryByLabelText('选择旧客户端导出的计划 JSON')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     expect(screen.getByRole('heading', { level: 3, name: '日报标题' })).toBeInTheDocument();
     expect(screen.getByText('执行内容：检查日报')).toBeInTheDocument();
     expect(screen.getByText('版本 2')).toBeInTheDocument();
@@ -101,12 +110,65 @@ describe('GoalsAndSchedules', () => {
     })));
   });
 
+  it('keeps an unfinished schedule form when switching sidebar categories', async () => {
+    const user = userEvent.setup();
+    mockEmptyGoalsAndSchedules();
+    renderPage();
+
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
+    await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
+    await user.type(screen.getByLabelText('计划内容'), '保留这个编辑草稿');
+    await user.click(screen.getByRole('link', { name: '目标' }));
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
+
+    expect(screen.getByLabelText('计划内容')).toHaveValue('保留这个编辑草稿');
+  });
+
+  it('keeps an unfinished schedule form while paging the schedule list', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [schedule, { ...schedule, id: 'j2234567', title: '第二个计划' }], next_cursor: '' });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    mockAvailableModels();
+    renderPage();
+
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
+    await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
+    await user.type(screen.getByLabelText('计划内容'), '分页时保留编辑内容');
+    await user.click(screen.getByRole('button', { name: '下一页' }));
+
+    expect(await screen.findByRole('heading', { level: 3, name: '第二个计划' })).toBeInTheDocument();
+    expect(screen.getByLabelText('计划内容')).toHaveValue('分页时保留编辑内容');
+  });
+
+  it('updates and deletes a goal using the latest server revision', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [goal], next_cursor: null });
+    vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [], next_cursor: '' });
+    vi.spyOn(portalApi, 'getGoal').mockResolvedValue(goal);
+    const update = vi.spyOn(portalApi, 'updateGoal').mockResolvedValue({ object_type: 'goal', object_id: 'goal_1', result_revision: 5, account_change_sequence: 7, replay: false });
+    const remove = vi.spyOn(portalApi, 'deleteGoal').mockResolvedValue({ object_type: 'goal', object_id: 'goal_1', result_revision: 5, account_change_sequence: 8, replay: false });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    mockAvailableModels();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '暂停目标' }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith('goal_1', {
+      base_revision: 4,
+      body: { ...goal.body, status: 'paused' },
+    }));
+    await user.click(screen.getByRole('button', { name: '删除' }));
+    await user.click(screen.getByRole('button', { name: '确认删除' }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('goal_1', { base_revision: 4 }));
+  });
+
   it('creates an enabled cloud schedule through the Portal session API', async () => {
     const user = userEvent.setup();
     mockEmptyGoalsAndSchedules();
     const create = vi.spyOn(portalApi, 'createSchedule').mockResolvedValue(schedule);
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
     await user.selectOptions(screen.getByLabelText('主机'), 'h1234567');
     await user.type(screen.getByLabelText('计划内容'), '检查工作日进度');
@@ -128,6 +190,7 @@ describe('GoalsAndSchedules', () => {
     const create = vi.spyOn(portalApi, 'createSchedule').mockResolvedValue({ ...schedule, host_id: null });
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
     expect(screen.getByLabelText('主机')).toHaveValue('');
     await user.type(screen.getByLabelText('计划内容'), '每天总结公开新闻');
@@ -148,6 +211,7 @@ describe('GoalsAndSchedules', () => {
     });
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
     await user.type(screen.getByLabelText('计划内容'), '每六小时检查一次');
     await user.click(screen.getByRole('radio', { name: '每 N 小时' }));
@@ -172,6 +236,7 @@ describe('GoalsAndSchedules', () => {
     mockAvailableModels();
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     await user.click(await screen.findByRole('button', { name: '编辑版本' }));
     const objective = await screen.findByLabelText('计划内容');
     await user.clear(objective);
@@ -198,6 +263,7 @@ describe('GoalsAndSchedules', () => {
     mockAvailableModels();
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     expect(await screen.findByText((text, element) => element?.classList.contains('schedule-card-meta') === true && text.includes(`锚点 ${anchor}`))).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '编辑版本' }));
     expect(await screen.findByText(`调度锚点：${anchor}（编辑时保留该相位）`)).toBeInTheDocument();
@@ -219,6 +285,7 @@ describe('GoalsAndSchedules', () => {
     vi.spyOn(portalApi, 'createSchedule').mockRejectedValue(new ApiError({ status: 403, code: 'forbidden', message: '计划管理权限不足' }));
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
     await user.type(screen.getByLabelText('计划内容'), '安全检查');
     await user.click(screen.getByRole('button', { name: '创建并启用' }));
@@ -240,8 +307,37 @@ describe('GoalsAndSchedules', () => {
     mockAvailableModels();
     renderPage();
 
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
     await user.click(await screen.findByRole('button', { name: '运行记录' }));
     expect(await screen.findByText(/已完成/)).toBeInTheDocument();
     expect(screen.getByText(/计划版本 2 · 任务 task-1/)).toBeInTheDocument();
+  });
+
+  it('loads later schedule run history pages with the returned cursor', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [schedule], next_cursor: '' });
+    const runs = vi.spyOn(portalApi, 'scheduleRuns')
+      .mockResolvedValueOnce({ items: [{
+        id: 'y1234567', schedule_id: schedule.id, schedule_version: 2, occurrence_key: 'occurrence-1', scheduled_at: schedule.next_run_at,
+        coalesced_count: 0, status: 'completed', skip_reason: null, task_id: 'task-1', notification_events: ['completed'], observation: null,
+        observation_outcome: 'unknown', created_at: '2026-11-02T01:00:00Z', updated_at: '2026-11-02T01:05:00Z', finished_at: '2026-11-02T01:05:00Z',
+      }], next_cursor: 'runs-next' })
+      .mockResolvedValueOnce({ items: [{
+        id: 'y2234567', schedule_id: schedule.id, schedule_version: 3, occurrence_key: 'occurrence-2', scheduled_at: schedule.next_run_at,
+        coalesced_count: 0, status: 'failed', skip_reason: null, task_id: 'task-2', notification_events: ['failed'], observation: null,
+        observation_outcome: 'unknown', created_at: '2026-11-03T01:00:00Z', updated_at: '2026-11-03T01:05:00Z', finished_at: '2026-11-03T01:05:00Z',
+      }], next_cursor: '' });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    mockAvailableModels();
+    renderPage();
+
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
+    await user.click(await screen.findByRole('button', { name: '运行记录' }));
+    expect(await screen.findByText(/任务 task-1/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '加载更多运行记录' }));
+
+    expect(await screen.findByText(/任务 task-2/)).toBeInTheDocument();
+    expect(runs).toHaveBeenNthCalledWith(2, schedule.id, { cursor: 'runs-next' });
   });
 });

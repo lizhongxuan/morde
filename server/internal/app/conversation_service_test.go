@@ -156,9 +156,9 @@ func TestConversationSearchPaginatesAfterHostAuthorization(t *testing.T) {
 	}
 	visibleSecondCursor := EncodePageCursor(secondRawPage[1].UpdatedAt, secondRawPage[1].ID)
 	store := &conversationStoreStub{listPages: map[string]ConversationPage{
-		"":                        {Items: firstRawPage, NextCursor: rawCursor},
-		rawCursor:                 {Items: secondRawPage},
-		visibleSecondCursor:       {Items: secondRawPage[2:]},
+		"":                  {Items: firstRawPage, NextCursor: rawCursor},
+		rawCursor:           {Items: secondRawPage},
+		visibleSecondCursor: {Items: secondRawPage[2:]},
 	}}
 	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
 		"hblocked": domain.NewError(domain.CodeForbidden, "host access denied"),
