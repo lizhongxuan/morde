@@ -27,7 +27,12 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 		t.Fatalf("localized server receipt time missing: %+v", input)
 	}
 	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "server received") ||
-		!strings.Contains(request.Instructions, "must not create a Task") {
+		!strings.Contains(request.Instructions, "must not create a Task") ||
+		!strings.Contains(request.Instructions, "acknowledgements") ||
+		!strings.Contains(request.Instructions, "text-only requests for small code snippets") ||
+		!strings.Contains(request.Instructions, "Explicit requests to delegate") ||
+		!strings.Contains(request.Instructions, "do not replace the requested delegation with a static text-only answer") ||
+		!strings.Contains(request.Instructions, "ask for the exact missing information") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
 	}
 }
@@ -87,6 +92,35 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 				t.Fatalf("direct reply or original model output was not preserved: %+v", decision)
 			}
 		})
+	}
+}
+
+func TestExplicitParallelDelegationStartsTaskWhenRouterMisses(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "商品页支持含税价格和分类筛选。请并行委派两个互不重叠的只读子任务，一个分析客户端，另一个分析服务端/API，由两个子Agent分别返回结果。"}
+	for _, output := range []string{
+		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
+		`{"action":"reply","task_id":"","question":"","reply":"下面是静态建议清单。"}`,
+		"not-json",
+	} {
+		decision := ParseConversationRouteDecisionForContext(output, value)
+		if decision.Action != ConversationRouteNew || decision.TaskID != "" || decision.Question != "" || decision.Reply != "" ||
+			decision.ModelOutput != output {
+			t.Errorf("explicit parallel delegation did not start independent Task: %q => %+v", output, decision)
+		}
+	}
+}
+
+func TestExplicitParallelDelegationFallbackAvoidsQueriesAndNegation(t *testing.T) {
+	for _, content := range []string{
+		"解释一下“请并行委派两个子Agent”是什么意思？",
+		"不要请并行委派子任务，只说明并行委派的含义。",
+	} {
+		value := ConversationRouteContext{ActorID: "u1234567", Content: content}
+		output := `{"action":"reply","task_id":"","question":"","reply":"这是在说并行分配工作。"}`
+		decision := ParseConversationRouteDecisionForContext(output, value)
+		if decision.Action != ConversationRouteReply || decision.Reply == "" {
+			t.Errorf("non-delegation query was turned into a Task: %q => %+v", content, decision)
+		}
 	}
 }
 

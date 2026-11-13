@@ -35,6 +35,33 @@ enum NanoMuseMordeProfileSyncPreference {
     }
 }
 
+enum NanoMuseMordePersonalContentSyncPolicy {
+    static func canFlush(scopeKey: String?, isSaving: Bool) -> Bool {
+        !isSaving && NanoMuseMordeProfileSyncPreference.canRead(scopeKey: scopeKey)
+    }
+}
+
+enum NanoMuseMordePersonalRefreshPolicy {
+    static func shouldRefreshOnForeground(isOnline: Bool) -> Bool { isOnline }
+
+    static func shouldRefreshOnReconnect(isForeground: Bool, wasOnline: Bool, isOnline: Bool) -> Bool {
+        isForeground && !wasOnline && isOnline
+    }
+
+    static func shouldRunPeriodicRefresh(isForeground: Bool, isOnline: Bool) -> Bool {
+        isForeground && isOnline
+    }
+}
+
+enum NanoMuseMordePersonalMutationReceiptPolicy {
+    static func accepts(receipt: MordePersonalMutationReceipt, mutation: MordePersonalDataMutation,
+                        currentScope: String?) -> Bool {
+        currentScope == mutation.scopeKey && receipt.object_type == mutation.objectType &&
+            receipt.object_id == mutation.objectID && receipt.result_revision > 0 &&
+            receipt.account_change_sequence > 0
+    }
+}
+
 struct MordePersonalDataMutation: Codable, Equatable, Sendable {
     let scopeKey: String
     let mutationID: String
@@ -348,7 +375,9 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
     private func foregrounded() async {
         isForeground = true
         updateRefreshLoop()
-        if networkIsOnline { await refresh(root: personalDataRoot) }
+        if NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnForeground(isOnline: networkIsOnline) {
+            await refresh(root: personalDataRoot)
+        }
     }
 
     private func backgrounded() {
@@ -362,13 +391,17 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
         guard wasOnline != isOnline else { return }
         networkIsOnline = isOnline
         updateRefreshLoop()
-        if isForeground, isOnline, !wasOnline { await refresh(root: personalDataRoot) }
+        if NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnReconnect(
+            isForeground: isForeground, wasOnline: wasOnline, isOnline: isOnline) {
+            await refresh(root: personalDataRoot)
+        }
     }
 
     private func updateRefreshLoop() {
         refreshLoop?.cancel()
         refreshLoop = nil
-        guard isForeground, networkIsOnline else { return }
+        guard NanoMuseMordePersonalRefreshPolicy.shouldRunPeriodicRefresh(
+            isForeground: isForeground, isOnline: networkIsOnline) else { return }
         refreshLoop = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
@@ -382,6 +415,9 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
     func object(_ type: String, _ id: String, scopeKey: String) -> MordePersonalSyncObject? {
         guard loadedScope == scopeKey else { return nil }
         return object(type, id)
+    }
+    func hasConfirmedSnapshot(scopeKey: String) -> Bool {
+        loadedScope == scopeKey && changeSequence != nil && error == nil
     }
     func values(_ type: String) -> [MordePersonalSyncObject] { Array(objects[type, default: [:]].values) }
 
@@ -407,11 +443,13 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
             error = nil
         }
         guard let scope else { syncEnabled = true; return }
-        syncEnabled = NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope)
+        // Morde personal-data saves are committed automatically; a legacy pause value must not
+        // leave new-format mutations queued indefinitely.
+        syncEnabled = true
         guard NanoMuseMordeProfileSyncPreference.canRead(scopeKey: scope) else { return }
         do {
             pending = try NanoMuseMordePersonalDataOutbox.load(scopeKey: scope, root: root)
-            if syncEnabled, pending != nil {
+            if pending != nil {
                 do { _ = try await flush(scope: scope, root: root) }
                 catch is MordePersonalRevisionConflict { /* Keep reading the cloud snapshot while the user resolves it. */ }
             }
@@ -540,8 +578,8 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
         catch { self.error = error.localizedDescription; throw error }
         pending = mutation
         error = nil
-        syncEnabled = NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope)
-        guard syncEnabled, let receipt = try await flush(scope: scope, root: root) else { return nil }
+        syncEnabled = true
+        guard let receipt = try await flush(scope: scope, root: root) else { return nil }
         await refresh(root: root)
         return receipt.result_revision
     }
@@ -559,8 +597,7 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
         catch { self.error = error.localizedDescription; throw error }
         pending = mutation
         error = nil
-        syncEnabled = NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope)
-        if !syncEnabled { return false }
+        syncEnabled = true
         _ = try await flush(scope: scope, root: root)
         await refresh(root: root)
         return pending == nil
@@ -576,7 +613,7 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
 
     private func flush(scope: String, root: URL) async throws -> MordePersonalMutationReceipt? {
         guard !isSaving, MordeShellAuthorization.shared.personalDataScopeKey == scope,
-              NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope),
+              NanoMuseMordePersonalContentSyncPolicy.canFlush(scopeKey: scope, isSaving: isSaving),
               let mutation = try NanoMuseMordePersonalDataOutbox.load(scopeKey: scope, root: root) else { return nil }
         pending = mutation
         isSaving = true
@@ -594,7 +631,12 @@ final class NanoMuseMordePersonalContentStore: ObservableObject {
                 receipt = try await MordeShellAuthorization.shared.replacePersonalObject(objectType: mutation.objectType,
                     objectID: mutation.objectID, baseRevision: mutation.baseRevision, body: body, idempotencyKey: mutation.mutationID)
             } else { throw NanoMuseMordePersonalDataOutboxError.invalidMutation }
-            guard MordeShellAuthorization.shared.personalDataScopeKey == scope else { return nil }
+            let currentScope = MordeShellAuthorization.shared.personalDataScopeKey
+            guard currentScope == scope else { return nil }
+            guard NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+                receipt: receipt, mutation: mutation, currentScope: currentScope) else {
+                throw URLError(.cannotParseResponse)
+            }
             try NanoMuseMordePersonalDataOutbox.acknowledge(scopeKey: scope, mutationID: mutation.mutationID, root: root)
             pending = nil
             error = nil

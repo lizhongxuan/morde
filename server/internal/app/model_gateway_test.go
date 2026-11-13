@@ -174,6 +174,40 @@ func TestModelGatewayReservesSettlesAndReturnsToolCalls(t *testing.T) {
 	}
 }
 
+func TestTaskModelGatewayUsesConfiguredGPT6LunaMaxReasoning(t *testing.T) {
+	store := &modelGatewayStoreTest{}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "ok", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}}
+	resolver := &modelGatewayResolverTest{personal: true, endpoint: ModelEndpoint{
+		BaseURL: "https://api.openai.com/v1", APIKey: "test-key", ModelID: "gpt-6-luna",
+	}}
+	service, err := NewModelGatewayService(store, resolver, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestModelResponseSealer(t, service)
+	service.SetGPT6LunaMaxReasoning(true)
+	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1,
+		EngineVersion: "dsh-1", ProfileVersion: "v1"}
+	raw := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"system","content":[{"type":"text","text":"policy"}]},{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":128}`)
+	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Complete(context.Background(), ModelCall{Source: ModelCallTask, Task: &fence, ModelID: "p1234567", CallID: callID,
+		RawRequest: raw, Request: ModelRequest{MaxOutputTokens: 128}})
+	if err != nil || client.calls != 1 || client.request.ReasoningEffort != "max" || client.request.DisableThinking ||
+		client.request.MaxOutputTokens < maxGPT6LunaReasoningTokens || store.reservation.ReservedTokens < maxGPT6LunaReasoningTokens {
+		t.Fatalf("GPT-6 Luna task max reasoning was not applied and reserved: request=%+v reservation=%+v error=%v",
+			client.request, store.reservation, err)
+	}
+	rawDigest := sha256.Sum256(raw)
+	if bytes.Equal(store.reservation.RequestDigest, rawDigest[:]) {
+		t.Fatal("max reasoning was not bound into the task model request digest")
+	}
+}
+
 func TestModelGatewayRejectsToolCallsNotAllowedByRequest(t *testing.T) {
 	for _, test := range []struct {
 		name         string

@@ -10,7 +10,7 @@ export function RouteGuard({ loginPath = '/login' }: { loginPath?: string }) {
   const { user, loading, error, refresh } = useAuth();
   const location = useLocation();
   if (loading) return <main className="loading-page" aria-live="polite">正在检查登录状态…</main>;
-  if (error) return <RecoverableError title="暂时无法连接服务" message="登录状态暂时无法确认。请检查连接后重试，或返回上一页。" homePath={loginPath} homeLabel="前往登录" onRetry={() => { void refresh(); }} />;
+  if (error && !user) return <RecoverableError title="暂时无法连接服务" message="登录状态暂时无法确认。请检查连接后重试，或返回上一页。" homePath={loginPath} homeLabel="前往登录" onRetry={() => { void refresh(); }} />;
   if (!user) return <Navigate to={loginPath} replace state={{ from: `${location.pathname}${location.search}${location.hash}` }} />;
   if (user.must_change_password && loginPath === '/login') return <Navigate to="/settings/password" replace />;
   return <Outlet />;

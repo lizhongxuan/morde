@@ -984,7 +984,7 @@ export async function runAgent(ipc, frame) {
     name: 'morde:coordinator', order: ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX') - 1,
     text: frame.system_prompt, interpolate: false,
   })
-  if (!frame.tools || frame.tools.length === 0) {
+  if (!coordinator && (!frame.tools || frame.tools.length === 0)) {
     ctx.systemPrompt.section({
       name: 'morde:no-tools', order: ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_SUFFIX'),
       text: 'No tools are available for this model run. Answer text requests normally. If a requested action requires a tool, explain that the tool is unavailable and never claim to have used it or completed the action.',

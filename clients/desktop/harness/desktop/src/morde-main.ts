@@ -2050,7 +2050,12 @@ function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string
   let allowedGateway: string | null = null;
   const returnToMain = () => {
     if (!win.isDestroyed()) win.close();
-    if (credentials === auth && mainWindow && !mainWindow.isDestroyed()) { showView("web"); mainWindow.focus(); }
+    if (credentials === auth && mainWindow && !mainWindow.isDestroyed()) {
+      showView("web");
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
   };
   hostWorkbenchReturnHandlers.set(win.webContents, () => {
     if (credentials !== auth || !allowedGateway || !isTrustedHostWorkbenchPage(win.webContents.getURL(), allowedGateway)) return false;
@@ -2112,7 +2117,10 @@ function positionWeb(): void {
 function showView(next: "web" | "sync"): void {
   view = next;
   if (mainWindow && webView) {
-    if (next === "web" && !webAttached) { mainWindow.contentView.addChildView(webView); webAttached = true; positionWeb(); webView.webContents.focus(); }
+    if (next === "web") {
+      if (!webAttached) { mainWindow.contentView.addChildView(webView); webAttached = true; webView.webContents.focus(); }
+      positionWeb();
+    }
     if (next === "sync" && webAttached) { mainWindow.contentView.removeChildView(webView); webAttached = false; }
   }
   notifyState();

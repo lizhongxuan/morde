@@ -25,7 +25,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const { data, isPending, error: queryError, refetch } = useQuery<PortalUser | null>({
     queryKey: ['auth', 'me'],
-    queryFn: () => portalApi.me(),
+    queryFn: async () => {
+      try { return await portalApi.me(); }
+      catch (error) {
+        if (error instanceof ApiError && error.status === 401) return null;
+        throw error;
+      }
+    },
     retry: false,
     staleTime: Infinity,
   });

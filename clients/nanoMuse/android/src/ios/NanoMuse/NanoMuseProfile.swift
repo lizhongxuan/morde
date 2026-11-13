@@ -909,9 +909,12 @@ final class NanoMuseMordeProfileSync: ObservableObject {
                 } else {
                     throw NanoMuseMordePersonalDataOutboxError.invalidMutation
                 }
-                guard MordeShellAuthorization.shared.personalDataScopeKey == scope,
-                      receipt.object_type == mutation.objectType, receipt.object_id == mutation.objectID,
-                      receipt.result_revision > 0 else { return nil }
+                let currentScope = MordeShellAuthorization.shared.personalDataScopeKey
+                guard currentScope == scope else { return nil }
+                guard NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+                    receipt: receipt, mutation: mutation, currentScope: currentScope) else {
+                    throw URLError(.cannotParseResponse)
+                }
                 try NanoMuseMordePersonalDataOutbox.acknowledge(scopeKey: scope, mutationID: mutation.mutationID,
                                                                 root: NanoMuseDirs.root)
                 saveRevision(receipt.result_revision,
@@ -920,9 +923,11 @@ final class NanoMuseMordeProfileSync: ObservableObject {
             } else if let legacy = legacyPending {
                 receipt = try await MordeShellAuthorization.shared.replacePersonalProfile(
                     baseRevision: legacy.baseRevision, body: legacy.body, idempotencyKey: legacy.mutationID)
-                guard MordeShellAuthorization.shared.personalDataScopeKey == scope,
-                      receipt.object_type == "profile", receipt.object_id == "default",
-                      receipt.result_revision > 0 else { return nil }
+                guard MordeShellAuthorization.shared.personalDataScopeKey == scope else { return nil }
+                guard receipt.object_type == "profile", receipt.object_id == "default",
+                      receipt.result_revision > 0, receipt.account_change_sequence > 0 else {
+                    throw URLError(.cannotParseResponse)
+                }
                 try NanoMuseMordeProfileOutbox.clear(scopeKey: scope, mutationID: legacy.mutationID,
                                                       root: NanoMuseDirs.root)
                 saveRevision(receipt.result_revision,

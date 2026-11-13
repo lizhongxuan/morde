@@ -216,6 +216,9 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	w.options.Logger.Warn("conversation route failed",
+		zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
+		zap.String("failure_reason", reason), zap.String("failure_category", cloudDSHModelErrorCategory(cause)))
 	if err := w.options.Actions.FailConversationRoute(ctx, claim, reason); err != nil {
 		return errors.Join(cause, err)
 	}

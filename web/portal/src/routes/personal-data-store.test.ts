@@ -179,6 +179,27 @@ describe('PersonalDataStore', () => {
     expect(activeAPI.replacePersonalObject).not.toHaveBeenCalled();
   });
 
+  it('stops applying a delayed snapshot and never drains after the active service scope changes', async () => {
+    const store = makeStore('u_scope_cancellation', 'https://portal.example.test', createMemoryPersonalDataStorage(), 'instance-old');
+    const draft = await store.queueReplace('profile', 'default', { name: 'Keep as an old-scope draft', avatar: 'dragon' });
+    let releaseSnapshot!: (value: { watermark: number; items: PersonalObject[]; next_cursor: null }) => void;
+    const blockedSnapshot = new Promise<{ watermark: number; items: PersonalObject[]; next_cursor: null }>((resolve) => { releaseSnapshot = resolve; });
+    const activeAPI = api({ personalDataSnapshot: vi.fn().mockReturnValue(blockedSnapshot) });
+    let active = true;
+
+    const sync = synchronizePersonalData(store, activeAPI, () => active);
+    await vi.waitFor(() => expect(activeAPI.personalDataSnapshot).toHaveBeenCalledTimes(1));
+    active = false;
+    releaseSnapshot({ watermark: 7, items: [profile(4, 'Old service response')], next_cursor: null });
+    await sync;
+
+    expect(activeAPI.replacePersonalObject).not.toHaveBeenCalled();
+    expect(await store.read()).toMatchObject({
+      snapshotComplete: false,
+      outbox: [{ id: draft.id, key: draft.key, status: 'pending', body: { name: 'Keep as an old-scope draft' } }],
+    });
+  });
+
   it('copies an old draft to the confirmed current version only after explicit selection and retains original blobs and keys', async () => {
     const storage = createMemoryPersonalDataStorage();
     const old = new PersonalDataStore('u_import_old', 'https://portal.example.test', storage, 'instance-old');
@@ -342,5 +363,30 @@ describe('PersonalDataStore', () => {
     expect((await store.read()).attachments).toHaveLength(0);
     expect((await store.read()).objects['["library_item","library-entry"]']?.revision).toBe(2);
     expect((await store.cachedAttachment(`pa_${'a'.repeat(32)}`))?.blob.size).toBe(blob.size);
+  });
+
+  it('keeps an upload handle if the service scope changes while upload creation is in flight', async () => {
+    const store = makeStore('u_upload_scope_change');
+    const original = profile(1, 'Existing profile');
+    await store.applySnapshot([original], 1);
+    const blob = new Blob(['attachment bytes'], { type: 'text/plain' });
+    const job = await store.queueAttachment({
+      objectID: original.object_id, name: 'draft.txt', kind: 'artifact', mediaType: blob.type,
+      sizeBytes: blob.size, sha256: await sha256Hex(await blob.arrayBuffer()), blob, baseRevision: original.revision,
+    });
+    let active = true;
+    const upload = vi.fn().mockImplementation(async () => {
+      active = false;
+      return { upload_id: 'pu_old-scope-upload', state: 'active' };
+    });
+    const putChunk = vi.fn();
+    const uploadAPI = api({ createPersonalAttachmentUpload: upload, putPersonalAttachmentChunk: putChunk });
+
+    await synchronizePersonalData(store, uploadAPI, () => active);
+
+    expect(putChunk).not.toHaveBeenCalled();
+    expect(await store.pendingAttachment(job.id)).toMatchObject({
+      status: 'pending', uploadID: 'pu_old-scope-upload',
+    });
   });
 });

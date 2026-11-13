@@ -190,6 +190,30 @@ func TestEncodeRequestDisablesReasoningOnlyForVerifiedGPT6Luna(t *testing.T) {
 	}
 }
 
+func TestEncodeRequestUsesMaxReasoningOnlyForFirstPartyGPT6Luna(t *testing.T) {
+	payload, err := encodeRequest(app.ModelRequest{
+		Endpoint: app.ModelEndpoint{BaseURL: "https://api.openai.com/v1", ModelID: "gpt-6-luna"},
+		Input:    []app.ModelInput{{Type: "message", Role: "user", Text: "probe"}}, MaxOutputTokens: 25_000,
+		ReasoningEffort: "max",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Reasoning responseReasoning `json:"reasoning"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil || got.Reasoning.Effort != "max" {
+		t.Fatalf("reasoning payload = %s, error = %v", payload, err)
+	}
+	if _, err := encodeRequest(app.ModelRequest{
+		Endpoint: app.ModelEndpoint{BaseURL: "https://api.example.test/v1", ModelID: "gpt-6-luna"},
+		Input:    []app.ModelInput{{Type: "message", Role: "user", Text: "probe"}}, MaxOutputTokens: 25_000,
+		ReasoningEffort: "max",
+	}, nil); err == nil {
+		t.Fatal("max reasoning was accepted for an OpenAI-compatible endpoint")
+	}
+}
+
 func TestCompleteHandlesUnknownUsageAndIncompleteStopReason(t *testing.T) {
 	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return jsonResponse(http.StatusOK, `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`), nil

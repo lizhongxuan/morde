@@ -216,12 +216,13 @@ func conversationRouteCallDigest(claim ConversationRouteClaim, value Conversatio
 		Instructions      string
 		Input             []ModelInput
 		MaxOutputTokens   int
+		ReasoningEffort   string `json:",omitempty"`
 		DisableThinking   bool
 		History           []historyEvidence
 		Candidates        []ConversationRouteCandidate
 	}{claim.ServiceInstanceID, claim.Message.ID, claim.Message.ConversationID, claim.Message.ActorID,
 		value.ModelID, conversationRouteRetryAttempt(value), request.Instructions, request.Input, request.MaxOutputTokens,
-		request.DisableThinking, history, value.Candidates})
+		request.ReasoningEffort, request.DisableThinking, history, value.Candidates})
 	if err != nil {
 		return nil, "", err
 	}
@@ -291,9 +292,7 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	if err != nil {
 		return ConversationRouteDecision{}, err
 	}
-	if isFirstPartyGPT6Luna(endpoint.Endpoint) {
-		request.DisableThinking = true
-	}
+	s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
 	digest, callID, err := conversationRouteCallDigest(claim, value, request)
 	if err != nil {
 		return ConversationRouteDecision{}, err
@@ -382,16 +381,12 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	if err != nil {
 		return ModelResponse{}, err
 	}
-	if isFirstPartyGPT6Luna(endpoint.Endpoint) {
-		request.DisableThinking = true
-	}
+	s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
 	legacyRequest, err := ConversationRouteModelRequest(value)
 	if err != nil {
 		return ModelResponse{}, err
 	}
-	if isFirstPartyGPT6Luna(endpoint.Endpoint) {
-		legacyRequest.DisableThinking = true
-	}
+	s.applyGPT6LunaReasoning(endpoint.Endpoint, &legacyRequest, true)
 	legacyDigest, legacyCallID, err := conversationRouteCallDigest(claim, value, legacyRequest)
 	if err != nil {
 		return ModelResponse{}, err

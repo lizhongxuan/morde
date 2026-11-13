@@ -794,12 +794,17 @@ function isOnline(): boolean {
   return typeof navigator === 'undefined' || navigator.onLine !== false;
 }
 
-function syncIsActive(): boolean {
-  return isOnline();
+function syncIsActive(shouldContinue: () => boolean): boolean {
+  return shouldContinue() && isOnline();
 }
 
 /** Pulls a complete remote snapshot/change page, then retries local mutations and attachments. */
-export async function synchronizePersonalData(store: PersonalDataStore, api: PersonalDataAPI): Promise<void> {
+export async function synchronizePersonalData(
+  store: PersonalDataStore,
+  api: PersonalDataAPI,
+  shouldContinue: () => boolean = () => true,
+): Promise<void> {
+  if (!shouldContinue()) return;
   if (!isOnline()) {
     await store.setSyncError('当前离线；本地数据和待同步草稿已保留。');
     return;
@@ -815,27 +820,35 @@ export async function synchronizePersonalData(store: PersonalDataStore, api: Per
   }
   const lockName = `morde:personal-data-drain:v1:${encodeURIComponent(store.scope)}`;
   try {
-    await locks.request(lockName, { mode: 'exclusive' }, async () => synchronizePersonalDataWithLock(store, api));
+    await locks.request(lockName, { mode: 'exclusive' }, async () => {
+      if (shouldContinue()) await synchronizePersonalDataWithLock(store, api, shouldContinue);
+    });
   } catch (error) {
-    await store.setSyncError(messageOf(error));
+    if (shouldContinue()) await store.setSyncError(messageOf(error));
   }
 }
 
-async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: PersonalDataAPI): Promise<void> {
+async function synchronizePersonalDataWithLock(
+  store: PersonalDataStore,
+  api: PersonalDataAPI,
+  shouldContinue: () => boolean,
+): Promise<void> {
   try {
     const initial = await store.read();
+    if (!syncIsActive(shouldContinue)) return;
     if (!initial.snapshotComplete) {
       const objects: PersonalObject[] = [];
       let cursor: string | undefined;
       let watermark = 0;
       do {
-        if (!syncIsActive()) return;
+        if (!syncIsActive(shouldContinue)) return;
         const page = await api.personalDataSnapshot(cursor, 100);
+        if (!syncIsActive(shouldContinue)) return;
         watermark = page.watermark;
         objects.push(...page.items);
         cursor = page.next_cursor ?? undefined;
       } while (cursor);
-      if (!syncIsActive()) return;
+      if (!syncIsActive(shouldContinue)) return;
       await store.applySnapshot(objects, watermark);
     } else {
       let current = await store.read();
@@ -843,27 +856,32 @@ async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: Pe
       let through: number | undefined;
       let hasMore = true;
       while (hasMore) {
-        if (!syncIsActive()) return;
+        if (!syncIsActive(shouldContinue)) return;
         const page = await api.personalDataChanges(after, through, 100);
+        if (!syncIsActive(shouldContinue)) return;
         through = page.through_sequence;
         for (const change of page.items) {
-          if (!syncIsActive()) return;
+          if (!syncIsActive(shouldContinue)) return;
           const currentState = await store.read();
+          if (!syncIsActive(shouldContinue)) return;
           const matching = currentState.outbox.find((entry) => entry.key === change.mutation_id);
           if (matching) {
             if (change.operation === 'delete') {
               await store.acknowledge(matching.id, change.revision, null);
             } else {
               const object = await api.getPersonalObject(change.object_type, change.object_id);
+              if (!syncIsActive(shouldContinue)) return;
               await store.acknowledge(matching.id, object.revision, object.body);
             }
           } else if (change.operation === 'delete') {
             await store.applyRemote(null, change.object_type, change.object_id);
           } else {
             const object = await api.getPersonalObject(change.object_type, change.object_id);
+            if (!syncIsActive(shouldContinue)) return;
             await store.applyRemote(object, change.object_type, change.object_id);
           }
         }
+        if (!syncIsActive(shouldContinue)) return;
         after = page.next_after_sequence;
         hasMore = page.has_more;
         await store.updateCursor(after);
@@ -873,21 +891,26 @@ async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: Pe
     }
 
     let state = await store.read();
+    if (!syncIsActive(shouldContinue)) return;
     const pending = state.outbox.filter((item) => item.status === 'pending').sort((left, right) => left.createdAt - right.createdAt);
     for (const entry of pending) {
       try {
-        if (!syncIsActive()) return;
+        if (!syncIsActive(shouldContinue)) return;
         const current = await store.pendingMutation(entry.id);
+        if (!syncIsActive(shouldContinue)) return;
         if (!current || current.status !== 'pending') continue;
         let receipt: { result_revision: number; account_change_sequence: number };
         if (current.operation === 'delete') {
+          if (!syncIsActive(shouldContinue)) return;
           receipt = await api.deletePersonalObject(current.objectType, current.objectID, current.baseRevision, current.key);
           await store.acknowledge(current.id, receipt.result_revision, null);
         } else if (current.body) {
+          if (!syncIsActive(shouldContinue)) return;
           receipt = await api.replacePersonalObject(current.objectType, current.objectID, current.baseRevision, current.body, current.key);
           await store.acknowledge(current.id, receipt.result_revision, current.body);
         }
       } catch (error) {
+        if (!shouldContinue()) return;
         if (isConflict(error)) {
           let remote: PersonalObject | null | undefined;
           try { remote = await api.getPersonalObject(entry.objectType, entry.objectID); }
@@ -901,12 +924,15 @@ async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: Pe
     }
 
     state = await store.read();
+    if (!syncIsActive(shouldContinue)) return;
     for (const attachment of state.attachments.filter((item) => item.status === 'conflict' && item.cancelUploadPending && item.uploadID)) {
-      if (!syncIsActive()) return;
+      if (!syncIsActive(shouldContinue)) return;
       try {
         await api.cancelPersonalAttachmentUpload(attachment.uploadID!);
+        if (!shouldContinue()) return;
         await store.markAttachmentUploadCancelled(attachment.id);
       } catch (error) {
+        if (!shouldContinue()) return;
         if (isNotFound(error)) {
           await store.markAttachmentUploadCancelled(attachment.id);
           continue;
@@ -916,32 +942,45 @@ async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: Pe
       }
     }
     state = await store.read();
+    if (!syncIsActive(shouldContinue)) return;
     for (const attachment of state.attachments.filter((item) => item.status === 'pending')) {
       try {
-        if (!syncIsActive()) return;
+        if (!syncIsActive(shouldContinue)) return;
         const current = await store.pendingAttachment(attachment.id);
+        if (!syncIsActive(shouldContinue)) return;
         if (!current || current.status !== 'pending' || current.dependsOnKey) continue;
         let uploadID = current.uploadID;
         if (!uploadID) {
+          if (!syncIsActive(shouldContinue)) return;
           const receipt = await api.createPersonalAttachmentUpload({
             object_id: current.objectID, base_revision: current.baseRevision,
             size_bytes: current.sizeBytes, sha256: current.sha256, media_type: current.mediaType,
           }, current.createKey);
           uploadID = receipt.upload_id;
           await store.saveUploadID(current.id, uploadID);
+          // Persist the remote upload handle even when the user changed service scope while
+          // the create request was in flight. A later sync of the original scope can resume
+          // or cancel this upload without leaking an orphan on the old service.
+          if (!shouldContinue()) return;
         }
         const chunkBytes = 4 * 1024 * 1024;
         for (let offset = 0, sequence = 0; offset < current.sizeBytes; offset += chunkBytes, sequence++) {
-          if (!syncIsActive()) return;
+          if (!syncIsActive(shouldContinue)) return;
           const bytes = await current.blob.slice(offset, Math.min(offset + chunkBytes, current.sizeBytes)).arrayBuffer();
           const chunkDigest = await sha256Hex(bytes);
+          if (!syncIsActive(shouldContinue)) return;
           await api.putPersonalAttachmentChunk(uploadID, sequence, bytes, chunkDigest);
         }
-        if (!syncIsActive()) return;
+        if (!syncIsActive(shouldContinue)) return;
         const receipt = await api.commitPersonalAttachment(uploadID, current.commitKey);
+        if (!shouldContinue()) return;
         let object: PersonalObject;
-        try { object = await api.getPersonalObject('library_item', current.objectID); }
+        try {
+          object = await api.getPersonalObject('library_item', current.objectID);
+          if (!shouldContinue()) return;
+        }
         catch {
+          if (!shouldContinue()) return;
           object = {
             object_type: 'library_item', object_id: current.objectID, revision: receipt.result_revision,
             body: { name: current.name, kind: current.kind, mime: current.mediaType, size_bytes: current.sizeBytes, attachment_id: receipt.attachment_id },
@@ -951,6 +990,7 @@ async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: Pe
           attachmentID: receipt.attachment_id, name: current.name, mediaType: current.mediaType, blob: current.blob,
         });
       } catch (error) {
+        if (!shouldContinue()) return;
         if (isConflict(error)) {
           const cancelPending = Boolean(attachment.uploadID);
           try {
@@ -966,9 +1006,9 @@ async function synchronizePersonalDataWithLock(store: PersonalDataStore, api: Pe
         return;
       }
     }
-    await store.setSyncError(null);
+    if (shouldContinue()) await store.setSyncError(null);
   } catch (error) {
-    await store.setSyncError(messageOf(error));
+    if (shouldContinue()) await store.setSyncError(messageOf(error));
   }
 }
 

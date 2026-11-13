@@ -105,9 +105,12 @@ test.describe("Assistant durable tasks", () => {
       const geometry = await page.evaluate(() => ({
         errorBottoms: Array.from(document.querySelectorAll(".toast-region [role=alert]"), (element) => element.getBoundingClientRect().bottom),
         composerTop: document.querySelector(".assistant-composer")!.getBoundingClientRect().top,
+        topbarBottom: document.querySelector(".morde-topbar")!.getBoundingClientRect().bottom,
+        regionTop: document.querySelector(".toast-region")!.getBoundingClientRect().top,
         regionPosition: getComputedStyle(document.querySelector(".toast-region")!).position,
       }));
       expect(geometry.regionPosition).toBe("fixed");
+      expect(geometry.regionTop).toBeGreaterThanOrEqual(geometry.topbarBottom + 8);
       expect(geometry.errorBottoms.every((bottom) => bottom <= geometry.composerTop - 8), `${viewport.width}x${viewport.height}`).toBeTruthy();
     }
   });
@@ -159,10 +162,13 @@ test.describe("Assistant durable tasks", () => {
     await page.goto("/assistant");
 
     const sidebar = page.getByRole("complementary", { name: "对话" });
-    await expect(sidebar.getByRole("button", { name: /^主会话/ })).toBeVisible();
+    const mainConversation = sidebar.getByRole("button", { name: /^主会话/ });
+    await expect(mainConversation).toBeVisible();
     await expect(sidebar.getByText("旁聊历史暂不可用")).toBeVisible();
     await expect(sidebar.getByRole("button", { name: "新建旁聊" })).toBeEnabled();
     await expect(sidebar.locator(".conversation-list .conversation-item")).toHaveCount(0);
+    await mainConversation.click();
+    await expect(page.locator(".conversation-view-heading h2")).toHaveText("主会话");
   });
 
   test("accepts consecutive messages and restores independent Task workchains", async ({ page }) => {
@@ -392,6 +398,71 @@ test.describe("Assistant durable tasks", () => {
     await expect(sidePanel.getByRole("link", { name: "下载消息附件 1" })).toHaveAttribute("href", "/api/personal-data/attachments/amain001");
     await expect(sidePanel.getByText("主会话成果", { exact: true })).toBeVisible();
     await expect(sidePanel.locator(".task-file-card:visible").filter({ hasText: /旁聊成果/ })).toHaveCount(0);
+  });
+
+  test("hides cached conversation content after access is revoked and restores it on retry", async ({ page }) => {
+    await page.addInitScript(() => {
+      const nativeFetch = window.fetch.bind(window);
+      Object.assign(window, { e2eRevokeRequests: 0 });
+      window.fetch = (input, init) => {
+        const requestURL = typeof input === "string" ? input : input instanceof Request ? input.url : input.href;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        const path = new URL(requestURL, location.href).pathname;
+        if (method.toUpperCase() === "GET" && /^\/api\/conversations\/[^/]+\/messages$/.test(path)
+          && sessionStorage.getItem("e2e-revoke-conversation") === "revoked") {
+          Object.assign(window, { e2eRevokeRequests: Number((window as Window & { e2eRevokeRequests?: number }).e2eRevokeRequests ?? 0) + 1 });
+          return Promise.resolve(new Response(JSON.stringify({ error: { code: "not_found", message: "not found", details: {} } }), {
+            status: 404, headers: { "Content-Type": "application/json" },
+          }));
+        }
+        return nativeFetch(input, init);
+      };
+    });
+    await page.goto("/");
+    await page.getByLabel("用户名").fill("demo");
+    await page.getByLabel("密码").fill("demo");
+    await page.getByRole("button", { name: "登录" }).click();
+    await page.goto("/assistant");
+    await expect(page.getByRole("button", { name: /主会话/ })).toBeVisible();
+
+    const seeded = await page.evaluate(() => {
+      const storageKey = "cloudhost:portal-mock-assistant-state-v3";
+      const state = JSON.parse(localStorage.getItem(storageKey) ?? "null") as {
+        conversations?: Array<Record<string, unknown>>;
+        mainConversations?: Array<[string, { conversation_id?: string | null }]>;
+        conversationMessages?: Array<Record<string, unknown>>;
+      } | null;
+      const conversationID = state?.mainConversations?.find(([userID]) => userID === "u1a2b3c4")?.[1].conversation_id
+        ?? state?.conversations?.find((item) => item.is_main === true)?.id;
+      if (!state || typeof conversationID !== "string" || !state.conversationMessages) throw new Error("本地主会话状态缺失");
+      const message = { id: "mrevoked1", conversation_id: conversationID, sequence: 1, role: "user",
+        content: "仅授权会话可见的消息", attachment_ids: ["arevoked1"], routing_status: "accepted",
+        delivery_status: "applied", created_at: new Date().toISOString() };
+      state.conversationMessages = [...state.conversationMessages.filter((item) => item.conversation_id !== conversationID), message];
+      localStorage.setItem(storageKey, JSON.stringify(state));
+      return message;
+    });
+    await page.reload();
+    await expect(page.locator(".chat-message-user").filter({ hasText: "仅授权会话可见的消息" })).toBeVisible();
+    await page.getByRole("button", { name: "打开侧边栏" }).click();
+    const sidebar = page.getByRole("complementary", { name: "当前会话侧边栏" });
+    await sidebar.getByRole("button", { name: "文件" }).click();
+    await expect(sidebar.getByRole("link", { name: "下载消息附件 1" })).toBeVisible();
+
+    await page.evaluate(() => sessionStorage.setItem("e2e-revoke-conversation", "revoked"));
+    await page.getByRole("button", { name: "刷新对话" }).click();
+    await expect.poll(() => page.evaluate(() => (window as Window & { e2eRevokeRequests?: number }).e2eRevokeRequests ?? 0)).toBeGreaterThan(0);
+    await expect(page.getByRole("button", { name: /主会话/ })).toBeVisible();
+    const unavailable = page.locator(".conversation-view").getByRole("alert");
+    await expect(unavailable).toContainText("当前对话内容暂不可访问。");
+    await expect(page.getByRole("textbox", { name: "消息内容" })).toBeVisible();
+    await expect(page.locator(".chat-message-user").filter({ hasText: "仅授权会话可见的消息" })).toHaveCount(0);
+
+    await page.evaluate(() => sessionStorage.setItem("e2e-revoke-conversation", "allow"));
+    await page.getByRole("button", { name: "重试读取对话" }).click();
+    await expect(page.locator(".chat-message-user").filter({ hasText: "仅授权会话可见的消息" })).toBeVisible();
+    await sidebar.getByRole("link", { name: "下载消息附件 1" }).waitFor({ state: "visible" });
+    expect(seeded.attachment_ids).toEqual(["arevoked1"]);
   });
 
   test("keeps the conversation usable and allows retry when cloud computer authorization fails", async ({ page }) => {

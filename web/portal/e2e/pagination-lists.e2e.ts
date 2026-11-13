@@ -101,6 +101,53 @@ async function seedProjectAndGoalFixtures(page: Page) {
   expect(statuses.goals.every((status) => status === 201), JSON.stringify(statuses.goals)).toBe(true);
 }
 
+async function seedConnectionFixtures(page: Page) {
+  const statuses = await page.evaluate(async () => {
+    const models: number[] = [];
+    const teamModels: number[] = [];
+    const connectors: number[] = [];
+    for (let index = 11; index >= 0; index -= 1) {
+      const number = String(index + 1).padStart(2, "0");
+      models.push(await fetch("/api/model-connections", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `验收模型 ${number}`, base_url: `https://model-${number}.example.invalid/v1`, model_name: `local-test-${number}`, api_key: "local-e2e-dummy-only", shared: false }),
+      }).then((response) => response.status));
+    }
+    for (let index = 11; index >= 0; index -= 1) {
+      const number = String(index + 1).padStart(2, "0");
+      teamModels.push(await fetch("/api/model-connections", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `验收团队模型 ${number}`, base_url: `https://team-model-${number}.example.invalid/v1`, model_name: `local-team-test-${number}`, api_key: "local-e2e-dummy-only", shared: true }),
+      }).then((response) => response.status));
+    }
+    for (let index = 11; index >= 0; index -= 1) {
+      const number = String(index + 1).padStart(2, "0");
+      connectors.push(await fetch("/api/mcp/connectors", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `验收工具 ${number}`, endpoint_url: `https://mcp-${number}.example.invalid/mcp` }),
+      }).then((response) => response.status));
+    }
+    const [modelListResponse, connectorListResponse] = await Promise.all([
+      fetch("/api/model-connections", { credentials: "include" }),
+      fetch("/api/mcp/connectors", { credentials: "include" }),
+    ]);
+    const modelList = await modelListResponse.json() as { items: Array<{ name: string }> };
+    const connectorList = await connectorListResponse.json() as { items: Array<{ name: string }> };
+    return { models, teamModels, connectors, modelList: modelList.items.map((item) => item.name), connectorList: connectorList.items.map((item) => item.name) };
+  });
+  for (const list of ["models", "teamModels", "connectors"] as const) {
+    expect(statuses[list].every((status) => status === 201), `${list}: ${JSON.stringify(statuses[list])}`).toBe(true);
+  }
+  expect(statuses.modelList).toHaveLength(25);
+  expect(statuses.connectorList).toHaveLength(12);
+}
+
 async function navigateWithinPortal(page: Page, pathname: string) {
   await page.evaluate((path) => {
     window.history.pushState({}, "", path);
@@ -240,6 +287,65 @@ test.describe("screen pagination for business lists", () => {
     }
     await expect(firstGoal).toBeHidden();
     await expect(lastGoal).toBeVisible();
+    await expectPageFitsViewport(page);
+  });
+
+  test("paginates personal and team models plus MCP connections without page-level scrolling", async ({ page }) => {
+    await signInWithLongListFixtures(page);
+    await navigateWithinPortal(page, "/connections");
+    await expect(page.getByRole("heading", { name: "我的模型" })).toBeVisible();
+    await seedConnectionFixtures(page);
+
+    await page.getByRole("button", { name: /添加个人模型/ }).click();
+    await page.getByLabel("显示名称").fill("本地刷新触发模型");
+    await page.getByLabel("模型名").fill("local-refresh-trigger");
+    await page.getByLabel("服务地址").fill("https://refresh-trigger.example.invalid/v1");
+    await page.getByLabel("API 密钥").fill("local-e2e-dummy-only");
+    await page.getByRole("button", { name: "保存个人模型" }).click();
+
+    const personalPagination = page.getByRole("navigation", { name: "个人模型分页" });
+    const firstPersonalModel = page.getByRole("heading", { name: "验收模型 01" });
+    const lastPersonalModel = page.getByRole("heading", { name: "验收模型 12" });
+    await expect(firstPersonalModel).toBeVisible();
+    await expect(lastPersonalModel).toBeHidden();
+    await expectPageFitsViewport(page);
+    for (let pageIndex = 0; pageIndex < 12 && !(await lastPersonalModel.isVisible()); pageIndex += 1) {
+      await personalPagination.getByRole("button", { name: "下一页" }).click();
+    }
+    await expect(firstPersonalModel).toBeHidden();
+    await expect(lastPersonalModel).toBeVisible();
+    await expectPageFitsViewport(page);
+
+    await page.getByRole("button", { name: /^团队模型/ }).click();
+    const teamPagination = page.getByRole("navigation", { name: "团队模型分页" });
+    const firstTeamModel = page.getByRole("heading", { name: "验收团队模型 01" });
+    const lastTeamModel = page.getByRole("heading", { name: "验收团队模型 12" });
+    await expect(firstTeamModel).toBeVisible();
+    await expect(lastTeamModel).toBeHidden();
+    await expectPageFitsViewport(page);
+    for (let pageIndex = 0; pageIndex < 12 && !(await lastTeamModel.isVisible()); pageIndex += 1) {
+      await teamPagination.getByRole("button", { name: "下一页" }).click();
+    }
+    await expect(firstTeamModel).toBeHidden();
+    await expect(lastTeamModel).toBeVisible();
+    await expectPageFitsViewport(page);
+
+    await page.getByRole("button", { name: "MCP 工具" }).click();
+    await page.getByRole("button", { name: /添加工具连接/ }).click();
+    await page.getByLabel("连接名称").fill("本地刷新触发工具");
+    await page.getByLabel("MCP 服务地址").fill("https://refresh-trigger.example.invalid/mcp");
+    await page.getByRole("button", { name: "保存连接" }).click();
+    const connectorPagination = page.getByRole("navigation", { name: "MCP 工具连接列表分页" });
+    const firstConnector = page.getByRole("heading", { name: "验收工具 01" });
+    const lastConnector = page.getByRole("heading", { name: "验收工具 12" });
+    await expect(firstConnector).toBeVisible();
+    await expect(lastConnector).toBeHidden();
+    await expectPageFitsViewport(page);
+    for (let pageIndex = 0; pageIndex < 12 && !(await lastConnector.isVisible()); pageIndex += 1) {
+      await connectorPagination.getByRole("button", { name: "下一页" }).click();
+    }
+    await expect(firstConnector).toBeHidden();
+    await expect(lastConnector).toBeVisible();
     await expectPageFitsViewport(page);
   });
 });

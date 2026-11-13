@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const require = createRequire(import.meta.url);
@@ -84,6 +84,7 @@ function harness() {
         attached: [], addChildView: (view) => this.contentView.attached.push(view),
         removeChildView: (view) => { this.contentView.attached = this.contentView.attached.filter((item) => item !== view); },
       };
+      this.minimized = false;
       windows.push(this);
     }
     on(name, fn) { this.events.set(name, fn); }
@@ -91,6 +92,8 @@ function harness() {
     async loadFile(path) { this.path = path; }
     async loadURL(url) { this.webContents.url = url; }
     show() { this.shown = true; }
+    isMinimized() { return this.minimized; }
+    restore() { this.minimized = false; this.restored = true; }
     getContentBounds() { return this.contentBounds; }
     focus() { this.focused = true; }
     isDestroyed() { return this.destroyed ?? false; }
@@ -163,7 +166,7 @@ test('Portal bridge requires the current trusted top-level route and returns onl
   const calls = [];
   mockFetch(calls);
   const h = harness();
-  const selectedRoot = mkdtempSync(join(homedir(), 'morde-p11-empty-project-'));
+  const selectedRoot = mkdtempSync(join(process.cwd(), '.morde-p11-empty-project-'));
   const selectedDirectory = join(selectedRoot, 'empty-project');
   mkdirSync(selectedDirectory);
   try {
@@ -220,6 +223,42 @@ test('Portal bridge requires the current trusted top-level route and returns onl
   }
 });
 
+test('Portal project upload rejects a replaced empty directory before registering or uploading it', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls);
+  const h = harness();
+  const selectedRoot = mkdtempSync(join(process.cwd(), '.morde-p11-replaced-project-'));
+  const selectedDirectory = join(selectedRoot, 'empty-project');
+  const movedDirectory = join(selectedRoot, 'original-empty-project');
+  mkdirSync(selectedDirectory);
+  try {
+    await h.ready();
+    const portal = h.views[0];
+    portal.webContents.url = 'https://portal.example/hosts#host-h1234567';
+    h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] });
+    const selection = await h.invoke('morde:portal-project-select-directory', portal.webContents, ['h1234567', 'w1234567']);
+    assert.equal(selection.projectName, 'empty-project');
+
+    renameSync(selectedDirectory, movedDirectory);
+    mkdirSync(selectedDirectory);
+    h.dialog.showMessageBox = async () => ({ response: 0 });
+
+    await assert.rejects(
+      h.invoke('morde:portal-project-upload', portal.webContents, [selection.selectionID, 'empty-project']),
+      /项目文件夹身份已变化，请重新选择/,
+    );
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.endsWith('/sync-folders')), false,
+      'a changed local directory must be rejected before registering a remote folder');
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync-sessions')), false,
+      'a changed local directory must never start an upload session');
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+    rmSync(selectedRoot, { recursive: true, force: true });
+  }
+});
+
 test('returnToPortalHosts is limited to the verified Host Workbench top frame', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -269,8 +308,15 @@ test('returnToPortalHosts is limited to the verified Host Workbench top frame', 
     }
     assert.equal(mainWindow.options.frame, true, 'the desktop window uses native OS caption controls');
 
+    const restoredBounds = { x: 0, y: 0, width: 1680, height: 1050 };
+    mainWindow.contentBounds = restoredBounds;
+    mainWindow.minimized = true;
+    mainWindow.shown = false;
     assert.deepEqual(await returnHandler({ sender: hostContents, senderFrame: hostContents.mainFrame }), { returned: true });
     assert.equal(hostWindow.isDestroyed(), true);
+    assert.deepEqual(portal.bounds, restoredBounds, 'returning to an already attached view refreshes its bounds');
+    assert.equal(mainWindow.restored, true, 'returning from a Host Workbench restores a minimized desktop window');
+    assert.equal(mainWindow.shown, true, 'returning from a Host Workbench shows a hidden desktop window');
     assert.equal(mainWindow.focused, true);
     assert.equal(mainWindow.contentView.attached.includes(portal), true);
     await assert.rejects(returnHandler({ sender: hostContents, senderFrame: hostContents.mainFrame }), /Invalid Host Workbench window/);

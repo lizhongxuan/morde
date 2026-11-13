@@ -77,12 +77,13 @@ function LocationProbe() {
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter initialEntries={['/personal']}><Routes>
+  const rendered = render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter initialEntries={['/personal']}><Routes>
     <Route element={<PortalLayout />}>
       <Route path="/personal" element={<PersonalData />} />
       <Route path="/assistant" element={<LocationProbe />} />
     </Route>
   </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return { ...rendered, queryClient };
 }
 
 beforeEach(() => {
@@ -122,6 +123,39 @@ describe('PersonalData', () => {
     confirmCapabilities({ service_instance_id: 'service-personal-test' });
     await waitFor(() => expect(apiMocks.snapshot).toHaveBeenCalledTimes(1));
     expect(await screen.findByText(/保存后自动更新云端/)).toBeInTheDocument();
+  });
+
+  it('keeps an in-flight previous-service refresh from replacing or blocking the current service view', async () => {
+    const oldStore = new PersonalDataStore(currentUser.id, window.location.origin, undefined, 'service-old-switch');
+    const oldDraft = await oldStore.queueReplace('profile', 'default', { name: 'Old service draft', avatar: 'dragon' });
+    apiMocks.capabilities.mockResolvedValue({ service_instance_id: 'service-old-switch' });
+    let completeOldSnapshot!: (value: { watermark: number; items: Array<Record<string, unknown>>; next_cursor: null }) => void;
+    apiMocks.snapshot
+      .mockImplementationOnce(() => new Promise((resolve) => { completeOldSnapshot = resolve; }))
+      .mockResolvedValueOnce({
+        watermark: 12,
+        items: [{ object_type: 'profile', object_id: 'default', revision: 6, body: { name: 'Current service profile', avatar: 'dragon' } }],
+        next_cursor: null,
+      });
+
+    const rendered = renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await waitFor(() => expect(apiMocks.snapshot).toHaveBeenCalledTimes(1));
+    rendered.queryClient.setQueryData(['service-capabilities'], { service_instance_id: 'service-new-switch' });
+
+    await waitFor(() => expect(apiMocks.snapshot).toHaveBeenCalledTimes(2));
+    expect(await screen.findByDisplayValue('Current service profile')).toBeInTheDocument();
+    completeOldSnapshot({
+      watermark: 3,
+      items: [{ object_type: 'profile', object_id: 'default', revision: 2, body: { name: 'Stale old service profile', avatar: 'dragon' } }],
+      next_cursor: null,
+    });
+
+    await waitFor(async () => expect((await oldStore.read()).outbox[0]).toMatchObject({
+      id: oldDraft.id, status: 'conflict', body: { name: 'Old service draft' },
+    }));
+    expect(screen.getByLabelText('名称')).toHaveValue('Current service profile');
+    expect(apiMocks.replace).not.toHaveBeenCalled();
   });
 
   it('keeps the page viewport fitted and exposes long memory lists through pagination', async () => {

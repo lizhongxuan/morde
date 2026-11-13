@@ -53,6 +53,7 @@ type ModelRequest struct {
 	RequiredTool    string
 	MaxOutputTokens int
 	Temperature     *float64
+	ReasoningEffort string
 	DisableThinking bool
 	OnTextDelta     func(string) error
 }

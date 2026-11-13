@@ -207,6 +207,9 @@ export const portalApi = {
           ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) },
     }));
   },
+  conversationPreview: async (id: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
+    params: { path: { id }, query: { limit: 5 } },
+  })),
   conversationTasks: async (id: string, options: { view?: 'active' | 'recent' } = {}): Promise<components['schemas']['ConversationActiveTaskPage']> => {
     const items: components['schemas']['ConversationActiveTask'][] = [];
     const seen = new Set<string>();

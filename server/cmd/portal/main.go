@@ -329,6 +329,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model gateway: %w", err)
 	}
+	modelGateway.SetGPT6LunaMaxReasoning(cfg.Models.GPT6LunaMaxReasoning)
 	if err := modelGateway.SetModelResponseSealer(sealer); err != nil {
 		return fmt.Errorf("initialize model response encryption: %w", err)
 	}

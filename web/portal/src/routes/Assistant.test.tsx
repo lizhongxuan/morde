@@ -158,6 +158,7 @@ function mockCommon(options: { conversations?: Conversation[]; messages?: Conver
   vi.spyOn(portalApi, 'ensureMainConversation').mockResolvedValue({ status: 'ready', conversation_id: conversation.id, version: 1 });
   vi.spyOn(portalApi, 'setMainConversation').mockImplementation(async (conversationID) => ({ status: 'ready', conversation_id: conversationID, version: 2 }));
   vi.spyOn(portalApi, 'conversationMessages').mockResolvedValue({ items: options.messages ?? [], next_cursor: null });
+  vi.spyOn(portalApi, 'conversationPreview').mockResolvedValue({ items: [], next_cursor: null });
   vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
   vi.spyOn(portalApi, 'conversationTasks').mockResolvedValue({ items: [], next_cursor: null, pending_count: 0 });
   vi.spyOn(portalApi, 'tasks').mockResolvedValue({ items: options.tasks ?? [], next_cursor: null });
@@ -366,11 +367,11 @@ describe('Assistant durable tasks', () => {
     expect(activity).toHaveTextContent('删除于');
   });
 
-  it('associates each moder reply with its timestamp and makes it keyboard accessible', async () => {
+  it('associates each Morde reply with its timestamp and makes it keyboard accessible', async () => {
     mockCommon({ conversations: [conversation], messages: [message, reply] });
     renderPage();
 
-    const response = await screen.findByRole('article', { name: 'moder 的回复' });
+    const response = await screen.findByRole('article', { name: 'Morde 的回复' });
     expect(response).toHaveAttribute('tabindex', '0');
     const time = within(response.parentElement!).getByLabelText(/回复时间：/);
     expect(time).toHaveAttribute('datetime', reply.created_at);
@@ -482,6 +483,27 @@ describe('Assistant durable tasks', () => {
     render(<StrictMode><QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={['/assistant']}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider></StrictMode>);
 
     expect(await findReadyComposer()).toHaveValue('恢复之前的会话草稿');
+  });
+
+  it('keeps a newer composer edit when a delayed draft read completes', async () => {
+    mockCommon({ conversations: [conversation], mainConversation: { status: 'ready', conversation_id: conversation.id, version: 1 } });
+    let finishDraft!: (draft: AssistantComposerDraft | null) => void;
+    vi.spyOn(assistantDraftStorage, 'get').mockImplementation(() => new Promise((resolve) => { finishDraft = resolve; }));
+    const user = userEvent.setup();
+    renderPage();
+
+    const composer = await screen.findByRole('textbox', { name: '消息内容' });
+    await waitFor(() => expect(finishDraft).toBeTypeOf('function'));
+    fireEvent.change(composer, { target: { value: '较新的输入' } });
+    await act(async () => finishDraft({
+      id: conversation.id, conversationID: conversation.id, content: '旧草稿', modelID: '', hostID: '',
+      mcpConnectorIDs: [], attachments: [], updatedAt: Date.now(),
+    }));
+
+    await waitFor(() => expect(composer).toBeEnabled());
+    expect(composer).toHaveValue('较新的输入');
+    await user.type(composer, '仍可继续输入');
+    expect(composer).toHaveValue('较新的输入仍可继续输入');
   });
 
   it('keeps a locally staged attachment in its draft across a page remount without uploading it', async () => {
@@ -1549,12 +1571,16 @@ describe('Assistant durable tasks', () => {
   });
 
   it.each([
-    ['pending', '已受理，等待处理'], ['processing', '正在处理消息'],
-    ['waiting_user', '等待补充或确认'], ['failed', '消息处理失败'],
+    ['pending', '此消息 · 已受理，等待处理'], ['processing', '此消息 · 正在处理'],
+    ['waiting_user', '此消息 · 等待你补充任务信息'], ['failed', null],
   ] as const)('shows the actual routing state %s without requiring a Task', async (routingStatus, label) => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined, routing_status: routingStatus, delivery_status: 'pending' }] });
     renderPage();
-    expect(await screen.findByText(label)).toBeInTheDocument();
+    if (label) expect(await screen.findByText(label)).toBeInTheDocument();
+    else {
+      expect(screen.queryByText('消息处理失败')).not.toBeInTheDocument();
+      expect(await screen.findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
+    }
   });
 
   it('retains the processing retry key when the response is lost and reuses it on retry', async () => {
@@ -1564,10 +1590,10 @@ describe('Assistant durable tasks', () => {
       .mockRejectedValueOnce(new Error('连接中断')).mockResolvedValueOnce(undefined);
     const user = userEvent.setup();
     renderPage();
-    expect(await screen.findByText('模型暂时不可用或用量待核对')).toBeInTheDocument();
-    await user.click(await screen.findByRole('button', { name: '重试处理' }));
+    expect(screen.queryByText('模型暂时不可用或用量待核对')).not.toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
     await screen.findByText('连接中断');
-    await user.click(screen.getByRole('button', { name: '重试处理' }));
+    await user.click(screen.getByRole('button', { name: '重新处理这条消息' }));
     await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
     const first = retry.mock.calls[0]!;
     const second = retry.mock.calls[1]!;
@@ -1579,15 +1605,15 @@ describe('Assistant durable tasks', () => {
     await screen.findByText('已请求重新处理消息。');
   });
 
-  it('keeps an oversized accepted message visible and explains that it must be shortened', async () => {
+  it('keeps an oversized failed message visible without inline failure details', async () => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined,
       routing_status: 'failed', routing_failure_reason: 'message_too_long', delivery_status: 'pending' }] });
     renderPage();
-    const explanation = await screen.findByText(/消息及上下文超过当前模型输入上限/);
-    const article = explanation.closest<HTMLElement>('article')!;
+    const retry = await screen.findByRole('button', { name: '重新处理这条消息' });
+    const article = retry.closest<HTMLElement>('article')!;
     expect(within(article).getByText(message.content)).toBeInTheDocument();
-    expect(within(article).getByText(/请缩短后重新发送/)).toBeInTheDocument();
-    expect(within(article).queryByRole('button', { name: '重试处理' })).not.toBeInTheDocument();
+    expect(within(article).queryByText('消息处理失败')).not.toBeInTheDocument();
+    expect(within(article).queryByText(/超过当前模型输入上限/)).not.toBeInTheDocument();
   });
 
   it('deduplicates a snapshot against the same committed conversation message', () => {
@@ -1946,6 +1972,95 @@ describe('Assistant durable tasks', () => {
     await openTaskDynamics();
     expect(await screen.findByText('部分任务进展暂不可用，显示最近一次已确认状态。')).toBeInTheDocument();
     expect(screen.queryByText(`读取 ${task.id} 失败`)).not.toBeInTheDocument();
+  });
+
+  it('hides cached task details and artifacts after task access is revoked', async () => {
+    const restrictedTask = {
+      ...task,
+      result: '仅授权任务可见的原始结果',
+      artifacts: [{ id: 'a1234567', step_id: 's1234567', label: '受限成果名称', path: 'private/report.md',
+        media_type: 'text/markdown', workspace_id: 'w1234567', workspace_revision: 2, size_bytes: 12,
+        sha256: 'a'.repeat(64), verified: true, batch_item_id: null, batch_attempt: 1, created_at: timestamp }],
+    } satisfies Task;
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const getTask = vi.spyOn(portalApi, 'task').mockResolvedValue(restrictedTask);
+    const user = userEvent.setup();
+    const { client } = renderPage();
+
+    await findTaskActivity(task.id);
+    await user.click(screen.getByRole('button', { name: '文件' }));
+    expect(await screen.findByText('受限成果名称')).toBeInTheDocument();
+
+    getTask.mockRejectedValueOnce(new ApiError({ message: 'Task access was revoked', code: 'not_found', status: 404 }));
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ['task', task.id], exact: true });
+    });
+    await waitFor(() => expect(client.getQueryState(['task', task.id])?.status).toBe('error'));
+    expect(client.getQueryData<Task>(['task', task.id])?.result).toBe('仅授权任务可见的原始结果');
+    expect(screen.queryByText('受限成果名称')).not.toBeInTheDocument();
+    expect(screen.queryByText('private/report.md')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '任务' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('任务详情暂不可用，当前状态未确认。');
+    expect(screen.queryByText('仅授权任务可见的原始结果')).not.toBeInTheDocument();
+  });
+
+  it('hides cached messages, attachments, and task artifacts after conversation access is revoked, then recovers on retry', async () => {
+    const attachmentID = 'pa_0123456789abcdef0123456789abcdef';
+    const privateMessage = { ...message, content: '受限会话消息正文', attachment_ids: [attachmentID] };
+    const restrictedTask = {
+      ...task, result: '受限任务结果',
+      artifacts: [{ id: 'a1234567', step_id: 's1234567', label: '受限任务成果', path: 'private/report.md',
+        media_type: 'text/markdown', workspace_id: 'w1234567', workspace_revision: 2, size_bytes: 12,
+        sha256: 'a'.repeat(64), verified: true, batch_item_id: null, batch_attempt: 1, created_at: timestamp }],
+    } satisfies Task;
+    mockCommon({ conversations: [conversation], messages: [privateMessage] });
+    const readMessages = vi.mocked(portalApi.conversationMessages);
+    vi.mocked(portalApi.task).mockResolvedValue(restrictedTask);
+    const user = userEvent.setup();
+    const { client } = renderPage();
+
+    expect(await screen.findByText('受限会话消息正文')).toBeInTheDocument();
+    await findTaskActivity(task.id);
+    await user.click(screen.getByRole('button', { name: '文件' }));
+    expect(await screen.findByRole('link', { name: '下载消息附件 1' })).toBeInTheDocument();
+    expect(await screen.findByText('受限任务成果')).toBeInTheDocument();
+
+    readMessages.mockRejectedValueOnce(new ApiError({ message: 'Conversation access was revoked', code: 'not_found', status: 404 }))
+      .mockResolvedValueOnce({ items: [privateMessage], next_cursor: null });
+    await act(async () => { await client.invalidateQueries({ queryKey: ['conversation-messages', conversation.id], exact: true }); });
+    await waitFor(() => expect(client.getQueryState(['conversation-messages', conversation.id])?.status).toBe('error'));
+    expect(within(document.querySelector('.conversation-view')!).getByRole('alert')).toHaveTextContent('当前对话内容暂不可访问。');
+    expect(screen.queryByText('受限会话消息正文')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '下载消息附件 1' })).not.toBeInTheDocument();
+    expect(screen.queryByText('受限任务成果')).not.toBeInTheDocument();
+    expect(screen.queryByText('private/report.md')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '重试读取对话' }));
+    expect(await screen.findByText('受限会话消息正文')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '文件' }));
+    expect(await screen.findByRole('link', { name: '下载消息附件 1' })).toBeInTheDocument();
+  });
+
+  it('keeps cached conversation content visible during a transient network error', async () => {
+    const attachmentID = 'pa_0123456789abcdef0123456789abcdef';
+    const cachedMessage = { ...message, content: '断网时仍可查看的会话', attachment_ids: [attachmentID] };
+    mockCommon({ conversations: [conversation], messages: [cachedMessage] });
+    const readMessages = vi.mocked(portalApi.conversationMessages);
+    const user = userEvent.setup();
+    const { client } = renderPage();
+
+    expect(await screen.findByText('断网时仍可查看的会话')).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
+    await user.click(screen.getByRole('button', { name: '文件' }));
+    expect(await screen.findByRole('link', { name: '下载消息附件 1' })).toBeInTheDocument();
+
+    readMessages.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await act(async () => { await client.invalidateQueries({ queryKey: ['conversation-messages', conversation.id], exact: true }); });
+    await waitFor(() => expect(client.getQueryState(['conversation-messages', conversation.id])?.status).toBe('error'));
+    expect(screen.getByText('断网时仍可查看的会话')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '下载消息附件 1' })).toBeInTheDocument();
+    expect(screen.queryByText('当前对话内容暂不可访问。')).not.toBeInTheDocument();
   });
 
   it('accepts a message even when the runtime is stopping', async () => {

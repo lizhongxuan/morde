@@ -50,7 +50,7 @@ async function pasteFromClipboard(page: Page, field: Locator, value: string) {
 test.describe("local PC input and API recovery", () => {
   test.skip(process.env.CH_REAL_E2E === "1", "local mock scenario is disabled for a real-host run");
 
-  test("pastes actual clipboard content into text, password, and textarea fields", async ({ browser }) => {
+  test("supports clipboard paste across text, password, numeric, API key, and multiline fields", async ({ browser }) => {
     const context = await browser.newContext({
       permissions: ["clipboard-read", "clipboard-write"],
       serviceWorkers: "block",
@@ -59,20 +59,41 @@ test.describe("local PC input and API recovery", () => {
     try {
       await installPasteEvidence(page);
       await disableDevelopmentMockWorker(context);
-      await context.route("**/api/me", (route) => route.fulfill(json({ error: { code: "unauthenticated", message: "请先登录", details: {} } }, 401)));
-      await context.route("**/api/auth/login", (route) => route.fulfill(json({ user })));
+      let authenticated = false;
+      await context.route("**/api/me", (route) => route.fulfill(authenticated
+        ? json(user)
+        : json({ error: { code: "unauthenticated", message: "请先登录", details: {} } }, 401)));
+      await context.route("**/api/auth/login", (route) => { authenticated = true; return route.fulfill(json({ user })); });
       await context.route((url) => url.pathname === "/api/goals", (route) => route.fulfill(json({ items: [], next_cursor: null })));
       await context.route((url) => url.pathname === "/api/schedules", (route) => route.fulfill(json({ items: [], next_cursor: null })));
       await context.route((url) => url.pathname === "/api/hosts", (route) => route.fulfill(json({ items: [] })));
       await context.route((url) => url.pathname === "/api/available-models", (route) => route.fulfill(json({ items: [] })));
+      await context.route((url) => url.pathname === "/api/model-connections", (route) => route.fulfill(json({ items: [], configuration_status: "not_configured" })));
+      await context.route((url) => url.pathname === "/api/apikeys", (route) => route.fulfill(json({ items: [] })));
 
       await page.goto(`${portalUrl}/login?next=${encodeURIComponent("/goals?view=goals")}`);
-      await pasteFromClipboard(page, page.getByLabel("用户名"), "clipboard-user");
+      const username = page.getByLabel("用户名");
+      await pasteFromClipboard(page, username, "clipboard-user");
+      await username.focus();
+      await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+      await page.keyboard.press(process.platform === "darwin" ? "Meta+C" : "Control+C");
+      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("clipboard-user");
       await pasteFromClipboard(page, page.getByLabel("密码"), "clipboard-password-123");
       await page.getByRole("button", { name: "登录" }).click();
       await expect(page).toHaveURL(/\/goals\?view=goals$/);
       await page.getByRole("button", { name: /新建目标/ }).click();
       await pasteFromClipboard(page, page.getByLabel("说明"), "从剪贴板粘贴到多行说明\n第二行内容");
+
+      await page.goto(`${portalUrl}/connections`);
+      await page.getByRole("button", { name: /添加个人模型/ }).click();
+      await pasteFromClipboard(page, page.getByLabel("API 密钥"), "local-test-model-secret");
+      await pasteFromClipboard(page, page.getByLabel("上下文窗口（tokens）"), "128000");
+
+      await page.goto(`${portalUrl}/apikeys`);
+      await expect(page.getByRole("heading", { name: "我的密钥" })).toBeVisible();
+      await page.getByRole("button", { name: /创建 API Key/ }).click();
+      await pasteFromClipboard(page, page.getByLabel("名称"), "local-test-key");
+      await pasteFromClipboard(page, page.getByLabel("有效期（天，可选）"), "30");
     } finally {
       await context.close();
     }

@@ -1,10 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider, useMutation, useQuery } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { portalApi } from './api';
-import { AuthProvider } from './auth';
+import { AuthProvider, useAuth } from './auth';
 import { AdminGuard, RouteGuard } from './RouteGuard';
 
 vi.mock('../api/client', () => {
@@ -47,6 +48,33 @@ describe('RouteGuard', () => {
 
     expect(await screen.findByText('修改密码页面')).toBeInTheDocument();
     expect(screen.queryByText('助手页面')).toBeNull();
+  });
+
+  it('保留已确认登录的页面处理临时网络错误，并在服务确认401后回到登录页', async () => {
+    vi.mocked(portalApi.me)
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockRejectedValueOnce(new ApiError({ message: '未登录', code: 'unauthenticated', status: 401 }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(['auth', 'me'], { id: 'u1234567', name: 'demo', role: 'member' });
+    function RefreshAuth() {
+      const { refresh } = useAuth();
+      return <button type="button" onClick={() => { void refresh(); }}>刷新登录状态</button>;
+    }
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/assistant']}><Routes>
+      <Route element={<RouteGuard />}><Route path="/assistant" element={<><p>当前对话仍可使用</p><RefreshAuth /></>} /></Route>
+      <Route path="/login" element={<LoginLocation />} />
+    </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
+
+    await user.click(screen.getByRole('button', { name: '刷新登录状态' }));
+    await waitFor(() => expect(portalApi.me).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText('当前对话仍可使用')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '暂时无法连接服务' })).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: '刷新登录状态' }));
+    expect(await screen.findByText('登录页面')).toBeInTheDocument();
+    expect(screen.getByText('/assistant')).toBeInTheDocument();
+    expect(screen.queryByText('当前对话仍可使用')).toBeNull();
   });
 
   it('管理 API 单项返回 403 时留在当前页并显示页面错误', async () => {

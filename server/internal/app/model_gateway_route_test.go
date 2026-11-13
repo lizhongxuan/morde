@@ -76,6 +76,29 @@ func TestConversationRouteGatewayAccountsForTextOnlyDecisionAndRecoversIt(t *tes
 	}
 }
 
+func TestConversationRouteGatewayUsesConfiguredGPT6LunaMaxReasoning(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: `{"action":"reply","task_id":"","question":"","reply":"OK"}`,
+		StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}}
+	resolver := &modelGatewayResolverTest{personal: true, endpoint: ModelEndpoint{
+		BaseURL: "https://api.openai.com/v1", APIKey: "test-key", ModelID: "gpt-6-luna",
+	}}
+	service, err := NewModelGatewayService(store, resolver, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetGPT6LunaMaxReasoning(true)
+	decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != ConversationRouteReply || decision.Reply != "OK" || client.calls != 1 ||
+		client.request.ReasoningEffort != "max" || client.request.DisableThinking ||
+		client.request.MaxOutputTokens < maxGPT6LunaReasoningTokens ||
+		store.reservation.ReservedTokens < maxGPT6LunaReasoningTokens {
+		t.Fatalf("GPT-6 Luna max reasoning was not applied and reserved: decision=%+v request=%+v reservation=%+v error=%v",
+			decision, client.request, store.reservation, err)
+	}
+}
+
 func TestConversationRouteGatewayKeepsJokesAndTimeAsTasklessReplies(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -102,7 +125,8 @@ func TestConversationRouteGatewayKeepsJokesAndTimeAsTasklessReplies(t *testing.T
 			decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
 			if err != nil || decision.Action != ConversationRouteReply || decision.Reply != test.reply || client.calls != 1 ||
 				store.decision == nil || store.decision.Action != ConversationRouteReply || store.reservation.Task != nil ||
-				len(client.request.Tools) != 0 || !strings.Contains(client.request.Instructions, "jokes, and simple questions") {
+				len(client.request.Tools) != 0 || !strings.Contains(client.request.Instructions, "jokes, acknowledgements") ||
+				!strings.Contains(client.request.Instructions, "Simple questions") {
 				t.Fatalf("ordinary conversation did not remain a taskless reply: decision=%+v err=%v calls=%d", decision, err, client.calls)
 			}
 			var input struct {

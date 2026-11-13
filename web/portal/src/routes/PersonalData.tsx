@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router';
@@ -157,88 +157,123 @@ export function PersonalData() {
   const serviceInstanceID = capabilities.data?.service_instance_id;
   const personalAPI = useMemo(() => personalAPIFor(serviceInstanceID, userID), [serviceInstanceID, userID]);
   const store = useMemo(() => userID ? new PersonalDataStore(userID, window.location.origin, undefined, serviceInstanceID) : null, [userID, serviceInstanceID]);
-  const [state, setState] = useState<PersonalDataState | null>(null);
-  const [otherInstanceDrafts, setOtherInstanceDrafts] = useState<Array<{ scope: string; serviceInstanceID: string | null; state: PersonalDataState }>>([]);
+  const storeScope = store?.scope;
+  const activeScopeRef = useRef(storeScope);
+  useLayoutEffect(() => { activeScopeRef.current = storeScope; }, [storeScope]);
+  const [scopedState, setScopedState] = useState<{ scope: string; value: PersonalDataState } | null>(null);
+  const state = scopedState && scopedState.scope === storeScope ? scopedState.value : null;
+  const [scopedOtherInstanceDrafts, setScopedOtherInstanceDrafts] = useState<{
+    scope: string; value: Array<{ scope: string; serviceInstanceID: string | null; state: PersonalDataState }>;
+  } | null>(null);
+  const otherInstanceDrafts = scopedOtherInstanceDrafts && scopedOtherInstanceDrafts.scope === storeScope ? scopedOtherInstanceDrafts.value : [];
   const requestedSection = new URLSearchParams(location.search).get('section');
   const activeSection: Section = sections.some((section) => section.id === requestedSection) ? requestedSection as Section : 'profile';
-  const [localError, setLocalError] = useState<string | null>(null);
+  const [scopedLocalError, setScopedLocalError] = useState<{ scope: string; value: string } | null>(null);
+  const localError = scopedLocalError && scopedLocalError.scope === storeScope ? scopedLocalError.value : null;
   const [actionError, setActionError] = useState<string | null>(null);
   const [confirmOldDelete, setConfirmOldDelete] = useState<string | null>(null);
-  const [syncing, setSyncing] = useState(false);
-  const [quota, setQuota] = useState<{ used_bytes: number; remaining_bytes: number; quota_bytes: number; max_attachment_bytes: number } | null>(null);
-  const [quotaError, setQuotaError] = useState<string | null>(null);
+  const [syncingScopes, setSyncingScopes] = useState<ReadonlySet<string>>(() => new Set());
+  const syncingScopesRef = useRef(new Set<string>());
+  const requestedSyncScopesRef = useRef(new Set<string>());
+  const syncCallbacksRef = useRef(new Map<string, () => void>());
+  const syncing = storeScope ? syncingScopes.has(storeScope) : false;
+  const [scopedQuota, setScopedQuota] = useState<{
+    scope: string; value: { used_bytes: number; remaining_bytes: number; quota_bytes: number; max_attachment_bytes: number };
+  } | null>(null);
+  const quota = scopedQuota && scopedQuota.scope === storeScope ? scopedQuota.value : null;
+  const [scopedQuotaError, setScopedQuotaError] = useState<{ scope: string; value: string } | null>(null);
+  const quotaError = scopedQuotaError && scopedQuotaError.scope === storeScope ? scopedQuotaError.value : null;
   const [memoryContent, setMemoryContent] = useState('');
   const [memoryCategory, setMemoryCategory] = useState('');
   const [feedTitle, setFeedTitle] = useState('');
   const [feedBody, setFeedBody] = useState('');
   const [libraryKind, setLibraryKind] = useState<'artifact' | 'media'>('artifact');
-  const syncingRef = useRef(false);
-  const syncRequestedRef = useRef(false);
-
   const refreshOtherInstanceDrafts = useCallback(async () => {
-    if (!store || !serviceInstanceID) { setOtherInstanceDrafts([]); return; }
+    if (!store) return;
+    if (!serviceInstanceID) {
+      if (activeScopeRef.current === store.scope) setScopedOtherInstanceDrafts({ scope: store.scope, value: [] });
+      return;
+    }
     try {
       await store.quarantineOtherInstanceDrafts();
-      setOtherInstanceDrafts(await store.otherInstanceDraftScopes());
+      const drafts = await store.otherInstanceDraftScopes();
+      if (activeScopeRef.current === store.scope) setScopedOtherInstanceDrafts({ scope: store.scope, value: drafts });
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : '无法读取其他服务实例保留的草稿。');
+      if (activeScopeRef.current === store.scope) setActionError(error instanceof Error ? error.message : '无法读取其他服务实例保留的草稿。');
     }
   }, [store, serviceInstanceID]);
 
   const refreshLocal = useCallback(async () => {
     if (!store) return;
     try {
-      setState(await store.read());
-      setLocalError(null);
+      const next = await store.read();
+      if (activeScopeRef.current !== store.scope) return;
+      setScopedState({ scope: store.scope, value: next });
+      setScopedLocalError(null);
       await refreshOtherInstanceDrafts();
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : '无法读取本地个人数据。');
+      if (activeScopeRef.current === store.scope) setScopedLocalError({ scope: store.scope, value: error instanceof Error ? error.message : '无法读取本地个人数据。' });
     }
   }, [store, refreshOtherInstanceDrafts]);
 
   const sync = useCallback(async () => {
     if (!store || !serviceInstanceID) return;
-    if (syncingRef.current) {
-      syncRequestedRef.current = true;
+    const scope = store.scope;
+    if (activeScopeRef.current !== scope) return;
+    if (syncingScopesRef.current.has(scope)) {
+      requestedSyncScopesRef.current.add(scope);
       return;
     }
-    syncingRef.current = true;
-    setSyncing(true);
+    syncingScopesRef.current.add(scope);
+    setSyncingScopes(new Set(syncingScopesRef.current));
     try {
-      await synchronizePersonalData(store, personalAPI);
-      if (serviceInstanceID && (typeof navigator === 'undefined' || navigator.onLine)) {
+      await synchronizePersonalData(store, personalAPI, () => activeScopeRef.current === scope);
+      if (activeScopeRef.current === scope && (typeof navigator === 'undefined' || navigator.onLine)) {
         try {
           const result = await personalAPI.personalDataQuota();
-          setQuota({ used_bytes: result.used_bytes, remaining_bytes: result.remaining_bytes, quota_bytes: result.quota_bytes, max_attachment_bytes: result.max_attachment_bytes });
-          setQuotaError(null);
+          if (activeScopeRef.current === scope) {
+            setScopedQuota({ scope, value: { used_bytes: result.used_bytes, remaining_bytes: result.remaining_bytes, quota_bytes: result.quota_bytes, max_attachment_bytes: result.max_attachment_bytes } });
+            setScopedQuotaError(null);
+          }
         } catch (error) {
-          setQuotaError(error instanceof Error ? error.message : '无法读取附件空间。');
+          if (activeScopeRef.current === scope) setScopedQuotaError({ scope, value: error instanceof Error ? error.message : '无法读取附件空间。' });
         }
       }
     } finally {
-      syncingRef.current = false;
-      setSyncing(false);
+      syncingScopesRef.current.delete(scope);
+      setSyncingScopes(new Set(syncingScopesRef.current));
       await refreshLocal();
-      if (syncRequestedRef.current) {
-        syncRequestedRef.current = false;
-        void sync();
+      if (requestedSyncScopesRef.current.delete(scope)) {
+        const queuedSync = syncCallbacksRef.current.get(scope);
+        if (queuedSync) void queuedSync();
       }
     }
   }, [store, refreshLocal, personalAPI, serviceInstanceID]);
 
   useEffect(() => {
     if (!store) return undefined;
+    const callbacks = syncCallbacksRef.current;
+    callbacks.set(store.scope, sync);
+    return () => {
+      if (callbacks.get(store.scope) === sync) callbacks.delete(store.scope);
+    };
+  }, [store, sync]);
+
+  useEffect(() => {
+    if (!store) return undefined;
     let alive = true;
-    const unsubscribeStore = store.subscribe((next) => { if (alive) setState(next); });
+    const unsubscribeStore = store.subscribe((next) => {
+      if (alive && activeScopeRef.current === store.scope) setScopedState({ scope: store.scope, value: next });
+    });
     const onOnline = () => { void sync(); };
     window.addEventListener('online', onOnline);
     void store.read().then((next) => {
-      if (!alive) return;
-      setState(next);
-      setLocalError(null);
+      if (!alive || activeScopeRef.current !== store.scope) return;
+      setScopedState({ scope: store.scope, value: next });
+      setScopedLocalError(null);
       void refreshOtherInstanceDrafts().finally(() => { if (alive) void sync(); });
     }).catch((error: unknown) => {
-      if (alive) setLocalError(error instanceof Error ? error.message : '无法读取本地个人数据。');
+      if (alive && activeScopeRef.current === store.scope) setScopedLocalError({ scope: store.scope, value: error instanceof Error ? error.message : '无法读取本地个人数据。' });
     });
     return () => {
       alive = false;

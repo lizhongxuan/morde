@@ -13,7 +13,9 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	workbenchDir := t.TempDir()
 	t.Setenv("T02_TEST_INSTANCE", "test-instance")
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(validConfigYAML(workbenchDir)), 0o600); err != nil {
+	data := strings.Replace(validConfigYAML(workbenchDir), "models:\n  allowed_hosts: [api.openai.com]\n",
+		"models:\n  allowed_hosts: [api.openai.com]\n  gpt6_luna_max_reasoning: true\n", 1)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -21,9 +23,9 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled ||
+	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled || !cfg.Models.GPT6LunaMaxReasoning ||
 		cfg.SiteStorage.RootDir == "" || cfg.SiteStorage.MaxReleaseBytes != 10737418240 || cfg.SiteStorage.MaxOwnerBytes != 53687091200 || cfg.SiteStorage.MinFreeBytes != 10737418240 {
-		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.SiteStorage)
+		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s model_max_reasoning=%t site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.Models.GPT6LunaMaxReasoning, cfg.SiteStorage)
 	}
 	if cfg.MCP != (MCP{Enabled: true, MaxOutputBytes: 65536, ScreenshotMaxWidth: 1280}) {
 		t.Fatalf("MCP defaults = %+v", cfg.MCP)

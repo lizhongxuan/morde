@@ -629,7 +629,7 @@ test('runs a no-tool coordinator turn with its JSON instruction and Morde SOUL',
       assert.equal(text.split(runtimeSoul).length - 1, 1)
       assert.match(text, /Follow the assigned task and its required response format/)
       assert.match(text, /When the response format permits/)
-      assert.match(text, /No tools are available for this model run/)
+      assert.doesNotMatch(text, /No tools are available for this model run/)
       replyCoordinatorWithText(proc, frame, '{"action":"reply","task_id":"","question":"","reply":"route target"}')
     }
   })

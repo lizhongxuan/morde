@@ -17,6 +17,26 @@ import { FloatingError } from '../components/FloatingError';
 type Workspace = Awaited<ReturnType<typeof portalApi.workspaces>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type Binding = Host['workspaces'][number];
+type ProjectUploadTarget = {
+  hostId: string;
+  hostName: string;
+  hostState: 'running' | 'stopped';
+  workspaceId: string;
+  workspaceName: string;
+  folders: { folderID: string; projectName: string; relativePath: string; state: string }[];
+  blockedMessage?: string;
+};
+type ProjectDirectorySelection = {
+  selectionID: string;
+  hostId: string;
+  workspaceId: string;
+  projectName: string;
+  directoryName: string;
+};
+type PortalProjectBridge = {
+  projectUploadTargets?: () => Promise<unknown>;
+  selectProjectDirectory?: (hostId: string, workspaceId: string) => Promise<unknown>;
+};
 type PendingWorkspaceCreate = { version: 1; name: string; idempotencyKey: string };
 type WorkspaceRevisionDiff = components['schemas']['WorkspaceDiff'];
 type WorkspaceRestoreRecovery = { pending: PendingWorkspaceRestore | null; invalid: boolean };
@@ -43,6 +63,89 @@ const workspaceDiffDisplayLabel: Record<WorkspaceRevisionDiff['changes'][number]
   text: '文本可预览', binary: '二进制，不展示内容', too_large: '文件过大，不展示内容',
   metadata_only: '仅元数据', not_applicable: '无正文',
 };
+
+function portalProjectBridge(): PortalProjectBridge | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return (window as Window & { morde?: PortalProjectBridge }).morde;
+}
+
+function hasControlCharacters(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+  });
+}
+
+function safeDisplayText(value: string, maxLength: number): string {
+  return Array.from(value, (character) => hasControlCharacters(character) ? ' ' : character).join('').trim().slice(0, maxLength);
+}
+
+function parseProjectUploadTargets(value: unknown): ProjectUploadTarget[] {
+  if (!Array.isArray(value) || value.length > 1000) throw new Error('云端电脑列表无效');
+  return value.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('云端电脑列表无效');
+    const target = item as Record<string, unknown>;
+    if (typeof target.hostId !== 'string' || !/^h[a-z0-9]{7}$/.test(target.hostId)
+      || typeof target.workspaceId !== 'string' || !/^w[a-z0-9]{7}$/.test(target.workspaceId)
+      || typeof target.hostName !== 'string' || typeof target.workspaceName !== 'string'
+      || (target.hostState !== 'running' && target.hostState !== 'stopped')
+      || !Array.isArray(target.folders) || target.folders.length > 1000
+      || (target.blockedMessage !== undefined && typeof target.blockedMessage !== 'string')) {
+      throw new Error('云端电脑列表无效');
+    }
+    const folders = target.folders.map((folder) => {
+      if (!folder || typeof folder !== 'object' || Array.isArray(folder)) throw new Error('云端项目目录列表无效');
+      const value = folder as Record<string, unknown>;
+      if (typeof value.folderID !== 'string' || typeof value.projectName !== 'string'
+        || typeof value.relativePath !== 'string' || typeof value.state !== 'string') {
+        throw new Error('云端项目目录列表无效');
+      }
+      return { folderID: value.folderID, projectName: value.projectName, relativePath: value.relativePath, state: value.state };
+    });
+    return {
+      hostId: target.hostId,
+      hostName: safeDisplayText(target.hostName, 120) || target.hostId,
+      hostState: target.hostState,
+      workspaceId: target.workspaceId,
+      workspaceName: safeDisplayText(target.workspaceName, 120) || target.workspaceId,
+      folders,
+      ...(typeof target.blockedMessage === 'string' ? { blockedMessage: safeDisplayText(target.blockedMessage, 240) } : {}),
+    };
+  });
+}
+
+function parseProjectDirectorySelection(value: unknown, target: ProjectUploadTarget): ProjectDirectorySelection | null {
+  if (value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('本机目录选择结果无效');
+  const selection = value as Record<string, unknown>;
+  if (typeof selection.selectionID !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(selection.selectionID)
+    || selection.hostId !== target.hostId || selection.workspaceId !== target.workspaceId
+    || typeof selection.projectName !== 'string' || !selection.projectName || [...selection.projectName].length > 120
+    || typeof selection.directoryName !== 'string' || !selection.directoryName || selection.directoryName.length > 255
+    || /[\\/]/.test(selection.directoryName) || hasControlCharacters(selection.directoryName)) {
+    throw new Error('本机目录选择结果无效');
+  }
+  return {
+    selectionID: selection.selectionID,
+    hostId: target.hostId,
+    workspaceId: target.workspaceId,
+    projectName: selection.projectName.normalize('NFC'),
+    directoryName: selection.directoryName,
+  };
+}
+
+function validateProjectName(value: string): { name: string; error: string | null } {
+  const name = value.normalize('NFC');
+  if (!name || name.trim() !== name || [...name].length > 120 || name === '.' || name === '..'
+    || /[\\/<>:"|?*]/u.test(name) || hasControlCharacters(name) || /[. ]$/.test(name)) {
+    return { name, error: '请输入有效的项目目录名（最多 120 个字符，不能包含路径或系统保留符号）。' };
+  }
+  const base = name.split('.', 1)[0]!.toUpperCase();
+  if (['CON', 'PRN', 'AUX', 'NUL'].includes(base) || /^(?:COM|LPT)[1-9]$/.test(base)) {
+    return { name, error: '该项目名为系统保留名称，请换一个名称。' };
+  }
+  return { name, error: null };
+}
 
 function workspaceDiffRestorePaths(changes: WorkspaceRevisionDiff['changes']): string[] {
   const paths = new Map<string, string>();
@@ -137,12 +240,60 @@ export function Workspaces() {
   const [restoreWorkflowBusy, setRestoreWorkflowBusy] = useState(false);
   const [restoreWorkflowError, setRestoreWorkflowError] = useState('');
   const [writersStoppedConfirmed, setWritersStoppedConfirmed] = useState(false);
+  const projectBridge = portalProjectBridge();
+  const projectBridgeAvailable = Boolean(projectBridge?.projectUploadTargets && projectBridge.selectProjectDirectory);
+  const [selectedProjectTargetKey, setSelectedProjectTargetKey] = useState('');
+  const [projectDirectorySelection, setProjectDirectorySelection] = useState<ProjectDirectorySelection | null>(null);
+  const [projectNameDraft, setProjectNameDraft] = useState('');
+  const [confirmedProjectName, setConfirmedProjectName] = useState('');
+  const [projectDirectoryBusy, setProjectDirectoryBusy] = useState(false);
+  const [projectDirectoryError, setProjectDirectoryError] = useState('');
+  const [projectDirectoryNotice, setProjectDirectoryNotice] = useState('');
+  const [projectNameError, setProjectNameError] = useState('');
   const revisionRequestID = useRef(0);
+  const projectCapabilities = useQuery({
+    queryKey: ['project-upload-capabilities'],
+    queryFn: portalApi.capabilities,
+    enabled: projectBridgeAvailable,
+    retry: false,
+  });
+  const supportedFeatures = projectCapabilities.data?.supported_features ?? [];
+  const projectUploadGateEnabled = projectCapabilities.isSuccess && !projectCapabilities.isError
+    && supportedFeatures.includes('workspace_sync') && supportedFeatures.includes('project_upload');
+  const projectPreferences = useQuery({
+    queryKey: ['user-preferences'],
+    queryFn: portalApi.preferences,
+    enabled: projectUploadGateEnabled,
+    retry: false,
+  });
+  const projectTargets = useQuery({
+    queryKey: ['project-upload-targets', user?.id],
+    queryFn: async () => {
+      if (!projectBridge?.projectUploadTargets) throw new Error('当前桌面客户端不支持项目目录选择。');
+      return parseProjectUploadTargets(await projectBridge.projectUploadTargets());
+    },
+    enabled: projectBridgeAvailable && projectCapabilities.isSuccess && projectUploadGateEnabled,
+    retry: false,
+  });
   const hosts = useQuery({
     queryKey: ['hosts'], queryFn: portalApi.hosts,
     refetchInterval: (query) => query.state.data?.items.some((host) => host.state === 'creating' || host.state === 'deleting' || host.state === 'stopping'
       || host.workspaces.some((binding) => binding.state === 'preparing' || binding.state === 'active' || binding.state === 'unbinding')) ? 3000 : false,
   });
+  const configuredDefaultHost = hosts.data?.items.find((host) => host.owner_id === user?.id
+    && host.id === projectPreferences.data?.default_host_id);
+  const configuredDefaultWorkspace = configuredDefaultHost?.workspaces.find((binding) => binding.state !== 'detached');
+  const configuredDefaultProjectTarget = configuredDefaultHost && configuredDefaultWorkspace
+    ? projectTargets.data?.find((target) => target.hostId === configuredDefaultHost.id
+      && target.workspaceId === configuredDefaultWorkspace.workspace.id)
+    : undefined;
+  const selectedProjectTarget = projectTargets.data?.find((target) => `${target.hostId}/${target.workspaceId}` === selectedProjectTargetKey)
+    ?? configuredDefaultProjectTarget
+    ?? (projectPreferences.isSuccess && !projectPreferences.data.default_host_id ? projectTargets.data?.[0] : undefined);
+  const projectSelectionMatchesTarget = Boolean(selectedProjectTarget && projectDirectorySelection
+    && projectDirectorySelection.hostId === selectedProjectTarget.hostId
+    && projectDirectorySelection.workspaceId === selectedProjectTarget.workspaceId);
+  const projectNameValidation = validateProjectName(projectNameDraft);
   const query = useQuery({
     queryKey: ['workspaces'], queryFn: portalApi.workspaces,
     refetchInterval: (current) => current.state.data?.items.some((workspace) => workspace.state === 'deleting')
@@ -447,6 +598,36 @@ export function Workspaces() {
     try { await enterHostInNewTab(host.id); }
     catch (error) { notify(errorDetails(error).message, 'error'); }
   };
+  const chooseProjectDirectory = async () => {
+    if (!selectedProjectTarget || !projectUploadGateEnabled || !projectBridge?.selectProjectDirectory) return;
+    setProjectDirectoryBusy(true);
+    setProjectDirectoryError('');
+    setProjectDirectoryNotice('');
+    try {
+      const selection = parseProjectDirectorySelection(
+        await projectBridge.selectProjectDirectory(selectedProjectTarget.hostId, selectedProjectTarget.workspaceId),
+        selectedProjectTarget,
+      );
+      if (!selection) {
+        setProjectDirectoryNotice('已取消本机目录选择。');
+        return;
+      }
+      setProjectDirectorySelection(selection);
+      setProjectNameDraft(selection.projectName);
+      setConfirmedProjectName('');
+      setProjectNameError('');
+      setProjectDirectoryNotice(`已选择本机目录“${selection.directoryName}”。`);
+    } catch (error) {
+      setProjectDirectoryError(`选择本机目录失败：${errorDetails(error).message}`);
+    } finally {
+      setProjectDirectoryBusy(false);
+    }
+  };
+  const confirmProjectName = () => {
+    const validation = validateProjectName(projectNameDraft);
+    setProjectNameError(validation.error ?? '');
+    if (!validation.error && projectDirectorySelection) setConfirmedProjectName(validation.name);
+  };
 
   return <section className="workspace-route">
     {import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-info" role="status">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实云端文件。</p>}
@@ -460,6 +641,84 @@ export function Workspaces() {
         setRestoreConfirmationOpen(true);
       }}>{restoreWorkflowBusy ? '正在核对并恢复…' : '核对状态并继续恢复'}</button>
     </div>}
+    <section className="design-panel" aria-labelledby="project-upload-title">
+      <div className="design-panel-header"><div><h2 id="project-upload-title">本机项目目录</h2><p>选择云端电脑和本机文件夹，确认项目名后即可准备单向同步。</p></div></div>
+      {!projectBridgeAvailable && <p className="notice notice-warning" role="status">本机目录选择需要 Morde 桌面客户端。当前浏览器无法安全访问本机文件夹，请在桌面客户端继续。</p>}
+      {projectBridgeAvailable && projectCapabilities.isPending && <p className="notice notice-info" role="status">正在确认服务端项目同步能力…</p>}
+      {projectBridgeAvailable && projectCapabilities.isError && <FloatingError>无法确认服务端项目同步能力。为保护云端数据，项目目录和同步操作已关闭。<button type="button" className="button button-secondary button-small" onClick={() => void projectCapabilities.refetch()}>重试</button></FloatingError>}
+      {projectBridgeAvailable && projectCapabilities.isSuccess && !projectUploadGateEnabled && <p className="notice notice-info" role="status">服务端尚未开放项目目录同步（workspace_sync / project_upload）。目标列表和目录选择保持关闭；上传功能需等待 CFS-11 验收。</p>}
+      {projectBridgeAvailable && projectUploadGateEnabled && <>
+        {projectPreferences.isPending && <p className="notice notice-info" role="status">正在读取设置中的默认电脑与 Workspace…</p>}
+        {projectPreferences.isError && <FloatingError>无法读取默认电脑设置。请重试，或在下方手动选择已授权目标。<button type="button" className="button button-secondary button-small" onClick={() => void projectPreferences.refetch()}>重试</button></FloatingError>}
+        {projectTargets.isPending && <p className="notice notice-info" role="status">正在读取当前账号可用的云端电脑与工作区…</p>}
+        {projectTargets.isError && <FloatingError>无法读取云端电脑列表。请检查桌面连接后重试。 <button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></FloatingError>}
+        {projectTargets.isSuccess && !projectTargets.data.length && <p className="empty-card">当前账号没有可用于项目同步的云端电脑工作区。</p>}
+        {projectTargets.isSuccess && projectTargets.data.length > 0 && <>
+          {projectPreferences.isSuccess && projectPreferences.data.default_host_id && (hosts.isSuccess || hosts.isError) && !configuredDefaultProjectTarget && <p className="notice notice-warning" role="status">
+            {hosts.isError
+              ? '无法核对设置中的默认电脑和 Workspace。请先重试读取主机状态，或手动选择已授权目标；系统不会自动切换目标。'
+              : '设置中的默认电脑或其 Workspace 当前不可用于目录选择。请手动选择一个可用目标；系统不会自动切换目标。'}
+          </p>}
+          <ScreenPagination
+            items={projectTargets.data}
+            getKey={(target) => `${target.hostId}/${target.workspaceId}`}
+            estimatedItemHeight={62}
+            height="min(max(calc(100dvh - 470px), 74px), 180px)"
+            gap={6}
+            ariaLabel="项目同步目标"
+            className="project-target-list"
+            renderItem={(target) => {
+              const key = `${target.hostId}/${target.workspaceId}`;
+              const isSelected = (selectedProjectTarget?.hostId === target.hostId && selectedProjectTarget.workspaceId === target.workspaceId);
+              const isConfiguredDefault = configuredDefaultHost?.id === target.hostId
+                && configuredDefaultWorkspace?.workspace.id === target.workspaceId;
+              return <article className="schedule-card" style={{ padding: '8px 10px' }}>
+                <div className="schedule-card-heading">
+                  <div><strong>{target.hostName}{isConfiguredDefault && <small className="table-sub"> · 默认</small>}</strong><span>{target.hostState === 'running' ? '运行中' : '已停止'} · {target.workspaceName} · 已有项目 {target.folders.length} 个</span></div>
+                  <button type="button" className={`button ${isSelected ? 'button-primary' : 'button-secondary'} button-small`} aria-pressed={isSelected}
+                    onClick={() => {
+                      if (selectedProjectTargetKey === key) return;
+                      setSelectedProjectTargetKey(key);
+                      setProjectDirectorySelection(null);
+                      setProjectNameDraft('');
+                      setConfirmedProjectName('');
+                      setProjectNameError('');
+                      setProjectDirectoryError('');
+                      setProjectDirectoryNotice('');
+                    }}>使用此目标</button>
+                </div>
+                {target.blockedMessage && isSelected && <small className="table-sub">{target.blockedMessage}</small>}
+              </article>;
+            }}
+          />
+          {selectedProjectTarget && <div className="form-stack" style={{ marginTop: 10 }}>
+            {selectedProjectTarget.blockedMessage && <p className="notice notice-warning" role="status">{selectedProjectTarget.blockedMessage}</p>}
+            <div className="inline-actions">
+              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || Boolean(selectedProjectTarget.blockedMessage)} onClick={() => void chooseProjectDirectory()}>
+                {projectDirectoryBusy ? '正在打开目录选择器…' : projectSelectionMatchesTarget ? '重新选择本机目录' : '选择本机目录'}
+              </button>
+              {projectSelectionMatchesTarget && projectDirectorySelection && <span role="status">已选：{projectDirectorySelection.directoryName}</span>}
+            </div>
+            {projectDirectoryNotice && <p className="notice notice-info" role="status">{projectDirectoryNotice}</p>}
+            {projectDirectoryError && <FloatingError>{projectDirectoryError}</FloatingError>}
+            {projectSelectionMatchesTarget && projectDirectorySelection && <>
+              <label htmlFor="project-upload-name">项目名</label>
+              <input id="project-upload-name" value={projectNameDraft} maxLength={120} onChange={(event) => {
+                setProjectNameDraft(event.target.value);
+                setConfirmedProjectName('');
+                setProjectNameError('');
+              }} />
+              {projectNameError && <FloatingError>{projectNameError}</FloatingError>}
+              <div className="inline-actions">
+                <button type="button" className="button button-secondary" disabled={!projectNameDraft || confirmedProjectName === projectNameValidation.name} onClick={confirmProjectName}>确认项目名</button>
+                {confirmedProjectName && <span role="status">项目名已确认：{confirmedProjectName}</span>}
+                {confirmedProjectName && <button type="button" className="button button-primary" disabled title="CFS-11验收完成前，上传保持关闭">上传功能等待 CFS-11 验收</button>}
+              </div>
+            </>}
+          </div>}
+        </>}
+      </>}
+    </section>
     <section className="design-panel" aria-labelledby="workspace-list-title">
       <div className="design-panel-header"><div><h2 id="workspace-list-title">{computer ? `${computer.name || '云端电脑'} · 文件与版本` : '云端文件与版本'}</h2><p>{computer ? '查看这台电脑已保存的文件和历史版本；手动单向同步入口尚未开放。' : '以下为历史文件；新建和使用文件请从云端电脑入口开始。'}</p></div>{!computerID && !recoveryPending && !recoveryError && <Link className="button button-primary" to="/hosts/new">＋ 创建云端电脑</Link>}</div>
     {!computerID && (recoveryPending || recoveryError) && <form className="form-card form-stack workspace-create-form" aria-label="恢复历史文件空间创建" onSubmit={createWorkspace}>

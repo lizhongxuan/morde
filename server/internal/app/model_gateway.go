@@ -120,11 +120,12 @@ type ModelGatewayResolver interface {
 }
 
 type ModelGatewayService struct {
-	store          ModelCallStore
-	models         ModelGatewayResolver
-	client         ModelClient
-	projectBudget  *ProjectBudgetService
-	responseSealer *Sealer
+	store                ModelCallStore
+	models               ModelGatewayResolver
+	client               ModelClient
+	projectBudget        *ProjectBudgetService
+	responseSealer       *Sealer
+	gpt6LunaMaxReasoning bool
 }
 
 const modelRequestItemTokenReserve int64 = 32
@@ -135,6 +136,8 @@ const (
 	MaxDSHModelResponseTextBytes  = 256 << 10
 	MaxDSHModelResponseToolCalls  = 64
 	maxDSHModelResponseTokenCount = 1<<53 - 1
+	// OpenAI recommends reserving at least 25,000 tokens for max reasoning and output.
+	maxGPT6LunaReasoningTokens = 25_000
 )
 
 func normalizedModelTaskFence(value *ModelTaskFence) *ModelTaskFence {
@@ -180,6 +183,25 @@ func (s *ModelGatewayService) SetModelResponseSealer(sealer *Sealer) error {
 	}
 	s.responseSealer = sealer
 	return nil
+}
+
+func (s *ModelGatewayService) SetGPT6LunaMaxReasoning(enabled bool) {
+	s.gpt6LunaMaxReasoning = enabled
+}
+
+func (s *ModelGatewayService) applyGPT6LunaReasoning(endpoint ModelEndpoint, request *ModelRequest, disableByDefault bool) {
+	if !isFirstPartyGPT6Luna(endpoint) {
+		return
+	}
+	if s.gpt6LunaMaxReasoning {
+		request.DisableThinking = false
+		request.ReasoningEffort = "max"
+		if request.MaxOutputTokens < maxGPT6LunaReasoningTokens {
+			request.MaxOutputTokens = maxGPT6LunaReasoningTokens
+		}
+	} else if disableByDefault {
+		request.DisableThinking = true
+	}
 }
 
 // TaskToolCapability resolves the selected model for the task initiator, not
@@ -312,6 +334,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
+	if call.Source == ModelCallTask || call.Source == ModelCallCompaction {
+		request := call.Request
+		s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, call.Source == ModelCallTask)
+		call.Request = request
+		ownerID, digest, reserve, err = validateModelCall(call)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+	}
 	if call.Source == ModelCallCompaction && (call.Summary == nil || endpoint.ContextWindowTokens == nil ||
 		*endpoint.ContextWindowTokens != call.Summary.ContextWindowTokens) {
 		return ModelResponse{}, domain.NewError(domain.CodeConflict, "conversation summary model capacity changed")
@@ -379,9 +410,6 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	request := call.Request
 	request.Endpoint = endpoint.Endpoint
-	if call.Source == ModelCallTask && isFirstPartyGPT6Luna(endpoint.Endpoint) {
-		request.DisableThinking = true
-	}
 	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, ModelCallTimeout)
 	defer cancelDispatch()
 	var dispatchErr error
@@ -679,8 +707,20 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			RequiredTool    string
 			MaxOutputTokens int
 			Temperature     *float64
-			DisableThinking bool `json:",omitempty"`
-		}{call.ModelID, call.Request.Instructions, call.Request.Input, call.Request.Tools, call.Request.RequiredTool, call.Request.MaxOutputTokens, call.Request.Temperature, call.Request.DisableThinking})
+			ReasoningEffort string `json:",omitempty"`
+			DisableThinking bool   `json:",omitempty"`
+		}{call.ModelID, call.Request.Instructions, call.Request.Input, call.Request.Tools, call.Request.RequiredTool, call.Request.MaxOutputTokens, call.Request.Temperature, call.Request.ReasoningEffort, call.Request.DisableThinking})
+		if err != nil {
+			return "", empty, 0, domain.InvalidArgument("model_call", "model request cannot be encoded")
+		}
+	} else if call.Request.ReasoningEffort != "" {
+		var err error
+		raw, err = json.Marshal(struct {
+			RawRequest      json.RawMessage
+			ModelID         string
+			MaxOutputTokens int
+			ReasoningEffort string
+		}{raw, call.ModelID, call.Request.MaxOutputTokens, call.Request.ReasoningEffort})
 		if err != nil {
 			return "", empty, 0, domain.InvalidArgument("model_call", "model request cannot be encoded")
 		}

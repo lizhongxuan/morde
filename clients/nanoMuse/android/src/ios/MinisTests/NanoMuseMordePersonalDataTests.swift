@@ -18,7 +18,7 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "library_item", id: "../item"))
     }
 
-    func testLegacySyncPauseDoesNotDisableCloudReads() {
+    func testLegacySyncPauseDoesNotDisableAutomaticPersonalContentFlushOrCloudReads() {
         let scope = String(repeating: "e", count: 64)
         let suiteName = "NanoMuseMordePersonalDataTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -29,6 +29,9 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         XCTAssertFalse(NanoMuseMordeProfileSyncPreference.isEnabled(scopeKey: scope, defaults: defaults))
         XCTAssertTrue(NanoMuseMordeProfileSyncPreference.canRead(scopeKey: scope))
         XCTAssertFalse(NanoMuseMordeProfileSyncPreference.canFlush(syncEnabled: false, scopeKey: scope))
+        XCTAssertTrue(NanoMuseMordePersonalContentSyncPolicy.canFlush(scopeKey: scope, isSaving: false))
+        XCTAssertFalse(NanoMuseMordePersonalContentSyncPolicy.canFlush(scopeKey: scope, isSaving: true))
+        XCTAssertFalse(NanoMuseMordePersonalContentSyncPolicy.canFlush(scopeKey: nil, isSaving: false))
     }
 
     func testProfileRefreshUsesNewerCloudRevisionWithoutReplacingAnUnsavedDraft() {
@@ -48,6 +51,94 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         XCTAssertTrue(NanoMuseMordeProfileRefreshPolicy.shouldApply(
             remoteRevision: 2, currentRevision: 1, remoteDraft: localDraft,
             currentDraft: localDraft, baselineDraft: baseline))
+    }
+
+    func testMissingProfileResetsOnlyAfterConfirmedEmptySnapshotAndWithoutDraftChanges() {
+        let baseline = NanoMuseMordeProfileDraft.empty
+        let edited = NanoMuseMordeProfileDraft(name: "Local", description: "Draft", style: "muse")
+        func shouldReset(confirmed: Bool = true, loading: Bool = false, error: String? = nil,
+                         discarding: Bool = false, current: NanoMuseMordeProfileDraft = .empty) -> Bool {
+            NanoMuseMordeProfileRefreshPolicy.shouldResetForMissingCloudProfile(
+                hasConfirmedSnapshot: confirmed, isLoading: loading, error: error,
+                discardingDraft: discarding, currentDraft: current, baselineDraft: baseline)
+        }
+
+        XCTAssertFalse(shouldReset(confirmed: false))
+        XCTAssertFalse(shouldReset(loading: true))
+        XCTAssertFalse(shouldReset(error: "offline"))
+        XCTAssertFalse(shouldReset(current: edited))
+        XCTAssertTrue(shouldReset())
+        XCTAssertTrue(shouldReset(discarding: true, current: edited))
+    }
+
+    func testProfileRefreshFailurePreservesAnUnsubmittedDraft() {
+        let baseline = NanoMuseMordeProfileDraft.empty
+        let draft = NanoMuseMordeProfileDraft(name: "Local", description: "Unsaved", style: "flat")
+
+        XCTAssertFalse(NanoMuseMordeProfileRefreshPolicy.shouldResetForMissingCloudProfile(
+            hasConfirmedSnapshot: true, isLoading: false, error: "offline", discardingDraft: false,
+            currentDraft: draft, baselineDraft: baseline))
+        XCTAssertFalse(NanoMuseMordeProfileRefreshPolicy.shouldResetForMissingCloudProfile(
+            hasConfirmedSnapshot: false, isLoading: false, error: nil, discardingDraft: false,
+            currentDraft: draft, baselineDraft: baseline))
+    }
+
+    func testAutomaticRefreshPolicyCoversForegroundBackgroundAndReconnect() {
+        XCTAssertTrue(NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnForeground(isOnline: true))
+        XCTAssertFalse(NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnForeground(isOnline: false))
+
+        XCTAssertTrue(NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnReconnect(
+            isForeground: true, wasOnline: false, isOnline: true))
+        XCTAssertFalse(NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnReconnect(
+            isForeground: false, wasOnline: false, isOnline: true))
+        XCTAssertFalse(NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnReconnect(
+            isForeground: true, wasOnline: true, isOnline: true))
+        XCTAssertFalse(NanoMuseMordePersonalRefreshPolicy.shouldRefreshOnReconnect(
+            isForeground: true, wasOnline: true, isOnline: false))
+
+        XCTAssertTrue(NanoMuseMordePersonalRefreshPolicy.shouldRunPeriodicRefresh(
+            isForeground: true, isOnline: true))
+        XCTAssertFalse(NanoMuseMordePersonalRefreshPolicy.shouldRunPeriodicRefresh(
+            isForeground: false, isOnline: true))
+        XCTAssertFalse(NanoMuseMordePersonalRefreshPolicy.shouldRunPeriodicRefresh(
+            isForeground: true, isOnline: false))
+    }
+
+    func testMutationReceiptMustMatchScopeObjectAndCloudSequence() {
+        let scope = String(repeating: "a", count: 64)
+        let expected = mutation(scopeKey: scope, mutationID: "mutation-receipt-001", content: "local edit")
+
+        func receipt(objectType: String = "memory", objectID: String = "global",
+                     revision: Int64 = 2, sequence: Int64 = 9) -> MordePersonalMutationReceipt {
+            MordePersonalMutationReceipt(object_type: objectType, object_id: objectID,
+                result_revision: revision, account_change_sequence: sequence, replay: false)
+        }
+
+        XCTAssertTrue(NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+            receipt: receipt(), mutation: expected, currentScope: scope))
+        XCTAssertFalse(NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+            receipt: receipt(), mutation: expected, currentScope: String(repeating: "b", count: 64)))
+        XCTAssertFalse(NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+            receipt: receipt(objectType: "goal"), mutation: expected, currentScope: scope))
+        XCTAssertFalse(NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+            receipt: receipt(objectID: "user"), mutation: expected, currentScope: scope))
+        XCTAssertFalse(NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+            receipt: receipt(revision: 0), mutation: expected, currentScope: scope))
+        XCTAssertFalse(NanoMuseMordePersonalMutationReceiptPolicy.accepts(
+            receipt: receipt(sequence: 0), mutation: expected, currentScope: scope))
+    }
+
+    func testRefreshFailurePreservesPreviouslyConfirmedProfile() {
+        let confirmed = NanoMuseMordeProfileDraft(name: "Cloud", description: "Confirmed profile", style: "flat")
+        var visibleDraft = confirmed
+
+        if NanoMuseMordeProfileRefreshPolicy.shouldResetForMissingCloudProfile(
+            hasConfirmedSnapshot: true, isLoading: false, error: "offline", discardingDraft: false,
+            currentDraft: visibleDraft, baselineDraft: confirmed) {
+            visibleDraft = .empty
+        }
+
+        XCTAssertEqual(visibleDraft, confirmed)
     }
 
     @MainActor func testIncrementalChangesKeepRevisionsMonotonicAndApplyDeletion() throws {
@@ -73,6 +164,38 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
             item: MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 5,
                                           body: .object(["content": .string("restored")])), to: &objects)
         XCTAssertEqual(objects["memory"]?["global"]?.revision, 5)
+    }
+
+    @MainActor func testDuplicateAndOutOfOrderIncrementalChangesAreIdempotent() throws {
+        let previous = MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 4,
+                                                 body: .object(["content": .string("previous")]))
+        var objects = ["memory": ["global": previous]]
+
+        let latestChange = MordePersonalChange(change_sequence: 12, object_type: "memory", object_id: "global",
+            revision: 5, operation: "upsert", mutation_id: "mutation-latest-001")
+        let latestItem = MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 5,
+            body: .object(["content": .string("latest")]))
+        try NanoMuseMordePersonalContentStore.apply(latestChange, item: latestItem, to: &objects)
+        XCTAssertEqual(objects["memory"]?["global"], latestItem)
+
+        let outOfOrderChange = MordePersonalChange(change_sequence: 11, object_type: "memory", object_id: "global",
+            revision: 4, operation: "upsert", mutation_id: "mutation-previous-001")
+        try NanoMuseMordePersonalContentStore.apply(outOfOrderChange, item: previous, to: &objects)
+        XCTAssertEqual(objects["memory"]?["global"], latestItem)
+
+        try NanoMuseMordePersonalContentStore.apply(latestChange, item: latestItem, to: &objects)
+        XCTAssertEqual(objects["memory"]?["global"], latestItem)
+
+        let staleDelete = MordePersonalChange(change_sequence: 10, object_type: "memory", object_id: "global",
+            revision: 4, operation: "delete", mutation_id: "mutation-stale-delete-001")
+        try NanoMuseMordePersonalContentStore.apply(staleDelete, item: nil, to: &objects)
+        XCTAssertEqual(objects["memory"]?["global"], latestItem)
+
+        let duplicateDelete = MordePersonalChange(change_sequence: 13, object_type: "memory", object_id: "global",
+            revision: 6, operation: "delete", mutation_id: "mutation-delete-001")
+        try NanoMuseMordePersonalContentStore.apply(duplicateDelete, item: nil, to: &objects)
+        try NanoMuseMordePersonalContentStore.apply(duplicateDelete, item: nil, to: &objects)
+        XCTAssertNil(objects["memory"]?["global"])
     }
 
     @MainActor func testIncrementalUpsertRejectsMismatchedObjectIdentity() {
@@ -121,6 +244,34 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         try NanoMuseMordePersonalDataOutbox.acknowledge(scopeKey: scopeA, mutationID: first.mutationID, root: root)
         XCTAssertNil(try NanoMuseMordePersonalDataOutbox.load(scopeKey: scopeA, root: root))
         XCTAssertEqual(try NanoMuseMordePersonalDataOutbox.load(scopeKey: scopeB, root: root), otherAccount)
+    }
+
+    func testGenericOutboxIsolatedByServiceInstanceForSameAccount() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let accountA = try XCTUnwrap(MordeClientDataScope(
+            serviceOrigin: "https://morde.example",
+            serviceInstanceID: "00000000-0000-0000-0000-000000000001",
+            accountID: "user-1", installationID: "personal-data-v1"))
+        let accountB = try XCTUnwrap(MordeClientDataScope(
+            serviceOrigin: "https://morde.example",
+            serviceInstanceID: "00000000-0000-0000-0000-000000000002",
+            accountID: "user-1", installationID: "personal-data-v1"))
+        XCTAssertNotEqual(accountA.storageKey, accountB.storageKey)
+
+        let mutationA = mutation(scopeKey: accountA.storageKey, mutationID: "mutation-instance-001",
+                                 content: "service A")
+        try NanoMuseMordePersonalDataOutbox.enqueue(mutationA, scopeKey: accountA.storageKey, root: root)
+
+        XCTAssertEqual(try NanoMuseMordePersonalDataOutbox.load(scopeKey: accountA.storageKey, root: root), mutationA)
+        XCTAssertNil(try NanoMuseMordePersonalDataOutbox.load(scopeKey: accountB.storageKey, root: root))
+        try NanoMuseMordePersonalDataOutbox.acknowledge(
+            scopeKey: accountB.storageKey, mutationID: mutationA.mutationID, root: root)
+        XCTAssertEqual(try NanoMuseMordePersonalDataOutbox.load(scopeKey: accountA.storageKey, root: root), mutationA)
+
+        try NanoMuseMordePersonalDataOutbox.acknowledge(
+            scopeKey: accountA.storageKey, mutationID: mutationA.mutationID, root: root)
+        XCTAssertNil(try NanoMuseMordePersonalDataOutbox.load(scopeKey: accountA.storageKey, root: root))
     }
 
     func testGenericOutboxEnforcesSerializedSizeLimit() throws {

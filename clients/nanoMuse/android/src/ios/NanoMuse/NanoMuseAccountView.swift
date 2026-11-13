@@ -586,6 +586,13 @@ enum NanoMuseMordeProfileRefreshPolicy {
                             baselineDraft: NanoMuseMordeProfileDraft) -> Bool {
         remoteRevision > currentRevision && (currentDraft == baselineDraft || currentDraft == remoteDraft)
     }
+
+    static func shouldResetForMissingCloudProfile(hasConfirmedSnapshot: Bool, isLoading: Bool, error: String?,
+                                                   discardingDraft: Bool,
+                                                   currentDraft: NanoMuseMordeProfileDraft,
+                                                   baselineDraft: NanoMuseMordeProfileDraft) -> Bool {
+        hasConfirmedSnapshot && !isLoading && error == nil && (discardingDraft || currentDraft == baselineDraft)
+    }
 }
 
 struct NanoMuseMordeProfileView: View {
@@ -636,12 +643,17 @@ struct NanoMuseMordeProfileView: View {
                 }
             }
             Section {
-                if isLoading { ProgressView(AppLocalized("Loading Morde profile…")) }
+                if isLoading || personal.isLoading { ProgressView(AppLocalized("Loading Morde profile…")) }
                 else { Button(AppLocalized("Reload cloud profile")) { requestReload() } }
                 if remoteProfileChanged {
                     Label(AppLocalized("Cloud profile changed. Your unsaved edits are preserved."), systemImage: "arrow.triangle.2.circlepath")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+                if let refreshError = personal.error {
+                    Label(refreshError, systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
                 }
                 if sync.pending != nil {
                     Label(sync.syncEnabled ? AppLocalized("Profile change is waiting to sync.") : AppLocalized("Sync is paused; this profile change stays on this device."), systemImage: "clock")
@@ -659,7 +671,7 @@ struct NanoMuseMordeProfileView: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button(AppLocalized("Save")) { save() }
-                    .disabled(isLoading || isSaving || !authorization.signedIn || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(isLoading || personal.isLoading || isSaving || !authorization.signedIn || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .task(id: authorization.personalDataScopeKey) { await load() }
@@ -723,9 +735,10 @@ struct NanoMuseMordeProfileView: View {
         if let object = cloudProfile {
             observedProfileObject = object
             applyCloudProfile(object, discardingDraft: discardingDraft)
-        } else if let refreshError = personal.error {
-            error = refreshError
-        } else if discardingDraft || revision == 0 {
+        } else if NanoMuseMordeProfileRefreshPolicy.shouldResetForMissingCloudProfile(
+            hasConfirmedSnapshot: personal.hasConfirmedSnapshot(scopeKey: scope),
+            isLoading: personal.isLoading, error: personal.error, discardingDraft: discardingDraft,
+            currentDraft: currentDraft, baselineDraft: baselineDraft) {
             name = "Muse"
             description = ""
             style = "muse"

@@ -161,9 +161,10 @@ type SiteStorage struct {
 }
 
 type Models struct {
-	AllowedHosts []string           `yaml:"allowed_hosts"`
-	ProxyURL     string             `yaml:"proxy_url"`
-	ProjectRates []ProjectModelRate `yaml:"project_rates"`
+	AllowedHosts         []string           `yaml:"allowed_hosts"`
+	ProxyURL             string             `yaml:"proxy_url"`
+	ProjectRates         []ProjectModelRate `yaml:"project_rates"`
+	GPT6LunaMaxReasoning bool               `yaml:"gpt6_luna_max_reasoning"`
 }
 
 type ProjectModelRate struct {
