@@ -563,13 +563,20 @@ func (s *Store) ListMessages(ctx context.Context, ownerID, conversationID string
 		}
 	}
 	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,m.task_id,m.created_at,m.model_id,m.source_kind,
-m.source_exchange_id,m.requested_conversation_id,m.sequence,m.delivery_status,m.actor_id,
-COALESCE(r.client_message_id,''),COALESCE(r.state,''),COALESCE(r.failure_reason,''),
+m.source_exchange_id,m.requested_conversation_id,m.sequence,
+CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,m.actor_id,
+COALESCE(r.client_message_id,''),COALESCE(r.duplicate_of_message_id,''),
+CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN COALESCE(original_message.task_id,'') ELSE '' END,
+COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
   AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
 ) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence
 FROM conversation_messages m LEFT JOIN conversation_message_routes r ON r.message_id=m.id
+LEFT JOIN conversation_message_routes original_route ON original_route.service_instance_id=r.service_instance_id
+ AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
+ AND original_route.message_id=r.duplicate_of_message_id
+LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
 WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.source_kind<>'task_result_review'
   AND ($3::bigint=0 OR m.sequence<$3::bigint)
 ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
@@ -579,12 +586,12 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var deliveryStatus, clientID, routingStatus, routingFailure string
+		var deliveryStatus, clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &routingStatus, &routingFailure,
+			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
 			&outputStatus, &outputRevision, &outputEvent); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan conversation message: %w", err)
@@ -592,6 +599,8 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		message := messageDomain(row)
 		message.DeliveryStatus = conversation.DeliveryStatus(deliveryStatus)
 		message.ClientMessageID = clientID
+		message.DuplicateOfMessageID = duplicateID
+		message.RelatedTaskID = relatedTaskID
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
@@ -636,8 +645,12 @@ func (s *Store) ListProjectConversationMessages(ctx context.Context, actorID, pr
 		}
 	}
 	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,m.task_id,m.created_at,m.model_id,m.source_kind,
-m.source_exchange_id,m.requested_conversation_id,m.sequence,m.delivery_status,m.actor_id,
-CASE WHEN r.actor_id=$2 THEN COALESCE(r.client_message_id,'') ELSE '' END,COALESCE(r.state,''),COALESCE(r.failure_reason,''),
+m.source_exchange_id,m.requested_conversation_id,m.sequence,
+CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,m.actor_id,
+CASE WHEN r.actor_id=$2 THEN COALESCE(r.client_message_id,'') ELSE '' END,
+CASE WHEN r.actor_id=$2 THEN COALESCE(r.duplicate_of_message_id,'') ELSE '' END,
+CASE WHEN r.actor_id=$2 AND r.duplicate_of_message_id IS NOT NULL THEN COALESCE(original_message.task_id,'') ELSE '' END,
+COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
   AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
@@ -647,6 +660,10 @@ JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.p
 JOIN project_members pm ON pm.project_id=c.project_id AND pm.user_id=$2
 JOIN users u ON u.id=pm.user_id AND u.status='approved'
 LEFT JOIN conversation_message_routes r ON r.message_id=m.id
+LEFT JOIN conversation_message_routes original_route ON original_route.service_instance_id=r.service_instance_id
+ AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
+ AND original_route.message_id=r.duplicate_of_message_id
+LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
 WHERE m.conversation_id=$3 AND m.source_kind<>'task_result_review'
   AND ($4::bigint=0 OR m.sequence<$4::bigint)
 ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, limit+1)
@@ -656,12 +673,12 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var clientID, routingStatus, routingFailure string
+		var clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &routingStatus, &routingFailure,
+			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
 			&outputStatus, &outputRevision, &outputEvent); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan project conversation message: %w", err)
@@ -669,6 +686,8 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		message := messageDomain(row)
 		message.DeliveryStatus = conversation.DeliveryStatus(row.DeliveryStatus)
 		message.ClientMessageID = clientID
+		message.DuplicateOfMessageID = duplicateID
+		message.RelatedTaskID = relatedTaskID
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)

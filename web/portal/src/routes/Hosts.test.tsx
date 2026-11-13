@@ -33,22 +33,24 @@ const userControl = (control_version: number) => ({
   control_lease_expires_at: '2026-11-02T00:00:30.000Z', control_lease_active: true, control_lease_held_by_me: true, active_transition: null,
 });
 async function openMoreActions(user: ReturnType<typeof userEvent.setup>, host: Pick<Host, 'id' | 'name'>) {
-  await openHostDetails(user, host.id);
-  const card = document.getElementById(`host-${host.id}`);
-  if (!card) throw new Error(`Host card ${host.id} is not rendered`);
-  const summary = within(card).getByText('更多操作', { selector: 'summary' });
+  const card = await waitFor(() => {
+    const item = document.getElementById(`host-${host.id}`);
+    if (!item) throw new Error(`Host card ${host.id} is not rendered`);
+    return item;
+  });
+  const summary = within(card).queryByText('更多操作', { selector: 'summary' })
+    ?? within(card).getByText('查看控制权状态', { selector: 'summary' });
   if (!summary.parentElement?.hasAttribute('open')) await user.click(summary);
 }
 
 async function openHostDetails(user: ReturnType<typeof userEvent.setup>, hostID: string) {
-  const card = await waitFor(() => {
-    const item = document.getElementById(`host-${hostID}`);
-    if (!item) throw new Error(`Host card ${hostID} is not rendered`);
-    return item;
-  });
-  const disclosure = card.querySelector<HTMLDetailsElement>('.host-secondary-details');
-  const summary = disclosure?.querySelector('summary');
-  if (summary && !disclosure?.open) await user.click(summary);
+  await openMoreActions(user, { id: hostID, name: '' });
+  const card = document.getElementById(`host-${hostID}`);
+  if (!card) throw new Error(`Host card ${hostID} is not rendered`);
+  const toggle = within(card).queryByRole('button', { name: /详情与管理/ });
+  if (toggle?.getAttribute('aria-expanded') !== 'true') {
+    if (toggle) await user.click(toggle);
+  }
 }
 
 describe('Hosts', () => {
@@ -174,11 +176,12 @@ describe('Hosts', () => {
     const card = document.getElementById(`host-${ownedHost.id}`)!;
     expect(card).toHaveClass('host-card-compact');
     expect(viewButton).toBeVisible();
-    expect(within(card).getByText('资源、文件与管理', { selector: 'summary' })).toBeVisible();
-    expect(within(card).queryByText('运行状态')).toBeNull();
+    expect(within(card).getByText('更多操作', { selector: 'summary' })).toBeVisible();
+    expect(within(card).getByRole('button', { name: '详情与管理' })).toHaveAttribute('aria-expanded', 'false');
     expect(document.querySelector('.hosts-pagination')).toBeInTheDocument();
 
     await openHostDetails(user, ownedHost.id);
+    expect(document.getElementById(`host-details-${ownedHost.id}`)).toBeVisible();
     expect(await within(card).findByText('运行状态')).toBeVisible();
     expect(within(card).getByText('旧数据迁移状态未知')).toBeVisible();
     expect(within(card).getByRole('button', { name: /管理共享成员/ })).toBeVisible();
@@ -257,6 +260,7 @@ describe('Hosts', () => {
     expect(screen.getByRole('button', { name: '查看云端电脑 工作区版本未同步主机' })).toBeDisabled();
     expect(screen.getByText('云端电脑的文件正在准备、同步或存在冲突；打开和移交操作暂不可用。')).toBeInTheDocument();
     expect(screen.getAllByText(/请先关联并准备好这台电脑的文件/)).toHaveLength(3);
+    await openHostDetails(user, stoppedHost.id);
     await openMoreActions(user, stoppedHost);
     expect(screen.getByRole('button', { name: '恢复云端电脑 未绑定已停止主机' })).toBeDisabled();
     expect(screen.getByLabelText('恢复前关联已有云端文件')).toBeInTheDocument();

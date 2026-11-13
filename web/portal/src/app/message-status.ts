@@ -11,6 +11,12 @@ export function routingStatusText(status: ConversationMessage['routing_status'])
   return null;
 }
 
+/** Keep routine routing receipts out of the user bubble; Task cards show actionable Task state separately. */
+export function userVisibleRoutingStatusText(status: ConversationMessage['routing_status']): string | null {
+  if (status === 'waiting_adjustment') return '已收到修改，正在更新任务';
+  return null;
+}
+
 export function deliveryStatusText(status: ConversationMessage['delivery_status'] | undefined): string {
   if (status === 'pending') return '已发送，等待处理';
   if (status === 'applied') return '已发送';

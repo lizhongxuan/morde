@@ -227,6 +227,7 @@ type CloudDSHExecutorOptions struct {
 	ProjectContexts  CloudDSHProjectContexts
 	StreamCapability CloudDSHTextStreamingCapability
 	TextStreams      CloudDSHTextStreamStore
+	AgentActivity    app.TaskAgentActivityRecorder
 	RevisionStops    CloudDSHRevisionStopWitness
 	Tools            CloudDSHTools
 	Children         CloudDSHChildSessions
@@ -652,23 +653,24 @@ type cloudDSHIdentity struct {
 type cloudDSHFrame struct {
 	Type string `json:"type"`
 	cloudDSHIdentity
-	Version   int             `json:"version,omitempty"`
-	Engine    string          `json:"engine,omitempty"`
-	EngineVer string          `json:"engine_version,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	From      *int64          `json:"from_seq,omitempty"`
-	Through   *int64          `json:"through_seq,omitempty"`
-	Payload   string          `json:"payload,omitempty"`
-	SHA256    string          `json:"sha256,omitempty"`
-	Request   json.RawMessage `json:"request,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments json.RawMessage `json:"arguments,omitempty"`
-	State     string          `json:"state,omitempty"`
-	Status    string          `json:"status,omitempty"`
-	Code      string          `json:"code,omitempty"`
-	Summary   string          `json:"summary,omitempty"`
-	JobID     string          `json:"job_id,omitempty"`
+	Version             int             `json:"version,omitempty"`
+	Engine              string          `json:"engine,omitempty"`
+	EngineVer           string          `json:"engine_version,omitempty"`
+	ID                  string          `json:"id,omitempty"`
+	From                *int64          `json:"from_seq,omitempty"`
+	Through             *int64          `json:"through_seq,omitempty"`
+	ObservationSequence *int64          `json:"observation_sequence,omitempty"`
+	Payload             string          `json:"payload,omitempty"`
+	SHA256              string          `json:"sha256,omitempty"`
+	Request             json.RawMessage `json:"request,omitempty"`
+	CallID              string          `json:"call_id,omitempty"`
+	Name                string          `json:"name,omitempty"`
+	Arguments           json.RawMessage `json:"arguments,omitempty"`
+	State               string          `json:"state,omitempty"`
+	Status              string          `json:"status,omitempty"`
+	Code                string          `json:"code,omitempty"`
+	Summary             string          `json:"summary,omitempty"`
+	JobID               string          `json:"job_id,omitempty"`
 }
 
 type cloudDSHRead struct {
@@ -733,6 +735,7 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 	}
 	fields := map[string][]string{
 		"ready":             {"type", "version", "engine", "engine_version"},
+		"agent_status":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "status", "observation_sequence"},
 		"checkpoint":        {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
 		"checkpoint_read":   {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
 		"model":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},

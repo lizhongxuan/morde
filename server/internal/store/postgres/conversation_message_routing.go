@@ -140,14 +140,23 @@ func loadConversationReceipt(ctx context.Context, tx pgx.Tx, actorID, conversati
 	var role, delivery, routing, instanceID, routingFailure, projectID string
 	var hash []byte
 	err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,
-COALESCE(m.task_id,''),m.model_id,m.sequence,m.delivery_status,m.created_at,r.client_message_id,r.state,r.request_hash,r.service_instance_id::text,r.failure_reason,COALESCE(c.project_id,'')
+COALESCE(m.task_id,''),m.model_id,m.sequence,
+CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,
+m.created_at,r.client_message_id,COALESCE(original_route.state,r.state),r.request_hash,r.service_instance_id::text,
+COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(c.project_id,''),
+COALESCE(r.duplicate_of_message_id,''),COALESCE(original_message.task_id,'')
 FROM conversation_message_routes r
 JOIN service_identity i ON i.instance_id=r.service_instance_id AND i.singleton=true
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.conversation_id=r.conversation_id
 JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id
+LEFT JOIN conversation_message_routes original_route ON original_route.service_instance_id=r.service_instance_id
+ AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
+ AND original_route.message_id=r.duplicate_of_message_id
+LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
 WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorID, conversationID, clientID).Scan(
 		&value.ID, &value.ConversationID, &value.OwnerID, &value.ActorID, &role, &value.Content, &value.TaskID,
-		&value.ModelID, &value.Sequence, &delivery, &value.CreatedAt, &value.ClientMessageID, &routing, &hash, &instanceID, &routingFailure, &projectID)
+		&value.ModelID, &value.Sequence, &delivery, &value.CreatedAt, &value.ClientMessageID, &routing, &hash, &instanceID, &routingFailure, &projectID,
+		&value.DuplicateOfMessageID, &value.RelatedTaskID)
 	if err != nil {
 		return conversation.Message{}, nil, err
 	}
@@ -182,18 +191,25 @@ func (s *Store) FindConversationMessageByClientID(ctx context.Context, actorID, 
 			}
 		}
 		err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,
-COALESCE(m.task_id,''),m.model_id,m.sequence,m.delivery_status,m.created_at,r.client_message_id,r.state,r.failure_reason
+COALESCE(m.task_id,''),m.model_id,m.sequence,
+CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,
+m.created_at,r.client_message_id,COALESCE(r.duplicate_of_message_id,''),COALESCE(original_message.task_id,''),
+COALESCE(original_route.state,r.state),COALESCE(original_route.failure_reason,r.failure_reason)
 FROM conversation_message_routes r
 JOIN service_identity i ON i.instance_id=r.service_instance_id AND i.singleton=true
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.conversation_id=r.conversation_id
 JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id
+LEFT JOIN conversation_message_routes original_route ON original_route.service_instance_id=r.service_instance_id
+ AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
+ AND original_route.message_id=r.duplicate_of_message_id
+LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
 JOIN users u ON u.id=$1 AND u.status='approved'
 WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.archived_at IS NULL
   AND (($2='' AND c.project_id IS NULL AND c.owner_id=$1) OR
        ($2<>'' AND c.project_id=$2 AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.user_id=$1)))`,
 			actorID, projectID, conversationID, clientID).Scan(&value.ID, &value.ConversationID, &value.OwnerID,
 			&value.ActorID, &role, &value.Content, &value.TaskID, &value.ModelID, &value.Sequence, &delivery,
-			&value.CreatedAt, &value.ClientMessageID, &routing, &routingFailure)
+			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

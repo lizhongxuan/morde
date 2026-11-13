@@ -1,4 +1,9 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator } from "@playwright/test";
+
+async function openHostActions(host: Locator) {
+  const menu = host.locator(".host-more-actions");
+  if (!await menu.evaluate((element) => (element as HTMLDetailsElement).open)) await menu.locator("summary").click();
+}
 
 function isLocalUrl(value: string): boolean {
   try {
@@ -52,14 +57,14 @@ test.describe("portal mock flow", () => {
     await expect(page.locator("#main-content")).toBeFocused();
 
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "云端电脑", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "我的电脑", exact: true })).toBeVisible();
     const quotaStatus = await page.evaluate(async () => (await fetch('/api/admin/users/u1a2b3c4', {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ expected_status: 'approved', quota: { hosts: 3, cpu_milli: 4000, mem_mib: 8192 } }),
     })).status);
     expect(quotaStatus).toBe(200);
     await page.reload();
-    await page.context().route('https://workbench.mock.invalid/**', (route) => route.fulfill({
+    await page.context().route("**/__ch/auth*", (route) => route.fulfill({
       status: 200, contentType: 'text/html', body: '<!doctype html><meta charset="utf-8"><h1>本地测试主机</h1>',
     }));
 
@@ -72,17 +77,6 @@ test.describe("portal mock flow", () => {
     const createRequestPromise = page.waitForRequest((request) =>
       request.url() === new URL("/api/hosts", process.env.CH_PORTAL_E2E_URL ?? "http://127.0.0.1:5183").href && request.method() === "POST",
     );
-    await page.evaluate(() => {
-      const target = window as typeof window & { postCreateClicks?: number };
-      target.postCreateClicks = 0;
-      document.addEventListener(
-        "click",
-        () => {
-          target.postCreateClicks = (target.postCreateClicks ?? 0) + 1;
-        },
-        true,
-      );
-    });
     const createHost = page.getByRole("button", { name: "创建云端电脑" });
     await createHost.focus();
     await page.keyboard.press("Enter");
@@ -90,14 +84,22 @@ test.describe("portal mock flow", () => {
     expect(createRequest.headers()["idempotency-key"]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
     const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: "Playwright 本地验收", exact: true }) });
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
+    await page.evaluate(() => {
+      const target = window as typeof window & { postCreateClicks?: number };
+      target.postCreateClicks = 0;
+      document.addEventListener("click", () => { target.postCreateClicks = (target.postCreateClicks ?? 0) + 1; }, true);
+    });
 
+    await openHostActions(host);
     const popupPromise = page.waitForEvent("popup");
+    const hostID = (await host.getAttribute("id"))!.replace(/^host-/, "");
+    const hostOrigin = await page.evaluate(async (id) => new URL((await (await fetch(`/api/hosts/${id}`)).json()).url).origin, hostID);
     const enter = host.getByRole("button", { name: "查看云端电脑 Playwright 本地验收" });
     await enter.focus();
     await page.keyboard.press("Enter");
     const popup = await popupPromise;
     await expect(popup.getByRole("heading", { name: "本地测试主机" })).toBeVisible();
-    expect(new URL(popup.url()).origin).toBe("https://workbench.mock.invalid");
+    expect(new URL(popup.url()).origin).toBe(hostOrigin);
     const postCreateClicks = await page.evaluate(
       () => (window as typeof window & { postCreateClicks?: number }).postCreateClicks ?? 0,
     );
@@ -136,8 +138,10 @@ test.describe("portal mock flow", () => {
     const source = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: sourceName, exact: true }) });
     await expect(source.getByText("运行中")).toBeVisible({ timeout: 10_000 });
 
+    await openHostActions(source);
     await source.getByRole("button", { name: `释放运行资源 ${sourceName}` }).click();
     await page.getByRole("dialog").getByRole("button", { name: "释放运行资源" }).click();
+    await openHostActions(source);
     const copyButton = source.getByRole("button", { name: `复制云端电脑 ${sourceName}` });
     await expect(copyButton).toBeEnabled({ timeout: 10_000 });
     await copyButton.click();
@@ -153,7 +157,12 @@ test.describe("portal mock flow", () => {
     const copyRequest = await copyRequestPromise;
     expect(copyRequest.headers()["idempotency-key"]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
     expect(copyRequest.postDataJSON()).toMatchObject({ name: copyName, expected_current_revision: 2 });
-    await expect(page.locator(".host-card").filter({ has: page.getByRole("heading", { name: copyName, exact: true }) })).toBeVisible();
+    await expect(page.getByText(`已创建云端电脑“${copyName}”`)).toBeVisible();
+    const createdHost = await page.evaluate(async (name) => {
+      const response = await fetch("/api/hosts").then((result) => result.json()) as { items: Array<{ name: string }> };
+      return response.items.find((host) => host.name === name);
+    }, copyName);
+    expect(createdHost).toBeTruthy();
   });
 
   test("creates and revokes an API Key through the contracted endpoint", async ({ page }) => {
@@ -166,8 +175,6 @@ test.describe("portal mock flow", () => {
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
-    await page.getByRole("link", { name: "对话", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
     await page.getByRole("link", { name: "API Key", exact: true }).click();
     await page.getByRole("button", { name: "＋ 创建 API Key" }).click();
     await page.getByLabel("名称").fill("门户吊销验收");
@@ -177,13 +184,13 @@ test.describe("portal mock flow", () => {
     await expect(secretDialog.getByLabel("凭证")).toHaveValue("chk_mock-one-time-key");
     await secretDialog.getByRole("button", { name: "关闭并清除" }).click();
     await expect(secretDialog).toHaveCount(0);
-    await expect(page.getByRole("row").filter({ hasText: "门户吊销验收" })).toBeVisible();
+    const apiKeyCard = page.getByRole("article", { name: "API Key 门户吊销验收" });
+    await expect(apiKeyCard).toBeVisible();
     await expect(page.getByText("chk_mock-one-time-key", { exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "吊销 API Key 门户吊销验收" }).click();
     await page.getByRole("dialog").getByRole("button", { name: "吊销 Key" }).click();
-    const revokedRow = page.getByRole("row").filter({ hasText: "门户吊销验收" });
-    await expect(revokedRow.getByText("已吊销")).toBeVisible();
-    await expect(revokedRow.getByRole("button", { name: "吊销 API Key 门户吊销验收" })).toHaveCount(0);
+    await expect(apiKeyCard.getByText("已吊销")).toBeVisible();
+    await expect(apiKeyCard.getByRole("button", { name: "吊销 API Key 门户吊销验收" })).toHaveCount(0);
 
     expect(deletePaths).toHaveLength(1);
     expect(deletePaths[0]).toMatch(/^\/api\/apikeys\//);
@@ -195,7 +202,7 @@ test.describe("portal mock flow", () => {
     await page.getByLabel("密码").fill("member");
     await page.getByRole("button", { name: "登录" }).click();
     await page.getByRole("link", { name: "对话", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
+    await expect(page.getByRole("complementary", { name: "对话" })).toBeVisible();
     await expect(page.getByRole("link", { name: "管理后台" })).toHaveCount(0);
     await page.goto("/admin/users");
     await expect(page.getByRole("heading", { name: "没有管理权限" })).toBeVisible();
@@ -232,7 +239,7 @@ test("real single-host flow creates, uses, and cleans up only its own host", asy
   await page.getByLabel("密码").fill(process.env.CH_PASSWORD!);
   await page.getByRole("button", { name: "登录" }).click();
   await page.getByRole("link", { name: "对话", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "对话" })).toBeVisible();
 
   try {
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();

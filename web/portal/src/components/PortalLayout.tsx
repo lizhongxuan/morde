@@ -7,14 +7,15 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { MordeIcon, type MordeIconName } from './MordeIcon';
 
 const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
+  { to: '/hosts', label: '云端电脑', icon: 'monitor' },
   { to: '/assistant', label: '对话', icon: 'spark' },
+  { to: '/projects', label: '项目', icon: 'folder' },
   { to: '/personal', label: '个人数据', icon: 'user' },
   { to: '/goals', label: '目标与计划', icon: 'target' },
 ];
 
 const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
   { to: '/connections', label: '模型与工具', icon: 'link' },
-  { to: '/hosts', label: '云端电脑', icon: 'monitor' },
   { to: '/clients', label: '客户端', icon: 'panel' },
   { to: '/apikeys', label: 'API Key', icon: 'key' },
   { to: '/settings', label: '账户', icon: 'user' },
@@ -80,9 +81,6 @@ const pageNavigationFor = (pathname: string): PageNavigation | null => {
       { label: '定时计划', icon: 'refresh', to: '/goals?view=schedules', query: ['view', 'schedules'] },
     ],
   };
-  if (pathname === '/connections' || pathname === '/hosts' || pathname.startsWith('/hosts/') || pathname === '/clients' || pathname === '/apikeys' || pathname === '/settings') return {
-    title: '设置', items: settingLinks,
-  };
   return null;
 };
 
@@ -132,7 +130,12 @@ export function PortalLayout() {
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">
-        {primaryLinks.map(({ to, label, icon, end }) => <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
+        <span className="morde-nav-heading">工作</span>
+        {primaryLinks.filter(({ to }) => to !== '/projects' || user?.role === 'user').map(({ to, label, icon, end }) => <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
+      </nav>
+      <nav className="morde-navigation" aria-label="设置导航">
+        <span className="morde-nav-heading morde-nav-heading-spaced">设置与授权</span>
+        {settingLinks.map(({ to, label, icon }) => <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
       </nav>
       <div className="morde-sidebar-bottom">
         <div className="morde-profile">
@@ -140,7 +143,7 @@ export function PortalLayout() {
             <summary className="morde-avatar" aria-label="账号菜单" title="账号菜单">{user?.name.slice(0, 1) || 'M'}</summary>
             <div className="morde-account-menu-popover">
               <strong>{user?.name}</strong><small>PC 用户端</small>
-              <NavLink to="/connections" className="morde-account-menu-action" aria-label="设置" title="设置"><MordeIcon name="settings" />设置</NavLink>
+              <NavLink to="/settings" className="morde-account-menu-action" aria-label="账户设置" title="账户设置"><MordeIcon name="settings" />账户设置</NavLink>
               {(user?.role === 'admin' || user?.role === 'super_admin') && <a className="morde-account-menu-action" href="/admin/" aria-label="切换至管理后台"><MordeIcon name="link" />切换至管理后台</a>}
               <button className="morde-account-menu-action morde-profile-logout" type="button" onClick={() => setLogoutConfirmationOpen(true)} aria-label="退出登录" title="退出登录"><MordeIcon name="logout" />退出登录</button>
             </div>

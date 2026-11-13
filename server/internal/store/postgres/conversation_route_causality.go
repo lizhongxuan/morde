@@ -42,9 +42,14 @@ WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.c
 			return nil
 		}
 		var state string
+		attempt := claim.RouteAttempt
+		if claim.Input.ResultReviewID != "" {
+			attempt = 0
+		}
 		err := tx.QueryRow(ctx, `SELECT state FROM conversation_route_model_calls
-WHERE message_id=$1 AND actor_id=$2 AND state IN ('reserved','dispatched','unknown') FOR UPDATE`,
-			claim.Message.ID, claim.Message.ActorID).Scan(&state)
+WHERE message_id=$1 AND actor_id=$2 AND (state IN ('reserved','dispatched') OR (state='unknown' AND attempt=$3))
+ORDER BY (state IN ('reserved','dispatched')) DESC,updated_at DESC LIMIT 1 FOR UPDATE`,
+			claim.Message.ID, claim.Message.ActorID, attempt).Scan(&state)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("lock predecessor route model call: %w", err)
 		}
@@ -56,15 +61,21 @@ WHERE message_id=$1 AND actor_id=$2 AND state IN ('reserved','dispatched','unkno
 				return err
 			}
 		}
-		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='pending',lease_owner='',lease_expires_at=NULL,
-available_after=clock_timestamp(),failure_reason='',updated_at=clock_timestamp()
-WHERE message_id=$1 AND state='processing' AND lease_owner=$2 AND lease_version=$3 AND lease_expires_at>clock_timestamp()`,
-			claim.Message.ID, claim.LeaseOwner, claim.LeaseVersion)
+		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='pending',route_attempt=route_attempt+1,
+lease_owner='',lease_expires_at=NULL,available_after=clock_timestamp(),failure_reason='',updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5
+ AND state='processing' AND lease_owner=$6 AND lease_version=$7 AND route_attempt=$8
+ AND route_attempt<9223372036854775807 AND lease_expires_at>clock_timestamp()`,
+			claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID,
+			claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt)
 		if err != nil {
 			return fmt.Errorf("requeue arrived predecessor route: %w", err)
 		}
 		if result.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "conversation route lease is no longer current")
+		}
+		if err := syncConversationDuplicateMessages(ctx, tx, claim.Message.ID); err != nil {
+			return err
 		}
 		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
 			ObjectType: "message", ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID}); err != nil {

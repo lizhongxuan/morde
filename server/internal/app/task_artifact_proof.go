@@ -1,11 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/workspace"
@@ -44,9 +47,37 @@ func (s *WorkspaceSyncService) VerifyLatestCommittedArtifact(ctx context.Context
 // and actually reads all referenced blocks. The caller must independently bind
 // these facts to the authorized Task and step in its completion transaction.
 func (s *WorkspaceSyncService) VerifyCommittedArtifact(ctx context.Context, expected TaskArtifactProof) (proof TaskArtifactProof, retErr error) {
-	if ctx == nil || !domain.ValidUserID(expected.OwnerID) || !domain.ValidWorkspaceID(expected.WorkspaceID) ||
-		expected.Revision < 0 || expected.SizeBytes < 0 || !validSyncDigest(expected.SHA256) ||
-		workspace.ValidateRelativePath(expected.Path) != nil {
+	return s.writeCommittedArtifact(ctx, expected, io.Discard)
+}
+
+// OpenCommittedArtifact verifies a pinned artifact into a private temporary file
+// before exposing any bytes to the client.
+func (s *WorkspaceSyncService) OpenCommittedArtifact(ctx context.Context, expected TaskArtifactProof) (io.ReadSeekCloser, error) {
+	if expected.SizeBytes > workspace.MaxSyncFileBytes {
+		return nil, domain.NewError(domain.CodeResultTooLarge, "workspace artifact exceeds the download limit")
+	}
+	file, err := os.CreateTemp("", "morde-task-artifact-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("create private task artifact spool: %w", err)
+	}
+	path := file.Name()
+	cleanup := func(cause error) error {
+		return errors.Join(cause, file.Close(), os.Remove(path))
+	}
+	if _, err := s.writeCommittedArtifact(ctx, expected, file); err != nil {
+		return nil, cleanup(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, cleanup(fmt.Errorf("rewind verified task artifact: %w", err))
+	}
+	return &taskArtifactTempFile{File: file, path: path}, nil
+}
+
+func (s *WorkspaceSyncService) writeCommittedArtifact(ctx context.Context, expected TaskArtifactProof, dst io.Writer) (proof TaskArtifactProof, retErr error) {
+	if ctx == nil || dst == nil || s == nil || s.store == nil || s.blocks == nil ||
+		!domain.ValidUserID(expected.OwnerID) || !domain.ValidWorkspaceID(expected.WorkspaceID) ||
+		expected.Revision < 0 || expected.SizeBytes < 0 || expected.SizeBytes > workspace.MaxSyncFileBytes ||
+		!validSyncDigest(expected.SHA256) || workspace.ValidateRelativePath(expected.Path) != nil {
 		return TaskArtifactProof{}, domain.InvalidArgument("artifact", "workspace artifact proof is invalid")
 	}
 	if err := ctx.Err(); err != nil {
@@ -112,6 +143,12 @@ func (s *WorkspaceSyncService) VerifyCommittedArtifact(ctx context.Context, expe
 		if err := ctx.Err(); err != nil {
 			return TaskArtifactProof{}, err
 		}
+		if int64(len(data)) > expected.SizeBytes-total {
+			return TaskArtifactProof{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace artifact content exceeds its manifest size")
+		}
+		if _, err := io.Copy(dst, bytes.NewReader(data)); err != nil {
+			return TaskArtifactProof{}, fmt.Errorf("spool verified workspace artifact block: %w", err)
+		}
 		_, _ = hasher.Write(data)
 		total += int64(len(data))
 	}
@@ -122,4 +159,13 @@ func (s *WorkspaceSyncService) VerifyCommittedArtifact(ctx context.Context, expe
 		return TaskArtifactProof{}, err
 	}
 	return expected, nil
+}
+
+type taskArtifactTempFile struct {
+	*os.File
+	path string
+}
+
+func (f *taskArtifactTempFile) Close() error {
+	return errors.Join(f.File.Close(), os.Remove(f.path))
 }

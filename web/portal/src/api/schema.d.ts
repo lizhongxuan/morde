@@ -2625,7 +2625,7 @@ export interface paths {
         put?: never;
         /**
          * Retry processing of an accepted failed message
-         * @description Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+         * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryProjectConversationMessageProcessing"];
         delete?: never;
@@ -3305,7 +3305,7 @@ export interface paths {
         put?: never;
         /**
          * Retry processing of an accepted failed message
-         * @description Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+         * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryConversationMessageProcessing"];
         delete?: never;
@@ -3452,6 +3452,49 @@ export interface paths {
         };
         /** Get an owned task and its durable progress */
         get: operations["getTask"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/artifacts/{artifact_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                artifact_id: components["schemas"]["ArtifactId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download a verified Task artifact from its pinned Workspace revision
+         * @description Portal Session only. Returns bytes only after re-authorizing the Task and verifying the immutable Workspace revision, relative path, size, and SHA-256. Missing, inaccessible, legacy unverified, or changed artifacts are not returned.
+         */
+        get: operations["getTaskArtifactContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/steps/{step_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        /** Get safe details for one task step */
+        get: operations["getTaskStepDetail"];
         put?: never;
         post?: never;
         delete?: never;
@@ -8027,6 +8070,10 @@ export interface components {
             role: "user" | "assistant";
             content: string;
             task_id?: components["schemas"]["TaskId"];
+            /** @description Authorized original user message for a repeated request; the current message remains a separate timeline entry. */
+            duplicate_of_message_id?: components["schemas"]["MessageId"];
+            /** @description Task associated through the original request */
+            related_task_id?: components["schemas"]["TaskId"];
             client_message_id?: string;
             /** @enum {string} */
             routing_status?: "pending" | "processing" | "routed" | "waiting_user" | "waiting_adjustment" | "failed";
@@ -8294,8 +8341,46 @@ export interface components {
             status: components["schemas"]["TaskStepStatus"];
             title: string;
             summary: string;
+            /** @description Opaque Agent session ID that actually emitted this step. */
+            agent_id?: string;
+            /** Format: int64 */
+            task_revision?: number;
+            tool_name?: string;
+            phase?: string;
+            /** @enum {string} */
+            detail_state?: "not_recorded" | "available" | "expired" | "restricted";
             /** Format: date-time */
             created_at: string;
+        };
+        TaskAgentExecution: {
+            /** @description Opaque DSH Agent session identifier. */
+            id: string;
+            parent_id: string | null;
+            step_id: components["schemas"]["StepId"] | null;
+            /** Format: int64 */
+            task_revision: number;
+            /** @enum {string} */
+            role: "main" | "subagent";
+            /**
+             * @description Runtime observation only; unknown means the observation cannot be trusted as current.
+             * @enum {string}
+             */
+            status: "running" | "idle" | "unknown";
+            /** Format: date-time */
+            observed_at: string | null;
+        };
+        TaskStepDetail: {
+            task_id: components["schemas"]["TaskId"];
+            step_id: components["schemas"]["StepId"];
+            /** Format: int64 */
+            event_sequence: number;
+            tool_name: string;
+            /** @enum {string} */
+            detail_state: "available" | "not_recorded" | "expired" | "restricted";
+            object: string | null;
+            input: string | null;
+            result: string | null;
+            truncated: boolean;
         };
         TaskBatchItem: {
             id: components["schemas"]["BatchItemId"];
@@ -8524,6 +8609,7 @@ export interface components {
             /** @description Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available. */
             waiting_reason: string | null;
             steps: components["schemas"]["TaskStep"][];
+            agents?: components["schemas"]["TaskAgentExecution"][];
             batch_items: components["schemas"]["TaskBatchItem"][];
             artifacts: components["schemas"]["TaskArtifact"][];
             pending_request: components["schemas"]["TaskPendingRequest"] | null;
@@ -15375,6 +15461,63 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Task"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskArtifactContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                artifact_id: components["schemas"]["ArtifactId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified artifact bytes; response is private and non-cacheable. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "X-Content-Type-Options"?: "nosniff";
+                    "Content-Disposition"?: string;
+                    "X-Content-SHA256"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskStepDetail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Encrypted-at-rest, permission-checked activity projection; responses are never shared-cacheable. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepDetail"];
                 };
             };
             404: components["responses"]["NotFound"];

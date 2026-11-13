@@ -40,6 +40,11 @@ func (s *Sealer) Seal(plain []byte) ([]byte, error) {
 	return s.sealWithAAD(plain, nil)
 }
 
+// SealWithAAD binds ciphertext to the exact persisted object identity.
+func (s *Sealer) SealWithAAD(plain, aad []byte) ([]byte, error) {
+	return s.sealWithAAD(plain, aad)
+}
+
 func (s *Sealer) sealWithAAD(plain, aad []byte) ([]byte, error) {
 	if s == nil || s.aead == nil {
 		return nil, fmt.Errorf("data sealer is not initialized")
@@ -53,6 +58,11 @@ func (s *Sealer) sealWithAAD(plain, aad []byte) ([]byte, error) {
 
 func (s *Sealer) Open(ciphertext []byte) ([]byte, error) {
 	return s.openWithAAD(ciphertext, nil)
+}
+
+// OpenWithAAD rejects ciphertext copied from another persisted object scope.
+func (s *Sealer) OpenWithAAD(ciphertext, aad []byte) ([]byte, error) {
+	return s.openWithAAD(ciphertext, aad)
 }
 
 func (s *Sealer) openWithAAD(ciphertext, aad []byte) ([]byte, error) {

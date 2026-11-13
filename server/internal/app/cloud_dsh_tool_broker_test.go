@@ -321,6 +321,60 @@ func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progre
 	return event, nil
 }
 
+func TestCloudDSHToolActivityPersistsPreparePhaseAndReusesStepOnReplay(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	current := store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-1", 1, "session-root"
+	revision := int64(3)
+	current.CurrentRevision = &revision
+	current.Authorization.Version = 1
+	store.details.Task = current
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "read-call-1", Name: cloudDSHWorkspaceReadToolName, Arguments: `{"path":"README.md"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, nil)
+	first, err := newAgentStep(current.ID, 1, "tool", task.StepRunning, "Read README", "Checking the Workspace.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.commitProgress(ctx, current, first, current.Usage, task.StatusRunning, "", "task.step", map[string]any{"phase": "prepare"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.details.Steps) != 1 || store.details.Steps[0].ID != first.ID || store.details.Steps[0].Phase != "prepare" {
+		t.Fatalf("prepared activity step = %+v", store.details.Steps)
+	}
+	var firstEvent struct {
+		StepID string         `json:"step_id"`
+		Detail map[string]any `json:"detail"`
+	}
+	if err := json.Unmarshal(store.events[0].Payload, &firstEvent); err != nil || firstEvent.StepID != first.ID || firstEvent.Detail["phase"] != "prepare" {
+		t.Fatalf("prepared activity event = %+v, err=%v", firstEvent, err)
+	}
+
+	replayed := task.Step{ID: "s7654321", TaskID: current.ID, Sequence: 2, Kind: "tool", Status: task.StepSucceeded,
+		Title: "Read README", Summary: "Read completed."}
+	if err := broker.commitProgress(ctx, current, replayed, current.Usage, task.StatusRunning, "", "task.step", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.details.Steps) != 1 || store.details.Steps[0].ID != first.ID || store.details.Steps[0].Status != task.StepSucceeded ||
+		store.details.Steps[0].Phase != string(task.StepSucceeded) || len(store.events) != 2 {
+		t.Fatalf("replayed activity step=%+v events=%d", store.details.Steps, len(store.events))
+	}
+	var replayEvent struct {
+		StepID string `json:"step_id"`
+	}
+	if err := json.Unmarshal(store.events[1].Payload, &replayEvent); err != nil || replayEvent.StepID != first.ID {
+		t.Fatalf("replayed activity event step=%q, err=%v; want original %q", replayEvent.StepID, err, first.ID)
+	}
+}
+
 func TestCloudDSHToolBrokerReadsFixedNanoMuseSkillAndReplaysWithoutRecharging(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
@@ -441,6 +495,27 @@ func TestCloudDSHToolBrokerLoadsFixedSkillForHostlessServerTask(t *testing.T) {
 		t.Fatalf("hostless server skill read = %#v, err=%v, usage=%+v events=%d", result, err,
 			store.details.Task.Usage, len(store.events))
 	}
+	result, err = broker.Execute(context.Background(), claimed, ModelToolCall{
+		CallID: "call_hostless_markdown_skill", Name: cloudDSHSkillReadToolName, Arguments: `{"skill_id":"markdown-docs"}`,
+	})
+	if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, "morde_workspace_write") ||
+		strings.Contains(result.Output, "artifact.create_file") || !strings.Contains(result.Output, "downloadable artifact") ||
+		store.details.Task.Usage.ToolCalls != 2 || len(store.events) != 2 {
+		t.Fatalf("hostless Markdown skill read = %#v, err=%v, usage=%+v events=%d", result, err,
+			store.details.Task.Usage, len(store.events))
+	}
+	for index, skillID := range []string{"translation", "meeting-follow-up", "app-creation"} {
+		result, err = broker.Execute(context.Background(), claimed, ModelToolCall{
+			CallID: "call_hostless_followup_skill_" + skillID, Name: cloudDSHSkillReadToolName,
+			Arguments: `{"skill_id":"` + skillID + `"}`,
+		})
+		if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, `"skill_id":"`+skillID+`"`) ||
+			!strings.Contains(result.Output, cloudDSHWorkspaceWriteToolName) ||
+			store.details.Task.Usage.ToolCalls != int64(3+index) || len(store.events) != 3+index {
+			t.Fatalf("hostless %s skill read = %#v, err=%v, usage=%+v events=%d", skillID, result, err,
+				store.details.Task.Usage, len(store.events))
+		}
+	}
 }
 
 func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T) {
@@ -472,8 +547,11 @@ func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T)
 
 func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	definition := cloudDSHSkillReadDefinition()
-	if len(cloudDSHSkillCatalog) != 11 || len(definition.Description) > 2048 || !strings.Contains(definition.Description, "weekly-review:") ||
-		!strings.Contains(definition.Description, "amap:") || !strings.Contains(definition.Description, "Morde skill") ||
+	if len(cloudDSHSkillCatalog) != 18 || len(definition.Description) > 2048 || !strings.Contains(definition.Description, "weekly-review") ||
+		!strings.Contains(definition.Description, "amap") || !strings.Contains(definition.Description, "Morde skill") ||
+		!strings.Contains(definition.Description, "markdown-docs") || !strings.Contains(definition.Description, "wide-research") ||
+		!strings.Contains(definition.Description, "translation") || !strings.Contains(definition.Description, "meeting-follow-up") ||
+		!strings.Contains(definition.Description, "app-creation") ||
 		strings.Contains(definition.Description, "nanoMuse skill") {
 		t.Fatalf("skill catalog does not expose all built-ins: %d, %s", len(cloudDSHSkillCatalog), definition.Description)
 	}
@@ -488,8 +566,12 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	var toolIDs []string
 	for _, skill := range cloudDSHSkillCatalog {
 		metadata, ok := CloudDSHSkillMetadataForID(skill.id)
+		wantSourceRef := "clients/nanoMuse/nanomuse/skills/builtin/" + skill.id + "/SKILL.md"
+		if skill.sourceRef != "" {
+			wantSourceRef = skill.sourceRef
+		}
 		if !ok || metadata.ID != skill.id || metadata.Version != skill.version ||
-			metadata.SourceRef != "clients/nanoMuse/nanomuse/skills/builtin/"+skill.id+"/SKILL.md" {
+			metadata.SourceRef != wantSourceRef {
 			t.Fatalf("skill metadata is not fixed for %q: %#v", skill.id, metadata)
 		}
 		content, err := cloudDSHSkillBundle.ReadFile("cloud_dsh_skills/" + skill.id + ".md")
@@ -621,6 +703,44 @@ func TestCloudDSHToolBrokerRejectedApprovalReturnsWithoutDispatch(t *testing.T) 
 	if store.details.Task.Usage.ToolCalls != 1 || fixture.handlers["shell.exec"].calls.Load() != 0 || len(fixture.store.operations) != 0 {
 		t.Fatalf("rejected action crossed dispatch or counted twice: usage=%+v dispatches=%d operations=%d", store.details.Task.Usage,
 			fixture.handlers["shell.exec"].calls.Load(), len(fixture.store.operations))
+	}
+}
+
+func TestCloudDSHToolRejectedApprovalUpdatesSameFencedActivityStep(t *testing.T) {
+	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
+	current := &store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-approval", 1, "session-root"
+	revision := int64(4)
+	current.CurrentRevision = &revision
+	current.Authorization.Version = 2
+	call.TaskFence = &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+		AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+		AuthorizationVersion: current.Authorization.Version}
+
+	first, err := broker.Execute(context.Background(), *current, call)
+	if err != nil || first.Status != AgentToolNeedsUser || len(store.details.Steps) != 1 {
+		t.Fatalf("approval activity = %#v, err=%v, steps=%+v", first, err, store.details.Steps)
+	}
+	original := store.details.Steps[0]
+	if original.AgentSessionID != current.AgentSessionID || original.ToolCallKey != call.CallID ||
+		original.ToolName != call.Name || original.TaskRevision == nil || *original.TaskRevision != revision ||
+		original.Status != task.StepWaitingUser || original.Phase != string(task.StepWaitingUser) {
+		t.Fatalf("prepared approval activity step = %+v", original)
+	}
+
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestRejected, task.PendingDecisionReject)
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = store.details.Task.Lease.Owner, store.details.Task.Lease.Version
+	result, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || result.Status != AgentToolFailed || len(store.details.Steps) != 1 {
+		t.Fatalf("rejected approval activity = %#v, err=%v, steps=%+v", result, err, store.details.Steps)
+	}
+	settled := store.details.Steps[0]
+	if settled.ID != original.ID || settled.Sequence != original.Sequence || settled.AgentSessionID != original.AgentSessionID ||
+		settled.ToolCallKey != original.ToolCallKey || settled.Status != task.StepFailed || settled.Phase != string(task.StepFailed) ||
+		!strings.Contains(settled.Summary, "not dispatched") || fixture.handlers["shell.exec"].calls.Load() != 0 {
+		t.Fatalf("rejected approval did not settle original activity without dispatch: %+v calls=%d",
+			settled, fixture.handlers["shell.exec"].calls.Load())
 	}
 }
 
@@ -1371,6 +1491,36 @@ func TestCloudDSHFileDeliveryIntentUsesTaskTextConservatively(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := ClassifyFileDeliveryIntent(test.objective, test.hasWorkspace); got != test.want {
 				t.Fatalf("ClassifyFileDeliveryIntent(%q, %t) = %q, want %q", test.objective, test.hasWorkspace, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCloudDSHMarkdownFileDeliveryIntent(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		objective string
+		want      task.FileDeliveryIntent
+	}{
+		{name: "screenshot request", objective: "我要生产一个md文档", want: task.FileDeliveryRequired},
+		{name: "spaced markdown", objective: "为五子棋生成一份 Markdown 文档", want: task.FileDeliveryRequired},
+		{name: "extension", objective: "生成 .MD 文件并提供下载", want: task.FileDeliveryRequired},
+		{name: "md shorthand", objective: "生成md", want: task.FileDeliveryRequired},
+		{name: "save as markdown", objective: "保存为 Markdown 文件", want: task.FileDeliveryRequired},
+		{name: "design plan download request", objective: "为五子棋应用写一份设计方案，保存为 Markdown 文件并提供下载", want: task.FileDeliveryRequired},
+		{name: "downloadable design plan", objective: "帮助我写一个设计方案文档，并提供下载", want: task.FileDeliveryRequired},
+		{name: "chat only", objective: "只在聊天回答怎么生成 Markdown 文档", want: task.FileDeliveryNone},
+		{name: "negative", objective: "不要生产md文档，只用文字回答", want: task.FileDeliveryNone},
+		{name: "conflict", objective: "不要生成 .md 文件，但保存为 Markdown 文档", want: task.FileDeliveryUnclear},
+		{name: "how-to question", objective: "请告诉我如何生成一个 .md 文档", want: task.FileDeliveryNone},
+		{name: "tutorial file", objective: "帮我写一份如何生成 Markdown 文档的教程，保存为.md", want: task.FileDeliveryRequired},
+		{name: "tutorial filename", objective: "请生成一份关于如何生成 Markdown 的教程.md", want: task.FileDeliveryRequired},
+		{name: "summarize input file in chat", objective: "帮我分析文件并写一段总结", want: task.FileDeliveryNone},
+		{name: "output existing file contents", objective: "输出文件内容", want: task.FileDeliveryNone},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ClassifyFileDeliveryIntent(test.objective, false); got != test.want {
+				t.Fatalf("ClassifyFileDeliveryIntent(%q) = %q, want %q", test.objective, got, test.want)
 			}
 		})
 	}

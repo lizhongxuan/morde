@@ -63,6 +63,8 @@ function harness(initialAuth = null, existingRoot = null) {
     show() {}
     getContentBounds() { return { x: 0, y: 0, width: 1120, height: 760 }; }
     focus() { this.focused = true; }
+    isMinimized() { return false; }
+    restore() { this.minimized = false; }
     isDestroyed() { return this.destroyed || false; }
     close() { this.destroyed = true; this.events.get('closed')?.(); }
   }

@@ -90,9 +90,13 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 			}
 			scheduleObservation = &observation
 		}
-		steps, err := queries.ListTaskSteps(ctx, id)
+		steps, err := listTaskStepsWithActivity(ctx, tx, id)
 		if err != nil {
 			return fmt.Errorf("list task steps: %w", err)
+		}
+		agents, err := listTaskAgentExecutions(ctx, tx, row.ID, row.OwnerID)
+		if err != nil {
+			return fmt.Errorf("list task Agent executions: %w", err)
 		}
 		items, err := queries.ListTaskBatchItems(ctx, id)
 		if err != nil {
@@ -185,7 +189,7 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 			Task: projected[0], AssistantMessage: assistantMessage, CurrentRevisionStarted: &currentRevisionStarted,
 			Dependencies: dependencies, ChildJobs: childJobs, ResultReview: resultReview,
 			ResultMessagePending: resultMessagePending, ResultMessagePublished: resultMessagePublished,
-			ScheduleObservation: scheduleObservation, Steps: mapRows(steps, taskStepDomain),
+			ScheduleObservation: scheduleObservation, Steps: steps, Agents: agents,
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
 			PendingRequest: pendingRequest, ClarificationRequests: clarifications,
 			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs,
@@ -193,6 +197,72 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		return nil
 	})
 	return result, err
+}
+
+func listTaskStepsWithActivity(ctx context.Context, tx pgx.Tx, taskID string) ([]task.Step, error) {
+	rows, err := tx.Query(ctx, `SELECT id,task_id,sequence,kind,status,title,summary,created_at,COALESCE(agent_session_id,''),
+task_revision,COALESCE(tool_call_key,''),COALESCE(tool_name,''),request_digest,COALESCE(phase,''),detail_state
+FROM task_steps WHERE task_id=$1 ORDER BY sequence`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	steps := make([]task.Step, 0)
+	for rows.Next() {
+		var step task.Step
+		var revision pgtype.Int8
+		if err := rows.Scan(&step.ID, &step.TaskID, &step.Sequence, &step.Kind, &step.Status, &step.Title, &step.Summary, &step.CreatedAt,
+			&step.AgentSessionID, &revision, &step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState); err != nil {
+			return nil, err
+		}
+		if revision.Valid {
+			value := revision.Int64
+			step.TaskRevision = &value
+		}
+		steps = append(steps, step)
+	}
+	return steps, rows.Err()
+}
+
+func listTaskAgentExecutions(ctx context.Context, tx pgx.Tx, taskID, ownerID string) ([]app.TaskAgentExecution, error) {
+	rows, err := tx.Query(ctx, `SELECT s.session_id,COALESCE(s.parent_session_id,''),COALESCE(s.step_id,''),
+CASE WHEN s.parent_session_id IS NULL THEN t.current_revision ELSE s.task_revision END,
+CASE WHEN s.parent_session_id IS NULL THEN 'main' ELSE 'subagent' END,
+CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_sequence IS NOT NULL
+  AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_status ELSE 'unknown' END,
+CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_sequence IS NOT NULL
+  AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_observed_at ELSE NULL END
+FROM task_agent_sessions s JOIN tasks t ON t.id=s.task_id AND t.owner_id=s.owner_id
+LEFT JOIN LATERAL (SELECT true AS valid FROM task_agent_instances ai
+  WHERE ai.task_id=t.id AND ai.owner_id=t.owner_id AND ai.agent_generation=t.agent_generation
+    AND ai.agent_instance_id=t.agent_instance_id AND ai.agent_session_id=t.agent_session_id
+    AND ai.lease_owner=t.lease_owner AND ai.lease_version=t.lease_version AND ai.auth_version=t.auth_version
+    AND ai.state='active' AND ai.lease_expires_at > clock_timestamp()
+    AND t.status='running' AND t.lease_expires_at > clock_timestamp()
+    AND (t.auth_kind='schedule_task' OR t.auth_expires_at > clock_timestamp())
+  LIMIT 1) live ON true
+WHERE s.task_id=$1 AND s.owner_id=$2
+ORDER BY (s.parent_session_id IS NULL) DESC,s.created_at,s.session_id`, taskID, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	agents := make([]app.TaskAgentExecution, 0)
+	for rows.Next() {
+		var agent app.TaskAgentExecution
+		var status string
+		var observedAt pgtype.Timestamptz
+		if err := rows.Scan(&agent.ID, &agent.ParentID, &agent.StepID, &agent.TaskRevision, &agent.Role, &status, &observedAt); err != nil {
+			return nil, err
+		}
+		agent.Status = status
+		if observedAt.Valid {
+			value := observedAt.Time
+			agent.ObservedAt = &value
+		}
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
 }
 
 func (s *Store) ListTasks(ctx context.Context, ownerID string, filter app.TaskListRequest) (app.TaskPage, error) {
@@ -862,8 +932,7 @@ WHERE id=$1 AND owner_id=$2`, id, taskOwnerID, explanation); err != nil {
 				if err := requestTaskCancellationForAuthorization(ctx, tx, id, taskOwnerID); err != nil {
 					return err
 				}
-				if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='unknown'
-WHERE task_id=$1 AND owner_id=$2 AND role='user' AND delivery_status='pending'`, id, taskOwnerID); err != nil {
+				if err := markPendingTaskConversationMessagesUnknown(ctx, tx, id, taskOwnerID, ""); err != nil {
 					return fmt.Errorf("mark unresolved task messages unknown during snapshot recovery: %w", err)
 				}
 				sequence, err := incrementTaskEventSequence(ctx, tx, id)
@@ -1335,6 +1404,31 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	if len(progress.Artifacts) > 0 && (progress.Status != task.StatusCompleted || progress.Event.Type != "task.result") {
 		return task.Event{}, domain.InvalidArgument("artifacts", "task artifacts may only be committed with task completion")
 	}
+	if progress.ToolCall != nil {
+		call := progress.ToolCall
+		if len(progress.Steps) != 1 || call.AgentSessionID == "" || call.AgentInstanceID == "" || call.AgentGeneration < 1 ||
+			call.AuthorizationVersion < 1 || call.TaskRevision < 0 || call.CallKey == "" || len(call.CallKey) > 256 ||
+			!utf8.ValidString(call.CallKey) || strings.ContainsRune(call.CallKey, '\x00') || call.ToolName == "" || len(call.ToolName) > 128 ||
+			!utf8.ValidString(call.ToolName) || strings.ContainsRune(call.ToolName, '\x00') || len(call.RequestDigest) != 32 ||
+			(call.DetailState != "not_recorded" && call.DetailState != "available") || call.Phase == "" || len(call.Phase) > 64 ||
+			!utf8.ValidString(call.Phase) || strings.ContainsRune(call.Phase, '\x00') {
+			return task.Event{}, domain.InvalidArgument("tool_call", "task tool call progress is invalid")
+		}
+		if call.DetailState == "available" {
+			if len(call.DetailCiphertext) < 29 || len(call.DetailCiphertext) > 65564 || len(call.DetailSHA256) != 32 ||
+				call.DetailSizeBytes < 1 || call.DetailSizeBytes > 65536 || len(progress.Steps[0].ID) == 0 {
+				return task.Event{}, domain.InvalidArgument("tool_call.detail", "task tool detail is invalid")
+			}
+		} else if len(call.DetailCiphertext) != 0 || len(call.DetailSHA256) != 0 || call.DetailSizeBytes != 0 {
+			return task.Event{}, domain.InvalidArgument("tool_call.detail", "unavailable task tool detail must not include a payload")
+		}
+		step := progress.Steps[0]
+		taskRevision := call.TaskRevision
+		step.AgentSessionID, step.TaskRevision = call.AgentSessionID, &taskRevision
+		step.ToolCallKey, step.ToolName = call.CallKey, call.ToolName
+		step.RequestDigest, step.Phase, step.DetailState = append([]byte(nil), call.RequestDigest...), call.Phase, call.DetailState
+		progress.Steps[0] = step
+	}
 	if pending := progress.PendingRequest; pending != nil {
 		hostlessWorkspaceApproval := app.IsHostlessWorkspaceWriteApproval(*pending)
 		if !domain.ValidPendingRequestID(pending.ID) || pending.TaskID != progress.TaskID || pending.Version < 1 || pending.Kind != "approval" ||
@@ -1490,6 +1584,57 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			return taskLeaseConflict()
 		}
 		currentTask := rowTaskDomain(current)
+		if call := progress.ToolCall; call != nil {
+			var currentRevision int64
+			if err := tx.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, current.ID).Scan(&currentRevision); err != nil {
+				return fmt.Errorf("read task revision for tool call: %w", err)
+			}
+			if currentRevision != call.TaskRevision || current.AgentInstanceID != call.AgentInstanceID || current.AgentGeneration != call.AgentGeneration ||
+				current.AgentGeneration < 1 || current.AgentSessionID == "" || current.AuthVersion != call.AuthorizationVersion {
+				return domain.NewError(domain.CodeUnauthenticated, "task tool call fence changed")
+			}
+			var liveInstance bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM task_agent_instances ai
+WHERE ai.task_id=$1 AND ai.owner_id=$2 AND ai.agent_instance_id=$3 AND ai.agent_generation=$4 AND ai.agent_session_id=$5
+  AND ai.lease_owner=$6 AND ai.lease_version=$7 AND ai.auth_version=$8 AND ai.state='active'
+  AND ai.lease_expires_at > clock_timestamp())`, current.ID, current.OwnerID, call.AgentInstanceID, call.AgentGeneration,
+				current.AgentSessionID, progress.LeaseOwner, progress.LeaseVersion, call.AuthorizationVersion).Scan(&liveInstance); err != nil {
+				return fmt.Errorf("check live Agent instance for tool call: %w", err)
+			}
+			if !liveInstance {
+				return taskLeaseConflict()
+			}
+			underRoot, err := agentSessionDescendsFrom(ctx, tx, current.ID, current.OwnerID, call.AgentSessionID, current.AgentSessionID)
+			if err != nil {
+				return err
+			}
+			if !underRoot {
+				return domain.NewError(domain.CodeUnauthenticated, "tool call Agent session is outside the task execution tree")
+			}
+			var sessionRevision int64
+			if err := tx.QueryRow(ctx, `SELECT task_revision FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`,
+				current.ID, current.OwnerID, call.AgentSessionID).Scan(&sessionRevision); err != nil {
+				return domain.NewError(domain.CodeUnauthenticated, "tool call Agent session is unavailable")
+			}
+			if call.AgentSessionID != current.AgentSessionID && sessionRevision != currentRevision {
+				return domain.NewError(domain.CodeUnauthenticated, "tool call Agent session revision changed")
+			}
+			var existingStepID string
+			var existingToolName string
+			var existingRevision int64
+			var existingDigest []byte
+			err = tx.QueryRow(ctx, `SELECT id,tool_name,task_revision,request_digest FROM task_steps
+WHERE task_id=$1 AND agent_session_id=$2 AND tool_call_key=$3 FOR UPDATE`, current.ID, call.AgentSessionID, call.CallKey).
+				Scan(&existingStepID, &existingToolName, &existingRevision, &existingDigest)
+			if err == nil {
+				if existingStepID != progress.Steps[0].ID || existingToolName != call.ToolName || existingRevision != call.TaskRevision ||
+					!bytes.Equal(existingDigest, call.RequestDigest) {
+					return domain.NewError(domain.CodeIdempotencyConflict, "tool call identity was reused with different inputs")
+				}
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("read existing task tool call step: %w", err)
+			}
+		}
 		if current.WorkspaceID.Valid && !current.ProjectID.Valid {
 			if err := lockTaskWorkspaceForExecution(ctx, tx, current.WorkspaceID.String, current.InitiatorID); err != nil {
 				return err
@@ -1675,9 +1820,7 @@ WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND deli
 				return domain.NewError(domain.CodeConflict, "task has pending user messages")
 			}
 		case task.StatusFailed, task.StatusCancelled:
-			if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='unknown'
-WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND delivery_status='pending'`,
-				current.ID, current.OwnerID, current.ConversationID); err != nil {
+			if err := markPendingTaskConversationMessagesUnknown(ctx, tx, current.ID, current.OwnerID, current.ConversationID); err != nil {
 				return fmt.Errorf("mark undelivered user messages unknown on Task stop: %w", err)
 			}
 		}
@@ -1698,7 +1841,19 @@ WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND deli
 		}
 		stepIDs := make(map[string]struct{}, len(progress.Steps))
 		stepSequences := make(map[int64]struct{}, len(progress.Steps))
-		for _, step := range progress.Steps {
+		if err := assignTaskStepSequences(ctx, tx, progress.TaskID, progress.Steps); err != nil {
+			return err
+		}
+		eventPayload, err = alignTaskStepEventSequence(eventPayload, progress.Steps)
+		if err != nil {
+			return err
+		}
+		for index := range progress.Steps {
+			step := progress.Steps[index]
+			if step.DetailState == "" {
+				step.DetailState = "not_recorded"
+				progress.Steps[index].DetailState = step.DetailState
+			}
 			if !domain.ValidStepID(step.ID) || (step.TaskID != "" && step.TaskID != progress.TaskID) || step.Sequence < 1 || step.Kind == "" || !validStepStatus(step.Status) {
 				return domain.InvalidArgument("steps", "task step fields are invalid")
 			}
@@ -1719,15 +1874,58 @@ SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND step_id=$2 AND parent_ses
 			if childSessionStep {
 				return domain.NewError(domain.CodeForbidden, "task progress cannot change a child Agent Session step")
 			}
-			result, err := tx.Exec(ctx, `INSERT INTO task_steps (id, task_id, sequence, kind, status, title, summary) VALUES ($1,$2,$3,$4,$5,$6,$7)
-ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, title=EXCLUDED.title, summary=EXCLUDED.summary
-WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.sequence`,
-				step.ID, progress.TaskID, step.Sequence, step.Kind, string(step.Status), step.Title, step.Summary)
+			result, err := tx.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,title,summary,agent_session_id,task_revision,tool_call_key,tool_name,request_digest,phase,detail_state)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, title=EXCLUDED.title, summary=EXCLUDED.summary,
+ agent_session_id=COALESCE(task_steps.agent_session_id,EXCLUDED.agent_session_id),
+ task_revision=COALESCE(task_steps.task_revision,EXCLUDED.task_revision),
+ tool_call_key=COALESCE(task_steps.tool_call_key,EXCLUDED.tool_call_key),
+ tool_name=COALESCE(task_steps.tool_name,EXCLUDED.tool_name),
+ request_digest=COALESCE(task_steps.request_digest,EXCLUDED.request_digest),
+phase=CASE WHEN EXCLUDED.agent_session_id IS NOT NULL THEN EXCLUDED.phase ELSE task_steps.phase END,
+detail_state=CASE WHEN EXCLUDED.agent_session_id IS NOT NULL
+  THEN CASE WHEN EXCLUDED.detail_state='not_recorded' AND task_steps.detail_state='available' THEN 'available' ELSE EXCLUDED.detail_state END
+  ELSE task_steps.detail_state END
+WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.sequence
+ AND (task_steps.agent_session_id IS NULL OR EXCLUDED.agent_session_id IS NULL OR
+   (task_steps.agent_session_id=EXCLUDED.agent_session_id AND task_steps.task_revision=EXCLUDED.task_revision
+    AND task_steps.tool_call_key=EXCLUDED.tool_call_key AND task_steps.tool_name=EXCLUDED.tool_name
+    AND task_steps.request_digest=EXCLUDED.request_digest))`,
+				step.ID, progress.TaskID, step.Sequence, step.Kind, string(step.Status), step.Title, step.Summary,
+				nullableText(step.AgentSessionID), step.TaskRevision, nullableText(step.ToolCallKey), nullableText(step.ToolName),
+				step.RequestDigest, nullableText(step.Phase), step.DetailState)
 			if err != nil {
 				return fmt.Errorf("persist task step: %w", err)
 			}
 			if result.RowsAffected() == 0 {
 				return domain.NewError(domain.CodeInvalidState, "task step identity changed")
+			}
+		}
+		if call := progress.ToolCall; call != nil && call.DetailState == "available" {
+			step := progress.Steps[0]
+			if _, err := tx.Exec(ctx, `SAVEPOINT task_step_detail_write`); err != nil {
+				return fmt.Errorf("start encrypted Task step detail savepoint: %w", err)
+			}
+			_, detailErr := tx.Exec(ctx, `INSERT INTO task_step_details
+(task_id,owner_id,step_id,task_revision,payload_ciphertext,payload_sha256,payload_size_bytes,truncated)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT (task_id,step_id) DO UPDATE SET task_revision=EXCLUDED.task_revision,
+ payload_ciphertext=EXCLUDED.payload_ciphertext,payload_sha256=EXCLUDED.payload_sha256,
+ payload_size_bytes=EXCLUDED.payload_size_bytes,truncated=EXCLUDED.truncated,updated_at=clock_timestamp()`,
+				progress.TaskID, current.OwnerID, step.ID, call.TaskRevision, call.DetailCiphertext, call.DetailSHA256, call.DetailSizeBytes, call.Truncated)
+			if detailErr != nil {
+				if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT task_step_detail_write`); err != nil {
+					return fmt.Errorf("recover from encrypted Task step detail failure: %w", errors.Join(detailErr, err))
+				}
+				if _, err := tx.Exec(ctx, `UPDATE task_steps SET detail_state='not_recorded' WHERE task_id=$1 AND id=$2`, progress.TaskID, step.ID); err != nil {
+					return fmt.Errorf("mark unavailable encrypted Task step detail: %w", err)
+				}
+				step.DetailState = "not_recorded"
+				progress.Steps[0] = step
+				call.DetailState, call.DetailCiphertext, call.DetailSHA256, call.DetailSizeBytes = "not_recorded", nil, nil, 0
+			} else if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT task_step_detail_write`); err != nil {
+				return fmt.Errorf("release encrypted Task step detail savepoint: %w", err)
 			}
 		}
 		if len(progress.Artifacts) > 0 {

@@ -57,13 +57,6 @@ func taskDomain(row sqlcgen.Task) task.Task {
 	}
 }
 
-func taskStepDomain(row sqlcgen.TaskStep) task.Step {
-	return task.Step{
-		ID: row.ID, TaskID: row.TaskID, Sequence: row.Sequence, Kind: row.Kind,
-		Status: task.StepStatus(row.Status), Title: row.Title, Summary: row.Summary, CreatedAt: row.CreatedAt.Time,
-	}
-}
-
 func taskBatchItemDomain(row sqlcgen.TaskBatchItem) task.BatchItem {
 	return task.BatchItem{
 		ID: row.ID, TaskID: row.TaskID, Key: row.ItemKey, Input: row.Input,

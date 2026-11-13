@@ -64,6 +64,8 @@ type messageResponse struct {
 	Role                      conversation.Role                 `json:"role"`
 	Content                   string                            `json:"content"`
 	TaskID                    string                            `json:"task_id,omitempty"`
+	DuplicateOfMessageID      string                            `json:"duplicate_of_message_id,omitempty"`
+	RelatedTaskID             string                            `json:"related_task_id,omitempty"`
 	AttachmentIDs             []string                          `json:"attachment_ids,omitempty"`
 	ClientMessageID           string                            `json:"client_message_id,omitempty"`
 	RoutingStatus             conversation.RoutingStatus        `json:"routing_status,omitempty"`
@@ -566,6 +568,9 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 	}
 	if !domain.ValidMessageID(value.ID) || !domain.ValidConversationID(value.ConversationID) ||
 		(value.TaskID != "" && !domain.ValidTaskID(value.TaskID)) ||
+		(value.DuplicateOfMessageID != "" && (!domain.ValidMessageID(value.DuplicateOfMessageID) || value.DuplicateOfMessageID == value.ID ||
+			value.Role != conversation.RoleUser || value.TaskID != "")) ||
+		(value.RelatedTaskID != "" && (value.DuplicateOfMessageID == "" || !domain.ValidTaskID(value.RelatedTaskID))) ||
 		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.Sequence < 1 || value.CreatedAt.IsZero() ||
 		!deliveryStatus.Valid() || (value.RoutingStatus != "" && !value.RoutingStatus.Valid()) ||
 		(value.RoutingFailureReason != "" && !value.RoutingFailureReason.Valid()) {
@@ -599,7 +604,8 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 	}
 	return messageResponse{
 		ID: value.ID, ConversationID: value.ConversationID, Sequence: value.Sequence, Role: value.Role, Content: value.Content,
-		TaskID: value.TaskID, AttachmentIDs: append([]string(nil), value.AttachmentIDs...),
+		TaskID: value.TaskID, DuplicateOfMessageID: value.DuplicateOfMessageID, RelatedTaskID: value.RelatedTaskID,
+		AttachmentIDs:   append([]string(nil), value.AttachmentIDs...),
 		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
 		Sources:        append([]conversation.MessageSource(nil), value.Sources...),
 		DeliveryStatus: deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,

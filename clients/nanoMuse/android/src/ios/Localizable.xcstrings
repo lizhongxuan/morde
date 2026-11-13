@@ -4,6 +4,62 @@
     "" : {
 
     },
+    "Accepted; waiting for processing" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Angenommen · wartet auf Bearbeitung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Accepted; waiting for processing" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Aceptado · esperando a ser procesado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Reçu · en attente de traitement" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "受付済み · 処理待ち" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "접수됨 · 처리 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Принято · ожидает обработки" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已受理，等待处理" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已受理，等待處理" } }
+      }
+    },
+    "Processing message" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Nachricht wird verarbeitet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Processing message" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Procesando mensaje" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Traitement du message" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "メッセージを処理中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "메시지 처리 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Обработка сообщения" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在处理消息" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在處理訊息" } }
+      }
+    },
+    "Repeated request · linked to message %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wiederholte Anfrage · mit Nachricht %@ verknüpft" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Repeated request · linked to message %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Solicitud repetida · vinculada al mensaje %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Demande répétée · liée au message %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "重複した依頼 · メッセージ %@ に関連付け済み" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "중복 요청 · 메시지 %@에 연결됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторный запрос · связан с сообщением %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重复请求 · 已关联原消息 %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重複請求 · 已關聯原訊息 %@" } }
+      }
+    },
+    "Repeated request · related task %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wiederholte Anfrage · zugehörige Aufgabe %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Repeated request · related task %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Solicitud repetida · tarea relacionada %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Demande répétée · tâche associée %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "重複した依頼 · 関連タスク %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "중복 요청 · 관련 작업 %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторный запрос · связанная задача %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重复请求 · 关联任务 %@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重複請求 · 關聯任務 %@" } }
+      }
+    },
     "Cancel this file request?" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1180,6 +1236,20 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "使用雲端電腦" } }
       }
     },
+    "Use MCP tool: %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "MCP-Tool verwenden: %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Use MCP tool: %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Usar herramienta MCP: %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Utiliser l’outil MCP : %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "MCP ツールを使用：%@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "MCP 도구 사용: %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Использовать инструмент MCP: %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "使用 MCP 工具：%@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "使用 MCP 工具：%@" } }
+      }
+    },
     "Work in the workspace" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1206,6 +1276,34 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Обработка задачи" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "处理任务" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "處理任務" } }
+      }
+    },
+    "MCP tool" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "MCP-Tool" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "MCP tool" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "herramienta MCP" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "outil MCP" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "MCP ツール" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "MCP 도구" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "инструмент MCP" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "MCP 工具" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "MCP 工具" } }
+      }
+    },
+    "MCP connector" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "MCP-Verbindung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "MCP connector" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "conector MCP" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "connecteur MCP" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "MCP コネクター" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "MCP 커넥터" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "коннектор MCP" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "MCP 连接器" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "MCP 連接器" } }
       }
     },
     "Task is bound to another cloud computer; start a new task for the new target." : {
@@ -189022,6 +189120,118 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось загрузить запросы файлов с ПК." } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法加载 PC 文件请求。" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法載入 PC 檔案請求。" } }
+      }
+    },
+    "Attribution unconfirmed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Zuordnung nicht bestätigt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Attribution unconfirmed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Atribución sin confirmar" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Attribution non confirmée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "帰属未確認" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "귀속 확인 안 됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Привязка не подтверждена" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "归属未确认" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "歸屬尚未確認" } }
+      }
+    },
+    "Details are truncated" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Details sind gekürzt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Details are truncated" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Los detalles están truncados" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Les détails sont tronqués" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "詳細は省略されています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세부 정보가 일부 생략되었습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подробности сокращены" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "详情已截断" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "詳細資料已截斷" } }
+      }
+    },
+    "Details were not recorded" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Details wurden nicht aufgezeichnet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Details were not recorded" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se registraron los detalles" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Les détails n’ont pas été enregistrés" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "詳細は記録されていません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세부 정보가 기록되지 않았습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подробности не были записаны" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "未记录详情" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "未記錄詳細資料" } }
+      }
+    },
+    "Details have expired" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Details sind abgelaufen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Details have expired" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Los detalles han caducado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Les détails ont expiré" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "詳細の有効期限が切れています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세부 정보가 만료되었습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Срок хранения подробностей истёк" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "详情已过期" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "詳細資料已過期" } }
+      }
+    },
+    "Loading details…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Details werden geladen…" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Loading details…" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Cargando detalles…" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Chargement des détails…" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "詳細を読み込み中…" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세부 정보 로드 중…" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загрузка подробностей…" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在加载详情…" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在載入詳細資料…" } }
+      }
+    },
+    "Tool" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Werkzeug" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Tool" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Herramienta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Outil" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ツール" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "도구" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Инструмент" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "工具" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "工具" } }
+      }
+    },
+    "This detail is restricted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Diese Details sind eingeschränkt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This detail is restricted" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El acceso a estos detalles está restringido" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’accès à ces détails est restreint" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "この詳細情報へのアクセスは制限されています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 세부 정보에 대한 접근이 제한되었습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Доступ к этим подробностям ограничен" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此详情受限" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "此詳細資料受到限制" } }
+      }
+    },
+    "Task details are unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Aufgabendetails sind nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Task details are unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Los detalles de la tarea no están disponibles" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Les détails de la tâche ne sont pas disponibles" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "タスクの詳細を利用できません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 세부 정보를 사용할 수 없습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сведения о задаче недоступны" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务详情不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務詳細資料無法使用" } }
       }
     }
   },

@@ -706,6 +706,10 @@ func (b *CloudDSHToolBroker) executePersonalUpdate(ctx context.Context, claimed 
 
 func (b *CloudDSHToolBroker) commitTaskPersonalMutation(ctx context.Context, current task.Task, step task.Step, usage task.Usage,
 	detail any, commit CloudDSHPersonalMutationCommit) error {
+	step, toolCall, err := b.prepareTaskToolStep(ctx, current, step)
+	if err != nil {
+		return err
+	}
 	payload, err := agentStepEvent(step, usage, detail)
 	if err != nil {
 		return err
@@ -713,7 +717,7 @@ func (b *CloudDSHToolBroker) commitTaskPersonalMutation(ctx context.Context, cur
 	_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		Status: task.StatusRunning, CurrentStep: step.ID, Result: current.Result, Usage: usage,
-		Steps: []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: "task.step", Payload: payload},
+		Steps: []task.Step{step}, ToolCall: toolCall, Event: task.Event{TaskID: current.ID, Type: "task.step", Payload: payload},
 		CloudDSHPersonalMutation: &commit,
 	})
 	return err

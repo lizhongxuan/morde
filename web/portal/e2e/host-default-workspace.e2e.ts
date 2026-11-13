@@ -93,14 +93,12 @@ test.describe("default computer and Workspace continuity", () => {
     await signInWithDefaultHostFixtures(page);
     await page.goto("/connections");
 
-    const settingsSidebar = page.getByRole("complementary", { name: "设置子菜单" });
-    const cloudComputerLink = settingsSidebar.getByRole("link", { name: "云端电脑", exact: true });
+    const cloudComputerLink = page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "云端电脑", exact: true });
     await expect(cloudComputerLink).toBeVisible();
     await expect(cloudComputerLink).toHaveAttribute("href", "/hosts");
     await cloudComputerLink.click();
     await expect(page).toHaveURL(/\/hosts$/);
-    await expect(settingsSidebar.getByRole("link", { name: "云端电脑", exact: true }))
-      .toHaveAttribute("aria-current", "page");
+    await expect(cloudComputerLink).toHaveAttribute("aria-current", "page");
 
     const defaultComputer = page.getByRole("combobox", { name: "默认云端电脑" });
     await expect(defaultComputer).toHaveValue(firstHostID);

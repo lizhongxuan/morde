@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -69,9 +70,22 @@ type TaskService struct {
 	authorizer          TaskAuthorizer
 	executionAuthorizer TaskExecutionAuthorizer
 	models              ConfiguredModelCatalog
+	artifactReader      TaskArtifactReader
 	actions             TaskActionRequester
 	viewDeletions       TaskWorkspaceViewDeletionStore
 	projectAccess       ProjectAccessChecker
+	stepDetailSealer    *Sealer
+}
+
+func (s *TaskService) SetTaskStepDetailSealer(sealer *Sealer) error {
+	if s == nil || sealer == nil {
+		return domain.NewError(domain.CodeInvalidArgument, "task step detail sealer is required")
+	}
+	if s.stepDetailSealer != nil && s.stepDetailSealer != sealer {
+		return domain.NewError(domain.CodeInvalidState, "task step detail sealer cannot be replaced")
+	}
+	s.stepDetailSealer = sealer
+	return nil
 }
 
 func NewTaskService(store TaskStore, authorizer TaskAuthorizer, models ConfiguredModelCatalog, projectAccess ...ProjectAccessChecker) (*TaskService, error) {
@@ -556,7 +570,117 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 			details.Artifacts = nil
 		}
 	}
+	workspaceVisible, err := s.taskWorkspaceDetailVisible(ctx, principal, details.Task)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	if !workspaceVisible {
+		for index := range details.Steps {
+			if !strings.HasPrefix(details.Steps[index].ToolName, "morde_workspace_") {
+				continue
+			}
+			details.Steps[index].Title = "Workspace action"
+			details.Steps[index].Summary = "The Workspace resource is not available with the current permissions."
+			details.Steps[index].DetailState = "restricted"
+		}
+	}
 	return details, nil
+}
+
+func (s *TaskService) taskWorkspaceDetailVisible(ctx context.Context, principal identity.Principal, value task.Task) (bool, error) {
+	if value.WorkspaceID == "" {
+		return true, nil
+	}
+	reader, ok := s.store.(taskWorkspaceSnapshotReader)
+	if !ok || !domain.ValidWorkspaceID(value.WorkspaceID) {
+		return false, nil
+	}
+	current, err := reader.GetWorkspace(ctx, value.WorkspaceID)
+	if domain.CodeOf(err) == domain.CodeNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	ownerID := value.WorkspaceOwnerID
+	if ownerID == "" {
+		ownerID = value.OwnerID
+	}
+	if current.ID != value.WorkspaceID || current.OwnerID != ownerID || current.State != workspace.StateReady || current.DeletedAt != nil {
+		return false, nil
+	}
+	if value.ProjectID != "" {
+		if s.projectAccess == nil {
+			return false, nil
+		}
+		if _, err := s.projectAccess.RequireAccess(ctx, principal, value.ProjectID, project.RoleMember); err != nil {
+			if domain.CodeOf(err) == domain.CodeNotFound || domain.CodeOf(err) == domain.CodeForbidden {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	return current.OwnerID == principal.UserID, nil
+}
+
+func (s *TaskService) GetStepDetail(ctx context.Context, principal identity.Principal, taskID, stepID string) (TaskStepDetail, error) {
+	if !domain.ValidStepID(stepID) {
+		return TaskStepDetail{}, domain.NewError(domain.CodeNotFound, "task step not found")
+	}
+	details, err := s.Get(ctx, principal, taskID)
+	if err != nil {
+		return TaskStepDetail{}, err
+	}
+	var step *task.Step
+	for i := range details.Steps {
+		if details.Steps[i].ID == stepID {
+			step = &details.Steps[i]
+			break
+		}
+	}
+	if step == nil {
+		return TaskStepDetail{}, domain.NewError(domain.CodeNotFound, "task step not found")
+	}
+	result := TaskStepDetail{TaskID: taskID, StepID: stepID, EventSequence: details.Task.EventSequence,
+		ToolName: step.ToolName, DetailState: step.DetailState}
+	if result.DetailState == "" {
+		result.DetailState = "not_recorded"
+	}
+	if result.DetailState != "available" {
+		return result, nil
+	}
+	reader, ok := s.store.(TaskStepDetailReader)
+	if !ok || s.stepDetailSealer == nil || step.TaskRevision == nil {
+		result.DetailState = "not_recorded"
+		return result, nil
+	}
+	record, err := reader.GetTaskStepDetail(ctx, principal.UserID, taskID, stepID)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			result.DetailState = "expired"
+			return result, nil
+		}
+		return TaskStepDetail{}, err
+	}
+	if record.TaskID != taskID || record.OwnerID != details.Task.OwnerID || record.StepID != stepID || record.TaskRevision != *step.TaskRevision ||
+		record.SizeBytes < 1 || record.SizeBytes > 64<<10 || len(record.SHA256) != 32 {
+		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail identity is invalid")
+	}
+	plain, err := s.stepDetailSealer.OpenWithAAD(record.Ciphertext, taskStepDetailAAD(record.OwnerID, taskID, stepID, record.TaskRevision))
+	if err != nil || len(plain) != int(record.SizeBytes) || !bytes.Equal(sha256Bytes(plain), record.SHA256) {
+		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail integrity check failed")
+	}
+	var document TaskStepDetailDocument
+	decoder := json.NewDecoder(bytes.NewReader(plain))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&document) != nil || !validTaskStepDetailDocument(document) {
+		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail document is invalid")
+	}
+	result.DetailState, result.Truncated = "available", record.Truncated
+	result.EventSequence = record.EventSequence
+	result.Object, result.Input, result.Result = &document.Object, &document.Input, &document.Result
+	return result, nil
 }
 
 // Project Task owners can differ from the Workspace-owning member reading artifacts.

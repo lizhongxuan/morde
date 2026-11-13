@@ -156,7 +156,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	classifyContext.ModelID = modelID
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
-		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 {
+		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 || classifyContext.ResultReview != nil {
 		if _, err := app.ConversationRouteModelRequest(classifyContext); domain.CodeOf(err) == domain.CodeResultTooLarge && classifyContext.SummaryVersion > 0 {
 			classifyContext = snapshot.Context
 			classifyContext.ModelID = modelID
@@ -193,7 +193,13 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			return true, w.failRoute(ctx, claim, "model_unavailable", err)
 		}
 	}
+	if decision.InvalidOutput {
+		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid"))
+	}
 	decision = safeConversationRouteDecision(snapshot.Context, decision)
+	if decision.InvalidOutput {
+		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid for the current context"))
+	}
 	if snapshot.Context.ResultReview != nil && decision.Action != app.ConversationRouteReply {
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("task result review did not produce a reply"))
 	}
@@ -249,22 +255,29 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	}
 	switch decision.Action {
 	case app.ConversationRouteNew:
-		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" &&
+		if decision.TaskID == "" && decision.TargetMessageID == "" && (!decision.ExplicitNew || app.ConversationRouteHasExplicitNewIntent(value.Content)) &&
+			decision.ExpectedRevision == 0 && decision.Question == "" &&
 			app.ValidConversationRouteDependencyIDs(decision.DependencyTaskIDs, value.Candidates) {
 			return decision
 		}
+	case app.ConversationRouteJoin:
+		if decision.TaskID == "" && decision.TargetMessageID != "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 &&
+			decision.Question == "" && decision.Reply == "" && len(decision.DependencyTaskIDs) == 0 &&
+			app.ValidConversationRouteJoinTarget(decision.TargetMessageID, value.RequestCandidates) {
+			return decision
+		}
 	case app.ConversationRouteReply:
-		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" &&
+		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && decision.Question == "" &&
 			len(decision.DependencyTaskIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
 			return decision
 		}
 	case app.ConversationRouteClarify:
-		if decision.TaskID == "" && decision.ExpectedRevision == 0 && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
+		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
 			!strings.ContainsRune(decision.Question, '\x00') && len([]rune(decision.Question)) <= 200 {
 			return decision
 		}
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if decision.Question != "" {
+		if decision.TargetMessageID != "" || decision.ExplicitNew || decision.Question != "" {
 			return clarify
 		}
 		if value.ReferenceUnavailable {

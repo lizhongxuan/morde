@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	fileDeliveryNegative     = regexp.MustCompile(`(?i)(?:不要|无需|不用|不必|不需要|不再|别(?:再)?(?:生成|创建|制作|写入|写|保存|导出|输出))\s*(?:再\s*)?(?:在工作区\s*)?(?:生成|创建|制作|写入|写|保存|导出|提供|输出|产生)?\s*(?:任何|一个|一份|个|份)?\s*(?:文件|文档|附件|pdf|excel|word|ppt|表格|工作簿|幻灯片)|(?:只要|只需|只需要|仅需|仅用).{0,5}(?:文字|文本|聊天)|(?:don't|do not|no need to)\s+(?:create|write|save|generate|produce|export|output|deliver)\s+(?:(?:any|a|the)\s+)?(?:file|document|attachment|pdf|spreadsheet)|(?:no file|no attachment|text only|text-only|answer in chat|reply in chat)`)
-	fileDeliveryOutput       = regexp.MustCompile(`(?i)(?:生成|创建|新建|制作|做一份|做一个|做个|导出|另存|保存|输出|写入|写|提供|交付|create|generate|make|produce|export|save|write|deliver)\s*(?:一份|一个|个|份|a\s+|an\s+|the\s+|one\s+|my\s+|this\s+|me\s+)*\s*(?:pdf|excel|word|ppt|csv|xlsx|docx|pptx|文件|文档|附件|表格文件|电子表格|工作簿|幻灯片|file|document|attachment|spreadsheet|workbook|presentation)`)
+	fileDeliveryNegative     = regexp.MustCompile(`(?i)(?:不要|无需|不用|不必|不需要|不再|别(?:再)?(?:生成|生产|创建|制作|写成|写入|写|保存|导出|输出))\s*(?:再\s*)?(?:在工作区\s*)?(?:生成|生产|创建|制作|写成|写入|写|保存|导出|提供|输出|产生)?\s*(?:任何|一个|一份|个|份)?\s*(?:文件|文档|附件|pdf|excel|word|ppt|markdown|md|\.md|表格|工作簿|幻灯片)|(?:只要|只需|只需要|仅需|仅用).{0,5}(?:文字|文本|聊天)|(?:只|仅)在聊天(?:里|中)?(?:用文字)?(?:回答|回复|说明)|(?:don't|do not|no need to)\s+(?:create|write|save|generate|produce|export|output|deliver)\s+(?:(?:any|a|the)\s+)?(?:file|document|attachment|pdf|spreadsheet|markdown|\.md)|(?:no file|no attachment|text only|text-only|answer in chat|reply in chat)`)
+	fileDeliveryAction       = regexp.MustCompile(`(?i)(?:生成|生产|创建|新建|制作|做一份|做一个|做个|导出|下载|另存|保存|输出|写成|写入|撰写|整理成|写|上传|提供|交付|create|generate|make|produce|export|download|save|write|draft|prepare|attach|provide|output|deliver)`)
+	fileDeliveryMarkdown     = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])(?:\.md|markdown|md)(?:$|[^a-z0-9])`)
 	fileDeliveryReadOutput   = regexp.MustCompile(`输出(?:这个|该|当前)?(?:文件|文档)(?:的)?(?:内容|名称|名|大小|路径|格式|类型)`)
 	fileDeliveryClaimChinese = regexp.MustCompile(`(?:已经|已|现已|成功).{0,20}(?:保存|存储|存入|写入|创建|生成|导出|上传|交付)`)
 	fileDeliveryClaimEnglish = regexp.MustCompile(`(?i)\b(?:saved|created|generated|written|exported|uploaded|stored|delivered)\b`)
@@ -32,15 +33,10 @@ func RoutedFileDeliveryDirective(content string, hasWorkspace bool) (task.FileDe
 		if classification != task.FileDeliveryRequired {
 			continue
 		}
-		if containsAny(clause, "如何", "怎样", "怎么", "举例", "教程", "how to", "how do", "example") {
+		if fileDeliveryQuestionBeforeAction(clause) {
 			continue
 		}
-		if fileDeliveryOutput.MatchString(clause) || containsAny(clause, "在工作区", "到工作区", "写入工作区", "保存至工作区",
-			"in the workspace", "in the attached workspace", "to the workspace", "to the attached workspace") ||
-			hasWorkspace && containsAny(clause, "修改", "修复", "实现", "开发", "重构", "编辑", "更新", "fix", "implement", "develop", "refactor", "edit", "modify", "update") &&
-				containsAny(clause, "代码", "源码", "脚本", "项目", "仓库", "code", "source", "script", "project", "repository", "repo") {
-			positive = true
-		}
+		positive = true
 	}
 	switch {
 	case positive && negative:
@@ -52,6 +48,26 @@ func RoutedFileDeliveryDirective(content string, hasWorkspace bool) (task.FileDe
 	default:
 		return "", false
 	}
+}
+
+func fileDeliveryQuestionBeforeAction(clause string) bool {
+	match := fileDeliveryAction.FindStringIndex(clause)
+	if match == nil {
+		return false
+	}
+	prefix := clause[:match[0]]
+	return containsAny(prefix, "如何", "怎样", "怎么", "举例", "例子", "示例", "教程", "解释", "说明", "是什么意思", "什么叫",
+		"how to", "how do", "example", "explain", "what does", "what is", "meaning", "definition")
+}
+
+func fileDeliveryTargetAfterAction(text string) bool {
+	match := fileDeliveryAction.FindStringIndex(text)
+	if match == nil {
+		return false
+	}
+	suffix := text[match[1]:]
+	return fileDeliveryMarkdown.MatchString(suffix) || containsAny(suffix, "文件", "文档", "附件", "pdf", "excel", "word", "ppt",
+		"csv", "xlsx", "docx", "pptx", "表格", "工作簿", "幻灯片", "file", "document", "attachment", "spreadsheet", "workbook", "presentation")
 }
 
 // HasUnverifiedFileDeliveryClaim recognizes a limited set of explicit claims.

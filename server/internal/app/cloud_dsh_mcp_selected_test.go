@@ -190,6 +190,64 @@ func TestSelectedMCPDiscoveryIsLazyAndChecksToolSchema(t *testing.T) {
 	}
 }
 
+func TestSelectedMCPActivityUsesResolvedToolAndReusesCallIdentity(t *testing.T) {
+	client := &cloudDSHMCPClientStub{tools: []MCPConnectorToolDefinition{{Name: "lookup", Description: "Find a synthetic record",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}},
+		result: MCPConnectorToolResult{Text: []string{"synthetic result"}}}
+	broker, store, claimed := selectedMCPTestFixture(t, client)
+	discoverSelectedMCPForTest(t, broker, claimed, "k1234567")
+	current := store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-mcp", 1, "session-root"
+	revision := int64(5)
+	current.CurrentRevision = &revision
+	current.Authorization.Version = 2
+	store.details.Task = current
+	claimed = current
+	call := selectedMCPCallForTest(t, "selected-activity-1", "k1234567", "lookup", `{"query":"local"}`)
+	call.TaskFence = &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+		AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+		AuthorizationVersion: current.Authorization.Version}
+
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolNeedsUser || len(store.details.Steps) != 1 {
+		t.Fatalf("selected MCP activity = %+v, err=%v, steps=%+v", result, err, store.details.Steps)
+	}
+	original := store.details.Steps[0]
+	alias := cloudDSHMCPToolName("k1234567", "lookup")
+	if original.AgentSessionID != current.AgentSessionID || original.ToolCallKey != call.CallID || original.ToolName != alias ||
+		original.Title != "Run cloud dsh MCP tool: lookup" || original.TaskRevision == nil || *original.TaskRevision != revision ||
+		original.Status != task.StepWaitingUser {
+		t.Fatalf("selected MCP activity did not capture the resolved action: %+v", original)
+	}
+	expires := time.Now().Add(time.Minute).UTC()
+	store.mu.Lock()
+	resumed := store.details.Task
+	resumed.Status, resumed.WaitingReason = task.StatusRunning, ""
+	resumed.Lease = task.Lease{Owner: resumed.Lease.Owner, Version: resumed.Lease.Version + 1, ExpiresAt: &expires}
+	store.details.Task = resumed
+	store.mu.Unlock()
+	claimed = resumed
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = resumed.Lease.Owner, resumed.Lease.Version
+	repeated, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || repeated.Status != AgentToolNeedsUser || len(store.details.Steps) != 1 ||
+		store.details.Steps[0].ID != original.ID || store.details.Steps[0].Title != original.Title {
+		t.Fatalf("repeated MCP approval created a different activity: result=%+v err=%v steps=%+v", repeated, err, store.details.Steps)
+	}
+
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = store.details.Task.Lease.Owner, store.details.Task.Lease.Version
+	result, err = broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || result.Status != AgentToolSucceeded || len(store.details.Steps) != 1 || client.callCalls != 1 {
+		t.Fatalf("approved selected MCP activity = %+v, err=%v, steps=%+v, calls=%d", result, err, store.details.Steps, client.callCalls)
+	}
+	settled := store.details.Steps[0]
+	if settled.ID != original.ID || settled.Sequence != original.Sequence || settled.ToolCallKey != call.CallID ||
+		settled.ToolName != alias || settled.Title != "Run cloud dsh MCP tool: lookup" || settled.Status != task.StepSucceeded {
+		t.Fatalf("selected MCP replay created a different activity: original=%+v settled=%+v", original, settled)
+	}
+}
+
 func TestSelectedMCPDiscoveryFailureDoesNotBlockTask(t *testing.T) {
 	client := &failingMCPDiscoveryClient{}
 	broker, store, claimed := selectedMCPTestFixture(t, client)

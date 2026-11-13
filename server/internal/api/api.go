@@ -58,6 +58,7 @@ type Deps struct {
 	Control                      ControlService
 	ExecutionControl             ExecutionControlService
 	Tasks                        TaskService
+	TaskArtifactContent          TaskArtifactContentEndpointService
 	TaskMedia                    TaskMediaService
 	TaskFileFetch                TaskFileFetchEndpointService
 	TaskObservationTickets       TaskWorkbenchObservationTicketService
@@ -202,6 +203,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	RegisterProjectBudgetRoutes(group, deps.ProjectBudget)
 	RegisterProjectMCPConnectorRoutes(group, deps.ProjectMCPConnectors)
 	h.registerTasks(group, deps.Tasks)
+	h.registerTaskArtifactContent(group, deps.TaskArtifactContent)
 	if deps.TaskFileFetch != nil {
 		h.registerTaskFileFetchOwnerRoutes(group, deps.TaskFileFetch)
 	}
@@ -588,7 +590,7 @@ func clientCredentialRoute(method, path string) bool {
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/content",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id/content",
-			"/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
+			"/api/tasks", "/api/tasks/:id", "/api/tasks/:id/steps/:step_id", "/api/tasks/:id/events",
 			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id", "/api/personal-data/quota",
 			"/api/personal-data/attachments/:attachment_id",
 			"/api/goals", "/api/goals/:id",

@@ -132,6 +132,7 @@ function UserProjects() {
   const [localOutgoingInvitations, setLocalOutgoingInvitations] = useState<Record<string, ProjectInvitation[]>>({});
   const [pendingAction, setPendingAction] = useState('');
   const [notice, setNotice] = useState<ActionNotice | null>(null);
+  const [retryAcceptedMessageIDs, setRetryAcceptedMessageIDs] = useState<Set<string>>(() => new Set());
   const requestKeys = useRef(new Map<string, RequestKeyRecord>());
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: projectApi.projects, retry: false });
@@ -396,10 +397,24 @@ function UserProjects() {
       clearProcessingRetryKey(instanceID, user.id, target.projectID, target.conversationID, target.messageID);
     },
     onSuccess: async (_value, target) => {
-      setNotice({ kind: 'success', message: '已请求重新处理消息。' });
+      setRetryAcceptedMessageIDs((current) => new Set(current).add(target.messageID));
+      window.setTimeout(() => setRetryAcceptedMessageIDs((current) => {
+        if (!current.has(target.messageID)) return current;
+        const next = new Set(current);
+        next.delete(target.messageID);
+        return next;
+      }), 30_000);
       await queryClient.invalidateQueries({ queryKey: ['project-conversation-messages', target.projectID, target.conversationID] });
     },
-    onError: (error) => setNotice({ kind: 'error', message: errorDetails(error).message }),
+    onError: (error, target) => {
+      setRetryAcceptedMessageIDs((current) => {
+        if (!current.has(target.messageID)) return current;
+        const next = new Set(current);
+        next.delete(target.messageID);
+        return next;
+      });
+      setNotice({ kind: 'error', message: errorDetails(error).message });
+    },
   });
 
   const stopProjectTask = (task: ProjectTask) => {
@@ -848,12 +863,30 @@ function UserProjects() {
                         ariaLabel="项目共享对话消息" items={projectConversationMessages} getKey={(message) => message.id}
                         estimatedItemHeight={130} height={620}
                         renderItem={(message) => {
-                        const task = message.task_id ? taskByID.get(message.task_id) : undefined;
+                        const task = taskByID.get(message.task_id ?? message.related_task_id ?? '');
+                        const retryAccepted = retryAcceptedMessageIDs.has(message.id);
+                        const retryAcceptedStatus = retryAccepted && ['failed', 'pending', 'processing'].includes(message.routing_status ?? '')
+                          ? '正在重新处理消息' : null;
+                        const messageStatus = message.duplicate_of_message_id
+                          ? `重复请求 · 原消息 ${message.duplicate_of_message_id}${message.related_task_id
+                            ? ` · Task ${message.related_task_id} · 状态 ${task?.status ?? '待核对'}` : ''}`
+                          : message.role === 'user' ? retryAcceptedStatus ?? (message.delivery_status === 'applied' ? deliveryStatusText('applied') : null)
+                            : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status);
                         const sources = message.role === 'assistant' ? message.sources ?? [] : [];
                         const sourceContentMatches = sources.length > 0 && sources.every((source) => source.content.length > 0) &&
                           sources.map((source) => source.content).join('\n\n') === message.content;
                         return <article id={`project-conversation-message-${encodeURIComponent(message.id)}`} className="schedule-card" aria-label="项目对话消息">
-                          <div className="schedule-card-heading"><div><h4>{message.role === 'user' ? '成员提示' : 'AI 回复'}</h4><p className="muted">执行者 {message.actor_id} · 对话创建者 {message.owner_id}</p></div><span className="status">{message.output_status === 'streaming' ? '生成中' : message.output_status === 'interrupted' ? '已中断' : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status)}</span></div>
+                          <div className="schedule-card-heading">
+                            {message.role === 'user' && message.routing_status === 'failed' && !message.task_id && !message.related_task_id &&
+                              message.actor_id === user?.id && message.routing_failure_reason !== 'message_too_long' && !retryAccepted && <button type="button"
+                                className="message-retry" aria-label="重新处理这条消息" title="重新处理"
+                                style={{ flex: '0 0 22px', width: 22, height: 22, margin: '2px 0 0', padding: 0, display: 'grid', placeItems: 'center', border: '1px solid #f0b8b4', borderRadius: '50%', color: '#c72f2b', background: '#fff5f4', fontSize: 14, fontWeight: 800, lineHeight: 1, cursor: 'pointer' }}
+                                disabled={retryProjectProcessing.isPending && retryProjectProcessing.variables?.messageID === message.id}
+                                onClick={() => retryProjectProcessing.mutate({ projectID: project.id, conversationID: message.conversation_id, messageID: message.id })}>!</button>}
+                            <div><h4>{message.role === 'user' ? '成员提示' : 'AI 回复'}</h4><p className="muted">执行者 {message.actor_id} · 对话创建者 {message.owner_id}</p></div>
+                            {(message.output_status === 'streaming' || message.output_status === 'interrupted' || messageStatus) &&
+                              <span className="status">{message.output_status === 'streaming' ? '生成中' : message.output_status === 'interrupted' ? '已中断' : messageStatus}</span>}
+                          </div>
                           {sourceContentMatches ? <div className="chat-message-source-list">
                             {sources.map((source) => {
                               const sourceMessage = projectConversationMessages.find((candidate) => candidate.id === source.user_message_id);
@@ -888,11 +921,8 @@ function UserProjects() {
                           </p> : null}
                           {message.output_status === 'streaming' && <small role="status">正在生成…</small>}
                           {message.output_status === 'interrupted' && <small role="status">回复已中断</small>}
-                          {message.role === 'user' && message.routing_status === 'failed' && !message.task_id && <p>
-                            {routingFailureText(message.routing_failure_reason)}
-                            {message.actor_id === user?.id && message.routing_failure_reason !== 'message_too_long' && <button type="button" className="button button-small button-secondary" disabled={retryProjectProcessing.isPending}
-                              onClick={() => retryProjectProcessing.mutate({ projectID: project.id, conversationID: message.conversation_id, messageID: message.id })}>重试处理</button>}
-                          </p>}
+                          {message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason === 'message_too_long' &&
+                            <p role="alert" className="muted">{routingFailureText(message.routing_failure_reason)}</p>}
                           {message.task_id && <p className="muted">Task {message.task_id} · 状态 {task?.status ?? '未知'}
                             {task && Number.isSafeInteger(task.step_count) && task.step_count! > 0 && Number.isSafeInteger(task.completed_step_count) &&
                               <> · 已完成 {Math.min(task.completed_step_count!, task.step_count!)} / {task.step_count!} 步</>}

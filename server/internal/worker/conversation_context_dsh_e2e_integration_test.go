@@ -54,7 +54,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	window := 32_768
+	window := 16_384
 	model, err := store.CreateModelConnection(ctx, app.ModelConnectionRecord{ID: "p1234567", OwnerID: owner.ID,
 		Name: "Local conversation context E2E", BaseURL: "https://models.example.invalid/v1", ModelName: "synthetic-e2e",
 		ContextWindowTokens: &window, APIKeyCipher: modelKey})
@@ -192,9 +192,10 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 		if err != nil || !found {
 			t.Fatalf("route conversation message %q: found=%t err=%v", clientID, found, err)
 		}
-		var state string
-		if err := pool.QueryRow(ctx, `SELECT state FROM conversation_message_routes WHERE message_id=$1`, message.ID).Scan(&state); err != nil || state != "routed" {
-			t.Fatalf("message %q route state=%q err=%v", clientID, state, err)
+		var state, failureReason string
+		if err := pool.QueryRow(ctx, `SELECT state,failure_reason FROM conversation_message_routes WHERE message_id=$1`, message.ID).
+			Scan(&state, &failureReason); err != nil || state != "routed" {
+			t.Fatalf("message %q route state=%q failure_reason=%q err=%v", clientID, state, failureReason, err)
 		}
 		return message.ID
 	}
@@ -202,7 +203,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 		for cycle := 1; cycle <= 3; cycle++ {
 			for source := 1; source <= 2; source++ {
 				prefix := fmt.Sprintf("E2E source chat=%d cycle=%d source=%d confirmed durable fact. ", chatIndex, cycle, source)
-				content := prefix + strings.Repeat("x", 11*1024-len(prefix))
+				content := prefix + strings.Repeat("x", 4000-len(prefix))
 				acceptAndRoute(conversationID, content, fmt.Sprintf("context-source-%d-%d-%d", chatIndex, cycle, source))
 			}
 			acceptAndRoute(conversationID, fmt.Sprintf("E2E_COMPACTION_TRIGGER chat=%d cycle=%d", chatIndex, cycle),
@@ -266,7 +267,8 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, oldMainFe
 		}
 		bulkMessageIDs = append(bulkMessageIDs, message.ID)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied' WHERE id=ANY($1::text[])`, bulkMessageIDs); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied',
+created_at=clock_timestamp()-interval '1 hour' WHERE id=ANY($1::text[])`, bulkMessageIDs); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed' WHERE message_id=ANY($1::text[])`, bulkMessageIDs); err != nil {

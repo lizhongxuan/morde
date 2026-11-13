@@ -238,14 +238,16 @@ describe('Projects API integration', () => {
     await openProject();
     const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
     const otherMessage = (await screen.findByText(other.content)).closest<HTMLElement>('article')!;
-    expect(within(otherMessage).queryByRole('button', { name: '重试处理' })).not.toBeInTheDocument();
-    await user.click(within(ownMessage).getByRole('button', { name: '重试处理' }));
+    expect(within(otherMessage).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    await user.click(within(ownMessage).getByRole('button', { name: '重新处理这条消息' }));
     await screen.findByText('连接中断');
-    await user.click(within(ownMessage).getByRole('button', { name: '重试处理' }));
+    await user.click(within(ownMessage).getByRole('button', { name: '重新处理这条消息' }));
     await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
     expect(retry.mock.calls[0]).toEqual(retry.mock.calls[1]);
     expect(retry.mock.calls[0]).toEqual([project.id, projectConversation.id, own.id, expect.any(String), readyCapabilities.service_instance_id, owner.user_id]);
-    await screen.findByText('已请求重新处理消息。');
+    expect(await screen.findByText('正在重新处理消息')).toBeInTheDocument();
+    expect(screen.queryByText('已请求重新处理消息。')).not.toBeInTheDocument();
+    expect(within(ownMessage).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
   it('explains an oversized project message without offering an ineffective retry', async () => {
@@ -255,7 +257,7 @@ describe('Projects API integration', () => {
     await openProject();
     const explanation = await screen.findByText(/消息及上下文超过当前模型输入上限/);
     expect(explanation).toHaveTextContent('原文已保留；请缩短后重新发送');
-    expect(within(explanation.closest<HTMLElement>('article')!).queryByRole('button', { name: '重试处理' })).not.toBeInTheDocument();
+    expect(within(explanation.closest<HTMLElement>('article')!).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
   it('uses the capability-gated work-item query and idempotent claim endpoint', async () => {
@@ -376,6 +378,20 @@ describe('Projects API integration', () => {
     expect(within(message).getByText('上一位成员提交的提示')).toBeInTheDocument();
   });
 
+  it('shows duplicate project requests as associated with the original without a false confirmation state', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{
+      ...projectHistoryMessage, id: 'mduplicate1', task_id: undefined, duplicate_of_message_id: 'moriginal1',
+      related_task_id: task.id, routing_status: 'waiting_user', delivery_status: 'pending',
+    }]);
+    renderProjects();
+    await openProject();
+
+    const duplicate = await screen.findByRole('article', { name: '项目对话消息' });
+    expect(within(duplicate).getByText(`重复请求 · 原消息 moriginal1 · Task ${task.id} · 状态 ${task.status}`)).toBeInTheDocument();
+    expect(within(duplicate).queryByText('等待补充或确认')).not.toBeInTheDocument();
+    expect(within(duplicate).queryByRole('button', { name: '重试处理' })).not.toBeInTheDocument();
+  });
+
   it('shows completed Task step counts beside the related project message', async () => {
     vi.mocked(projectApi.tasks).mockResolvedValueOnce([{ ...task, step_count: 4, completed_step_count: 2 }]);
     vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{ ...projectHistoryMessage, task_id: task.id }]);
@@ -418,13 +434,15 @@ describe('Projects API integration', () => {
     expect(within(reply).queryByText('旧的分段内容。')).not.toBeInTheDocument();
   });
 
-  it('shows a project routing failure instead of an agent delivery status', async () => {
+  it('shows a retry action for a project routing failure without inline status or cause', async () => {
     vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{ ...projectHistoryMessage,
       task_id: undefined, routing_status: 'failed', delivery_status: 'pending' }]);
     renderProjects();
     await openProject();
     const message = await screen.findByRole('article', { name: '项目对话消息' });
-    expect(within(message).getByText('消息处理失败')).toBeInTheDocument();
+    expect(within(message).getByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
+    expect(within(message).queryByText('消息处理失败')).not.toBeInTheDocument();
+    expect(within(message).queryByText(/处理暂时不可用/)).not.toBeInTheDocument();
   });
 
   it('shows persisted streaming and interrupted project replies in their conversation order', async () => {

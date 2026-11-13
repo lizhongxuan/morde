@@ -93,7 +93,7 @@ func (s *Store) ResolveConversationRouteModel(ctx context.Context, claim app.Con
 
 func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.ConversationRouteModelFence, modelID string) error {
 	claim, value := fence.Claim, fence.Context
-	if value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content || value.ReferenceTaskID != claim.Input.ReferenceTaskID ||
+	if value.ActorID != claim.Message.ActorID || value.ReferenceTaskID != claim.Input.ReferenceTaskID ||
 		value.ModelID != modelID || len(value.History) > 100 || len(value.Candidates) > 100 {
 		return domain.InvalidArgument("route_context", "route model context is invalid")
 	}
@@ -247,19 +247,26 @@ func (s *Store) PrepareConversationRouteModelCall(ctx context.Context, call app.
 		var priorVersion time.Time
 		var dispatchVersion int64
 		phase := conversationRouteModelPhase(call.Route.Context)
-		err := tx.QueryRow(ctx, `SELECT state,call_id,model_id,request_digest,decision,model_version,COALESCE(project_id,''),dispatch_lease_owner,dispatch_lease_version,phase
+		attempt := call.Route.Context.RouteAttempt
+		if call.Route.Context.ResultReview != nil {
+			attempt = 0
+		}
+		var priorAttempt int64
+		err := tx.QueryRow(ctx, `SELECT state,call_id,model_id,request_digest,decision,model_version,COALESCE(project_id,''),dispatch_lease_owner,dispatch_lease_version,phase,attempt
 FROM conversation_route_model_calls WHERE message_id=$1 AND actor_id=$2
- AND (phase=$3 OR state IN ('reserved','dispatched','unknown'))
-ORDER BY (state IN ('reserved','dispatched','unknown')) DESC,(phase=$3) DESC LIMIT 1 FOR UPDATE`,
-			call.Route.Claim.Message.ID, call.OwnerID, phase).
-			Scan(&state, &priorCall, &priorModel, &digest, &result, &priorVersion, &priorProject, &dispatchOwner, &dispatchVersion, &priorPhase)
-		if err == nil && priorPhase != phase && state == "reserved" {
+ AND (state IN ('reserved','dispatched') OR (phase=$3 AND attempt=$4) OR (state='unknown' AND attempt=$4))
+ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DESC,updated_at DESC LIMIT 1 FOR UPDATE`,
+			call.Route.Claim.Message.ID, call.OwnerID, phase, attempt).
+			Scan(&state, &priorCall, &priorModel, &digest, &result, &priorVersion, &priorProject, &dispatchOwner, &dispatchVersion, &priorPhase, &priorAttempt)
+		if err == nil && state == "reserved" && (priorPhase != phase || priorAttempt != attempt || priorProject != call.ProjectID ||
+			priorCall != call.CallID || priorModel != call.ModelID || !bytes.Equal(digest, call.RequestDigest) ||
+			!priorVersion.Equal(call.ConnectionVersion)) {
 			if err := releaseRouteReservationInTx(ctx, tx, call.OwnerID, call.Route.Claim.Message.ID); err != nil {
 				return err
 			}
 			err = pgx.ErrNoRows
 		}
-		legacyPrior := err == nil && priorPhase == phase && call.LegacyCallID != "" && priorCall == call.LegacyCallID &&
+		legacyPrior := err == nil && priorPhase == phase && priorAttempt == 0 && attempt == 0 && call.LegacyCallID != "" && priorCall == call.LegacyCallID &&
 			priorProject == call.ProjectID && priorModel == call.ModelID && bytes.Equal(digest, call.LegacyDigest) &&
 			priorVersion.Equal(call.ConnectionVersion)
 		if legacyPrior && state == "reserved" {
@@ -288,8 +295,27 @@ ORDER BY (state IN ('reserved','dispatched','unknown')) DESC,(phase=$3) DESC LIM
 			}
 			if legacyPrior && state == "settled" {
 				var value app.ConversationRouteDecision
-				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context.Candidates) {
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context) {
 					return domain.NewError(domain.CodeInvalidState, "settled legacy route decision is invalid")
+				}
+				if staleAttemptZeroRouteDecision(value, call.Route.Context) {
+					return domain.NewError(domain.CodeConflict, "legacy route result predates current request candidates")
+				}
+				decision = &value
+				return nil
+			}
+			if state == "settled" && phase == "normal" && attempt == 0 && priorAttempt == 0 && priorPhase == phase &&
+				strings.HasPrefix(call.CallID, "mdl_") && call.LegacyCallID != "" && priorCall == call.CallID &&
+				priorProject == call.ProjectID && priorModel == call.ModelID && priorVersion.Equal(call.ConnectionVersion) {
+				if err := checkModelCaller(ctx, tx, call); err != nil {
+					return err
+				}
+				var value app.ConversationRouteDecision
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context) {
+					return domain.NewError(domain.CodeInvalidState, "settled coordinator route decision is invalid")
+				}
+				if staleAttemptZeroRouteDecision(value, call.Route.Context) {
+					return domain.NewError(domain.CodeConflict, "legacy coordinator result predates current request candidates")
 				}
 				decision = &value
 				return nil
@@ -324,11 +350,11 @@ ORDER BY (state IN ('reserved','dispatched','unknown')) DESC,(phase=$3) DESC LIM
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO conversation_route_model_calls
-(message_id,service_instance_id,owner_id,actor_id,conversation_id,project_id,source,call_id,request_digest,model_id,model_version,state,phase)
-VALUES ($1,$2::uuid,$3,$4,$5,NULLIF($6,''),'route',$7,$8,$9,$10,'reserved',$11)`,
+(message_id,service_instance_id,owner_id,actor_id,conversation_id,project_id,source,call_id,request_digest,model_id,model_version,state,phase,attempt)
+VALUES ($1,$2::uuid,$3,$4,$5,NULLIF($6,''),'route',$7,$8,$9,$10,'reserved',$11,$12)`,
 			call.Route.Claim.Message.ID, call.Route.Claim.ServiceInstanceID, call.Route.Claim.Message.OwnerID,
 			call.OwnerID, call.Route.Claim.Message.ConversationID, call.ProjectID, call.CallID,
-			call.RequestDigest, call.ModelID, call.ConnectionVersion, phase)
+			call.RequestDigest, call.ModelID, call.ConnectionVersion, phase, attempt)
 		if err != nil {
 			return fmt.Errorf("reserve route model call: %w", err)
 		}
@@ -621,7 +647,7 @@ WHERE r.message_id=$1 AND r.actor_id=$2 AND r.lease_owner=$3 AND r.lease_version
 // worker's lease expired after dispatch.
 func (s *Store) SettleConversationRouteModelCall(ctx context.Context, call app.ModelCallReservation, decision *app.ConversationRouteDecision, usage app.ModelUsage, unknown bool) error {
 	if call.Source != app.ModelCallRoute || call.Route == nil || !domain.ValidUserID(call.OwnerID) ||
-		(!unknown && (decision == nil || !validStoredRouteDecision(*decision, call.Route.Context.Candidates) || !usage.Known || usage.InputTokens < 0 || usage.OutputTokens < 0 ||
+		(!unknown && (decision == nil || !validStoredRouteDecision(*decision, call.Route.Context) || !usage.Known || usage.InputTokens < 0 || usage.OutputTokens < 0 ||
 			usage.InputTokens > math.MaxInt64-usage.OutputTokens)) {
 		return domain.InvalidArgument("route_model", "route model settlement is invalid")
 	}
@@ -753,28 +779,50 @@ WHERE message_id=$1 AND call_id=$3 AND state IN ('dispatched','unknown')`, call.
 	return nil
 }
 
-func validStoredRouteDecision(value app.ConversationRouteDecision, candidates []app.ConversationRouteCandidate) bool {
+func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext) bool {
 	if !app.ValidConversationRouteModelOutput(value.ModelOutput) {
 		return false
 	}
+	if value.InvalidOutput {
+		return value.Action == app.ConversationRouteClarify && value.TaskID == "" && value.TargetMessageID == "" &&
+			!value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
+			value.Question != "" && utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
+	}
 	switch value.Action {
 	case app.ConversationRouteNew:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && value.Reply == "" &&
-			app.ValidConversationRouteDependencyIDs(value.DependencyTaskIDs, candidates)
+		return value.TaskID == "" && value.TargetMessageID == "" && (!value.ExplicitNew || app.ConversationRouteHasExplicitNewIntent(context.Content)) &&
+			value.ExpectedRevision == 0 && value.Question == "" && value.Reply == "" &&
+			app.ValidConversationRouteDependencyIDs(value.DependencyTaskIDs, context.Candidates)
+	case app.ConversationRouteJoin:
+		return value.TaskID == "" && value.TargetMessageID != "" && !value.ExplicitNew && value.ExpectedRevision == 0 &&
+			value.Question == "" && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
+			app.ValidConversationRouteJoinTarget(value.TargetMessageID, context.RequestCandidates)
 	case app.ConversationRouteReply:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && len(value.DependencyTaskIDs) == 0 &&
+		return value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Question == "" && len(value.DependencyTaskIDs) == 0 &&
 			app.ValidConversationRouteReply(value.Reply)
 	case app.ConversationRouteClarify:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 && value.Question != "" &&
+		return value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 && value.Question != "" &&
 			utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if value.Question != "" || value.Reply != "" || len(value.DependencyTaskIDs) != 0 {
+		if value.TargetMessageID != "" || value.ExplicitNew || value.Question != "" || value.Reply != "" || len(value.DependencyTaskIDs) != 0 {
 			return false
 		}
-		for _, candidate := range candidates {
+		for _, candidate := range context.Candidates {
 			if candidate.TaskID == value.TaskID && candidate.Revision == value.ExpectedRevision {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func staleAttemptZeroRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext) bool {
+	if value.Action != app.ConversationRouteNew && value.Action != app.ConversationRouteReply {
+		return false
+	}
+	for _, candidate := range context.RequestCandidates {
+		if app.ValidConversationRouteJoinTarget(candidate.MessageID, context.RequestCandidates) {
+			return true
 		}
 	}
 	return false
@@ -784,7 +832,7 @@ func (s *Store) RecoverConversationCoordinatorModelOutput(ctx context.Context, f
 	claim := fence.Claim
 	value := fence.Context
 	if ctx == nil || !domain.ValidModelConnectionID(value.ModelID) || value.ActorID != claim.Message.ActorID ||
-		value.Content != claim.Message.Content || value.ReferenceTaskID != claim.Input.ReferenceTaskID {
+		value.ReferenceTaskID != claim.Input.ReferenceTaskID {
 		return "", domain.InvalidArgument("route_context", "coordinator model recovery fence is invalid")
 	}
 	var output string
@@ -794,9 +842,13 @@ func (s *Store) RecoverConversationCoordinatorModelOutput(ctx context.Context, f
 		}
 		var state, modelID string
 		var encoded []byte
+		attempt := value.RouteAttempt
+		if value.ResultReview != nil {
+			attempt = 0
+		}
 		err := tx.QueryRow(ctx, `SELECT state,model_id,decision FROM conversation_route_model_calls
-WHERE message_id=$1 AND actor_id=$2 AND phase=$3`, claim.Message.ID, claim.Message.ActorID,
-			conversationRouteModelPhase(value)).Scan(&state, &modelID, &encoded)
+WHERE message_id=$1 AND actor_id=$2 AND phase=$3 AND attempt=$4`, claim.Message.ID, claim.Message.ActorID,
+			conversationRouteModelPhase(value), attempt).Scan(&state, &modelID, &encoded)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "coordinator model result is unavailable")
 		}
@@ -805,8 +857,11 @@ WHERE message_id=$1 AND actor_id=$2 AND phase=$3`, claim.Message.ID, claim.Messa
 		}
 		var decision app.ConversationRouteDecision
 		if state != "settled" || modelID != value.ModelID || json.Unmarshal(encoded, &decision) != nil ||
-			!validStoredRouteDecision(decision, value.Candidates) {
+			!validStoredRouteDecision(decision, value) {
 			return domain.NewError(domain.CodeInvalidState, "coordinator model result is not safely recoverable")
+		}
+		if attempt == 0 && staleAttemptZeroRouteDecision(decision, value) {
+			return domain.NewError(domain.CodeConflict, "legacy coordinator result predates current request candidates")
 		}
 		output = decision.ModelOutput
 		if output == "" {

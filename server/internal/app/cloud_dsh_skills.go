@@ -37,17 +37,24 @@ type cloudDSHSkill struct {
 }
 
 var cloudDSHSkillCatalog = []cloudDSHSkill{
-	{id: "amap", version: "1", description: "Find places, routes, travel times, distances, and weather in China through an authorized Amap connector."},
-	{id: "compare-options", version: "1", description: "Compare options against the user's criteria and recommend one with sourced tradeoffs."},
-	{id: "feishu", version: "1", description: "Use an authorized Feishu connector for calendar, people, groups, tasks, and documents."},
-	{id: "inbox-triage", version: "1", description: "Sort recent email into reply, waiting, todo, and ignore; prepare drafts without sending."},
-	{id: "kuaidi100", version: "1", description: "Track a parcel or estimate courier shipping through an authorized Kuaidi100 connector."},
-	{id: "meeting-prep", version: "1", description: "Prepare a meeting brief from the user's authorized calendar, mail, and workspace tools."},
-	{id: "phone-messages", version: "1", description: "Help review or draft phone messages only when an authorized phone interface is available."},
-	{id: "tencent-meeting", version: "1", description: "Manage Tencent Meeting information through an authorized connector or available tool."},
-	{id: "train-tickets", version: "2", description: "Find China train routes and options; booking requires explicit user direction and an available authorized phone flow."},
-	{id: "trip-plan", version: "1", description: "Plan a multi-day trip with itinerary, packing list, budget, and calendar checks."},
-	{id: "weekly-review", version: "1", description: "Review the past week and plan the next one using authorized calendar, mail, and workspace tools."},
+	{id: "amap", version: "1", description: "Find China places, routes, travel times, and weather when authorized tools are available."},
+	{id: "app-creation", version: "1", description: "Create app source in the current Workspace; run it only through this Task's authorized Host tools.", sourceRef: "server/internal/app/cloud_dsh_skills/app-creation.md"},
+	{id: "compare-options", version: "1", description: "Compare options against the user's criteria and source requirements."},
+	{id: "feishu", version: "1", description: "Use available Feishu tools for work information."},
+	{id: "inbox-triage", version: "1", description: "Triage email and prepare drafts; sending is separate."},
+	{id: "knowledge-organization", version: "1", description: "Find and organize notes in the current authorized Workspace using verified files.", sourceRef: "server/internal/app/cloud_dsh_skills/knowledge-organization.md"},
+	{id: "kuaidi100", version: "1", description: "Track parcels when authorized tools are available."},
+	{id: "markdown-docs", version: "1", description: "Create and deliver verified Markdown artifacts.", sourceRef: "server/internal/app/cloud_dsh_skills/markdown-docs.md"},
+	{id: "meeting-follow-up", version: "1", description: "Turn an authorized meeting record into decisions, actions, and open questions in the current Workspace.", sourceRef: "server/internal/app/cloud_dsh_skills/meeting-follow-up.md"},
+	{id: "meeting-prep", version: "1", description: "Prepare from authorized calendar, mail, and Workspace sources."},
+	{id: "phone-messages", version: "1", description: "Review or draft messages through an authorized phone interface."},
+	{id: "task-management", version: "1", description: "Organize commitments in the current authorized Workspace without confusing them with active Morde Tasks.", sourceRef: "server/internal/app/cloud_dsh_skills/task-management.md"},
+	{id: "tencent-meeting", version: "1", description: "Use authorized Tencent Meeting tools if available."},
+	{id: "train-tickets", version: "2", description: "Find train options; booking needs explicit approval and available phone tools."},
+	{id: "translation", version: "1", description: "Translate user-provided or authorized text faithfully and save Markdown only to the current Workspace when requested.", sourceRef: "server/internal/app/cloud_dsh_skills/translation.md"},
+	{id: "trip-plan", version: "1", description: "Plan travel with an itinerary, packing list, budget, and available calendar tools."},
+	{id: "weekly-review", version: "1", description: "Review and plan using available calendar, mail, and Workspace tools."},
+	{id: "wide-research", version: "1", description: "Research independent inputs with bounded DSH child Agents and sources.", sourceRef: "server/internal/app/cloud_dsh_skills/wide-research.md"},
 }
 
 // CloudDSHSkillMetadataForID exposes only metadata for the fixed embedded catalog.
@@ -68,7 +75,9 @@ func CloudDSHSkillMetadataForID(id string) (CloudDSHSkillMetadata, bool) {
 func cloudDSHSkillForID(id string) (cloudDSHSkill, bool) {
 	for _, skill := range cloudDSHSkillCatalog {
 		if skill.id == id {
-			skill.sourceRef = "clients/nanoMuse/nanomuse/skills/builtin/" + skill.id + "/SKILL.md"
+			if skill.sourceRef == "" {
+				skill.sourceRef = "clients/nanoMuse/nanomuse/skills/builtin/" + skill.id + "/SKILL.md"
+			}
 			skill.resource = "cloud_dsh_skills/" + skill.id + ".md"
 			return skill, true
 		}
@@ -104,7 +113,7 @@ func cloudDSHSkillReadDefinition() AgentToolDefinition {
 	})
 	return AgentToolDefinition{
 		ModelTool: ModelTool{Name: cloudDSHSkillReadToolName,
-			Description: "Load a reviewed Morde skill only when the request matches its purpose. Skills do not add permissions; use only this task's authorized tools and Workspace. Available: " + strings.Join(descriptions, "; "),
+			Description: "Load a reviewed Morde skill only when its purpose matches. Skills do not add permissions; use this Task's authorized tools and Workspace. Available: " + strings.Join(descriptions, "; "),
 			Parameters:  parameters},
 		RequiredScope: identity.ScopeTaskRead,
 	}
@@ -187,10 +196,14 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	if recovering && checkpointOutput != nil && *checkpointOutput != string(output) {
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed Morde skill output changed")
 	}
+	step, toolCall, err := b.prepareTaskToolStep(ctx, current, step)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
 	if _, err := b.store.CommitTaskProgress(ctx, TaskProgress{
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		Status: task.StatusRunning, CurrentStep: step.ID, Result: current.Result, Usage: usage,
-		Steps: []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: "task.step", Payload: payload},
+		Steps: []task.Step{step}, ToolCall: toolCall, Event: task.Event{TaskID: current.ID, Type: "task.step", Payload: payload},
 		CloudDSHSkillRead: &commit,
 	}); err != nil {
 		return AgentToolResult{}, err

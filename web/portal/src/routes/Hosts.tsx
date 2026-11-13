@@ -323,18 +323,19 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
   const selectedWorkspace = bindableWorkspaces.find((workspace) => workspace.id === workspaceID);
   const runtimeState = host.workspace_runtime_online === true ? '在线' : host.workspace_runtime_online === false ? '离线' : '未知';
   return <article className="host-card host-card-compact" id={`host-${host.id}`}>
-    <div className="host-card-heading"><div><h2>{host.name || '未命名主机'}</h2><p className="muted mono">{host.id} · {host.template_id}</p></div><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
-    <div className="host-quick-facts" aria-label="电脑概要">
-      <span>{formatCpu(host.resources?.cpu_limit_milli)} / {formatMemory(host.resources?.mem_limit_mib)}</span>
-      <span>到期 {formatDate(host.expires_at)}</span>
-      <span>{host.workspaces.length ? host.workspaces.map((binding) => binding.workspace.name || binding.workspace.id).join('、') : '暂无文件空间'}</span>
-    </div>
+    <div className="host-card-heading"><h2>{host.name || '未命名主机'}</h2><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
     <div className="host-actions host-primary-actions">
-      <Link className="button button-secondary" to={`/workspaces?host=${encodeURIComponent(host.id)}`}>文件与版本</Link>
       <button type="button" className="button button-primary" onClick={onEnter} disabled={!canEnter || host.state !== 'running' || busy || host.control_state === 'taking_over' || host.control_state === 'returning'} aria-label={`${host.control_state === 'user' ? '操作' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看'}云端电脑 ${name}`}>{host.control_state === 'user' ? '操作电脑' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看电脑'}</button>
       <details className="host-more-actions">
         <summary aria-label={`更多操作 ${name}`}>更多操作</summary>
         <div>
+          <Link className="button button-secondary" to={`/workspaces?host=${encodeURIComponent(host.id)}`}>文件与版本</Link>
+          {!canEnter && <p className="host-action-reason" id={enterHelpID} role="status">{enterReason}{enterReason?.startsWith('请先') && <> <Link to={`/workspaces?host=${encodeURIComponent(host.id)}`}>管理电脑文件</Link></>}</p>}
+          <button type="button" className="button button-secondary" aria-controls={`host-details-${host.id}`} aria-expanded={detailsOpen} onClick={(event) => {
+            setDetailsOpen((value) => !value);
+            const actions = event.currentTarget.closest<HTMLDetailsElement>('.host-more-actions');
+            if (actions) { actions.open = false; actions.querySelector('summary')?.focus(); }
+          }}>{detailsOpen ? '收起详情与管理' : '详情与管理'}</button>
           <button type="button" className="button button-secondary" onClick={onRenew} disabled={host.state !== 'running' || busy} aria-label={`续期主机 ${name}`}>续期</button>
           {host.state === 'running' && <button type="button" className="button button-secondary" onClick={onRelease} disabled={busy} aria-label={`释放运行资源 ${name}`}>释放运行资源</button>}
           {host.state === 'stopped' && <button type="button" className="button button-primary" onClick={onRestore} disabled={busy || !workspaceRestorable} aria-label={`恢复云端电脑 ${name}`} title={!workspaceRestorable ? '恢复前需要关联并准备好云端文件' : undefined}>恢复</button>}
@@ -345,9 +346,7 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
         </div>
       </details>
     </div>
-    {!canEnter && <details className="host-action-reason"><summary>查看无法进入的原因</summary><p id={enterHelpID}>{enterReason}{enterReason?.startsWith('请先') && <> <Link to={`/workspaces?host=${encodeURIComponent(host.id)}`}>管理电脑文件</Link></>}</p></details>}
-    <details className="host-secondary-details" open={detailsOpen}>
-      <summary onClick={(event) => { event.preventDefault(); setDetailsOpen((value) => !value); }}>资源、文件与管理</summary>
+    <section className="host-secondary-details" id={`host-details-${host.id}`} aria-label="详情与管理" hidden={!detailsOpen}>
       {detailsOpen && <div className="host-secondary-content">
     <div className="host-facts">
       <div><span>规格</span><strong>{formatCpu(host.resources?.cpu_limit_milli)} / {formatMemory(host.resources?.mem_limit_mib)}</strong></div>
@@ -379,7 +378,7 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
     {canEnter && <HostMemberManager hostId={host.id} />}
     {canEnter && host.state === 'running' && <HostControlPanel host={host} canControl canReleaseAnyLease />}
       </div>}
-    </details>
+    </section>
   </article>;
 }
 

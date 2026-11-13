@@ -42,6 +42,10 @@ type TaskFileFetchQueryService interface {
 	GetTaskFileFetch(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
 }
 
+type TaskStepDetailService interface {
+	GetStepDetail(context.Context, identity.Principal, string, string) (app.TaskStepDetail, error)
+}
+
 type TaskRevisionFencedActionService interface {
 	RequestActionWithRevisionFence(context.Context, identity.Principal, string, task.Action, task.Status, *app.TaskActionRevisionFence, string) (app.TaskActionResult, error)
 }
@@ -125,6 +129,7 @@ type taskResponse struct {
 	ResultMessagePublished bool                              `json:"result_message_published,omitempty"`
 	WaitingReason          *string                           `json:"waiting_reason"`
 	Steps                  []taskStepResponse                `json:"steps"`
+	Agents                 []taskAgentResponse               `json:"agents,omitempty"`
 	BatchItems             []taskBatchItemResponse           `json:"batch_items"`
 	Artifacts              []taskArtifactResponse            `json:"artifacts"`
 	PendingRequest         *taskPendingRequestResponse       `json:"pending_request"`
@@ -221,6 +226,17 @@ func validTaskText(value string, maxRunes int) bool {
 	return utf8.ValidString(value) && utf8.RuneCountInString(value) > 0 && utf8.RuneCountInString(value) <= maxRunes
 }
 
+func optionalTaskText(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func validTaskAgentID(value string) bool {
+	return validTaskText(value, 128) && !strings.ContainsRune(value, '\x00')
+}
+
 func validTaskActionExpectedStatus(action task.Action, status task.Status) bool {
 	switch action {
 	case task.ActionPause:
@@ -247,13 +263,28 @@ type taskUsageResponse struct {
 }
 
 type taskStepResponse struct {
-	ID        string          `json:"id"`
-	Sequence  int64           `json:"sequence"`
-	Kind      string          `json:"kind"`
-	Status    task.StepStatus `json:"status"`
-	Title     string          `json:"title"`
-	Summary   string          `json:"summary"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID           string          `json:"id"`
+	Sequence     int64           `json:"sequence"`
+	Kind         string          `json:"kind"`
+	Status       task.StepStatus `json:"status"`
+	Title        string          `json:"title"`
+	Summary      string          `json:"summary"`
+	AgentID      *string         `json:"agent_id,omitempty"`
+	TaskRevision *int64          `json:"task_revision,omitempty"`
+	ToolName     *string         `json:"tool_name,omitempty"`
+	Phase        *string         `json:"phase,omitempty"`
+	DetailState  string          `json:"detail_state"`
+	CreatedAt    time.Time       `json:"created_at"`
+}
+
+type taskAgentResponse struct {
+	ID           string     `json:"id"`
+	ParentID     *string    `json:"parent_id"`
+	StepID       *string    `json:"step_id"`
+	TaskRevision int64      `json:"task_revision"`
+	Role         string     `json:"role"`
+	Status       string     `json:"status"`
+	ObservedAt   *time.Time `json:"observed_at"`
 }
 
 type taskBatchItemResponse struct {
@@ -342,6 +373,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks", h.submitTask(service))
 	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
+	if detailService, ok := service.(TaskStepDetailService); ok {
+		group.GET("/tasks/:id/steps/:step_id", h.getTaskStepDetail(detailService))
+	}
 	if fetchService, ok := service.(TaskFileFetchQueryService); ok {
 		group.GET("/tasks/:id/file-fetches/:fetch_id", h.getTaskFileFetch(fetchService))
 	}
@@ -351,6 +385,37 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+func (h *api) getTaskStepDetail(service TaskStepDetailService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("request", "task step detail does not accept a query string or body"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		stepID, ok := safeIDParam(c, "step_id", "step_id", domain.ValidStepID)
+		if !ok {
+			return
+		}
+		value, err := service.GetStepDetail(c.Request.Context(), principal, taskID, stepID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.JSON(http.StatusOK, value)
+	}
 }
 
 func (h *api) registerTaskWorkbenchObservationTickets(group *gin.RouterGroup, service TaskWorkbenchObservationTicketService) {
@@ -875,7 +940,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
 		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
-		Steps: make([]taskStepResponse, 0, len(value.Steps)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
+		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
 		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt,
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
@@ -961,10 +1026,35 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			!validStepKind(step.Kind) || utf8.RuneCountInString(step.Summary) > 2000 || step.CreatedAt.IsZero() {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
+		detailState := step.DetailState
+		if detailState == "" {
+			detailState = "not_recorded"
+		}
+		if detailState != "not_recorded" && detailState != "available" && detailState != "expired" && detailState != "restricted" {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		if step.AgentSessionID != "" && !validTaskAgentID(step.AgentSessionID) ||
+			(step.TaskRevision != nil && *step.TaskRevision < 0) || (step.ToolName != "" && !validTaskText(step.ToolName, 128)) ||
+			(step.Phase != "" && !validTaskText(step.Phase, 64)) {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
 		response.Steps = append(response.Steps, taskStepResponse{
 			ID: step.ID, Sequence: step.Sequence, Kind: step.Kind, Status: step.Status, Title: step.Title,
-			Summary: step.Summary, CreatedAt: step.CreatedAt,
+			Summary: step.Summary, CreatedAt: step.CreatedAt, AgentID: optionalTaskText(step.AgentSessionID), TaskRevision: step.TaskRevision,
+			ToolName: optionalTaskText(step.ToolName), Phase: optionalTaskText(step.Phase), DetailState: detailState,
 		})
+	}
+	for _, agent := range value.Agents {
+		if !validTaskAgentID(agent.ID) || (agent.ParentID != "" && !validTaskAgentID(agent.ParentID)) ||
+			(agent.StepID != "" && !domain.ValidStepID(agent.StepID)) || agent.TaskRevision < 0 ||
+			(agent.Role != "main" && agent.Role != "subagent") ||
+			(agent.Status != "running" && agent.Status != "idle" && agent.Status != "unknown") ||
+			(agent.ObservedAt != nil && agent.ObservedAt.IsZero()) || (agent.Role == "main" && (agent.ParentID != "" || agent.StepID != "")) ||
+			(agent.Role == "subagent" && (agent.ParentID == "" || agent.StepID == "")) {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.Agents = append(response.Agents, taskAgentResponse{ID: agent.ID, ParentID: optionalTaskText(agent.ParentID),
+			StepID: optionalTaskText(agent.StepID), TaskRevision: agent.TaskRevision, Role: agent.Role, Status: agent.Status, ObservedAt: agent.ObservedAt})
 	}
 	for _, item := range value.BatchItems {
 		if !domain.ValidBatchItemID(item.ID) || item.TaskID != value.Task.ID || !validBatchStatusResponse(item.Status) || item.Attempt < 1 {

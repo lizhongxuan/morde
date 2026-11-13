@@ -6,6 +6,11 @@ import { projectApi } from './project-api';
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+  it('builds a same-origin URL for a Task artifact download', () => {
+    expect(portalApi.taskArtifactContentURL('q1234567', 'a7654321'))
+      .toBe('/api/tasks/q1234567/artifacts/a7654321/content');
+  });
+
   it('normalizes empty non-ready main-conversation IDs from the API contract', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'selection_required', conversation_id: '', version: 0 })));
 
@@ -276,18 +281,41 @@ describe('typed Portal API client', () => {
 
   it('sends a stable idempotency key for a metered model connection check', async () => {
     const requests: Request[] = [];
+    const responses = [
+      { text: true, tools: false, vision: false, text_stream: false },
+      { text: false, tools: true, vision: false, text_stream: false },
+    ];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(new Request(input, init));
-      return Response.json({ text: true, tools: false, vision: false, text_stream: false });
+      return Response.json(responses[requests.length - 1]);
     }));
 
-    await portalApi.checkModelConnection('p1234567', 'model-probe-key-001');
+    await expect(portalApi.checkModelConnection('p1234567', 'model-probe-key-001')).resolves.toEqual({
+      text: true, tools: true, vision: false, text_stream: false,
+    });
 
     expect(requests.map((request) => new URL(request.url).pathname)).toEqual(['/api/model-connections/p1234567/check', '/api/model-connections/p1234567/check']);
     expect(requests[0]!.headers.get('Idempotency-Key')).toBe('model-probe-key-001');
     expect(requests[1]!.headers.get('Idempotency-Key')).not.toBe(requests[0]!.headers.get('Idempotency-Key'));
     expect(await requests[0]!.json()).toEqual({ capability: 'text' });
     expect(await requests[1]!.json()).toEqual({ capability: 'tools' });
+  });
+
+  it('surfaces a failed tool capability probe after text succeeds', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      if (requests.length === 1) return Response.json({ text: true, tools: false, vision: false, text_stream: false });
+      return Response.json({ error: { code: 'upstream_error', message: 'tool probe failed' } }, { status: 502 });
+    }));
+
+    await expect(portalApi.checkModelConnection('p1234567', 'model-probe-key-001')).rejects.toMatchObject({
+      code: 'upstream_error', status: 502,
+    });
+    expect(requests).toHaveLength(2);
+    expect(await requests[0]!.json()).toEqual({ capability: 'text' });
+    expect(await requests[1]!.json()).toEqual({ capability: 'tools' });
+    expect(requests[1]!.headers.get('Idempotency-Key')).not.toBe(requests[0]!.headers.get('Idempotency-Key'));
   });
 
   it('checks streaming separately with its own idempotency key', async () => {

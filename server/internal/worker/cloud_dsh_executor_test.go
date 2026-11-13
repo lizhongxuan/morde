@@ -801,6 +801,61 @@ func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T)
 	}
 }
 
+type cloudDSHTestActivityRecorder struct {
+	observations []app.TaskAgentActivityObservation
+	applied      bool
+	err          error
+}
+
+func (r *cloudDSHTestActivityRecorder) RecordTaskAgentActivity(_ context.Context, observation app.TaskAgentActivityObservation) (bool, error) {
+	r.observations = append(r.observations, observation)
+	return r.applied, r.err
+}
+
+func TestCloudDSHExecutorRecordsRootAgentStatusObservations(t *testing.T) {
+	executor, supervisor, _, _, _, value := cloudDSHFixture(t)
+	recorder := &cloudDSHTestActivityRecorder{applied: true}
+	executor.options.AgentActivity = recorder
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("candidate result = %v", err)
+	}
+	if len(recorder.observations) != 3 {
+		t.Fatalf("observations = %#v, want initial, running and idle", recorder.observations)
+	}
+	for index, expected := range []string{"idle", "running", "idle"} {
+		observation := recorder.observations[index]
+		if observation.Fence != supervisor.launch.Fence || observation.Status != expected ||
+			observation.ObservationSequence != int64(index+1) {
+			t.Fatalf("observation %d = %#v", index, observation)
+		}
+	}
+}
+
+func TestCloudDSHExecutorDoesNotTreatUnrecordedAgentStatusAsTaskCompletion(t *testing.T) {
+	executor, _, _, _, _, value := cloudDSHFixture(t)
+	recorder := &cloudDSHTestActivityRecorder{}
+	executor.options.AgentActivity = recorder
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("candidate result with stale observations = %v", err)
+	}
+	if len(recorder.observations) == 0 {
+		t.Fatal("no observation reached the recorder")
+	}
+}
+
+func TestCloudDSHExecutorStopsWhenAgentStatusPersistenceFails(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	persistErr := errors.New("activity storage unavailable")
+	recorder := &cloudDSHTestActivityRecorder{err: persistErr}
+	executor.options.AgentActivity = recorder
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, persistErr) {
+		t.Fatalf("activity persistence error = %v", err)
+	}
+	if len(recorder.observations) != 1 || len(models.calls) != 0 {
+		t.Fatalf("observations=%d model calls=%d", len(recorder.observations), len(models.calls))
+	}
+}
+
 func TestCloudDSHExecutorUsesTextOnlyModelWithoutRegisteringTools(t *testing.T) {
 	executor, _, _, _, models, value := cloudDSHFixture(t)
 	value.InitiatorID = "u2345678"

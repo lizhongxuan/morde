@@ -190,7 +190,7 @@ func (s *ModelGatewayService) RecoverConversationCoordinatorModelOutput(ctx cont
 	if !ok {
 		return "", domain.NewError(domain.CodeUnsupported, "conversation coordinator result recovery is unavailable")
 	}
-	if ctx == nil || value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content ||
+	if ctx == nil || value.ActorID != claim.Message.ActorID || !conversationRouteContextMatchesClaim(value, claim) ||
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) {
 		return "", domain.InvalidArgument("route_context", "coordinator recovery context is invalid")
 	}
@@ -212,6 +212,7 @@ func conversationRouteCallDigest(claim ConversationRouteClaim, value Conversatio
 		ConversationID    string
 		ActorID           string
 		ModelID           string
+		RouteAttempt      int64 `json:"route_attempt,omitempty"`
 		ReviewAttempt     int64 `json:"review_attempt,omitempty"`
 		Instructions      string
 		Input             []ModelInput
@@ -221,7 +222,7 @@ func conversationRouteCallDigest(claim ConversationRouteClaim, value Conversatio
 		History           []historyEvidence
 		Candidates        []ConversationRouteCandidate
 	}{claim.ServiceInstanceID, claim.Message.ID, claim.Message.ConversationID, claim.Message.ActorID,
-		value.ModelID, conversationRouteRetryAttempt(value), request.Instructions, request.Input, request.MaxOutputTokens,
+		value.ModelID, conversationRouteCallAttempt(value), conversationRouteRetryAttempt(value), request.Instructions, request.Input, request.MaxOutputTokens,
 		request.ReasoningEffort, request.DisableThinking, history, value.Candidates})
 	if err != nil {
 		return nil, "", err
@@ -235,6 +236,56 @@ func conversationRouteRetryAttempt(value ConversationRouteContext) int64 {
 		return value.ResultReview.RetryAttempt
 	}
 	return 0
+}
+
+func conversationRouteCallAttempt(value ConversationRouteContext) int64 {
+	if value.ResultReview != nil {
+		return 0
+	}
+	return value.RouteAttempt
+}
+
+func conversationRouteContextMatchesClaim(value ConversationRouteContext, claim ConversationRouteClaim) bool {
+	if value.Content == claim.Message.Content {
+		return true
+	}
+	const aggregatePrefix = "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n"
+	const aggregateSeparator = "\n\n--- 用户补充 ---\n\n"
+	if !strings.HasPrefix(value.Content, aggregatePrefix) {
+		return false
+	}
+	content := strings.TrimPrefix(value.Content, aggregatePrefix)
+	first := strings.SplitN(content, aggregateSeparator, 2)[0]
+	return first == claim.Message.Content
+}
+
+func legacyConversationRouteModelRequest(value ConversationRouteContext, request ModelRequest) (ModelRequest, error) {
+	if value.ResultReview != nil || len(request.Input) != 1 || request.Input[0].Type != "message" {
+		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request is invalid")
+	}
+	var input struct {
+		Summary              map[string]any               `json:"summary,omitempty"`
+		Message              string                       `json:"message"`
+		ReferenceTime        string                       `json:"reference_time,omitempty"`
+		TimeZone             string                       `json:"time_zone,omitempty"`
+		TimeZoneProvided     bool                         `json:"time_zone_provided"`
+		ReferenceTaskID      string                       `json:"reference_task_id,omitempty"`
+		ReferenceUnavailable bool                         `json:"reference_unavailable,omitempty"`
+		PreviousUnresolved   bool                         `json:"previous_unresolved,omitempty"`
+		PreviousMissing      bool                         `json:"previous_missing,omitempty"`
+		History              []ConversationRouteHistory   `json:"history"`
+		Tasks                []ConversationRouteCandidate `json:"active_tasks"`
+	}
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be decoded")
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be encoded")
+	}
+	request.Instructions = legacyConversationRouteInstructions
+	request.Input[0].Text = string(body)
+	return request, nil
 }
 
 func (s *ModelGatewayService) routeProjectReservation(ctx context.Context, call ModelCallReservation, request ModelRequest) (*ProjectModelReservation, error) {
@@ -280,13 +331,19 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	if ctx == nil || !domain.ValidServiceInstanceID(claim.ServiceInstanceID) || !domain.ValidMessageID(claim.Message.ID) ||
 		!domain.ValidConversationID(claim.Message.ConversationID) || !domain.ValidUserID(claim.Message.OwnerID) ||
 		!domain.ValidUserID(claim.Message.ActorID) || claim.Message.Role != conversation.RoleUser || claim.Message.Sequence < 1 ||
-		claim.LeaseOwner == "" || claim.LeaseVersion < 1 || value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content ||
+		claim.LeaseOwner == "" || claim.LeaseVersion < 1 || value.ActorID != claim.Message.ActorID || !conversationRouteContextMatchesClaim(value, claim) ||
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) {
 		return ConversationRouteDecision{}, domain.InvalidArgument("route_context", "routing identity or content is invalid")
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil {
 		return ConversationRouteDecision{}, err
+	}
+	if value.RouteAttempt == 0 && value.ResultReview == nil {
+		request, err = legacyConversationRouteModelRequest(value, request)
+		if err != nil {
+			return ConversationRouteDecision{}, err
+		}
 	}
 	endpoint, err := s.models.ResolveGatewayEndpoint(ctx, value.ActorID, value.ModelID, false, false)
 	if err != nil {
@@ -358,7 +415,7 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	if ctx == nil || !domain.ValidServiceInstanceID(claim.ServiceInstanceID) || !domain.ValidMessageID(claim.Message.ID) ||
 		!domain.ValidConversationID(claim.Message.ConversationID) || !domain.ValidUserID(claim.Message.OwnerID) ||
 		!domain.ValidUserID(claim.Message.ActorID) || claim.Message.Role != conversation.RoleUser || claim.Message.Sequence < 1 ||
-		claim.LeaseOwner == "" || claim.LeaseVersion < 1 || value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content ||
+		claim.LeaseOwner == "" || claim.LeaseVersion < 1 || value.ActorID != claim.Message.ActorID || !conversationRouteContextMatchesClaim(value, claim) ||
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) ||
 		!dshModelIdentityPattern.MatchString(sessionID) || throughSequence < 0 || throughSequence > 1<<53-1 {
 		return ModelResponse{}, domain.InvalidArgument("route_context", "coordinator model identity or content is invalid")
@@ -385,6 +442,12 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	legacyRequest, err := ConversationRouteModelRequest(value)
 	if err != nil {
 		return ModelResponse{}, err
+	}
+	if value.RouteAttempt == 0 && value.ResultReview == nil {
+		legacyRequest, err = legacyConversationRouteModelRequest(value, legacyRequest)
+		if err != nil {
+			return ModelResponse{}, err
+		}
 	}
 	s.applyGPT6LunaReasoning(endpoint.Endpoint, &legacyRequest, true)
 	legacyDigest, legacyCallID, err := conversationRouteCallDigest(claim, value, legacyRequest)

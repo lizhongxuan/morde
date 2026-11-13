@@ -26,7 +26,7 @@ test.describe("Assistant durable tasks", () => {
     await page.getByRole("button", { name: "登录" }).click();
 
     const routes = ["/assistant", "/personal", "/goals", "/hosts", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/projects", "/workspaces"];
-    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals", "/hosts", "/clients", "/apikeys", "/connections", "/settings"]);
+    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals"]);
     for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }, { width: 480, height: 720 }]) {
       await page.setViewportSize(viewport);
       for (const route of routes) {
@@ -60,8 +60,11 @@ test.describe("Assistant durable tasks", () => {
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
     await page.goto("/hosts");
-    await expect(page.locator(".host-card").first()).toContainText("1 核 / 2 GiB");
-    await expect(page.locator(".host-card").first()).toContainText("已停止");
+    const host = page.locator(".host-card").first();
+    await expect(host).toContainText("已停止");
+    await host.locator(".host-more-actions summary").click();
+    await host.getByRole("button", { name: "详情与管理" }).click();
+    await expect(host).toContainText("1 核 / 2 GiB");
     const layoutBefore = await page.evaluate(() => [".morde-topbar", ".morde-sidebar", ".morde-main"].map((selector) => {
       const { x, y, width, height } = document.querySelector(selector)!.getBoundingClientRect();
       return [x, y, width, height];
@@ -188,13 +191,14 @@ test.describe("Assistant durable tasks", () => {
     await expect(sendButton).toBeEnabled();
     await sendButton.click();
     await expect(page.locator(".chat-message-user p").filter({ hasText: firstPrompt })).toBeVisible();
-    await expect(page.locator(".chat-message-user").filter({ hasText: "已受理，等待处理" })).toContainText(firstPrompt);
+    await expect(page.getByText("此消息 · 已受理，等待处理")).toHaveCount(0);
 
     await page.getByRole("textbox", { name: "消息内容" }).fill(secondPrompt);
     await expect(sendButton).toBeEnabled();
     await sendButton.click();
     await expect(page.locator(".chat-message-user p").filter({ hasText: secondPrompt })).toBeVisible();
-    await expect(page.locator(".chat-message-user").filter({ hasText: "已受理，等待处理" })).toHaveCount(2);
+    await expect(page.locator(".chat-message-user p").filter({ hasText: firstPrompt })).toHaveCount(1);
+    await expect(page.locator(".chat-message-user p").filter({ hasText: secondPrompt })).toHaveCount(1);
     await expect(page.getByRole("button", { name: "打开侧边栏" })).toHaveAttribute("aria-expanded", "false");
     await expect(page.locator(".task-activity")).toHaveCount(0);
 
@@ -258,7 +262,9 @@ test.describe("Assistant durable tasks", () => {
 
     await page.reload();
     await page.locator(".conversation-group-details > summary").click();
-    await page.getByRole("button", { name: /新对话 本机最近查看/ }).click();
+    const restoredConversation = page.locator(".conversation-item").filter({ hasText: secondPrompt }).last();
+    await expect(restoredConversation).toBeVisible();
+    await restoredConversation.click();
     await expect(page.locator(".chat-message-user p").filter({ hasText: firstPrompt })).toBeVisible();
     await expect(page.locator(".chat-message-user p").filter({ hasText: secondPrompt })).toBeVisible();
     const assistantReply = page.locator(".chat-message-assistant").filter({ hasText: "第一项任务已完成首轮建议。" });
@@ -308,8 +314,15 @@ test.describe("Assistant durable tasks", () => {
     const prompt = `会话文件分页隔离 ${Date.now()}`;
     await page.getByRole("textbox", { name: "消息内容" }).fill(prompt);
     await page.getByRole("button", { name: "发送", exact: true }).click();
-    await expect(page.locator(".chat-message-user").filter({ hasText: prompt })).toContainText("已受理，等待处理");
+    await expect(page.locator(".chat-message-user p").filter({ hasText: prompt })).toHaveCount(1);
 
+    await expect.poll(() => page.evaluate((prompt) => {
+      const stored = localStorage.getItem("cloudhost:portal-mock-assistant-state-v3");
+      if (!stored) return false;
+      const state = JSON.parse(stored) as { conversations?: Array<Record<string, unknown>>; conversationMessages?: Array<Record<string, unknown>> };
+      const sideMessage = state.conversationMessages?.find((item) => item.content === prompt);
+      return Boolean(sideMessage && state.conversations?.some((item) => item.id === sideMessage.conversation_id));
+    }, prompt)).toBe(true);
     const seeded = await page.evaluate((prompt) => {
       const storageKey = "cloudhost:portal-mock-assistant-state-v3";
       const stored = localStorage.getItem(storageKey);
@@ -338,7 +351,7 @@ test.describe("Assistant durable tasks", () => {
         steps: [{ id: `s${id}`, sequence: 1, kind: "tool", status: "running", title: "读取工作区", summary: "", created_at: timestamp }],
         batch_items: [],
         artifacts: [{ id: `f${id}`, step_id: `s${id}`, label: artifactLabel, path: "reports/summary.txt", media_type: "text/plain",
-          workspace_id: null, workspace_revision: null, size_bytes: 12, sha256: null, verified: true,
+          workspace_id: "w1234567", workspace_revision: 1, size_bytes: 12, sha256: "a".repeat(64), verified: true,
           batch_item_id: null, batch_attempt: 1, created_at: timestamp }],
         pending_request: null, clarification_request: null, stop_request: null,
         assistant_message: { id: `m${id}`, conversation_id: conversationID, sequence: 2, task_id: id, task_revision: 1,
@@ -378,7 +391,6 @@ test.describe("Assistant durable tasks", () => {
     const files = sidePanel.locator(".task-panel-files");
     await expect(files.getByRole("link", { name: "下载消息附件 1" })).toHaveAttribute("href", "/api/personal-data/attachments/aside001");
     await expect(files.getByRole("link", { name: "下载消息附件 1" })).toBeVisible();
-    await expect(files.getByText("旁聊成果 10")).toBeAttached();
     const lastSideArtifact = files.getByText("旁聊成果 10");
     for (let pageIndex = 0; pageIndex < 10 && !(await lastSideArtifact.isVisible()); pageIndex += 1) {
       const nextPage = files.getByRole("button", { name: "下一页" });
@@ -512,9 +524,12 @@ test.describe("Assistant durable tasks", () => {
     const prompt = "长消息中文🙂".repeat(4_500);
     expect(new TextEncoder().encode(prompt).length).toBeGreaterThan(32 * 1024);
     await page.getByRole("textbox", { name: "消息内容" }).fill(prompt);
+    const uploadCommit = page.waitForResponse((response) => response.request().method() === "POST"
+      && new URL(response.url()).pathname.endsWith("/commit"));
     await page.getByRole("button", { name: "发送", exact: true }).click();
+    await uploadCommit;
     const message = page.locator(".chat-message-user").filter({ hasText: prompt.slice(0, 24) }).last();
-    await expect(message).toContainText("已受理，等待处理");
+    await expect(message).toBeVisible();
     await expect(page.getByRole("textbox", { name: "消息内容" })).toHaveValue("");
     const saved = await page.evaluate((prefix) => {
       const state = JSON.parse(localStorage.getItem("cloudhost:portal-mock-assistant-state-v3") ?? "null") as {
@@ -554,12 +569,22 @@ test.describe("Assistant durable tasks", () => {
       await page.getByRole("button", { name: "打开侧边栏" }).click();
       await expect(page.getByRole("button", { name: "关闭侧边栏" })).toBeVisible();
       await page.getByRole("button", { name: "关闭侧边栏" }).click();
-      const sendIsUsable = await page.getByRole("button", { name: "发送", exact: true }).evaluate((button) => {
+      const sendMetrics = await page.getByRole("button", { name: "发送", exact: true }).evaluate((button) => {
         const rect = button.getBoundingClientRect();
         const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-        return rect.top >= 0 && rect.bottom <= window.innerHeight && (target === button || button.contains(target));
+        const containers = [".morde-topbar", ".morde-main", ".morde-page", ".assistant-page", ".assistant-layout", ".assistant-main", ".conversation-view", ".assistant-composer"]
+          .map((selector) => {
+            const element = document.querySelector(selector);
+            if (!element) return [selector, null];
+            const bounds = element.getBoundingClientRect();
+            return [selector, { top: bounds.top, bottom: bounds.bottom, height: bounds.height, scrollHeight: element.scrollHeight }];
+          });
+        return { inViewport: rect.top >= 0 && rect.bottom <= window.innerHeight,
+          unobstructed: target === button || button.contains(target),
+          rect: { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height },
+          viewport: { width: window.innerWidth, height: window.innerHeight }, containers };
       });
-      expect(sendIsUsable).toBeTruthy();
+      expect(sendMetrics, JSON.stringify(sendMetrics)).toMatchObject({ inViewport: true, unobstructed: true });
     }
   });
 

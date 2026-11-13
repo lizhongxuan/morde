@@ -307,6 +307,9 @@ type ConversationMessageRoute struct {
 	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
 	AvailableAfter          pgtype.Timestamptz `json:"available_after"`
 	AwaitingPredecessor     bool               `json:"awaiting_predecessor"`
+	DuplicateOfMessageID    pgtype.Text        `json:"duplicate_of_message_id"`
+	RouteAttempt            int64              `json:"route_attempt"`
+	AutoRetryCount          int16              `json:"auto_retry_count"`
 }
 
 type ConversationMessageUpload struct {
@@ -391,6 +394,7 @@ type ConversationRouteModelCall struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	Phase                string             `json:"phase"`
+	Attempt              int64              `json:"attempt"`
 }
 
 type ConversationSummaryHead struct {
@@ -1595,6 +1599,10 @@ type TaskAgentSession struct {
 	IsBackground         bool               `json:"is_background"`
 	CancelRequestedAt    pgtype.Timestamptz `json:"cancel_requested_at"`
 	TaskRevision         int64              `json:"task_revision"`
+	ActivityStatus       pgtype.Text        `json:"activity_status"`
+	ActivityGeneration   pgtype.Int8        `json:"activity_generation"`
+	ActivitySequence     pgtype.Int8        `json:"activity_sequence"`
+	ActivityObservedAt   pgtype.Timestamptz `json:"activity_observed_at"`
 }
 
 type TaskArtifact struct {
@@ -1988,14 +1996,34 @@ type TaskSandboxLifecycle struct {
 }
 
 type TaskStep struct {
-	ID        string             `json:"id"`
-	TaskID    string             `json:"task_id"`
-	Sequence  int64              `json:"sequence"`
-	Kind      string             `json:"kind"`
-	Status    string             `json:"status"`
-	Title     string             `json:"title"`
-	Summary   string             `json:"summary"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID             string             `json:"id"`
+	TaskID         string             `json:"task_id"`
+	Sequence       int64              `json:"sequence"`
+	Kind           string             `json:"kind"`
+	Status         string             `json:"status"`
+	Title          string             `json:"title"`
+	Summary        string             `json:"summary"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	AgentSessionID pgtype.Text        `json:"agent_session_id"`
+	TaskRevision   pgtype.Int8        `json:"task_revision"`
+	ToolCallKey    pgtype.Text        `json:"tool_call_key"`
+	ToolName       pgtype.Text        `json:"tool_name"`
+	RequestDigest  []byte             `json:"request_digest"`
+	Phase          pgtype.Text        `json:"phase"`
+	DetailState    string             `json:"detail_state"`
+}
+
+type TaskStepDetail struct {
+	TaskID            string             `json:"task_id"`
+	OwnerID           string             `json:"owner_id"`
+	StepID            string             `json:"step_id"`
+	TaskRevision      int64              `json:"task_revision"`
+	PayloadCiphertext []byte             `json:"payload_ciphertext"`
+	PayloadSha256     []byte             `json:"payload_sha256"`
+	PayloadSizeBytes  int32              `json:"payload_size_bytes"`
+	Truncated         bool               `json:"truncated"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TaskStopRequest struct {

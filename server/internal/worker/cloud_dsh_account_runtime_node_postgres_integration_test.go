@@ -366,6 +366,9 @@ func f01RunNodeAccountTaskControlled(ctx context.Context, manager *CloudDSHAccou
 			return fmt.Errorf("read Task frame: %w", err)
 		}
 		switch frame.Type {
+		case "agent_status":
+			// Agent activity frames are observations; they do not change the Task protocol.
+			continue
 		case "checkpoint":
 			ack := map[string]any{"type": "checkpoint_ack", "id": frame.ID, "ok": true,
 				"through_seq": frame.ThroughSeq, "sha256": frame.SHA256}

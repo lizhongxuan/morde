@@ -23,7 +23,9 @@ function adminHistoryFallback(): Plugin {
 }
 
 export default defineConfig(({ mode }) => {
-  const realApi = loadEnv(mode, process.cwd(), "VITE_").VITE_MOCK_API !== "1";
+  const env = loadEnv(mode, process.cwd(), "VITE_");
+  const realApi = env.VITE_MOCK_API !== "1";
+  const apiTarget = env.VITE_PORTAL_API_PROXY_TARGET || "http://127.0.0.1:7080";
 
   return {
     plugins: [react(), adminHistoryFallback()],
@@ -37,8 +39,8 @@ export default defineConfig(({ mode }) => {
       proxy: {
         ...(realApi
           ? {
-            "/api": { target: "http://127.0.0.1:7080", changeOrigin: false },
-            "/mcp": { target: "http://127.0.0.1:7080", changeOrigin: false },
+            "/api": { target: apiTarget, changeOrigin: false },
+            "/mcp": { target: apiTarget, changeOrigin: false },
             }
           : {}),
       },

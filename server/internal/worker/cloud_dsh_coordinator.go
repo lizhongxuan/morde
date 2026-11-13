@@ -297,9 +297,13 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim, value app.ConversationRouteContext) app.ConversationCoordinatorIdentity {
 	seed := strings.Join([]string{"morde-dsh-coordinator-session-v1", claim.ServiceInstanceID, claim.Message.OwnerID,
 		claim.Message.ActorID, claim.Message.ConversationID, claim.Message.ID}, "\n")
-	if value.ResultReview != nil && value.ResultReview.RetryAttempt > 0 {
-		// Retries must not resume a completed DSH turn from the previous attempt.
-		seed += fmt.Sprintf("\nresult-review-retry:%d", value.ResultReview.RetryAttempt)
+	if value.ResultReview != nil {
+		if value.ResultReview.RetryAttempt > 0 {
+			// Retries must not resume a completed DSH turn from the previous attempt.
+			seed += fmt.Sprintf("\nresult-review-retry:%d", value.ResultReview.RetryAttempt)
+		}
+	} else if claim.RouteAttempt > 0 {
+		seed += fmt.Sprintf("\nroute-attempt:%d", claim.RouteAttempt)
 	}
 	digest := sha256.Sum256([]byte(seed))
 	hexDigest := hex.EncodeToString(digest[:])

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -107,16 +109,180 @@ func TestSelectedMCPHTTPBrokerApprovalReplayAndRevocation(t *testing.T) {
 	}
 }
 
+func TestGitHubMCPHTTPBrokerEnforcesReadonlyProfileAndDurableResults(t *testing.T) {
+	const (
+		connectorID = "k1234567"
+		endpoint    = "https://api.githubcopilot.com/mcp/"
+	)
+	var protocolRequests atomic.Int32
+	var searchCalls atomic.Int32
+	var issueReadCalls atomic.Int32
+	var createIssueCalls atomic.Int32
+	var requestHeadersMu sync.Mutex
+	var requestHeaders []http.Header
+
+	provider := sdk.NewServer(&sdk.Implementation{Name: "morde-local-github-fixture", Version: "1"}, nil)
+	provider.AddTool(&sdk.Tool{
+		Name: "get_me", Description: "Read a synthetic profile.",
+		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	}, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: "synthetic user"}}}, nil
+	})
+	provider.AddTool(&sdk.Tool{
+		Name: "search_code", Description: "Search synthetic code.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`),
+	}, func(_ context.Context, request *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		searchCalls.Add(1)
+		if string(request.Params.Arguments) != `{"query":"repo:acme/demo bug"}` {
+			return nil, errors.New("unexpected synthetic search arguments")
+		}
+		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: "synthetic search result"}}}, nil
+	})
+	provider.AddTool(&sdk.Tool{
+		Name: "issue_read", Description: "Read a synthetic issue.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"issue_number":{"type":"integer"}},"required":["owner","repo","issue_number"],"additionalProperties":false}`),
+	}, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		issueReadCalls.Add(1)
+		return &sdk.CallToolResult{IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: "synthetic issue is unavailable"}}}, nil
+	})
+	provider.AddTool(&sdk.Tool{
+		Name: "create_issue", Description: "Write a synthetic issue.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}`),
+	}, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		createIssueCalls.Add(1)
+		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: "unexpected write"}}}, nil
+	})
+	providerHandler := sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return provider }, &sdk.StreamableHTTPOptions{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		protocolRequests.Add(1)
+		requestHeadersMu.Lock()
+		requestHeaders = append(requestHeaders, request.Header.Clone())
+		requestHeadersMu.Unlock()
+		providerHandler.ServeHTTP(writer, request)
+	}))
+	defer server.Close()
+
+	client := &selectedMCPStreamableHTTPTestClient{
+		httpClient:             server.Client(),
+		requiredRemoteEndpoint: endpoint,
+		localRouteEndpoint:     server.URL + "/mcp/",
+	}
+	broker, store, claimed := selectedMCPTestFixture(t, client)
+	connector := store.values[connectorID]
+	connector.EndpointURL = endpoint
+	store.values[connectorID] = connector
+
+	discovery, err := broker.Execute(context.Background(), claimed, ModelToolCall{
+		CallID: "github-http-discover", Name: cloudDSHMCPDiscoverToolName,
+		Arguments: `{"connector_id":"` + connectorID + `"}`,
+	})
+	if err != nil || discovery.Status != AgentToolSucceeded || protocolRequests.Load() == 0 {
+		t.Fatalf("local GitHub MCP discovery = %+v err=%v requests=%d", discovery, err, protocolRequests.Load())
+	}
+	var catalog struct {
+		Tools []MCPConnectorToolDefinition `json:"tools"`
+	}
+	if err := json.Unmarshal([]byte(discovery.Output), &catalog); err != nil {
+		t.Fatalf("decode local GitHub catalog: %v; output=%q", err, discovery.Output)
+	}
+	gotTools := make(map[string]bool, len(catalog.Tools))
+	for _, tool := range catalog.Tools {
+		gotTools[tool.Name] = true
+	}
+	if len(gotTools) != 3 || !gotTools["get_me"] || !gotTools["search_code"] || !gotTools["issue_read"] || gotTools["create_issue"] {
+		t.Fatalf("GitHub catalog did not filter write tools: %+v", catalog.Tools)
+	}
+
+	writeCall := selectedMCPCallForTest(t, "github-http-write", connectorID, "create_issue", `{"title":"synthetic"}`)
+	blockedWrite, err := broker.Execute(context.Background(), claimed, writeCall)
+	if err != nil || blockedWrite.Status != AgentToolFailed || createIssueCalls.Load() != 0 || len(store.operations) != 0 {
+		t.Fatalf("GitHub write tool was not rejected before remote execution: result=%+v err=%v writes=%d operations=%d",
+			blockedWrite, err, createIssueCalls.Load(), len(store.operations))
+	}
+
+	searchCall := selectedMCPCallForTest(t, "github-http-search", connectorID, "search_code", `{"query":"repo:acme/demo bug"}`)
+	waiting, err := broker.Execute(context.Background(), claimed, searchCall)
+	if err != nil || waiting.Status != AgentToolNeedsUser || searchCalls.Load() != 0 {
+		t.Fatalf("GitHub read call before exact approval = %+v err=%v calls=%d", waiting, err, searchCalls.Load())
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
+	searchResult, err := broker.Execute(context.Background(), claimed, searchCall)
+	if err != nil || searchResult.Status != AgentToolSucceeded || searchCalls.Load() != 1 {
+		t.Fatalf("approved GitHub search = %+v err=%v calls=%d", searchResult, err, searchCalls.Load())
+	}
+	var searchOutput cloudDSHMCPOutput
+	if err := json.Unmarshal([]byte(searchResult.Output), &searchOutput); err != nil || searchOutput.IsError || len(searchOutput.Text) != 1 || searchOutput.Text[0] != "synthetic search result" {
+		t.Fatalf("GitHub search output = %+v err=%v raw=%q", searchOutput, err, searchResult.Output)
+	}
+	searchReplay, err := broker.Reconcile(context.Background(), claimed, searchCall, nil)
+	if err != nil || searchReplay.Status != AgentToolSucceeded || searchReplay.Output != searchResult.Output || searchCalls.Load() != 1 {
+		t.Fatalf("GitHub exact search replay = %+v err=%v calls=%d", searchReplay, err, searchCalls.Load())
+	}
+
+	issueCall := selectedMCPCallForTest(t, "github-http-issue", connectorID, "issue_read", `{"owner":"acme","repo":"demo","issue_number":42}`)
+	issueApproval, err := broker.Execute(context.Background(), store.details.Task, issueCall)
+	if err != nil || issueApproval.Status != AgentToolNeedsUser || issueReadCalls.Load() != 0 {
+		t.Fatalf("GitHub issue read before approval = %+v err=%v calls=%d", issueApproval, err, issueReadCalls.Load())
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	issueResult, err := broker.Execute(context.Background(), store.details.Task, issueCall)
+	issueOperation := store.operations[agentOperationKey(issueCall.CallID)]
+	if err != nil || issueResult.Status != AgentToolFailed || issueReadCalls.Load() != 1 || issueOperation.Status != task.OperationFailed {
+		t.Fatalf("GitHub confirmed read failure = %+v err=%v calls=%d operation=%+v",
+			issueResult, err, issueReadCalls.Load(), issueOperation)
+	}
+	issueReplay, err := broker.Reconcile(context.Background(), store.details.Task, issueCall, nil)
+	if err != nil || issueReplay.Status != AgentToolFailed || issueReplay.Output != issueResult.Output || issueReadCalls.Load() != 1 {
+		t.Fatalf("GitHub confirmed failure replay = %+v err=%v calls=%d", issueReplay, err, issueReadCalls.Load())
+	}
+
+	requestHeadersMu.Lock()
+	observedHeaders := append([]http.Header(nil), requestHeaders...)
+	requestHeadersMu.Unlock()
+	if len(observedHeaders) == 0 {
+		t.Fatal("local MCP server observed no protocol requests")
+	}
+	for index, headers := range observedHeaders {
+		if headers.Get(githubMCPReadonlyHeader) != "true" || headers.Get(githubMCPToolsHeader) != githubMCPReadonlyTools {
+			t.Fatalf("local GitHub protocol request %d missed server-enforced read-only headers: %v", index, headers)
+		}
+	}
+}
+
 // This adapter exercises MCP Streamable HTTP against the local fake server. It
 // intentionally bypasses ConnectorClient endpoint/DNS policy; those guards have
 // focused tests in the mcpconnector package.
 type selectedMCPStreamableHTTPTestClient struct {
-	httpClient *http.Client
+	httpClient             *http.Client
+	requiredRemoteEndpoint string
+	localRouteEndpoint     string
 }
 
-func (client *selectedMCPStreamableHTTPTestClient) connect(ctx context.Context, endpoint string) (*sdk.ClientSession, func(), error) {
+func (client *selectedMCPStreamableHTTPTestClient) connect(ctx context.Context, endpoint string, headers http.Header) (*sdk.ClientSession, func(), error) {
+	if client.requiredRemoteEndpoint != "" {
+		if endpoint != client.requiredRemoteEndpoint || client.localRouteEndpoint == "" {
+			return nil, nil, errors.New("local MCP test route rejected an unexpected remote endpoint")
+		}
+		route, err := url.Parse(client.localRouteEndpoint)
+		if err != nil || route.Scheme != "http" || route.Host == "" {
+			return nil, nil, errors.New("local MCP test route is invalid")
+		}
+		endpoint = route.String()
+	}
+	httpClient := client.httpClient
+	if len(headers) > 0 || client.localRouteEndpoint != "" {
+		copy := *client.httpClient
+		base := copy.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		copy.Transport = selectedMCPTestRoundTripper{base: base, allowedEndpoint: client.localRouteEndpoint, headers: headers.Clone()}
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		httpClient = &copy
+	}
 	transport := &sdk.StreamableClientTransport{
-		Endpoint: endpoint, HTTPClient: client.httpClient,
+		Endpoint: endpoint, HTTPClient: httpClient,
 		DisableStandaloneSSE: true, MaxRetries: -1,
 	}
 	session, err := sdk.NewClient(&sdk.Implementation{Name: "morde-app-test-client", Version: "1"}, nil).
@@ -127,8 +293,32 @@ func (client *selectedMCPStreamableHTTPTestClient) connect(ctx context.Context, 
 	return session, func() { _ = session.Close() }, nil
 }
 
-func (client *selectedMCPStreamableHTTPTestClient) ListTools(ctx context.Context, endpoint string, _ http.Header) ([]MCPConnectorToolDefinition, error) {
-	session, closeSession, err := client.connect(ctx, endpoint)
+type selectedMCPTestRoundTripper struct {
+	base            http.RoundTripper
+	allowedEndpoint string
+	headers         http.Header
+}
+
+func (transport selectedMCPTestRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if transport.allowedEndpoint != "" {
+		allowed, err := url.Parse(transport.allowedEndpoint)
+		if err != nil || request.URL.Scheme != allowed.Scheme || request.URL.Host != allowed.Host {
+			return nil, errors.New("local MCP test transport blocked a non-local request")
+		}
+	}
+	cloned := request.Clone(request.Context())
+	cloned.Header = request.Header.Clone()
+	for key, values := range transport.headers {
+		cloned.Header.Del(key)
+		for _, value := range values {
+			cloned.Header.Add(key, value)
+		}
+	}
+	return transport.base.RoundTrip(cloned)
+}
+
+func (client *selectedMCPStreamableHTTPTestClient) ListTools(ctx context.Context, endpoint string, headers http.Header) ([]MCPConnectorToolDefinition, error) {
+	session, closeSession, err := client.connect(ctx, endpoint, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +338,7 @@ func (client *selectedMCPStreamableHTTPTestClient) ListTools(ctx context.Context
 	return definitions, nil
 }
 
-func (client *selectedMCPStreamableHTTPTestClient) CallTool(ctx context.Context, endpoint string, _ http.Header,
+func (client *selectedMCPStreamableHTTPTestClient) CallTool(ctx context.Context, endpoint string, headers http.Header,
 	name string, arguments json.RawMessage) (MCPConnectorToolResult, error) {
 	var input any
 	decoder := json.NewDecoder(bytes.NewReader(arguments))
@@ -156,7 +346,7 @@ func (client *selectedMCPStreamableHTTPTestClient) CallTool(ctx context.Context,
 	if err := decoder.Decode(&input); err != nil {
 		return MCPConnectorToolResult{}, err
 	}
-	session, closeSession, err := client.connect(ctx, endpoint)
+	session, closeSession, err := client.connect(ctx, endpoint, headers)
 	if err != nil {
 		return MCPConnectorToolResult{}, err
 	}

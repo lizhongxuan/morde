@@ -38,6 +38,8 @@ SYNCTHING_SOURCE_DIR="/path/to/local/syncthing-f02-worktree" IMAGE_PLATFORM=linu
 
    安装前要求 `web/portal/dist/index.html`、`web/portal/dist/admin/index.html`、`web/portal/dist/app/index.html` 和 `web/workbench/dist/index.html` 均已生成；任一入口缺失时安装会失败。正式 PC 客户端基于 `clients/desktop/harness/desktop` 二开并复用唯一同步引擎 `runtime/morde-sync`；其签名、公证和下载发布不在本部署步骤内。
 
+   PC 与 Web 的聊天界面统一由 `web/portal` 提供：桌面 WebView 打开账号 Portal 的 `/assistant`，Portal 从 `web/portal/dist` 提供静态页面，不单独打包第二份聊天 UI。界面修改必须重新构建并部署 Portal 静态产物；PC 登录的 Portal 与浏览器访问的 Web 若不是同一个服务版本，显示仍会不同。自动化发布验证会运行 `test-portal-deployment.py` 检查这条共享链路，避免桌面入口和 Web 产物分叉。
+
 每个 Workspace 注册独立的 `workspace-<workspace_id>` Docker named volume，Host 只把已核验身份的卷挂载到 `/home/gem/workspace`；卷 registry 已就绪但卷缺失或标签不符时启动失败，不会创建空卷替代。旧 `workspace-root` 卷仅供唯一明确绑定它的旧 Host 使用；`runtime-data` 与 `host-apps` 旧卷均保留，等待 W22 迁移和回滚预检。新 Host 不再挂载独立 `host-apps` 卷，Apps catalog 使用容器临时目录 `/run/morde-runtime/apps`。`runtime-<host_id>` 卷仍挂载 `/var/lib/morde-runtime`，保存 Runtime cache 与本地日志证据；Runtime 操作账本的权威副本已迁至 Portal PostgreSQL。Host 入口以 `root:root`、`0700` 初始化 runtime 目录，以 `root:1000`、`3770`（setgid）初始化 Workspace 根；AIO UID/GID 1000 可读写，Runtime 原子提交的文件使用 `0660`。新 Workspace Host 的空 profile 默认桌面目录及 Chromium 下载目录指向 Workspace；已有非空 profile 目录、用户自定义路径和旧卷保持原样。删除 Host 或清理失败 Sandbox 时，确认 Sandbox 已清理后再回收 Host runtime 卷；Workspace named volume 独立于 Host 生命周期。OpenSandbox Docker 后端忽略 PVC `storage` 请求，因此 `20Gi` 只是请求值，不是硬配额，Docker named volumes 仍受宿主 Docker 数据盘容量限制。固定 linux/amd64 镜像、Linux 卷重建和硬容量限额尚未验收；不要据此开放依赖这些能力的正式功能。
 Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退避重启；AIO 和桌面进程继续运行，Host 健康检查在 Runtime readiness 恢复前保持失败。该机制只恢复 Runtime 控制面进程，不会恢复尚未登记的 PTY / GUI 会话，也不会把未知操作结果标成成功。
 

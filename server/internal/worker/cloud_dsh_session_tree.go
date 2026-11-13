@@ -1112,6 +1112,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}()
 	pendingCancels := make(map[string]cloudDSHJobCancelPending)
 	ready := false
+	var lastAgentObservation int64
 	for {
 		var item cloudDSHRead
 		if activeModelID == "" && len(queuedModelIDs) > 0 {
@@ -1409,6 +1410,24 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			return errors.New("dsh frame identity is invalid")
 		}
 		switch frame.Type {
+		case "agent_status":
+			if frame.cloudDSHIdentity != rootIdentity || frame.ObservationSequence == nil ||
+				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
+				(frame.Status != "idle" && frame.Status != "running") {
+				return errors.New("dsh agent status observation is invalid")
+			}
+			if *frame.ObservationSequence <= lastAgentObservation {
+				continue
+			}
+			lastAgentObservation = *frame.ObservationSequence
+			if e.options.AgentActivity != nil {
+				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+					Fence: fence, Status: frame.Status, ObservationSequence: *frame.ObservationSequence,
+				})
+				if err != nil {
+					return fmt.Errorf("record dsh agent status observation: %w", err)
+				}
+			}
 		case "checkpoint_read":
 			if !state.resume || !cloudDSHID.MatchString(frame.ID) || frame.From == nil || *frame.From != state.readThrough+1 ||
 				*frame.From > state.restoreThrough || len(state.pageReadIDs) >= 100_000 {

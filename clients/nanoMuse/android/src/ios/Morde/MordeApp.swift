@@ -28,6 +28,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskRelaunchFixtureLaunchArgument = "-morde.localTaskRelaunchFixture"
     static let taskApprovalConflictFixtureLaunchArgument = "-morde.localTaskApprovalConflictFixture"
     static let taskSequentialSendFixtureLaunchArgument = "-morde.localTaskSequentialSendFixture"
+    static let taskStartedAcknowledgementFixtureLaunchArgument = "-morde.localTaskStartedAcknowledgementFixture"
     static let taskQueueFixtureLaunchArgument = "-morde.localTaskQueueFixture"
     static let chatSendOfflineFixtureLaunchArgument = "-morde.localChatSendOfflineFixture"
     static let chatOfflineRecoveryFixtureLaunchArgument = "-morde.localChatOfflineRecoveryFixture"
@@ -1717,13 +1718,15 @@ private final class MordeAuthURLProtocol: URLProtocol {
         var message: [String: Any] = ["id": String(format: "m%07d", sequence), "conversation_id": "c1234567",
                 "task_id": taskSequentialID(index), "role": role, "content": content,
                 "status": "completed", "delivery_status": NSNull(),
-                "created_at": String(format: "2026-11-04T00:00:%02dZ", sequence)]
+                "created_at": String(format: "2026-11-04T00:00:%02dZ", sequence),
+                "owner_id": "u_localtest1", "actor_id": "u_localtest1"]
         let keys = taskSequentialSendKeysSnapshot
         if role == "user", index <= keys.count {
             message["client_message_id"] = keys[index - 1]
             let tooLong = ProcessInfo.processInfo.arguments.contains("-morde.localMessageTooLongFixture")
             if index == 1 && (ProcessInfo.processInfo.arguments.contains("-morde.localRoutingFailureFixture") || tooLong) &&
                 !taskSequentialRetriedSnapshot {
+                message.removeValue(forKey: "task_id")
                 message["routing_status"] = "failed"
                 message["routing_failure_reason"] = tooLong ? "message_too_long" : "model_unavailable"
             } else {
@@ -1740,10 +1743,35 @@ private final class MordeAuthURLProtocol: URLProtocol {
         return ["id": taskSequentialID(index), "conversation_id": "c1234567", "host_id": NSNull(),
                 "execution_location": "server", "workspace_id": NSNull(), "input_revision": NSNull(),
                 "objective": content, "status": "completed", "event_sequence": 1, "result": reply,
+                "current_revision": 1, "desired_revision": 1, "current_revision_started": true,
                 "current_step": NSNull(), "step_count": 1, "completed_step_count": 1,
                 "waiting_reason": NSNull(), "stop_request": NSNull(),
                 "pending_request": NSNull(), "clarification_request": NSNull(), "batch_items": NSNull(),
                 "updated_at": String(format: "2026-11-04T00:00:%02dZ", index), "assistant_message": assistant]
+    }
+
+    private static func taskStartedAcknowledgementFixtureMessages() -> [[String: Any]] {
+        [
+            ["id": "m0000401", "conversation_id": "c1234567", "sequence": 1,
+             "task_id": "q1234567", "role": "user", "content": "First request in one task",
+             "routing_status": "routed", "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
+            ["id": "m0000402", "conversation_id": "c1234567", "sequence": 2,
+             "task_id": "q1234567", "role": "user", "content": "Follow-up in the same task",
+             "routing_status": "routed", "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
+            ["id": "m0000403", "conversation_id": "c1234567", "sequence": 3,
+             "task_id": "q1234567", "role": "assistant", "content": "Task started fixture reply",
+             "status": "completed", "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
+        ]
+    }
+
+    private static func taskStartedAcknowledgementFixtureTask() -> [String: Any] {
+        ["id": "q1234567", "conversation_id": "c1234567", "host_id": NSNull(),
+         "execution_location": "server", "workspace_id": NSNull(), "input_revision": NSNull(),
+         "objective": "Task started acknowledgement fixture", "status": "completed", "event_sequence": 1,
+         "current_revision": 1, "desired_revision": 1, "current_revision_started": true,
+         "result": "Task started", "current_step": NSNull(), "step_count": 1, "completed_step_count": 1,
+         "waiting_reason": NSNull(), "stop_request": NSNull(), "pending_request": NSNull(),
+         "clarification_request": NSNull(), "batch_items": NSNull(), "updated_at": "2026-11-13T00:00:00Z"]
     }
 
     private static func taskQueueFixtureTask() -> [String: Any] {
@@ -3149,12 +3177,15 @@ private final class MordeAuthURLProtocol: URLProtocol {
         } else if isFixtureOrigin, ["/api/tasks/q1234567", "/api/tasks/q2345678"].contains(request.url?.path ?? ""), request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.taskMediaFixtureLaunchArgument) ||
-                   ProcessInfo.processInfo.arguments.contains(Self.taskTabLifecycleFixtureLaunchArgument)) {
+                   ProcessInfo.processInfo.arguments.contains(Self.taskTabLifecycleFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument)) {
             statusCode = 200
             if ProcessInfo.processInfo.arguments.contains(Self.taskQueueFixtureLaunchArgument) {
                 body = (try? JSONSerialization.data(withJSONObject: Self.taskQueueFixtureTask())) ?? Data()
             } else if ProcessInfo.processInfo.arguments.contains(Self.taskTabLifecycleFixtureLaunchArgument) {
                 body = (try? JSONSerialization.data(withJSONObject: Self.taskTabLifecycleTask())) ?? Data()
+            } else if ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument) {
+                body = (try? JSONSerialization.data(withJSONObject: Self.taskStartedAcknowledgementFixtureTask())) ?? Data()
             } else if ProcessInfo.processInfo.arguments.contains(Self.taskMediaFixtureLaunchArgument) {
                 let decision = Self.taskMediaFixtureDecisionSnapshot
                 if decision == "approve" {
@@ -3228,9 +3259,12 @@ private final class MordeAuthURLProtocol: URLProtocol {
             if request.url?.path == "/api/conversations/c1234567/tasks",
                (ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
                 ProcessInfo.processInfo.arguments.contains(Self.taskPagesHostStopTaskFixtureLaunchArgument) ||
-                ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument)) {
+                ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
+                ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument)) {
                 if ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
                     items = Self.taskPagesK2Tasks()
+                } else if ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument) {
+                    items = [Self.taskStartedAcknowledgementFixtureTask()]
                 } else if ProcessInfo.processInfo.arguments.contains(Self.taskQueueFixtureLaunchArgument) {
                     items = [Self.taskQueueFixtureTask()]
                 } else if ProcessInfo.processInfo.arguments.contains(Self.taskTabLifecycleFixtureLaunchArgument) {
@@ -3513,12 +3547,35 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 // A client_message_id lookup returns only the matching user message; the seed assistant reply is unrelated.
                 statusCode = 200
                 let items: [[String: Any]]
-                if let offlineRecoveredMessage,
+                if ProcessInfo.processInfo.arguments.contains(Self.taskSequentialSendFixtureLaunchArgument) {
+                    items = Self.taskSequentialSendContentsSnapshot.enumerated().compactMap { offset, content in
+                        let message = Self.taskSequentialMessage(offset + 1, content: content, role: "user")
+                        return message["client_message_id"] as? String == requestedClientMessageID ? message : nil
+                    }
+                } else if let offlineRecoveredMessage,
                    offlineRecoveredMessage["client_message_id"] as? String == requestedClientMessageID {
                     items = [offlineRecoveredMessage]
                 } else {
                     items = []
                 }
+                body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
+            } else if conversationID == "c1234567",
+                      ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument) {
+                statusCode = 200
+                body = (try? JSONSerialization.data(withJSONObject: [
+                    "items": Self.taskStartedAcknowledgementFixtureMessages(), "next_cursor": NSNull(),
+                ])) ?? Data()
+            } else if conversationID == "c1234567",
+                      ProcessInfo.processInfo.arguments.contains(Self.taskSequentialSendFixtureLaunchArgument) {
+                statusCode = 200
+                var items: [[String: Any]] = Self.taskSequentialSendContentsSnapshot.enumerated().flatMap { offset, content in
+                    let index = offset + 1
+                    let userMessage = Self.taskSequentialMessage(index, content: content, role: "user")
+                    return Self.taskSequentialRetriedSnapshot
+                        ? [userMessage, Self.taskSequentialMessage(index, content: "Local sequential reply \(index)", role: "assistant")]
+                        : [userMessage]
+                }
+                if let offlineRecoveredMessage { items.append(offlineRecoveredMessage) }
                 body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
             } else if conversationID == "c1234567",
                       ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
@@ -3580,11 +3637,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
         } else if isFixtureOrigin, request.url?.path == "/api/conversations/c1234567/messages", request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskSSEFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
-                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument)) {
+                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument)) {
             statusCode = 200
             if ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
                 body = (try? JSONSerialization.data(withJSONObject: [
                     "items": Self.taskPagesK2Messages(), "next_cursor": NSNull(),
+                ])) ?? Data()
+            } else if ProcessInfo.processInfo.arguments.contains(Self.taskStartedAcknowledgementFixtureLaunchArgument) {
+                body = (try? JSONSerialization.data(withJSONObject: [
+                    "items": Self.taskStartedAcknowledgementFixtureMessages(), "next_cursor": NSNull(),
                 ])) ?? Data()
             } else if ProcessInfo.processInfo.arguments.contains(Self.taskSequentialSendFixtureLaunchArgument) {
                 let contents = Self.taskSequentialSendContentsSnapshot
@@ -4480,6 +4542,8 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
     let client_message_id: String?
     let routing_status: String?
     let routing_failure_reason: String?
+    let duplicate_of_message_id: String?
+    let related_task_id: String?
     let attachment_ids: [String]?
     let output_status: String?
     let output_task_revision: Int64?
@@ -4491,7 +4555,8 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
         MordeClientMessage(id: id, conversation_id: conversation_id, sequence: sequence, task_id: task_id,
             role: role, content: content, attachment_ids: attachment_ids, delivery_status: delivery_status,
             created_at: created_at, client_message_id: client_message_id, routing_status: routing_status,
-            routing_failure_reason: routing_failure_reason, local_send_status: local_send_status,
+            routing_failure_reason: routing_failure_reason, duplicate_of_message_id: duplicate_of_message_id,
+            related_task_id: related_task_id, local_send_status: local_send_status,
             owner_id: owner_id, actor_id: actor_id, sources: sources, output_status: output_status,
             output_task_revision: output_task_revision, output_result_event_sequence: output_result_event_sequence)
     }
@@ -4580,6 +4645,8 @@ struct MordeTask: Decodable, Identifiable {
     struct Step: Decodable, Identifiable {
         let id: String; let sequence: Int; let kind: String; let status: String
         let title: String; let summary: String; let created_at: String
+        let agent_id: String?; let task_revision: Int64?; let tool_name: String?
+        let phase: String?; let detail_state: String?; let truncated: Bool?
     }
     struct Artifact: Decodable, Identifiable {
         let id: String; let label: String; let media_type: String; let verified: Bool
@@ -4616,7 +4683,7 @@ struct MordeTask: Decodable, Identifiable {
     let pending_request: Pending?
     let clarification_request: Clarification?; let batch_items: [MordeBatchItem]?
     let dependencies: [Dependency]?; let child_jobs: [ChildJob]?; let result_review: ResultReview?
-    let steps: [Step]?; let artifacts: [Artifact]?; let updated_at: String
+    let steps: [Step]?; let agents: [MordeTaskAgentExecution]?; let artifacts: [Artifact]?; let updated_at: String
     let assistant_message: MordeClientMessage?
 
     var isWaitingForRevisionStart: Bool {
@@ -6184,6 +6251,7 @@ private struct MordeIndependentSendTarget {
     private var conversationLoadMoreGeneration = UUID()
     private var messageLoadMoreGeneration = UUID()
     private var taskDetailLoadGenerations: [String: UUID] = [:]
+    private var taskStepDetailLoadGenerations: [String: UUID] = [:]
     private var taskFileFetchLoadGenerations: [String: UUID] = [:]
     private var clientInstallationsLoadGeneration = UUID()
     private var revocationReconciliationInProgress = false
@@ -6432,6 +6500,32 @@ private struct MordeIndependentSendTarget {
         }
         guard value.id == id else { throw URLError(.cannotParseResponse) }
         taskPageDetails[id] = value
+        return value
+    }
+
+    func taskStepDetail(taskID: String, stepID: String, minimumEventSequence: Int64,
+                        expectedScopeKey: String) async throws -> MordeTaskStepDetail {
+        guard let path = MordeTaskResponsePolicy.stepDetailPath(taskID: taskID, stepID: stepID),
+              let scope = currentDataScope, scope.storageKey == expectedScopeKey,
+              let snapshot = taskPageDetails[taskID], snapshot.id == taskID,
+              snapshot.steps?.contains(where: { $0.id == stepID }) == true else {
+            throw CancellationError()
+        }
+        let requestKey = "\(taskID):\(stepID)"
+        let generation = UUID()
+        taskStepDetailLoadGenerations[requestKey] = generation
+        defer {
+            if taskStepDetailLoadGenerations[requestKey] == generation {
+                taskStepDetailLoadGenerations.removeValue(forKey: requestKey)
+            }
+        }
+        let value: MordeTaskStepDetail = try await call(path)
+        let latestSequence = max(minimumEventSequence, taskPageDetails[taskID]?.event_sequence ?? 0)
+        guard currentDataScope == scope, taskStepDetailLoadGenerations[requestKey] == generation,
+              taskPageDetails[taskID]?.id == taskID,
+              value.isValid(taskID: taskID, stepID: stepID, atLeast: latestSequence) else {
+            throw CancellationError()
+        }
         return value
     }
 
@@ -7000,7 +7094,9 @@ private struct MordeIndependentSendTarget {
                 delivery_status: message.delivery_status, created_at: message.created_at ?? "",
                 owner_id: original?.owner_id ?? ownerID, actor_id: original?.actor_id ?? message.actor_id ?? "",
                 client_message_id: message.client_message_id, routing_status: message.routing_status,
-                routing_failure_reason: message.routing_failure_reason, attachment_ids: original?.attachment_ids,
+                routing_failure_reason: message.routing_failure_reason,
+                duplicate_of_message_id: message.duplicate_of_message_id, related_task_id: message.related_task_id,
+                attachment_ids: original?.attachment_ids,
                 output_status: message.displayStatus, output_task_revision: message.displayTaskRevision,
                 output_result_event_sequence: message.displayResultEventSequence,
                 local_send_status: message.local_send_status, sources: message.sources)
@@ -7014,6 +7110,7 @@ private struct MordeIndependentSendTarget {
                 role: "user", content: $0.content, task_id: nil, delivery_status: nil, created_at: $0.createdAt,
                 owner_id: ownerID, actor_id: scope.accountID, client_message_id: $0.id,
                 routing_status: nil, routing_failure_reason: nil,
+                duplicate_of_message_id: nil, related_task_id: nil,
                 attachment_ids: $0.attachments.filter(\.linked).compactMap(\.attachmentID),
                 output_status: nil, output_task_revision: nil, output_result_event_sequence: nil,
                 local_send_status: $0.state.rawValue, sources: nil)
@@ -7149,11 +7246,15 @@ private struct MordeIndependentSendTarget {
               !routingRetryInFlight.contains(messageID) else { return }
         if let projectID {
             guard selectedProjectID == projectID, selectedProjectConversationID == conversationID,
-                  projectConversationMessages.contains(where: { $0.id == messageID && $0.actor_id == scope.accountID &&
-                      $0.routing_status == "failed" && MordeRoutingPresentation.canRetryProcessing($0.routing_failure_reason) }) else { return }
+                  projectConversationMessages.contains(where: { $0.id == messageID && $0.role == "user" &&
+                      $0.actor_id == scope.accountID && $0.related_task_id == nil &&
+                      $0.duplicate_of_message_id == nil && $0.routing_status == "failed" &&
+                      MordeRoutingPresentation.canRetryProcessing($0.routing_failure_reason) }) else { return }
         } else {
             guard currentConversation == conversationID,
-                  messages.contains(where: { $0.id == messageID && $0.role == "user" && $0.routing_status == "failed" &&
+                  messages.contains(where: { $0.id == messageID && $0.role == "user" && $0.actor_id == scope.accountID &&
+                      $0.related_task_id == nil && $0.duplicate_of_message_id == nil &&
+                      $0.routing_status == "failed" &&
                       MordeRoutingPresentation.canRetryProcessing($0.routing_failure_reason) }) else { return }
         }
         let storageKey = MordeRoutingRetryAttempt.storageKey(scope: scope, projectID: projectID,
@@ -7175,6 +7276,8 @@ private struct MordeIndependentSendTarget {
             try messageOutbox.finishRoutingRetry(storageKey: storageKey, attempt: attempt, scope: scope)
             if let projectID, selectedProjectID == projectID, selectedProjectConversationID == conversationID {
                 await loadProjectConversationMessages(projectID: projectID, conversationID: conversationID)
+            } else if projectID == nil, currentConversation == conversationID {
+                await retryCurrentConversationMessages()
             }
             try? await Task.sleep(nanoseconds: 3_500_000_000)
         } catch {
@@ -7814,7 +7917,9 @@ private struct MordeIndependentSendTarget {
                         content: received.content, task_id: received.task_id, delivery_status: received.delivery_status,
                         created_at: received.created_at ?? queued.createdAt, owner_id: ownerID, actor_id: actorID,
                         client_message_id: received.client_message_id, routing_status: received.routing_status,
-                        routing_failure_reason: received.routing_failure_reason, attachment_ids: received.attachment_ids,
+                        routing_failure_reason: received.routing_failure_reason,
+                        duplicate_of_message_id: received.duplicate_of_message_id, related_task_id: received.related_task_id,
+                        attachment_ids: received.attachment_ids,
                         output_status: received.output_status, output_task_revision: received.output_task_revision,
                         output_result_event_sequence: received.output_result_event_sequence,
                         local_send_status: nil, sources: received.sources)
@@ -8126,6 +8231,7 @@ private struct MordeIndependentSendTarget {
         conversationLoadMoreGeneration = UUID()
         messageLoadMoreGeneration = UUID()
         taskDetailLoadGenerations = [:]
+        taskStepDetailLoadGenerations = [:]
         taskFileFetchLoadGenerations = [:]
         clientInstallationsLoadGeneration = UUID()
         devicesLoadGeneration = UUID()
@@ -12895,6 +13001,11 @@ private struct MordeIndependentSendTarget {
         try await client.taskPage(status: status, cursor: cursor)
     }
     func task(id: String) async throws -> MordeTask { try await client.task(id: id) }
+    func taskStepDetail(taskID: String, stepID: String, minimumEventSequence: Int64,
+                        expectedScopeKey: String) async throws -> MordeTaskStepDetail {
+        try await client.taskStepDetail(taskID: taskID, stepID: stepID,
+            minimumEventSequence: minimumEventSequence, expectedScopeKey: expectedScopeKey)
+    }
     func refreshFileFetches(taskID: String) async throws {
         try await client.loadTaskFileFetches(taskID: taskID)
     }
@@ -15991,6 +16102,15 @@ private struct MordeRoot: View {
     private var currentConversationTask: MordeTask? {
         client.conversationTasks.first { $0.id == chatAppendTaskID && $0.conversation_id == client.currentConversation }
     }
+    private var startedConversationMessageIDs: Set<String> {
+        guard let conversationID = client.currentConversation else { return [] }
+        let tasks = client.conversationTasks.filter { $0.conversation_id == conversationID }.map {
+            MordeTaskStartedAcknowledgementState(taskID: $0.id, currentRevision: $0.current_revision,
+                desiredRevision: $0.desired_revision, currentRevisionStarted: $0.current_revision_started)
+        }
+        return MordeTaskStartedAcknowledgementPolicy.messageIDs(
+            messages: client.displayedConversationMessages, tasks: tasks)
+    }
     private var canQueueConversationFollowUp: Bool {
         guard let task = currentConversationTask else { return false }
         return ["queued", "running"].contains(task.status)
@@ -16409,7 +16529,12 @@ private struct MordeRoot: View {
                                 },
                                 serviceNeedsUpdate: client.autoRoutingAvailable == false,
                                 processingRetryInFlight: client.routingRetryInFlight.contains(message.id),
-                                processingRetryError: client.routingRetryErrors[message.id],
+                                canRetryProcessing: message.role == "user" && message.actor_id == client.user?.id &&
+                                    message.routing_status == "failed" && message.related_task_id == nil &&
+                                    message.duplicate_of_message_id == nil &&
+                                    (pending == nil || pending?.state == .accepted) &&
+                                    MordeRoutingPresentation.canRetryProcessing(message.routing_failure_reason),
+                                showsTaskStartedAcknowledgement: startedConversationMessageIDs.contains(message.id),
                                 onRetry: { if let id = message.client_message_id { client.retryPendingMessage(id) } },
                                 onSendIndependently: pending.flatMap(client.independentSendTarget).map { target in
                                     { independentSendTarget = target }
@@ -17701,7 +17826,8 @@ private struct MIFMordeMessageBubble: View {
     let waitingForEarlier: String?
     let serviceNeedsUpdate: Bool
     let processingRetryInFlight: Bool
-    let processingRetryError: String?
+    let canRetryProcessing: Bool
+    let showsTaskStartedAcknowledgement: Bool
     let onRetry: () -> Void
     let onSendIndependently: (() -> Void)?
     let onRetryProcessing: () -> Void
@@ -17720,8 +17846,29 @@ private struct MIFMordeMessageBubble: View {
     }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 0) {
+        HStack(alignment: .bottom, spacing: 8) {
             if isUser { Spacer(minLength: userSpacerWidth) }
+            if canRetryProcessing {
+                Button(action: onRetryProcessing) {
+                    Group {
+                        if processingRetryInFlight {
+                            ProgressView().tint(.red)
+                        } else {
+                            Image(systemName: "exclamationmark")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    .frame(width: 34, height: 34)
+                    .background(Color(uiColor: .systemBackground), in: Circle())
+                    .overlay(Circle().stroke(Color.red.opacity(0.32), lineWidth: 1))
+                    .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(processingRetryInFlight)
+                .accessibilityLabel(AppLocalized("Retry processing"))
+                .accessibilityIdentifier("morde.chat.message.retry-processing.\(message.id)")
+            }
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: isUser ? 6 : 3) {
                     if sourceLines.isEmpty || !sourceContentMatchesMessage {
@@ -17776,6 +17923,7 @@ private struct MIFMordeMessageBubble: View {
                                     comment: "Message send status"))
                                     .font(.caption)
                                     .foregroundStyle(pending.state == .failed || pending.state == .unknown ? Color.orange : Color.secondary)
+                                    .accessibilityIdentifier("morde.chat.message.status.\(message.client_message_id ?? pending.id)")
                                 if pending.state == .failed || pending.state == .unknown || pending.error != nil {
                                     Button(AppLocalized("Retry"), action: onRetry)
                                         .font(.caption.weight(.medium))
@@ -17792,28 +17940,20 @@ private struct MIFMordeMessageBubble: View {
                                     .accessibilityIdentifier("morde.outbox.detach.\(pending.id)")
                             }
                         }
-                    } else if isUser, message.client_message_id != nil {
+                    } else if isUser, message.client_message_id != nil, message.routing_status != "failed" {
                         Text(AppLocalized("Sent"))
                             .font(.caption).foregroundStyle(.secondary)
                             .accessibilityIdentifier("morde.chat.message.status.\(message.client_message_id ?? message.id)")
                     }
                     if isUser, (pending == nil || pending?.state == .accepted),
+                       let originalMessageID = message.duplicate_of_message_id {
+                        Text(verbatim: MordeRoutingPresentation.duplicateMessageLocalizationKey(
+                            originalMessageID: originalMessageID, taskID: message.related_task_id))
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else if isUser, (pending == nil || pending?.state == .accepted),
                        let key = MordeRoutingPresentation.localizationKey(message.routing_status) {
                         Text(verbatim: NSLocalizedString(key, comment: "Message routing status"))
                             .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if isUser, (pending == nil || pending?.state == .accepted), message.routing_status == "failed" {
-                        Text(verbatim: NSLocalizedString(MordeRoutingPresentation.failureLocalizationKey(message.routing_failure_reason),
-                                                         comment: "Message processing failure"))
-                            .font(.caption).foregroundStyle(.orange)
-                        if MordeRoutingPresentation.canRetryProcessing(message.routing_failure_reason) {
-                            Button(AppLocalized("Retry processing"), action: onRetryProcessing)
-                                .font(.caption.weight(.medium)).frame(minHeight: 44)
-                                .disabled(processingRetryInFlight)
-                        }
-                        if let processingRetryError {
-                            Text(verbatim: processingRetryError).font(.caption).foregroundStyle(.orange)
-                        }
                     }
                     if message.displayStatus == "streaming" {
                         Text("正在生成…")
@@ -17830,6 +17970,18 @@ private struct MIFMordeMessageBubble: View {
                     if isUser {
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
                             .fill(userMessageFill)
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if isUser && showsTaskStartedAcknowledgement {
+                        Text("👌🏻")
+                            .font(.system(size: 17))
+                            .padding(3)
+                            .background(.regularMaterial, in: Circle())
+                            .overlay(Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                            .offset(x: 7, y: 7)
+                            .accessibilityLabel(AppLocalized("Task started"))
+                            .accessibilityIdentifier("morde.chat.message.task-started.\(message.id)")
                     }
                 }
             }
@@ -18787,7 +18939,15 @@ private struct MordeProjectsRoom: View {
 
     private func projectConversationTranscript(_ project: MordeProject,
                                                conversation: MordeProjectConversation) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let conversationMessages = client.displayedProjectConversationMessages
+        let startedTaskStates = client.projectConversationTasks.filter { $0.conversation_id == conversation.id }.map {
+            MordeTaskStartedAcknowledgementState(taskID: $0.id, currentRevision: $0.current_revision,
+                desiredRevision: $0.desired_revision, currentRevisionStarted: $0.current_revision_started)
+        }
+        let startedMessageIDs = MordeTaskStartedAcknowledgementPolicy.messageIDs(
+            messages: conversationMessages.filter { $0.conversation_id == conversation.id }.map(\.clientMessage),
+            tasks: startedTaskStates)
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(conversation.title.isEmpty ? "新共享会话" : conversation.title).font(.headline)
                 Spacer()
@@ -18803,7 +18963,9 @@ private struct MordeProjectsRoom: View {
             } else if client.displayedProjectConversationMessages.isEmpty {
                 Text("这条共享会话还没有消息。").font(.footnote).foregroundStyle(.secondary)
             }
-            ForEach(client.displayedProjectConversationMessages) { projectConversationMessageRow($0) }
+            ForEach(conversationMessages) {
+                projectConversationMessageRow($0, startedTaskMessageIDs: startedMessageIDs)
+            }
             ForEach(client.visibleUnconfirmedMessages.filter {
                 $0.projectID == project.id && $0.conversationID == conversation.id
             } + client.otherInstanceUnconfirmedMessages.filter {
@@ -18826,7 +18988,9 @@ private struct MordeProjectsRoom: View {
         }
     }
 
-    private func projectConversationMessageRow(_ message: MordeProjectConversationMessage) -> some View {
+    private func projectConversationMessageRow(_ message: MordeProjectConversationMessage,
+                                                startedTaskMessageIDs: Set<String>) -> some View {
+        let isUser = message.role == "user"
         let pending = client.pendingMessages.first {
             $0.id == message.client_message_id && $0.projectID == client.selectedProjectID &&
                 $0.conversationID == message.conversation_id
@@ -18840,7 +19004,39 @@ private struct MordeProjectsRoom: View {
         let sourceLines = MordeConversationMessageSourcePresentation.lines(message.sources, userMessages: sourceMessages)
         let sourceContentMatchesMessage = !sourceLines.isEmpty &&
             sourceLines.map(\.source.content).joined(separator: "\n\n") == message.content
-        return VStack(alignment: message.role == "user" ? .trailing : .leading, spacing: 4) {
+        let canRetryProcessing = isUser && message.actor_id == client.user?.id &&
+            message.routing_status == "failed" && message.related_task_id == nil &&
+            message.duplicate_of_message_id == nil &&
+            (pending == nil || pending?.state == .accepted) &&
+            MordeRoutingPresentation.canRetryProcessing(message.routing_failure_reason)
+        return HStack(alignment: .bottom, spacing: 8) {
+            if isUser { Spacer(minLength: 40) }
+            if canRetryProcessing {
+                Button {
+                    guard let projectID = client.selectedProjectID else { return }
+                    Task { await client.retryMessageProcessing(messageID: message.id,
+                        conversationID: message.conversation_id, projectID: projectID) }
+                } label: {
+                    Group {
+                        if client.routingRetryInFlight.contains(message.id) {
+                            ProgressView().tint(.red)
+                        } else {
+                            Image(systemName: "exclamationmark")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    .frame(width: 34, height: 34)
+                    .background(Color(uiColor: .systemBackground), in: Circle())
+                    .overlay(Circle().stroke(Color.red.opacity(0.32), lineWidth: 1))
+                    .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(client.routingRetryInFlight.contains(message.id))
+                .accessibilityLabel(AppLocalized("Retry processing"))
+                .accessibilityIdentifier("morde.projectConversation.message.retry-processing.\(message.id)")
+            }
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
             Text(message.role == "user" ? message.actor_id : "AI 回复")
                 .font(.caption).foregroundStyle(.secondary)
             if sourceLines.isEmpty || !sourceContentMatchesMessage {
@@ -18916,35 +19112,33 @@ private struct MordeProjectsRoom: View {
                         .font(.caption).frame(minHeight: 44)
                     }
                 }
-            } else if message.role == "user", message.client_message_id != nil {
+            } else if message.role == "user", message.client_message_id != nil, message.routing_status != "failed" {
                 Text(AppLocalized("Sent")).font(.caption).foregroundStyle(.secondary)
             }
-            if message.role == "user",
+            if message.role == "user", let originalMessageID = message.duplicate_of_message_id,
+               !client.pendingMessages.contains(where: { $0.id == message.client_message_id && $0.state != .accepted }) {
+                Text(verbatim: MordeRoutingPresentation.duplicateMessageLocalizationKey(
+                    originalMessageID: originalMessageID, taskID: message.related_task_id))
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if message.role == "user",
                !client.pendingMessages.contains(where: { $0.id == message.client_message_id && $0.state != .accepted }),
                let key = MordeRoutingPresentation.localizationKey(message.routing_status) {
                 Text(verbatim: NSLocalizedString(key, comment: "Message routing status"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if message.role == "user", message.routing_status == "failed",
-               !client.pendingMessages.contains(where: { $0.id == message.client_message_id && $0.state != .accepted }) {
-                Text(verbatim: NSLocalizedString(MordeRoutingPresentation.failureLocalizationKey(message.routing_failure_reason),
-                                                 comment: "Message processing failure"))
-                    .font(.caption).foregroundStyle(.orange)
-                if message.actor_id == client.user?.id && MordeRoutingPresentation.canRetryProcessing(message.routing_failure_reason) {
-                    Button(AppLocalized("Retry processing")) {
-                        guard let projectID = client.selectedProjectID else { return }
-                        Task { await client.retryMessageProcessing(messageID: message.id,
-                            conversationID: message.conversation_id, projectID: projectID) }
-                    }
-                    .font(.caption.weight(.medium)).frame(minHeight: 44)
-                    .disabled(client.routingRetryInFlight.contains(message.id))
-                }
-                if let error = client.routingRetryErrors[message.id] {
-                    Text(verbatim: error).font(.caption).foregroundStyle(.orange)
-                }
+            if isUser && startedTaskMessageIDs.contains(message.id) {
+                Text("👌🏻")
+                    .font(.system(size: 17))
+                    .padding(3)
+                    .background(.regularMaterial, in: Circle())
+                    .overlay(Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                    .accessibilityLabel(AppLocalized("Task started"))
+                    .accessibilityIdentifier("morde.projectConversation.message.task-started.\(message.id)")
             }
+            }
+            if !isUser { Spacer(minLength: 0) }
         }
-        .frame(maxWidth: .infinity, alignment: message.role == "user" ? .trailing : .leading)
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     }
 
     private func projectConversationTaskStatus(_ task: MordeTask) -> some View {

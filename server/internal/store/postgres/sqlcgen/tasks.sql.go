@@ -464,7 +464,7 @@ func (q *Queries) ListTaskEvents(ctx context.Context, arg ListTaskEventsParams) 
 }
 
 const listTaskSteps = `-- name: ListTaskSteps :many
-SELECT id, task_id, sequence, kind, status, title, summary, created_at FROM task_steps WHERE task_id = $1 ORDER BY sequence
+SELECT id, task_id, sequence, kind, status, title, summary, created_at, agent_session_id, task_revision, tool_call_key, tool_name, request_digest, phase, detail_state FROM task_steps WHERE task_id = $1 ORDER BY sequence
 `
 
 func (q *Queries) ListTaskSteps(ctx context.Context, taskID string) ([]TaskStep, error) {
@@ -485,6 +485,13 @@ func (q *Queries) ListTaskSteps(ctx context.Context, taskID string) ([]TaskStep,
 			&i.Title,
 			&i.Summary,
 			&i.CreatedAt,
+			&i.AgentSessionID,
+			&i.TaskRevision,
+			&i.ToolCallKey,
+			&i.ToolName,
+			&i.RequestDigest,
+			&i.Phase,
+			&i.DetailState,
 		); err != nil {
 			return nil, err
 		}

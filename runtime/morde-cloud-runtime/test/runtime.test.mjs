@@ -597,6 +597,11 @@ test('real dsh runs only after worker confirms its events', async () => {
   assert.equal(settled?.state, 'completed_candidate')
   assert.equal(settled.through_seq, through)
   assert.ok(frames.some(frame => frame.type === 'checkpoint' && JSON.parse(frame.payload).events.some(event => event.type === 'assistant/message')))
+  assert.deepEqual(frames.filter(frame => frame.type === 'agent_status'), ['idle', 'running', 'idle'].map((status, index) => ({
+    type: 'agent_status', ...taskFence(start), status, observation_sequence: index + 1,
+  })))
+  assert.ok(frames.findIndex(frame => frame.type === 'agent_status' && frame.status === 'idle' && frame.observation_sequence === 3) <
+    frames.findIndex(frame => frame.type === 'settled'))
 })
 
 test('runs a no-tool coordinator turn with its JSON instruction and Morde SOUL', async () => {
@@ -640,6 +645,7 @@ test('runs a no-tool coordinator turn with its JSON instruction and Morde SOUL',
   assert.deepEqual(JSON.parse(terminal?.result), { action: 'reply', task_id: '', question: '', reply: 'route target' })
   assert.equal(terminal?.through_seq, through)
   assert.deepEqual(coordinatorFence(terminal), coordinatorFence(internalStart))
+  assert.equal(frames.some(frame => frame.type === 'agent_status'), false)
   for (const frame of frames.filter(item => ['checkpoint', 'checkpoint_read', 'model', 'model_cancel', 'coordinator_settled'].includes(item.type))) {
     assert.equal(Object.hasOwn(frame, 'task_id'), false)
     assert.deepEqual(coordinatorFence(frame), coordinatorFence(internalStart))
@@ -1291,6 +1297,9 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
   assert.equal(frames.filter(frame => frame.type === 'child_settle').length, 1)
   assert.equal(frames.filter(frame => frame.type === 'tool_call').length, 1)
   assert.equal(frames.filter(frame => frame.type === 'settled').at(-1)?.state, 'completed_candidate')
+  const statusFrames = frames.filter(frame => frame.type === 'agent_status')
+  assert.ok(statusFrames.length > 0)
+  assert.ok(statusFrames.every(frame => frame.session_id === start.session_id))
   assert.ok(pagesBySession.get(start.session_id)?.length > 0)
   assert.ok(pagesBySession.get(childIdentity.session_id)?.length > 0)
 })
@@ -2441,12 +2450,18 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
 
 test('restores a completed dsh session from verified pages without replaying the prompt', async () => {
   const pages = await captureSession()
-  const result = await resumeSession(pages)
+  const result = await resumeSession(pages, {
+    alterStart: value => ({ ...value, agent_id: 'agent_recovered', generation: 2 }),
+  })
   assert.equal(result.code, 0, `frames: ${result.frames.map(frame => frame.type).join(', ')}`)
   assert.deepEqual(result.offsets, pages.map(page => page.from_seq))
   assert.equal(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
   assert.equal(result.frames.find(frame => frame.type === 'settled')?.session_id, start.session_id)
   assert.equal(result.frames.some(frame => frame.type === 'model'), false)
+  assert.deepEqual(result.frames.filter(frame => frame.type === 'agent_status'), [{
+    type: 'agent_status', ...taskFence({ ...start, agent_id: 'agent_recovered', generation: 2 }),
+    status: 'idle', observation_sequence: 1,
+  }])
 })
 
 test('runs a trusted background-job continuation after restoring a completed task session', async () => {
@@ -3426,6 +3441,17 @@ test('account runtime forwards fenced running message delivery to the task agent
   assert.equal(modelCalls, 2)
   assert.deepEqual(errors, [])
   assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+  const statusFrames = frames.filter(frame => frame.type === 'agent_status')
+  assert.equal(statusFrames[0]?.status, 'idle')
+  assert.ok(statusFrames.some(frame => frame.status === 'running'))
+  assert.equal(statusFrames.at(-1)?.status, 'idle')
+  for (const [index, status] of statusFrames.entries()) {
+    assert.deepEqual(taskFence(status), taskFence(task))
+    assert.equal(status.server_instance_id, account.server_instance_id)
+    assert.equal(status.runtime_id, account.runtime_id)
+    assert.equal(status.runtime_generation, account.runtime_generation)
+    assert.equal(status.observation_sequence, index + 1)
+  }
 })
 
 test('account runtime strips account fences before forwarding a tool result to dsh', async t => {

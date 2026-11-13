@@ -299,6 +299,55 @@ JOIN conversation_message_routes route ON route.message_id=batch.trigger_message
 	}
 }
 
+func TestConversationRouteKeepsRecentPublishedTaskResultPastHistoryWindow(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx := context.Background()
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO model_connections
+(id,owner_id,name,base_url,model_name,api_key_cipher,capability_text,checked_at)
+VALUES ('p1234567',NULL,'result history model','http://127.0.0.1','test',decode(repeat('01',29),'hex'),true,clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	result := f.createTask(t, f.ownerID, "summarize the synthetic launch risks")
+	if !f.complete(t, &result, "synthetic task result") {
+		t.Fatal("task result was not queued")
+	}
+	f.runNextReview(t)
+	var resultMessageID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT published_message_id FROM conversation_result_batches WHERE state='published'`).Scan(&resultMessageID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.WithTx(ctx, func(tx pgx.Tx) error {
+		for index := 0; index < 10; index++ {
+			messageID, err := domain.NewMessageID()
+			if err != nil {
+				return err
+			}
+			if err := insertMessage(ctx, tx, conversation.Message{ID: messageID, OwnerID: f.ownerID, ActorID: f.ownerID,
+				ConversationID: f.conversation.ID, Role: conversation.RoleUser, Content: fmt.Sprintf("unrelated turn %d", index),
+				SourceKind: "conversation", DeliveryStatus: conversation.DeliveryApplied}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	history := f.routeHistoryForActor(t, f.ownerID)
+	resultFound, requestFound := false, false
+	for _, message := range history {
+		if message.MessageID == resultMessageID && message.Content == resultReviewTestReply {
+			resultFound = true
+		}
+		if message.MessageID == result.UserMessageID && message.Content == "summarize the synthetic launch risks" {
+			requestFound = true
+		}
+	}
+	if !resultFound || !requestFound {
+		t.Fatalf("route history after ten unrelated turns omitted the published result or its original request: result=%t request=%t history=%#v",
+			resultFound, requestFound, history)
+	}
+}
+
 func TestConversationResultReviewRetryRestoresFailedBatch(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
@@ -856,6 +905,42 @@ VALUES ('p1234567',NULL,'result model','http://127.0.0.1','test',decode(repeat('
 			}
 		}
 	}
+	if err := store.WithTx(ctx, func(tx pgx.Tx) error {
+		for index := 0; index < 10; index++ {
+			messageID, err := domain.NewMessageID()
+			if err != nil {
+				return err
+			}
+			if err := insertMessage(ctx, tx, conversation.Message{ID: messageID, OwnerID: owner.ID, ActorID: owner.ID,
+				ConversationID: value.ID, Role: conversation.RoleUser, Content: fmt.Sprintf("unrelated project turn %d", index),
+				SourceKind: "conversation", DeliveryStatus: conversation.DeliveryApplied}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ownerHistory = f.routeHistoryForActor(t, owner.ID)
+	memberHistory = f.routeHistoryForActor(t, member.ID)
+	for actor, history := range map[string][]app.ConversationRouteHistory{"owner": ownerHistory, "member": memberHistory} {
+		for _, id := range []string{ownerMessage, memberMessage} {
+			if !contains(history, id) {
+				t.Fatalf("%s route context omitted a recent published project result outside the newest-message window %s: %#v", actor, id, history)
+			}
+		}
+	}
+	for actor, history := range map[string][]app.ConversationRouteHistory{"owner": ownerHistory, "member": memberHistory} {
+		own := []string{a1.UserMessageID, a2.UserMessageID}
+		if actor == "member" {
+			own = []string{b1.UserMessageID, b2.UserMessageID}
+		}
+		for _, id := range own {
+			if !contains(history, id) {
+				t.Fatalf("%s route context omitted its published Task request %s: %#v", actor, id, history)
+			}
+		}
+	}
 }
 
 func TestConversationResultAggregationDoesNotPublishForRemovedProjectMember(t *testing.T) {
@@ -916,11 +1001,13 @@ func (f resultAggregationFixture) routeHistoryForActor(t *testing.T, actorID str
 		t.Fatal(err)
 	}
 	input := app.ConversationRoutingInput{ProjectID: f.conversation.ProjectID}
-	hash := sha256.Sum256([]byte("route-context-" + actorID))
+	messageID := mustID(t, domain.NewMessageID)
+	clientID := "result-context-" + actorID + "-" + messageID
+	hash := sha256.Sum256([]byte("route-context-" + clientID))
 	_, _, err = f.store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
-		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: f.ownerID, ActorID: actorID,
+		Message: conversation.Message{ID: messageID, OwnerID: f.ownerID, ActorID: actorID,
 			ConversationID: f.conversation.ID, Role: conversation.RoleUser, Content: "follow-up"},
-		ServiceInstanceID: instanceID, ClientID: "result-context-" + actorID, RequestHash: hash[:], Input: input,
+		ServiceInstanceID: instanceID, ClientID: clientID, RequestHash: hash[:], Input: input,
 		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: token.ID, Version: 1, ExpiresAt: &token.ExpiresAt},
 	})
 	if err != nil {

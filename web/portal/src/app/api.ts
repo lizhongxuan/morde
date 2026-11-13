@@ -241,6 +241,10 @@ export const portalApi = {
     throw new Error('任务页数超过读取上限');
   },
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  taskArtifactContentURL: (id: string, artifactID: string) => `/api/tasks/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifactID)}/content`,
+  taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
+    params: { path: { id, step_id: stepID } },
+  })),
   taskFileFetches: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/file-fetches', { params: { path: { id } } })),
   deleteTaskFileFetchContent: async (id: string, fetchID: string): Promise<void> => {
     unwrapApiResponse(await api.DELETE('/api/tasks/{id}/file-fetches/{fetch_id}/content', { params: { path: { id, fetch_id: fetchID } } }));
@@ -409,13 +413,10 @@ export const portalApi = {
     const text = unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
       params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { capability: 'text' },
     }));
-    try {
-      return unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
-        params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { capability: 'tools' },
-      }));
-    } catch {
-      return text;
-    }
+    const tools = unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
+      params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { capability: 'tools' },
+    }));
+    return { ...tools, text: text.text };
   },
   checkModelTextStreaming: async (id: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { capability: 'text_stream' },

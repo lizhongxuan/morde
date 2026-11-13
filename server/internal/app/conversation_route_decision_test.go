@@ -14,7 +14,7 @@ import (
 
 func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 	receivedAt := time.Date(2026, 11, 12, 3, 4, 5, 0, time.UTC)
-	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "现在几点？",
+	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", RouteAttempt: 1, Content: "现在几点？",
 		TimeZone: "Asia/Shanghai", ServerReceivedAt: receivedAt})
 	if err != nil {
 		t.Fatal(err)
@@ -26,13 +26,14 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 	if input["reference_time"] != "2026-11-12T11:04:05+08:00" || input["time_zone"] != "Asia/Shanghai" || input["time_zone_provided"] != true {
 		t.Fatalf("localized server receipt time missing: %+v", input)
 	}
-	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "server received") ||
-		!strings.Contains(request.Instructions, "must not create a Task") ||
+	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "reference_time and time_zone") ||
+		!strings.Contains(request.Instructions, "server time is unavailable") ||
 		!strings.Contains(request.Instructions, "acknowledgements") ||
 		!strings.Contains(request.Instructions, "text-only requests for small code snippets") ||
-		!strings.Contains(request.Instructions, "Explicit requests to delegate") ||
-		!strings.Contains(request.Instructions, "do not replace the requested delegation with a static text-only answer") ||
-		!strings.Contains(request.Instructions, "ask for the exact missing information") {
+		!strings.Contains(request.Instructions, "An explicit request to create, write, export, save, or deliver a file or document") ||
+		!strings.Contains(request.Instructions, "Explicit requests to search, browse, consult sources") ||
+		!strings.Contains(request.Instructions, "require a Task; do not replace requested work with a text-only answer") ||
+		!strings.Contains(request.Instructions, "ask for that exact information") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
 	}
 }
@@ -96,11 +97,11 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 }
 
 func TestExplicitParallelDelegationStartsTaskWhenRouterMisses(t *testing.T) {
-	value := ConversationRouteContext{ActorID: "u1234567", Content: "商品页支持含税价格和分类筛选。请并行委派两个互不重叠的只读子任务，一个分析客户端，另一个分析服务端/API，由两个子Agent分别返回结果。"}
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "商品页支持含税价格和分类筛选。请并行委派两个互不重叠的只读子任务，一个分析客户端，另一个分析服务端/API，由两个子Agent分别返回结果。",
+		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}}
 	for _, output := range []string{
 		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
 		`{"action":"reply","task_id":"","question":"","reply":"下面是静态建议清单。"}`,
-		"not-json",
 	} {
 		decision := ParseConversationRouteDecisionForContext(output, value)
 		if decision.Action != ConversationRouteNew || decision.TaskID != "" || decision.Question != "" || decision.Reply != "" ||
@@ -121,6 +122,191 @@ func TestExplicitParallelDelegationFallbackAvoidsQueriesAndNegation(t *testing.T
 		if decision.Action != ConversationRouteReply || decision.Reply == "" {
 			t.Errorf("non-delegation query was turned into a Task: %q => %+v", content, decision)
 		}
+	}
+}
+
+func TestExplicitSearchStartsTaskWhenRouterMisses(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "查阅 OpenAI 官方文档，说明 Structured Outputs 用来解决什么问题，并给出可打开的来源链接。"}
+	for _, output := range []string{
+		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
+		`{"action":"reply","task_id":"","question":"","reply":"Structured Outputs 用于约束输出格式。"}`,
+	} {
+		decision := ParseConversationRouteDecisionForContext(output, value)
+		if decision.Action != ConversationRouteNew || decision.TaskID != "" || decision.Question != "" || decision.Reply != "" ||
+			decision.ModelOutput != output {
+			t.Errorf("explicit source lookup did not start independent Task: %q => %+v", output, decision)
+		}
+	}
+}
+
+func TestExplicitDownloadableDocumentStartsTaskWhenRouterMisses(t *testing.T) {
+	for _, output := range []string{
+		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
+		`{"action":"reply","task_id":"","question":"","reply":"我可以直接把设计方案写在聊天里。"}`,
+	} {
+		decision := ParseConversationRouteDecisionForContext(output, ConversationRouteContext{
+			ActorID: "u1234567", Content: "帮助我写一个设计方案文档，并且可以下载的",
+		})
+		if decision.Action != ConversationRouteNew || decision.InvalidOutput || decision.ModelOutput != output {
+			t.Errorf("explicit downloadable document did not start a Task: %q => %+v", output, decision)
+		}
+	}
+	for _, content := range []string{
+		"请告诉我怎么写一个 Markdown 文档",
+		"不要生成文档，只用聊天文字说明",
+	} {
+		decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"这是说明。"}`,
+			ConversationRouteContext{ActorID: "u1234567", Content: content})
+		if decision.Action != ConversationRouteReply {
+			t.Errorf("conversational or negative document request became a Task: %q => %+v", content, decision)
+		}
+	}
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "帮助我写一个设计方案文档，并且可以下载的",
+		PreviousUnresolved: true}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"先确认上一条消息"}`, value)
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("file intent bypassed an unresolved predecessor: %+v", decision)
+	}
+	value.PreviousUnresolved = false
+	value.ReferenceTaskID, value.ReferenceUnavailable = "q1234567", true
+	decision = ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"先恢复任务"}`, value)
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("file intent bypassed an unavailable task reference: %+v", decision)
+	}
+}
+
+func TestConversationRouteJoinRequiresAuthorizedSameScopeCandidate(t *testing.T) {
+	digest := make([]byte, sha256.Size)
+	digest[0] = 1
+	candidate := ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3, Content: "分析 Morde 项目",
+		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: digest}
+	value := ConversationRouteContext{ActorID: "u1234567", RouteAttempt: 1, Content: "分析 Morde 项目", ExecutionScopeDigest: digest,
+		RequestCandidates: []ConversationRouteRequestCandidate{candidate}}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"join","task_id":"","target_message_id":"m1234567","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`, value)
+	if decision.Action != ConversationRouteJoin || decision.TargetMessageID != candidate.MessageID || decision.InvalidOutput {
+		t.Fatalf("valid same-scope join was rejected: %+v", decision)
+	}
+	for _, invalid := range []struct {
+		name      string
+		candidate ConversationRouteRequestCandidate
+	}{
+		{name: "another actor target", candidate: ConversationRouteRequestCandidate{MessageID: "m7654321", Sequence: 2,
+			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: digest}},
+		{name: "different execution scope", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
+			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingProcessing}},
+		{name: "completed task", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
+			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingRouted, TaskID: "q1234567",
+			TaskStatus: task.StatusCompleted, SameExecutionScope: true, ExecutionScopeDigest: digest}},
+		{name: "failed route without task", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
+			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingFailed, SameExecutionScope: true, ExecutionScopeDigest: digest}},
+		{name: "routed non-reply without task", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
+			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, ExecutionScopeDigest: digest}},
+	} {
+		t.Run(invalid.name, func(t *testing.T) {
+			value.RequestCandidates = []ConversationRouteRequestCandidate{invalid.candidate}
+			decision := ParseConversationRouteDecisionForContext(`{"action":"join","task_id":"","target_message_id":"m1234567","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`, value)
+			if decision.Action != ConversationRouteClarify || !decision.InvalidOutput {
+				t.Fatalf("unauthorized join target was accepted: %+v", decision)
+			}
+		})
+	}
+	for _, status := range []task.Status{task.StatusQueued, task.StatusRunning} {
+		candidate := ConversationRouteRequestCandidate{MessageID: "m2345678", Sequence: 4, Content: "补充同一目标的要求",
+			RoutingStatus: conversation.RoutingRouted, TaskID: "q1234567", TaskStatus: status,
+			SameExecutionScope: true, ExecutionScopeDigest: digest}
+		if !ValidConversationRouteJoinTarget(candidate.MessageID, []ConversationRouteRequestCandidate{candidate}) {
+			t.Errorf("active %s Task was not a valid merge target", status)
+		}
+	}
+	directReply := ConversationRouteRequestCandidate{MessageID: "m3456789", Sequence: 5, Content: "分析 Morde 项目",
+		RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, DirectReply: true, ExecutionScopeDigest: digest}
+	if !ValidConversationRouteJoinTarget(directReply.MessageID, []ConversationRouteRequestCandidate{directReply}) {
+		t.Fatal("direct-reply route was not eligible for safe reclassification and join")
+	}
+}
+
+func TestConversationRouteExplicitNewIntentRequiresPositiveRerun(t *testing.T) {
+	for _, test := range []struct {
+		content string
+		want    bool
+	}{
+		{content: "重新开始一个新任务", want: true},
+		{content: "Start another task for the same request", want: true},
+		{content: "请明确重做一遍", want: true},
+		{content: "Do not start another task", want: false},
+		{content: "Don't start a new task", want: false},
+		{content: "继续相同目标，并补充失败处理", want: false},
+		{content: "另一个目标：生成测试方案", want: false},
+	} {
+		t.Run(test.content, func(t *testing.T) {
+			if got := ConversationRouteHasExplicitNewIntent(test.content); got != test.want {
+				t.Fatalf("ConversationRouteHasExplicitNewIntent(%q)=%t, want %t", test.content, got, test.want)
+			}
+		})
+	}
+}
+
+func TestConversationRouteExplicitRerunAndInvalidOutputStayDistinct(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", RouteAttempt: 1, Content: "请从头再做，开始一个新任务"}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","explicit_new":true,"question":"","reply":"","dependency_task_ids":[]}`, value)
+	if decision.Action != ConversationRouteNew || !decision.ExplicitNew {
+		t.Fatalf("explicit rerun was not retained: %+v", decision)
+	}
+	value.Content = "请继续原来的分析"
+	decision = ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","explicit_new":true,"question":"","reply":"","dependency_task_ids":[]}`, value)
+	if !decision.InvalidOutput {
+		t.Fatalf("unsupported explicit_new flag was treated as user ambiguity: %+v", decision)
+	}
+	value.Content = "换一个目标，帮我设计 Morde 的发布流程"
+	decision = ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`, value)
+	if decision.Action != ConversationRouteNew || decision.ExplicitNew || decision.InvalidOutput {
+		t.Fatalf("independent target was confused with an explicit rerun: %+v", decision)
+	}
+	decision = ParseConversationRouteDecisionForContext("not-json", value)
+	if !decision.InvalidOutput {
+		t.Fatalf("malformed model output was treated as valid clarification: %+v", decision)
+	}
+}
+
+func TestConversationRouteExecutionScopeIgnoresOnlyCausalPredecessor(t *testing.T) {
+	first := ConversationRoutingInput{ProjectID: "pr123456", HostID: "h1234567", PreviousClientMessageID: "prior-001",
+		ClientAttachmentIDs: []string{"pa_0123456789abcdef0123456789abcdef"}}
+	second := first
+	second.PreviousClientMessageID = "prior-002"
+	firstDigest, err := ConversationRouteExecutionScopeDigest(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := ConversationRouteExecutionScopeDigest(second)
+	if err != nil || string(firstDigest) != string(secondDigest) {
+		t.Fatalf("causal predecessor changed execution scope: %x %x err=%v", firstDigest, secondDigest, err)
+	}
+	second.HostID = "h7654321"
+	otherDigest, err := ConversationRouteExecutionScopeDigest(second)
+	if err != nil || string(firstDigest) == string(otherDigest) {
+		t.Fatalf("different execution target shared scope digest: %x %x err=%v", firstDigest, otherDigest, err)
+	}
+}
+
+func TestExplicitSearchFallbackAvoidsQuestionsNegationAndActiveTasks(t *testing.T) {
+	for _, content := range []string{
+		"搜索算法是什么？",
+		"请不要搜索 OpenAI 文档，只解释 Structured Outputs。",
+		"Explain what the word search means.",
+	} {
+		value := ConversationRouteContext{ActorID: "u1234567", Content: content}
+		output := `{"action":"reply","task_id":"","question":"","reply":"这是一个解释性问题。"}`
+		decision := ParseConversationRouteDecisionForContext(output, value)
+		if decision.Action != ConversationRouteReply || decision.Reply == "" {
+			t.Errorf("query or negation was turned into a Task: %q => %+v", content, decision)
+		}
+	}
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "查阅 OpenAI 官方文档", Candidates: []ConversationRouteCandidate{{
+		TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1,
+	}}}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`, value)
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("search fallback overrode active-task ambiguity: %+v", decision)
 	}
 }
 

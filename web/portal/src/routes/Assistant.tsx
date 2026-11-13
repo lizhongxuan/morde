@@ -8,7 +8,7 @@ import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview, K2TaskDependency } from '../app/k2-task-projection';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import { useMessageOutbox } from '../app/use-message-outbox';
-import { deliveryStatusText } from '../app/message-status';
+import { deliveryStatusText, userVisibleRoutingStatusText } from '../app/message-status';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { outboxReceiptRequest } from '../app/message-outbox';
@@ -35,6 +35,9 @@ type ConversationMessagePage = Awaited<ReturnType<typeof portalApi.conversationM
 type ConversationMessagesData = { pages: ConversationMessagePage[]; pageParams: unknown[] };
 type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
+type TaskStep = Task['steps'][number];
+type TaskAgent = NonNullable<Task['agents']>[number];
+type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskArtifact = Task['artifacts'][number];
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
@@ -71,20 +74,30 @@ function isPlaceholderConversationTitle(title?: string): boolean {
   return !title?.trim() || ['新对话', '新旁聊', '对话'].includes(title.trim());
 }
 
-function conversationMessageStatus(message: AssistantDisplayMessage, task?: TaskSummary): string | null {
-  if (message.routing_status === 'failed') return null;
-  const routingStatus = message.routing_status === 'pending' ? '已受理，等待处理'
-    : message.routing_status === 'processing' ? '正在处理'
-      : message.routing_status === 'waiting_user' ? '等待你补充任务信息'
-        : message.routing_status === 'waiting_adjustment' ? '已收到修改，正在更新任务' : null;
-  if (routingStatus) {
-    const taskTitle = conversationTitleFromText(task?.objective);
-    return `${taskTitle ? `任务“${taskTitle}”` : message.task_id ? '关联任务' : '此消息'} · ${routingStatus}`;
+function conversationMessageStatus(message: AssistantDisplayMessage, task?: Task): string | null {
+  if (message.duplicate_of_message_id) {
+    const relatedTask = message.related_task_id ? ` · 关联任务“${conversationTitleFromText(task?.objective) ?? message.related_task_id}”` : '';
+    const status = task ? ` · ${taskActivityStatusText(task, task)}` : message.related_task_id ? ' · 任务状态待核对' : '';
+    return `重复请求 · 原消息 ${message.duplicate_of_message_id}${relatedTask}${status}`;
   }
+  if (message.routing_status === 'failed' || message.routing_status === 'pending' || message.routing_status === 'processing') return null;
+  const taskTitle = conversationTitleFromText(task?.objective);
+  const messageSource = taskTitle ? `任务“${taskTitle}”`
+    : message.task_id ? `关联任务 ${message.task_id}` : '此消息';
+  const routingStatus = userVisibleRoutingStatusText(message.routing_status);
+  if (routingStatus) return `${messageSource} · ${routingStatus}`;
+  if (message.routing_status === 'waiting_user') return null;
   if (message.delivery_status === 'applied') return null;
   const deliveryStatus = message.delivery_status === 'pending' && task && terminalTaskStatuses.has(task.status)
     ? '消息未处理，处理已结束' : deliveryStatusText(message.delivery_status);
-  return `${message.task_id ? '关联任务' : '此消息'} · ${deliveryStatus}`;
+  return `${messageSource} · ${deliveryStatus}`;
+}
+
+function hasCompleteVerifiedArtifactProof(artifact: TaskArtifact): boolean {
+  return artifact.verified && Boolean(artifact.workspace_id) && Number.isSafeInteger(artifact.workspace_revision)
+    && (artifact.workspace_revision ?? -1) >= 0 && Number.isSafeInteger(artifact.size_bytes)
+    && (artifact.size_bytes ?? -1) >= 0 && /^[a-f0-9]{64}$/iu.test(artifact.sha256 ?? '')
+    && Boolean(artifact.path.trim()) && Boolean(artifact.media_type.trim());
 }
 
 function AssistantOutboxRetryButton({ entry, sendMessage, label }: {
@@ -93,15 +106,28 @@ function AssistantOutboxRetryButton({ entry, sendMessage, label }: {
   return <button type="button" className="button button-small button-secondary" onClick={() => void sendMessage(entry, true)}>{label}</button>;
 }
 
-function AssistantTaskSupplementForm({ task, value, disabled, saving, onChange, onSubmit }: {
+function AssistantTaskSupplementForm({ task, value, disabled, saving, needsWorkspaceTarget, workspaceID, workspaces, onWorkspaceChange, onChange, onSubmit }: {
   task: Task; value: string; disabled: boolean; saving: boolean;
+  needsWorkspaceTarget: boolean; workspaceID: string; workspaces: { id: string; name: string; revision: number }[];
+  onWorkspaceChange: (workspaceID: string) => void;
   onChange: (event: ChangeEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>, task: Task) => void;
 }) {
   return <form className="task-supplement-form" aria-label="补充任务" onSubmit={(event) => onSubmit(event, task)}>
+    {needsWorkspaceTarget && <div className="task-supplement-target">
+      <label htmlFor={`task-supplement-workspace-${task.id}`}>保存到 Workspace</label>
+      <select id={`task-supplement-workspace-${task.id}`} aria-label="选择任务 Workspace" value={workspaceID}
+        required disabled={disabled} onChange={(event) => onWorkspaceChange(event.target.value)}>
+        <option value="">请选择可写 Workspace</option>
+        {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · v{workspace.revision}</option>)}
+      </select>
+      <small>选择后会把这个任务绑定到该 Workspace，再继续保存文档。</small>
+    </div>}
     <label htmlFor={`task-supplement-${task.id}`}>补充任务内容</label>
     <textarea id={`task-supplement-${task.id}`} value={value} maxLength={maxMessageBytes} onChange={onChange} disabled={disabled} />
-    <button type="submit" className="button button-primary" disabled={!value.trim() || saving}>发送补充任务</button>
+    <button type="submit" className="button button-primary" disabled={(!value.trim() && !needsWorkspaceTarget) || (needsWorkspaceTarget && !workspaceID) || disabled || saving}>
+      {needsWorkspaceTarget ? '选择 Workspace 并继续' : '发送补充任务'}
+    </button>
   </form>;
 }
 
@@ -392,7 +418,8 @@ function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): s
   }
   if (task.status === 'failed') return task.result || '任务执行失败。';
   if (task.status === 'cancelled') return '服务端已确认任务停止。';
-  if (task.result_message_pending || task.result_message_published) return '任务已完成，正在整理回复。';
+  if (task.result_message_pending) return '任务已完成，正在整理回复。';
+  if (task.result_message_published) return '任务已完成，最终回复已发布。';
   return task.result || '任务已完成。';
 }
 
@@ -442,7 +469,8 @@ const taskEventTypes = [
 ] as const;
 
 function stepTitle(step: Task['steps'][number]): string {
-  const prefix = ['Run cloud dsh tool: ', 'Run cloud dsh MCP tool: ', 'Run Hostless Workspace tool: ']
+  const mcpPrefix = 'Run cloud dsh MCP tool: ';
+  const prefix = ['Run cloud dsh tool: ', mcpPrefix, 'Run Hostless Workspace tool: ']
     .find((value) => step.title.startsWith(value));
   if (!prefix) return step.title;
   const name = step.title.slice(prefix.length);
@@ -451,6 +479,7 @@ function stepTitle(step: Task['steps'][number]): string {
   if (name === 'morde_workspace_list') return '查看电脑文件';
   if (name === 'morde_workspace_read') return '读取电脑文件';
   if (name === 'morde_workspace_write') return '保存电脑文件';
+  if (prefix === mcpPrefix) return name.startsWith('morde_mcp_') ? '使用 MCP 工具' : `使用 MCP 工具：${name}`;
   if (name.startsWith('browser_')) return '操作浏览器';
   if (name.startsWith('desktop_')) return '操作云端电脑';
   if (name.startsWith('file_')) return '处理文件';
@@ -458,9 +487,127 @@ function stepTitle(step: Task['steps'][number]): string {
   return '使用工具';
 }
 
+function stepDetailToolName(step: TaskStep, fallback?: string | null): string | undefined {
+  const prefix = 'Run cloud dsh MCP tool: ';
+  if (!step.title.startsWith(prefix)) return fallback ?? undefined;
+  const name = step.title.slice(prefix.length);
+  return name.startsWith('morde_mcp_') || !name ? 'MCP 工具' : name;
+}
+
+function stepDetailObject(step: TaskStep, object: string | null): string | null {
+  if (object === null || !step.title.startsWith('Run cloud dsh MCP tool: ') || !object.startsWith('morde_mcp_')) return object;
+  return 'MCP 连接器';
+}
+
 const stepStatus: Record<Task['steps'][number]['status'], string> = {
   queued: '等待中', running: '进行中', waiting_user: '等待确认', succeeded: '已完成', failed: '失败', unknown: '结果待确认',
 };
+
+function stepStatusText(step: TaskStep): string {
+  if (step.phase === 'prepare' && step.status === 'failed') return '失败（未派发）';
+  if (step.phase === 'prepare' && (step.status === 'queued' || step.status === 'running')) return '准备中';
+  return stepStatus[step.status];
+}
+
+type TaskActivityGroup = { id: string; title: string; status: string; depth: number; steps: TaskStep[] };
+type TaskPanelGroup = { id: string; title: string; tasks: TaskSummary[] };
+type TaskPanelRow = { key: string; group: TaskPanelGroup; task: TaskSummary | null; first: boolean };
+
+function taskActivityGroups(task: Task, steps: TaskStep[]): TaskActivityGroup[] {
+  const agents = task.agents ?? [];
+  const byID = new Map(agents.map((agent) => [agent.id, agent]));
+  const roots = agents.filter((agent) => agent.role === 'main' && agent.parent_id === null);
+  const groups: TaskActivityGroup[] = [];
+  const groupedSteps = new Set<string>();
+  const visited = new Set<string>();
+  const sequenceFor = (agent: TaskAgent) => task.steps.find((step) => step.id === agent.step_id)?.sequence ?? Number.MAX_SAFE_INTEGER;
+  const ownerFor = (step: TaskStep): string | undefined => {
+    if (step.agent_id) return step.agent_id;
+    const delegations = agents.filter((agent) => agent.step_id === step.id && agent.parent_id);
+    return delegations.length === 1 ? delegations[0]?.parent_id ?? undefined : undefined;
+  };
+  const visit = (agent: TaskAgent, path: number[]) => {
+    if (visited.has(agent.id) || byID.get(agent.id) !== agent) return;
+    visited.add(agent.id);
+    const owned = steps.filter((step) => ownerFor(step) === agent.id).sort((a, b) => a.sequence - b.sequence);
+    owned.forEach((step) => groupedSteps.add(step.id));
+    const delegation = task.steps.find((step) => step.id === agent.step_id);
+    const observed = agent.status === 'running' ? '进行中' : agent.status === 'idle' ? '空闲' : '状态待确认';
+    groups.push({ id: `agent:${agent.id}`, title: path.length ? `子 Agent ${path.map((part) => String(part).padStart(2, '0')).join('.')}` : '主 Agent',
+      status: agent.role === 'subagent' && delegation ? stepStatusText(delegation) : observed, depth: path.length, steps: owned });
+    const children = agents.filter((child) => child.role === 'subagent' && child.parent_id === agent.id)
+      .sort((left, right) => sequenceFor(left) - sequenceFor(right) || left.id.localeCompare(right.id));
+    children.forEach((child, index) => visit(child, [...path, index + 1]));
+  };
+  if (roots.length === 1) visit(roots[0]!, []);
+  const unassigned = steps.filter((step) => !groupedSteps.has(step.id)).sort((a, b) => a.sequence - b.sequence);
+  if (unassigned.length) groups.push({ id: 'unassigned', title: '归属待确认', status: '', depth: 0, steps: unassigned });
+  return groups;
+}
+
+function latestTaskSnapshot(previous: unknown, next: unknown): unknown {
+  const oldTask = previous as Task | undefined;
+  const newTask = next as Task;
+  return oldTask && oldTask.id === newTask.id && oldTask.event_sequence > newTask.event_sequence ? oldTask : newTask;
+}
+
+function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceID }: {
+  task: Task; step: TaskStep; conversationID: string; actorID: string; serviceInstanceID: string;
+}) {
+  const client = useQueryClient();
+  const [accessRevoked, setAccessRevoked] = useState(false);
+  const queryKey = ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id] as const;
+  const detail = useQuery({
+    queryKey,
+    queryFn: async () => {
+      const result = await portalApi.taskStepDetail(task.id, step.id);
+      if (result.task_id !== task.id || result.step_id !== step.id) throw new Error('详情身份不匹配');
+      return result.detail_state === 'available' ? result : { ...result, object: null, input: null, result: null };
+    },
+    enabled: Boolean(actorID && serviceInstanceID && conversationID) && !accessRevoked,
+    retry: false,
+    gcTime: 0,
+    structuralSharing: (previous: unknown, next: unknown) => {
+      const oldDetail = previous as TaskStepDetail | undefined;
+      const newDetail = next as TaskStepDetail;
+      if (newDetail.detail_state !== 'available') return newDetail;
+      return oldDetail && oldDetail.task_id === newDetail.task_id && oldDetail.step_id === newDetail.step_id &&
+        oldDetail.event_sequence > newDetail.event_sequence ? oldDetail : newDetail;
+    },
+    refetchInterval: (query) => !terminalTaskStatuses.has(task.status) ||
+      (query.state.data && query.state.data.event_sequence < task.event_sequence) ? 1500 : false,
+  });
+  const inaccessible = isResourceNoLongerAccessible(detail.error);
+  if (inaccessible && !accessRevoked) setAccessRevoked(true);
+  useEffect(() => {
+    if (!accessRevoked) return;
+    client.removeQueries({ queryKey: ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id], exact: true });
+  }, [accessRevoked, actorID, client, conversationID, serviceInstanceID, step.id, task.id]);
+  if (accessRevoked || inaccessible) return <p className="task-step-detail-message" role="status">详情不可访问或已删除。</p>;
+  if (detail.isError) return <p className="task-step-detail-message" role="alert">详情暂不可用。
+    <button type="button" className="button button-small button-secondary" onClick={() => void detail.refetch()}>重试</button></p>;
+  if (!actorID || !serviceInstanceID) return <p className="task-step-detail-message" role="status">账号或服务身份暂不可确认。</p>;
+  const data = detail.data;
+  if (!data) return <p className="task-step-detail-message" role="status">正在读取详情…</p>;
+  if (data.task_id !== task.id || data.step_id !== step.id) return <p className="task-step-detail-message" role="alert">详情身份不匹配。</p>;
+  const unavailable: Record<Exclude<TaskStepDetail['detail_state'], 'available'>, string> = {
+    not_recorded: '详情未记录。', expired: '详情已过期。', restricted: '没有权限查看详情。',
+  };
+  const toolName = stepDetailToolName(step, data.tool_name);
+  const object = stepDetailObject(step, data.object);
+  if (data.detail_state === 'available' && data.event_sequence < task.event_sequence) return <p className="task-step-detail-message" role="status">正在读取详情…</p>;
+  return <div className="task-step-detail" aria-label="动作详情">
+    {toolName && <p><strong>工具</strong> {toolName}</p>}
+    <p><strong>时间</strong> {formatDate(step.created_at)}</p>
+    {data.detail_state !== 'available' ? <p role="status">{unavailable[data.detail_state]}</p> : <>
+      {object !== null && <p><strong>对象</strong> {object || '（空）'}</p>}
+      {data.input !== null && <p><strong>输入</strong> {data.input || '（空）'}</p>}
+      {data.result !== null && <p><strong>结果</strong> {data.result || '（空结果）'}</p>}
+      {data.object === null && data.input === null && data.result === null && <p>没有可展示的输入或结果。</p>}
+      {data.truncated && <p>内容已截断。</p>}
+    </>}
+  </div>;
+}
 
 const taskStatusLabel: Record<Task['status'], string> = {
   queued: '排队中', running: '运行中', waiting_user: '等待用户', pausing: '正在暂停', paused: '已暂停',
@@ -489,7 +636,9 @@ function taskActivityProgressText(summary: TaskSummary, task: Task | undefined, 
     if (task.clarification_request) return `等待补充：${task.clarification_request.question}`;
   }
   const currentStep = task.steps.find((step) => step.id === task.current_step);
-  if (currentStep && task.status === 'running' && currentStep.kind !== 'model') return stepTitle(currentStep);
+  const latestStep = currentStep?.kind !== 'model' ? currentStep : undefined;
+  const progressStep = latestStep ?? [...task.steps].reverse().find((step) => ['tool', 'subagent', 'verification', 'verify', 'progress'].includes(step.kind));
+  if (progressStep && task.status === 'running') return stepTitle(progressStep);
   if (task.status === 'failed') return '任务执行失败，查看工作过程或更多信息了解原因。';
   if (task.status === 'completed') return '任务已完成，打开详情查看结果。';
   return taskStatusText(task, cloudTasksAvailable);
@@ -546,28 +695,38 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
     if (terminal || typeof EventSource === 'undefined') return;
     const source = new EventSource(`/api/tasks/${encodeURIComponent(task.id)}/events?after=${cursor.current}`);
     let disposed = false;
+    let resyncing = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const resync = () => {
+      if (disposed || resyncing) return;
+      resyncing = true;
       source.close();
       onState(task.id, 'resyncing');
-      void client.fetchQuery({ queryKey: ['task', task.id], queryFn: () => portalApi.task(task.id), staleTime: 0 }).then((snapshot) => {
+      void client.fetchQuery({ queryKey: ['task', task.id], queryFn: () => portalApi.task(task.id), staleTime: 0,
+        structuralSharing: latestTaskSnapshot }).then((snapshot) => {
         if (!disposed) {
+          if (snapshot.event_sequence < cursor.current) {
+            retry = setTimeout(() => { resyncing = false; resync(); }, 1000);
+            return;
+          }
           cursor.current = snapshot.event_sequence;
           void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
           void client.invalidateQueries({ queryKey: ['task-file-fetches', task.id] });
+          void client.invalidateQueries({ queryKey: ['task-step-detail'], predicate: (query) => query.queryKey[4] === task.id });
           setGeneration((value) => value + 1);
         }
-      }).catch(() => {
+      }).catch((error: unknown) => {
         if (!disposed) {
           onState(task.id, 'disconnected');
-          retry = setTimeout(() => setGeneration((value) => value + 1), 3000);
+          if (!isResourceNoLongerAccessible(error)) retry = setTimeout(() => setGeneration((value) => value + 1), 3000);
         }
       });
     };
-    source.onopen = () => onState(task.id, 'connected');
-    source.onerror = () => onState(task.id, 'disconnected');
+    source.onopen = () => { if (!disposed && !resyncing) onState(task.id, 'connected'); };
+    source.onerror = () => resync();
     for (const type of taskEventTypes) {
       source.addEventListener(type, (event) => {
+        if (disposed || resyncing) return;
         let value: unknown;
         try { value = JSON.parse((event as MessageEvent<string>).data); } catch { return; }
         if (type === 'task.snapshot_required') {
@@ -584,7 +743,11 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
         onState(task.id, 'connected');
         void client.invalidateQueries({ queryKey: ['task', task.id] });
         void client.invalidateQueries({ queryKey: ['task-file-fetches', task.id] });
-        if (type === 'task.status' || type === 'task.waiting_user') void client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
+        void client.invalidateQueries({ queryKey: ['task-step-detail'], predicate: (query) => query.queryKey[4] === task.id });
+        if (type === 'task.status' || type === 'task.waiting_user') {
+          void client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
+          void client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] });
+        }
         if (type === 'task.message' || type === 'task.result' || type === 'task.response') {
           void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
         }
@@ -610,6 +773,9 @@ export function Assistant() {
   const [composerDraftError, setComposerDraftError] = useState<string | null>(null);
   const [hydratedComposerDraftKey, setHydratedComposerDraftKey] = useState<string | null>(null);
   const [hostSelection, setHostSelection] = useState<string | null>(null);
+  const [workspaceSelection, setWorkspaceSelection] = useState<string | null>(null);
+  const [retryAcceptedMessageIDs, setRetryAcceptedMessageIDs] = useState<Set<string>>(() => new Set());
+  const [retryAcceptedResultReviewTaskIDs, setRetryAcceptedResultReviewTaskIDs] = useState<Set<string>>(() => new Set());
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
@@ -620,8 +786,12 @@ export function Assistant() {
   const [preparingAttachmentIDsForRender, setPreparingAttachmentIDsForRender] = useState<ReadonlySet<string>>(() => new Set());
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const [taskSupplementDrafts, setTaskSupplementDrafts] = useState<Record<string, string>>({});
+  const [taskWorkspaceSelections, setTaskWorkspaceSelections] = useState<Record<string, string>>({});
   const [supplementTaskID, setSupplementTaskID] = useState<string | null>(null);
   const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
+  const [taskStepSelection, setTaskStepSelection] = useState<{ taskID: string; stepID: string } | null>(null);
+  const [visibleActivitySteps, setVisibleActivitySteps] = useState<Record<string, number>>({});
+  const [taskPanelRecentOpen, setTaskPanelRecentOpen] = useState(false);
   const [taskPanelTab, setTaskPanelTab] = useState<'tasks' | 'files' | 'computer'>('tasks');
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
   const [computerHostID, setComputerHostID] = useState<string | null>(null);
@@ -704,6 +874,7 @@ export function Assistant() {
     staleTime: Infinity,
   });
   const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000 });
+  const workspaces = useQuery({ queryKey: ['assistant-workspaces'], queryFn: portalApi.workspaces, staleTime: 30_000 });
   const mcpConnectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const availableModels = useQuery({ queryKey: ['available-models'], queryFn: portalApi.availableModels });
   const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences });
@@ -773,6 +944,9 @@ export function Assistant() {
   if (panelConversationID !== conversationID) {
     setPanelConversationID(conversationID);
     setTaskDetailTaskID(null);
+    setTaskStepSelection(null);
+    setVisibleActivitySteps({});
+    setTaskPanelRecentOpen(false);
     setTaskPanelTab('tasks');
     setComputerConnecting(false);
     setComputerEmbed(null);
@@ -897,6 +1071,7 @@ export function Assistant() {
       setContent('');
       setModelID('');
       setHostSelection(null);
+      setWorkspaceSelection(null);
       setMcpConnectorIDs([]);
       setComposerAttachments([]);
       setOfficePreviews({});
@@ -914,6 +1089,7 @@ export function Assistant() {
           setContent('');
           setModelID('');
           setHostSelection(null);
+          setWorkspaceSelection(null);
           setMcpConnectorIDs([]);
           setComposerAttachments([]);
           setOfficePreviews({});
@@ -993,16 +1169,17 @@ export function Assistant() {
   const taskIDs = [...new Set([
     ...conversationTaskItems.map((item) => item.id),
     ...recentConversationTaskItems.map((item) => item.id),
-    ...conversationMessageItems.flatMap((message) => message.task_id ? [message.task_id] : []),
+    ...conversationMessageItems.flatMap((message) => [message.task_id, message.related_task_id].filter((id): id is string => Boolean(id))),
   ])];
   const currentConversationTaskIDs = new Set([
     ...conversationTaskItems.map((item) => item.id),
     ...recentConversationTaskItems.map((item) => item.id),
-    ...conversationMessageItems.flatMap((message) => message.task_id ? [message.task_id] : []),
+    ...conversationMessageItems.flatMap((message) => [message.task_id, message.related_task_id].filter((id): id is string => Boolean(id))),
   ]);
   const taskQueries = useQueries({ queries: taskIDs.map((id) => ({
     queryKey: ['task', id], queryFn: () => portalApi.task(id),
     enabled: currentConversationTaskIDs.has(id) || taskDetailTaskID === id,
+    structuralSharing: latestTaskSnapshot,
     refetchInterval: (query: { state: { data: Task | undefined } }) => query.state.data?.result_message_pending ? 1000
       : query.state.data && terminalTaskStatuses.has(query.state.data.status) ? false
         : query.state.data && query.state.data.conversation_id !== conversationID ? 5000 : 1500,
@@ -1022,7 +1199,7 @@ export function Assistant() {
   const taskPanelIDs = [...new Set([
     ...conversationTaskItems.map((item) => item.id),
     ...recentConversationTaskItems.map((item) => item.id),
-    ...conversationMessageItems.flatMap((message) => message.task_id ? [message.task_id] : []),
+    ...conversationMessageItems.flatMap((message) => [message.task_id, message.related_task_id].filter((id): id is string => Boolean(id))),
   ])];
   const taskPanelTasks = taskPanelIDs.flatMap((id) => {
     const summary = conversationTaskItems.find((item) => item.id === id) ?? recentConversationTaskItems.find((item) => item.id === id) ?? allTasksByID.get(id);
@@ -1031,12 +1208,23 @@ export function Assistant() {
     Date.parse(allTasksByID.get(left.id)?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id));
   const taskProgressReadError = taskQueries.some((query, index) => query.isError && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
   const visibleTaskPanelTasks = taskPanelTasks.filter((item) => item.conversation_id === conversationID);
+  const taskPanelGroups: TaskPanelGroup[] = [
+    { id: 'attention', title: '待你处理', tasks: visibleTaskPanelTasks.filter((item) => (allTasksByID.get(item.id)?.status ?? item.status) === 'waiting_user') },
+    { id: 'running', title: '进行中', tasks: visibleTaskPanelTasks.filter((item) => ['queued', 'running', 'pausing', 'cancelling'].includes(allTasksByID.get(item.id)?.status ?? item.status)) },
+    { id: 'paused', title: '已暂停', tasks: visibleTaskPanelTasks.filter((item) => (allTasksByID.get(item.id)?.status ?? item.status) === 'paused') },
+    { id: 'recent', title: '最近结束', tasks: visibleTaskPanelTasks.filter((item) => terminalTaskStatuses.has(allTasksByID.get(item.id)?.status ?? item.status)) },
+  ];
+  const taskPanelRows = taskPanelGroups.flatMap<TaskPanelRow>((group) => {
+    if (!group.tasks.length) return [];
+    if (group.id === 'recent' && !taskPanelRecentOpen) return [{ key: 'group-recent', group, task: null, first: true }];
+    return group.tasks.map((item, index) => ({ key: `task-${item.id}`, group, task: item, first: index === 0 }));
+  });
   const conversationFiles: ConversationFileItem[] = [
     ...conversationMessageItems.flatMap((item) => (item.attachment_ids ?? []).map((attachmentID, index) => ({
       kind: 'attachment' as const, key: `attachment:${item.id}:${attachmentID}`, attachmentID,
       messageID: item.id, index: index + 1, createdAt: item.created_at,
     }))),
-    ...tasks.flatMap((item) => item.artifacts.map((artifact) => ({ kind: 'artifact' as const,
+    ...tasks.flatMap((item) => item.artifacts.filter(hasCompleteVerifiedArtifactProof).map((artifact) => ({ kind: 'artifact' as const,
       key: `artifact:${item.id}:${artifact.id}`, taskID: item.id, taskTitle: item.objective || '未命名任务', artifact }))),
   ];
   const pendingTaskCount = !conversationContentAccessRevoked && conversationTasks.isSuccess && !taskProgressReadError ? conversationTasks.data.pending_count : null;
@@ -1049,7 +1237,12 @@ export function Assistant() {
     return () => window.clearInterval(timer);
   }, [client, conversationID, resultsAwaitingMessages]);
   const tasksByID = new Map(tasks.map((task) => [task.id, task]));
-  const activePanelTasks = allTasks.filter((task) => !terminalTaskStatuses.has(task.status));
+  const activePanelTasks = tasks.filter((task) => !terminalTaskStatuses.has(task.status));
+  const selectedActiveTask = activePanelTasks.find((task) => task.id === taskDetailTaskID);
+  const streamedTasks = [
+    ...(selectedActiveTask ? [selectedActiveTask] : []),
+    ...activePanelTasks.filter((task) => task.id !== selectedActiveTask?.id),
+  ].slice(0, maxTaskEventStreams);
   const networkReadFailures = [
     { failed: capabilities.isError, error: capabilities.error, retry: () => capabilities.refetch() },
     { failed: conversations.isError, error: conversations.error, retry: () => conversations.refetch() },
@@ -1098,6 +1291,7 @@ export function Assistant() {
     : undefined;
   const preferredHostID = hostSelection ?? '';
   const hostItems = hosts.data?.items ?? [];
+  const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
   const selectedHost = hostItems.find((host) => host.id === preferredHostID);
   const hostIsReady = selectedHost?.state === 'running' && selectedHost.control_state === 'ai';
   const computerHostOptions: ComputerHostOption[] = [
@@ -1176,6 +1370,17 @@ export function Assistant() {
     }
   }
   const displayMessages = mergeTaskAssistantMessages(conversationMessageItems, tasks);
+  const startedTaskMessageIDs = new Set<string>();
+  const markedStartedTasks = new Set<string>();
+  for (const message of [...displayMessages].reverse()) {
+    const taskID = message.task_id ?? message.related_task_id;
+    if (message.role !== 'user' || !taskID || message.routing_status === 'failed' || message.duplicate_of_message_id || markedStartedTasks.has(taskID)) continue;
+    const task = tasksByID.get(taskID);
+    if (task?.current_revision_started !== true || (task.current_revision !== undefined && task.desired_revision !== undefined
+      && task.current_revision !== task.desired_revision)) continue;
+    markedStartedTasks.add(taskID);
+    startedTaskMessageIDs.add(message.id);
+  }
   const latestDisplayMessageContent = displayMessages.at(-1)?.content;
   const loadOlderMessages = async () => {
     const view = conversationView.current;
@@ -1357,7 +1562,23 @@ export function Assistant() {
       clearProcessingRetryKey(instanceID, user.id, '', target.conversationID, target.messageID);
     },
     onSuccess: async (_value, target) => {
-      notify(target.resultReview ? '已请求重新整理任务结果。' : '已请求重新处理消息。', 'success');
+      if (target.resultReview && target.taskID) {
+        setRetryAcceptedResultReviewTaskIDs((current) => new Set(current).add(target.taskID!));
+        window.setTimeout(() => setRetryAcceptedResultReviewTaskIDs((current) => {
+          if (!current.has(target.taskID!)) return current;
+          const next = new Set(current);
+          next.delete(target.taskID!);
+          return next;
+        }), 30_000);
+      } else {
+        setRetryAcceptedMessageIDs((current) => new Set(current).add(target.messageID));
+        window.setTimeout(() => setRetryAcceptedMessageIDs((current) => {
+          if (!current.has(target.messageID)) return current;
+          const next = new Set(current);
+          next.delete(target.messageID);
+          return next;
+        }), 30_000);
+      }
       await client.invalidateQueries({ queryKey: ['conversation-messages', target.conversationID] });
       if (target.taskID) {
         await client.invalidateQueries({ queryKey: ['task', target.taskID] });
@@ -1365,7 +1586,21 @@ export function Assistant() {
         await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
       }
     },
-    onError: (error) => notify(errorDetails(error).message, 'error'),
+    onError: (error, target) => {
+      if (target.taskID) setRetryAcceptedResultReviewTaskIDs((current) => {
+        if (!current.has(target.taskID!)) return current;
+        const next = new Set(current);
+        next.delete(target.taskID!);
+        return next;
+      });
+      setRetryAcceptedMessageIDs((current) => {
+        if (!current.has(target.messageID)) return current;
+        const next = new Set(current);
+        next.delete(target.messageID);
+        return next;
+      });
+      notify(errorDetails(error).message, 'error');
+    },
   });
   const respondToApproval = useMutation({
     mutationFn: (request: { taskID: string; approvalID: string; version: number; decision: 'approve' | 'reject'; actionScope: string; key: string }) =>
@@ -1662,6 +1897,7 @@ export function Assistant() {
           ...(timeZone ? { time_zone: timeZone } : {}),
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
           ...(hostSelection ? { host_id: hostSelection } : {}),
+          ...(workspaceSelection ? { workspace_id: workspaceSelection } : {}),
           ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
           ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
         },
@@ -1719,6 +1955,7 @@ export function Assistant() {
     setConversationID(id);
     setModelID('');
     setHostSelection(null);
+    setWorkspaceSelection(null);
     setMcpConnectorIDs([]);
     setContent('');
     setComposerAttachments([]);
@@ -1754,8 +1991,12 @@ export function Assistant() {
 
   const submitTaskSupplement = (event: FormEvent<HTMLFormElement>, task: Task) => {
     event.preventDefault();
-    const text = (taskSupplementDrafts[task.id] ?? '').trim();
-    if (savingMessageRef.current || !text) return;
+    const supplementalText = (taskSupplementDrafts[task.id] ?? '').trim();
+    const needsWorkspaceTarget = task.waiting_reason === 'workspace_unavailable' && !task.workspace_id;
+    const selectedWorkspaceID = needsWorkspaceTarget ? taskWorkspaceSelections[task.id] ?? '' : '';
+    const text = supplementalText || (needsWorkspaceTarget && selectedWorkspaceID
+      ? '请继续当前任务，并将结果保存到我选择的 Workspace。' : '');
+    if (savingMessageRef.current || !text || (needsWorkspaceTarget && !selectedWorkspaceID)) return;
     if (new TextEncoder().encode(text).length > maxMessageBytes) {
       notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
       return;
@@ -1768,7 +2009,8 @@ export function Assistant() {
         ? conversationMessageItems : (await portalApi.conversationMessages(task.conversation_id)).items;
       const pending: PendingConversationMessage = {
         actorID: user?.id ?? '',
-        request: { client_message_id: id, content: text, reference_task_id: task.id },
+        request: { client_message_id: id, content: text, reference_task_id: task.id,
+          ...(selectedWorkspaceID ? { workspace_id: selectedWorkspaceID, change_task_target: true } : {}) },
         conversationID: task.conversation_id,
         ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
         attachments: [], status: 'pending', createdAt: Date.now(),
@@ -2001,6 +2243,7 @@ export function Assistant() {
     const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
     const visibleSteps = task.steps.filter((step) => ['tool', 'subagent', 'verification', 'verify', 'batch_item', 'batch_result', 'progress'].includes(step.kind) &&
       !(task.waiting_reason === 'dsh_recovery_unresolved' && step.status === 'unknown'));
+    const activityGroups = taskActivityGroups(task, visibleSteps);
     const publishedReplyVisible = Boolean(review?.state === 'published' && review.source_task_id === task.id && review.reply_message_id &&
       (task.conversation_id !== conversationID || displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
         message.sources?.some((source) => source.task_id === review.source_task_id &&
@@ -2057,7 +2300,7 @@ export function Assistant() {
         <h3>当前进展</h3>
         <p role={task.status === 'failed' ? 'alert' : 'status'}>{progressText}</p>
         {recoveryMessage && <p role="status">{recoveryMessage}</p>}
-        {taskEventFeeds[task.id] === 'disconnected' && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
+        {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
       </section>
       {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
         <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
@@ -2107,7 +2350,11 @@ export function Assistant() {
         </button>
       </div>}
       {busy && supplementTaskID === task.id && task.waiting_reason !== 'project_recovery_unavailable' && <AssistantTaskSupplementForm
-        task={task} value={taskSupplementDrafts[task.id] ?? ''} disabled={savingMessage} saving={savingMessage} onSubmit={submitTaskSupplement}
+        task={task} value={taskSupplementDrafts[task.id] ?? ''} disabled={savingMessage} saving={savingMessage}
+        needsWorkspaceTarget={task.waiting_reason === 'workspace_unavailable' && !task.workspace_id}
+        workspaceID={taskWorkspaceSelections[task.id] ?? ''} workspaces={workspaceItems}
+        onWorkspaceChange={(workspaceID) => setTaskWorkspaceSelections((current) => ({ ...current, [task.id]: workspaceID }))}
+        onSubmit={submitTaskSupplement}
         onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))} />}
       {supplementEntries.map(({ message, scope }) => <div className="task-supplement-status" key={message.request.client_message_id}>
         <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
@@ -2115,12 +2362,35 @@ export function Assistant() {
         {message.status !== 'sending' && <AssistantOutboxRetryButton entry={{ scope, message }} sendMessage={sendMessage}
           label={message.status === 'accepted' ? '核对消息' : '核对并重试'} />}
       </div>)}
-      {visibleSteps.length > 0 && <details className="task-detail-work"><summary>工作过程</summary><ol className="task-activity-steps">
-        {visibleSteps.map((step) => <li key={step.id}><span aria-hidden="true">•</span><span><strong>{stepTitle(step)}</strong>
-          {step.kind !== 'progress' && <small>{stepStatus[step.status]}</small>}
-          {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
-        </span></li>)}
-      </ol></details>}
+      {activityGroups.length > 0 && <section className="task-detail-work" aria-label="工作过程"><h3>工作过程</h3>
+        {activityGroups.map((group) => {
+          const groupKey = `${task.id}:${group.id}`;
+          const visibleCount = visibleActivitySteps[groupKey] ?? 30;
+          return <section className="task-agent-group" key={group.id} aria-label={group.title}
+            style={{ marginInlineStart: `${Math.min(group.depth, 3) * 12}px` }}>
+          <h4>{group.title}{group.status && <small>{group.status}</small>}</h4>
+          <ol className="task-activity-steps">{group.steps.slice(0, visibleCount).map((step) => {
+            const expanded = taskStepSelection?.taskID === task.id && taskStepSelection.stepID === step.id;
+            return <li key={step.id}><span className={`task-step-icon status-${step.status}`} aria-hidden="true">●</span><div>
+              <button type="button" className="task-activity-step-button" aria-expanded={expanded} aria-controls={`task-step-detail-${step.id}`}
+                onClick={() => setTaskStepSelection(expanded ? null : { taskID: task.id, stepID: step.id })}>
+                <strong>{stepTitle(step)}</strong><small>{stepStatusText(step)}</small>
+                {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
+              </button>
+              {expanded && <section id={`task-step-detail-${step.id}`} aria-label={`动作详情：${stepTitle(step)}`}>
+                <TaskStepDetails key={`${user?.id ?? ''}:${capabilities.data?.service_instance_id ?? ''}:${task.conversation_id}:${task.id}:${step.id}`}
+                  task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
+                  serviceInstanceID={capabilities.data?.service_instance_id ?? ''} />
+              </section>}
+            </div></li>;
+          })}</ol>
+          {group.steps.length > visibleCount && <button type="button" className="button button-small button-secondary"
+            onClick={() => setVisibleActivitySteps((current) => ({ ...current, [groupKey]: visibleCount + 30 }))}>
+            显示更多工作过程（剩余 {group.steps.length - visibleCount} 项）
+          </button>}
+        </section>;
+        })}
+      </section>}
       {k2Read.kind === 'invalid' && <FloatingError>
         任务协作记录暂不可用；当前仅展示已确认的任务状态和结果。
       </FloatingError>}
@@ -2131,25 +2401,28 @@ export function Assistant() {
       </section> : null}
       {review && <section className="task-activity-k2 task-activity-review" aria-label="结果整理">
         <h3>结果整理</h3>
-        <p role={review.state === 'failed' ? 'alert' : 'status'}>{resultReviewStatusText(review, publishedReplyVisible)}</p>
-        {review.state === 'failed' && review.trigger_message_id && <button type="button" className="button button-small button-secondary"
+        <p role={review.state === 'failed' && !retryAcceptedResultReviewTaskIDs.has(task.id) ? 'alert' : 'status'}>
+          {retryAcceptedResultReviewTaskIDs.has(task.id) ? '正在重新整理任务结果…' : resultReviewStatusText(review, publishedReplyVisible)}</p>
+        {publishedReplyVisible && review.reply_message_id && <a href={`#conversation-message-${encodeURIComponent(review.reply_message_id)}`}>查看最终回复</a>}
+        {review.state === 'failed' && review.trigger_message_id && !retryAcceptedResultReviewTaskIDs.has(task.id) && <button type="button" className="button button-small button-secondary"
           disabled={retryProcessing.isPending}
           onClick={() => retryProcessing.mutate({ conversationID: task.conversation_id, messageID: review.trigger_message_id!, taskID: task.id, resultReview: true })}>
           重试结果整理
         </button>}
       </section>}
-      {task.artifacts.length > 0 && <section className="task-activity-k2 task-activity-artifacts" aria-label="任务成果">
-        <h3>任务成果</h3><ul>{task.artifacts.map((artifact) => <li key={artifact.id}>
+      {task.artifacts.some(hasCompleteVerifiedArtifactProof) && <section className="task-activity-k2 task-activity-artifacts" aria-label="任务成果">
+        <h3>任务成果</h3><ul>{task.artifacts.filter(hasCompleteVerifiedArtifactProof).map((artifact) => <li key={artifact.id}>
           <strong>{artifact.label}</strong>
-          <small>{artifact.path} · {artifact.media_type}{artifact.size_bytes === null ? '' : ` · ${formatBytes(artifact.size_bytes)}`}
-            {' · '}{artifact.verified ? '已核验' : '核验状态待确认'}</small>
+          <small>{artifact.path} · {artifact.media_type} · {formatBytes(artifact.size_bytes!)}</small>
+          <a className="task-activity-link" href={portalApi.taskArtifactContentURL(task.id, artifact.id)} download
+            aria-label={`下载任务成果 ${artifact.label}`}>下载成果 ↓</a>
         </li>)}</ul>
       </section>}
       {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
         {taskHost?.state === 'running'
           ? <button type="button" className="button button-secondary" disabled={openingTaskID === task.id}
             onClick={openTaskObservation.bind(undefined, task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…'
-              : task.artifacts.some((artifact) => artifact.verified) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
+              : task.artifacts.some(hasCompleteVerifiedArtifactProof) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
           : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
         {taskObservationError?.taskID === task.id && <FloatingError>{taskObservationError.message}</FloatingError>}
       </div>}
@@ -2184,7 +2457,7 @@ export function Assistant() {
       <button ref={(button) => { if (button) taskCardButtons.current.set(summary.id, button); else taskCardButtons.current.delete(summary.id); }}
         type="button" className="task-activity-card-button"
         aria-label={`${waiting ? '查看并处理' : '查看详情'}：${title}，${taskActivityStatusText(summary, task)}`}
-        onClick={() => setTaskDetailTaskID(summary.id)}>
+        onClick={() => { setTaskStepSelection(null); setTaskDetailTaskID(summary.id); }}>
         <span className="task-activity-card-title"><strong>{title}</strong>
           <span className={`task-activity-status status-${status}`}>{taskActivityStatusText(summary, task)}</span></span>
         <span className="task-activity-card-subtitle">{taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
@@ -2261,7 +2534,7 @@ export function Assistant() {
             {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
           </button>}
         </header>
-        {activePanelTasks.slice(0, maxTaskEventStreams).map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
+        {streamedTasks.map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
         <div className={`conversation-view${conversationID ? '' : ' conversation-view-welcome'}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
           const view = event.currentTarget;
           const atLatest = view.scrollHeight - view.scrollTop - view.clientHeight < 80;
@@ -2285,8 +2558,10 @@ export function Assistant() {
                     onClick={() => void loadOlderMessages()}>{messages.isFetchingNextPage ? '正在加载更早消息…' : messages.isFetchNextPageError ? '重试加载更早消息' : '加载更早消息'}</button>
                 </div>}
                 {displayMessages.map((message, index) => {
-                  const messageTask = message.task_id ? tasksByID.get(message.task_id) : undefined;
-                  const routingStatus = message.role === 'user' ? conversationMessageStatus(message, messageTask) : null;
+                  const messageTask = tasksByID.get(message.task_id ?? message.related_task_id ?? '');
+                  const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
+                    ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
+                  const routingStatus = message.role === 'user' ? acceptedRetryStatus ?? conversationMessageStatus(message, messageTask) : null;
                   const previous = displayMessages[index - 1];
                   const messageDate = formatDate(message.created_at).split(' ')[0];
                   const showDate = !previous || formatDate(previous.created_at).split(' ')[0] !== messageDate;
@@ -2294,12 +2569,13 @@ export function Assistant() {
                     {showDate && <div className="conversation-time-divider"><time dateTime={message.created_at}>{messageDate}</time></div>}
                     <div className={`chat-message-row chat-message-row-${message.role}`}>
                     {message.role === 'assistant' && <span className="assistant-logo assistant-logo-message" aria-hidden="true" />}
-                    {message.role === 'user' && message.routing_status === 'failed' && <button type="button" className="message-retry"
-                      aria-label="重新处理这条消息" title="重新处理" disabled={retryProcessing.isPending}
+                    {message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
+                      && !message.related_task_id && !retryAcceptedMessageIDs.has(message.id) && <button type="button" className="message-retry"
+                      aria-label="重新处理这条消息" title="重新处理" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
                       onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>!</button>}
                     <div className="chat-message-body">
                     {message.role === 'assistant' && <strong className="chat-message-author">Morde</strong>}
-                    <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}`}
+                    <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}${startedTaskMessageIDs.has(message.id) ? ' chat-message-user-started' : ''}`}
                       aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
                       {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
@@ -2308,15 +2584,16 @@ export function Assistant() {
                       </small> : null}
                       {message.snapshotStatus === 'streaming' && <small role="status">正在生成…</small>}
                       {message.snapshotStatus === 'interrupted' && <small role="status">回复已中断</small>}
-                      {message.role === 'user' && routingStatus && <small className="chat-message-status" role="status">
+                      {startedTaskMessageIDs.has(message.id) && <span className="chat-task-started" role="img" aria-label="任务已开始处理" title="任务已开始处理">👌🏻</span>}
+                    </article>
+                    {message.role === 'user' && routingStatus && <div className="chat-message-status" role="status">
                         {routingStatus}
                         {message.delivery_status === 'unknown' && <button type="button" className="button button-small button-secondary"
                           disabled={messages.isFetching} onClick={() => {
                             void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
                             if (message.task_id) void client.invalidateQueries({ queryKey: ['task', message.task_id] });
                           }}>核对状态</button>}
-                      </small>}
-                    </article>
+                      </div>}
                     {message.role === 'assistant' && <time className="assistant-reply-time" dateTime={message.created_at} aria-label={`回复时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>}
                     </div></div>
                   </Fragment>;
@@ -2342,7 +2619,7 @@ export function Assistant() {
             {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
             {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
-            <textarea id="assistant-content" value={visibleComposerContent} onChange={(event) => {
+            <textarea id="assistant-content" value={visibleComposerContent} style={{ resize: 'none' }} onChange={(event) => {
               composerEditRevision.current += 1;
               if (!conversationID) ensureLocalConversationKey();
               setContent(event.target.value);
@@ -2407,7 +2684,16 @@ export function Assistant() {
                     {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
                     {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
                   </select></label>
+                  <label className="assistant-selector"><MordeIcon name="folder" /><span className="sr-only">目标 Workspace</span><select aria-label="选择目标 Workspace"
+                    value={composerDraftReady ? workspaceSelection ?? '' : ''} disabled={!composerDraftReady || workspaces.isPending}
+                    onChange={(event) => { composerEditRevision.current += 1; setWorkspaceSelection(event.target.value || null); }}>
+                    <option value="">自动选择 Workspace</option>
+                    {workspaceSelection && !workspaceItems.some((workspace) => workspace.id === workspaceSelection) &&
+                      <option value={workspaceSelection}>所选 Workspace 状态待核对</option>}
+                    {workspaceItems.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · v{workspace.revision}</option>)}
+                  </select></label>
                 </div>
+                {workspaces.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline assistant-connector-error" role="alert">工作区列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
                 {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
                     <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
@@ -2466,6 +2752,7 @@ export function Assistant() {
         {!conversationContentAccessRevoked && taskPanelTab === 'tasks' && taskDetailTaskID && <div className="task-panel-detail task-panel-list">
           <div className="task-panel-detail-nav"><button type="button" className="button button-small button-secondary"
             onClick={() => {
+              setTaskStepSelection(null);
               setTaskDetailTaskID(null);
               window.requestAnimationFrame(() => taskCardButtons.current.get(taskDetailTaskID)?.focus());
             }}>‹ 返回任务列表</button></div>
@@ -2474,7 +2761,7 @@ export function Assistant() {
               <button type="button" className="button button-small button-secondary" onClick={() => void selectedTaskQuery.refetch()}>重试</button></FloatingError>
               : <p className="muted" role="status">此任务已不在当前可见列表中，请刷新任务动态。</p>}
         </div>}
-        {!conversationContentAccessRevoked && taskPanelTab === 'tasks' && !taskDetailTaskID && <div className="task-panel-list">
+        {!conversationContentAccessRevoked && taskPanelTab === 'tasks' && <div className="task-panel-list" hidden={Boolean(taskDetailTaskID)}>
           {capabilities.isPending && <p className="muted" role="status">正在确认账号与服务身份…</p>}
           {conversationID && conversationTasks.isPending && !conversationTasks.data && <p className="muted" role="status">正在读取任务…</p>}
           {conversationTasks.isError && <FloatingError className="error-inline" role="alert">任务状态暂不可用。
@@ -2487,9 +2774,15 @@ export function Assistant() {
           {!conversationID && <p className="muted">开始对话后，这里会显示相关任务。</p>}
           {conversationID && !conversationTasks.isPending && !recentConversationTasks.isPending && !taskProgressReadError && !visibleTaskPanelTasks.length &&
             <p className="muted">此会话还没有任务。</p>}
-          {visibleTaskPanelTasks.length > 0 && <ScreenPagination items={visibleTaskPanelTasks} getKey={(item) => item.id}
+          {taskPanelRows.length > 0 && <ScreenPagination items={taskPanelRows} getKey={(item) => item.key}
             estimatedItemHeight={116} height="100%" ariaLabel="当前会话任务分页" className="task-panel-pagination"
-            renderItem={renderTaskSummary} />}
+            renderItem={(row) => <div className="task-panel-group">
+              {row.first && (row.group.id === 'recent'
+                ? <button type="button" className="task-panel-group-toggle" aria-expanded={taskPanelRecentOpen}
+                  onClick={() => setTaskPanelRecentOpen((open) => !open)}>最近结束 <span aria-hidden="true">{taskPanelRecentOpen ? '▾' : '▸'}</span></button>
+                : <h3>{row.group.title}</h3>)}
+              {row.task && renderTaskSummary(row.task)}
+            </div>} />}
         </div>}
         {!conversationContentAccessRevoked && taskPanelTab === 'files' && <div className="task-panel-list task-panel-files">
           {messages.hasNextPage && <button type="button" className="button button-small button-secondary" disabled={messages.isFetchingNextPage}
@@ -2504,8 +2797,9 @@ export function Assistant() {
               </article>
               : <article className="task-file-card" key={item.key}>
                 <strong>{item.artifact.label || '任务成果'}</strong>
-                <small>{item.taskTitle} · {item.artifact.path} · {item.artifact.media_type}
-                  {item.artifact.size_bytes === null ? '' : ` · ${formatBytes(item.artifact.size_bytes)}`}</small>
+                <small>{item.taskTitle} · {item.artifact.path} · {item.artifact.media_type} · {formatBytes(item.artifact.size_bytes!)}</small>
+                <a href={portalApi.taskArtifactContentURL(item.taskID, item.artifact.id)} download
+                  aria-label={`下载任务成果 ${item.artifact.label}`}>下载成果 ↓</a>
                 <button type="button" className="button button-small button-secondary" onClick={() => {
                   setTaskPanelTab('tasks');
                   setTaskDetailTaskID(item.taskID);

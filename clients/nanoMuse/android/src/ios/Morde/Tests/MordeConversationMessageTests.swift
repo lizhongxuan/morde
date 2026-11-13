@@ -36,6 +36,63 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(message.routing_status, "pending")
     }
 
+    func testClientMessageDecodesDuplicateAssociationAndKeepsItsTask() throws {
+        let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":3,"role":"user","content":"相同请求","delivery_status":"pending","created_at":"2026-11-13T12:00:00Z","client_message_id":"client-message-3","routing_status":"waiting_user","duplicate_of_message_id":"m7654321","related_task_id":"q1234567"}"#.utf8)
+
+        let message = try JSONDecoder().decode(MordeClientMessage.self, from: data)
+
+        XCTAssertEqual(message.duplicate_of_message_id, "m7654321")
+        XCTAssertEqual(message.related_task_id, "q1234567")
+        XCTAssertEqual(MordeRoutingPresentation.duplicateMessageLocalizationKey(
+            originalMessageID: message.duplicate_of_message_id!, taskID: message.related_task_id),
+            "Repeated request · related task q1234567")
+    }
+
+    func testRoutineRoutingStatusesStayHiddenButAdjustmentRemainsVisible() {
+        XCTAssertNil(MordeRoutingPresentation.localizationKey("pending"))
+        XCTAssertNil(MordeRoutingPresentation.localizationKey("processing"))
+        XCTAssertNil(MordeRoutingPresentation.localizationKey("waiting_user"))
+        XCTAssertNil(MordeRoutingPresentation.localizationKey("failed"))
+        XCTAssertEqual(MordeRoutingPresentation.localizationKey("waiting_adjustment"),
+                       "Adjustment received; waiting to update")
+    }
+
+    func testTaskStartedAcknowledgementMarksOneLatestEligibleMessagePerTask() {
+        let messages = [
+            MordeClientMessage(id: "m0000008", sequence: 8, task_id: "q5678901",
+                               role: "user", content: "independent task"),
+            MordeClientMessage(id: "m0000007", sequence: 7, task_id: "q4567890",
+                               role: "user", content: "not started"),
+            MordeClientMessage(id: "m0000006", sequence: 6, task_id: "q3456789",
+                               role: "user", content: "waiting for revision"),
+            MordeClientMessage(id: "m0000005", sequence: 5, task_id: "q2345678",
+                               role: "user", content: "failed", routing_status: "failed"),
+            MordeClientMessage(id: "m0000004", sequence: 4, task_id: "q1234567",
+                               role: "assistant", content: "reply"),
+            MordeClientMessage(id: "m0000003", sequence: 3, role: "user", content: "exact repeat",
+                               duplicate_of_message_id: "m0000001", related_task_id: "q1234567"),
+            MordeClientMessage(id: "m0000002", sequence: 2, task_id: "q1234567",
+                               role: "user", content: "same task follow-up"),
+            MordeClientMessage(id: "m0000001", sequence: 1, task_id: "q1234567",
+                               role: "user", content: "task root"),
+        ]
+        let tasks = [
+            MordeTaskStartedAcknowledgementState(taskID: "q1234567", currentRevision: 2,
+                desiredRevision: 2, currentRevisionStarted: true),
+            MordeTaskStartedAcknowledgementState(taskID: "q2345678", currentRevision: 1,
+                desiredRevision: 1, currentRevisionStarted: true),
+            MordeTaskStartedAcknowledgementState(taskID: "q3456789", currentRevision: 1,
+                desiredRevision: 2, currentRevisionStarted: true),
+            MordeTaskStartedAcknowledgementState(taskID: "q4567890", currentRevision: 1,
+                desiredRevision: 1, currentRevisionStarted: false),
+            MordeTaskStartedAcknowledgementState(taskID: "q5678901", currentRevision: 1,
+                desiredRevision: 1, currentRevisionStarted: true),
+        ]
+
+        XCTAssertEqual(MordeTaskStartedAcknowledgementPolicy.messageIDs(messages: messages, tasks: tasks),
+                       Set(["m0000002", "m0000008"]))
+    }
+
     func testPublishedTaskResultIsShownOnceWithItsSource() {
         let snapshot = MordeClientMessage(
             id: "m0000001", conversation_id: "c1234567", task_id: "q1234567",

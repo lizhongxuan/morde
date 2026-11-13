@@ -1026,14 +1026,14 @@ func cloudDSHWorkspaceWriteApproval(write cloudDSHWorkspaceWriteArguments, works
 	}
 }
 
-func (b *CloudDSHToolBroker) verifyHostlessWorkspaceToolHistory(ctx context.Context, current task.Task, inputs []ModelInput) (bool, error) {
+func (b *CloudDSHToolBroker) verifyHostlessWorkspaceToolHistory(ctx context.Context, current task.Task, inputs []ModelInput) ([]AgentVerifiedArtifact, error) {
 	if !cloudDSHWorkspaceToolsEligible(current) || b.workspaceTools == nil {
 		for _, input := range inputs {
 			if input.Type == "function_call" && cloudDSHWorkspaceToolName(input.Name) {
-				return false, domain.NewError(domain.CodeInvalidState, "Workspace tool history has no bound Workspace")
+				return nil, domain.NewError(domain.CodeInvalidState, "Workspace tool history has no bound Workspace")
 			}
 		}
-		return false, nil
+		return nil, nil
 	}
 	outputs := make(map[string]ModelInput)
 	for _, input := range inputs {
@@ -1041,77 +1041,115 @@ func (b *CloudDSHToolBroker) verifyHostlessWorkspaceToolHistory(ctx context.Cont
 			continue
 		}
 		if input.CallID == "" {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace tool history has an invalid output identity")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace tool history has an invalid output identity")
 		}
 		if _, exists := outputs[input.CallID]; exists {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace tool history contains duplicate outputs")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace tool history contains duplicate outputs")
 		}
 		outputs[input.CallID] = input
 	}
 	seenCalls := make(map[string]struct{})
-	succeededWrite := false
+	latestByPath := make(map[string]AgentVerifiedArtifact)
 	for _, input := range inputs {
 		if input.Type != "function_call" || !cloudDSHWorkspaceToolName(input.Name) {
 			continue
 		}
 		if input.CallID == "" || len(input.CallID) > 256 {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace tool history has an invalid call identity")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace tool history has an invalid call identity")
 		}
 		if _, exists := seenCalls[input.CallID]; exists {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace tool history contains duplicate calls")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace tool history contains duplicate calls")
 		}
 		seenCalls[input.CallID] = struct{}{}
 		output, exists := outputs[input.CallID]
 		if !exists {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace tool history is missing a result")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace tool history is missing a result")
 		}
 		if input.Name != cloudDSHWorkspaceWriteToolName {
 			continue
 		}
 		if len(input.Arguments) == 0 || len(input.Arguments) > maxAgentToolArgsBytes || !validAgentJSONObject([]byte(input.Arguments), maxAgentToolArgsBytes) {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace write history arguments are invalid")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace write history arguments are invalid")
 		}
 		var arguments cloudDSHWorkspaceWriteArguments
 		if decodeStrictRuntimeResult([]byte(input.Arguments), &arguments) != nil || arguments.ExpectedRevision < *current.InputRevision ||
 			current.WorkspaceCheckpointRevision == nil || arguments.ExpectedRevision > *current.WorkspaceCheckpointRevision {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace write history revision is invalid")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace write history revision is invalid")
 		}
 		requestHash, err := agentOperationHash(input.Name, json.RawMessage(input.Arguments))
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		operationKey := agentOperationKey(input.CallID)
 		receipt, err := b.workspaceTools.workspaces.FindTaskWorkspacePublishReceipt(ctx, current.OwnerID, current.ID, current.WorkspaceID, operationKey)
 		if domain.CodeOf(err) == domain.CodeNotFound {
 			var claimed cloudDSHWorkspaceWriteReceiptOutput
 			if decodeStrictRuntimeResult([]byte(output.Output), &claimed) == nil && claimed.Status == "committed" {
-				return false, domain.NewError(domain.CodeInvalidState, "Workspace write history has no durable commit receipt")
+				return nil, domain.NewError(domain.CodeInvalidState, "Workspace write history has no durable commit receipt")
 			}
 			continue
 		}
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if receipt.WorkspaceID != current.WorkspaceID || receipt.BaseRevision != arguments.ExpectedRevision || receipt.RequestHash != hex.EncodeToString(requestHash[:]) {
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace write history does not match its durable receipt")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace write history does not match its durable receipt")
 		}
 		switch receipt.State {
 		case TaskWorkspacePublishSucceeded:
 			result := cloudDSHWorkspaceReceiptResult(receipt, operationKey)
 			if result.Status != AgentToolSucceeded || output.Output != result.Output {
-				return false, domain.NewError(domain.CodeInvalidState, "Workspace write output does not match its durable receipt")
+				return nil, domain.NewError(domain.CodeInvalidState, "Workspace write output does not match its durable receipt")
 			}
-			succeededWrite = true
+			if existing, ok := latestByPath[arguments.Path]; !ok || receipt.PublishedRevision > existing.Revision {
+				latestByPath[arguments.Path] = AgentVerifiedArtifact{
+					Label: path.Base(arguments.Path), Path: arguments.Path, WorkspaceID: current.WorkspaceID,
+					Revision: receipt.PublishedRevision,
+				}
+			}
 		case TaskWorkspacePublishConflict, TaskWorkspacePublishQuotaRejected:
 			claimed := cloudDSHWorkspaceReceiptResult(receipt, operationKey)
 			if claimed.Status != AgentToolFailed || output.Output != "[tool error] "+claimed.Output {
-				return false, domain.NewError(domain.CodeInvalidState, "failed Workspace write output does not match its durable receipt")
+				return nil, domain.NewError(domain.CodeInvalidState, "failed Workspace write output does not match its durable receipt")
 			}
 		case TaskWorkspacePublishPending:
-			return false, domain.NewError(domain.CodeWorkspaceBusy, "Workspace write receipt is still pending")
+			return nil, domain.NewError(domain.CodeWorkspaceBusy, "Workspace write receipt is still pending")
 		default:
-			return false, domain.NewError(domain.CodeInvalidState, "Workspace write receipt state is invalid")
+			return nil, domain.NewError(domain.CodeInvalidState, "Workspace write receipt state is invalid")
 		}
 	}
-	return succeededWrite, nil
+	if len(latestByPath) > maxAgentVerifiedArtifacts {
+		return nil, domain.NewError(domain.CodeResultTooLarge, "the task produced too many downloadable files")
+	}
+	paths := make([]string, 0, len(latestByPath))
+	for filePath := range latestByPath {
+		paths = append(paths, filePath)
+	}
+	sort.Strings(paths)
+	artifacts := make([]AgentVerifiedArtifact, 0, len(paths))
+	for _, filePath := range paths {
+		artifact := latestByPath[filePath]
+		page, err := b.workspaceTools.workspaces.store.GetWorkspaceManifestPage(ctx, current.WorkspaceID, artifact.Revision, filePath, "", 2)
+		if err != nil {
+			return nil, err
+		}
+		if page.WorkspaceID != current.WorkspaceID || page.Revision != artifact.Revision || len(page.Files) != 1 || page.NextCursor != nil ||
+			page.Files[0].Path != filePath || workspace.ValidateFile(page.Files[0]) != nil ||
+			workspace.CanonicalFileKind(page.Files[0].Kind) == workspace.FileKindSymlink {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Workspace artifact manifest does not match the committed write")
+		}
+		file := page.Files[0]
+		proof := TaskArtifactProof{OwnerID: taskWorkspaceOwner(current), WorkspaceID: current.WorkspaceID, Revision: artifact.Revision,
+			Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256}
+		if _, err := b.workspaceTools.workspaces.VerifyCommittedArtifact(ctx, proof); err != nil {
+			return nil, err
+		}
+		mediaType := TaskFileFetchMediaTypeForPath(filePath)
+		if mediaType == "" {
+			mediaType = "application/octet-stream"
+		}
+		artifact.MediaType, artifact.SizeBytes, artifact.SHA256 = mediaType, file.SizeBytes, file.SHA256
+		artifacts = append(artifacts, artifact)
+	}
+	return artifacts, nil
 }

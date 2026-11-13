@@ -222,6 +222,384 @@ FROM tasks t WHERE t.id=$1`, taskID, []string{second.Message.ID, third.Message.I
 	}
 }
 
+func TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	original := f.receive(t, "route-join-original", "分析 Morde 项目", input)
+	originalSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := f.receive(t, "route-join-duplicate", "分析一下 Morde 项目", input)
+	duplicateSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, duplicate)
+	if err != nil || len(duplicateSnapshot.Context.RequestCandidates) != 1 ||
+		duplicateSnapshot.Context.RequestCandidates[0].MessageID != original.Message.ID ||
+		!duplicateSnapshot.Context.RequestCandidates[0].SameExecutionScope {
+		t.Fatalf("duplicate routing candidates = %+v err=%v", duplicateSnapshot.Context.RequestCandidates, err)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, duplicate, duplicateSnapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: original.Message.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var association, duplicateTaskID, duplicateDelivery, duplicateState, originalState string
+	var taskCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(duplicate.duplicate_of_message_id,''),COALESCE(message.task_id,''),
+message.delivery_status,duplicate.state,original.state,(SELECT count(*) FROM tasks WHERE conversation_id=$1)
+FROM conversation_message_routes duplicate
+JOIN conversation_messages message ON message.id=duplicate.message_id
+JOIN conversation_message_routes original ON original.message_id=$3
+WHERE duplicate.message_id=$2`, f.conversation.ID, duplicate.Message.ID, original.Message.ID).
+		Scan(&association, &duplicateTaskID, &duplicateDelivery, &duplicateState, &originalState, &taskCount); err != nil {
+		t.Fatal(err)
+	}
+	if association != original.Message.ID || duplicateTaskID != "" || duplicateDelivery != string(conversation.DeliveryPending) ||
+		duplicateState != "routed" || originalState != "processing" || taskCount != 0 {
+		t.Fatalf("duplicate was not durably linked while original was processing: association=%q task=%q delivery=%s duplicate=%s original=%s tasks=%d",
+			association, duplicateTaskID, duplicateDelivery, duplicateState, originalState, taskCount)
+	}
+	originalSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, original, originalSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("stale root route was not safely requeued after a join: %v", err)
+	}
+	resumed, found, err := f.store.ClaimConversationRoute(ctx, "route-join-root-worker", time.Minute)
+	if err != nil || !found || resumed.Message.ID != original.Message.ID || resumed.RouteAttempt != original.RouteAttempt+1 {
+		t.Fatalf("claim root after joined input changed its context: claim=%+v found=%t err=%v", resumed, found, err)
+	}
+	resumedSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, resumed)
+	if err != nil || !strings.Contains(resumedSnapshot.Context.Content, duplicate.Message.Content) {
+		t.Fatalf("reclassified root omitted joined input: content=%q err=%v", resumedSnapshot.Context.Content, err)
+	}
+	resumedSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, resumed, resumedSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("apply root after joined input refresh: %v", err)
+	}
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1`, f.conversation.ID).Scan(&taskCount); err != nil || taskCount != 1 {
+		t.Fatalf("joined message created extra task: tasks=%d err=%v", taskCount, err)
+	}
+	var rootTaskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, original.Message.ID).Scan(&rootTaskID); err != nil || rootTaskID == "" {
+		t.Fatalf("original request task was not created: task=%q err=%v", rootTaskID, err)
+	}
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(task_id,'') FROM conversation_messages WHERE id=$1`, duplicate.Message.ID).Scan(&duplicateTaskID); err != nil || duplicateTaskID != "" {
+		t.Fatalf("duplicate message entered the task inbox: task=%q err=%v", duplicateTaskID, err)
+	}
+	page, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var duplicateProjection *conversation.Message
+	for index := range page.Items {
+		if page.Items[index].ID == duplicate.Message.ID {
+			duplicateProjection = &page.Items[index]
+		}
+	}
+	if duplicateProjection == nil || duplicateProjection.DuplicateOfMessageID != original.Message.ID ||
+		duplicateProjection.RelatedTaskID != rootTaskID || duplicateProjection.TaskID != "" ||
+		duplicateProjection.RoutingStatus != conversation.RoutingRouted || duplicateProjection.DeliveryStatus != conversation.DeliveryApplied {
+		t.Fatalf("duplicate projection did not mirror the original task: %+v", duplicateProjection)
+	}
+	reconciled, found, err := f.store.FindConversationMessageByClientID(ctx, f.ownerID, "", f.conversation.ID,
+		"route-join-duplicate", f.instanceID)
+	if err != nil || !found || reconciled.DuplicateOfMessageID != original.Message.ID || reconciled.RelatedTaskID != rootTaskID ||
+		reconciled.TaskID != "" || reconciled.RoutingStatus != conversation.RoutingRouted {
+		t.Fatalf("client-id reconciliation lost duplicate association: %+v found=%t err=%v", reconciled, found, err)
+	}
+}
+
+func TestConversationRouteJoinAppendsRequirementsToActiveTaskRevision(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	root := f.receive(t, "route-join-revision-root", "整理项目资料并生成设计方案", input)
+	rootSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, root, rootSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, root.Message.ID).Scan(&taskID); err != nil || taskID == "" {
+		t.Fatalf("create root Task: task=%q err=%v", taskID, err)
+	}
+
+	addition := "方案中补充风险、验收标准，并提供可下载的 Markdown 文档。"
+	joined := f.receive(t, "route-join-revision-addition", addition, input)
+	joinedSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, joined)
+	if err != nil || len(joinedSnapshot.Context.RequestCandidates) != 1 ||
+		joinedSnapshot.Context.RequestCandidates[0].MessageID != root.Message.ID ||
+		joinedSnapshot.Context.RequestCandidates[0].TaskID != taskID ||
+		joinedSnapshot.Context.RequestCandidates[0].TaskStatus != task.StatusQueued {
+		t.Fatalf("active Task was not offered as a join target: candidates=%+v err=%v", joinedSnapshot.Context.RequestCandidates, err)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, joined, joinedSnapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: root.Message.ID,
+	}); err != nil {
+		t.Fatalf("join active task with new requirements: %v", err)
+	}
+	var routeState, delivery, association, messageTaskID, taskStatus string
+	var taskCount, intentCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT route.state,message.delivery_status,COALESCE(route.duplicate_of_message_id,''),
+COALESCE(message.task_id,''),task.status,(SELECT count(*) FROM tasks WHERE conversation_id=$1),
+(SELECT count(*) FROM task_revision_intents WHERE message_id=message.id AND state='stopping')
+FROM conversation_message_routes route
+JOIN conversation_messages message ON message.id=route.message_id
+JOIN tasks task ON task.id=$3 AND task.conversation_id=message.conversation_id
+WHERE route.message_id=$2`, f.conversation.ID, joined.Message.ID, taskID).
+		Scan(&routeState, &delivery, &association, &messageTaskID, &taskStatus, &taskCount, &intentCount); err != nil {
+		t.Fatal(err)
+	}
+	if routeState != "waiting_adjustment" || delivery != "pending" || association != root.Message.ID || messageTaskID != "" ||
+		taskStatus != string(task.StatusPausing) || taskCount != 1 || intentCount != 1 {
+		t.Fatalf("join did not create one safe Task revision: route=%q delivery=%q association=%q message_task=%q task_status=%q tasks=%d intents=%d",
+			routeState, delivery, association, messageTaskID, taskStatus, taskCount, intentCount)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	stop, found, err := f.store.ClaimNextTaskStop(ctx, "route-join-revision-stop-worker", time.Minute)
+	if err != nil || !found || stop.Task.ID != taskID {
+		t.Fatalf("claim revision stop: found=%t err=%v", found, err)
+	}
+	if _, err := f.store.CompleteTaskStop(ctx, taskID, stop.Request.ID, stop.Request.LeaseOwner, stop.Request.LeaseVersion); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := f.store.ApplyNextConversationTaskRevision(ctx); err != nil || !applied {
+		t.Fatalf("apply joined Task revision: applied=%t err=%v", applied, err)
+	}
+	var actualTaskID, intentState, actualContent string
+	var currentRevision int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(message.task_id,''),intent.state,message.content,task.current_revision
+FROM conversation_messages message JOIN task_revision_intents intent ON intent.message_id=message.id
+JOIN tasks task ON task.id=intent.task_id WHERE message.id=$1`, joined.Message.ID).
+		Scan(&actualTaskID, &intentState, &actualContent, &currentRevision); err != nil || actualTaskID != taskID || intentState != "applied" ||
+		actualContent != addition || currentRevision != 1 {
+		t.Fatalf("joined input was lost from the same Task revision: task=%q intent=%q content=%q revision=%d err=%v",
+			actualTaskID, intentState, actualContent, currentRevision, err)
+	}
+}
+
+func TestConcurrentConversationRouteJoinsReclassifyAndPreserveBothRevisions(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	root := f.receive(t, "route-join-race-root", "制定项目实施方案", input)
+	rootSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, root, rootSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, root.Message.ID).Scan(&taskID); err != nil || taskID == "" {
+		t.Fatalf("create root Task: task=%q err=%v", taskID, err)
+	}
+	additions := []app.ConversationRouteClaim{
+		f.receive(t, "route-join-race-addition-1", "补充数据安全要求。", input),
+		f.receive(t, "route-join-race-addition-2", "再补充验收标准。", input),
+	}
+	snapshots := make([]app.ConversationRouteSnapshot, len(additions))
+	for index, claim := range additions {
+		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+		rootJoinable := false
+		for _, candidate := range snapshot.Context.RequestCandidates {
+			rootJoinable = rootJoinable || candidate.MessageID == root.Message.ID && candidate.TaskID == taskID && candidate.TaskStatus == task.StatusQueued
+		}
+		if err != nil || !rootJoinable {
+			t.Fatalf("join snapshot %d=%+v err=%v", index, snapshot.Context.RequestCandidates, err)
+		}
+		snapshots[index] = snapshot
+	}
+	start := make(chan struct{})
+	results := make(chan error, len(additions))
+	var group sync.WaitGroup
+	for index, claim := range additions {
+		group.Add(1)
+		go func(index int, claim app.ConversationRouteClaim) {
+			defer group.Done()
+			<-start
+			results <- f.store.ApplyConversationRoute(ctx, claim, snapshots[index], app.ConversationRouteDecision{
+				Action: app.ConversationRouteJoin, TargetMessageID: root.Message.ID,
+			})
+		}(index, claim)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("concurrent join was not committed or safely requeued: %v", err)
+		}
+	}
+	var pendingID string
+	var revisions, pending int
+	if err := f.store.pool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM task_revision_intents WHERE task_id=$1 AND state='stopping'),
+(SELECT count(*) FROM conversation_message_routes WHERE conversation_id=$2 AND state='pending'),
+COALESCE((SELECT message_id FROM conversation_message_routes WHERE conversation_id=$2 AND state='pending' ORDER BY message_id LIMIT 1),'')`,
+		taskID, f.conversation.ID).Scan(&revisions, &pending, &pendingID); err != nil || revisions != 1 || pending != 1 || pendingID == "" {
+		t.Fatalf("concurrent joins did not serialize to one revision plus one reclassification: revisions=%d pending=%d message=%q err=%v",
+			revisions, pending, pendingID, err)
+	}
+	secondPass, found, err := f.store.ClaimConversationRoute(ctx, "route-join-race-worker", time.Minute)
+	if err != nil || !found || secondPass.Message.ID != pendingID {
+		t.Fatalf("claim the stale join: claim=%+v found=%t err=%v", secondPass, found, err)
+	}
+	secondSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, secondPass)
+	rootJoinable := false
+	for _, candidate := range secondSnapshot.Context.RequestCandidates {
+		rootJoinable = rootJoinable || candidate.MessageID == root.Message.ID && candidate.TaskID == taskID && candidate.TaskStatus == task.StatusPausing
+	}
+	if err != nil || !rootJoinable {
+		t.Fatalf("reclassified join did not see the active revision: candidates=%+v err=%v", secondSnapshot.Context.RequestCandidates, err)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, secondPass, secondSnapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: root.Message.ID,
+	}); err != nil {
+		t.Fatalf("append second revision to the same Task: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	stop, found, err := f.store.ClaimNextTaskStop(ctx, "route-join-race-stop-worker", time.Minute)
+	if err != nil || !found || stop.Task.ID != taskID {
+		t.Fatalf("claim shared revision stop: found=%t err=%v", found, err)
+	}
+	if _, err := f.store.CompleteTaskStop(ctx, taskID, stop.Request.ID, stop.Request.LeaseOwner, stop.Request.LeaseVersion); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := f.store.ApplyNextConversationTaskRevision(ctx); err != nil || !applied {
+		t.Fatalf("apply both joined revisions: applied=%t err=%v", applied, err)
+	}
+	var taskCount, appliedMessages, appliedIntents int
+	var current, desired int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*),max(task.current_revision),max(task.desired_revision),
+(SELECT count(*) FROM conversation_messages WHERE id=ANY($2::text[]) AND task_id=$1 AND delivery_status='pending'),
+(SELECT count(*) FROM task_revision_intents WHERE task_id=$1 AND message_id=ANY($2::text[]) AND state='applied')
+FROM tasks task WHERE task.id=$1`, taskID, []string{additions[0].Message.ID, additions[1].Message.ID}).
+		Scan(&taskCount, &current, &desired, &appliedMessages, &appliedIntents); err != nil || taskCount != 1 || current != 2 || desired != 2 ||
+		appliedMessages != 2 || appliedIntents != 2 {
+		t.Fatalf("concurrent additions were not preserved in one Task: tasks=%d revision=%d/%d messages=%d intents=%d err=%v",
+			taskCount, current, desired, appliedMessages, appliedIntents, err)
+	}
+}
+
+func TestConversationRouteConcurrentNewDecisionReclassifiesAgainstCreatedTask(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	original := f.receive(t, "route-race-original", "分析 Morde 项目", input)
+	originalSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicates := []app.ConversationRouteClaim{
+		f.receive(t, "route-race-duplicate-1", "分析 Morde 项目", input),
+		f.receive(t, "route-race-duplicate-2", "分析一下 Morde 项目", input),
+		f.receive(t, "route-race-duplicate-3", "也帮我分析这个 Morde 项目", input),
+	}
+	duplicateSnapshots := make([]app.ConversationRouteSnapshot, len(duplicates))
+	for index, duplicate := range duplicates {
+		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, duplicate)
+		containsOriginal := false
+		for _, candidate := range snapshot.Context.RequestCandidates {
+			containsOriginal = containsOriginal || candidate.MessageID == original.Message.ID
+		}
+		if err != nil || !containsOriginal {
+			t.Fatalf("concurrent route snapshot %d=%+v err=%v", index, snapshot, err)
+		}
+		snapshot.Context.ModelID = "p1234567"
+		duplicateSnapshots[index] = snapshot
+	}
+	originalSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, original, originalSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	for index, duplicate := range duplicates {
+		if err := f.store.ApplyConversationRoute(ctx, duplicate, duplicateSnapshots[index],
+			app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+			t.Fatalf("stale concurrent decision %d failed: %v", index, err)
+		}
+	}
+	for index, duplicate := range duplicates {
+		if index == 0 {
+			var duplicateOf, duplicateTaskID, state string
+			if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(route.duplicate_of_message_id,''),COALESCE(message.task_id,''),route.state
+FROM conversation_message_routes route JOIN conversation_messages message ON message.id=route.message_id
+WHERE route.message_id=$1`, duplicate.Message.ID).Scan(&duplicateOf, &duplicateTaskID, &state); err != nil ||
+				duplicateOf != original.Message.ID || duplicateTaskID != "" || state != "routed" {
+				t.Fatalf("stale exact duplicate was not linked to the original request: duplicate_of=%q task=%q state=%q err=%v",
+					duplicateOf, duplicateTaskID, state, err)
+			}
+			continue
+		}
+		current, found, err := f.store.ClaimConversationRoute(ctx, "route-actions-test", time.Minute)
+		if err != nil || !found || current.Message.ID != duplicate.Message.ID {
+			t.Fatalf("reclassified duplicate claim %d=%+v found=%t err=%v", index, current, found, err)
+		}
+		var attempt int64
+		if err := f.store.pool.QueryRow(ctx, `SELECT route_attempt FROM conversation_message_routes WHERE message_id=$1`, duplicate.Message.ID).Scan(&attempt); err != nil || attempt != duplicate.RouteAttempt+1 || current.RouteAttempt != attempt {
+			t.Fatalf("duplicate %d route attempt=%d initial=%d claimed=%d err=%v", index, attempt, duplicate.RouteAttempt, current.RouteAttempt, err)
+		}
+		currentSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, current)
+		containsOriginalTask := false
+		for _, candidate := range currentSnapshot.Context.RequestCandidates {
+			containsOriginalTask = containsOriginalTask || candidate.MessageID == original.Message.ID && candidate.TaskID != ""
+		}
+		if err != nil || !containsOriginalTask {
+			t.Fatalf("refreshed duplicate snapshot %d=%+v err=%v", index, currentSnapshot, err)
+		}
+		if err := f.store.ApplyConversationRoute(ctx, current, currentSnapshot, app.ConversationRouteDecision{
+			Action: app.ConversationRouteJoin, TargetMessageID: original.Message.ID,
+		}); err != nil {
+			t.Fatalf("join duplicate %d to the original request: %v", index, err)
+		}
+	}
+	var taskCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1`, f.conversation.ID).Scan(&taskCount); err != nil || taskCount != 1 {
+		t.Fatalf("four concurrent requests created %d tasks, err=%v", taskCount, err)
+	}
+	for index, duplicate := range duplicates {
+		var duplicateOf, duplicateTaskID string
+		if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(route.duplicate_of_message_id,''),COALESCE(message.task_id,'')
+FROM conversation_message_routes route JOIN conversation_messages message ON message.id=route.message_id
+WHERE route.message_id=$1`, duplicate.Message.ID).Scan(&duplicateOf, &duplicateTaskID); err != nil ||
+			duplicateOf != original.Message.ID || duplicateTaskID != "" {
+			t.Fatalf("duplicate %d was not linked to the single root: duplicate_of=%q duplicate_task=%q err=%v",
+				index, duplicateOf, duplicateTaskID, err)
+		}
+	}
+}
+
+func TestConversationRouteJoinRejectsDifferentExecutionScope(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	original := f.receive(t, "route-join-scope-original", "分析 Morde 项目", app.ConversationRoutingInput{HostID: "h1234567"})
+	duplicate := f.receive(t, "route-join-scope-other", "分析 Morde 项目", app.ConversationRoutingInput{HostID: "h7654321"})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, duplicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Context.RequestCandidates) != 1 || snapshot.Context.RequestCandidates[0].SameExecutionScope {
+		t.Fatalf("different execution scope was not represented: %+v", snapshot.Context.RequestCandidates)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, duplicate, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: original.Message.ID,
+	}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("cross-scope join was accepted: %v", err)
+	}
+	var state, association string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,'') FROM conversation_message_routes WHERE message_id=$1`,
+		duplicate.Message.ID).Scan(&state, &association); err != nil || state != "processing" || association != "" {
+		t.Fatalf("rejected join changed the message route: state=%s association=%q err=%v", state, association, err)
+	}
+}
+
 func TestConversationRouteDefaultComputerDoesNotChangeRevisionTargetContext(t *testing.T) {
 	for _, test := range []struct {
 		name             string
@@ -399,7 +777,7 @@ func TestConversationRouteNeverAppliesRevisionsOutOfMessageOrder(t *testing.T) {
 	}
 }
 
-func TestConversationRouteStaleDecisionCannotStopTask(t *testing.T) {
+func TestConversationRouteStaleDecisionReclassifiesWithoutStoppingTask(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
 	first := f.receive(t, "route-stale-001", "Do work", app.ConversationRoutingInput{})
@@ -430,12 +808,13 @@ func TestConversationRouteStaleDecisionCannotStopTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	var taskStatus, routeStatus string
-	if err := f.store.pool.QueryRow(ctx, `SELECT t.status,r.state FROM tasks t JOIN conversation_message_routes r ON r.message_id=$2 WHERE t.id=$1`,
-		taskID, second.Message.ID).Scan(&taskStatus, &routeStatus); err != nil {
+	var attempt int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT t.status,r.state,r.route_attempt FROM tasks t JOIN conversation_message_routes r ON r.message_id=$2 WHERE t.id=$1`,
+		taskID, second.Message.ID).Scan(&taskStatus, &routeStatus, &attempt); err != nil {
 		t.Fatal(err)
 	}
-	if taskStatus != string(task.StatusQueued) || routeStatus != "waiting_user" {
-		t.Fatalf("stale decision changed task: task=%s route=%s", taskStatus, routeStatus)
+	if taskStatus != string(task.StatusQueued) || routeStatus != "pending" || attempt != second.RouteAttempt+1 {
+		t.Fatalf("stale decision stopped Task or skipped automatic reclassification: task=%s route=%s attempt=%d", taskStatus, routeStatus, attempt)
 	}
 }
 
@@ -531,11 +910,16 @@ func TestConversationRouteRetryReusesMessageAndFencesIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	var state string
-	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).Scan(&state); err != nil || state != "failed" {
-		t.Fatalf("replayed key restarted a later failure: state=%q err=%v", state, err)
+	var routeAttempt int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,route_attempt FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).Scan(&state, &routeAttempt); err != nil || state != "failed" || routeAttempt != next.RouteAttempt {
+		t.Fatalf("replayed key restarted a later failure: state=%q attempt=%d first_attempt=%d err=%v", state, routeAttempt, next.RouteAttempt, err)
 	}
 	if err := retry("route-retry-key-002"); err != nil {
 		t.Fatalf("new user retry failed: %v", err)
+	}
+	var retryAttempt int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT route_attempt FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).Scan(&retryAttempt); err != nil || retryAttempt != next.RouteAttempt+1 {
+		t.Fatalf("fresh retry did not receive a new routing attempt: attempt=%d previous=%d err=%v", retryAttempt, next.RouteAttempt, err)
 	}
 	other := createPreRetirementTestUser(t, f.store, 1, 2000, 4096)
 	principal.UserID, principal.TokenID = other.ID, testSessionTokenID(other.ID)
@@ -545,6 +929,147 @@ func TestConversationRouteRetryReusesMessageAndFencesIdempotency(t *testing.T) {
 	var count int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1`, f.conversation.ID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("retry duplicated message: count=%d err=%v", count, err)
+	}
+}
+
+func TestConcurrentConversationRouteRetryWithSameKeyCreatesOneAttempt(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-retry-concurrent-001", "Retry this message once", app.ConversationRoutingInput{})
+	if err := f.store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession,
+		TokenID: f.authorization.TokenID, Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	const callers = 8
+	ready := sync.WaitGroup{}
+	ready.Add(callers)
+	var group sync.WaitGroup
+	group.Add(callers)
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			defer group.Done()
+			ready.Done()
+			<-start
+			results <- f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID,
+				f.instanceID, "route-retry-concurrent-key-001")
+		}()
+	}
+	ready.Wait()
+	close(start)
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("same-key concurrent retry did not replay successfully: %v", err)
+		}
+	}
+	var state string
+	var attempt, messages int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,
+ (SELECT count(*) FROM conversation_messages WHERE conversation_id=r.conversation_id)
+FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID).
+		Scan(&state, &attempt, &messages); err != nil || state != "pending" || attempt != claim.RouteAttempt+1 || messages != 1 {
+		t.Fatalf("concurrent retry produced multiple attempts or messages: state=%q attempt=%d messages=%d err=%v",
+			state, attempt, messages, err)
+	}
+	retry, found, err := f.store.ClaimConversationRoute(ctx, "route-retry-concurrent-worker", time.Minute)
+	if err != nil || !found || retry.Message.ID != claim.Message.ID || retry.RouteAttempt != attempt {
+		t.Fatalf("single retry attempt was not claimable: claim=%+v found=%t err=%v", retry, found, err)
+	}
+}
+
+func TestConversationRouteRetryFromDuplicateTargetsOriginalRoute(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	root := f.receive(t, "route-retry-duplicate-root", "分析 Morde 项目", input)
+	duplicate := f.receive(t, "route-retry-duplicate-copy", "分析一下 Morde 项目", input)
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, duplicate)
+	if err != nil || len(snapshot.Context.RequestCandidates) != 1 {
+		t.Fatalf("duplicate retry context=%+v err=%v", snapshot.Context.RequestCandidates, err)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, duplicate, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: root.Message.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.FailConversationRoute(ctx, root, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: f.ownerID, Kind: identity.KindSession, TokenID: f.authorization.TokenID,
+		Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, duplicate.Message.ID, f.instanceID,
+		"route-retry-duplicate-key-001"); err != nil {
+		t.Fatalf("retry through duplicate message: %v", err)
+	}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, root.Message.ID, f.instanceID,
+		"route-retry-duplicate-key-001"); err != nil {
+		t.Fatalf("same normalized retry key did not replay through root: %v", err)
+	}
+	retried, found, err := f.store.ClaimConversationRoute(ctx, "route-retry-duplicate-worker", time.Minute)
+	if err != nil || !found || retried.Message.ID != root.Message.ID || retried.RouteAttempt != root.RouteAttempt+1 {
+		t.Fatalf("retry did not target the original request: claim=%+v found=%t err=%v", retried, found, err)
+	}
+	message, found, err := f.store.FindConversationMessageByClientID(ctx, f.ownerID, "", f.conversation.ID,
+		"route-retry-duplicate-copy", f.instanceID)
+	if err != nil || !found || message.RoutingStatus != conversation.RoutingProcessing ||
+		message.DuplicateOfMessageID != root.Message.ID || message.DeliveryStatus != conversation.DeliveryPending {
+		t.Fatalf("duplicate did not mirror original retry: %+v found=%t err=%v", message, found, err)
+	}
+}
+
+func TestConversationRouteContextChangesReclassifyAndFailAfterThreeConflicts(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	prior := f.receive(t, "route-reclass-prior-001", "先前的任务", app.ConversationRoutingInput{})
+	priorSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, prior, priorSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var priorTaskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, prior.Message.ID).Scan(&priorTaskID); err != nil {
+		t.Fatal(err)
+	}
+	claim := f.receive(t, "route-reclass-root-001", "分析这个项目", app.ConversationRoutingInput{})
+	for conflict := 1; conflict <= 3; conflict++ {
+		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET desired_revision=desired_revision+1 WHERE id=$1`, priorTaskID); err != nil {
+			t.Fatal(err)
+		}
+		snapshot.Context.ModelID = "p1234567"
+		if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+			t.Fatalf("reclassify conflict %d: %v", conflict, err)
+		}
+		var state, failure string
+		var attempt int64
+		var retries int16
+		var taskID string
+		if err := f.store.pool.QueryRow(ctx, `SELECT r.state,r.failure_reason,r.route_attempt,r.auto_retry_count,COALESCE(m.task_id,'')
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).
+			Scan(&state, &failure, &attempt, &retries, &taskID); err != nil {
+			t.Fatal(err)
+		}
+		if taskID != "" || retries != int16(conflict) || (conflict < 3 && (state != "pending" || attempt != claim.RouteAttempt+1)) ||
+			(conflict == 3 && (state != "failed" || failure != "routing_context_unavailable" || attempt != claim.RouteAttempt)) {
+			t.Fatalf("conflict %d produced state=%s failure=%s attempt=%d retries=%d task=%s", conflict, state, failure, attempt, retries, taskID)
+		}
+		if conflict < 3 {
+			next, found, err := f.store.ClaimConversationRoute(ctx, "route-reclass-test-worker", time.Minute)
+			if err != nil || !found || next.Message.ID != claim.Message.ID {
+				t.Fatalf("claim reclassified route: claim=%+v found=%t err=%v", next, found, err)
+			}
+			claim = next
+		}
 	}
 }
 

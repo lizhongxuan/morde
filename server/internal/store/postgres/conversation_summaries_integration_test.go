@@ -1181,6 +1181,10 @@ func TestConversationSummaryMigrationRefusesDestructiveRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProvider()
+	if _, err := f.store.pool.Exec(context.Background(), `UPDATE conversation_message_routes SET route_attempt=0
+WHERE message_id=ANY($1::text[])`, []string{prior.Message.ID, claim.Message.ID}); err != nil {
+		t.Fatalf("prepare legacy route receipts for summary rollback: %v", err)
+	}
 	if _, err := provider.DownTo(context.Background(), 174); err == nil || !strings.Contains(err.Error(), "cannot remove conversation compaction model call records") {
 		t.Fatalf("rollback with a persisted summary model call was allowed: %v", err)
 	}

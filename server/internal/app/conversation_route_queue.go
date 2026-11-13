@@ -14,6 +14,7 @@ type ConversationRouteClaim struct {
 	ServiceInstanceID string
 	Input             ConversationRoutingInput
 	Authorization     task.Authorization
+	RouteAttempt      int64
 	LeaseOwner        string
 	LeaseVersion      int64
 	LeaseExpiresAt    time.Time

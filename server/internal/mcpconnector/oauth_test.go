@@ -100,6 +100,50 @@ func TestConnectorOAuthPKCEExchangeAndRefresh(t *testing.T) {
 	}
 }
 
+func TestConnectorOAuthDoesNotRequestEveryAdvertisedScope(t *testing.T) {
+	client := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(request *http.Request) (*http.Response, error) {
+		status, body := http.StatusOK, ""
+		headers := make(http.Header)
+		switch request.URL.Host + request.URL.Path {
+		case "mcp.example.test/mcp":
+			status = http.StatusUnauthorized
+			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource"`)
+		case "mcp.example.test/.well-known/oauth-protected-resource":
+			body = `{"resource":"https://mcp.example.test/mcp","authorization_servers":["https://auth.example.test"],"scopes_supported":["read","write","admin"]}`
+		case "auth.example.test/.well-known/oauth-authorization-server":
+			body = `{"issuer":"https://auth.example.test","authorization_endpoint":"https://auth.example.test/authorize","token_endpoint":"https://auth.example.test/token","registration_endpoint":"https://auth.example.test/register","code_challenge_methods_supported":["S256"]}`
+		case "auth.example.test/register":
+			var registration map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&registration); err != nil {
+				t.Fatal(err)
+			}
+			if _, requested := registration["scope"]; requested {
+				t.Fatalf("dynamic registration requested all advertised scopes: %v", registration)
+			}
+			status, body = http.StatusCreated, `{"client_id":"registered-client","token_endpoint_auth_method":"none"}`
+		default:
+			t.Fatalf("unexpected OAuth request: %s %s", request.Method, request.URL)
+		}
+		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})}
+
+	start, err := client.Begin(context.Background(), "https://mcp.example.test/mcp", "https://portal.example.test/api/mcp/oauth/callback", "", "", nil)
+	if err != nil || start.ClientRequired {
+		t.Fatalf("Begin() = %#v, %v", start, err)
+	}
+	parsed, err := url.Parse(start.AuthorizationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Has("scope") {
+		t.Fatalf("authorization URL requested scopes absent from the challenge: %v", parsed.Query())
+	}
+	var flow connectorOAuthFlow
+	if err := json.Unmarshal(start.Payload, &flow); err != nil || flow.Scope != "" {
+		t.Fatalf("OAuth flow scope = %q, %v", flow.Scope, err)
+	}
+}
+
 func TestConnectorOAuthRequiresManualClientAndRejectsUnsafeMetadata(t *testing.T) {
 	manualClient := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(request *http.Request) (*http.Response, error) {
 		var status int

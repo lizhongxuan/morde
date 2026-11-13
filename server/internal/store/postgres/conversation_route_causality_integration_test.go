@@ -228,6 +228,12 @@ func TestConversationRouteCausalityMigrationPreservesAndProtectsLedger(t *testin
 		t.Fatal(err)
 	}
 	defer closeProvider()
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET route_attempt=0,auto_retry_count=0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_route_model_calls SET attempt=0`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := provider.DownTo(ctx, 159); err != nil {
 		t.Fatalf("roll back ordinary route history: %v", err)
 	}
@@ -245,7 +251,7 @@ func TestConversationRouteCausalityMigrationPreservesAndProtectsLedger(t *testin
 	if decision.Action != app.ConversationRouteNew {
 		t.Fatalf("independence decision=%+v", decision)
 	}
-	if _, err := provider.DownTo(ctx, 159); err == nil || !strings.Contains(err.Error(), "cannot remove causal routing") {
+	if _, err := provider.DownTo(ctx, 159); err == nil || !strings.Contains(err.Error(), "cannot discard conversation route association or retry evidence") {
 		t.Fatalf("rollback discarded independence ledger: %v", err)
 	}
 }
@@ -276,6 +282,84 @@ func TestConversationRouteUnknownIndependenceCallCannotDispatchNextPhase(t *test
 	client.err = nil
 	if _, err := gateway.ClassifyConversationRoute(ctx, claim, snapshot.Context); domain.CodeOf(err) != domain.CodeInvalidState || client.calls.Load() != 1 {
 		t.Fatalf("unknown independence call was dispatched again: calls=%d err=%v", client.calls.Load(), err)
+	}
+}
+
+func TestConversationRouteRetryIsolatesOldUnknownFromPredecessorRequeue(t *testing.T) {
+	ctx := context.Background()
+	client := &routeModelClientTest{err: errors.New("synthetic provider interruption")}
+	store, gateway, principal, fixture, _ := routeModelFixture(t, false, client)
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET owner_id=$1 WHERE id=$2`, principal.UserID, fixture.Input.ModelID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FailConversationRoute(ctx, fixture, "routing_action_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	message := receiveCausalMessage(t, store, fixture, "causal-retry-dependent-001", "causal-retry-previous-001", "继续这项工作")
+	firstClaim := claimCausalMessage(t, store, message.ID)
+	firstSnapshot, err := store.LoadConversationRouteSnapshot(ctx, firstClaim)
+	if err != nil || !firstSnapshot.PreviousMissing {
+		t.Fatalf("initial missing predecessor snapshot=%+v err=%v", firstSnapshot, err)
+	}
+	firstSnapshot.Context.ModelID = fixture.Input.ModelID
+	if _, err := gateway.ClassifyConversationRoute(ctx, firstClaim, firstSnapshot.Context); err == nil {
+		t.Fatal("synthetic interruption reported a classification")
+	}
+	if err := store.FailConversationRoute(ctx, firstClaim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", firstClaim.Message.ConversationID, firstClaim.Message.ID, instanceID,
+		"causal-retry-unknown-attempt-001"); err != nil {
+		t.Fatalf("retry unknown personal predecessor route: %v", err)
+	}
+	secondClaim, found, err := store.ClaimConversationRoute(ctx, "causal-retry-new-attempt", time.Minute)
+	if err != nil || !found || secondClaim.Message.ID != message.ID || secondClaim.RouteAttempt != firstClaim.RouteAttempt+1 {
+		t.Fatalf("second attempt claim=%+v found=%t err=%v", secondClaim, found, err)
+	}
+	secondSnapshot, err := store.LoadConversationRouteSnapshot(ctx, secondClaim)
+	if err != nil || !secondSnapshot.PreviousMissing {
+		t.Fatalf("retried missing predecessor snapshot=%+v err=%v", secondSnapshot, err)
+	}
+	previous := receiveCausalMessage(t, store, fixture, "causal-retry-previous-001", "", "上一条合成消息")
+	requeued, err := store.RequeueConversationRouteAfterPredecessor(ctx, secondClaim, secondSnapshot)
+	if err != nil || !requeued {
+		t.Fatalf("old attempt unknown blocked safe predecessor requeue: requeued=%t err=%v", requeued, err)
+	}
+	var state, oldCallState, oldLedgerState string
+	var attempt int64
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,c.state,l.state
+FROM conversation_message_routes r JOIN conversation_route_model_calls c ON c.message_id=r.message_id
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE r.message_id=$1 AND c.attempt=$2`, message.ID, firstClaim.RouteAttempt).
+		Scan(&state, &attempt, &oldCallState, &oldLedgerState); err != nil || state != "pending" ||
+		attempt != secondClaim.RouteAttempt+1 || oldCallState != "unknown" || oldLedgerState != "unknown" {
+		t.Fatalf("predecessor requeue changed attempt evidence: state=%q attempt=%d old_call=%q old_ledger=%q err=%v",
+			state, attempt, oldCallState, oldLedgerState, err)
+	}
+	thirdClaim, found, err := store.ClaimConversationRoute(ctx, "causal-retry-resumed", time.Minute)
+	if err != nil || !found || thirdClaim.Message.ID != message.ID || thirdClaim.RouteAttempt != attempt {
+		t.Fatalf("resumed claim=%+v found=%t err=%v", thirdClaim, found, err)
+	}
+	thirdSnapshot, err := store.LoadConversationRouteSnapshot(ctx, thirdClaim)
+	if err != nil || thirdSnapshot.PreviousMissing || thirdSnapshot.PreviousMessageID != previous.ID {
+		t.Fatalf("resumed predecessor snapshot=%+v err=%v", thirdSnapshot, err)
+	}
+	thirdSnapshot.Context.ModelID = fixture.Input.ModelID
+	client.err = nil
+	decision, err := gateway.ClassifyConversationRoute(ctx, thirdClaim, thirdSnapshot.Context)
+	if err != nil || decision.Action != app.ConversationRouteNew || client.calls.Load() != 2 {
+		t.Fatalf("resumed route was not a fresh classification: decision=%+v calls=%d err=%v", decision, client.calls.Load(), err)
+	}
+	var oldRows, newRows int
+	if err := store.pool.QueryRow(ctx, `SELECT
+ (SELECT count(*) FROM conversation_route_model_calls WHERE message_id=$1 AND attempt=$2 AND state='unknown'),
+ (SELECT count(*) FROM conversation_route_model_calls WHERE message_id=$1 AND attempt=$3 AND state='settled')`,
+		message.ID, firstClaim.RouteAttempt, thirdClaim.RouteAttempt).Scan(&oldRows, &newRows); err != nil || oldRows != 1 || newRows != 1 {
+		t.Fatalf("attempt ledger rows old=%d new=%d err=%v", oldRows, newRows, err)
 	}
 }
 

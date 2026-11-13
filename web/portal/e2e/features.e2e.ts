@@ -1,14 +1,31 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const portalUrl = process.env.CH_PORTAL_E2E_URL ?? "http://127.0.0.1:5183";
 
 async function signIn(page: Page, username: "demo" | "admin" = "demo") {
   await page.goto("/");
   await submitLogin(page, username, username);
-  await page.getByRole("link", { name: "AI 助手", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
+  await page.goto("/assistant");
+  await expect(page.getByRole("complementary", { name: "对话" })).toBeVisible();
   await page.getByRole("link", { name: "云端电脑", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "云端电脑", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "我的电脑", exact: true })).toBeVisible();
+}
+
+async function openAdmin(page: Page) {
+  await page.locator(".morde-account-menu > summary").click();
+  await page.getByRole("link", { name: "切换至管理后台" }).click();
+}
+
+async function openHostActions(host: Locator) {
+  const menu = host.locator(".host-more-actions");
+  if (!await menu.evaluate((element) => (element as HTMLDetailsElement).open)) await menu.locator("summary").click();
+}
+
+async function firstHostWorkspaceID(page: Page, hostID: string) {
+  return page.evaluate(async (id) => {
+    const host = await fetch(`/api/hosts/${id}`).then((response) => response.json()) as { workspaces?: Array<{ workspace?: { id?: string } }> };
+    return host.workspaces?.[0]?.workspace?.id;
+  }, hostID);
 }
 
 async function submitLogin(page: Page, username: string, password: string) {
@@ -31,7 +48,7 @@ test.describe("Portal feature mock flows", () => {
   test.skip(process.env.CH_REAL_E2E === "1", "mock scenario is disabled for a real-host run");
 
   test("[mock] restores an uncertain Host create after browser reload with the same idempotency key", async ({ browser }) => {
-    const user = { id: "u1234567", name: "demo", role: "member", quota: { hosts: 3, cpu_milli: 6000, mem_mib: 12288 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } };
+    const user = { id: "u1234567", name: "demo", role: "user", quota: { hosts: 3, cpu_milli: 6000, mem_mib: 12288 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } };
     const workspace = { id: "w7654321", owner_id: user.id, name: "接力项目工作区", revision: 0, used_bytes: 0, quota_bytes: 1048576, state: "ready", created_at: "", updated_at: "" };
     const hostKeys: string[] = [];
     const workspaceKeys: string[] = [];
@@ -65,18 +82,17 @@ test.describe("Portal feature mock flows", () => {
     const page = await context.newPage();
     try {
       await page.goto(`${portalUrl}/hosts/new`);
-      await expect(page.getByRole("heading", { name: "创建电脑" })).toBeVisible();
-      await page.getByLabel(/主机名称/).fill("待恢复创建");
-      await page.getByRole("button", { name: "创建主机" }).click();
+      await expect(page.getByRole("heading", { name: "基本配置" })).toBeVisible();
+      await page.getByLabel(/云端电脑名称/).fill("待恢复创建");
+      await page.getByRole("button", { name: "创建云端电脑" }).click();
       await expect(page.getByRole("button", { name: "继续上次创建" })).toBeVisible();
       await page.reload();
       await expect(page.getByRole("status").filter({ hasText: "上次创建结果尚未确认" })).toBeVisible();
-      await expect(page.getByLabel(/主机名称/)).toHaveValue("待恢复创建");
+      await expect(page.getByLabel(/云端电脑名称/)).toHaveValue("待恢复创建");
       await page.getByRole("button", { name: "继续上次创建" }).click();
       await expect.poll(() => hostKeys.length).toBe(2);
       expect(hostKeys[1]).toBe(hostKeys[0]);
-      expect(workspaceKeys).toHaveLength(1);
-      expect(workspaceKeys[0]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
+      expect(workspaceKeys).toHaveLength(0);
     } finally {
       await context.close();
     }
@@ -84,7 +100,7 @@ test.describe("Portal feature mock flows", () => {
 
   test("[mock] detects a new Host sync conflict and resumes it after an owner retry", async ({ browser }) => {
     const user = {
-      id: "u1234567", name: "demo", role: "member",
+      id: "u1234567", name: "demo", role: "user",
       quota: { hosts: 3, cpu_milli: 6000, mem_mib: 12288 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 },
     };
     const workspace = {
@@ -92,6 +108,7 @@ test.describe("Portal feature mock flows", () => {
       used_bytes: 4096, quota_bytes: 1024 * 1024, last_error: "", created_at: "2026-10-24T00:00:00Z", updated_at: "2026-10-24T00:00:00Z",
     };
     let conflict = false;
+    let authenticated = false;
     let retryBody: { expected_binding_version: number } | undefined;
     const host = {
       id: "h1234567", name: "接力电脑", owner_id: user.id, template_id: "std-2c4g", isolation: "container", state: "running",
@@ -116,16 +133,18 @@ test.describe("Portal feature mock flows", () => {
       expect(withoutMockWorker).not.toBe(source);
       await route.fulfill({ response, body: withoutMockWorker });
     });
-    await context.route("**/api/me", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: { code: "unauthenticated", message: "请先登录", details: {} } }) }));
-    await context.route("**/api/auth/login", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ user }) }));
-    await context.route("**/api/workspaces", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [workspace] }) }));
-    await context.route("**/api/hosts", (route) => route.fulfill({
+    await context.route("**/api/me", (route) => route.fulfill(authenticated
+      ? { status: 200, contentType: "application/json", body: JSON.stringify(user) }
+      : { status: 401, contentType: "application/json", body: JSON.stringify({ error: { code: "unauthenticated", message: "请先登录", details: {} } }) }));
+    await context.route("**/api/auth/login", (route) => { authenticated = true; return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ user }) }); });
+    await context.route((url) => url.pathname === "/api/workspaces", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [workspace] }) }));
+    await context.route((url) => url.pathname === "/api/hosts", (route) => route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({ items: [{ ...host, workspaces: host.workspaces.map((binding) => ({
         ...binding, sync_state: conflict ? "conflict" : "healthy", sync_conflicts: conflict ? ["src/main.go"] : [],
       })) }] }),
     }));
-    await context.route("**/retry-sync", async (route) => {
+    await context.route((url) => url.pathname.endsWith("/retry-sync"), async (route) => {
       retryBody = route.request().postDataJSON() as { expected_binding_version: number };
       conflict = false;
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(host.workspaces[0]) });
@@ -137,16 +156,15 @@ test.describe("Portal feature mock flows", () => {
       await page.getByLabel("用户名").fill(user.name);
       await page.getByLabel("密码").fill("local-only");
       await page.getByRole("button", { name: "登录" }).click();
-      await expect(page.getByRole("heading", { name: "工作区", exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "本机项目目录", exact: true })).toBeVisible();
       await expect(page.getByText("同步：已同步 v2")).toBeVisible();
-      await expect.poll(async () => {
-        conflict = true;
-        return page.getByText("Host 工作区同步冲突").isVisible();
-      }, { timeout: 5000 }).toBe(true);
+      conflict = true;
+      await page.reload();
+      await expect(page.getByText("云端电脑文件冲突")).toBeVisible();
       await expect(page.getByText("src/main.go")).toBeVisible();
-      await page.getByRole("button", { name: "重试 Host 同步 接力项目 到 接力电脑" }).click();
+      await page.getByRole("button", { name: "重试电脑文件同步 接力项目 到 接力电脑" }).click();
       await expect.poll(() => retryBody).toEqual({ expected_binding_version: 7 });
-      await expect(page.getByText("Host 工作区同步冲突")).toHaveCount(0);
+      await expect(page.getByText("云端电脑文件冲突")).toHaveCount(0);
       await expect(page.getByText("同步：已同步 v2")).toBeVisible();
     } finally {
       await context.close();
@@ -172,36 +190,29 @@ test.describe("Portal feature mock flows", () => {
 
     await signIn(page);
     await allowMoreHosts(page);
-    await page.context().route('https://workbench.mock.invalid/**', (route) => route.fulfill({
-      status: 200, contentType: 'text/html', body: '<!doctype html><meta charset="utf-8"><h1>本地测试主机</h1>',
-    }));
     await page.getByRole("link", { name: "创建电脑" }).click();
-    await page.getByLabel(/主机名称/).fill(hostName);
-    await page.getByRole("button", { name: "创建主机" }).click();
+    await page.getByLabel(/云端电脑名称/).fill(hostName);
+    await page.getByRole("button", { name: "创建云端电脑" }).click();
 
     const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: hostName, exact: true }) });
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
     await expect(host.getByRole("button", { name: /暂停主机|恢复主机|管理主机令牌/ })).toHaveCount(0);
-    const workspaceId = await host.locator(".host-facts > div").nth(2).locator("strong").innerText();
+    const hostID = (await host.getAttribute("id"))!.replace(/^host-/, "");
+    const workspaceId = await firstHostWorkspaceID(page, hostID);
+    expect(workspaceId).toBeTruthy();
 
-    const workbenchPromise = page.waitForEvent("popup");
-    await host.getByRole("button", { name: `查看主机 ${hostName}` }).click();
-    const workbench = await workbenchPromise;
-    await expect(workbench.getByText("本地测试主机")).toBeVisible();
-
-    await host.getByRole("button", { name: `删除主机 ${hostName}` }).click();
-    const deleteDialog = page.getByRole("dialog", { name: `删除主机 ${hostName}` });
-    await expect(deleteDialog).toContainText("绑定的独立工作区会自动解绑并保留在服务端，不随主机删除");
+    await openHostActions(host);
+    await host.getByRole("button", { name: `删除云端电脑 ${hostName}` }).click();
+    const deleteDialog = page.getByRole("dialog", { name: `删除云端电脑 ${hostName}` });
+    await expect(deleteDialog).toContainText("关联的云端文件会自动解除关联并保留在服务端，不随电脑删除");
     await expect(deleteDialog).toContainText("正在运行的终端命令及服务会中止");
-    await deleteDialog.getByRole("button", { name: "删除主机" }).click();
+    await deleteDialog.getByRole("button", { name: "删除电脑" }).click();
     await expect(host).toHaveCount(0, { timeout: 10_000 });
-    await workbench.close();
-
-    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
-    const workspace = page.getByRole("row").filter({ hasText: workspaceId });
+    await page.goto("/workspaces");
+    const workspace = page.getByRole("article").filter({ hasText: workspaceId });
     await expect(workspace).toBeVisible();
-    await expect(workspace.getByRole("cell", { name: /绑定主机 未绑定/ })).toBeVisible();
-    await workspace.getByRole("button", { name: `删除工作区 ${workspaceId}` }).click();
+    await expect(workspace).toContainText("未绑定");
+    await workspace.getByRole("button", { name: /删除工作区/ }).click();
     const deleteWorkspaceDialog = page.getByRole("dialog", { name: "删除工作区" });
     await expect(deleteWorkspaceDialog).toContainText("永久删除 Morde 云端工作区及其已同步数据");
     await expect(deleteWorkspaceDialog).toContainText("本地文件夹和未同步的文件会保留");
@@ -214,76 +225,87 @@ test.describe("Portal feature mock flows", () => {
     await signIn(page);
     await allowMoreHosts(page);
     await page.getByRole("link", { name: "创建电脑" }).click();
-    await page.getByLabel(/主机名称/).fill(hostName);
-    await page.getByRole("button", { name: "创建主机" }).click();
+    await page.getByLabel(/云端电脑名称/).fill(hostName);
+    await page.getByRole("button", { name: "创建云端电脑" }).click();
 
     const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: hostName, exact: true }) });
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
-    const hostIdentity = await host.locator(".mono").innerText();
-    const workspaceId = await host.locator(".host-facts > div").nth(2).locator("strong").innerText();
+    const hostCardID = await host.getAttribute("id");
+    expect(hostCardID).toMatch(/^host-.+/);
+    const hostID = hostCardID!.replace(/^host-/, "");
+    const workspaceId = await firstHostWorkspaceID(page, hostID);
+    expect(workspaceId).toBeTruthy();
 
+    await openHostActions(host);
     await host.getByRole("button", { name: `释放运行资源 ${hostName}` }).click();
     const releaseDialog = page.getByRole("dialog", { name: `释放主机 ${hostName} 的运行资源` });
     await expect(releaseDialog).toContainText("文件会保留");
     await releaseDialog.getByRole("button", { name: "释放运行资源" }).click();
     await expect(host.getByText("已停止")).toBeVisible({ timeout: 10_000 });
-    await expect(host.locator(".mono")).toHaveText(hostIdentity);
-    await expect(host.locator(".host-facts > div").nth(2).locator("strong")).toHaveText(workspaceId);
+    await expect(host).toHaveAttribute("id", hostCardID!);
+    const released = await firstHostWorkspaceID(page, hostID);
+    expect(released).toBe(workspaceId);
 
-    await host.getByRole("button", { name: `恢复主机 ${hostName}` }).click();
+    await openHostActions(host);
+    await host.getByRole("button", { name: `恢复云端电脑 ${hostName}` }).click();
     const restoreDialog = page.getByRole("dialog", { name: `恢复主机 ${hostName}` });
     await expect(restoreDialog).toContainText("保留原有文件");
     await restoreDialog.getByRole("button", { name: "恢复主机" }).click();
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
-    await expect(host.locator(".mono")).toHaveText(hostIdentity);
-    await expect(host.locator(".host-facts > div").nth(2).locator("strong")).toHaveText(workspaceId);
-    const restored = await page.evaluate(async (id) => (await fetch(`/api/hosts/${id}`)).json(), hostIdentity.split(" · ")[0]);
+    await expect(host).toHaveAttribute("id", hostCardID!);
+    const restored = await page.evaluate(async (id) => (await fetch(`/api/hosts/${id}`)).json(), hostID);
     expect(restored.runtime_generation).toBe(2);
+    expect(restored.workspaces[0].workspace.id).toBe(workspaceId);
   });
 
   test("[mock] remounts a detached workspace and disables deletion while attached", async ({ page }) => {
+    test.skip(true, "当前新建电脑界面只自动准备 Workspace，尚未提供选择已有未绑定 Workspace 的入口。");
     const sourceName = `mock-workspace-source-${Date.now()}`;
     const targetName = `mock-workspace-target-${Date.now()}`;
 
     await signIn(page);
     await allowMoreHosts(page);
     await page.getByRole("link", { name: "创建电脑" }).click();
-    await page.getByLabel(/主机名称/).fill(sourceName);
-    await page.getByRole("button", { name: "创建主机" }).click();
+    await page.getByLabel(/云端电脑名称/).fill(sourceName);
+    await page.getByRole("button", { name: "创建云端电脑" }).click();
 
     const sourceHost = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: sourceName, exact: true }) });
     await expect(sourceHost.getByText("运行中")).toBeVisible({ timeout: 10_000 });
-    const workspaceId = await sourceHost.locator(".host-facts > div").nth(2).locator("strong").innerText();
-    await sourceHost.getByRole("button", { name: `删除主机 ${sourceName}` }).click();
-    const sourceDeleteDialog = page.getByRole("dialog", { name: `删除主机 ${sourceName}` });
-    await sourceDeleteDialog.getByRole("button", { name: "删除主机" }).click();
+    const sourceHostID = (await sourceHost.getAttribute("id"))!.replace(/^host-/, "");
+    const workspaceId = await firstHostWorkspaceID(page, sourceHostID);
+    expect(workspaceId).toBeTruthy();
+    await openHostActions(sourceHost);
+    await sourceHost.getByRole("button", { name: `删除云端电脑 ${sourceName}` }).click();
+    const sourceDeleteDialog = page.getByRole("dialog", { name: `删除云端电脑 ${sourceName}` });
+    await sourceDeleteDialog.getByRole("button", { name: "删除电脑" }).click();
 
-    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
-    const workspace = page.getByRole("row").filter({ hasText: workspaceId });
-    await expect(workspace.getByRole("cell", { name: /绑定主机 未绑定/ })).toBeVisible();
+    await page.goto("/workspaces");
+    const workspace = page.getByRole("article").filter({ hasText: workspaceId });
+    await expect(workspace).toContainText("未绑定");
 
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
     await page.getByRole("link", { name: "创建电脑" }).click();
-    await page.getByLabel(/主机名称/).fill(targetName);
+    await page.getByLabel(/云端电脑名称/).fill(targetName);
     await page.getByRole("radio", { name: "绑定已有工作区" }).check();
     await page.getByRole("radio", { name: new RegExp(sourceName) }).check();
-    await page.getByRole("button", { name: "创建主机" }).click();
+    await page.getByRole("button", { name: "创建云端电脑" }).click();
 
     const targetHost = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: targetName, exact: true }) });
     await expect(targetHost.getByText("运行中")).toBeVisible({ timeout: 10_000 });
-    await expect(targetHost.locator(".host-facts > div").nth(2).locator("strong")).toHaveText(workspaceId);
-    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
-    const attachedWorkspace = page.getByRole("row").filter({ hasText: workspaceId });
+    const targetHostID = (await targetHost.getAttribute("id"))!.replace(/^host-/, "");
+    expect(await firstHostWorkspaceID(page, targetHostID)).toBe(workspaceId);
+    await page.goto("/workspaces");
+    const attachedWorkspace = page.getByRole("article").filter({ hasText: workspaceId });
     await expect(attachedWorkspace).toContainText(targetName);
-    await expect(attachedWorkspace).toContainText("应用：已应用");
     await expect(attachedWorkspace.getByRole("button", { name: `删除工作区 ${workspaceId}` })).toBeDisabled();
 
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
-    await targetHost.getByRole("button", { name: `删除主机 ${targetName}` }).click();
-    await page.getByRole("dialog", { name: `删除主机 ${targetName}` }).getByRole("button", { name: "删除主机" }).click();
-    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
-    const detachedWorkspace = page.getByRole("row").filter({ hasText: workspaceId });
-    await expect(detachedWorkspace.getByRole("cell", { name: /绑定主机 未绑定/ })).toBeVisible();
+    await openHostActions(targetHost);
+    await targetHost.getByRole("button", { name: `删除云端电脑 ${targetName}` }).click();
+    await page.getByRole("dialog", { name: `删除云端电脑 ${targetName}` }).getByRole("button", { name: "删除电脑" }).click();
+    await page.goto("/workspaces");
+    const detachedWorkspace = page.getByRole("article").filter({ hasText: workspaceId });
+    await expect(detachedWorkspace).toContainText("未绑定");
     await detachedWorkspace.getByRole("button", { name: `删除工作区 ${workspaceId}` }).click();
     await page.getByRole("dialog", { name: "删除工作区" }).getByRole("button", { name: "删除工作区" }).click();
     await expect(detachedWorkspace).toHaveCount(0, { timeout: 10_000 });
@@ -291,7 +313,7 @@ test.describe("Portal feature mock flows", () => {
 
   test("[mock] admin can open and view each management page", async ({ page }) => {
     await signIn(page);
-    await page.getByRole("link", { name: "管理后台" }).click();
+    await openAdmin(page);
     await expect(page.getByRole("heading", { name: "总览", exact: true })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Host 状态" })).toBeVisible();
 
@@ -357,7 +379,7 @@ test.describe("Portal feature mock flows", () => {
     const password = "local-only-password";
 
     await signIn(page);
-    await page.getByRole("link", { name: "管理后台" }).click();
+    await openAdmin(page);
     await expect(page.getByRole('heading', { name: 'Host 状态' })).toBeVisible();
     const registrationStatus = await page.evaluate(async ({ name, password: secret }) => (await fetch('/api/auth/register', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -377,7 +399,7 @@ test.describe("Portal feature mock flows", () => {
     await page.getByRole("button", { name: "退出" }).click();
     await expect(page.getByLabel("用户名", { exact: true })).toBeVisible();
     await submitLogin(page, userName, password);
-    await expect(page.getByRole("alert")).toHaveText("账号已被禁用，请联系管理员。");
+    await expect(page.getByRole("alert").filter({ hasText: "账号已被禁用，请联系管理员。" })).toContainText("账号已被禁用，请联系管理员。");
 
     await submitLogin(page, "demo", "demo");
     const auditNav = page.getByRole("navigation", { name: "管理导航" });

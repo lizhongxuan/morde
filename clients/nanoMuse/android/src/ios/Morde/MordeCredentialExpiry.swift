@@ -579,6 +579,10 @@ enum MordeTaskResponsePolicy {
         id.range(of: #"^q[a-z0-9]{7}$"#, options: .regularExpression) != nil
     }
 
+    static func hasValidStepID(_ id: String) -> Bool {
+        id.range(of: #"^s[a-z0-9]{7}$"#, options: .regularExpression) != nil
+    }
+
     static func hasValidRequestID(_ id: String) -> Bool {
         id.range(of: #"^r[a-z0-9]{7}$"#, options: .regularExpression) != nil
     }
@@ -607,6 +611,18 @@ enum MordeTaskResponsePolicy {
 
     static func inputPath(taskID: String) -> String? {
         hasValidTaskID(taskID) ? "/api/tasks/\(taskID)/inputs" : nil
+    }
+
+    static func stepDetailPath(taskID: String, stepID: String) -> String? {
+        guard hasValidTaskID(taskID), hasValidStepID(stepID) else { return nil }
+        return "/api/tasks/\(taskID)/steps/\(stepID)"
+    }
+
+    static func stepTimeLabel(_ value: String) -> String? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        return date?.formatted(date: .abbreviated, time: .shortened)
     }
 }
 
@@ -1350,6 +1366,118 @@ struct MordeTaskEventCursor: Equatable, Sendable {
     }
 }
 
+struct MordeTaskAgentExecution: Decodable, Equatable, Identifiable, Sendable {
+    let id: String
+    let parent_id: String?
+    let step_id: String?
+    let task_revision: Int64
+    let role: String
+    let status: String
+    let observed_at: String?
+}
+
+struct MordeTaskStepDetail: Decodable, Equatable, Sendable {
+    let task_id: String
+    let step_id: String
+    let event_sequence: Int64
+    let tool_name: String
+    let detail_state: String
+    let object: String?
+    let input: String?
+    let result: String?
+    let truncated: Bool
+
+    func isValid(taskID: String, stepID: String, atLeast sequence: Int64) -> Bool {
+        task_id == taskID && step_id == stepID && event_sequence >= sequence &&
+            event_sequence >= 0 &&
+            MordeTaskResponsePolicy.hasValidTaskID(task_id) &&
+            MordeTaskResponsePolicy.hasValidStepID(step_id) &&
+            tool_name.utf8.count <= 128 &&
+            [object, input, result].allSatisfy { ($0?.utf8.count ?? 0) <= 8192 } &&
+            !detail_state.isEmpty && detail_state.utf8.count <= 64
+    }
+}
+
+struct MordeTaskAgentActivityStep: Equatable, Sendable {
+    let id: String
+    let sequence: Int64
+    let agentID: String?
+}
+
+struct MordeTaskAgentActivityGroup: Equatable, Identifiable, Sendable {
+    let id: String
+    let title: String
+    let status: String?
+    let taskRevision: Int64?
+    let depth: Int
+    let stepIDs: [String]
+}
+
+enum MordeTaskAgentActivityPolicy {
+    static func groups(agents: [MordeTaskAgentExecution], steps: [MordeTaskAgentActivityStep]) -> [MordeTaskAgentActivityGroup] {
+        guard !steps.isEmpty || !agents.isEmpty else { return [] }
+        let orderedSteps = steps.sorted { $0.sequence < $1.sequence }
+        func unassigned(_ values: [MordeTaskAgentActivityStep]) -> [MordeTaskAgentActivityGroup] {
+            values.isEmpty ? [] : [MordeTaskAgentActivityGroup(
+                id: "unassigned", title: "Attribution unconfirmed", status: nil,
+                taskRevision: nil, depth: 0, stepIDs: values.map(\.id))]
+        }
+        guard !agents.isEmpty else { return unassigned(orderedSteps) }
+        let byID = Dictionary(grouping: agents, by: \.id)
+        let roots = agents.filter { $0.parent_id == nil }
+        guard byID.count == agents.count, roots.count == 1,
+              roots[0].role == "main",
+              agents.allSatisfy({ agent in
+                  !agent.id.isEmpty && agent.task_revision >= 0 &&
+                  ((agent.parent_id == nil && agent.role == "main") || (agent.parent_id != nil && agent.role == "subagent")) &&
+                  (agent.parent_id.map { parentID in parentID != agent.id && byID[parentID] != nil } ?? true)
+              }),
+              Set(orderedSteps.map(\.id)).count == orderedSteps.count else {
+            return unassigned(orderedSteps)
+        }
+        let stepByID = Dictionary(uniqueKeysWithValues: orderedSteps.map { ($0.id, $0) })
+        let children = Dictionary(grouping: agents.filter { $0.parent_id != nil }, by: { $0.parent_id! })
+        var groups: [MordeTaskAgentActivityGroup] = []
+        var visiting = Set<String>()
+        var visited = Set<String>()
+        var invalidTree = false
+
+        func append(_ agent: MordeTaskAgentExecution, depth: Int, path: [Int]) {
+            guard !invalidTree else { return }
+            guard visiting.insert(agent.id).inserted else {
+                invalidTree = true
+                return
+            }
+            guard !visited.contains(agent.id) else {
+                invalidTree = true
+                visiting.remove(agent.id)
+                return
+            }
+            visited.insert(agent.id)
+            let ownSteps = orderedSteps.filter { $0.agentID == agent.id }
+            groups.append(MordeTaskAgentActivityGroup(id: agent.id,
+                title: depth == 0 ? "MAIN" : "SUBAGENT " + path.map { String(format: "%02d", $0) }.joined(separator: "."),
+                status: agent.status,
+                taskRevision: agent.task_revision,
+                depth: depth, stepIDs: ownSteps.map(\.id)))
+            let orderedChildren = (children[agent.id] ?? []).sorted { left, right in
+                let leftSequence = left.step_id.flatMap { stepByID[$0]?.sequence } ?? Int64.max
+                let rightSequence = right.step_id.flatMap { stepByID[$0]?.sequence } ?? Int64.max
+                return leftSequence == rightSequence ? left.id < right.id : leftSequence < rightSequence
+            }
+            for (index, child) in orderedChildren.enumerated() {
+                append(child, depth: depth + 1, path: path + [index + 1])
+            }
+            visiting.remove(agent.id)
+        }
+        append(roots[0], depth: 0, path: [])
+        guard !invalidTree, visited.count == agents.count else { return unassigned(orderedSteps) }
+        let assigned = Set(groups.flatMap(\.stepIDs))
+        groups += unassigned(orderedSteps.filter { !assigned.contains($0.id) })
+        return groups
+    }
+}
+
 enum MordeConversationTaskStopPolicy {
     private static let stoppableStatuses: Set<String> = ["queued", "running", "paused", "waiting_user"]
 
@@ -1385,6 +1513,8 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     let client_message_id: String?
     let routing_status: String?
     let routing_failure_reason: String?
+    let duplicate_of_message_id: String?
+    let related_task_id: String?
     let local_send_status: String?
     let owner_id: String?
     let actor_id: String?
@@ -1402,7 +1532,7 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     init(id: String, conversation_id: String? = nil, sequence: Int64? = nil, task_id: String? = nil,
          role: String, content: String, attachment_ids: [String]? = nil, status: String? = nil, delivery_status: String? = nil,
          created_at: String? = nil, client_message_id: String? = nil, routing_status: String? = nil,
-         routing_failure_reason: String? = nil,
+         routing_failure_reason: String? = nil, duplicate_of_message_id: String? = nil, related_task_id: String? = nil,
          local_send_status: String? = nil, owner_id: String? = nil, actor_id: String? = nil,
          task_revision: Int64? = nil, result_event_sequence: Int64? = nil,
          sources: [MordeClientMessageSource]? = nil, output_status: String? = nil,
@@ -1420,6 +1550,8 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
         self.client_message_id = client_message_id
         self.routing_status = routing_status
         self.routing_failure_reason = routing_failure_reason
+        self.duplicate_of_message_id = duplicate_of_message_id
+        self.related_task_id = related_task_id
         self.local_send_status = local_send_status
         self.owner_id = owner_id
         self.actor_id = actor_id
@@ -1544,7 +1676,9 @@ enum MordeTaskSnapshotMessageMerge {
             attachment_ids: snapshot.attachment_ids, status: resolvedStatus,
             delivery_status: snapshot.delivery_status, created_at: snapshot.created_at,
             client_message_id: snapshot.client_message_id, routing_status: snapshot.routing_status,
-            routing_failure_reason: snapshot.routing_failure_reason, local_send_status: snapshot.local_send_status,
+            routing_failure_reason: snapshot.routing_failure_reason,
+            duplicate_of_message_id: snapshot.duplicate_of_message_id, related_task_id: snapshot.related_task_id,
+            local_send_status: snapshot.local_send_status,
             owner_id: snapshot.owner_id, actor_id: snapshot.actor_id, task_revision: snapshot.task_revision,
             result_event_sequence: snapshot.result_event_sequence, sources: snapshot.sources,
             output_status: nil, output_task_revision: snapshot.output_task_revision,
@@ -1640,6 +1774,7 @@ enum MordeTaskSnapshotMessageMerge {
                     status: "completed", delivery_status: existing.delivery_status,
                     created_at: existing.created_at, client_message_id: existing.client_message_id,
                     routing_status: existing.routing_status, routing_failure_reason: existing.routing_failure_reason,
+                    duplicate_of_message_id: existing.duplicate_of_message_id, related_task_id: existing.related_task_id,
                     local_send_status: existing.local_send_status,
                     owner_id: existing.owner_id, actor_id: existing.actor_id, task_revision: existing.task_revision,
                     result_event_sequence: existing.result_event_sequence, sources: existing.sources,
@@ -1656,6 +1791,8 @@ enum MordeTaskSnapshotMessageMerge {
                     client_message_id: snapshot.client_message_id ?? existing.client_message_id,
                     routing_status: snapshot.routing_status ?? existing.routing_status,
                     routing_failure_reason: snapshot.routing_failure_reason ?? existing.routing_failure_reason,
+                    duplicate_of_message_id: snapshot.duplicate_of_message_id ?? existing.duplicate_of_message_id,
+                    related_task_id: snapshot.related_task_id ?? existing.related_task_id,
                     local_send_status: existing.local_send_status,
                     owner_id: snapshot.owner_id ?? existing.owner_id, actor_id: snapshot.actor_id ?? existing.actor_id,
                     task_revision: snapshot.task_revision,
@@ -1677,7 +1814,7 @@ enum MordeTaskStepPresentation {
     // The server retains the original tool call in its audit trail; these labels are only for display.
     static func titleLocalizationKey(_ title: String) -> String? {
         if title == "开始处理" { return "Starting the task" }
-        let prefixes = ["Run cloud dsh tool: ", "Run Hostless Workspace tool: "]
+        let prefixes = ["Run cloud dsh tool: ", "Run cloud dsh MCP tool: ", "Run Hostless Workspace tool: "]
         guard let prefix = prefixes.first(where: { title.hasPrefix($0) }) else { return nil }
         let tool = String(title.dropFirst(prefix.count)).lowercased()
         switch tool {
@@ -1699,8 +1836,34 @@ enum MordeTaskStepPresentation {
     }
 
     static func title(_ title: String) -> String {
+        if title.hasPrefix("Run cloud dsh MCP tool: ") {
+            guard let name = mcpToolName(title) else {
+                return NSLocalizedString("MCP tool", comment: "Task tool shown to the user")
+            }
+            return String(format: NSLocalizedString("Use MCP tool: %@", comment: "Task tool shown to the user"), name)
+        }
         guard let key = titleLocalizationKey(title) else { return title }
         return NSLocalizedString(key, comment: "Task step shown to the user")
+    }
+
+    static func detailToolName(title: String, storedToolName: String?, detailToolName: String) -> String {
+        guard title.hasPrefix("Run cloud dsh MCP tool: ") else { return storedToolName ?? detailToolName }
+        return mcpToolName(title) ?? NSLocalizedString("MCP tool", comment: "Task tool shown to the user")
+    }
+
+    static func detailObject(title: String, object: String?) -> String? {
+        guard let object else { return nil }
+        if title.hasPrefix("Run cloud dsh MCP tool: ") && object.hasPrefix("morde_mcp_") {
+            return NSLocalizedString("MCP connector", comment: "Task tool object shown to the user")
+        }
+        return object
+    }
+
+    private static func mcpToolName(_ title: String) -> String? {
+        let prefix = "Run cloud dsh MCP tool: "
+        guard title.hasPrefix(prefix) else { return nil }
+        let name = String(title.dropFirst(prefix.count))
+        return name.isEmpty || name.hasPrefix("morde_mcp_") ? nil : name
     }
 
     static func summary(_ summary: String, title: String) -> String? {
@@ -1848,6 +2011,11 @@ struct MordeRetryAttempt: Codable, Equatable {
 }
 
 enum MordeRoutingPresentation {
+    static func duplicateMessageLocalizationKey(originalMessageID: String, taskID: String?) -> String {
+        let key = taskID == nil ? "Repeated request · linked to message %@" : "Repeated request · related task %@"
+        return String(format: NSLocalizedString(key, comment: "Duplicate conversation message association"), taskID ?? originalMessageID)
+    }
+
     static func localizationKey(_ status: String?) -> String? {
         status == "waiting_adjustment" ? "Adjustment received; waiting to update" : nil
     }
@@ -1863,6 +2031,62 @@ enum MordeRoutingPresentation {
     }
 
     static func canRetryProcessing(_ reason: String?) -> Bool { reason != "message_too_long" }
+}
+
+struct MordeTaskStartedAcknowledgementState: Equatable, Sendable {
+    let taskID: String
+    let currentRevision: Int64?
+    let desiredRevision: Int64?
+    let currentRevisionStarted: Bool?
+}
+
+enum MordeTaskStartedAcknowledgementPolicy {
+    /// Mirrors the Web transcript: acknowledge only the newest eligible user message for a Task,
+    /// and only after the current Task revision has actually started.
+    static func messageIDs(messages: [MordeClientMessage],
+                           tasks: [MordeTaskStartedAcknowledgementState]) -> Set<String> {
+        var taskByID: [String: MordeTaskStartedAcknowledgementState] = [:]
+        var ambiguousTaskIDs = Set<String>()
+        for task in tasks {
+            guard MordeTaskResponsePolicy.hasValidTaskID(task.taskID) else { continue }
+            if taskByID[task.taskID] != nil {
+                taskByID.removeValue(forKey: task.taskID)
+                ambiguousTaskIDs.insert(task.taskID)
+            } else if !ambiguousTaskIDs.contains(task.taskID) {
+                taskByID[task.taskID] = task
+            }
+        }
+
+        let ordered = messages.enumerated().sorted { lhs, rhs in
+            switch (lhs.element.sequence, rhs.element.sequence) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.offset < rhs.offset
+            }
+        }
+
+        var seenTaskIDs = Set<String>()
+        var result = Set<String>()
+        for (_, message) in ordered.reversed() {
+            guard message.role == "user", !message.id.isEmpty,
+                  message.routing_status != "failed",
+                  message.duplicate_of_message_id?.isEmpty != false,
+                  let taskID = message.task_id ?? message.related_task_id,
+                  MordeTaskResponsePolicy.hasValidTaskID(taskID),
+                  !ambiguousTaskIDs.contains(taskID), !seenTaskIDs.contains(taskID),
+                  let task = taskByID[taskID], task.currentRevisionStarted == true,
+                  task.currentRevision == nil || task.desiredRevision == nil ||
+                    task.currentRevision == task.desiredRevision else { continue }
+            seenTaskIDs.insert(taskID)
+            result.insert(message.id)
+        }
+        return result
+    }
 }
 
 enum MordeRoutingRetryAttempt {

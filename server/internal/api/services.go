@@ -60,6 +60,10 @@ type TaskFileFetchEndpointService interface {
 	DeleteTaskFileFetchContent(context.Context, identity.Principal, string, string) (app.TaskFileFetch, error)
 }
 
+type TaskArtifactContentEndpointService interface {
+	OpenTaskArtifactContent(context.Context, identity.Principal, string, string) (app.TaskArtifactContent, error)
+}
+
 type WorkspaceSyncDeviceService interface {
 	CreateFolder(context.Context, identity.Principal, string, string, string) (workspace.SyncFolder, error)
 	ListFolders(context.Context, identity.Principal, string) ([]workspace.SyncFolder, error)

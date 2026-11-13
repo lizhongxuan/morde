@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/task"
 )
 
 type routeGatewayStoreTest struct {
@@ -45,9 +47,116 @@ func (s *routeGatewayStoreTest) SettleConversationRouteModelCall(_ context.Conte
 
 func routeGatewayFixture() (ConversationRouteClaim, ConversationRouteContext) {
 	claim := ConversationRouteClaim{Message: conversation.Message{ID: "m1234567", ConversationID: "c1234567", OwnerID: "u1234567",
-		ActorID: "u1234567", Role: conversation.RoleUser, Sequence: 1, Content: "开始一项新任务"},
+		ActorID: "u1234567", Role: conversation.RoleUser, Sequence: 1, Content: "开始一项新任务"}, RouteAttempt: 1,
 		ServiceInstanceID: "00000000-0000-4000-8000-000000000001", LeaseOwner: "worker-1", LeaseVersion: 1}
-	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, ModelID: "p1234567", Content: claim.Message.Content}
+	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
+}
+
+func TestConversationRouteInitialAttemptIncludesJoinCandidates(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	scopeDigest := make([]byte, sha256.Size)
+	scopeDigest[0] = 1
+	value.ExecutionScopeDigest = scopeDigest
+	value.History = []ConversationRouteHistory{{MessageID: "m7654321", Sequence: 1, Role: conversation.RoleAssistant,
+		Content: "1. 继续任务 A；2. 开始新任务"}}
+	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: "m8765432", Sequence: 2, Content: "继续任务 A",
+		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: scopeDigest}}
+	initial, err := ConversationRouteModelRequest(value)
+	if err != nil || !strings.Contains(initial.Instructions, `"target_message_id"`) ||
+		!strings.Contains(initial.Instructions, "same_execution_scope") || !strings.Contains(initial.Instructions, "joinable field is true") ||
+		!strings.Contains(initial.Instructions, `bare number such as "1"`) ||
+		!strings.Contains(initial.Input[0].Text, `"prior_requests":[`) || !strings.Contains(initial.Input[0].Text, "继续任务 A") {
+		t.Fatalf("initial route did not include authorized join context and selection rules: request=%+v err=%v", initial, err)
+	}
+	var requestInput struct {
+		PriorRequests []conversationRouteModelRequestCandidate `json:"prior_requests"`
+		History       []ConversationRouteHistory               `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(initial.Input[0].Text), &requestInput); err != nil || len(requestInput.PriorRequests) != 1 ||
+		!requestInput.PriorRequests[0].Joinable || len(requestInput.History) != 1 || requestInput.History[0].Content != value.History[0].Content {
+		t.Fatalf("initial route omitted joinability or authorized option history: input=%+v err=%v", requestInput, err)
+	}
+	joined := ParseConversationRouteDecisionForContext(`{"action":"join","task_id":"","target_message_id":"m8765432","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`, value)
+	if joined.Action != ConversationRouteJoin || joined.TargetMessageID != "m8765432" {
+		t.Fatalf("initial route rejected a same-scope prior request: %+v", joined)
+	}
+	actualDigest, actualID, err := conversationRouteCallDigest(claim, value, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.RouteAttempt = 2
+	current, err := ConversationRouteModelRequest(value)
+	if err != nil || !strings.Contains(current.Input[0].Text, `"prior_requests":[`) {
+		t.Fatalf("retries did not keep the association-aware request: request=%+v err=%v", current, err)
+	}
+	currentDigest, currentID, err := conversationRouteCallDigest(claim, value, current)
+	if err != nil || bytes.Equal(actualDigest, currentDigest) || actualID == currentID {
+		t.Fatalf("retry attempt reused the first route model identity: digest=%x id=%q err=%v", currentDigest, currentID, err)
+	}
+}
+
+func TestConversationRouteGatewayJoinsFollowupToSameDeliverable(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	const targetMessageID = "m7654321"
+	const followup = "同一个方案增加 AI 难度和存档设计"
+	claim.Message.Sequence = 2
+	claim.Message.Content, value.Content = followup, followup
+	digest := make([]byte, sha256.Size)
+	digest[0] = 1
+	value.ExecutionScopeDigest = digest
+	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: targetMessageID, Sequence: 1,
+		Content: "为五子棋应用写一份设计方案并保存为 Markdown", RoutingStatus: conversation.RoutingRouted,
+		TaskID: "q1234567", TaskStatus: task.StatusRunning, SameExecutionScope: true, ExecutionScopeDigest: digest}}
+	output := `{"action":"join","task_id":"","target_message_id":"` + targetMessageID + `","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: output, StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 12, OutputTokens: 4}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != ConversationRouteJoin || decision.TargetMessageID != targetMessageID || client.calls != 1 ||
+		!strings.Contains(client.request.Instructions, "a follow-up that adds requirements to the same deliverable, use join") ||
+		!strings.Contains(client.request.Input[0].Text, `"joinable":true`) || !strings.Contains(client.request.Input[0].Text, followup) {
+		t.Fatalf("same-deliverable follow-up did not join its authorized Task: decision=%+v err=%v request=%+v",
+			decision, err, client.request)
+	}
+}
+
+func TestConversationRouteLegacyAttemptKeepsVersionedRequest(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.RouteAttempt, value.RouteAttempt = 0, 0
+	scopeDigest := make([]byte, sha256.Size)
+	scopeDigest[0] = 1
+	value.ExecutionScopeDigest = scopeDigest
+	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: "m8765432", Sequence: 2,
+		Content: "同一项工作", RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true,
+		ExecutionScopeDigest: scopeDigest}}
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: `{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`,
+		StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != ConversationRouteNew || client.calls != 1 ||
+		client.request.Instructions != legacyConversationRouteInstructions ||
+		!strings.Contains(client.request.Instructions, "An explicit request to create, write, export, save, or deliver a file or document") {
+		t.Fatalf("legacy route attempt did not preserve its prompt: decision=%+v instructions=%q err=%v",
+			decision, client.request.Instructions, err)
+	}
+	var input map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(client.request.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := input["prior_requests"]; exists {
+		t.Fatalf("legacy route attempt received association-aware fields: %s", client.request.Input[0].Text)
+	}
+	if _, exists := input["active_tasks"]; !exists {
+		t.Fatalf("legacy route attempt lost the prior active_tasks input: %s", client.request.Input[0].Text)
+	}
 }
 
 func TestConversationRouteGatewayAccountsForTextOnlyDecisionAndRecoversIt(t *testing.T) {

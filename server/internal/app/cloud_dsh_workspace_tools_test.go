@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,16 @@ type cloudDSHT08WorkspaceStore struct {
 type cloudDSHT08MultiOwnerWorkspaceStore struct {
 	*cloudDSHT08WorkspaceStore
 	byWorkspaceID map[string]*cloudDSHT08WorkspaceStore
+}
+
+type cloudDSHArtifactCaptureStore struct {
+	*cloudDSHBrokerTaskStore
+	progress TaskProgress
+}
+
+func (s *cloudDSHArtifactCaptureStore) CommitTaskProgress(ctx context.Context, progress TaskProgress) (task.Event, error) {
+	s.progress = progress
+	return s.cloudDSHBrokerTaskStore.CommitTaskProgress(ctx, progress)
 }
 
 func (s *cloudDSHT08MultiOwnerWorkspaceStore) GetWorkspace(ctx context.Context, workspaceID string) (workspace.Workspace, error) {
@@ -298,6 +309,74 @@ func TestCloudDSHWorkspaceWriteRequiresApprovalAndCommitsOnlyTheApprovedCall(t *
 	replayed, err := broker.Reconcile(context.Background(), resumed, call, &checkpoint)
 	if err != nil || replayed.Status != result.Status || replayed.Output != result.Output || workspaceStore.commits != 1 {
 		t.Fatalf("approved Workspace write replay = %#v, err=%v; commits=%d", replayed, err, workspaceStore.commits)
+	}
+}
+
+func TestCloudDSHHostlessWorkspaceWriteCompletionRegistersVerifiedArtifact(t *testing.T) {
+	fixture, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
+	current.Objective = "Write and save a Gomoku design as Markdown."
+	setCloudDSHCompletionFence(&current)
+	store.details.Task = current
+
+	content := []byte("# Gomoku design\n\n- Board: 15 x 15\n")
+	file := syncServiceFile("gomoku-design.md", content)
+	workspaceStore.workspace.Revision = 1
+	workspaceStore.snapshots[1] = []workspace.File{file}
+	fixture.workspaceBlocks = &proofBlocks{syncBlockMemory: newSyncBlockMemory()}
+	fixture.workspaceBlocks.data[file.SHA256] = content
+	fixture.executor.workspaces.blocks = fixture.workspaceBlocks
+	manifestSHA, err := workspace.ManifestTreeWithMetadataSHA256([]workspace.File{file}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-gomoku-design",
+		cloudDSHWorkspaceWriteArguments{ExpectedRevision: 0, Path: file.Path, Content: string(content)})
+	requestHash, err := agentOperationHash(call.Name, json.RawMessage(call.Arguments))
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationKey := agentOperationKey(call.CallID)
+	receipt := TaskWorkspacePublishReceipt{State: TaskWorkspacePublishSucceeded, WorkspaceID: current.WorkspaceID,
+		BaseRevision: 0, PublishedRevision: 1, ManifestSHA256: manifestSHA, RequestHash: hex.EncodeToString(requestHash[:])}
+	receiptKey := taskWorkspacePublishReceiptKey(current.ID, operationKey)
+	workspaceStore.taskWorkspacePublishReceipts[receiptKey] = receipt
+	workspaceStore.taskWorkspacePublishCommands[receiptKey] = TaskWorkspacePublishCommand{
+		OwnerID: current.OwnerID, TaskID: current.ID, WorkspaceID: current.WorkspaceID, BaseRevision: 0, RequestHash: requestHash[:],
+	}
+	toolResult := cloudDSHWorkspaceReceiptResult(receipt, operationKey)
+	inputs := []ModelInput{
+		{Type: "function_call", CallID: call.CallID, Name: call.Name, Arguments: call.Arguments},
+		{Type: "function_call_output", CallID: call.CallID, Output: toolResult.Output},
+	}
+	capture := &cloudDSHArtifactCaptureStore{cloudDSHBrokerTaskStore: store}
+	broker.store = capture
+	if err := broker.Complete(context.Background(), current, cloudDSHCompletionFor(current, "The Gomoku design is ready.", inputs)); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(capture.progress.Artifacts) != 1 {
+		t.Fatalf("completed hostless Task artifacts = %#v", capture.progress.Artifacts)
+	}
+	artifact := capture.progress.Artifacts[0]
+	if artifact.TaskID != current.ID || artifact.StepID != capture.progress.CurrentStep || artifact.WorkspaceID != current.WorkspaceID ||
+		artifact.Revision != 1 || artifact.Path != file.Path || artifact.MediaType != "text/markdown" ||
+		artifact.SizeBytes != int64(len(content)) || artifact.SHA256 != file.SHA256 || capture.progress.Status != task.StatusCompleted {
+		t.Fatalf("completed hostless artifact proof = %#v progress=%#v", artifact, capture.progress)
+	}
+	reader, err := fixture.executor.workspaces.OpenCommittedArtifact(context.Background(), TaskArtifactProof{
+		OwnerID: current.OwnerID, WorkspaceID: artifact.WorkspaceID, Revision: artifact.Revision,
+		Path: artifact.Path, SizeBytes: artifact.SizeBytes, SHA256: artifact.SHA256,
+	})
+	if err != nil {
+		t.Fatalf("open pinned hostless artifact: %v", err)
+	}
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("close pinned hostless artifact: %v", err)
+		}
+	}()
+	actual, err := io.ReadAll(reader)
+	if err != nil || !bytes.Equal(actual, content) {
+		t.Fatalf("downloaded Markdown = %q, err=%v", actual, err)
 	}
 }
 

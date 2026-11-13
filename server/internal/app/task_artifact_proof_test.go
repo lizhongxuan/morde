@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -100,6 +101,47 @@ func TestVerifyCommittedArtifactReadsPinnedRevision(t *testing.T) {
 	}
 	if store.blockReadLocksHeld != 0 || store.blockReadLockReleases != 1 {
 		t.Fatal("artifact verification did not release its storage lock")
+	}
+}
+
+func TestOpenCommittedArtifactReturnsVerifiedPinnedContentAndCleansSpool(t *testing.T) {
+	service, store, _, claim := proofFixture(t)
+	body, err := service.OpenCommittedArtifact(context.Background(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spool, ok := body.(*taskArtifactTempFile)
+	if !ok {
+		t.Fatalf("artifact body type = %T", body)
+	}
+	if _, err := os.Stat(spool.path); err != nil {
+		t.Fatalf("verified artifact spool is unavailable: %v", err)
+	}
+	content, err := io.ReadAll(body)
+	digest := sha256.Sum256(content)
+	if err != nil || string(content) != "hello world" || hex.EncodeToString(digest[:]) != claim.SHA256 {
+		t.Fatalf("verified artifact content = %q, err=%v", content, err)
+	}
+	if store.blockReadLocksHeld != 0 || store.blockReadLockReleases != 1 {
+		t.Fatal("artifact spool did not release the Workspace block lock")
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close artifact body: %v", err)
+	}
+	if _, err := os.Stat(spool.path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("artifact spool remained after close: %v", err)
+	}
+}
+
+func TestOpenCommittedArtifactDoesNotExposeCorruptContent(t *testing.T) {
+	service, _, blocks, claim := proofFixture(t)
+	first := sha256.Sum256([]byte("hello "))
+	blocks.data[hex.EncodeToString(first[:])] = []byte("tampered")
+	if body, err := service.OpenCommittedArtifact(context.Background(), claim); err == nil || body != nil {
+		if body != nil {
+			_ = body.Close()
+		}
+		t.Fatalf("corrupt artifact was opened: body=%v err=%v", body, err)
 	}
 }
 

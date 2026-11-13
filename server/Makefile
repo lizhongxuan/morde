@@ -16,7 +16,7 @@ cover:
 	@set -eu; profile=$$(mktemp); trap 'rm -f "$$profile"' EXIT; \
 	packages=$$(go list ./internal/... | grep -v '/sqlcgen$$' || true); \
 	if [ -z "$$packages" ]; then echo 'no internal packages'; exit 0; fi; \
-	go test -coverprofile="$$profile" $$packages; \
+	go test -p=1 -timeout=30m -coverprofile="$$profile" $$packages; \
 	go tool cover -func="$$profile" | tail -n 1
 
 generate:
@@ -26,4 +26,4 @@ generate:
 it:
 	@if [ -z "$${CH_TEST_DATABASE_URL:-}" ]; then echo 'skipping PostgreSQL integration tests: CH_TEST_DATABASE_URL is not set'; fi
 	@if [ -z "$${CH_OSB_URL:-}" ] || [ -z "$${CH_OSB_API_KEY:-}" ]; then echo 'skipping OpenSandbox integration tests: CH_OSB_URL and CH_OSB_API_KEY are not both set'; fi
-	go test ./...
+	go test -timeout=45m ./...

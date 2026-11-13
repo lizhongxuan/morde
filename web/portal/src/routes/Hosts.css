@@ -87,22 +87,11 @@
 .hosts-page .host-card-heading p { margin: 2px 0 0; font-size: 10px; line-height: 1.25; }
 .hosts-page .host-card-heading .status { padding: 3px 6px; font-size: 10px; }
 
-.hosts-page .host-quick-facts {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 3px 12px;
-  color: #65738a;
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.hosts-page .host-quick-facts span { min-width: 0; overflow-wrap: anywhere; }
-.hosts-page .host-primary-actions { min-width: 0; gap: 5px; padding-top: 6px; }
+.hosts-page .host-primary-actions { min-width: 0; gap: 5px; padding-top: 6px; flex-wrap: wrap; }
 .hosts-page .host-actions .button { min-height: 27px; padding: 4px 8px; font-size: 10px; white-space: nowrap; }
 .hosts-page .host-more-actions > summary { min-height: 27px; padding: 4px 8px; font-size: 10px; }
-.hosts-page .host-more-actions[open] > div { gap: 5px; padding: 7px; }
+.hosts-page .host-more-actions[open] > summary { width: fit-content; margin-left: auto; }
+.hosts-page .host-more-actions[open] > div { justify-content: flex-end; gap: 5px; padding: 7px; }
 
 .hosts-page .host-action-reason,
 .hosts-page .host-secondary-details {
@@ -111,7 +100,6 @@
   font-size: 10px;
 }
 
-.hosts-page .host-action-reason > summary,
 .hosts-page .host-secondary-details > summary {
   width: fit-content;
   max-width: 100%;
@@ -129,11 +117,9 @@
   cursor: pointer;
 }
 
-.hosts-page .host-action-reason > summary::-webkit-details-marker,
 .hosts-page .host-secondary-details > summary::-webkit-details-marker { display: none; }
-.hosts-page .host-action-reason > summary::after,
 .hosts-page .host-secondary-details > summary::after { margin-left: 7px; content: '⌄'; }
-.hosts-page .host-action-reason > p { margin: 5px 0 0; color: #65738a; line-height: 1.45; overflow-wrap: anywhere; }
+.hosts-page .host-action-reason { flex: 1 1 280px; margin: 0; color: #65738a; line-height: 1.45; overflow-wrap: anywhere; }
 .hosts-page .host-secondary-content { min-width: 0; display: grid; gap: 8px; padding: 8px 0 0; }
 .hosts-page .host-secondary-content .host-facts { margin: 0; gap: 7px 12px; }
 .hosts-page .host-secondary-content .host-facts span { font-size: 10px; }

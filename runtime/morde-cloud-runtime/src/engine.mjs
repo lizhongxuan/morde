@@ -1007,6 +1007,21 @@ export async function runAgent(ipc, frame) {
       sessionDurable.agent = agent
       sessionDurable.agentState = state
       agentCtx.on('agent/error', () => { state.failed = true })
+      if (!coordinator && sessionDurable === durable) {
+        let observationSequence = 0
+        const observeStatus = status => {
+          if (!['idle', 'running'].includes(status) || observationSequence >= Number.MAX_SAFE_INTEGER) {
+            ipc.fail('invalid agent status')
+            return
+          }
+          void ipc.send({ type: 'agent_status', ...sessionDurable.identity, status,
+            observation_sequence: ++observationSequence }).catch(() => ipc.fail('agent status dispatch failed'))
+        }
+        agentCtx.on('agent/status', ({ agent: subject, status }) => {
+          if (subject === agent) observeStatus(status)
+        })
+        observeStatus(agent.status)
+      }
       const tools = sessionDurable.start.tools ?? []
       const toolNames = new Set(tools.map(tool => tool.name))
       agentCtx.on('tools/pre-execute', async exec => {

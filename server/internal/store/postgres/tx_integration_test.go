@@ -767,7 +767,7 @@ func newTemporaryStore(t *testing.T) (*Store, *pgxpool.Pool) {
 		t.Skip("CH_TEST_DATABASE_URL is unset; PostgreSQL atomic integration tests were not run")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	baseConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

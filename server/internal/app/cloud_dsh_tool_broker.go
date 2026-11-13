@@ -37,6 +37,18 @@ type CloudDSHToolBroker struct {
 	goals                    *GoalService
 	schedules                *ScheduleService
 	projectContext           *ProjectService
+	stepDetailSealer         *Sealer
+}
+
+func (b *CloudDSHToolBroker) SetTaskStepDetailSealer(sealer *Sealer) error {
+	if b == nil || sealer == nil {
+		return domain.NewError(domain.CodeInvalidArgument, "task step detail sealer is required")
+	}
+	if b.stepDetailSealer != nil && b.stepDetailSealer != sealer {
+		return domain.NewError(domain.CodeInvalidState, "task step detail sealer cannot be replaced")
+	}
+	b.stepDetailSealer = sealer
+	return nil
 }
 
 // SetHistorySearchCursorSigning configures stable, service-bound signatures
@@ -361,10 +373,11 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if cloudDSHHasHostToolHistory(completion.Inputs) {
 			return domain.NewError(domain.CodeInvalidState, "hostless dsh task contains computer tool history")
 		}
-		workspaceWrite, err := b.verifyHostlessWorkspaceToolHistory(ctx, current, completion.Inputs)
+		verifiedArtifacts, err := b.verifyHostlessWorkspaceToolHistory(ctx, current, completion.Inputs)
 		if err != nil {
 			return err
 		}
+		workspaceWrite := len(verifiedArtifacts) > 0
 		if fileIntent != task.FileDeliveryNone && !workspaceWrite {
 			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
 		}
@@ -377,8 +390,12 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return err
 		}
 		useCloudDSHStreamResultStep(&step, details, completion)
+		artifacts, err := prepareCloudDSHVerifiedArtifacts(details, step, verifiedArtifacts)
+		if err != nil {
+			return err
+		}
 		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
-			map[string]any{"source": "cloud_dsh"}, "", nil)
+			map[string]any{"source": "cloud_dsh"}, "", artifacts)
 	}
 
 	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs)
@@ -595,7 +612,11 @@ func ClassifyFileDeliveryIntent(objective string, hasWorkspace bool) task.FileDe
 	if text == "" {
 		return task.FileDeliveryUnclear
 	}
-	noFileRequested := false
+	if fileDeliveryReadOutput.MatchString(text) {
+		return task.FileDeliveryNone
+	}
+	noFileRequested := fileDeliveryNegative.MatchString(text)
+	text = fileDeliveryNegative.ReplaceAllString(text, " ")
 	for _, phrase := range []string{
 		"不要生成文件", "不要创建文件", "不要写文件", "不要写入文件", "不要保存文件", "不要输出文件",
 		"不要在工作区写文件", "不要在工作区保存文件",
@@ -615,10 +636,23 @@ func ClassifyFileDeliveryIntent(objective string, hasWorkspace bool) task.FileDe
 			text = strings.ReplaceAll(text, phrase, " ")
 		}
 	}
-	noFileRequested = noFileRequested || containsAny(text, "不需要文件", "无需文件", "不用文件", "不要文件", "无需附件", "只要文字", "只需要文字", "直接回答", "直接回复文字", "在聊天里回答", "no file needed", "no need for a file", "no attachment", "no file", "without a file", "text only", "text-only", "just answer", "answer in chat", "reply in chat")
-	outputAction := containsAny(text, "生成", "创建", "新建", "制作", "做一份", "做个", "做一个", "导出", "下载", "保存", "另存", "交付", "提供", "输出", "上传", "写", "撰写", "整理成", "draft", "generate", "create", "make", "produce", "export", "download", "save", "deliver", "attach", "provide", "output", "write", "prepare")
-	fileTarget := containsAny(text, "文件", "文档", "附件", "下载", "file", "document", "attachment", "download", ".pdf", ".csv", ".xlsx", ".docx", ".pptx", " pdf", " csv", " xlsx", " docx", " pptx", "excel", "word", "powerpoint", "ppt", "spreadsheet", "workbook", "presentation", "slide deck")
+	noFileRequested = noFileRequested || containsAny(text, "不需要文件", "无需文件", "不用文件", "不要文件", "无需附件", "只要文字", "只需要文字",
+		"只在聊天回答", "只在聊天里回答", "只在聊天中回答", "直接回答", "直接回复文字", "在聊天里回答", "no file needed", "no need for a file",
+		"no attachment", "no file", "without a file", "text only", "text-only", "just answer", "answer in chat", "reply in chat")
+	if fileDeliveryQuestionBeforeAction(text) {
+		if containsAny(text, "保存为", "保存到", "保存至", "写入工作区", "提供下载", "下载到", "save as", "save to", "to the workspace") {
+			return task.FileDeliveryUnclear
+		}
+		return task.FileDeliveryNone
+	}
+	outputAction := containsAny(text, "生成", "生产", "创建", "新建", "制作", "做一份", "做个", "做一个", "导出", "下载", "保存", "另存", "交付", "提供",
+		"输出", "上传", "写成", "写", "撰写", "整理成", "draft", "generate", "create", "make", "produce", "export", "download", "save", "deliver",
+		"attach", "provide", "output", "write", "prepare")
+	fileTarget := fileDeliveryTargetAfterAction(text)
 	workspaceDestination := containsAny(text, "在工作区", "到工作区", "写入工作区", "保存到工作区", "保存至工作区", "in the workspace", "in the attached workspace", "in the cloud workspace", "to the workspace", "to the attached workspace", "to the cloud workspace", "into the workspace", "into the attached workspace", "into the cloud workspace")
+	if !fileTarget && !workspaceDestination && containsAny(text, "一段总结", "写一段总结", "总结一下", "a short summary", "a brief summary", "summarize it in chat") {
+		return task.FileDeliveryNone
+	}
 	if outputAction && workspaceDestination {
 		if noFileRequested {
 			return task.FileDeliveryUnclear
@@ -762,6 +796,7 @@ func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.T
 }
 
 func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, call ModelToolCall) (AgentToolResult, error) {
+	ctx = b.toolActivityContext(ctx, claimed, call)
 	return b.execute(ctx, claimed, call, false, nil)
 }
 
@@ -770,7 +805,23 @@ func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, cal
 // another tool-call budget unit. A missing result may be run only when no
 // operation exists; a checkpointed result must match a terminal ledger result.
 func (b *CloudDSHToolBroker) Reconcile(ctx context.Context, claimed task.Task, call ModelToolCall, checkpointOutput *string) (AgentToolResult, error) {
+	ctx = b.toolActivityContext(ctx, claimed, call)
 	return b.execute(ctx, claimed, call, true, checkpointOutput)
+}
+
+func (b *CloudDSHToolBroker) toolActivityContext(ctx context.Context, claimed task.Task, call ModelToolCall) context.Context {
+	if ctx == nil || call.TaskFence == nil {
+		return ctx
+	}
+	current := claimed
+	if current.CurrentRevision == nil {
+		details, err := b.store.GetTask(ctx, claimed.ID, claimed.OwnerID)
+		if err != nil {
+			return ctx
+		}
+		current = details.Task
+	}
+	return withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
 }
 
 func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
@@ -1704,7 +1755,10 @@ func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	step.Status, step.Title, step.Summary = task.StepWaitingUser, "Approval required: "+request.Call.Name, preparation.Approval.Content
+	step.Status, step.Summary = task.StepWaitingUser, preparation.Approval.Content
+	if !strings.HasPrefix(step.Title, "Run cloud dsh MCP tool: ") {
+		step.Title = "Approval required: " + request.Call.Name
+	}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", preparation.Approval, pending); err != nil {
 		return AgentToolResult{}, err
 	}
@@ -1757,7 +1811,47 @@ func (b *CloudDSHToolBroker) markUnknown(ctx context.Context, current task.Task,
 	return err
 }
 
+func (b *CloudDSHToolBroker) prepareTaskToolStep(ctx context.Context, current task.Task, step task.Step) (task.Step, *TaskToolCallProgress, error) {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		return step, nil, nil
+	}
+	if step.Status == task.StepWaitingUser {
+		step.Summary = "The task is waiting for your response before continuing."
+	}
+	details, err := b.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return task.Step{}, nil, err
+	}
+	for _, existing := range details.Steps {
+		if existing.AgentSessionID != activity.call.TaskFence.AgentSessionID || existing.ToolCallKey != activity.call.CallID {
+			continue
+		}
+		if existing.ToolName != activity.call.Name || existing.TaskRevision == nil ||
+			*existing.TaskRevision != *activity.current.CurrentRevision || !bytes.Equal(existing.RequestDigest, activity.digest) {
+			return task.Step{}, nil, domain.NewError(domain.CodeIdempotencyConflict, "tool call identity was reused with different inputs")
+		}
+		step.ID, step.Sequence = existing.ID, existing.Sequence
+		break
+	}
+	call, err := taskToolCallProgress(activity, step)
+	if err != nil || call == nil {
+		return step, call, err
+	}
+	step.AgentSessionID, step.TaskRevision = call.AgentSessionID, &call.TaskRevision
+	step.ToolCallKey, step.ToolName = call.CallKey, call.ToolName
+	step.RequestDigest, step.Phase, step.DetailState = append([]byte(nil), call.RequestDigest...), call.Phase, call.DetailState
+	return step, call, nil
+}
+
 func (b *CloudDSHToolBroker) commitProgress(ctx context.Context, current task.Task, step task.Step, usage task.Usage, status task.Status, waitingReason, eventType string, detail any, pending ...*task.PendingRequest) error {
+	if fields, ok := detail.(map[string]any); ok && fields["phase"] == "prepare" {
+		step.Phase = "prepare"
+	}
+	step, toolCall, err := b.prepareTaskToolStep(ctx, current, step)
+	if err != nil {
+		return err
+	}
 	payload, err := agentStepEvent(step, usage, detail)
 	if err != nil {
 		return err
@@ -1766,6 +1860,7 @@ func (b *CloudDSHToolBroker) commitProgress(ctx context.Context, current task.Ta
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		Status: status, CurrentStep: step.ID, Result: current.Result, WaitingReason: waitingReason,
 		Usage: usage, Steps: []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: eventType, Payload: payload},
+		ToolCall: toolCall,
 	}
 	if len(pending) > 1 {
 		return domain.InvalidArgument("pending_request", "at most one pending request may be committed")

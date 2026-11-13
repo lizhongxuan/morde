@@ -42,11 +42,11 @@ test("[mock] shows login rejection and Retry-After feedback as alerts", async ({
     await page.getByLabel("用户名").fill("wrong-user");
     await page.getByLabel("密码").fill("wrong-password");
     await page.getByRole("button", { name: "登录" }).click();
-    const alert = page.getByRole("alert");
-    await expect(alert).toHaveText("用户名或密码错误，请重试。");
+    const rejectedAlert = page.getByRole("alert").filter({ hasText: "用户名或密码错误，请重试。" });
+    await expect(rejectedAlert).toBeVisible();
 
     await page.getByRole("button", { name: "登录" }).click();
-    await expect(alert).toHaveText("登录尝试过于频繁。请在 7 秒后重试。");
+    await expect(page.getByRole("alert").filter({ hasText: "登录尝试过于频繁。请在 7 秒后重试。" })).toBeVisible();
     expect(loginAttempts).toBe(2);
   } finally {
     await context.close();

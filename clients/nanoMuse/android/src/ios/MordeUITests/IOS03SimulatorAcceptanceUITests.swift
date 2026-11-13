@@ -74,6 +74,69 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     }
 
     @MainActor
+    func testTaskActivityShowsSharedPortalTask() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let configuredOrigin = environment["MORDE_TASK_ACTIVITY_PORTAL_ORIGIN"],
+              let username = environment["MORDE_TASK_ACTIVITY_USERNAME"], !username.isEmpty,
+              let password = environment["MORDE_TASK_ACTIVITY_PASSWORD"], !password.isEmpty,
+              let taskID = environment["MORDE_TASK_ACTIVITY_TASK_ID"], !taskID.isEmpty,
+              let expectedObjective = environment["MORDE_TASK_ACTIVITY_OBJECTIVE"], !expectedObjective.isEmpty,
+              let expectedStepTitle = environment["MORDE_TASK_ACTIVITY_STEP_TITLE"], !expectedStepTitle.isEmpty else {
+            throw XCTSkip("Set local Portal task activity credentials, origin, task ID, objective, and step title.")
+        }
+
+        guard configuredOrigin == configuredOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
+              var components = URLComponents(string: Self.repairLoopbackSchemeSeparator(configuredOrigin)),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host?.lowercased(), Self.isLocalPortalHost(host),
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              components.port.map({ (1...65_535).contains($0) }) ?? true,
+              components.url != nil else {
+            XCTFail("The task activity acceptance origin must be a local loopback origin.")
+            return
+        }
+        components.scheme = scheme
+        components.host = host
+        components.path = ""
+
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = ["-morde.server", components.string!, "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+
+        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu"
+        )).firstMatch
+        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
+        if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
+
+        let usernameField = app.textFields["morde.auth.username"]
+        XCTAssertTrue(usernameField.waitForExistence(timeout: 15))
+        usernameField.tap()
+        usernameField.typeText(username)
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        passwordField.tap()
+        passwordField.typeText(password)
+        app.buttons["morde.auth.submit"].tap()
+
+        let tasksTab = app.buttons["morde.nav.tab.tasks"]
+        XCTAssertTrue(tasksTab.waitForExistence(timeout: 30), "The iOS client should open after local Portal sign-in.")
+        tasksTab.tap()
+        let taskRow = app.buttons["morde.tasks.row.\(taskID)"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 30), "iOS should load the exact Task created by the PC client.")
+        taskRow.tap()
+
+        let objective = app.staticTexts["morde.task.objective"]
+        XCTAssertTrue(objective.waitForExistence(timeout: 20))
+        XCTAssertEqual(objective.label, expectedObjective)
+        let currentStep = app.descendants(matching: .any).matching(NSPredicate(
+            format: "label CONTAINS %@", expectedStepTitle
+        )).firstMatch
+        XCTAssertTrue(currentStep.waitForExistence(timeout: 20), "The same Task's persisted activity should appear on iOS.")
+    }
+
+    @MainActor
     func testC10PortalMessagePersistsAcrossAppRestart() async throws {
         guard let username = ProcessInfo.processInfo.environment["MORDE_C10_TEST_USERNAME"],
               !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -187,7 +250,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "Real Portal login should open the authenticated chat composer.")
 
         let marker = "C10-Portal-\(UUID().uuidString)"
-        let messageText = "\(marker) Create a new task to reply with a short acknowledgment."
+        let messageText = ProcessInfo.processInfo.environment["MORDE_C10_MESSAGE_TEXT"]
+            ?? "\(marker) Create a new task to reply with a short acknowledgment."
         let composer = app.textFields["morde.chat.composer"]
         composer.tap()
         composer.typeText(messageText)
@@ -385,11 +449,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         }
         XCTAssertTrue(chatComposer.waitForExistence(timeout: 40),
                       "The same Portal account should return to chat after relaunch.")
-        let restoredMessageQuery = app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
-        XCTAssertTrue(restoredMessageQuery.firstMatch.waitForExistence(timeout: 60),
+        let restoredMessage = app.staticTexts["morde.chat.message.content.\(clientMessageID)"]
+        XCTAssertTrue(restoredMessage.waitForExistence(timeout: 60),
                       "The original Portal message should be restored from server conversation history.")
-        XCTAssertEqual(restoredMessageQuery.count, 1,
-                       "The original Portal message should still appear exactly once after restart.")
+        XCTAssertEqual(restoredMessage.label, messageText,
+                       "The original client message ID should render its content exactly once after restart.")
         let restoredPeerMessageQuery = app.staticTexts.matching(NSPredicate(format: "label == %@", peerMessageText))
         XCTAssertTrue(restoredPeerMessageQuery.firstMatch.waitForExistence(timeout: 60),
                       "The second installation message should reconcile into the iOS conversation after relaunch.")
@@ -406,8 +470,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The second installation cloud reply should remain readable after relaunch.")
         XCTAssertEqual(restoredReplyQuery.count, 1,
                        "The cloud reply should appear exactly once in the relaunched iOS conversation.")
-        XCTAssertTrue(restoredReplyQuery.firstMatch.label.contains(peerReplyText),
-                      "The restored task source should contain the cloud reply text.")
+        let restoredReplyContent = app.staticTexts["morde.chat.message.content.\(peerReplyID)"]
+        XCTAssertTrue(restoredReplyContent.waitForExistence(timeout: 30),
+                      "The final Agent reply should remain readable after relaunch.")
+        XCTAssertTrue(restoredReplyContent.label.contains(peerReplyText),
+                      "The restored Agent reply should contain its Portal reply text.")
     }
 
     @MainActor
@@ -1766,9 +1833,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         task.tap()
 
         XCTAssertTrue(app.staticTexts["morde.task.objective"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.descendants(matching: .any)["morde.task.step.s0000001"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.descendants(matching: .any)["morde.task.step.s0000003"].waitForExistence(timeout: 15),
-                      "The current step should render a current timeline marker.")
+        XCTAssertTrue(app.staticTexts["Read task snapshot"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Review current changes"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "当前"))
+            .firstMatch.waitForExistence(timeout: 15),
+            "The current step should expose its timeline marker to accessibility.")
         for tab in ["chat", "tasks", "approvals", "resources"] {
             XCTAssertFalse(app.buttons["morde.nav.tab.\(tab)"].isSelected,
                            "Task details do not select a primary tab in the design.")
@@ -4204,6 +4273,54 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", "Sequential plain-text message two")).count, 1)
     }
 
+    func testMordeFailedRouteShowsLeftRetryButtonAndRetriesInPlace() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskSSEFixture", "-morde.localTaskSequentialSendFixture", "-morde.localRoutingFailureFixture",
+        ], resetExistingAccount: true)
+
+        let content = "Retry this failed route fixture"
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        composer.tap()
+        composer.typeText(content)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: send)
+        XCTAssertEqual(XCTWaiter.wait(for: [enabled], timeout: 15), .completed)
+        send.tap()
+
+        XCTAssertTrue(app.staticTexts[content].waitForExistence(timeout: 20))
+        let retry = app.buttons["morde.chat.message.retry-processing.m0000001"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 30),
+                      "A failed, unassigned route should show the red retry control left of its message.")
+        XCTAssertFalse(app.staticTexts["morde.chat.message.status.m0000001"].exists,
+                       "A routing failure should not render a status/reason label inside the user message.")
+        retry.tap()
+
+        XCTAssertTrue(app.staticTexts["Local sequential reply 1"].waitForExistence(timeout: 40),
+                      "Retrying should settle the same message and display its synthetic response.")
+        XCTAssertFalse(retry.exists,
+                       "The retry control should disappear after the route is accepted.")
+    }
+
+    func testMordeChatShowsOneStartedAcknowledgementForMessagesInSameTask() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: ["-morde.localTaskStartedAcknowledgementFixture"],
+                        resetExistingAccount: true)
+
+        XCTAssertTrue(app.staticTexts["First request in one task"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["Follow-up in the same task"].waitForExistence(timeout: 20))
+        let firstAcknowledgement = app.descendants(matching: .any)["morde.chat.message.task-started.m0000401"]
+        let latestAcknowledgement = app.descendants(matching: .any)["morde.chat.message.task-started.m0000402"]
+        XCTAssertFalse(firstAcknowledgement.exists,
+                       "An earlier message in the same Task must not receive a second started badge.")
+        XCTAssertTrue(latestAcknowledgement.waitForExistence(timeout: 10),
+                      "The newest eligible message should show the Task-started acknowledgement.")
+        XCTAssertEqual(app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.chat.message.task-started.")).count, 1)
+    }
+
     func testMordeChatComposerQueuesImageAndPDFAttachmentsOnActiveTask() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: [
@@ -4276,8 +4393,13 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
         XCTAssertTrue(app.staticTexts["Retry queued image and PDF after response loss"].waitForExistence(timeout: 20),
                       "Retry with the same idempotency key should reconcile the accepted queue message.")
-        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "fixture-image.jpg")).firstMatch.exists)
-        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "fixture.pdf")).firstMatch.exists)
+        let reconciledMessage = app.descendants(matching: .any)["morde.chat.message.m9999999"]
+        XCTAssertTrue(reconciledMessage.waitForExistence(timeout: 20),
+                      "The accepted server message should appear in the conversation.")
+        let linkedAttachments = reconciledMessage.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.attachment."))
+        XCTAssertGreaterThanOrEqual(Set(linkedAttachments.allElementsBoundByIndex.map(\.identifier)).count, 2,
+                       "The reconciled message should retain both attachments even when they are not previewable.")
         XCTAssertFalse(app.buttons["morde.chat.stopTask"].exists)
         assertChatLongPressMenuOffersStopTask(app, taskID: "q1234567")
     }

@@ -4,7 +4,7 @@ const portalUrl = process.env.CH_PORTAL_E2E_URL ?? "http://127.0.0.1:5183";
 const user = {
   id: "u1234567",
   name: "demo",
-  role: "member",
+  role: "user",
   quota: { hosts: 3, cpu_milli: 6000, mem_mib: 12288 },
   usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 },
 };
@@ -55,8 +55,9 @@ async function signedInPage(
     expect(withoutDevWorker).not.toBe(source);
     await route.fulfill({ response, body: withoutDevWorker });
   });
-  await context.route("**/api/me", (route) => route.fulfill(apiError("unauthenticated", "请先登录", 401)));
-  await context.route("**/api/auth/login", (route) => route.fulfill(json({ user })));
+  let authenticated = false;
+  await context.route("**/api/me", (route) => route.fulfill(authenticated ? json(user) : apiError("unauthenticated", "请先登录", 401)));
+  await context.route("**/api/auth/login", (route) => { authenticated = true; return route.fulfill(json({ user })); });
   await setupRoutes?.(context);
 
   const page = await context.newPage();
@@ -64,9 +65,10 @@ async function signedInPage(
   await page.getByLabel("用户名").fill(user.name);
   await page.getByLabel("密码").fill("local-only");
   await page.getByRole("button", { name: "登录" }).click();
-  await expect(page.getByRole("heading", { name: "对话" })).toBeVisible();
+  await page.goto("/assistant");
+  await expect(page.getByRole("complementary", { name: "对话" })).toBeVisible();
   await page.getByRole("link", { name: "云端电脑", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "云端电脑", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "我的电脑", exact: true })).toBeVisible();
   return { context, page };
 }
 
@@ -137,7 +139,7 @@ test.describe("Portal visible error mock flows", () => {
       await context.unroute("**/api/me");
       await context.route("**/api/me", (route) => route.fulfill(json(user)));
       await page.goto(`${portalUrl}/workspaces`);
-      const workspace = page.getByRole("row").filter({ hasText: detachedWorkspace.id });
+      const workspace = page.getByRole("article").filter({ hasText: detachedWorkspace.id });
       await workspace.getByRole("button", { name: `删除工作区 ${detachedWorkspace.name}` }).click();
       await page.getByRole("dialog", { name: "删除工作区" }).getByRole("button", { name: "删除工作区" }).click();
       await expect(page.getByRole("alert")).toContainText("工作目录正在被其他主机使用");

@@ -198,18 +198,19 @@ WHERE id=$1 AND owner_id=$2 AND task_id=$3 AND role='user' AND delivery_status='
 				if result.RowsAffected() != 1 {
 					return domain.NewError(domain.CodeInvalidState, "checkpoint user message changed before commit")
 				}
-				route, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='routed',updated_at=clock_timestamp()
+				if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: fence.OwnerID,
+					ObjectType: "message", ObjectID: messageID, Operation: "upsert", MutationID: messageID}); err != nil {
+					return err
+				}
+				if err := syncConversationDuplicateMessages(ctx, tx, messageID); err != nil {
+					return err
+				}
+				_, err = tx.Exec(ctx, `UPDATE conversation_message_routes SET state='routed',updated_at=clock_timestamp()
 WHERE message_id=$1 AND owner_id=$2 AND state='waiting_adjustment' AND EXISTS (
  SELECT 1 FROM task_revision_intents revision WHERE revision.message_id=$1 AND revision.task_id=$3
  AND revision.owner_id=$2 AND revision.state='applied')`, messageID, fence.OwnerID, fence.TaskID)
 				if err != nil {
 					return fmt.Errorf("confirm checkpointed task revision: %w", err)
-				}
-				if route.RowsAffected() == 1 {
-					if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: fence.OwnerID,
-						ObjectType: "message", ObjectID: messageID, Operation: "upsert", MutationID: messageID}); err != nil {
-						return err
-					}
 				}
 			}
 			if value.RootTurnStarted {
@@ -404,13 +405,7 @@ func agentCheckpointInstanceFence(fence app.AgentCheckpointFence, rootSessionID 
 }
 
 func markPendingConversationMessagesUnknown(ctx context.Context, tx pgx.Tx, taskID, ownerID string) error {
-	if _, err := tx.Exec(ctx, `UPDATE conversation_messages AS message SET delivery_status='unknown'
-FROM tasks task
-WHERE task.id=$1 AND task.owner_id=$2 AND message.task_id=task.id AND message.owner_id=task.owner_id
-  AND message.conversation_id=task.conversation_id AND message.role='user' AND message.delivery_status='pending'`, taskID, ownerID); err != nil {
-		return fmt.Errorf("mark unmatched pending task messages unknown: %w", err)
-	}
-	return nil
+	return markPendingTaskConversationMessagesUnknown(ctx, tx, taskID, ownerID, "")
 }
 
 func (s *Store) ReadAgentCheckpointPage(ctx context.Context, request app.AgentCheckpointPageRequest) (app.StoredAgentCheckpoint, error) {

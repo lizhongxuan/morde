@@ -548,6 +548,12 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize task service: %w", err)
 	}
+	if err := tasks.SetTaskStepDetailSealer(sealer); err != nil {
+		return fmt.Errorf("configure task step detail encryption: %w", err)
+	}
+	if err := tasks.SetTaskArtifactReader(workspaceSync); err != nil {
+		return fmt.Errorf("configure task artifact downloads: %w", err)
+	}
 	schedules, err := app.NewScheduleService(store, credentials, modelConnections)
 	if err != nil {
 		return fmt.Errorf("initialize schedule service: %w", err)
@@ -741,7 +747,7 @@ func serve(ctx context.Context, configPath string) error {
 		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
-		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskFileFetch: tasks,
+		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskArtifactContent: tasks, TaskFileFetch: tasks,
 		TaskObservationTickets: tasks, Conversations: conversations,
 		ProjectConversations:           projectConversations,
 		ProjectConversationAttachments: projectConversationAttachments,
@@ -951,6 +957,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
+	if err := tools.SetTaskStepDetailSealer(sealer); err != nil {
+		return nil, err
+	}
 	if err := tools.SetHistorySearchCursorSigning(serviceInstanceID, historyCursorKey); err != nil {
 		return nil, err
 	}
@@ -996,7 +1005,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	}
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
 		SupervisorID: cfg.SupervisorID, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
-		Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools,
+		Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools, AgentActivity: store,
 		Children: childSessions, Completion: tools, RevisionStops: store, TextStreams: store, ProjectContexts: store,
 	})
 	if err != nil {

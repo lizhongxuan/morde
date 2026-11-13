@@ -220,15 +220,15 @@ describe('Workspaces', () => {
     renderWorkspaces([workspace], [firstHost]);
 
     const pagination = screen.getByRole('region', { name: '云端工作区' });
-    expect(pagination).toHaveStyle({ height: 'min(max(calc(100dvh - 320px), 36px), 620px)' });
-    expect(Math.min(Math.max(720 - 320, 36), 620)).toBe(400);
+    expect(pagination).toHaveStyle({ height: 'min(max(calc(100dvh - clamp(320px, 50dvh, 450px)), 36px), 620px)' });
+    expect(Math.min(Math.max(720 - Math.min(Math.max(320, 720 * 0.5), 450), 36), 620)).toBe(360);
     const measuredContentHeight = 703;
     const previousPaginationHeight = 450;
     const availablePageHeight = 662;
     const pageChromeHeight = measuredContentHeight - previousPaginationHeight;
-    expect(pageChromeHeight + 400).toBeLessThanOrEqual(availablePageHeight);
-    expect(400 - 36).toBeGreaterThanOrEqual(270);
-    const shortViewportListHeight = Math.min(Math.max(480 - 320, 36), 620);
+    expect(pageChromeHeight + 360).toBeLessThanOrEqual(availablePageHeight);
+    expect(360 - 36).toBeGreaterThanOrEqual(270);
+    const shortViewportListHeight = Math.min(Math.max(480 - Math.min(Math.max(320, 480 * 0.5), 450), 36), 620);
     expect(pageChromeHeight + shortViewportListHeight).toBeLessThanOrEqual(480 - 58);
     expect(screen.getByRole('article', { name: `工作区 ${workspace.name}` })).toBeVisible();
     expect(screen.getByText(/开发电脑 · 运行中/)).toBeVisible();

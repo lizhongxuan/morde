@@ -11,16 +11,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/dshguardian"
 )
@@ -900,6 +904,576 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3`, submitted.Task.ID, ow
 		parent.Task.CheckpointThroughSequence != oldRootCheckpointThrough || !bytes.Equal(parent.Task.CheckpointDigest, oldRootCheckpointDigest) {
 		t.Fatalf("failed-closed recovery changed the pinned parent checkpoint: task=%#v err=%v", parent.Task, err)
 	}
+}
+
+// TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim uses a real
+// PostgreSQL checkpoint/child store and the real local DSH subprocess. Its
+// synthetic model has no external provider and its only application tool is
+// deliberately never invoked. The first runtime is interrupted while a
+// background child is running; a later lease owner resumes and settles it,
+// then a further reclaim reads the durable child output from the parent's
+// persisted cursor before completing.
+func TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	store, pool := newF01TemporaryStore(t)
+	owner := createF01User(t, ctx, store)
+	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifySession(ctx, createF01Session(t, ctx, store, owner.ID))
+	if err != nil || principal.Kind != identity.KindSession {
+		t.Fatalf("verify Task session: principal=%#v err=%v", principal, err)
+	}
+	schedules, err := app.NewScheduleService(store, credentials, f01ConfiguredModels{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueAt := time.Now().UTC().Add(-5 * time.Second).Truncate(time.Second)
+	scheduled, err := schedules.Create(ctx, principal, app.CreateScheduleCommand{
+		ModelID: "p1234567", Objective: "Start a background child and review its result before reporting.",
+		Timing:        schedule.Timing{Kind: schedule.TimingOnce, RunAt: dueAt.Format(time.RFC3339), TimeZone: "UTC"},
+		Budget:        task.Budget{ActiveSeconds: 120, ToolCalls: 12, ModelTokens: 2000},
+		MisfirePolicy: schedule.MisfireRunOnce, NotificationEvents: []schedule.NotificationEvent{schedule.NotifyCompleted},
+	}, "f07-background-output-reclaim-001")
+	if err != nil {
+		t.Fatalf("create synthetic scheduled Task: %v", err)
+	}
+	processed, err := schedules.ProcessDue(ctx, time.Now().UTC(), 10)
+	if err != nil || processed != 1 {
+		t.Fatalf("process synthetic schedule: processed=%d err=%v", processed, err)
+	}
+	runs, err := schedules.Runs(ctx, principal, scheduled.ID, app.PageRequest{Limit: 10})
+	if err != nil || len(runs.Items) != 1 || runs.Items[0].TaskID == nil || runs.Items[0].Status != schedule.RunQueued {
+		t.Fatalf("scheduled Task was not queued: runs=%#v err=%v", runs.Items, err)
+	}
+	taskID := *runs.Items[0].TaskID
+	claimed, found, err := store.ClaimNextTask(ctx, "f07-background-output-worker-one", 5*time.Minute)
+	if err != nil || !found || claimed.ID != taskID {
+		t.Fatalf("claim initial Task: task=%#v found=%t err=%v", claimed, found, err)
+	}
+
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x77}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopKey := bytes.Repeat([]byte{0x78}, 32)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeStopVerifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisorID := "f07-background-output-supervisor"
+	supervisorAuth, err := app.NewAgentStopAuthenticator(supervisorID, stopKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardianAuth, err := app.NewAgentGuardianStopAuthenticator(supervisorID, publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskGuardianAuth, err := app.NewAccountAgentTaskGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceServiceWithGuardianStops(store, supervisorAuth, agentGuardianAuth, taskGuardianAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedCheckpoints := &f01ObservedCheckpoints{AgentCheckpointService: checkpoints}
+	checkpointCapture := &f07ObservedCheckpoints{f01ObservedCheckpoints: observedCheckpoints, bySession: make(map[string][]f07CheckpointEntry)}
+	children, err := app.NewAgentChildSessionService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, dshScript := f01NodeRuntimePaths(t)
+	accountScript := filepath.Join(filepath.Dir(dshScript), "bin-account.mjs")
+	model := newF07BackgroundOutputModel()
+	tools := &f07SyntheticTool{}
+	guardian := &f01SignedNodeTaskGuardian{key: privateKey}
+	accountControl, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeSupervisor := func() *f01RecoveringNodeAccountSupervisor {
+		t.Helper()
+		return &f01RecoveringNodeAccountSupervisor{
+			f01NodeAccountSupervisor: &f01NodeAccountSupervisor{node: node, script: accountScript},
+			recovery:                 &signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: privateKey},
+		}
+	}
+	makeRuntimeManager := func(supervisor CloudDSHAccountRuntimeSupervisor, leaseOwner string) *CloudDSHAccountRuntimeManager {
+		t.Helper()
+		manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+			Control: accountControl, Supervisor: supervisor, Guardian: guardian, StopVerifier: runtimeStopVerifier,
+			TaskStopper: instances, LeaseOwner: leaseOwner, MaxTasks: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return manager
+	}
+	makeExecutor := func(manager *CloudDSHAccountRuntimeManager) *CloudDSHExecutor {
+		t.Helper()
+		executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
+			ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: supervisorID,
+			AccountRuntimes: manager, Instances: instances, Checkpoints: checkpointCapture,
+			Models: model, Tools: tools, Children: children,
+			Completion: &parentSiblingCancelCompletion{store: store},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return executor
+	}
+
+	firstSupervisor := makeSupervisor()
+	firstManager := makeRuntimeManager(firstSupervisor, "f07-background-output-runtime-one")
+	defer func() {
+		if command := firstSupervisor.cmd; command != nil && command.Process != nil && command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	firstExecutor := makeExecutor(firstManager)
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	firstDone := make(chan error, 1)
+	firstRuntimeError := make(chan error, 1)
+	go func() {
+		runErr := firstExecutor.ExecuteTask(firstCtx, claimed)
+		firstDone <- runErr
+		firstRuntimeError <- runErr
+	}()
+	select {
+	case <-model.childStarted:
+	case runErr := <-firstRuntimeError:
+		t.Fatalf("first Agent stopped before the background child model call: %v", runErr)
+	case <-ctx.Done():
+		t.Fatalf("background child did not start: %v", ctx.Err())
+	}
+	var initialDetails app.TaskDetails
+	var startupDiagnostic string
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelStartup()
+	if err := waitF01(t, startupCtx, func() (bool, error) {
+		current, err := store.GetTask(ctx, taskID, owner.ID)
+		if err != nil {
+			return false, err
+		}
+		initialDetails = current
+		if current.Task.AgentGeneration != 1 || current.Task.AgentSessionID == "" || current.Task.CheckpointThroughSequence < 0 {
+			startupDiagnostic = fmt.Sprintf("generation=%d session=%q checkpoint=%d events=%v",
+				current.Task.AgentGeneration, current.Task.AgentSessionID, current.Task.CheckpointThroughSequence, observedCheckpoints.snapshot())
+			return false, nil
+		}
+		rootToolResultPersisted := false
+		for _, entry := range observedCheckpoints.snapshot() {
+			if strings.Contains(entry, "session="+current.Task.AgentSessionID) && strings.Contains(entry, "type=tool/result") {
+				rootToolResultPersisted = true
+				break
+			}
+		}
+		childRows, err := children.List(ctx, f07AgentFence(current.Task, supervisorID), current.Task.AgentSessionID)
+		if err != nil {
+			return false, err
+		}
+		startupDiagnostic = fmt.Sprintf("root_tool_result=%t children=%#v checkpoint_events=%v",
+			rootToolResultPersisted, childRows, observedCheckpoints.snapshot())
+		startupDiagnostic += fmt.Sprintf(" model_calls=%v", model.callSnapshot())
+		return rootToolResultPersisted && len(childRows) == 1 && childRows[0].Background &&
+			childRows[0].Step.Status == task.StepRunning && childRows[0].CheckpointThrough >= 0 &&
+			len(childRows[0].CheckpointDigest) == 32, nil
+	}, firstRuntimeError, nil); err != nil {
+		t.Fatalf("parent delegation and running child checkpoint were not both persisted: %v; state: %s", err, startupDiagnostic)
+	}
+	childBeforeRestart, err := children.List(ctx, f07AgentFence(initialDetails.Task, supervisorID), initialDetails.Task.AgentSessionID)
+	if err != nil || len(childBeforeRestart) != 1 || childBeforeRestart[0].Step.Status != task.StepRunning || childBeforeRestart[0].CancelRequested {
+		t.Fatalf("background child before Node restart = %#v err=%v", childBeforeRestart, err)
+	}
+	rootSessionID := initialDetails.Task.AgentSessionID
+	rootThroughBeforeRestart := initialDetails.Task.CheckpointThroughSequence
+	rootDigestBeforeRestart := append([]byte(nil), initialDetails.Task.CheckpointDigest...)
+	if rootThroughBeforeRestart < 0 || len(rootDigestBeforeRestart) != 32 {
+		t.Fatalf("parent checkpoint is not pinned before restart: through=%d digest=%d", rootThroughBeforeRestart, len(rootDigestBeforeRestart))
+	}
+	oldProcess := firstSupervisor.cmd
+	if oldProcess == nil || oldProcess.Process == nil {
+		t.Fatal("real Node account Runtime was not available for restart simulation")
+	}
+	if err := oldProcess.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("stop first Node Runtime: %v", err)
+	}
+	model.interrupt()
+	select {
+	case runErr := <-firstDone:
+		if runErr == nil || errors.Is(runErr, ErrCloudDSHCompletionPending) || errors.Is(runErr, errCloudDSHBackgroundOutputPending) {
+			t.Fatalf("interrupted first Agent result = %v, want a recoverable Runtime interruption", runErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("first Agent did not stop after Node restart: %v", ctx.Err())
+	}
+	waitOldRuntime := make(chan error, 1)
+	go func() { waitOldRuntime <- oldProcess.Wait() }()
+	select {
+	case waitErr := <-waitOldRuntime:
+		if waitErr == nil || oldProcess.ProcessState == nil || oldProcess.ProcessState.ExitCode() != -1 {
+			t.Fatalf("wait for first Node Runtime: %v", waitErr)
+		}
+		firstSupervisor.cmd = nil
+	case <-ctx.Done():
+		t.Fatalf("first Node Runtime did not exit: %v", ctx.Err())
+	}
+	firstManager.mu.Lock()
+	firstRuntimeSession := firstManager.sessions[claimed.ConversationID]
+	firstManager.mu.Unlock()
+	if firstRuntimeSession == nil {
+		t.Fatal("first account Runtime session is missing")
+	}
+	oldRuntimeFence := firstRuntimeSession.runtime.Fence
+	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime_generation=$4`,
+		oldRuntimeFence.ServiceInstanceID, owner.ID, oldRuntimeFence.RuntimeID, oldRuntimeFence.RuntimeGeneration); err != nil {
+		t.Fatalf("expire first account Runtime lease: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE id=$1 AND lease_owner=$2 AND lease_version=$3`, taskID, claimed.Lease.Owner, claimed.Lease.Version); err != nil {
+		t.Fatalf("expire first Task lease: %v", err)
+	}
+	recovered, found, err := store.ClaimNextTask(ctx, "f07-background-output-worker-two", 5*time.Minute)
+	if err != nil || !found || recovered.ID != taskID || recovered.AgentSessionID != rootSessionID ||
+		recovered.CheckpointThroughSequence != rootThroughBeforeRestart || !bytes.Equal(recovered.CheckpointDigest, rootDigestBeforeRestart) {
+		t.Fatalf("claim parent after first lease expiry: task=%#v found=%t err=%v", recovered, found, err)
+	}
+
+	secondSupervisor := makeSupervisor()
+	secondManager := makeRuntimeManager(secondSupervisor, "f07-background-output-runtime-two")
+	defer func() {
+		if command := secondSupervisor.cmd; command != nil && command.Process != nil && command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	secondExecutor := makeExecutor(secondManager)
+	if err := secondExecutor.ExecuteTask(ctx, recovered); !errors.Is(err, errCloudDSHBackgroundOutputPending) {
+		failedDetails, detailsErr := store.GetTask(ctx, taskID, owner.ID)
+		var generation, through int64
+		var digest []byte
+		var failedChildren []app.AgentChildSession
+		var childrenErr error
+		if detailsErr == nil {
+			generation, through, digest = failedDetails.Task.AgentGeneration, failedDetails.Task.CheckpointThroughSequence, failedDetails.Task.CheckpointDigest
+			failedChildren, childrenErr = children.List(ctx, f07AgentFence(failedDetails.Task, supervisorID), rootSessionID)
+		}
+		t.Fatalf("restart resumed child but skipped the pending parent output: err=%v task_generation=%d task_checkpoint=%d/%x details_err=%v children=%#v children_err=%v model_calls=%v",
+			err, generation, through, digest,
+			detailsErr, failedChildren, childrenErr, model.callSnapshot())
+	}
+	settledDetails, err := store.GetTask(ctx, taskID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settledChildren, err := f07ReadPersistedChildren(ctx, pool, taskID, owner.ID, rootSessionID)
+	if err != nil || len(settledChildren) != 1 || settledChildren[0].Step.Status != task.StepSucceeded ||
+		settledChildren[0].Step.Summary != f07BackgroundOutputSummary || settledChildren[0].CheckpointThrough < 0 ||
+		len(settledChildren[0].CheckpointDigest) != 32 || settledChildren[0].CancelRequested {
+		t.Fatalf("background result was not durably settled after restart: children=%#v err=%v", settledChildren, err)
+	}
+	if settledDetails.Task.CheckpointThroughSequence <= rootThroughBeforeRestart || len(settledDetails.Task.CheckpointDigest) != 32 ||
+		bytes.Equal(settledDetails.Task.CheckpointDigest, rootDigestBeforeRestart) {
+		t.Fatalf("parent recovery did not durably continue its open turn before output consumption: before=%d/%x after=%d/%x",
+			rootThroughBeforeRestart, rootDigestBeforeRestart, settledDetails.Task.CheckpointThroughSequence, settledDetails.Task.CheckpointDigest)
+	}
+	model.setJob(settledChildren[0].SessionID, settledChildren[0].CheckpointThrough)
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE id=$1 AND lease_owner=$2 AND lease_version=$3`, settledDetails.Task.ID,
+		settledDetails.Task.Lease.Owner, settledDetails.Task.Lease.Version); err != nil {
+		t.Fatalf("expire pending-output Task lease: %v", err)
+	}
+	reclaimed, found, err := store.ClaimNextTask(ctx, "f07-background-output-worker-three", 5*time.Minute)
+	if err != nil || !found || reclaimed.ID != taskID || reclaimed.AgentSessionID != rootSessionID ||
+		reclaimed.CheckpointThroughSequence != settledDetails.Task.CheckpointThroughSequence || !bytes.Equal(reclaimed.CheckpointDigest, settledDetails.Task.CheckpointDigest) {
+		t.Fatalf("claim parent for durable output continuation: task=%#v found=%t err=%v", reclaimed, found, err)
+	}
+	if err := secondExecutor.ExecuteTask(ctx, reclaimed); err != nil {
+		t.Fatalf("consume settled background output and complete parent: %v", err)
+	}
+	completed, err := store.GetTask(ctx, taskID, owner.ID)
+	if err != nil || completed.Task.Status != task.StatusCompleted || completed.Task.Result != f07BackgroundParentSummary {
+		t.Fatalf("parent result after background output continuation = status %s result=%q err=%v",
+			completed.Task.Status, completed.Task.Result, err)
+	}
+	completedChildren, err := f07ReadPersistedChildren(ctx, pool, taskID, owner.ID, rootSessionID)
+	if err != nil || len(completedChildren) != 1 || completedChildren[0].Step.Status != task.StepSucceeded ||
+		completedChildren[0].Step.Summary != f07BackgroundOutputSummary || completedChildren[0].CheckpointThrough != settledChildren[0].CheckpointThrough ||
+		!bytes.Equal(completedChildren[0].CheckpointDigest, settledChildren[0].CheckpointDigest) {
+		t.Fatalf("child settlement changed while the parent consumed output: children=%#v err=%v", completedChildren, err)
+	}
+	rootHistory, err := checkpointCapture.rootHistory(rootSessionID, completed.Task.CheckpointThroughSequence)
+	if err != nil {
+		t.Fatalf("read completed parent output checkpoint: %v", err)
+	}
+	outputCall := rootHistory.calls[f07BackgroundOutputCallID]
+	var outputResult struct {
+		JobID      string `json:"job_id"`
+		Status     string `json:"status"`
+		NextCursor int64  `json:"next_cursor"`
+		Output     string `json:"output"`
+	}
+	if outputCall == nil || outputCall.name != cloudDSHJobOutputToolName || !outputCall.callSeen || !outputCall.resultSeen ||
+		json.Unmarshal([]byte(outputCall.resultText), &outputResult) != nil || outputResult.JobID != completedChildren[0].SessionID ||
+		outputResult.Status != "succeeded" || outputResult.NextCursor != completedChildren[0].CheckpointThrough ||
+		outputResult.Output != f07BackgroundOutputSummary || !model.outputConsumed.Load() || tools.calls.Load() != 0 {
+		t.Fatalf("durable background output/cursor was not consumed exactly once: call=%#v result=%#v consumed=%t tool_calls=%d",
+			outputCall, outputResult, model.outputConsumed.Load(), tools.calls.Load())
+	}
+	rootDefinitions := []app.AgentToolDefinition{tools.definition()}
+	rootDefinitions = append(rootDefinitions, cloudDSHJobTools()...)
+	rootDefinitions = append(rootDefinitions, cloudDSHDelegateTool([]app.AgentToolDefinition{tools.definition()}))
+	continuations, waiting, err := cloudDSHBackgroundOutputContinuations(rootHistory, completedChildren,
+		completed.Task.ID, rootSessionID, rootDefinitions)
+	if err != nil || waiting || len(continuations) != 0 {
+		t.Fatalf("fully consumed child output was not idempotently recognized: continuations=%#v waiting=%t err=%v", continuations, waiting, err)
+	}
+}
+
+const (
+	f07BackgroundOutputCallID  = "f07_read_background_output"
+	f07BackgroundOutputSummary = "The child completed from its durable checkpoint."
+	f07BackgroundParentSummary = "I reviewed the durable background result."
+)
+
+type f07SyntheticTool struct{ calls atomic.Int32 }
+
+type f07CheckpointEntry struct {
+	from, through int64
+	digest        []byte
+	payload       []byte
+}
+
+type f07ObservedCheckpoints struct {
+	*f01ObservedCheckpoints
+	mu        sync.Mutex
+	bySession map[string][]f07CheckpointEntry
+}
+
+func (checkpoints *f07ObservedCheckpoints) Save(ctx context.Context, command app.AgentCheckpointCommand) (bool, error) {
+	checkpoints.mu.Lock()
+	checkpoints.bySession[command.Fence.AgentSessionID] = append(checkpoints.bySession[command.Fence.AgentSessionID], f07CheckpointEntry{
+		from: command.From, through: command.Through, digest: append([]byte(nil), command.Digest...), payload: append([]byte(nil), command.Payload...),
+	})
+	checkpoints.mu.Unlock()
+	return checkpoints.f01ObservedCheckpoints.Save(ctx, command)
+}
+
+func (checkpoints *f07ObservedCheckpoints) rootHistory(sessionID string, through int64) (*cloudDSHCheckpointHistory, error) {
+	checkpoints.mu.Lock()
+	entries := append([]f07CheckpointEntry(nil), checkpoints.bySession[sessionID]...)
+	checkpoints.mu.Unlock()
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].from == entries[j].from {
+			return entries[i].through < entries[j].through
+		}
+		return entries[i].from < entries[j].from
+	})
+	history := newCloudDSHCheckpointHistory(sessionID)
+	for _, entry := range entries {
+		if entry.through < history.nextSeq {
+			continue
+		}
+		if err := history.append(entry.payload, entry.from, entry.through); err != nil {
+			return nil, err
+		}
+	}
+	if history.nextSeq != through+1 {
+		return nil, fmt.Errorf("captured root checkpoint ends at %d; persisted task head is %d", history.nextSeq-1, through)
+	}
+	return history, nil
+}
+
+func f07ReadPersistedChildren(ctx context.Context, pool *pgxpool.Pool, taskID, ownerID, rootSessionID string) ([]app.AgentChildSession, error) {
+	rows, err := pool.Query(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+s.is_background,s.cancel_requested_at IS NOT NULL,st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
+FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
+WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 ORDER BY st.sequence`, taskID, ownerID, rootSessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	children := make([]app.AgentChildSession, 0)
+	for rows.Next() {
+		var child app.AgentChildSession
+		var allowedTools []byte
+		var status string
+		if err := rows.Scan(&child.TaskID, &child.SessionID, &child.ParentSessionID, &child.SpawnKey, &child.CheckpointThrough,
+			&child.CheckpointDigest, &allowedTools, &child.Background, &child.CancelRequested, &child.Step.ID, &child.Step.Sequence,
+			&child.Step.Kind, &status, &child.Step.Title, &child.Step.Summary, &child.Step.CreatedAt); err != nil {
+			return nil, err
+		}
+		child.Step.TaskID, child.Step.Status = child.TaskID, task.StepStatus(status)
+		if err := json.Unmarshal(allowedTools, &child.AllowedTools); err != nil {
+			return nil, err
+		}
+		children = append(children, child)
+	}
+	return children, rows.Err()
+}
+
+func (tools *f07SyntheticTool) definition() app.AgentToolDefinition {
+	return app.AgentToolDefinition{ModelTool: app.ModelTool{Name: "f07_test_noop", Description: "A test-only tool that must not execute.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[],"additionalProperties":false}`)}}
+}
+
+func (tools *f07SyntheticTool) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
+	return []app.AgentToolDefinition{tools.definition()}, nil
+}
+
+func (tools *f07SyntheticTool) Execute(context.Context, task.Task, app.ModelToolCall) (app.AgentToolResult, error) {
+	tools.calls.Add(1)
+	return app.AgentToolResult{}, errors.New("synthetic no-op tool must not execute")
+}
+
+func (*f07SyntheticTool) InitialContext(context.Context, task.Task) (string, error) {
+	return "Synthetic context for this integration test.", nil
+}
+
+type f07BackgroundOutputModel struct {
+	mu             sync.Mutex
+	rootCalls      map[int64]int
+	childCalls     map[int64]int
+	callLog        []string
+	childStarted   chan struct{}
+	interrupted    chan struct{}
+	childOnce      sync.Once
+	interruptOnce  sync.Once
+	jobID          string
+	cursor         int64
+	outputConsumed atomic.Bool
+}
+
+func newF07BackgroundOutputModel() *f07BackgroundOutputModel {
+	return &f07BackgroundOutputModel{rootCalls: make(map[int64]int), childCalls: make(map[int64]int),
+		childStarted: make(chan struct{}), interrupted: make(chan struct{}), cursor: -1}
+}
+
+func (model *f07BackgroundOutputModel) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
+	if call.Task == nil {
+		return app.ModelResponse{}, errors.New("synthetic model call is missing its Task fence")
+	}
+	usage := app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}
+	model.mu.Lock()
+	model.callLog = append(model.callLog, fmt.Sprintf("gen=%d session=%s root=%s through=%d", call.Task.AgentGeneration,
+		call.Task.AgentSessionID, call.Task.AgentRootSessionID, call.Task.ThroughSequence))
+	model.mu.Unlock()
+	if call.Task.AgentSessionID != call.Task.AgentRootSessionID {
+		model.mu.Lock()
+		model.childCalls[call.Task.AgentGeneration]++
+		generation := call.Task.AgentGeneration
+		model.mu.Unlock()
+		if generation == 1 {
+			model.childOnce.Do(func() { close(model.childStarted) })
+			select {
+			case <-ctx.Done():
+				return app.ModelResponse{}, ctx.Err()
+			case <-model.interrupted:
+				return app.ModelResponse{}, errors.New("synthetic child request interrupted for restart")
+			}
+		}
+		if generation == 2 {
+			return app.ModelResponse{Text: f07BackgroundOutputSummary, StopReason: "stop", Usage: usage}, nil
+		}
+		return app.ModelResponse{}, fmt.Errorf("unexpected child model generation %d", generation)
+	}
+	model.mu.Lock()
+	model.rootCalls[call.Task.AgentGeneration]++
+	callNumber := model.rootCalls[call.Task.AgentGeneration]
+	model.mu.Unlock()
+	switch call.Task.AgentGeneration {
+	case 1:
+		if callNumber == 1 {
+			return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "f07_spawn_background", Name: cloudDSHDelegateToolName,
+				Arguments: `{"title":"Restartable result","objective":"Return a concise result for the parent.","tool_names":[],"run_in_background":true}`}},
+				StopReason: "tool_calls", Usage: usage}, nil
+		}
+	case 2:
+		if callNumber == 1 {
+			return app.ModelResponse{Text: "I will review the delegated result before finishing.", StopReason: "stop", Usage: usage}, nil
+		}
+	case 3:
+		if callNumber == 1 {
+			if !strings.Contains(string(call.RawRequest), "Internal continuation:") {
+				return app.ModelResponse{}, errors.New("parent recovery omitted its trusted output continuation")
+			}
+			model.mu.Lock()
+			jobID := model.jobID
+			model.mu.Unlock()
+			if jobID == "" {
+				return app.ModelResponse{}, errors.New("settled child identity is unavailable")
+			}
+			return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: f07BackgroundOutputCallID, Name: cloudDSHJobOutputToolName,
+				Arguments: fmt.Sprintf(`{"job_id":%q,"after_seq":-1}`, jobID)}},
+				StopReason: "tool_calls", Usage: usage}, nil
+		}
+		if callNumber == 2 {
+			outputText, ok := f01ToolResult(call.RawRequest, f07BackgroundOutputCallID)
+			var result struct {
+				JobID      string `json:"job_id"`
+				Status     string `json:"status"`
+				NextCursor int64  `json:"next_cursor"`
+				Output     string `json:"output"`
+			}
+			model.mu.Lock()
+			jobID, cursor := model.jobID, model.cursor
+			model.mu.Unlock()
+			if !ok || json.Unmarshal([]byte(outputText), &result) != nil || result.JobID != jobID || result.Status != "succeeded" ||
+				result.NextCursor != cursor || result.Output != f07BackgroundOutputSummary {
+				return app.ModelResponse{}, errors.New("parent did not receive the complete durable child output")
+			}
+			model.outputConsumed.Store(true)
+			return app.ModelResponse{Text: f07BackgroundParentSummary, StopReason: "stop", Usage: usage}, nil
+		}
+	}
+	return app.ModelResponse{}, fmt.Errorf("unexpected parent model generation/call %d/%d", call.Task.AgentGeneration, callNumber)
+}
+
+func (model *f07BackgroundOutputModel) setJob(jobID string, cursor int64) {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.jobID, model.cursor = jobID, cursor
+}
+
+func (model *f07BackgroundOutputModel) callSnapshot() []string {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	return append([]string(nil), model.callLog...)
+}
+
+func (model *f07BackgroundOutputModel) interrupt() {
+	model.interruptOnce.Do(func() { close(model.interrupted) })
+}
+
+func f07AgentFence(value task.Task, supervisorID string) app.AgentInstanceFence {
+	return app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.InitiatorID,
+		AgentInstanceID: value.AgentInstanceID, AgentGeneration: value.AgentGeneration, AgentSessionID: value.AgentSessionID,
+		SupervisorID: supervisorID, LeaseOwner: value.Lease.Owner, LeaseVersion: value.Lease.Version,
+		AuthorizationVersion: value.Authorization.Version, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
 }
 
 func f01NodeRuntimePaths(t *testing.T) (string, string) {

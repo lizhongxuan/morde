@@ -252,14 +252,21 @@ type ConversationContextTaskResult struct {
 }
 
 type Step struct {
-	ID        string
-	TaskID    string
-	Sequence  int64
-	Kind      string
-	Status    StepStatus
-	Title     string
-	Summary   string
-	CreatedAt time.Time
+	ID             string
+	TaskID         string
+	Sequence       int64
+	Kind           string
+	Status         StepStatus
+	Title          string
+	Summary        string
+	AgentSessionID string
+	TaskRevision   *int64
+	ToolCallKey    string
+	ToolName       string
+	RequestDigest  []byte
+	Phase          string
+	DetailState    string
+	CreatedAt      time.Time
 }
 
 func StepCounts(steps []Step) (total, completed int64) {

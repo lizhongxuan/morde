@@ -150,9 +150,7 @@ func (client *ConnectorOAuthClient) Begin(ctx context.Context, connectorURL, red
 		return ConnectorOAuthStart{}, errors.New("MCP authorization server does not support PKCE S256")
 	}
 	scope := fields["scope"]
-	if scope == "" && len(resourceMeta.ScopesSupported) > 0 {
-		scope = strings.Join(resourceMeta.ScopesSupported, " ")
-	}
+	// scopes_supported lists capabilities; it does not authorize requesting every listed scope.
 	resource := resourceMeta.Resource
 	if resource == "" {
 		resource = connectorURL

@@ -331,6 +331,15 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("npm run build", gates)
         self.assertIn("web/mobile run build", package["scripts"]["build"])
 
+    def test_desktop_chat_uses_the_same_portal_artifact_as_web(self):
+        repository = ROOT.parents[1]
+        desktop = (repository / "clients/desktop/harness/desktop/src/morde-main.ts").read_text()
+        server = (repository / "server/cmd/portal/main.go").read_text()
+        config = (ROOT / "portal.yaml").read_text()
+        self.assertIn("const assistantURL = `${auth.origin}/assistant`;", desktop)
+        self.assertIn("PortalFiles: os.DirFS(cfg.PortalWeb.Dir)", server)
+        self.assertIn("dir: web/portal/dist", config)
+
     def test_installer_accepts_only_existing_local_docker_socket(self):
         installer = (ROOT / "install-portal-service.sh").read_text()
         start = installer.index("docker_socket=${CH_DOCKER_HOST#unix://}")

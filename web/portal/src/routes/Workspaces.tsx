@@ -735,7 +735,7 @@ export function Workspaces() {
       items={visibleWorkspaces}
       getKey={(item) => item.id}
       estimatedItemHeight={270}
-      height="min(max(calc(100dvh - 320px), 36px), 620px)"
+      height="min(max(calc(100dvh - clamp(320px, 50dvh, 450px)), 36px), 620px)"
       gap={10}
       ariaLabel="云端工作区"
       className="schedule-list workspace-list"

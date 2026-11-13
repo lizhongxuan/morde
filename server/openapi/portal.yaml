@@ -3868,7 +3868,7 @@ paths:
       tags: [Projects]
       operationId: retryProjectConversationMessageProcessing
       summary: Retry processing of an accepted failed message
-      description: Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+      description: Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       responses:
         '202': { description: Retry accepted or exact replay }
@@ -4866,7 +4866,7 @@ paths:
       tags: [Tasks]
       operationId: retryConversationMessageProcessing
       summary: Retry processing of an accepted failed message
-      description: Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+      description: Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       responses:
         '202': { description: Retry accepted or exact replay }
@@ -5086,6 +5086,55 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/artifacts/{artifact_id}/content:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
+      - { name: artifact_id, in: path, required: true, schema: { $ref: '#/components/schemas/ArtifactId' } }
+    get:
+      tags: [Tasks]
+      operationId: getTaskArtifactContent
+      summary: Download a verified Task artifact from its pinned Workspace revision
+      description: Portal Session only. Returns bytes only after re-authorizing the Task and verifying the immutable Workspace revision, relative path, size, and SHA-256. Missing, inaccessible, legacy unverified, or changed artifacts are not returned.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Verified artifact bytes; response is private and non-cacheable.
+          headers:
+            Cache-Control: { schema: { type: string, const: 'private, no-store' } }
+            X-Content-Type-Options: { schema: { type: string, const: nosniff } }
+            Content-Disposition: { schema: { type: string } }
+            X-Content-SHA256: { schema: { type: string, pattern: '^[a-f0-9]{64}$' } }
+          content:
+            '*/*': { schema: { type: string, format: binary } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/steps/{step_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: step_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/StepId' }
+    get:
+      tags: [Tasks]
+      operationId: getTaskStepDetail
+      summary: Get safe details for one task step
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Encrypted-at-rest, permission-checked activity projection; responses are never shared-cacheable.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskStepDetail' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/file-fetches/{fetch_id}:
@@ -11013,6 +11062,8 @@ components:
         role: { type: string, enum: [user, assistant] }
         content: { type: string }
         task_id: { $ref: '#/components/schemas/TaskId' }
+        duplicate_of_message_id: { $ref: '#/components/schemas/MessageId', description: Authorized original user message for a repeated request; the current message remains a separate timeline entry. }
+        related_task_id: { $ref: '#/components/schemas/TaskId', description: Task associated through the original request, when one exists and is visible to the caller. }
         client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
         routing_status: { type: string, enum: [pending, processing, routed, waiting_user, waiting_adjustment, failed] }
         routing_failure_reason: { type: string, enum: [model_unavailable, routing_context_unavailable, routing_action_unavailable, message_too_long] }
@@ -11290,7 +11341,36 @@ components:
         status: { $ref: '#/components/schemas/TaskStepStatus' }
         title: { type: string }
         summary: { type: string }
+        agent_id: { type: string, maxLength: 128, description: Opaque Agent session ID that actually emitted this step. }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        tool_name: { type: string, maxLength: 128 }
+        phase: { type: string, maxLength: 64 }
+        detail_state: { type: string, enum: [not_recorded, available, expired, restricted] }
         created_at: { type: string, format: date-time }
+    TaskAgentExecution:
+      type: object
+      required: [id, parent_id, step_id, task_revision, role, status, observed_at]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 128, description: Opaque DSH Agent session identifier. }
+        parent_id: { type: [string, 'null'], maxLength: 128 }
+        step_id: { oneOf: [{ $ref: '#/components/schemas/StepId' }, { type: 'null' }] }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        role: { type: string, enum: [main, subagent] }
+        status: { type: string, enum: [running, idle, unknown], description: Runtime observation only; unknown means the observation cannot be trusted as current. }
+        observed_at: { type: [string, 'null'], format: date-time }
+    TaskStepDetail:
+      type: object
+      required: [task_id, step_id, event_sequence, tool_name, detail_state, object, input, result, truncated]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        step_id: { $ref: '#/components/schemas/StepId' }
+        event_sequence: { type: integer, format: int64, minimum: 0 }
+        tool_name: { type: string, maxLength: 128 }
+        detail_state: { type: string, enum: [available, not_recorded, expired, restricted] }
+        object: { type: [string, 'null'], maxLength: 8192 }
+        input: { type: [string, 'null'], maxLength: 8192 }
+        result: { type: [string, 'null'], maxLength: 8192 }
+        truncated: { type: boolean }
     TaskBatchItem:
       type: object
       required: [id, key, status, attempt, result, error]
@@ -11501,6 +11581,7 @@ components:
             result_message_published: { type: boolean, description: The final result is published as a conversation message with sources; use that message rather than displaying a separate Task result. }
             waiting_reason: { type: [string, 'null'], description: 'Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available.' }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
+            agents: { type: array, items: { $ref: '#/components/schemas/TaskAgentExecution' } }
             batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
             artifacts: { type: array, items: { $ref: '#/components/schemas/TaskArtifact' } }
             pending_request: { oneOf: [{ $ref: '#/components/schemas/TaskPendingRequest' }, { type: 'null' }] }

@@ -83,7 +83,11 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	crossClientAcceptance := os.Getenv("MORDE_BROWSER_CROSS_CLIENT") == "1"
 	model := browserAcceptanceModel{}
+	if crossClientAcceptance {
+		model.routeBarrier = &browserAcceptanceRouteBarrier{expected: 4, ready: make(chan struct{})}
+	}
 	models, err := app.NewModelConnectionService(store, sealer, model, []string{"example.invalid"})
 	if err != nil {
 		t.Fatal(err)
@@ -182,9 +186,13 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	maxConcurrentRoutes := 2
+	if crossClientAcceptance {
+		maxConcurrentRoutes = 4
+	}
 	routerWorker, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
 		Queue: store, Actions: store, Models: gateway, WorkerID: "browser-acceptance-route",
-		LeaseDuration: time.Minute, PollInterval: 100 * time.Millisecond, MaxConcurrent: 2, Logger: zap.NewNop(),
+		LeaseDuration: time.Minute, PollInterval: 100 * time.Millisecond, MaxConcurrent: maxConcurrentRoutes, Logger: zap.NewNop(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -417,6 +425,11 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 				if err := store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM conversation_messages WHERE owner_id=$1`, owner.ID).Scan(&messages, &replies); err != nil || messages < minimumMessages || (attachmentResume == nil && projectAttachmentResume == nil && messageUploadResume == nil && replies < 1) {
 					t.Fatalf("browser messages=%d replies=%d err=%v", messages, replies, err)
 				}
+				if os.Getenv("MORDE_BROWSER_DUPLICATE_EXPECTED") == "1" {
+					if err := assertBrowserDuplicateFlow(ctx, store, owner.ID, mainConversation.ConversationID); err != nil {
+						t.Fatal(err)
+					}
+				}
 				if activity != nil {
 					if err := activity.assertVerified(); err != nil {
 						t.Fatal(err)
@@ -495,7 +508,45 @@ WHERE owner_id=$1 AND conversation_id=$2 AND role='user'`, owner.ID, projectAtta
 	}
 }
 
-type browserAcceptanceModel struct{ nativeAcceptanceModel }
+const browserAcceptanceDuplicateContent = "Morde browser acceptance: analyze project"
+const browserAcceptanceStatusContent = "本机浏览器验收：进度如何"
+const browserAcceptanceIndependentContent = "本机浏览器验收：独立总结当前会话"
+
+type browserAcceptanceModel struct {
+	nativeAcceptanceModel
+	routeBarrier *browserAcceptanceRouteBarrier
+}
+
+type browserAcceptanceRouteBarrier struct {
+	mu       sync.Mutex
+	expected int
+	waiters  int
+	ready    chan struct{}
+}
+
+func (barrier *browserAcceptanceRouteBarrier) wait(ctx context.Context) error {
+	barrier.mu.Lock()
+	barrier.waiters++
+	if barrier.waiters >= barrier.expected {
+		select {
+		case <-barrier.ready:
+		default:
+			close(barrier.ready)
+		}
+	}
+	ready := barrier.ready
+	barrier.mu.Unlock()
+	timer := time.NewTimer(time.Minute)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errors.New("cross-client route barrier timed out waiting for all four messages")
+	}
+}
 
 type browserMessageUploadResumeFixture struct {
 	mu                             sync.Mutex
@@ -860,8 +911,50 @@ func (f *browserAttachmentResumeFixture) observe(r *http.Request, status int) {
 	}
 }
 
-func (browserAcceptanceModel) Complete(ctx context.Context, request app.ModelRequest) (app.ModelResponse, error) {
+func (model browserAcceptanceModel) Complete(ctx context.Context, request app.ModelRequest) (app.ModelResponse, error) {
+	if strings.HasPrefix(request.Instructions, "Review the completed Task results") {
+		return app.ModelResponse{Text: `{"action":"reply","reply":"本地验收：任务结果已汇总。"}`,
+			Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+	}
 	if strings.HasPrefix(request.Instructions, "Classify the user's new message") {
+		if len(request.Input) > 0 {
+			var input struct {
+				Message       string                                  `json:"message"`
+				Tasks         []app.ConversationRouteCandidate        `json:"active_tasks"`
+				PriorRequests []app.ConversationRouteRequestCandidate `json:"prior_requests"`
+			}
+			if json.Unmarshal([]byte(request.Input[0].Text), &input) == nil {
+				if input.Message == browserAcceptanceStatusContent {
+					for _, candidate := range input.Tasks {
+						if candidate.Objective == browserAcceptanceDuplicateContent {
+							body, err := json.Marshal(map[string]string{"action": "status", "task_id": candidate.TaskID})
+							if err != nil {
+								return app.ModelResponse{}, err
+							}
+							return app.ModelResponse{Text: string(body), Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+						}
+					}
+				}
+				if input.Message == browserAcceptanceDuplicateContent {
+					if model.routeBarrier != nil {
+						if err := model.routeBarrier.wait(ctx); err != nil {
+							return app.ModelResponse{}, err
+						}
+						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":""}`,
+							Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+					}
+					for _, prior := range input.PriorRequests {
+						if prior.Content == input.Message && prior.SameExecutionScope {
+							body, err := json.Marshal(map[string]string{"action": "join", "target_message_id": prior.MessageID})
+							if err != nil {
+								return app.ModelResponse{}, err
+							}
+							return app.ModelResponse{Text: string(body), Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+						}
+					}
+				}
+			}
+		}
 		return app.ModelResponse{Text: `{"action":"new","task_id":"","question":""}`,
 			Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 	}
@@ -871,7 +964,11 @@ func (browserAcceptanceModel) Complete(ctx context.Context, request app.ModelReq
 type browserAcceptanceExecutor struct{ store *Store }
 
 func (e browserAcceptanceExecutor) ExecuteTask(ctx context.Context, current task.Task) error {
-	timer := time.NewTimer(750 * time.Millisecond)
+	delay := 750 * time.Millisecond
+	if current.Objective == browserAcceptanceDuplicateContent {
+		delay = 30 * time.Second
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -889,6 +986,97 @@ func (e browserAcceptanceExecutor) ExecuteTask(ctx context.Context, current task
 		Steps: []task.Step{{ID: stepID, TaskID: current.ID, Sequence: 1, Kind: "result", Status: task.StepSucceeded}},
 		Event: task.Event{Type: "task.result", Payload: []byte(`{}`)}})
 	return err
+}
+
+func assertBrowserDuplicateFlow(ctx context.Context, store *Store, ownerID, conversationID string) error {
+	rows, err := store.pool.Query(ctx, `SELECT message.id,COALESCE(route.duplicate_of_message_id,''),COALESCE(message.task_id,'')
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.owner_id=$1 AND message.conversation_id=$2 AND message.role='user' AND message.content=$3
+ORDER BY message.sequence`, ownerID, conversationID, browserAcceptanceDuplicateContent)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type message struct{ id, duplicateOf, taskID string }
+	var messages []message
+	for rows.Next() {
+		var value message
+		if err := rows.Scan(&value.id, &value.duplicateOf, &value.taskID); err != nil {
+			return err
+		}
+		messages = append(messages, value)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	expectedDuplicates := 2
+	if os.Getenv("MORDE_BROWSER_CROSS_CLIENT") == "1" {
+		expectedDuplicates = 4
+	}
+	if len(messages) != expectedDuplicates || messages[0].taskID == "" || messages[0].duplicateOf != "" {
+		return fmt.Errorf("duplicate messages were not linked to one task: %+v", messages)
+	}
+	for _, duplicate := range messages[1:] {
+		if duplicate.duplicateOf != messages[0].id || duplicate.taskID != "" {
+			return fmt.Errorf("duplicate message did not link to the single root request: %+v", messages)
+		}
+	}
+	var duplicateTasks int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1 AND objective=$2`,
+		conversationID, browserAcceptanceDuplicateContent).Scan(&duplicateTasks); err != nil {
+		return err
+	}
+	if duplicateTasks != 1 {
+		return fmt.Errorf("duplicate request created %d tasks", duplicateTasks)
+	}
+	var independentCount int
+	var independentTaskID string
+	if err := store.pool.QueryRow(ctx, `SELECT count(*),COALESCE(max(message.task_id),'')
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.owner_id=$1 AND message.conversation_id=$2 AND message.role='user' AND message.content=$3`,
+		ownerID, conversationID, browserAcceptanceIndependentContent).Scan(&independentCount, &independentTaskID); err != nil {
+		return err
+	}
+	if independentCount != 1 || independentTaskID == "" || independentTaskID == messages[0].taskID {
+		return fmt.Errorf("independent request did not create its own task: messages=%d task=%q", independentCount, independentTaskID)
+	}
+	var statusCount, statusTaskCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE message.task_id IS NOT NULL)
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.owner_id=$1 AND message.conversation_id=$2 AND message.role='user' AND message.content=$3
+AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conversationID,
+		browserAcceptanceStatusContent).Scan(&statusCount, &statusTaskCount); err != nil {
+		return err
+	}
+	if statusCount != 1 || statusTaskCount != 0 {
+		return fmt.Errorf("status follow-up created a task or was not answered: messages=%d tasks=%d", statusCount, statusTaskCount)
+	}
+	page, err := store.ListMessages(ctx, ownerID, conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return err
+	}
+	duplicateFound, originalTaskReplies := false, 0
+	for _, item := range page.Items {
+		if item.ID == messages[1].id && (item.DuplicateOfMessageID != messages[0].id ||
+			item.RelatedTaskID != messages[0].taskID || item.TaskID != "" ||
+			item.RoutingStatus != conversation.RoutingRouted || item.DeliveryStatus != conversation.DeliveryApplied) {
+			return fmt.Errorf("duplicate message projection lost its original task status: %+v", item)
+		}
+		if item.ID == messages[1].id {
+			duplicateFound = true
+		}
+		if item.Role == conversation.RoleAssistant {
+			for _, source := range item.Sources {
+				if source.TaskID == messages[0].taskID {
+					originalTaskReplies++
+				}
+			}
+		}
+	}
+	if !duplicateFound || originalTaskReplies != 1 {
+		return fmt.Errorf("duplicate projection or single original reply missing: duplicate=%t replies=%d", duplicateFound, originalTaskReplies)
+	}
+	return nil
 }
 
 // The opt-in activity stages are selected only by these synthetic messages.

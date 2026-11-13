@@ -146,7 +146,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .workspace-bind-actions { grid-template-columns: minmax(140px, 1fr) auto; align-items: center; }
 .form-error { margin: 0; padding: 10px 12px; color: #a52219; border-radius: 7px; background: #fff1ef; }
 .inline-actions { display: flex; align-items: center; gap: 8px; }
-.toast-region { position: fixed; z-index: 60; top: 76px; right: 20px; width: min(420px, calc(100vw - 40px)); display: grid; gap: 10px; }
+.toast-region { position: fixed; z-index: 60; top: 76px; right: 20px; width: min(420px, calc(100vw - 40px)); display: grid; gap: 10px; pointer-events: none; }
+.toast-region > * { pointer-events: none; }
+.toast-region > * button { pointer-events: auto; }
 .toast { padding: 13px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 9px; background: #fff; box-shadow: var(--shadow); }
 .toast-success { color: #05603a; border-color: #a6f4c5; }
 .toast-error { color: #a52219; border-color: #f4b9b4; }
@@ -1002,6 +1004,8 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .task-activity-actions { margin-top: 9px; }
 .task-activity-actions .button { white-space: normal; }
 .task-supplement-form { margin-top: 10px; display: grid; gap: 7px; }
+.task-supplement-target { display: grid; gap: 5px; }
+.task-supplement-target small { color: var(--muted); }
 .task-supplement-form textarea { min-height: 76px; resize: vertical; }
 .task-supplement-status { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .task-supplement-status small { color: var(--muted); }
@@ -1026,7 +1030,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .conversation-view-heading { align-items: center; flex-direction: row; }
 }
 
-/* moder conversation layout */
+/* Morde conversation layout */
 .morde-shell:has(.assistant-page) { background: #fff; }
 .morde-brand-mark, .assistant-logo {
   flex: none; border: 1px solid #e7edf7; background: #fff url('./assets/morde-logo.png') center / contain no-repeat;
@@ -1076,10 +1080,12 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .chat-message-row-assistant .chat-message-body { flex: 1; max-width: 620px; }
 .assistant-page .chat-message { max-width: none; padding: 11px 16px; border: 0; color: #344052; font-size: 14px; line-height: 1.7; }
 .assistant-page .chat-message-user { border-radius: 17px 17px 5px 17px; background: #dcecff; color: #263b55; }
+.assistant-page .chat-message-user-started { position: relative; padding-bottom: 30px; }
+.assistant-page .chat-task-started { position: absolute; right: 7px; bottom: 4px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: #f1f2f4; font-size: 14px; line-height: 1; }
 .assistant-page .chat-message-assistant { border-radius: 17px 17px 17px 5px; background: #f1f2f4; }
 .assistant-page .chat-message-author { min-height: 26px; margin: 0; color: #607089; font-size: 11px; }
 .assistant-page .chat-message-user .chat-message-author { display: none; }
-.assistant-page .chat-message-status { color: #68778d; }
+.assistant-page .chat-message-status { margin: 4px 10px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #68778d; font-size: 11px; line-height: 1.4; }
 .assistant-page .message-retry { flex: 0 0 22px; width: 22px; height: 22px; margin: 7px 0 0; padding: 0; display: grid; place-items: center; border: 1px solid #f0b8b4; border-radius: 50%; color: #c72f2b; background: #fff5f4; font-size: 14px; font-weight: 800; line-height: 1; cursor: pointer; }
 .assistant-page .message-retry:hover:not(:disabled) { border-color: #d94039; background: #ffe9e7; }
 .assistant-page .message-retry:disabled { cursor: wait; opacity: .55; }
@@ -1154,10 +1160,13 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 @media (max-height: 500px) {
   .assistant-page .conversation-view-heading { flex-basis: 54px; padding-block: 6px; }
-  .assistant-page .conversation-view { padding-top: 8px; padding-bottom: 42px; }
+  .assistant-page .conversation-view { padding-block: 8px 12px; scroll-padding-bottom: 12px; }
   .assistant-page .assistant-composer { max-height: calc(100% - 70px); padding-block: 4px; }
   .assistant-page .assistant-composer form { padding: 8px; }
   .assistant-page .assistant-composer textarea { height: 32px; min-height: 32px; }
+  .assistant-page .assistant-composer-footer { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px; }
+  .assistant-page .assistant-selectors { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .assistant-page .assistant-task-actions { align-self: end; }
 }
 
 .assistant-history-content { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow-y: auto; }
@@ -1244,6 +1253,9 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-panel-group > h3 span,
 .assistant-page .task-panel-group-recent > summary span { color: #96a2b2; font-size: 12px; font-weight: 500; }
 .assistant-page .task-panel-group-recent > summary { padding: 4px 0; cursor: pointer; }
+.assistant-page .task-panel-group-toggle { width: 100%; padding: 4px 0; border: 0; display: flex; align-items: center; justify-content: space-between; color: #63738b; background: transparent; text-align: left; font-size: 13px; font-weight: 700; cursor: pointer; }
+.assistant-page .task-panel-group-toggle:focus-visible,
+.assistant-page .task-activity-step-button:focus-visible { outline: 2px solid #8eb5ff; outline-offset: 2px; }
 .assistant-page .task-panel-cards { min-width: 0; display: grid; gap: 8px; }
 .assistant-page .task-activity-card { min-width: 0; border: 1px solid #e6ebf2; border-radius: 10px; background: #fff; }
 .assistant-page .task-activity-card-button { width: 100%; min-width: 0; padding: 12px; display: grid; gap: 7px; border: 0; border-radius: inherit; color: inherit; background: transparent; text-align: left; cursor: pointer; }
@@ -1286,6 +1298,19 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-panel-detail .task-activity-artifacts li small { color: #7f8da2; font-size: 12px; overflow-wrap: anywhere; }
 .assistant-page .task-detail-work > summary,
 .assistant-page .task-detail-diagnostics > summary { color: #536780; font-size: 13px; font-weight: 650; cursor: pointer; }
+.assistant-page .task-detail-work h3 { margin: 0 0 10px; color: #60728b; font-size: 13px; }
+.assistant-page .task-agent-group { min-width: 0; padding: 8px 0; border-top: 1px solid #edf0f4; }
+.assistant-page .task-agent-group h4 { margin: 0; display: flex; justify-content: space-between; gap: 8px; color: #536780; font-size: 13px; }
+.assistant-page .task-agent-group h4 small { color: #7f8da2; font-size: 12px; font-weight: 400; }
+.assistant-page .task-activity-steps li > div { min-width: 0; }
+.assistant-page .task-step-icon { color: #9ba9b8; font-size: 10px; line-height: 1.8; }
+.assistant-page .task-step-icon.status-running { color: #e39b19; }
+.assistant-page .task-step-icon.status-succeeded { color: #2a9a56; }
+.assistant-page .task-step-icon.status-failed { color: #bf493f; }
+.assistant-page .task-activity-step-button { width: 100%; min-width: 0; padding: 0; border: 0; display: grid; gap: 3px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.assistant-page .task-step-detail { margin-top: 8px; padding: 10px; border-radius: 8px; background: #f4f7fa; }
+.assistant-page .task-step-detail p,
+.assistant-page .task-step-detail-message { margin: 3px 0; color: #536780; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .assistant-page .task-detail-diagnostics { padding-top: 10px; border-top: 1px solid #edf0f4; }
 .assistant-page .task-detail-diagnostics > p,
 .assistant-page .task-detail-diagnostics > ul { color: #7f8da2; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -1388,6 +1413,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout { grid-template-columns: minmax(0, 1fr); }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-sidebar { display: none; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr) clamp(320px, 25vw, 360px); }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel > .assistant-task-panel { grid-column: 2; }
 @media (min-width: 621px) and (max-width: 1000px) {
   .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 52px; --pc-context-sidebar-width: 220px; }
   .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }

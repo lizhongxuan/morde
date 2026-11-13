@@ -74,6 +74,17 @@ enum MordeCredentialExpiryTests {
         precondition(MordeTaskStepPresentation.titleLocalizationKey("Run cloud dsh tool: desktop_click") == "Use the cloud computer")
         precondition(MordeTaskStepPresentation.titleLocalizationKey("Run cloud dsh tool: an_unknown_tool") == "Process the task")
         precondition(MordeTaskStepPresentation.titleLocalizationKey("A user-facing step") == nil)
+        let mcpTitle = "Run cloud dsh MCP tool: lookup"
+        precondition(MordeTaskStepPresentation.title(mcpTitle) == String(format: NSLocalizedString("Use MCP tool: %@", comment: ""), "lookup"))
+        precondition(MordeTaskStepPresentation.detailToolName(title: mcpTitle, storedToolName: "morde_mcp_k1234567_abcdef123456",
+            detailToolName: "morde_mcp_k1234567_abcdef123456") == "lookup")
+        precondition(MordeTaskStepPresentation.detailToolName(title: "Run cloud dsh MCP tool: morde_mcp_k1234567_abcdef123456",
+            storedToolName: "morde_mcp_k1234567_abcdef123456", detailToolName: "morde_mcp_k1234567_abcdef123456") == NSLocalizedString("MCP tool", comment: ""))
+        precondition(MordeTaskStepPresentation.title("Run cloud dsh MCP tool: morde_mcp_k1234567_abcdef123456") == NSLocalizedString("MCP tool", comment: ""))
+        precondition(MordeTaskStepPresentation.detailObject(title: "Run cloud dsh MCP tool: lookup",
+            object: "Synthetic") == "Synthetic")
+        precondition(MordeTaskStepPresentation.detailObject(title: "Run cloud dsh MCP tool: lookup",
+            object: "morde_mcp_k1234567_abcdef123456") == NSLocalizedString("MCP connector", comment: ""))
         precondition(MordeTaskStepPresentation.summary("Checking the task checkpoint and Workspace revision.",
             title: "Run Hostless Workspace tool: morde_workspace_read") == nil)
         precondition(MordeTaskStepPresentation.summary("The file could not be read.",
@@ -1164,6 +1175,8 @@ enum MordeCredentialExpiryTests {
         let adjustment = try! JSONDecoder().decode(MordeClientMessage.self, from: Data(
             #"{"id":"m1234567","role":"user","content":"change","routing_status":"waiting_adjustment"}"#.utf8))
         precondition(MordeRoutingPresentation.localizationKey(adjustment.routing_status) == "Adjustment received; waiting to update")
+        precondition(MordeRoutingPresentation.localizationKey("pending") == nil)
+        precondition(MordeRoutingPresentation.localizationKey("processing") == nil)
         precondition(MordeRoutingPresentation.localizationKey("waiting_user") == nil)
         precondition(MordeRoutingPresentation.localizationKey("routed") == nil)
         let failedMessage = try! JSONDecoder().decode(MordeClientMessage.self, from: Data(
@@ -1441,14 +1454,20 @@ enum MordeCredentialExpiryTests {
         precondition(multiRestored[2].previousClientMessageID == nil)
         precondition(MordeOutboxScheduling.readyIDs(multiRestored, scope: scope, inFlight: []) == [multiTarget.id])
         let firstFields = MordeConversationMessagePayload.direct(wireFirst)
-        precondition(Set(firstFields.keys) == ["client_message_id", "content"])
+        var expectedFirstKeys: Set<String> = ["client_message_id", "content"]
+        if wireFirst.timeZone != nil { expectedFirstKeys.insert("time_zone") }
+        precondition(Set(firstFields.keys) == expectedFirstKeys)
         precondition(firstFields["client_message_id"] as? String == wireFirst.id)
         precondition(firstFields["content"] as? String == wireFirst.content)
+        precondition((firstFields["time_zone"] as? String) == wireFirst.timeZone)
         let directFields = MordeConversationMessagePayload.direct(wireSecond)
-        precondition(Set(directFields.keys) == ["client_message_id", "content", "previous_client_message_id",
-            "reference_task_id", "model_id", "host_id", "workspace_id", "client_attachment_ids"])
+        var expectedDirectKeys: Set<String> = ["client_message_id", "content", "previous_client_message_id",
+            "reference_task_id", "model_id", "host_id", "workspace_id", "client_attachment_ids"]
+        if wireSecond.timeZone != nil { expectedDirectKeys.insert("time_zone") }
+        precondition(Set(directFields.keys) == expectedDirectKeys)
         precondition(directFields["client_message_id"] as? String == wireSecond.id)
         precondition(directFields["previous_client_message_id"] as? String == wireFirst.id)
+        precondition((directFields["time_zone"] as? String) == wireSecond.timeZone)
         precondition(directFields["reference_task_id"] as? String == "q1234567")
         precondition(directFields["model_id"] as? String == "p1234567")
         precondition(directFields["host_id"] as? String == "h1234567")
@@ -1460,6 +1479,7 @@ enum MordeCredentialExpiryTests {
         precondition(decodedFields["content"] as? String == wireSecond.content)
         let uploadFields = MordeConversationMessagePayload.uploadInitialization(wireLong, bytes: longBytes)
         precondition(uploadFields["previous_client_message_id"] as? String == wireSecond.id)
+        precondition((uploadFields["time_zone"] as? String) == wireLong.timeZone)
         precondition(uploadFields["reference_task_id"] as? String == "q1234567")
         precondition(uploadFields["client_attachment_ids"] as? [String] == ["local-slot-002"])
         precondition(uploadFields["total_bytes"] as? Int == longBytes.count)

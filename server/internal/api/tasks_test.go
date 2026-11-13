@@ -36,6 +36,10 @@ type taskServiceStub struct {
 	conversationTaskCalls  int
 	getID                  string
 	getDetails             *app.TaskDetails
+	stepDetail             app.TaskStepDetail
+	stepDetailCalls        int
+	stepDetailTaskID       string
+	stepDetailStepID       string
 	actionTaskID           string
 	action                 task.Action
 	actionExpected         task.Status
@@ -200,6 +204,12 @@ func (s *taskServiceStub) Get(_ context.Context, _ identity.Principal, id string
 		return *s.getDetails, s.err
 	}
 	return app.TaskDetails{Task: apiTestTask()}, s.err
+}
+
+func (s *taskServiceStub) GetStepDetail(_ context.Context, _ identity.Principal, taskID, stepID string) (app.TaskStepDetail, error) {
+	s.stepDetailCalls++
+	s.stepDetailTaskID, s.stepDetailStepID = taskID, stepID
+	return s.stepDetail, s.err
 }
 
 func (s *taskServiceStub) RequestAction(ctx context.Context, principal identity.Principal, taskID string, action task.Action, expected task.Status, key string) (app.TaskActionResult, error) {
@@ -734,6 +744,56 @@ func TestGetTaskCountsStepsExcludingBudget(t *testing.T) {
 	})
 	if err != nil || view.StepCount != 3 || view.CompletedStepCount != 1 {
 		t.Fatalf("task step counts = (%d, %d), err=%v; want (3, 1)", view.StepCount, view.CompletedStepCount, err)
+	}
+}
+
+func TestTaskDetailAllowsRestrictedStepDetails(t *testing.T) {
+	current := apiTestTask()
+	view, err := toTaskResponse(app.TaskDetails{Task: current, Steps: []task.Step{{
+		ID: "s1234567", TaskID: current.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded,
+		Title: "Workspace action", Summary: "The Workspace resource is not available with the current permissions.",
+		ToolName: "morde_workspace_file_read", DetailState: "restricted", CreatedAt: time.Now().UTC(),
+	}}})
+	if err != nil || len(view.Steps) != 1 || view.Steps[0].DetailState != "restricted" {
+		t.Fatalf("restricted TaskStep response=%+v err=%v", view.Steps, err)
+	}
+}
+
+func TestTaskStepDetailRouteIsNoStoreAndRejectsQueryOrBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &taskServiceStub{stepDetail: app.TaskStepDetail{
+		TaskID: "q1234567", StepID: "s1234567", EventSequence: 8, ToolName: "morde_workspace_file_read",
+		DetailState: "available",
+	}}
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set(principalKey, identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession})
+		c.Next()
+	})
+	(&api{}).registerTasks(engine.Group("/api"), service)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567", nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		response.Header().Get("Pragma") != "no-cache" || response.Header().Get("Referrer-Policy") != "no-referrer" ||
+		!strings.Contains(response.Body.String(), `"detail_state":"available"`) || service.stepDetailCalls != 1 ||
+		service.stepDetailTaskID != "q1234567" || service.stepDetailStepID != "s1234567" {
+		t.Fatalf("step detail response=%d headers=%v body=%s calls=%d", response.Code, response.Header(), response.Body.String(), service.stepDetailCalls)
+	}
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567?include=secret", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567", strings.NewReader("{}")),
+	} {
+		response = httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("step detail accepted query/body: status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	if service.stepDetailCalls != 1 {
+		t.Fatalf("invalid detail requests reached service %d times", service.stepDetailCalls-1)
 	}
 }
 

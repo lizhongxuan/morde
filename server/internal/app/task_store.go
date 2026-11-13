@@ -91,12 +91,84 @@ type TaskDetails struct {
 	ResultMessagePublished bool
 	ScheduleObservation    *schedule.ObservationSpec
 	Steps                  []task.Step
+	Agents                 []TaskAgentExecution
 	BatchItems             []task.BatchItem
 	Artifacts              []task.Artifact
 	PendingRequest         *task.PendingRequest
 	ClarificationRequests  []task.ClarificationRequest
 	StopRequest            *task.StopRequest
 	StopOperationIDs       []string
+}
+
+type TaskAgentExecution struct {
+	ID           string
+	ParentID     string
+	StepID       string
+	TaskRevision int64
+	Role         string
+	Status       string
+	ObservedAt   *time.Time
+}
+
+type TaskAgentActivityObservation struct {
+	Fence               AgentInstanceFence
+	Status              string
+	ObservationSequence int64
+}
+
+type TaskAgentActivityRecorder interface {
+	RecordTaskAgentActivity(context.Context, TaskAgentActivityObservation) (bool, error)
+}
+
+type TaskStepDetailRecord struct {
+	TaskID        string
+	OwnerID       string
+	StepID        string
+	TaskRevision  int64
+	EventSequence int64
+	Ciphertext    []byte
+	SHA256        []byte
+	SizeBytes     int32
+	Truncated     bool
+}
+
+type TaskStepDetailDocument struct {
+	Object string `json:"object"`
+	Input  string `json:"input"`
+	Result string `json:"result"`
+}
+
+type TaskStepDetail struct {
+	TaskID        string  `json:"task_id"`
+	StepID        string  `json:"step_id"`
+	EventSequence int64   `json:"event_sequence"`
+	ToolName      string  `json:"tool_name"`
+	DetailState   string  `json:"detail_state"`
+	Object        *string `json:"object"`
+	Input         *string `json:"input"`
+	Result        *string `json:"result"`
+	Truncated     bool    `json:"truncated"`
+}
+
+type TaskStepDetailReader interface {
+	GetTaskStepDetail(context.Context, string, string, string) (TaskStepDetailRecord, error)
+}
+
+type TaskToolCallProgress struct {
+	AgentSessionID       string
+	AgentInstanceID      string
+	AgentGeneration      int64
+	AuthorizationVersion int64
+	TaskRevision         int64
+	CallKey              string
+	ToolName             string
+	RequestDigest        []byte
+	Phase                string
+	DetailState          string
+	DetailCiphertext     []byte
+	DetailSHA256         []byte
+	DetailSizeBytes      int32
+	Truncated            bool
 }
 
 type AssistantMessageStatus string
@@ -176,6 +248,7 @@ type TaskProgress struct {
 	Usage                    task.Usage
 	ObservationFingerprint   string
 	Steps                    []task.Step
+	ToolCall                 *TaskToolCallProgress
 	Artifacts                []task.Artifact
 	Event                    task.Event
 	PendingRequest           *task.PendingRequest

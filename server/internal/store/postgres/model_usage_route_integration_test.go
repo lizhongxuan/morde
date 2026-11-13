@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,11 +20,13 @@ import (
 )
 
 type routeModelClientTest struct {
-	calls   atomic.Int32
-	started chan struct{}
-	release chan struct{}
-	err     error
-	reply   string
+	calls         atomic.Int32
+	started       chan struct{}
+	release       chan struct{}
+	err           error
+	reply         string
+	secondReply   string
+	allowRepeated bool
 }
 
 func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
@@ -42,10 +45,7 @@ func (c *routeModelClientTest) Complete(ctx context.Context, request app.ModelRe
 	if len(request.Tools) != 0 {
 		return app.ModelResponse{}, errors.New("route call unexpectedly included tools")
 	}
-	if c.started != nil {
-		if count > 1 {
-			return app.ModelResponse{}, errors.New("unexpected repeated provider dispatch")
-		}
+	if c.started != nil && count == 1 {
 		close(c.started)
 		select {
 		case <-c.release:
@@ -53,10 +53,16 @@ func (c *routeModelClientTest) Complete(ctx context.Context, request app.ModelRe
 			return app.ModelResponse{}, ctx.Err()
 		}
 	}
+	if c.started != nil && count > 1 && !c.allowRepeated {
+		return app.ModelResponse{}, errors.New("unexpected repeated provider dispatch")
+	}
 	if c.err != nil {
 		return app.ModelResponse{}, c.err
 	}
 	reply := c.reply
+	if count > 1 && c.secondReply != "" {
+		reply = c.secondReply
+	}
 	if reply == "" {
 		reply = `{"action":"new","task_id":"","question":""}`
 	}
@@ -79,6 +85,11 @@ func routeModelFixture(t *testing.T, useProject bool, client *routeModelClientTe
 }
 
 func routeModelFixtureWithMember(t *testing.T, useProject, separateOwner bool, client *routeModelClientTest) (*Store, *app.ModelGatewayService, identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
+	return routeModelFixtureWithMemberAndContent(t, useProject, separateOwner, client, "hello route")
+}
+
+func routeModelFixtureWithMemberAndContent(t *testing.T, useProject, separateOwner bool, client *routeModelClientTest,
+	content string) (*Store, *app.ModelGatewayService, identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
 	t.Helper()
 	store, _, _, principal, modelID := modelProbeFixture(t, app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1})
 	ctx := context.Background()
@@ -134,14 +145,15 @@ func routeModelFixtureWithMember(t *testing.T, useProject, separateOwner bool, c
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := app.ConversationRoutingInput{ProjectID: projectID, ModelID: modelID}
-	hash, err := app.ConversationReceiptHash(value.ID, "hello route", input)
+	input := app.ConversationRoutingInput{ProjectID: projectID, ModelID: modelID,
+		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000}}
+	hash, err := app.ConversationReceiptHash(value.ID, content, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _, err = store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
 		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: value.OwnerID, ActorID: principal.UserID,
-			ConversationID: value.ID, Role: conversation.RoleUser, Content: "hello route"},
+			ConversationID: value.ID, Role: conversation.RoleUser, Content: content},
 		ServiceInstanceID: instanceID, ClientID: "route-client-message-01", Input: input, RequestHash: hash,
 		Authorization: task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 			ClientInstallationID: principal.ClientInstallationID, Scopes: scopes, Version: 1, ExpiresAt: &expires},
@@ -364,10 +376,471 @@ FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.messag
 	}
 }
 
+func TestConversationRouteRetryUsesAttemptScopedSettledModelCall(t *testing.T) {
+	client := &routeModelClientTest{}
+	store, gateway, principal, claim, _ := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", claim.Message.ConversationID, claim.Message.ID, instanceID, "route-attempt-retry-001"); err != nil {
+		t.Fatal(err)
+	}
+	retry, found, err := store.ClaimConversationRoute(ctx, "route-attempt-test-worker", time.Minute)
+	if err != nil || !found || retry.Message.ID != claim.Message.ID || retry.RouteAttempt != claim.RouteAttempt+1 {
+		t.Fatalf("retry claim=%+v found=%t err=%v", retry, found, err)
+	}
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, retry)
+	if err != nil || snapshot.Context.RouteAttempt != retry.RouteAttempt {
+		t.Fatalf("retry context attempt=%d claim=%d err=%v", snapshot.Context.RouteAttempt, retry.RouteAttempt, err)
+	}
+	snapshot.Context.ModelID = claim.Input.ModelID
+	if _, err := gateway.ClassifyConversationRoute(ctx, retry, snapshot.Context); err != nil {
+		t.Fatalf("classify retried route: %v (message=%q actor=%q/%q model=%q input_model=%q attempt=%d/%d lease=%q/%d)",
+			err, retry.Message.ID, snapshot.Context.ActorID, retry.Message.ActorID, snapshot.Context.ModelID,
+			retry.Input.ModelID, snapshot.Context.RouteAttempt, retry.RouteAttempt, retry.LeaseOwner, retry.LeaseVersion)
+	}
+	if _, err := gateway.ClassifyConversationRoute(ctx, retry, snapshot.Context); err != nil || client.calls.Load() != 1 {
+		t.Fatalf("same attempt dispatched twice: calls=%d err=%v", client.calls.Load(), err)
+	}
+	var storedAttempt int64
+	var calls, ledgerEntries int
+	if err := store.pool.QueryRow(ctx, `SELECT
+(SELECT attempt FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal'),
+(SELECT count(*) FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal'),
+(SELECT count(*) FROM model_call_ledger WHERE owner_id=$2 AND source='route')`, claim.Message.ID, principal.UserID).
+		Scan(&storedAttempt, &calls, &ledgerEntries); err != nil || storedAttempt != retry.RouteAttempt || calls != 1 || ledgerEntries != 1 {
+		t.Fatalf("attempt ledger did not settle exactly once: attempt=%d calls=%d ledger=%d err=%v", storedAttempt, calls, ledgerEntries, err)
+	}
+}
+
+func TestUnknownPersonalRouteCallCanRetryWithIndependentAttempt(t *testing.T) {
+	client := &routeModelClientTest{err: errors.New("synthetic provider interruption")}
+	store, gateway, principal, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET owner_id=$1 WHERE id=$2`, principal.UserID, value.ModelID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClassifyConversationRoute(ctx, claim, value); err == nil {
+		t.Fatal("provider interruption reported a route decision")
+	}
+	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	var oldCallID, oldRouteState, oldLedgerState string
+	var oldPersonal bool
+	if err := store.pool.QueryRow(ctx, `SELECT c.call_id,c.state,l.state,l.personal_model FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1`, claim.Message.ID).Scan(&oldCallID, &oldRouteState, &oldLedgerState, &oldPersonal); err != nil ||
+		oldRouteState != "unknown" || oldLedgerState != "unknown" || !oldPersonal {
+		t.Fatalf("unknown personal call was not retained: route=%q ledger=%q personal=%t err=%v", oldRouteState, oldLedgerState, oldPersonal, err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", claim.Message.ConversationID, claim.Message.ID, instanceID,
+		"route-unknown-personal-retry-001"); err != nil {
+		t.Fatalf("retry unknown text-only route: %v", err)
+	}
+	retry, found, err := store.ClaimConversationRoute(ctx, "route-unknown-personal-worker", time.Minute)
+	if err != nil || !found || retry.RouteAttempt != claim.RouteAttempt+1 {
+		t.Fatalf("retry claim=%+v found=%t err=%v", retry, found, err)
+	}
+	retrySnapshot, err := store.LoadConversationRouteSnapshot(ctx, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrySnapshot.Context.ModelID = value.ModelID
+	client.err = nil
+	decision, err := gateway.ClassifyConversationRoute(ctx, retry, retrySnapshot.Context)
+	if err != nil || decision.Action != app.ConversationRouteNew || client.calls.Load() != 2 {
+		t.Fatalf("retry classification=%+v calls=%d err=%v", decision, client.calls.Load(), err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyConversationRoute(ctx, retry, retrySnapshot, decision); err != nil {
+		t.Fatalf("apply retried route: %v", err)
+	}
+	var routes, tasks, ledgerEntries int
+	var routeState string
+	var currentAttempt int64
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,
+ (SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id),
+ (SELECT count(*) FROM tasks t WHERE t.conversation_id=r.conversation_id AND t.initiator_id=r.actor_id
+   AND EXISTS (SELECT 1 FROM conversation_messages m WHERE m.id=$1 AND m.task_id=t.id)),
+ (SELECT count(*) FROM model_call_ledger l WHERE l.owner_id=r.actor_id AND l.source='route' AND l.call_id IN
+   (SELECT c.call_id FROM conversation_route_model_calls c WHERE c.message_id=r.message_id))
+FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID).
+		Scan(&routeState, &currentAttempt, &routes, &tasks, &ledgerEntries); err != nil || routeState != "routed" ||
+		currentAttempt != retry.RouteAttempt || routes != 2 || tasks != 1 || ledgerEntries != 2 {
+		t.Fatalf("attempt evidence or route action: state=%q attempt=%d route_calls=%d tasks=%d ledgers=%d err=%v",
+			routeState, currentAttempt, routes, tasks, ledgerEntries, err)
+	}
+	var oldState, newState, newCallID string
+	if err := store.pool.QueryRow(ctx, `SELECT
+ (SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$2),
+ (SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$3),
+ (SELECT call_id FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$3)`,
+		claim.Message.ID, claim.RouteAttempt, retry.RouteAttempt).Scan(&oldState, &newState, &newCallID); err != nil ||
+		oldState != "unknown" || newState != "settled" || oldCallID == newCallID {
+		t.Fatalf("retry overwrote prior unknown evidence: old=%q new=%q calls=%q/%q err=%v", oldState, newState, oldCallID, newCallID, err)
+	}
+}
+
+func TestConversationRouteRetryAttemptsMigrationKeepsUnknownEvidence(t *testing.T) {
+	client := &routeModelClientTest{err: errors.New("synthetic provider interruption")}
+	store, gateway, principal, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET owner_id=$1 WHERE id=$2`, principal.UserID, value.ModelID); err != nil {
+		t.Fatal(err)
+	}
+	provider, closeProvider, err := newMigrationProvider(store.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProvider()
+	if _, err := provider.DownTo(ctx, 194); err != nil {
+		t.Fatalf("roll back retry-attempt migration before exercising it: %v", err)
+	}
+	if _, err := provider.UpTo(ctx, 195); err != nil {
+		t.Fatalf("reapply retry-attempt migration: %v", err)
+	}
+
+	if _, err := gateway.ClassifyConversationRoute(ctx, claim, value); err == nil {
+		t.Fatal("first provider interruption reported a route decision")
+	}
+	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", claim.Message.ConversationID, claim.Message.ID, instanceID,
+		"route-unknown-migration-retry-001"); err != nil {
+		t.Fatalf("retry first unknown call: %v", err)
+	}
+	retry, found, err := store.ClaimConversationRoute(ctx, "route-unknown-migration-worker", time.Minute)
+	if err != nil || !found || retry.RouteAttempt != claim.RouteAttempt+1 {
+		t.Fatalf("retry claim=%+v found=%t err=%v", retry, found, err)
+	}
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = value.ModelID
+	if _, err := gateway.ClassifyConversationRoute(ctx, retry, snapshot.Context); err == nil {
+		t.Fatal("second provider interruption reported a route decision")
+	}
+	if err := store.FailConversationRoute(ctx, retry, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	var unknown int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_route_model_calls WHERE message_id=$1 AND state='unknown'`,
+		claim.Message.ID).Scan(&unknown); err != nil || unknown != 2 {
+		t.Fatalf("unknown route evidence count=%d, want 2: %v", unknown, err)
+	}
+	if _, err := provider.DownTo(ctx, 194); err == nil || !strings.Contains(err.Error(), "cannot restore single unresolved route call") {
+		t.Fatalf("rollback discarded retry evidence: %v", err)
+	}
+}
+
+func TestUnknownSharedProjectRouteRetryIsRejectedUntilReconciled(t *testing.T) {
+	client := &routeModelClientTest{err: errors.New("synthetic provider interruption")}
+	store, gateway, principal, claim, value := routeModelFixture(t, true, client)
+	ctx := context.Background()
+	if _, err := gateway.ClassifyConversationRoute(ctx, claim, value); err == nil {
+		t.Fatal("provider interruption reported a route decision")
+	}
+	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	var callID string
+	if err := store.pool.QueryRow(ctx, `SELECT call_id FROM conversation_route_model_calls WHERE message_id=$1 AND state='unknown'`, claim.Message.ID).Scan(&callID); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, claim.Input.ProjectID, claim.Message.ConversationID, claim.Message.ID,
+		instanceID, "route-unknown-shared-retry-001"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unknown shared model usage was blindly retried: %v", err)
+	}
+	var routeState, accountState, projectState string
+	var attempt int64
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,l.state,p.status
+FROM conversation_message_routes r JOIN conversation_route_model_calls c ON c.message_id=r.message_id
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+JOIN project_budget_ledger p ON p.project_id=c.project_id AND p.source=c.source AND p.call_id=c.call_id
+WHERE r.message_id=$1`, claim.Message.ID).Scan(&routeState, &attempt, &accountState, &projectState); err != nil ||
+		routeState != "failed" || attempt != claim.RouteAttempt || accountState != "unknown" || projectState != "unknown" || client.calls.Load() != 1 {
+		t.Fatalf("blocked retry changed execution or budget evidence: route=%q attempt=%d account=%q project=%q calls=%d err=%v",
+			routeState, attempt, accountState, projectState, client.calls.Load(), err)
+	}
+	if _, err := store.ReconcileUnknownModelCall(ctx, principal, app.ModelUsageReconcileCommand{OwnerID: principal.UserID,
+		Source: app.ModelCallRoute, CallID: callID, InputTokens: 8, OutputTokens: 3, Evidence: "synthetic provider usage confirmed"}); err != nil {
+		t.Fatalf("reconcile synthetic route usage: %v", err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, claim.Input.ProjectID, claim.Message.ConversationID, claim.Message.ID,
+		instanceID, "route-unknown-shared-retry-001"); err != nil {
+		t.Fatalf("retry reconciled route: %v", err)
+	}
+}
+
+func TestUnknownSharedPlatformRouteRetryIsRejectedUntilReconciled(t *testing.T) {
+	client := &routeModelClientTest{err: errors.New("synthetic provider interruption")}
+	store, gateway, principal, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if _, err := gateway.ClassifyConversationRoute(ctx, claim, value); err == nil {
+		t.Fatal("provider interruption reported a route decision")
+	}
+	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", claim.Message.ConversationID, claim.Message.ID,
+		instanceID, "route-unknown-platform-retry-001"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unknown shared platform usage was blindly retried: %v", err)
+	}
+	var routeState, accountState string
+	var attempt int64
+	var personal bool
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,l.state,l.personal_model
+FROM conversation_message_routes r JOIN conversation_route_model_calls c ON c.message_id=r.message_id
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE r.message_id=$1`, claim.Message.ID).Scan(&routeState, &attempt, &accountState, &personal); err != nil ||
+		routeState != "failed" || attempt != claim.RouteAttempt || accountState != "unknown" || personal || client.calls.Load() != 1 {
+		t.Fatalf("blocked platform retry changed route or usage evidence: route=%q attempt=%d account=%q personal=%t calls=%d err=%v",
+			routeState, attempt, accountState, personal, client.calls.Load(), err)
+	}
+}
+
+func TestLateRouteModelResultCannotOverrideRetryAttempt(t *testing.T) {
+	client := &routeModelClientTest{started: make(chan struct{}), release: make(chan struct{}),
+		reply:         `{"action":"new","task_id":"","question":""}`,
+		secondReply:   `{"action":"reply","task_id":"","question":"","reply":"新 attempt 的答复"}`,
+		allowRepeated: true}
+	defer releaseRouteTestClient(client)
+	store, gateway, principal, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET owner_id=$1 WHERE id=$2`, principal.UserID, value.ModelID); err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot.Context.ModelID = value.ModelID
+	type routeResult struct {
+		decision app.ConversationRouteDecision
+		err      error
+	}
+	lateResult := make(chan routeResult, 1)
+	go func() {
+		decision, err := gateway.ClassifyConversationRoute(ctx, claim, value)
+		lateResult <- routeResult{decision: decision, err: err}
+	}()
+	select {
+	case <-client.started:
+	case result := <-lateResult:
+		t.Fatalf("original route did not reach the synthetic provider: decision=%+v err=%v", result.decision, result.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("original route did not reach the synthetic provider")
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE message_id=$1`, claim.Message.ID); err != nil {
+		t.Fatal(err)
+	}
+	newLease, found, err := store.ClaimConversationRoute(ctx, "route-retry-race-takeover", time.Minute)
+	if err != nil || !found || newLease.LeaseVersion <= claim.LeaseVersion {
+		t.Fatalf("take over original attempt: claim=%+v found=%t err=%v", newLease, found, err)
+	}
+	if _, err := gateway.ClassifyConversationRoute(ctx, newLease, value); domain.CodeOf(err) != domain.CodeInvalidState || client.calls.Load() != 1 {
+		t.Fatalf("takeover repeated an uncertain provider call: calls=%d err=%v", client.calls.Load(), err)
+	}
+	if err := store.FailConversationRoute(ctx, newLease, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", claim.Message.ConversationID, claim.Message.ID, instanceID,
+		"route-late-result-retry-001"); err != nil {
+		t.Fatalf("retry unknown pure-text route: %v", err)
+	}
+	retry, found, err := store.ClaimConversationRoute(ctx, "route-retry-race-next", time.Minute)
+	if err != nil || !found || retry.RouteAttempt != claim.RouteAttempt+1 {
+		t.Fatalf("retry claim=%+v found=%t err=%v", retry, found, err)
+	}
+	retrySnapshot, err := store.LoadConversationRouteSnapshot(ctx, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrySnapshot.Context.ModelID = value.ModelID
+	decision, err := gateway.ClassifyConversationRoute(ctx, retry, retrySnapshot.Context)
+	if err != nil || decision.Action != app.ConversationRouteReply || client.calls.Load() != 2 {
+		t.Fatalf("new attempt classification=%+v calls=%d err=%v", decision, client.calls.Load(), err)
+	}
+	if err := store.ApplyConversationRoute(ctx, retry, retrySnapshot, decision); err != nil {
+		t.Fatalf("apply new attempt response: %v", err)
+	}
+	close(client.release)
+	late := <-lateResult
+	if late.err != nil || late.decision.Action != app.ConversationRouteNew {
+		t.Fatalf("old provider response did not settle its original attempt: decision=%+v err=%v", late.decision, late.err)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, oldSnapshot, late.decision); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("late response applied to the newer route attempt: %v", err)
+	}
+	var routeState, latestAnswer string
+	var taskID *string
+	var attempt int64
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,m.task_id,
+ (SELECT content FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant'
+  AND a.source_kind='conversation' ORDER BY a.sequence DESC LIMIT 1)
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).
+		Scan(&routeState, &attempt, &taskID, &latestAnswer); err != nil || routeState != "routed" || attempt != retry.RouteAttempt ||
+		taskID != nil || latestAnswer != "新 attempt 的答复" {
+		t.Fatalf("late result changed current route: state=%q attempt=%d task=%v answer=%q err=%v",
+			routeState, attempt, taskID, latestAnswer, err)
+	}
+	var oldState, newState, oldCallID, newCallID string
+	if err := store.pool.QueryRow(ctx, `SELECT
+ (SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$2),
+ (SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$3),
+ (SELECT call_id FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$2),
+ (SELECT call_id FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=$3)`,
+		claim.Message.ID, claim.RouteAttempt, retry.RouteAttempt).Scan(&oldState, &newState, &oldCallID, &newCallID); err != nil ||
+		oldState != "settled" || newState != "settled" || oldCallID == newCallID {
+		t.Fatalf("route attempts did not retain separate settlement evidence: old=%q new=%q calls=%q/%q err=%v",
+			oldState, newState, oldCallID, newCallID, err)
+	}
+}
+
+func TestRepeatedToolRequestReclassifiesOriginalDirectReplyAsOneTask(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"上次只提供了文字答复。"}`}
+	store, gateway, principal, root, contextValue := routeModelFixtureWithMemberAndContent(t, false, false, client, "分析一下 Morde 项目")
+	ctx := context.Background()
+	initial, err := gateway.ClassifyConversationRoute(ctx, root, contextValue)
+	if err != nil || initial.Action != app.ConversationRouteReply {
+		t.Fatalf("initial direct response=%+v err=%v", initial, err)
+	}
+	rootSnapshot, err := store.LoadConversationRouteSnapshot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSnapshot.Context.ModelID = contextValue.ModelID
+	if err := store.ApplyConversationRoute(ctx, root, rootSnapshot, initial); err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := app.ConversationReceiptHash(root.Message.ConversationID, root.Message.Content, root.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
+		ServiceInstanceID: root.ServiceInstanceID,
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: root.Message.OwnerID, ActorID: principal.UserID,
+			ConversationID: root.Message.ConversationID, Role: conversation.RoleUser, Content: root.Message.Content},
+		ClientID: "route-direct-reply-duplicate", RequestHash: hash, Input: root.Input, Authorization: root.Authorization,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, found, err := store.ClaimConversationRoute(ctx, "route-direct-reply-test", time.Minute)
+	if err != nil || !found || duplicate.Message.ID != message.ID {
+		t.Fatalf("claim repeated request=%+v found=%t err=%v", duplicate, found, err)
+	}
+	duplicateSnapshot, err := store.LoadConversationRouteSnapshot(ctx, duplicate)
+	if err != nil || len(duplicateSnapshot.Context.RequestCandidates) != 1 ||
+		duplicateSnapshot.Context.RequestCandidates[0].MessageID != root.Message.ID {
+		t.Fatalf("duplicate candidates=%+v err=%v", duplicateSnapshot.Context.RequestCandidates, err)
+	}
+	if err := store.ApplyConversationRoute(ctx, duplicate, duplicateSnapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: root.Message.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var rootState, rootDelivery, duplicateOf, duplicateDelivery string
+	var rootAttempt int64
+	if err := store.pool.QueryRow(ctx, `SELECT root.state,root.route_attempt,original.delivery_status,
+COALESCE(duplicate.duplicate_of_message_id,''),repeated.delivery_status
+FROM conversation_message_routes root
+JOIN conversation_messages original ON original.id=root.message_id
+JOIN conversation_message_routes duplicate ON duplicate.message_id=$2
+JOIN conversation_messages repeated ON repeated.id=duplicate.message_id
+WHERE root.message_id=$1`, root.Message.ID, duplicate.Message.ID).
+		Scan(&rootState, &rootAttempt, &rootDelivery, &duplicateOf, &duplicateDelivery); err != nil ||
+		rootState != "pending" || rootAttempt != root.RouteAttempt+1 || rootDelivery != "pending" ||
+		duplicateOf != root.Message.ID || duplicateDelivery != "pending" {
+		t.Fatalf("direct reply was not reopened with its duplicate: root=%s/%d delivery=%s link=%s duplicate=%s err=%v",
+			rootState, rootAttempt, rootDelivery, duplicateOf, duplicateDelivery, err)
+	}
+	resumed, found, err := store.ClaimConversationRoute(ctx, "route-direct-reply-test", time.Minute)
+	if err != nil || !found || resumed.Message.ID != root.Message.ID || resumed.RouteAttempt != rootAttempt {
+		t.Fatalf("reclassification claim=%+v found=%t err=%v", resumed, found, err)
+	}
+	resumedSnapshot, err := store.LoadConversationRouteSnapshot(ctx, resumed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumedSnapshot.Context.ModelID = contextValue.ModelID
+	client.reply = `{"action":"new","task_id":"","question":"","dependency_task_ids":[]}`
+	newDecision, err := gateway.ClassifyConversationRoute(ctx, resumed, resumedSnapshot.Context)
+	if err != nil || newDecision.Action != app.ConversationRouteNew {
+		t.Fatalf("reclassified request=%+v err=%v", newDecision, err)
+	}
+	resumedSnapshot.Context.ModelID = contextValue.ModelID
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyConversationRoute(ctx, resumed, resumedSnapshot, newDecision); err != nil {
+		t.Fatalf("apply resumed task classification: %v", err)
+	}
+	var taskCount, oldReplyCount int
+	var rootTaskID, duplicateTaskID, relatedTaskID, rootTaskDelivery, duplicateTaskDelivery string
+	if err := store.pool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM tasks WHERE conversation_id=$3),
+COALESCE((SELECT task_id FROM conversation_messages WHERE id=$1),''),
+COALESCE((SELECT task_id FROM conversation_messages WHERE id=$2),''),
+COALESCE((SELECT original.task_id FROM conversation_message_routes duplicate
+ JOIN conversation_messages original ON original.id=duplicate.duplicate_of_message_id WHERE duplicate.message_id=$2),''),
+(SELECT delivery_status FROM conversation_messages WHERE id=$1),
+(SELECT delivery_status FROM conversation_messages WHERE id=$2),
+(SELECT count(*) FROM conversation_messages WHERE conversation_id=$3 AND role='assistant' AND content='上次只提供了文字答复。')`,
+		root.Message.ID, duplicate.Message.ID, root.Message.ConversationID).
+		Scan(&taskCount, &rootTaskID, &duplicateTaskID, &relatedTaskID, &rootTaskDelivery, &duplicateTaskDelivery, &oldReplyCount); err != nil ||
+		taskCount != 1 || rootTaskID == "" || duplicateTaskID != "" || relatedTaskID != rootTaskID ||
+		rootTaskDelivery != "pending" || duplicateTaskDelivery != rootTaskDelivery || oldReplyCount != 1 {
+		t.Fatalf("reclassified direct reply: tasks=%d root=%s duplicate_task=%s related=%s delivery=%s/%s old_replies=%d err=%v",
+			taskCount, rootTaskID, duplicateTaskID, relatedTaskID, rootTaskDelivery, duplicateTaskDelivery, oldReplyCount, err)
+	}
+}
+
 func TestCoordinatorResumesSettledLegacyRouteDecisionWithoutRedispatch(t *testing.T) {
 	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"答案是 42。"}`}
-	_, gateway, _, claim, value := routeModelFixture(t, false, client)
+	store, gateway, _, claim, value := routeModelFixture(t, false, client)
 	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET route_attempt=0 WHERE message_id=$1`, claim.Message.ID); err != nil {
+		t.Fatalf("prepare legacy route receipt: %v", err)
+	}
+	claim.RouteAttempt = 0
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = value.ModelID
+	value = snapshot.Context
 
 	legacyDecision, err := gateway.ClassifyConversationRoute(ctx, claim, value)
 	if err != nil || legacyDecision.Action != app.ConversationRouteReply || legacyDecision.ModelOutput != client.reply {
@@ -392,6 +865,119 @@ func TestCoordinatorResumesSettledLegacyRouteDecisionWithoutRedispatch(t *testin
 	if err != nil || response.Text != client.reply || client.calls.Load() != 1 {
 		t.Fatalf("resume prior route decision through coordinator: response=%+v calls=%d err=%v", response, client.calls.Load(), err)
 	}
+}
+
+func TestCoordinatorReusesSettledAttemptZeroCallAfterRequestUpgrade(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"已保存的旧结果"}`}
+	store, gateway, _, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET route_attempt=0 WHERE message_id=$1`, claim.Message.ID); err != nil {
+		t.Fatalf("prepare legacy route receipt: %v", err)
+	}
+	claim.RouteAttempt = 0
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = value.ModelID
+	value = snapshot.Context
+
+	firstRequest := routeCoordinatorRequestRaw(t, value.ModelID, "legacy route prompt", `{"message":"hello route","history":[],"active_tasks":[]}`)
+	first, err := gateway.CompleteConversationCoordinatorModel(ctx, claim, value, "coord_session_upgrade_123", 0, firstRequest)
+	if err != nil || first.Text != client.reply || client.calls.Load() != 1 {
+		t.Fatalf("settle attempt-zero coordinator call: response=%+v calls=%d err=%v", first, client.calls.Load(), err)
+	}
+
+	changedRequest := routeCoordinatorRequestRaw(t, value.ModelID, "upgraded prompt with prior_requests", `{"message":"hello route","prior_requests":[],"history":[],"active_tasks":[]}`)
+	second, err := gateway.CompleteConversationCoordinatorModel(ctx, claim, value, "coord_session_upgrade_123", 0, changedRequest)
+	if err != nil || second.Text != first.Text || client.calls.Load() != 1 {
+		t.Fatalf("upgrade redispatched or replaced settled attempt-zero output: first=%+v second=%+v calls=%d err=%v",
+			first, second, client.calls.Load(), err)
+	}
+	var calls, ledgerRows int
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=0),
+(SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=0),
+(SELECT count(*) FROM model_call_ledger WHERE owner_id=$2 AND source='route')`, claim.Message.ID, claim.Message.ActorID).
+		Scan(&calls, &state, &ledgerRows); err != nil || calls != 1 || state != "settled" || ledgerRows != 1 {
+		t.Fatalf("attempt-zero billing evidence was duplicated: calls=%d state=%q ledger=%d err=%v", calls, state, ledgerRows, err)
+	}
+}
+
+func TestUnknownLegacyAttemptZeroCoordinatorCallDoesNotBlockFreshRetry(t *testing.T) {
+	client := &routeModelClientTest{err: errors.New("synthetic provider interruption")}
+	store, gateway, principal, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET owner_id=$1 WHERE id=$2`, principal.UserID, value.ModelID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET route_attempt=0 WHERE message_id=$1`, claim.Message.ID); err != nil {
+		t.Fatalf("prepare legacy route receipt: %v", err)
+	}
+	claim.RouteAttempt = 0
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = value.ModelID
+	value = snapshot.Context
+	legacyRequest := routeCoordinatorRequestRaw(t, value.ModelID, "legacy route prompt", `{"message":"hello route","history":[],"active_tasks":[]}`)
+	if _, err := gateway.CompleteConversationCoordinatorModel(ctx, claim, value, "coord_session_unknown_123", 0, legacyRequest); err == nil || client.calls.Load() != 1 {
+		t.Fatalf("synthetic interruption was not recorded as unknown: calls=%d err=%v", client.calls.Load(), err)
+	}
+	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryConversationRoute(ctx, principal, "", claim.Message.ConversationID, claim.Message.ID, instanceID,
+		"route-legacy-unknown-retry-001"); err != nil {
+		t.Fatalf("retry isolated personal-model unknown: %v", err)
+	}
+	retry, found, err := store.ClaimConversationRoute(ctx, "route-legacy-unknown-worker", time.Minute)
+	if err != nil || !found || retry.RouteAttempt != 1 {
+		t.Fatalf("fresh attempt claim=%+v found=%t err=%v", retry, found, err)
+	}
+	retrySnapshot, err := store.LoadConversationRouteSnapshot(ctx, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrySnapshot.Context.ModelID = value.ModelID
+	client.err = nil
+	decision, err := gateway.ClassifyConversationRoute(ctx, retry, retrySnapshot.Context)
+	if err != nil || decision.Action != app.ConversationRouteNew || client.calls.Load() != 2 {
+		t.Fatalf("fresh route attempt was blocked by old unknown: decision=%+v calls=%d err=%v", decision, client.calls.Load(), err)
+	}
+	var oldState, newState string
+	var oldAttempts, newAttempts int
+	if err := store.pool.QueryRow(ctx, `SELECT
+(SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=0),
+(SELECT state FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal' AND attempt=1),
+(SELECT count(*) FROM model_call_ledger WHERE owner_id=$2 AND source='route'),
+(SELECT count(*) FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal')`, claim.Message.ID, claim.Message.ActorID).
+		Scan(&oldState, &newState, &oldAttempts, &newAttempts); err != nil || oldState != "unknown" || newState != "settled" ||
+		oldAttempts != 2 || newAttempts != 2 {
+		t.Fatalf("legacy unknown evidence was overwritten: old=%q new=%q ledger=%d calls=%d err=%v", oldState, newState, oldAttempts, newAttempts, err)
+	}
+}
+
+func routeCoordinatorRequestRaw(t *testing.T, modelID, instructions, userText string) json.RawMessage {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]any{
+		"provider": "morde", "model": modelID,
+		"messages": []any{
+			map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": instructions}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": userText}}},
+		},
+		"tools": []any{}, "max_tokens": 256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestRouteModelLeaseTakeoverHoldsAndRecoversLateResult(t *testing.T) {

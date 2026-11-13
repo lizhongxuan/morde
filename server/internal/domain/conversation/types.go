@@ -96,6 +96,8 @@ type Message struct {
 	Role                      Role
 	Content                   string
 	TaskID                    string
+	DuplicateOfMessageID      string
+	RelatedTaskID             string
 	AttachmentIDs             []string
 	ClientMessageID           string
 	RoutingStatus             RoutingStatus

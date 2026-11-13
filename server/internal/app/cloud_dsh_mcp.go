@@ -172,6 +172,11 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 			return githubMCPRequestHeaders(connector.EndpointURL, headers), nil
 		},
 	}
+	ctx = withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
+	if activity, ok := cloudDSHToolActivityFromContext(ctx); ok {
+		activity.displayObject = source.connectorName
+		ctx = context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
+	}
 	if result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source); handled || err != nil {
 		return result, err
 	}
@@ -193,7 +198,7 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 	pending := details.PendingRequest
 	sameApproval := sameMCPConnectorApproval(pending, current, call, hash, fence)
 	if pending != nil && pending.Status == task.PendingRequestPending {
-		result, err := b.pauseForExistingMCPApproval(ctx, details, pending)
+		result, err := b.pauseForExistingMCPApproval(ctx, details, pending, source.remoteTool)
 		return result, true, err
 	}
 	if sameApproval {
@@ -210,7 +215,7 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 				return result, true, err
 			}
 			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
-				"External MCP action rejected", "The connected service was not called.")
+				"Run cloud dsh MCP tool: "+source.remoteTool, "The connected service was not called.")
 			if err != nil {
 				return AgentToolResult{}, true, err
 			}
@@ -222,7 +227,7 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 		}
 	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
-		"Approve external MCP action: "+source.remoteTool, "Waiting for approval before calling the connected service.")
+		"Run cloud dsh MCP tool: "+source.remoteTool, "Waiting for approval before calling the connected service.")
 	if err != nil {
 		return AgentToolResult{}, true, err
 	}
@@ -233,10 +238,10 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 	return result, true, err
 }
 
-func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, details TaskDetails, pending *task.PendingRequest) (AgentToolResult, error) {
+func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, details TaskDetails, pending *task.PendingRequest, remoteTool string) (AgentToolResult, error) {
 	current := details.Task
 	step, err := newAgentStep(details.Task.ID, maxStepSequence(details.Steps)+1, "tool", task.StepWaitingUser,
-		"Approval required: "+pending.ToolName, pending.Content)
+		"Run cloud dsh MCP tool: "+remoteTool, pending.Content)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -552,7 +557,7 @@ func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskD
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task execution budget is exhausted")
 	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
-		"Run cloud dsh MCP tool: "+call.Name, "Checking the task grant, connector version, and call ledger.")
+		"Run cloud dsh MCP tool: "+source.remoteTool, "Checking the task grant, connector version, and call ledger.")
 	if err != nil {
 		return AgentToolResult{}, err
 	}

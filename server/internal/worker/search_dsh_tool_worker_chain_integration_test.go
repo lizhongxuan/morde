@@ -239,7 +239,7 @@ func TestDSHSearchReadThroughBrokerPersistsSourceDateAndWorkChain(t *testing.T) 
 	steps := map[string]task.Step{}
 	for _, step := range run.details.Steps {
 		for _, name := range []string{"morde_web_search", "morde_web_read"} {
-			if step.Title == "Run cloud dsh MCP tool: "+name {
+			if step.ToolName == name {
 				steps[name] = step
 			}
 		}

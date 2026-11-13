@@ -328,6 +328,14 @@ WHERE id=$1 AND task_id IS NULL AND owner_id=$3 AND actor_id=$4 AND conversation
 			if _, err := tx.Exec(ctx, `UPDATE task_revision_intents SET state='applied',updated_at=clock_timestamp() WHERE message_id=$1 AND state='stopping'`, revision.claim.Message.ID); err != nil {
 				return fmt.Errorf("apply task revision intent: %w", err)
 			}
+			if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: ownerID,
+				ObjectType: "message", ObjectID: revision.claim.Message.ID, Operation: "upsert",
+				MutationID: revision.claim.Message.ClientMessageID}); err != nil {
+				return err
+			}
+			if err := syncConversationDuplicateMessages(ctx, tx, revision.claim.Message.ID); err != nil {
+				return err
+			}
 		}
 		var sequence int64
 		err = tx.QueryRow(ctx, `UPDATE tasks SET status='queued',current_revision=desired_revision,lease_version=lease_version+1,file_delivery_intent=$5,
