@@ -15,6 +15,12 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 	for _, definition := range cloudDSHBuiltinSearchDefinitions() {
 		toolNames[definition.Name] = struct{}{}
 	}
+	for _, definition := range cloudDSHGoalToolDefinitions() {
+		toolNames[definition.Name] = struct{}{}
+	}
+	for _, definition := range cloudDSHScheduleToolDefinitions() {
+		toolNames[definition.Name] = struct{}{}
+	}
 	toolNames[cloudDSHTaskAttachmentReadToolName] = struct{}{}
 
 	mordeToolReference := regexp.MustCompile(`\bmorde_[a-z_]+\b`)
@@ -38,7 +44,7 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 		allowedSkillIDs[id] = struct{}{}
 	}
 
-	for _, id := range []string{"task-management", "knowledge-organization", "wide-research", "translation", "meeting-follow-up", "app-creation"} {
+	for _, id := range []string{"task-management", "knowledge-organization", "wide-research", "translation", "meeting-follow-up", "app-creation", "email-management", "meeting-preparation", "scheduling", "weekly-review-planning"} {
 		t.Run(id, func(t *testing.T) {
 			skill, ok := cloudDSHSkillForID(id)
 			if !ok {
@@ -79,6 +85,24 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 				!strings.Contains(text, "does not read calendars") || !strings.Contains(text, "create external tasks")) {
 				t.Errorf("meeting-follow-up does not state its source and action limits")
 			}
+			if id == "email-management" && (!strings.Contains(text, "does not grant mailbox access") ||
+				!strings.Contains(text, cloudDSHTaskAttachmentReadToolName) || !strings.Contains(text, "Send only when the user explicitly requests")) {
+				t.Errorf("email-management does not enforce source and send authorization limits")
+			}
+			if id == "scheduling" && (!strings.Contains(text, "does not grant calendar access") ||
+				!strings.Contains(text, "label every option provisional") || !strings.Contains(text, "daylight-saving")) {
+				t.Errorf("scheduling does not preserve availability and time-zone uncertainty")
+			}
+			if id == "meeting-preparation" && (!strings.Contains(text, cloudDSHTaskAttachmentReadToolName) ||
+				!strings.Contains(text, "do not guess from Morde recurring schedules") ||
+				!strings.Contains(text, "Do not send invitations")) {
+				t.Errorf("meeting-preparation confuses schedules with calendar events or permits unrequested writes")
+			}
+			if id == "weekly-review-planning" && (!strings.Contains(text, cloudDSHTaskAttachmentReadToolName) ||
+				!strings.Contains(text, "not calendar events") ||
+				!strings.Contains(text, "Do not overwrite an existing review")) {
+				t.Errorf("weekly-review-planning confuses Morde schedules or overwrites prior reviews")
+			}
 			if id == "app-creation" {
 				for _, name := range []string{runtimeToolShellExec, runtimeToolFileRead, runtimeToolFileWrite,
 					runtimeToolFileList, runtimeToolFileFind, runtimeToolBrowserOpenTab, runtimeToolBrowserSnapshot} {
@@ -114,5 +138,10 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 				}
 			}
 		})
+	}
+	for _, id := range []string{"inbox-triage", "meeting-prep", "weekly-review"} {
+		if _, ok := allowedSkillIDs[id]; ok {
+			t.Errorf("legacy Muse skill %q remains available to new Tasks", id)
+		}
 	}
 }

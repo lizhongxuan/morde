@@ -1,6 +1,7 @@
 package mcpconnector
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -31,11 +32,15 @@ func TestConnectorOAuthPKCEExchangeAndRefresh(t *testing.T) {
 			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource", scope="read write"`)
 		case "mcp.example.test/.well-known/oauth-protected-resource":
 			status = http.StatusOK
-			body = `{"resource":"https://mcp.example.test/mcp","authorization_servers":["https://auth.example.test/tenant"]}`
+			body = `{"resource":"https://mcp.example.test/mcp","authorization_servers":["https://auth.example.test/tenant"],"scopes_supported":["read","write","admin"]}`
 		case "auth.example.test/.well-known/oauth-authorization-server/tenant":
 			status = http.StatusOK
 			body = `{"issuer":"https://auth.example.test/tenant","authorization_endpoint":"https://auth.example.test/authorize","token_endpoint":"https://auth.example.test/token","registration_endpoint":"https://auth.example.test/register","code_challenge_methods_supported":["S256"]}`
 		case "auth.example.test/register":
+			var registration map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&registration); err != nil || registration["scope"] != "read write" {
+				t.Fatalf("registration expanded the challenged scope: %v, %v", registration, err)
+			}
 			status = http.StatusCreated
 			body = `{"client_id":"registered-client","token_endpoint_auth_method":"none"}`
 		case "auth.example.test/token":
@@ -100,47 +105,133 @@ func TestConnectorOAuthPKCEExchangeAndRefresh(t *testing.T) {
 	}
 }
 
-func TestConnectorOAuthDoesNotRequestEveryAdvertisedScope(t *testing.T) {
-	client := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(request *http.Request) (*http.Response, error) {
-		status, body := http.StatusOK, ""
-		headers := make(http.Header)
-		switch request.URL.Host + request.URL.Path {
-		case "mcp.example.test/mcp":
-			status = http.StatusUnauthorized
-			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource"`)
-		case "mcp.example.test/.well-known/oauth-protected-resource":
-			body = `{"resource":"https://mcp.example.test/mcp","authorization_servers":["https://auth.example.test"],"scopes_supported":["read","write","admin"]}`
-		case "auth.example.test/.well-known/oauth-authorization-server":
-			body = `{"issuer":"https://auth.example.test","authorization_endpoint":"https://auth.example.test/authorize","token_endpoint":"https://auth.example.test/token","registration_endpoint":"https://auth.example.test/register","code_challenge_methods_supported":["S256"]}`
-		case "auth.example.test/register":
-			var registration map[string]any
-			if err := json.NewDecoder(request.Body).Decode(&registration); err != nil {
-				t.Fatal(err)
+func TestConnectorOAuthRejectsExpandedTokenScope(t *testing.T) {
+	for _, test := range []struct {
+		name, operation, requested, returned, want string
+		wantErr                                    bool
+	}{
+		{name: "exchange expansion", operation: "exchange", requested: "read", returned: "read write", wantErr: true},
+		{name: "exchange narrowing", operation: "exchange", requested: "read write", returned: "read", want: "read"},
+		{name: "exchange unchanged", operation: "exchange", requested: "read", want: "read"},
+		{name: "refresh expansion", operation: "refresh", requested: "read", returned: "read write", wantErr: true},
+		{name: "refresh narrowing", operation: "refresh", requested: "read write", returned: "read", want: "read"},
+		{name: "refresh unchanged", operation: "refresh", requested: "read", want: "read"},
+		{name: "invalid returned scope", operation: "refresh", requested: "read", returned: "read\twrite", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(request *http.Request) (*http.Response, error) {
+				if request.URL.String() != "https://auth.example.test/token" {
+					t.Fatalf("unexpected token request: %s", request.URL)
+				}
+				body, err := json.Marshal(map[string]any{"access_token": "synthetic", "scope": test.returned})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: request}, nil
+			})}
+			registration := ConnectorOAuthRegistration{ClientID: "client", AuthMethod: "none"}
+			var got ConnectorOAuthCredentials
+			var err error
+			if test.operation == "exchange" {
+				payload, marshalErr := json.Marshal(connectorOAuthFlow{Verifier: "v", TokenEndpoint: "https://auth.example.test/token",
+					RedirectURI: "https://portal.example.test/api/mcp/oauth/callback", Registration: registration, Scope: test.requested})
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				got, err = client.Exchange(context.Background(), payload, "code", "")
+			} else {
+				got, err = client.Refresh(context.Background(), ConnectorOAuthCredentials{TokenEndpoint: "https://auth.example.test/token",
+					Registration: registration, RefreshToken: "synthetic-refresh", Scope: test.requested})
 			}
-			if _, requested := registration["scope"]; requested {
-				t.Fatalf("dynamic registration requested all advertised scopes: %v", registration)
+			if test.wantErr {
+				if err == nil || got.AccessToken != "" {
+					t.Fatalf("expanded or invalid scope was accepted: credentials=%+v err=%v", got, err)
+				}
+			} else if err != nil || got.Scope != test.want {
+				t.Fatalf("scope=%q want=%q err=%v", got.Scope, test.want, err)
 			}
-			status, body = http.StatusCreated, `{"client_id":"registered-client","token_endpoint_auth_method":"none"}`
-		default:
-			t.Fatalf("unexpected OAuth request: %s %s", request.Method, request.URL)
-		}
-		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
-	})}
-
-	start, err := client.Begin(context.Background(), "https://mcp.example.test/mcp", "https://portal.example.test/api/mcp/oauth/callback", "", "", nil)
-	if err != nil || start.ClientRequired {
-		t.Fatalf("Begin() = %#v, %v", start, err)
+		})
 	}
-	parsed, err := url.Parse(start.AuthorizationURL)
+}
+
+func TestConnectorOAuthRejectsUnscopedLegacyBeforeTokenRequest(t *testing.T) {
+	client := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unscoped OAuth data reached the token endpoint")
+		return nil, nil
+	})}
+	registration := ConnectorOAuthRegistration{ClientID: "client", AuthMethod: "none"}
+	payload, err := json.Marshal(connectorOAuthFlow{Verifier: "v", TokenEndpoint: "https://auth.example.test/token",
+		RedirectURI: "https://portal.example.test/api/mcp/oauth/callback", Registration: registration})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Query().Has("scope") {
-		t.Fatalf("authorization URL requested scopes absent from the challenge: %v", parsed.Query())
+	if _, err := client.Exchange(context.Background(), payload, "code", ""); err == nil {
+		t.Fatal("accepted an unscoped OAuth flow")
 	}
-	var flow connectorOAuthFlow
-	if err := json.Unmarshal(start.Payload, &flow); err != nil || flow.Scope != "" {
-		t.Fatalf("OAuth flow scope = %q, %v", flow.Scope, err)
+	if _, err := client.Refresh(context.Background(), ConnectorOAuthCredentials{TokenEndpoint: "https://auth.example.test/token",
+		Registration: registration, RefreshToken: "legacy-refresh"}); err == nil {
+		t.Fatal("accepted an unscoped OAuth credential")
+	}
+}
+
+func TestConnectorOAuthRejectsMissingScopeBeforeRegistration(t *testing.T) {
+	var requests int
+	client := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(request *http.Request) (*http.Response, error) {
+		requests++
+		headers := make(http.Header)
+		if request.URL.Host+request.URL.Path != "mcp.example.test/mcp" {
+			t.Fatalf("unexpected OAuth request: %s %s", request.Method, request.URL)
+		}
+		headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource"`)
+		return &http.Response{StatusCode: http.StatusUnauthorized, Header: headers, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})}
+
+	if start, err := client.Begin(context.Background(), "https://mcp.example.test/mcp", "https://portal.example.test/api/mcp/oauth/callback", "", "", nil); err == nil || start.AuthorizationURL != "" || requests != 1 {
+		t.Fatalf("missing scope should be refused before discovery or registration: start=%#v requests=%d err=%v", start, requests, err)
+	}
+}
+
+func TestConnectorOAuthChallengeCannotExpandExistingAuthorization(t *testing.T) {
+	for _, test := range []struct {
+		name, oldScope, challenge string
+		wantErr                   bool
+	}{
+		{name: "broader challenge", oldScope: "read", challenge: "read write", wantErr: true},
+		{name: "unknown old scope", challenge: "read", wantErr: true},
+		{name: "narrower challenge", oldScope: "read write", challenge: "read"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requests int
+			client := &ConnectorOAuthClient{transport: connectorOAuthRoundTripper(func(request *http.Request) (*http.Response, error) {
+				requests++
+				status, body := http.StatusOK, ""
+				headers := make(http.Header)
+				switch request.URL.Host + request.URL.Path {
+				case "mcp.example.test/mcp":
+					status = http.StatusUnauthorized
+					headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource", scope="`+test.challenge+`"`)
+				case "mcp.example.test/resource":
+					body = `{"authorization_servers":["https://auth.example.test"],"scopes_supported":["read","write","admin"]}`
+				case "auth.example.test/.well-known/oauth-authorization-server":
+					body = `{"issuer":"https://auth.example.test","authorization_endpoint":"https://auth.example.test/authorize","token_endpoint":"https://auth.example.test/token","token_endpoint_auth_methods_supported":["none"]}`
+				default:
+					t.Fatalf("unexpected request: %s", request.URL)
+				}
+				return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+			})}
+			start, err := client.Begin(context.Background(), "https://mcp.example.test/mcp", "https://portal.example.test/api/mcp/oauth/callback",
+				"client", "", &ConnectorOAuthCredentials{Scope: test.oldScope})
+			if test.wantErr {
+				if err == nil || start.AuthorizationURL != "" || requests != 1 {
+					t.Fatalf("broader challenge was accepted: start=%+v requests=%d err=%v", start, requests, err)
+				}
+				return
+			}
+			parsed, parseErr := url.Parse(start.AuthorizationURL)
+			if err != nil || parseErr != nil || parsed.Query().Get("scope") != test.challenge {
+				t.Fatalf("narrower challenge: start=%+v err=%v parse=%v", start, err, parseErr)
+			}
+		})
 	}
 }
 
@@ -152,7 +243,7 @@ func TestConnectorOAuthRequiresManualClientAndRejectsUnsafeMetadata(t *testing.T
 		switch request.URL.Host + request.URL.Path {
 		case "mcp.example.test/mcp":
 			status = http.StatusUnauthorized
-			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource"`)
+			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource", scope="read"`)
 		case "mcp.example.test/resource":
 			status, body = http.StatusOK, `{"authorization_servers":["https://auth.example.test"]}`
 		case "auth.example.test/.well-known/oauth-authorization-server":
@@ -179,7 +270,7 @@ func TestConnectorOAuthRequiresManualClientAndRejectsUnsafeMetadata(t *testing.T
 		switch request.URL.Host + request.URL.Path {
 		case "mcp.example.test/mcp":
 			status = http.StatusUnauthorized
-			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource"`)
+			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource", scope="read"`)
 		case "mcp.example.test/resource":
 			status, body = http.StatusOK, `{"authorization_servers":["https://auth.example.test"]}`
 		case "auth.example.test/.well-known/oauth-authorization-server":
@@ -217,7 +308,7 @@ func TestConnectorOAuthManualClientUsesAdvertisedAuthenticationMethod(t *testing
 				switch request.URL.Host + request.URL.Path {
 				case "mcp.example.test/mcp":
 					status = http.StatusUnauthorized
-					headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource"`)
+					headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/resource", scope="read"`)
 				case "mcp.example.test/resource":
 					body = `{"authorization_servers":["https://auth.example.test"]}`
 				case "auth.example.test/.well-known/oauth-authorization-server":
@@ -283,7 +374,7 @@ func TestConnectorOAuthTokenRedirectIsRejected(t *testing.T) {
 	})}
 	payload, err := json.Marshal(connectorOAuthFlow{
 		Verifier: "v", TokenEndpoint: "https://auth.example.test/token", RedirectURI: "https://portal.example.test/api/mcp/oauth/callback",
-		Registration: ConnectorOAuthRegistration{ClientID: "id", AuthMethod: "none"}, Resource: "https://mcp.example.test/mcp",
+		Registration: ConnectorOAuthRegistration{ClientID: "id", AuthMethod: "none"}, Resource: "https://mcp.example.test/mcp", Scope: "read",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +403,7 @@ func TestConnectorOAuthPublicHelpersValidateStateFlowAndBearerExpiry(t *testing.
 	}
 
 	now := time.Unix(1_800_000_000, 0)
-	credentials := ConnectorOAuthCredentials{AccessToken: "access-token", ExpiresAt: now.Add(time.Minute).UnixMilli()}
+	credentials := ConnectorOAuthCredentials{AccessToken: "access-token", ExpiresAt: now.Add(time.Minute).UnixMilli(), Scope: "read"}
 	if got := credentials.AuthorizationHeader(now); got != "Bearer access-token" {
 		t.Fatalf("AuthorizationHeader() = %q", got)
 	}
@@ -323,8 +414,12 @@ func TestConnectorOAuthPublicHelpersValidateStateFlowAndBearerExpiry(t *testing.
 	if got := credentials.AuthorizationHeader(now); got != "" {
 		t.Fatalf("AuthorizationHeader() returned an empty token: %q", got)
 	}
+	credentials.AccessToken, credentials.Scope = "legacy-token", ""
+	if got := credentials.AuthorizationHeader(now); got != "" {
+		t.Fatalf("AuthorizationHeader() accepted an unscoped legacy token: %q", got)
+	}
 
-	valid := json.RawMessage(`{"verifier":"v","token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/callback","registration":{"client_id":"id"}}`)
+	valid := json.RawMessage(`{"verifier":"v","token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/callback","registration":{"client_id":"id"},"scope":"read"}`)
 	if err := ValidateConnectorOAuthFlowPayload(valid); err != nil {
 		t.Fatalf("ValidateConnectorOAuthFlowPayload(valid) = %v", err)
 	}
@@ -333,6 +428,7 @@ func TestConnectorOAuthPublicHelpersValidateStateFlowAndBearerExpiry(t *testing.
 		"malformed":        []byte(`{"`),
 		"missing verifier": []byte(`{"token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/callback","registration":{"client_id":"id"}}`),
 		"missing client":   []byte(`{"verifier":"v","token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/callback"}`),
+		"missing scope":    []byte(`{"verifier":"v","token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/callback","registration":{"client_id":"id"}}`),
 		"unsafe endpoint":  []byte(`{"verifier":"v","token_endpoint":"http://auth.example.test/token","redirect_uri":"https://portal.example.test/callback","registration":{"client_id":"id"}}`),
 		"oversized":        []byte(strings.Repeat(" ", connectorOAuthResponseLimit+1)),
 	} {
@@ -354,7 +450,7 @@ func TestConnectorOAuthRetriesRegistrationAndUsesClientSecretBasic(t *testing.T)
 		switch request.URL.Host + request.URL.Path {
 		case "mcp.example.test/mcp":
 			status = http.StatusUnauthorized
-			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource"`)
+			headers.Set("WWW-Authenticate", `Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource", scope="read"`)
 		case "mcp.example.test/.well-known/oauth-protected-resource":
 			body = `{"authorization_servers":["https://auth.example.test"]}`
 		case "auth.example.test/.well-known/oauth-authorization-server":

@@ -403,6 +403,11 @@ func TestCloudDSHToolBrokerReadsFixedNanoMuseSkillAndReplaysWithoutRecharging(t 
 			if definition.RequiredScope != identity.ScopeTaskRead || !validAgentJSONObject(definition.Parameters, maxAgentToolSchemaBytes) {
 				t.Fatalf("skill tool definition is invalid: %#v", definition)
 			}
+			for _, id := range []string{"inbox-triage", "meeting-prep", "weekly-review"} {
+				if strings.Contains(definition.Description, id+":") {
+					t.Errorf("deprecated skill %q was exposed to new Tasks", id)
+				}
+			}
 		}
 	}
 	if !found {
@@ -452,6 +457,18 @@ func TestCloudDSHToolBrokerReadsFixedNanoMuseSkillAndReplaysWithoutRecharging(t 
 	if _, err := broker.Execute(context.Background(), claimed, unknown); domain.CodeOf(err) != domain.CodeForbidden ||
 		store.details.Task.Usage.ToolCalls != 1 || len(store.events) != 1 {
 		t.Fatalf("unknown skill was not rejected: err=%v usage=%+v events=%d", err, store.details.Task.Usage, len(store.events))
+	}
+	legacy := ModelToolCall{CallID: "call_legacy_skill", Name: cloudDSHSkillReadToolName, Arguments: `{"skill_id":"weekly-review"}`}
+	if _, err := broker.Execute(context.Background(), claimed, legacy); domain.CodeOf(err) != domain.CodeForbidden ||
+		store.details.Task.Usage.ToolCalls != 1 || len(store.events) != 1 {
+		t.Fatalf("deprecated skill was available to a new Task: err=%v usage=%+v events=%d", err,
+			store.details.Task.Usage, len(store.events))
+	}
+	legacyReplay, err := broker.Reconcile(context.Background(), claimed, legacy, nil)
+	if err != nil || legacyReplay.Status != AgentToolSucceeded || !strings.Contains(legacyReplay.Output, `"skill_id":"weekly-review"`) ||
+		store.details.Task.Usage.ToolCalls != 2 || len(store.events) != 2 {
+		t.Fatalf("deprecated skill could not recover an existing checkpoint: result=%#v err=%v usage=%+v events=%d", legacyReplay, err,
+			store.details.Task.Usage, len(store.events))
 	}
 }
 
@@ -547,11 +564,13 @@ func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T)
 
 func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	definition := cloudDSHSkillReadDefinition()
-	if len(cloudDSHSkillCatalog) != 18 || len(definition.Description) > 2048 || !strings.Contains(definition.Description, "weekly-review") ||
+	if len(cloudDSHSkillCatalog) != 22 || len(definition.Description) > 2048 || !strings.Contains(definition.Description, "weekly-review-planning") ||
+		strings.Contains(definition.Description, "Legacy Muse") ||
 		!strings.Contains(definition.Description, "amap") || !strings.Contains(definition.Description, "Morde skill") ||
 		!strings.Contains(definition.Description, "markdown-docs") || !strings.Contains(definition.Description, "wide-research") ||
 		!strings.Contains(definition.Description, "translation") || !strings.Contains(definition.Description, "meeting-follow-up") ||
-		!strings.Contains(definition.Description, "app-creation") ||
+		!strings.Contains(definition.Description, "app-creation") || !strings.Contains(definition.Description, "email-management") ||
+		!strings.Contains(definition.Description, "scheduling") ||
 		strings.Contains(definition.Description, "nanoMuse skill") {
 		t.Fatalf("skill catalog does not expose all built-ins: %d, %s", len(cloudDSHSkillCatalog), definition.Description)
 	}
@@ -579,7 +598,9 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 			strings.Contains(string(content), "author: nanoMuse") {
 			t.Fatalf("embedded skill %q is unavailable: %v", skill.id, err)
 		}
-		toolIDs = append(toolIDs, skill.id)
+		if !skill.deprecated {
+			toolIDs = append(toolIDs, skill.id)
+		}
 	}
 	if len(schema.Properties["skill_id"].Enum) != len(toolIDs) {
 		t.Fatalf("skill tool allowlist differs from the embedded catalog: %#v", schema.Properties)

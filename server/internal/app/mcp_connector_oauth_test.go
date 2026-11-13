@@ -61,6 +61,23 @@ func (client *mcpConnectorOAuthClientStub) Refresh(context.Context, mcpconnector
 	return client.refreshed, nil
 }
 
+func TestMCPConnectorOAuthDoesNotStoreFlowWithoutExplicitScope(t *testing.T) {
+	service, store, _ := mcpConnectorTestService(t)
+	principal := mcpConnectorPrincipal("u1234567")
+	created, err := service.Create(context.Background(), principal, CreateMCPConnectorCommand{Name: "Example", EndpointURL: "https://mcp.example.test/mcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{6}, 32))
+	service.oauthClient = &mcpConnectorOAuthClientStub{start: mcpconnector.ConnectorOAuthStart{
+		AuthorizationURL: "https://auth.example.test/authorize?state=" + state, State: state,
+		Payload: []byte(`{"verifier":"v","token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/api/mcp/oauth/callback","registration":{"client_id":"client"}}`),
+	}}
+	if _, err := service.BeginOAuth(context.Background(), principal, created.ID, created.Revision, "", ""); domain.CodeOf(err) != domain.CodeInternal || len(store.flows) != 0 {
+		t.Fatalf("missing scope stored an OAuth flow: error=%v flows=%d", err, len(store.flows))
+	}
+}
+
 func TestMCPConnectorOAuthCallbackEncryptsTokensAndRefreshesWithCAS(t *testing.T) {
 	service, store, sealer := mcpConnectorTestService(t)
 	principal := mcpConnectorPrincipal("u1234567")
@@ -75,7 +92,7 @@ func TestMCPConnectorOAuthCallbackEncryptsTokensAndRefreshesWithCAS(t *testing.T
 		"verifier": "one-time-pkce-verifier", "issuer": "https://auth.example.test",
 		"authorization_endpoint": "https://auth.example.test/authorize", "token_endpoint": "https://auth.example.test/token",
 		"resource": "https://mcp.example.test/mcp", "registration": map[string]string{"client_id": "client", "auth_method": "none"},
-		"redirect_uri": "https://portal.example.test/api/mcp/oauth/callback",
+		"redirect_uri": "https://portal.example.test/api/mcp/oauth/callback", "scope": "read",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -88,13 +105,13 @@ func TestMCPConnectorOAuthCallbackEncryptsTokensAndRefreshesWithCAS(t *testing.T
 			Issuer: "https://auth.example.test", AuthorizationEndpoint: "https://auth.example.test/authorize",
 			TokenEndpoint: "https://auth.example.test/token", Resource: "https://mcp.example.test/mcp",
 			Registration: mcpconnector.ConnectorOAuthRegistration{ClientID: "client", AuthMethod: "none"},
-			AccessToken:  "access-before-refresh", RefreshToken: "refresh-before-refresh", ExpiresAt: time.Now().Add(5 * time.Second).UnixMilli(), ExpiresIn: 3600,
+			AccessToken:  "access-before-refresh", RefreshToken: "refresh-before-refresh", ExpiresAt: time.Now().Add(5 * time.Second).UnixMilli(), ExpiresIn: 3600, Scope: "read",
 		},
 		refreshed: mcpconnector.ConnectorOAuthCredentials{
 			Issuer: "https://auth.example.test", AuthorizationEndpoint: "https://auth.example.test/authorize",
 			TokenEndpoint: "https://auth.example.test/token", Resource: "https://mcp.example.test/mcp",
 			Registration: mcpconnector.ConnectorOAuthRegistration{ClientID: "client", AuthMethod: "none"},
-			AccessToken:  "rotated-access-token", RefreshToken: "rotated-refresh-token", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), ExpiresIn: 3600,
+			AccessToken:  "rotated-access-token", RefreshToken: "rotated-refresh-token", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), ExpiresIn: 3600, Scope: "read",
 		},
 	}
 	service.oauthClient = client
@@ -156,7 +173,7 @@ func TestMCPConnectorOAuthProviderDenialConsumesState(t *testing.T) {
 	state := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32))
 	payload, _ := json.Marshal(map[string]any{
 		"verifier": "verifier", "issuer": "https://auth.example.test", "token_endpoint": "https://auth.example.test/token",
-		"registration": map[string]string{"client_id": "client", "auth_method": "none"}, "redirect_uri": "https://portal.example.test/api/mcp/oauth/callback",
+		"registration": map[string]string{"client_id": "client", "auth_method": "none"}, "redirect_uri": "https://portal.example.test/api/mcp/oauth/callback", "scope": "read",
 	})
 	service.oauthClient = &mcpConnectorOAuthClientStub{start: mcpconnector.ConnectorOAuthStart{
 		AuthorizationURL: "https://auth.example.test/authorize?state=" + state, State: state, Payload: payload,
@@ -186,7 +203,7 @@ func TestMCPConnectorOAuthStaleConnectorDoesNotExchangeCode(t *testing.T) {
 		"verifier": "one-time-pkce-verifier", "issuer": "https://auth.example.test",
 		"authorization_endpoint": "https://auth.example.test/authorize", "token_endpoint": "https://auth.example.test/token",
 		"resource": "https://mcp.example.test/mcp", "registration": map[string]string{"client_id": "client", "auth_method": "none"},
-		"redirect_uri": "https://portal.example.test/api/mcp/oauth/callback",
+		"redirect_uri": "https://portal.example.test/api/mcp/oauth/callback", "scope": "read",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -209,5 +226,29 @@ func TestMCPConnectorOAuthStaleConnectorDoesNotExchangeCode(t *testing.T) {
 	if client.exchangeCalls != 0 || store.values[created.ID].CredentialVersion != 0 || len(store.values[created.ID].CredentialCipher) != 0 || len(store.flows) != 0 {
 		t.Fatalf("stale callback exchanged or stored credentials: exchanges=%d connector=%#v remaining_flows=%d",
 			client.exchangeCalls, store.values[created.ID], len(store.flows))
+	}
+}
+
+func TestMCPConnectorOAuthDeletedConnectorDoesNotExchangeCode(t *testing.T) {
+	service, store, _ := mcpConnectorTestService(t)
+	principal := mcpConnectorPrincipal("u1234567")
+	created, err := service.Create(context.Background(), principal, CreateMCPConnectorCommand{Name: "Example", EndpointURL: "https://mcp.example.test/mcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{10}, 32))
+	client := &mcpConnectorOAuthClientStub{start: mcpconnector.ConnectorOAuthStart{
+		AuthorizationURL: "https://auth.example.test/authorize?state=" + state, State: state,
+		Payload: []byte(`{"verifier":"v","token_endpoint":"https://auth.example.test/token","redirect_uri":"https://portal.example.test/api/mcp/oauth/callback","registration":{"client_id":"client"},"scope":"read"}`),
+	}}
+	service.oauthClient = client
+	if _, err := service.BeginOAuth(context.Background(), principal, created.ID, created.Revision, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Delete(context.Background(), principal, created.ID, MCPConnectorRevisionCommand{ExpectedRevision: created.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CompleteOAuth(context.Background(), state, "authorization-code", "", ""); domain.CodeOf(err) != domain.CodeNotFound || client.exchangeCalls != 0 || len(store.flows) != 0 {
+		t.Fatalf("deleted connector exchanged a code or retained its flow: err=%v calls=%d flows=%d", err, client.exchangeCalls, len(store.flows))
 	}
 }

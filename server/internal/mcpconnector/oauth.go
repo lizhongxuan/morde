@@ -134,6 +134,13 @@ func (client *ConnectorOAuthClient) Begin(ctx context.Context, connectorURL, red
 		return ConnectorOAuthStart{}, errors.New("MCP server does not advertise OAuth authorization")
 	}
 	fields := parseOAuthChallenge(challenge)
+	scope := fields["scope"]
+	if _, ok := oauthScopes(scope); !ok {
+		return ConnectorOAuthStart{}, errors.New("MCP server did not provide a valid explicit OAuth scope")
+	}
+	if previous != nil && !oauthScopeSubset(scope, previous.Scope) {
+		return ConnectorOAuthStart{}, errors.New("MCP server requested broader OAuth scope than the existing authorization")
+	}
 	resourceMeta, err := client.discoverProtectedResource(ctx, endpoint, fields)
 	if err != nil {
 		return ConnectorOAuthStart{}, errors.New("MCP server OAuth metadata is unavailable")
@@ -149,13 +156,11 @@ func (client *ConnectorOAuthClient) Begin(ctx context.Context, connectorURL, red
 	if len(authorizationServer.CodeChallengeMethodsSupported) > 0 && !containsOAuthValue(authorizationServer.CodeChallengeMethodsSupported, "S256") {
 		return ConnectorOAuthStart{}, errors.New("MCP authorization server does not support PKCE S256")
 	}
-	scope := fields["scope"]
-	// scopes_supported lists capabilities; it does not authorize requesting every listed scope.
 	resource := resourceMeta.Resource
 	if resource == "" {
 		resource = connectorURL
 	}
-	if len(scope) > 2048 || !validOAuthResource(resource) {
+	if !validOAuthResource(resource) {
 		return ConnectorOAuthStart{}, errors.New("MCP protected resource metadata is invalid")
 	}
 	redirect := redirectURI
@@ -220,6 +225,9 @@ func (client *ConnectorOAuthClient) Exchange(ctx context.Context, payload []byte
 		!validOAuthURI(flow.TokenEndpoint, false) || !validOAuthURI(flow.RedirectURI, false) {
 		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth flow data is invalid")
 	}
+	if _, ok := oauthScopes(flow.Scope); !ok {
+		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth flow scope is invalid")
+	}
 	if callbackIssuer != "" && callbackIssuer != flow.Issuer {
 		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth callback issuer does not match")
 	}
@@ -230,6 +238,9 @@ func (client *ConnectorOAuthClient) Exchange(ctx context.Context, payload []byte
 	tokens, err := client.tokenRequest(ctx, flow.TokenEndpoint, form, flow.Registration)
 	if err != nil {
 		return ConnectorOAuthCredentials{}, err
+	}
+	if tokens.Scope != "" && !oauthScopeSubset(tokens.Scope, flow.Scope) {
+		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth token scope exceeds the requested scope")
 	}
 	return ConnectorOAuthCredentials{
 		Issuer: flow.Issuer, AuthorizationEndpoint: flow.AuthorizationEndpoint, TokenEndpoint: flow.TokenEndpoint,
@@ -242,6 +253,9 @@ func (client *ConnectorOAuthClient) Refresh(ctx context.Context, credentials Con
 	if ctx == nil || credentials.RefreshToken == "" || !validOAuthURI(credentials.TokenEndpoint, false) || credentials.Registration.ClientID == "" {
 		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth refresh data is invalid")
 	}
+	if _, ok := oauthScopes(credentials.Scope); !ok {
+		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth refresh scope is invalid")
+	}
 	form := url.Values{
 		"grant_type": {"refresh_token"}, "refresh_token": {credentials.RefreshToken},
 		"client_id": {credentials.Registration.ClientID}, "resource": {credentials.Resource},
@@ -252,6 +266,9 @@ func (client *ConnectorOAuthClient) Refresh(ctx context.Context, credentials Con
 	tokens, err := client.tokenRequest(ctx, credentials.TokenEndpoint, form, credentials.Registration)
 	if err != nil {
 		return ConnectorOAuthCredentials{}, err
+	}
+	if tokens.Scope != "" && !oauthScopeSubset(tokens.Scope, credentials.Scope) {
+		return ConnectorOAuthCredentials{}, errors.New("MCP OAuth refreshed scope exceeds the authorized scope")
 	}
 	credentials.AccessToken = tokens.AccessToken
 	if tokens.RefreshToken != "" {
@@ -527,6 +544,43 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func oauthScopes(value string) (map[string]struct{}, bool) {
+	if value == "" || len(value) > 2048 {
+		return nil, false
+	}
+	scopes := make(map[string]struct{})
+	for _, scope := range strings.Split(value, " ") {
+		if scope == "" {
+			return nil, false
+		}
+		for i := 0; i < len(scope); i++ {
+			c := scope[i]
+			if c < 0x21 || c > 0x7e || c == '"' || c == '\\' {
+				return nil, false
+			}
+		}
+		scopes[scope] = struct{}{}
+	}
+	return scopes, true
+}
+
+func oauthScopeSubset(granted, requested string) bool {
+	allowed, ok := oauthScopes(requested)
+	if !ok {
+		return false
+	}
+	actual, ok := oauthScopes(granted)
+	if !ok {
+		return false
+	}
+	for scope := range actual {
+		if _, ok := allowed[scope]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func containsOAuthValue(values []string, value string) bool {
 	for _, item := range values {
 		if item == value {
@@ -559,6 +613,9 @@ func (start ConnectorOAuthStart) DigestState() ([32]byte, error) {
 }
 
 func (credentials ConnectorOAuthCredentials) AuthorizationHeader(now time.Time) string {
+	if _, ok := oauthScopes(credentials.Scope); !ok {
+		return ""
+	}
 	if credentials.AccessToken == "" || credentials.ExpiresAt > 0 && now.UnixMilli() >= credentials.ExpiresAt {
 		return ""
 	}
@@ -570,6 +627,9 @@ func ValidateConnectorOAuthFlowPayload(payload []byte) error {
 	if len(payload) == 0 || len(payload) > connectorOAuthResponseLimit || json.Unmarshal(payload, &flow) != nil || flow.Verifier == "" ||
 		flow.Registration.ClientID == "" || !validOAuthURI(flow.TokenEndpoint, false) || !validOAuthURI(flow.RedirectURI, false) {
 		return fmt.Errorf("MCP OAuth flow payload is invalid")
+	}
+	if _, ok := oauthScopes(flow.Scope); !ok {
+		return fmt.Errorf("MCP OAuth flow scope is invalid")
 	}
 	return nil
 }

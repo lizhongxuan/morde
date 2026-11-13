@@ -125,7 +125,7 @@ func removeTreeCopyXattr(file *os.File, path, name string, symlink bool) error {
 	} else {
 		err = unix.Fremovexattr(int(file.Fd()), name)
 	}
-	if errors.Is(err, unix.ENODATA) {
+	if errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
 		return nil
 	}
 	return err

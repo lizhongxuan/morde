@@ -432,9 +432,9 @@ func cloudDSHTerminalChildStatus(status task.StepStatus) bool {
 }
 
 // cloudDSHBackgroundOutputContinuations verifies durable child identity and
-// finds the furthest output cursor recorded in the parent's checkpoint. A
-// terminal status is consumed only after a matching dsh_job_output result has
-// reached the child's pinned checkpoint cursor.
+// finds the contiguous output cursor recorded in the parent's checkpoint. A
+// terminal status is consumed only after matching dsh_job_output results cover
+// the child's pinned checkpoint from the beginning.
 func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, children []app.AgentChildSession,
 	taskID, parentSessionID string, parentDefinitions []app.AgentToolDefinition) ([]cloudDSHBackgroundOutputContinuation, bool, error) {
 	if len(children) > 16 {
@@ -496,8 +496,11 @@ func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, c
 			return nil, false, errors.New("background child authorization or handle changed")
 		}
 
-		cursor := int64(-1)
-		consumed := false
+		type outputPage struct {
+			after, next int64
+			status      string
+		}
+		pages := make([]outputPage, 0)
 		for _, call := range history.calls {
 			if call.name != cloudDSHJobOutputToolName || !call.callSeen || !call.resultSeen {
 				continue
@@ -527,10 +530,19 @@ func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, c
 				len(result.Output) > cloudDSHJobOutputMaxBytes || result.NextCursor < request.AfterSeq || result.NextCursor > child.CheckpointThrough {
 				return nil, false, errors.New("background output result in the parent checkpoint is invalid")
 			}
-			if result.NextCursor > cursor {
-				cursor = result.NextCursor
+			pages = append(pages, outputPage{after: request.AfterSeq, next: result.NextCursor, status: result.Status})
+		}
+		sort.Slice(pages, func(i, j int) bool { return pages[i].after < pages[j].after })
+		cursor := int64(-1)
+		consumed := false
+		for _, page := range pages {
+			if page.after > cursor {
+				break
 			}
-			if result.Status == status && result.NextCursor >= child.CheckpointThrough {
+			if page.next > cursor {
+				cursor = page.next
+			}
+			if page.status == status && page.next == child.CheckpointThrough {
 				consumed = true
 			}
 		}

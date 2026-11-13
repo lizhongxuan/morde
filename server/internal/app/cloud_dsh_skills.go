@@ -34,26 +34,31 @@ type cloudDSHSkill struct {
 	description string
 	sourceRef   string
 	resource    string
+	deprecated  bool
 }
 
 var cloudDSHSkillCatalog = []cloudDSHSkill{
 	{id: "amap", version: "1", description: "Find China places, routes, travel times, and weather when authorized tools are available."},
 	{id: "app-creation", version: "1", description: "Create app source in the current Workspace; run it only through this Task's authorized Host tools.", sourceRef: "server/internal/app/cloud_dsh_skills/app-creation.md"},
 	{id: "compare-options", version: "1", description: "Compare options against the user's criteria and source requirements."},
+	{id: "email-management", version: "1", description: "Triage and draft from user-provided or authorized email sources; never claim mailbox access or send without approval.", sourceRef: "server/internal/app/cloud_dsh_skills/email-management.md"},
 	{id: "feishu", version: "1", description: "Use available Feishu tools for work information."},
-	{id: "inbox-triage", version: "1", description: "Triage email and prepare drafts; sending is separate."},
+	{id: "inbox-triage", version: "1", description: "Legacy Muse inbox workflow retained for checkpoint recovery.", deprecated: true},
 	{id: "knowledge-organization", version: "1", description: "Find and organize notes in the current authorized Workspace using verified files.", sourceRef: "server/internal/app/cloud_dsh_skills/knowledge-organization.md"},
 	{id: "kuaidi100", version: "1", description: "Track parcels when authorized tools are available."},
 	{id: "markdown-docs", version: "1", description: "Create and deliver verified Markdown artifacts.", sourceRef: "server/internal/app/cloud_dsh_skills/markdown-docs.md"},
 	{id: "meeting-follow-up", version: "1", description: "Turn an authorized meeting record into decisions, actions, and open questions in the current Workspace.", sourceRef: "server/internal/app/cloud_dsh_skills/meeting-follow-up.md"},
-	{id: "meeting-prep", version: "1", description: "Prepare from authorized calendar, mail, and Workspace sources."},
+	{id: "meeting-prep", version: "1", description: "Legacy Muse meeting workflow retained for checkpoint recovery.", deprecated: true},
+	{id: "meeting-preparation", version: "1", description: "Prepare a meeting brief from user-provided information and authorized Task tools.", sourceRef: "server/internal/app/cloud_dsh_skills/meeting-preparation.md"},
 	{id: "phone-messages", version: "1", description: "Review or draft messages through an authorized phone interface."},
+	{id: "scheduling", version: "1", description: "Propose meeting times from authorized availability; do not book or notify without approval.", sourceRef: "server/internal/app/cloud_dsh_skills/scheduling.md"},
 	{id: "task-management", version: "1", description: "Organize commitments in the current authorized Workspace without confusing them with active Morde Tasks.", sourceRef: "server/internal/app/cloud_dsh_skills/task-management.md"},
 	{id: "tencent-meeting", version: "1", description: "Use authorized Tencent Meeting tools if available."},
 	{id: "train-tickets", version: "2", description: "Find train options; booking needs explicit approval and available phone tools."},
 	{id: "translation", version: "1", description: "Translate user-provided or authorized text faithfully and save Markdown only to the current Workspace when requested.", sourceRef: "server/internal/app/cloud_dsh_skills/translation.md"},
 	{id: "trip-plan", version: "1", description: "Plan travel with an itinerary, packing list, budget, and available calendar tools."},
-	{id: "weekly-review", version: "1", description: "Review and plan using available calendar, mail, and Workspace tools."},
+	{id: "weekly-review", version: "1", description: "Legacy Muse review workflow retained for checkpoint recovery.", deprecated: true},
+	{id: "weekly-review-planning", version: "1", description: "Review the week using available Morde goals and schedules, user-provided context, and authorized connectors.", sourceRef: "server/internal/app/cloud_dsh_skills/weekly-review-planning.md"},
 	{id: "wide-research", version: "1", description: "Research independent inputs with bounded DSH child Agents and sources.", sourceRef: "server/internal/app/cloud_dsh_skills/wide-research.md"},
 }
 
@@ -103,6 +108,9 @@ func cloudDSHSkillReadDefinition() AgentToolDefinition {
 	ids := make([]string, 0, len(cloudDSHSkillCatalog))
 	descriptions := make([]string, 0, len(cloudDSHSkillCatalog))
 	for _, skill := range cloudDSHSkillCatalog {
+		if skill.deprecated {
+			continue
+		}
 		ids = append(ids, skill.id)
 		descriptions = append(descriptions, skill.id+": "+skill.description)
 	}
@@ -131,6 +139,9 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	skill, ok := cloudDSHSkillForID(arguments.SkillID)
 	if !ok {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Morde skill is not in the fixed allowlist")
+	}
+	if skill.deprecated && !recovering {
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "deprecated Morde skill is available only to recover an existing DSH checkpoint")
 	}
 	details, err := b.currentServerTask(ctx, claimed)
 	if err != nil {

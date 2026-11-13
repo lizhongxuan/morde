@@ -2133,6 +2133,40 @@ func TestCloudDSHBackgroundOutputContinuationRequiresMatchingTerminalStatusAndCu
 	}
 }
 
+func TestCloudDSHBackgroundOutputContinuationRequiresContiguousOutput(t *testing.T) {
+	const jobID = "child_contiguous"
+	history := newCloudDSHCheckpointHistory("session_parent")
+	history.calls["spawn_contiguous"] = &cloudDSHToolCall{name: cloudDSHDelegateToolName,
+		arguments: []byte(`{"title":"Background job","objective":"Finish the delegated task.","tool_names":["file_read"],"run_in_background":true}`),
+		callSeen:  true, resultSeen: true, resultText: `{"job_id":"child_contiguous","status":"running"}`}
+	child := app.AgentChildSession{TaskID: "q1234567", SessionID: jobID, ParentSessionID: history.sessionID,
+		SpawnKey: "spawn_contiguous", Background: true, AllowedTools: []string{"file_read"},
+		CheckpointThrough: 7, CheckpointDigest: bytes.Repeat([]byte{3}, sha256.Size),
+		Step: task.Step{ID: "step_contiguous", TaskID: "q1234567", Sequence: 1, Kind: "subagent", Status: task.StepSucceeded}}
+	addOutput := func(id string, after, next int64, status string) {
+		history.calls[id] = &cloudDSHToolCall{name: cloudDSHJobOutputToolName,
+			arguments: []byte(fmt.Sprintf(`{"after_seq":%d,"job_id":"%s"}`, after, jobID)), callSeen: true, resultSeen: true,
+			resultText: fmt.Sprintf(`{"job_id":"%s","status":"%s","next_cursor":%d,"output":""}`, jobID, status, next)}
+	}
+	check := func(wantCursor int64, wantPending bool) {
+		t.Helper()
+		continuations, waiting, err := cloudDSHBackgroundOutputContinuations(history, []app.AgentChildSession{child},
+			child.TaskID, history.sessionID, []app.AgentToolDefinition{cloudDSHReadTool()})
+		if err != nil || waiting || (len(continuations) == 1) != wantPending || len(continuations) > 1 ||
+			(wantPending && continuations[0].AfterSeq != wantCursor) {
+			t.Fatalf("continuations=%#v waiting=%t err=%v; want pending=%t cursor=%d", continuations, waiting, err, wantPending, wantCursor)
+		}
+	}
+
+	addOutput("tail_only", 7, 7, "succeeded")
+	check(-1, true)
+	addOutput("first_page", -1, 2, "running")
+	addOutput("last_page", 4, 7, "succeeded")
+	check(2, true)
+	addOutput("middle_page", 2, 4, "running")
+	check(7, false)
+}
+
 func latestAgentCheckpoint(commands []app.AgentCheckpointCommand, sessionID string) app.AgentCheckpointCommand {
 	var latest app.AgentCheckpointCommand
 	for _, command := range commands {

@@ -76,7 +76,7 @@ func (s *MCPConnectorService) BeginOAuth(ctx context.Context, principal identity
 	if start.ClientRequired {
 		return MCPConnectorOAuthStart{Kind: "client_required", DeveloperURL: start.DeveloperURL, RedirectURI: start.RedirectURI}, nil
 	}
-	if start.AuthorizationURL == "" || start.State == "" || len(start.Payload) == 0 || len(start.Payload) > 32<<10 {
+	if start.AuthorizationURL == "" || start.State == "" || mcpconnector.ValidateConnectorOAuthFlowPayload(start.Payload) != nil {
 		return MCPConnectorOAuthStart{}, domain.NewError(domain.CodeInternal, "MCP server OAuth authorization could not be prepared")
 	}
 	flowID, err := randomMCPConnectorOAuthFlowID()

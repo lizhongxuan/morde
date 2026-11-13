@@ -100,7 +100,7 @@ Morde 继续只使用 DSH 作为 Agent Runtime。当前 [依赖](../../runtime/m
 - [ ] **FIX-01（待验证）建立可复现的本地基线**
   - 修改/范围：不覆盖工作区已有未提交修改；记录 Portal 二进制、`web/portal/dist`、DSH 镜像/依赖、桌面壳、服务实例及数据库迁移版本。对 B40 数据库做本机备份，在隔离副本验证 191 → 193/194 及后续新迁移；保留 `mug0rvrl` 的原消息、未知调用和账本。
   - 验收：隔离服务能打开同一会话的合成复现，能分别注入已知失败、模型结果/用量未知及 Task 操作未知；记录每次消息、Task 和调用数量。不把已有演示模式回复当真实模型或工具证据。
-  - 当前证据：源码 `1e8368d697d3`、Portal 静态资源和运行时依赖指纹已记录；本机 B40 服务二进制 SHA-256 为 `e606b0a8…c137db501`，数据库迁移为 191。只读备份保存在 Lima 本机 `/opt/c20-e2e/local-backups/b40-pre-fix-20261113T115102Z.dump`（0600）；隔离副本从 191 应用当前 193/194 迁移后为 194。`internal/app` 未知模型结果单测、`internal/store/postgres` 重试/迟到结果/未知 MCP 操作集成测试和 `internal/worker` 对话路由测试通过，未调用真实模型，未修改或重启 B40。已查明 Vite 默认代理 7080 与当前本机测试 API 7086 不匹配；新增 `VITE_PORTAL_API_PROXY_TARGET` 覆盖值，保持默认 7080 不变。临时在 5174 代理到 7086 后，`/api/me` 返回预期未登录 401，证明 API 转发已连通；没有进行浏览器登录。浏览器实际打开隔离服务并记录合成会话复现尚待 FIX-10 集成验收。
+  - 当前证据：源码 `1e8368d697d3`、Portal 静态资源和运行时依赖指纹已记录；本机 B40 服务二进制 SHA-256 为 `e606b0a8…c137db501`，数据库迁移为 191。只读备份保存在 Lima 本机 `/opt/c20-e2e/local-backups/b40-pre-fix-20261113T115102Z.dump`（0600）；隔离副本从 191 应用当前 193/194 迁移后为 194。`internal/app` 未知模型结果单测、`internal/store/postgres` 重试/迟到结果/未知 MCP 操作集成测试和 `internal/worker` 对话路由测试通过，未调用真实模型，未修改或重启 B40。已查明 Vite 默认代理 7080 与当前本机测试 API 7086 不匹配；新增 `VITE_PORTAL_API_PROXY_TARGET` 覆盖值，保持默认 7080 不变。此前 5174 到 7086 的连通探测仅得到预期未登录 401，未做浏览器登录。本轮另以全新临时 PostgreSQL/Portal（迁移 195）、临时数据目录和独立端口 17486 启动隔离测试服务，Vite 5174 代理到该 Portal；PC Electron 与 Web 浏览器均用同一临时账号成功登录 `/assistant`，未访问或改动 B40。该临时 Portal 没有配置模型/DSH 工具，不能据登录成功推断任务生成、下载或自动归并已通过。
 
 - [ ] **FIX-02（进行中，依赖 FIX-01）修复消息重试和未知模型调用**
   - 修改：`server/internal/app/conversation_message_retry.go`、`model_gateway_route.go`，`server/internal/store/postgres/conversation_route_actions.go`、`model_usage_route.go`、`model_usage.go` 和相关项目预算/对账实现；按第三节增加下一可用迁移，统一更新 `server/openapi/portal.yaml`、公共约定及相关测试。
@@ -131,22 +131,22 @@ Morde 继续只使用 DSH 作为 Agent Runtime。当前 [依赖](../../runtime/m
 - [ ] **FIX-07（进行中，依赖 FIX-06）核实并增强 DSH 子 Agent 协作**
   - 修改：`runtime/morde-cloud-runtime/src/engine.mjs`、`server/internal/worker/cloud_dsh_*` 及现有子任务/检查点路径。对照同版本上游子 Agent provider，先验证是否可在不绕过 Morde Broker 的前提下复用；不兼容时记录原因并补强现有 `dsh_delegate`，保持唯一 DSH Runtime。后台子任务结果通过现有 `dsh_job_output` 或受控持久通知交给父 Agent；补齐唤醒、幂等消费和重启后汇合，不把子任务结算当成父 Agent 已汇总。
   - 验收：主任务协调两个无资源冲突的子任务，收到实际成功/失败结果后汇总；覆盖权限收窄、跨用户隔离、并行结果、取消、进程重启、检查点恢复及不重复执行已完成操作。
-  - 当前证据：新增 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim`，使用本地 PostgreSQL 临时库和真实 Node DSH 子进程，覆盖 child checkpoint 重启恢复、PG 持久结算、父任务 output-pending 后续接、输出/cursor 持久化及重复续接幂等；`-count=2` 连续通过且临时库清理为零。fixture 使用合成模型和 no-op 工具；主 Agent 同时协调两个真实子任务并汇总的端到端仍待验证。
+  - 当前证据：新增 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim`，使用本地 PostgreSQL 临时库和真实 Node DSH 子进程，覆盖 child checkpoint 重启恢复、PG 持久结算、父任务 output-pending 后续接、输出/cursor 持久化及重复续接幂等。另修复父 Agent 直接从子任务末尾游标读取空结果时误判“已消费完成”：只有从起点连续覆盖到固定检查点末尾并读到匹配终态才算完成；跳页、缺页和补齐回归通过。`go test ./internal/worker -count=1` 及三项 PostgreSQL + Node DSH 恢复/取消隔离测试通过，临时数据库已清理。对照当前固定的 DSH `0.2.2-rc.1` 依赖及上游 `dsh-subagent` provider seam 后，没有直接加载通用 provider：它不替代 Morde 的持久 Task、用户/会话隔离、Broker 授权和操作账本；继续用 DSH 唯一 Runtime，通过现有 Morde `dsh_delegate` 适配。fixture 使用合成模型和 no-op 工具；主 Agent 同时协调两个真实子任务并汇总的端到端仍待验证。
 
 - [ ] **FIX-08（进行中，依赖 FIX-06）整理并接通连接器目录**
   - 修改：`server/internal/app/mcp_connectors.go`、`mcp_connector_oauth.go`、`cloud_dsh_mcp*.go`、`server/internal/mcpconnector/`、`web/portal/src/routes/Connections.tsx` 和现有 OpenAPI；复用当前 MCP 存储、工具发现、凭据和审批，生成 79 个资料条目的来源、适配方式、读写权限及实际接通状态清单。
   - 验收：本机 GitHub 只读 MCP 夹具完成授权、发现、调用、失败、撤权和恢复；不可用连接器不暴露为已可用。不同账号/项目隔离，写操作不得借技能说明获得权限，未知外部写入不得盲目重试。
-  - 当前证据：本地 `httptest` + MCP SDK 夹具验证 GitHub 只读工具筛选、写工具拦截、审批执行，以及成功/失败结果重放不重复调用；`internal/app` 和 `internal/mcpconnector` 定向测试通过，复用了既有撤权及未知结果恢复用例。79 项连接器盘点、Portal 目录和 OAuth 全流程仍未完成。
+  - 当前证据：本地 `httptest` + MCP SDK 夹具验证 GitHub 只读工具筛选、写工具拦截、审批执行，以及成功/失败结果重放不重复调用。OAuth 现在要求授权挑战给出明确 scope；重授权、令牌交换和刷新不能扩大既有范围，无 scope 的旧凭据不会发出。`go test ./internal/app ./internal/mcpconnector` 及 OAuth 定向测试通过。79 项连接器目录、Portal 状态页和真实 OAuth/外部服务调用仍未完成；不含明确 scope 的服务及无 scope 旧连接需重新授权。
 
-- [ ] **FIX-09A（进行中，已先接通 3 项，依赖 FIX-06/07；连接器场景依赖对应 FIX-09B 条目）移植常用工作技能**
-  - 修改：在现有技能目录中逐项适配 `wide-research`、`app-creation`、`knowledge-organization`、`task-management`、`email-management`、`meeting-follow-up`、`scheduling` 和 `translation`；补充 documents 的 PDF、Word、表格及演示文稿能力时，先验证各自实际工具链。去重已有同类技能，去掉 Muse 私有命令和不存在的工具引用。
+- [ ] **FIX-09A（进行中，已有 10 项被测工作技能适配，依赖 FIX-06/07；连接器场景依赖对应 FIX-09B 条目）移植常用工作技能**
+  - 修改：在现有技能目录中逐项适配 `wide-research`、`app-creation`、`knowledge-organization`、`task-management`、`email-management`、`meeting-follow-up`、`scheduling`、`translation`、`meeting-preparation` 和 `weekly-review-planning`；由 `email-management` 覆盖原 `inbox-triage` 的邮件分类与草稿流程。旧 `inbox-triage`、`meeting-prep`、`weekly-review` 只保留给已有 DSH 检查点恢复，不向新任务暴露。补充 documents 的 PDF、Word、表格及演示文稿能力时，先验证各自实际工具链。去重已有同类技能，去掉 Muse 私有命令和不存在的工具引用。
   - 验收：每个启用技能的典型请求都能证明技能加载、真实本机工具调用、可读取的结果和失败反馈；缺少后端或格式生成能力的条目保持未接通。
-  - 当前证据：Morde 自有 `task-management`、`knowledge-organization`、`wide-research`、`translation`、`meeting-follow-up` 和 `app-creation` 6 项技能已列入固定 DSH 目录；新加文本技能只处理用户提供/授权读取的内容，`app-creation` 只有在当前 Task 实际提供授权 Host 工具时才运行或预览，否则仅交付源文本并说明未运行，不自动安装依赖或发布。translation/meeting-follow-up 不开放外部邮件、日历或翻译服务。`TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools`、`TestCloudDSHToolBrokerKeepsHostlessTasksAndProvidesScopedTools`、`TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata`、`TestCloudDSHDelegateToolsAreRestrictedToParentDefinitions` 和 `TestCloudDSHExecutorRunsAndSettlesPersistedChildSession` 定向测试通过，验证固定目录、技能加载/元数据、工具边界与 DSH 子任务调用合同；本次尚未以真实模型运行完整典型翻译、会议跟进、应用预览或多输入研究。邮箱、日历、Office 生成暂不声称接通。附件已有受限 DOCX/XLSX/PPTX 文本提取，PDF 读取依赖派生文本或预览；这不等于 Office 格式编辑、渲染或交付。当前 Runtime 镜像仅含 Node，且未接入 DSH Office/Workspace 依赖插件或 LibreOffice；Office 工作流仍待按 Morde 沙箱与产物边界验证。
+  - 当前证据：`task-management`、`knowledge-organization`、`wide-research`、`translation`、`meeting-follow-up`、`app-creation`、`email-management`、`scheduling`、`meeting-preparation` 和 `weekly-review-planning` 10 项工作技能均列入固定 DSH 目录，只引用 Morde 已注册的 DSH/Workspace/Goal/Schedule/搜索工具或按 Task 选定的 MCP 工具；实际能否调用仍由当前 Task 与授权范围决定。缺少邮箱/日历连接时不会声称查过收件箱、参与者有空或日程已创建；用户资料、邮件和会议记录均按不可信来源处理。旧 `inbox-triage`、`meeting-prep`、`weekly-review` 已从新任务技能枚举中下架，但保留不可变的内嵌正文供检查点重放；新增测试证明新任务拒绝旧 ID、重放仍可完成，避免改动已有 DSH 会话。定向技能/目录/重放测试通过，完整 `go test ./internal/app` 通过。此证据只证明固定技能加载与测试工具合同，不证明外部邮箱、日历连接器或真实模型调用已经接通；本机真实 DSH/连接器联调、Office 格式编辑/渲染及 PDF 完整读取仍待验证。当前 Runtime 镜像仅含 Node，且未接入 DSH Office/Workspace 依赖插件或 LibreOffice；Office 工作流仍待按 Morde 沙箱与产物边界验证。
 
 - [ ] **FIX-09B（未开始，依赖 FIX-08）接入常用办公连接器**
   - 修改：在现有连接器目录逐项适配 Google Drive/Docs/Sheets/Slides、Gmail/Calendar、Outlook Mail/Calendar、Slack、Notion 和 Linear。逐项选可用官方 MCP 或公开 API，明确账号、授权范围、读取和写入方法；GitHub 沿用 FIX-08 的只读边界，不能凭文档开放写权限。
   - 验收：每个启用连接器使用本机合成服务验证连接、分页读取、权限不足、断连/撤权和结果回传；写入路径先在本机夹具验证审批与操作账本，本次不发送消息或文件。没有可用适配器的服务显示未接通。
-  - 当前证据：只读盘点发现 Portal 已有六个 Google Workspace MCP 预填地址，但尚无 OAuth/工具发现/调用证据；Google 官方服务处于 Developer Preview。Linear 有官方只读 MCP 候选，Notion 和 Slack 有托管 MCP，但都未验证 Morde OAuth 兼容性；Slack 需注册应用且不支持动态注册。Outlook 目前没有 Morde 适配器，Muse 资料依赖本机不存在的私有 CLI。通用 OAuth 在挑战未指定 scope 时会请求服务端列出的全部 scopes，接入前须按服务和动作固定最小 scope；已连接状态也不能代替账号、工作区和实际调用验证。只读审计未修改文件、未连接外部服务。
+  - 当前证据：只读盘点发现 Portal 已有六个 Google Workspace MCP 预填地址，但尚无真实 OAuth/工具发现/调用证据；Google 官方服务处于 Developer Preview。Linear 有官方只读 MCP 候选，Notion 和 Slack 有托管 MCP，但都未验证 Morde OAuth 兼容性；Slack 需注册应用且不支持动态注册。Outlook 目前没有 Morde 适配器，Muse 资料依赖本机不存在的私有 CLI。OAuth 客户端已拒绝无 scope 挑战，并防止交换、刷新和重授权扩权；Morde 仍没有按服务/动作选择最小 scope 的 UI，不提供明确 scope 的服务和无 scope 旧连接暂不可用。已连接状态不代表账号、工作区和实际调用通过。只读审计未连接外部服务。
 
 - [ ] **FIX-09C（未开始，依赖 FIX-08）逐类处理剩余资料**
   - 修改：按第四节继续盘点商务、旅行、购物/支付、社交、健康、设备、媒体和其余定制技能及连接器；对每项登记来源、适配器、权限、依赖、状态和验收，按类别形成可独立交付的批次。对依赖 Muse 私有服务、不可用设备或未知接口的条目记录具体阻塞，不做假实现。
@@ -157,6 +157,7 @@ Morde 继续只使用 DSH 作为 Agent Runtime。当前 [依赖](../../runtime/m
   - 验收：同一 Portal 地址、账号、数据及视口下，PC 与浏览器加载同一组页面资源并完成相同的重试、澄清、任务及产物下载，已有连接器入口及未连接状态一致；不同服务实例或演示模式必须被识别。验证页面刷新、客户端重启、两个会话和两个账号；保留之前已要求的消息区无遮挡、Enter 发送、Shift+Enter 换行、输入框不可拖拽和用户消息无时间等回归。
   - 当前证据：Portal mock Playwright E2E 共 17 项通过、3 项跳过；聊天/输入/恢复 E2E 另 16/16 通过。释放/恢复主机用例揭示旧测试依赖已移除的 `.mono` 文本，改为从卡片稳定 ID 属性核对后，单项及整组复跑通过；紧凑视口测试还发现并修复 640×360 输入栏溢出。`web/portal` 的 typecheck、lint 和生产构建通过；桌面壳 `npm run build`、typecheck 及 `morde-main-recovery` 回归 55/55 通过。完整桌面套件原来 3 个失败文件都引用未编入当前包的旧 `main.ts`/`operator.ts`；已归档到 `tests/legacy/` 并说明不属于当前入口。随后 `npm test` 当前入口测试 263/263 通过。内置浏览器现场检查显示 `5173` 仍处于演示模式，Morde 桌面端加载的是 `7086` 上已登录的服务端 Portal；二者不是同一服务/数据。刚重建的 Portal 生产静态资源哈希与 `7086` 当前 `/` 返回的静态资源哈希不同，确认服务端仍提供旧构建；未覆盖或重启 B40。以上 Playwright 用例均为本机 mock；Live PC/Web 隔离服务验收仍待完成。
   - 本轮复核统一界面机制：`python3 deploy/single/test-portal-deployment.py` 19/19 通过；该门禁断言桌面 WebView 指向账号 Portal 的 `/assistant`，服务端静态目录为 `web/portal/dist`。这证明代码链路统一，但不证明正在运行的 PC 与浏览器已连到同一服务版本，当前 5173/7086 差异仍待隔离实测。
+  - 本轮本地联机 smoke：使用独立临时数据库和 Portal，当前工作区桌面壳通过 `npm start` 重建并打开，Web 浏览器也访问同一 Vite 5174、由其代理到 Portal 17486；两端都显示 `/assistant` 并以同一临时测试账号登录，未连接 5173 演示模式或 B40 7086。登录及统一服务入口已验证；该 Portal 没有配置云端模型和工具，故消息处理、文档产物下载、同任务并发归并、刷新/重启后的任务状态仍未端到端验证，PC-CHAT-017/018 保持未执行。
 
 - [ ] **FIX-11（未开始，依赖 FIX-07、FIX-08 和相应 FIX-09 批次）集成验收扩展能力**
   - 修改：复用 DSH、MCP、Portal 和 iOS 的现有端到端夹具，为每批已接通的 Agent、技能和连接器补充实际调用、失败、撤权与重启证据。
