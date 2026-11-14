@@ -1,10 +1,7 @@
 import { portalApi } from './api';
 
-type HostPage = Awaited<ReturnType<typeof portalApi.hosts>>;
-type Host = HostPage['items'][number];
 type WorkspacePage = Awaited<ReturnType<typeof portalApi.workspaces>>;
 type Workspace = WorkspacePage['items'][number];
-type Binding = Host['workspaces'][number];
 
 export type WorkspaceRestorePhase =
   | 'unbind'
@@ -34,10 +31,9 @@ export type PendingWorkspaceRestore = {
   bindExpectedVersion?: number;
 };
 
-export type WorkspaceRestoreAPI = Pick<typeof portalApi,
-  'hosts' | 'workspaces' | 'unbindWorkspaceFromHost' | 'releaseHost' | 'restoreWorkspacePaths' | 'bindWorkspaceToHost' | 'restoreHost'>;
+export type WorkspaceRestoreAPI = Pick<typeof portalApi, 'workspaces' | 'restoreWorkspacePaths'>;
 
-type Snapshot = { host: Host | null; workspace: Workspace; binding: Binding | null };
+type Snapshot = { workspace: Workspace };
 
 const idempotencyKeyPattern = /^[A-Za-z0-9._~-]{8,128}$/;
 const restorePhases: WorkspaceRestorePhase[] = [
@@ -67,12 +63,10 @@ export function isPendingWorkspaceRestore(value: unknown): value is PendingWorks
 }
 
 async function snapshot(api: WorkspaceRestoreAPI, operation: PendingWorkspaceRestore): Promise<Snapshot> {
-  const [hosts, workspaces] = await Promise.all([api.hosts(), api.workspaces()]);
+  const workspaces = await api.workspaces();
   const workspace = workspaces.items.find((item) => item.id === operation.workspaceID);
-  const host = operation.hostID ? hosts.items.find((item) => item.id === operation.hostID) ?? null : null;
-  if (!workspace || (operation.hostID && !host)) throw new Error('恢复对象已不存在；未继续后续步骤。');
-  const binding = host?.workspaces.find((item) => item.workspace.id === operation.workspaceID) ?? null;
-  return { host, workspace, binding };
+  if (!workspace) throw new Error('恢复对象已不存在；未继续后续步骤。');
+  return { workspace };
 }
 
 async function pollSnapshot(
@@ -96,69 +90,21 @@ export async function continueWorkspaceRestore(
   api: WorkspaceRestoreAPI = portalApi,
 ): Promise<void> {
   if (!isPendingWorkspaceRestore(initial)) throw new Error('本机恢复记录无效，未执行任何操作。');
+  if (initial.hostID || ['wait_detached', 'release_host', 'wait_stopped', 'bind_workspace', 'restore_host', 'wait_running'].includes(initial.phase)) {
+    throw new Error('旧版电脑文件恢复依赖解绑或重绑电脑存储，当前服务已停用；恢复记录已保留，请先人工核对云端电脑和文件状态。');
+  }
   let operation = initial;
   const checkpoint = (next: PendingWorkspaceRestore) => { operation = next; save(next); };
 
   for (let step = 0; step < 40; step++) {
     if (operation.phase === 'unbind') {
-      if (!operation.hostID) { checkpoint({ ...operation, phase: 'restore_workspace' }); continue; }
-      const current = await snapshot(api, operation);
-      if (current.binding?.state === 'detached') { checkpoint({ ...operation, phase: 'release_host' }); continue; }
-      if (current.binding?.state === 'unbinding') { checkpoint({ ...operation, phase: 'wait_detached' }); continue; }
-      if (!current.host || current.host.state !== 'running' || current.binding?.state !== 'active'
-        || current.binding.sync_state !== 'healthy' || current.binding.applied_revision !== operation.expectedCurrentRevision
-        || current.binding.desired_revision !== operation.expectedCurrentRevision || current.binding.sync_conflicts.length > 0) {
-        throw new Error('Host 或 Workspace 绑定状态与恢复记录不一致；未继续解绑。');
-      }
-      await api.unbindWorkspaceFromHost(operation.hostID, operation.workspaceID, {
-        expected_binding_version: current.binding.binding_version,
-        writers_stopped: true,
-      }, operation.unbindKey);
-      checkpoint({ ...operation, phase: 'wait_detached' });
-      continue;
-    }
-
-    if (operation.phase === 'wait_detached') {
-      const result = await pollSnapshot(api, operation, (current) => {
-        if (current.binding?.state === 'detached') return 'ready';
-        if (current.binding?.state === 'failed' || !current.binding) throw new Error('解绑失败或绑定记录消失；未释放 Host。');
-        if (current.binding.state === 'active') return 'retry';
-        if (current.binding.state !== 'unbinding') throw new Error('绑定状态未知；未释放 Host。');
-        return null;
-      }, '等待 Workspace 确认解绑');
-      checkpoint({ ...operation, phase: result.result === 'ready' ? 'release_host' : 'unbind' });
-      continue;
-    }
-
-    if (operation.phase === 'release_host') {
-      const current = await snapshot(api, operation);
-      if (!current.host || (current.binding && current.binding.state !== 'detached')) throw new Error('Host 尚未确认 Workspace detached；未释放计算资源。');
-      if (current.host.state === 'stopped') { checkpoint({ ...operation, phase: 'restore_workspace' }); continue; }
-      if (current.host.state === 'stopping') { checkpoint({ ...operation, phase: 'wait_stopped' }); continue; }
-      if (current.host.state !== 'running') throw new Error('Host 状态未知；未释放计算资源。');
-      await api.releaseHost(current.host.id, true);
-      checkpoint({ ...operation, phase: 'wait_stopped' });
-      continue;
-    }
-
-    if (operation.phase === 'wait_stopped') {
-      const result = await pollSnapshot(api, operation, (current) => {
-        if (current.binding && current.binding.state !== 'detached') throw new Error('Host 未解绑；未恢复 Workspace。');
-        if (current.host?.state === 'stopped') return 'ready';
-        if (current.host?.state === 'running') return 'retry';
-        if (current.host?.state !== 'stopping') throw new Error('Host 停止状态未知；未恢复 Workspace。');
-        return null;
-      }, '等待 Host 停止');
-      checkpoint({ ...operation, phase: result.result === 'ready' ? 'restore_workspace' : 'release_host' });
+      checkpoint({ ...operation, phase: 'restore_workspace' });
       continue;
     }
 
     if (operation.phase === 'restore_workspace') {
       const current = await snapshot(api, operation);
-      if (current.workspace.state !== 'ready' || (current.binding && current.binding.state !== 'detached')) {
-        throw new Error('Workspace 未就绪或仍绑定 Host；未提交恢复。');
-      }
-      if (operation.hostID && current.host?.state !== 'stopped') throw new Error('Host 尚未停止；未提交 Workspace 恢复。');
+      if (current.workspace.state !== 'ready') throw new Error('Workspace 未就绪；未提交恢复。');
       if (!operation.restoreRequested && current.workspace.revision !== operation.expectedCurrentRevision) {
         throw new Error('Workspace 当前 revision 已变化；请重新比较版本。');
       }
@@ -185,68 +131,7 @@ export async function continueWorkspaceRestore(
         if (current.workspace.revision > restoredRevision) throw new Error('Workspace revision 再次变化；未继续绑定 Host。');
         return null;
       }, '等待 Workspace projection');
-      checkpoint({ ...operation, phase: operation.hostID ? 'bind_workspace' : 'wait_projection' });
-      if (!operation.hostID && result.result === 'ready') return;
-      continue;
-    }
-
-    if (operation.phase === 'bind_workspace') {
-      if (!operation.hostID || operation.restoredRevision === undefined) throw new Error('恢复记录缺少 Host 或目标 revision；未继续绑定。');
-      const current = await snapshot(api, operation);
-      if (current.workspace.revision !== operation.restoredRevision || current.workspace.state !== 'ready' || current.host?.state !== 'stopped') {
-        throw new Error('Workspace revision 或 Host 状态已变化；未继续绑定。');
-      }
-      if (current.binding && current.binding.state !== 'detached') {
-        if (current.binding.state === 'failed') throw new Error('Host Workspace 绑定失败；可核对状态后恢复。');
-        checkpoint({ ...operation, phase: 'restore_host' });
-        continue;
-      }
-      const expectedVersion = operation.bindExpectedVersion ?? current.binding?.binding_version ?? 0;
-      if (operation.bindExpectedVersion === undefined) checkpoint({ ...operation, bindExpectedVersion: expectedVersion });
-      const binding = await api.bindWorkspaceToHost(operation.hostID, {
-        workspace_id: operation.workspaceID,
-        expected_revision: operation.restoredRevision,
-        expected_binding_version: expectedVersion,
-      }, operation.bindKey);
-      if (binding.workspace.id !== operation.workspaceID || binding.state === 'failed') throw new Error('Host Workspace 绑定未被确认；恢复流程已暂停。');
-      checkpoint({ ...operation, phase: 'restore_host' });
-      continue;
-    }
-
-    if (operation.phase === 'restore_host') {
-      const current = await snapshot(api, operation);
-      if (!current.host || !current.binding || current.binding.state === 'detached' || current.binding.state === 'failed') {
-        throw new Error('Workspace 尚未绑定到 Host；未启动 Host。');
-      }
-      if (current.host.state === 'running' || (current.host.state === 'creating'
-        && (current.host.state_reason === 'restore_pending' || current.host.state_reason === 'restore_unknown'))) {
-        checkpoint({ ...operation, phase: 'wait_running' });
-        continue;
-      }
-      if (current.host.state !== 'stopped') throw new Error('Host 不处于可恢复状态；未继续启动。');
-      await api.restoreHost(operation.hostID!);
-      checkpoint({ ...operation, phase: 'wait_running' });
-      continue;
-    }
-
-    if (operation.phase === 'wait_running') {
-      const result = await pollSnapshot(api, operation, (current) => {
-        if (!current.host || !current.binding || current.binding.state === 'detached' || current.binding.state === 'failed') {
-          throw new Error('Host Workspace 绑定状态异常；恢复流程已暂停。');
-        }
-        if (current.host.state === 'running' && current.host.workspace_runtime_online === true
-          && current.binding.state === 'active' && current.binding.sync_state === 'healthy'
-          && current.binding.applied_revision === operation.restoredRevision
-          && current.binding.desired_revision === operation.restoredRevision && current.binding.sync_conflicts.length === 0) return 'ready';
-        if (current.host.state === 'stopped') return 'retry';
-        if (current.host.state !== 'creating' && current.host.state !== 'running' && current.host.state !== 'stopping') {
-          throw new Error('Host 恢复状态未知；未报告 Workspace 已就绪。');
-        }
-        return null;
-      }, '等待 Host 和 Workspace 应用恢复 revision');
       if (result.result === 'ready') return;
-      checkpoint({ ...operation, phase: 'restore_host' });
-      continue;
     }
   }
   throw new Error('恢复步骤过多，流程已暂停；请重新核对服务端状态。');

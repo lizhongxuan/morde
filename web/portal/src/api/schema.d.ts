@@ -1791,6 +1791,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/workspaces/{id}/sync-sessions/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Recover a resumable sync session by its idempotency key
+         * @description Call only when api/capabilities advertises workspace_sync_checkpoint_recovery. Requires an owner Portal Session or the same installation-bound Device credential used to create the session; HostReplica credentials are rejected. The caller must be authorized for the owner and Workspace. The Idempotency-Key is scoped by owner and workspace for the recovery lookup, and the stored session must also match the authenticated replica. A matching session returns the same SyncSession model as create. If no reservation exists after authorization, the server inserts an immutable tombstone under the original global idempotency primary key before returning 404, so a late in-flight create cannot commit. A key that points to another Workspace, replica, quota rejection, tombstone, or missing session returns the same 404 without revealing session data; existing idempotency rows are never overwritten. This endpoint never deletes Workspace data or sessions.
+         */
+        post: operations["recoverWorkspaceSyncSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/workspaces/{id}/sync-sessions/{session_id}": {
         parameters: {
             query?: never;
@@ -9121,6 +9143,8 @@ export interface components {
             phase?: string;
             /** @enum {string} */
             detail_state?: "not_recorded" | "available" | "expired" | "restricted";
+            /** Format: date-time */
+            created_at: string;
         };
         TaskPlanStep: {
             id: string;
@@ -10299,7 +10323,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. workspace_sync_checkpoint_recovery means POST /api/workspaces/{id}/sync-sessions/recover is assembled; clients must require this feature before treating its 404 as a recovery miss instead of an older server's route-not-found response. On an authorized owner/workspace request, a missing idempotency record is tombstoned before the recovery miss is returned, preventing a delayed create from creating a session later. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
@@ -13159,6 +13183,44 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    recoverWorkspaceSyncSession: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The exact key used by the create request. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Existing owner-, Workspace-, and replica-scoped resumable session */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSession"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No recoverable session is visible for this owner, Workspace, and replica. After successful authorization, an unused key is permanently tombstoned before this response. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
