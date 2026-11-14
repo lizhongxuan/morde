@@ -206,14 +206,16 @@ type taskWorkspaceViewDeletionResponse struct {
 }
 
 type taskPendingRequestResponse struct {
-	ID                      string `json:"id"`
-	Version                 int64  `json:"version"`
-	Kind                    string `json:"kind"`
-	Title                   string `json:"title"`
-	Object                  string `json:"object"`
-	Content                 string `json:"content"`
-	Impact                  string `json:"impact"`
-	MediaPreviewOperationID string `json:"media_preview_operation_id,omitempty"`
+	ID                      string     `json:"id"`
+	Version                 int64      `json:"version"`
+	Status                  string     `json:"status"`
+	Kind                    string     `json:"kind"`
+	Title                   string     `json:"title"`
+	Object                  string     `json:"object"`
+	Content                 string     `json:"content"`
+	Impact                  string     `json:"impact"`
+	ExpiresAt               *time.Time `json:"expires_at"`
+	MediaPreviewOperationID string     `json:"media_preview_operation_id,omitempty"`
 }
 
 type taskClarificationRequestResponse struct {
@@ -231,6 +233,20 @@ func optionalTaskText(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func pendingRequestResponseStatus(pending *task.PendingRequest) string {
+	if pending == nil {
+		return ""
+	}
+	if pending.Status == task.PendingRequestPending {
+		return "pending"
+	}
+	if pending.Status == task.PendingRequestExpired && pending.Decision == task.PendingDecisionReject &&
+		pending.ExpiresAt != nil && pending.RespondedAt != nil && !pending.RespondedAt.Before(*pending.ExpiresAt) {
+		return "expired"
+	}
+	return ""
 }
 
 func validTaskAgentID(value string) bool {
@@ -966,16 +982,29 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			Role: message.Role, Content: message.Content, Status: status, CreatedAt: message.CreatedAt,
 		}
 	}
-	if pending := value.PendingRequest; pending != nil && pending.Status == task.PendingRequestPending {
-		if value.Task.Status != task.StatusWaitingUser || !domain.ValidPendingRequestID(pending.ID) || pending.TaskID != value.Task.ID || pending.Version < 1 || pending.Kind != "approval" ||
-			(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
-			!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) {
-			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-		}
-		response.PendingRequest = &taskPendingRequestResponse{
-			ID: pending.ID, Version: pending.Version, Kind: pending.Kind, Title: pending.Title,
-			Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
-			MediaPreviewOperationID: pending.MediaPreviewOperationID,
+	if pending := value.PendingRequest; pending != nil {
+		pendingStatus := pendingRequestResponseStatus(pending)
+		if pendingStatus == "" {
+			switch pending.Status {
+			case task.PendingRequestApproved, task.PendingRequestRejected, task.PendingRequestCancelled:
+				// Other terminal approvals retain their existing hidden behavior.
+			default:
+				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+			}
+		} else {
+			active := pendingStatus == "pending"
+			if (active && value.Task.Status != task.StatusWaitingUser) ||
+				!domain.ValidPendingRequestID(pending.ID) || pending.TaskID != value.Task.ID || pending.Version < 1 || pending.Kind != "approval" ||
+				(pending.ExpiresAt != nil && pending.ExpiresAt.IsZero()) ||
+				(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
+				!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) {
+				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+			}
+			response.PendingRequest = &taskPendingRequestResponse{
+				ID: pending.ID, Version: pending.Version, Status: pendingStatus, Kind: pending.Kind, Title: pending.Title,
+				Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
+				ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
+			}
 		}
 	}
 	for _, clarification := range value.ClarificationRequests {

@@ -2488,6 +2488,35 @@ func (f *runtimeToolExecutorFixture) prepared(name, arguments string, scope iden
 	return request, preparation
 }
 
+func TestRuntimeToolExecutorRejectsExpiredApprovalFromCurrentTaskSnapshot(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	fixture.fence.RuntimeInstanceID = "runtime-instance-1"
+	fixture.fences.fence = fixture.fence
+	request := fixture.request(runtimeToolFileWrite, `{"workspace_id":"w1234567","path":"reports/result.txt","content":"synthetic"}`, identity.ScopeComputerOperate)
+	hash, err := agentOperationHash(request.Call.Name, request.Arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := newPendingApproval(request.Task, request.Call, hash[:], AgentApprovalRequest{
+		Object: "reports/result.txt", Content: "Write this file?", Impact: "The authorized Workspace will change.",
+	}, request.Fence, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt, respondedAt := time.Now().UTC().Add(-time.Minute), time.Now().UTC()
+	pending.Status, pending.Decision = task.PendingRequestExpired, task.PendingDecisionReject
+	pending.ExpiresAt, pending.RespondedAt = &expiresAt, &respondedAt
+	fixture.store.details.PendingRequest = pending
+	request.Approval = &AgentToolApprovalDecision{
+		PendingID: pending.ID, Version: pending.Version, Decision: task.PendingDecisionApprove,
+		RequestHash: append([]byte(nil), hash[:]...),
+	}
+	allowed, err := fixture.executor.hasCurrentRuntimeToolApproval(context.Background(), request.Task, request, request.Fence)
+	if allowed || domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("expired approval = allowed %t err=%v; want forbidden", allowed, err)
+	}
+}
+
 func (f *runtimeToolExecutorFixture) persistOperation(request AgentToolRequest) {
 	hash, err := agentOperationHash(request.Call.Name, request.Arguments)
 	if err != nil {

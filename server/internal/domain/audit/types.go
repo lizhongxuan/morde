@@ -40,6 +40,13 @@ const (
 	ActionClientWebSession             Action = "client.web_session"
 	ActionClientScheduleGrant          Action = "client.schedule_grant"
 	ActionClientRevoke                 Action = "client.revoke"
+	ActionCodexSessionGrant            Action = "codex.session.grant"
+	ActionCodexSessionDelete           Action = "codex.session.delete"
+	ActionCodexCommandCreate           Action = "codex.command.create"
+	ActionCodexCommandClaim            Action = "codex.command.claim"
+	ActionCodexCommandResult           Action = "codex.command.result"
+	ActionCodexApprovalDecision        Action = "codex.approval.decision"
+	ActionCodexApprovalResult          Action = "codex.approval.result"
 	ActionWorkspaceDelete              Action = "workspace.delete"
 	ActionUserCreate                   Action = "user.create"
 	ActionUserUpdate                   Action = "user.update"
@@ -84,6 +91,8 @@ func (a Action) Valid() bool {
 		ActionModelConnectionCreate, ActionModelConnectionUpdate, ActionModelConnectionDelete, ActionModelConnectionCheck,
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
 		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientScheduleGrant, ActionClientRevoke,
+		ActionCodexSessionGrant, ActionCodexSessionDelete, ActionCodexCommandCreate, ActionCodexCommandClaim, ActionCodexCommandResult,
+		ActionCodexApprovalDecision, ActionCodexApprovalResult,
 		ActionHostRestoreRecovery, ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionAdminNudgePolicyUpdate,
 		ActionAdminControlRuleCreate, ActionAdminControlRuleUpdate, ActionAdminControlRuleDelete,
 		ActionAdminControlRuleFire, ActionAdminControlEvaluate, ActionAdminControlNotifyTest, ActionMCPCall,

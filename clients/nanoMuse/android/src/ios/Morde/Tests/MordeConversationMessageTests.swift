@@ -215,6 +215,82 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(next.previousClientMessageID, recoveredSecond.id)
     }
 
+    func testMessagePagesRejectOtherOrMissingConversations() {
+        let first = MordeClientMessage(id: "m0000001", conversation_id: "c1234567", role: "user", content: "第一会话")
+        let second = MordeClientMessage(id: "m0000002", conversation_id: "c7654321", role: "user", content: "第二会话")
+        let missing = MordeClientMessage(id: "m0000003", role: "assistant", content: "未标识会话")
+
+        XCTAssertTrue(MordeConversationMessagePagePolicy.matches([], conversationID: "c1234567"))
+        XCTAssertTrue(MordeConversationMessagePagePolicy.matches([first], conversationID: "c1234567"))
+        XCTAssertFalse(MordeConversationMessagePagePolicy.matches([first, second], conversationID: "c1234567"))
+        XCTAssertFalse(MordeConversationMessagePagePolicy.matches([missing], conversationID: "c1234567"))
+    }
+
+    func testAuthorizationLossDoesNotClaimAnUncertainSendFailed() {
+        let rejected = MordeOutboxFailurePolicy.confirmsRejection(
+            submissionBegan: true, firstSubmission: true, hadUncertainSubmission: false,
+            domain: "Morde", code: 401)
+        XCTAssertFalse(rejected)
+        XCTAssertEqual(MordeOutboxFailurePolicy.state(mayHaveBeenAccepted: true,
+            confirmedRejection: rejected, domain: "Morde", code: 401), .unknown)
+        XCTAssertEqual(MordeOutboxFailurePolicy.state(mayHaveBeenAccepted: false,
+            confirmedRejection: false, domain: "Morde", code: 401), .pending)
+    }
+
+    func testOutboxReauthenticationKeepsTwoConversationQueuesIndependent() throws {
+        let scope = try makeScope()
+        let renewedScope = try XCTUnwrap(MordeClientDataScope(serviceOrigin: "https://morde.example",
+            serviceInstanceID: scope.serviceInstanceID, accountID: scope.accountID, installationID: "install-2"))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("morde-conversation-queues-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outbox = MordeMessageOutbox(root: root)
+        var first = try outbox.enqueue(scope: scope, conversationID: "c1234567", content: "会话一首条",
+            modelID: nil, attachmentIDs: [])
+        let second = try outbox.enqueue(scope: scope, conversationID: "c7654321", content: "会话二首条",
+            modelID: nil, attachmentIDs: [])
+        let firstFollowup = try outbox.enqueue(scope: scope, conversationID: "c1234567", content: "会话一后续",
+            modelID: nil, attachmentIDs: [])
+        first.state = .sending
+        first.submissionStarted = true
+        first.submissionUncertain = true
+        try outbox.replace(first, scope: scope)
+
+        let reopened = MordeMessageOutbox(root: root)
+        let recovered = try reopened.recoverInterruptedMessages(scope: renewedScope)
+        XCTAssertEqual(recovered.map(\.id), [first.id, second.id, firstFollowup.id])
+        XCTAssertEqual(recovered.first?.state, .unknown)
+        XCTAssertNil(second.previousClientMessageID)
+        XCTAssertEqual(firstFollowup.previousClientMessageID, first.id)
+        XCTAssertEqual(MordeOutboxScheduling.readyIDs(recovered, scope: renewedScope, inFlight: []),
+                       [first.id, second.id])
+        XCTAssertEqual(MordeConversationMessagePayload.direct(recovered[0])["client_message_id"] as? String, first.id)
+        XCTAssertEqual(MordeConversationMessagePayload.direct(recovered[2])["previous_client_message_id"] as? String, first.id)
+    }
+
+    func testLocalConversationMappingAndMessageIdentitySurviveRestart() throws {
+        let scope = try makeScope()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("morde-local-conversation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let localID = "local-12345678-1234-4234-8234-123456789012"
+        let outbox = MordeMessageOutbox(root: root)
+        let first = try outbox.enqueue(scope: scope, conversationID: localID, content: "待创建会话",
+            modelID: nil, attachmentIDs: [])
+        try outbox.resolveLocalConversation(localID, serverID: "c1234567", scope: scope)
+
+        let reopened = MordeMessageOutbox(root: root)
+        XCTAssertEqual(try reopened.resolvedConversationID(localID, scope: scope), "c1234567")
+        try reopened.resolveLocalConversation(localID, serverID: "c1234567", scope: scope)
+        XCTAssertThrowsError(try reopened.resolveLocalConversation(localID, serverID: "c7654321", scope: scope))
+        let restored = try XCTUnwrap(reopened.messages(scope: scope).first)
+        XCTAssertEqual(restored.id, first.id)
+        XCTAssertEqual(restored.conversationID, "c1234567")
+        let followup = try reopened.enqueue(scope: scope, conversationID: "c1234567", content: "后续消息",
+            modelID: nil, attachmentIDs: [])
+        XCTAssertEqual(followup.previousClientMessageID, first.id)
+    }
+
     private func makeScope(instanceID: String = "11111111-1111-4111-8111-111111111111",
                            accountID: String = "user-1") throws -> MordeClientDataScope {
         try XCTUnwrap(MordeClientDataScope(serviceOrigin: "https://morde.example",

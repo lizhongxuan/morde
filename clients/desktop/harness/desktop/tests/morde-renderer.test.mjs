@@ -72,6 +72,7 @@ test('local sync content follows main-process view state and public pages use th
   const calls = [];
   const api = {
     state: async () => current,
+    openAssistant: async () => calls.push(['open-assistant']),
     workspaces: async () => ({ items: [] }),
     publicPage: async (...args) => calls.push(args),
     onState: (listener) => { notifyState = listener; }, onSync() {},
@@ -82,9 +83,12 @@ test('local sync content follows main-process view state and public pages use th
   notifyState(current);
   assert.equal(elements.get('sync-page').hidden, false);
   elements.get('origin').value = 'https://portal.example';
+  elements.get('open-assistant').onclick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [['open-assistant']]);
   elements.get('register').onclick();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(calls[0], ['register', 'https://portal.example']);
+  assert.deepEqual(calls[1], ['register', 'https://portal.example']);
 });
 
 test('project uploader reports cloud confirmation separately from Host application', async () => {
@@ -188,7 +192,11 @@ test('completed unresolved project checkpoint offers receipt polling without off
 
 test('desktop shell leaves Portal navigation unobstructed by its own header', async () => {
   const html = await readFile(new URL('../resources/morde.html', import.meta.url), 'utf8');
-  assert.doesNotMatch(html, /<header\b|id="(?:account|navigation|web|account-settings|local-sync|logout)"/);
+  const [beforeSync] = html.split('<section id="sync-page" hidden>');
+  assert.notEqual(beforeSync, html, 'the local fallback is hidden while Portal is active');
+  assert.doesNotMatch(beforeSync, /<header\b/);
+  assert.doesNotMatch(html, /id="(?:account|navigation|web|account-settings|local-sync|logout)"/);
+  assert.match(html, /<header class="pc-local-topbar">/);
 });
 
 test('workspace controls keep the fixed local-node switch and expose scoped one-shot sync and handoff actions', async () => {

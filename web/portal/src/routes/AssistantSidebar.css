@@ -79,3 +79,6 @@
   font-size: 12px;
   font-weight: 650;
 }
+.assistant-page .conversation-search { display: block; margin: 10px 0 4px; }
+.assistant-page .conversation-search input { width: 100%; min-height: 34px; padding: 7px 10px; border: 1px solid #e3e8f0; border-radius: 8px; color: #263245; background: #fff; font: inherit; font-size: 12px; }
+.assistant-page .conversation-search input:focus-visible { outline: 2px solid #7aa7ff; outline-offset: 1px; }

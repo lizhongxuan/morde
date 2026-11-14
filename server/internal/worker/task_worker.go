@@ -22,6 +22,12 @@ type TaskLeaseStore interface {
 	RenewTaskLease(context.Context, string, string, int64, time.Duration) (task.Task, error)
 }
 
+// TaskApprovalExpiryStore advances one due approval without requiring a client
+// to read the Task. Implementations coordinate competing workers in storage.
+type TaskApprovalExpiryStore interface {
+	ExpireNextPendingRequest(context.Context) (bool, error)
+}
+
 type TaskExecutor interface {
 	ExecuteTask(context.Context, task.Task) error
 }
@@ -133,6 +139,13 @@ func (w *TaskWorker) Run(ctx context.Context) (runErr error) {
 	}
 	var workers sync.WaitGroup
 	workers.Add(w.maxConcurrentTasks)
+	if expirer, ok := w.store.(TaskApprovalExpiryStore); ok {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			w.runApprovalExpiryLoopRecovering(runCtx, expirer)
+		}()
+	}
 	for range w.maxConcurrentTasks {
 		go func() {
 			defer workers.Done()
@@ -151,6 +164,39 @@ func (w *TaskWorker) Run(ctx context.Context) (runErr error) {
 		return fmt.Errorf("task worker lifecycle: %w", lifecycleErr)
 	}
 	return ctx.Err()
+}
+
+func (w *TaskWorker) runApprovalExpiryLoopRecovering(ctx context.Context, expirer TaskApprovalExpiryStore) {
+	for ctx.Err() == nil {
+		panicked := func() (panicked bool) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("task approval expiry loop panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+					panicked = true
+				}
+			}()
+			w.runApprovalExpiryLoop(ctx, expirer)
+			return false
+		}()
+		if !panicked || !waitTaskWorker(ctx, w.pollInterval) {
+			return
+		}
+	}
+}
+
+func (w *TaskWorker) runApprovalExpiryLoop(ctx context.Context, expirer TaskApprovalExpiryStore) {
+	for ctx.Err() == nil {
+		expired, err := expirer.ExpireNextPendingRequest(ctx)
+		if err != nil && ctx.Err() == nil {
+			w.logger.Warn("expire pending task approval failed", zap.String("error_type", fmt.Sprintf("%T", err)))
+		}
+		if expired && err == nil {
+			continue
+		}
+		if !waitTaskWorker(ctx, w.pollInterval) {
+			return
+		}
+	}
 }
 
 func (w *TaskWorker) runClaimLoopRecovering(ctx context.Context) {

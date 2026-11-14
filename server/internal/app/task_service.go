@@ -561,6 +561,22 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
 		return TaskDetails{}, hideTaskAccessError(err)
 	}
+	if pending := details.PendingRequest; pending != nil && pending.Status == task.PendingRequestPending && pending.ExpiresAt != nil {
+		expirer, ok := s.store.(TaskPendingRequestExpirer)
+		if !ok {
+			return TaskDetails{}, domain.NewError(domain.CodeInternal, "approval expiry storage is unavailable")
+		}
+		if _, err := expirer.ExpirePendingRequest(ctx, principal.UserID, id, pending.ID, pending.Version); err != nil {
+			return TaskDetails{}, err
+		}
+		details, err = s.store.GetTask(ctx, id, principal.UserID)
+		if err != nil {
+			return TaskDetails{}, err
+		}
+		if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
+			return TaskDetails{}, hideTaskAccessError(err)
+		}
+	}
 	if len(details.Artifacts) > 0 {
 		visible, err := s.taskArtifactWorkspaceVisible(ctx, principal.UserID, details.Task.WorkspaceID)
 		if err != nil {

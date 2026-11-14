@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -22,6 +23,12 @@ type personalSyncStoreStub struct {
 	through        *int64
 	changeLimit    int32
 	changes        personal.ChangePage
+	historyCalls   int
+	historyObject  string
+	historyCursor  *personal.MemoryHistoryCursor
+	historyLimit   int32
+	historyBatch   personal.MemoryHistoryBatch
+	historyErr     error
 }
 
 func (s *personalSyncStoreStub) GetPersonalSnapshotBatch(_ context.Context, _ identity.Principal, cursor *personal.SnapshotCursor, limit int32) (personal.SnapshotBatch, error) {
@@ -34,6 +41,13 @@ func (s *personalSyncStoreStub) GetPersonalChanges(_ context.Context, _ identity
 	s.changesCalls++
 	s.after, s.through, s.changeLimit = after, through, limit
 	return s.changes, nil
+}
+
+func (s *personalSyncStoreStub) GetPersonalMemoryHistoryBatch(_ context.Context, _ identity.Principal, objectID string,
+	cursor *personal.MemoryHistoryCursor, limit int32) (personal.MemoryHistoryBatch, error) {
+	s.historyCalls++
+	s.historyObject, s.historyCursor, s.historyLimit = objectID, cursor, limit
+	return s.historyBatch, s.historyErr
 }
 
 func TestPersonalSyncSnapshotSignsAndBindsNextPageCursor(t *testing.T) {
@@ -131,5 +145,83 @@ func TestPersonalSyncChangesFixesThroughSequenceAndValidatesBounds(t *testing.T)
 func TestNewPersonalSyncServiceRequiresDataKey(t *testing.T) {
 	if _, err := NewPersonalSyncService(&personalSyncStoreStub{}, []byte("short")); err == nil {
 		t.Fatal("NewPersonalSyncService accepted a non-32-byte data key")
+	}
+}
+
+func TestPersonalMemoryHistorySignsCursorAndBindsRequest(t *testing.T) {
+	key := []byte(strings.Repeat("m", 32))
+	changedAt := time.Date(2026, 11, 14, 3, 0, 0, 0, time.UTC)
+	store := &personalSyncStoreStub{historyBatch: personal.MemoryHistoryBatch{
+		ServiceInstanceID: "00000000-0000-4000-8000-000000000001", HasMore: true,
+		Items: []personal.MemoryRevision{{Revision: 4, ChangedAt: changedAt, Body: json.RawMessage(`{"content":"prior"}`),
+			Restorable: true, SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{
+				Kind: "mutation_receipt", ID: "mutation-123",
+			}}}},
+	}}
+	service, err := NewPersonalSyncService(store, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	page, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", "", 0)
+	if err != nil || len(page.Items) != 1 || page.NextCursor == "" || store.historyCalls != 1 || store.historyObject != "global" ||
+		store.historyLimit != personalSyncDefaultLimit || store.historyCursor != nil {
+		t.Fatalf("GetMemoryHistory() = %+v, err=%v store=%+v", page, err, store)
+	}
+	cursor, err := personal.DecodeMemoryHistoryCursor(page.NextCursor, key)
+	if err != nil || cursor.OwnerID != principal.UserID || cursor.ServiceInstanceID != store.historyBatch.ServiceInstanceID ||
+		cursor.ObjectType != personal.ObjectTypeMemory || cursor.ObjectID != "global" || cursor.AfterRevision != 4 {
+		t.Fatalf("decoded memory history cursor = %+v, err=%v", cursor, err)
+	}
+
+	store.historyBatch = personal.MemoryHistoryBatch{ServiceInstanceID: cursor.ServiceInstanceID, Items: []personal.MemoryRevision{}}
+	if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", page.NextCursor, 5); err != nil ||
+		store.historyCursor == nil || store.historyCursor.AfterRevision != 4 || store.historyLimit != 5 {
+		t.Fatalf("history continuation = cursor %+v limit %d err %v", store.historyCursor, store.historyLimit, err)
+	}
+
+	other := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t7654321"}
+	if _, err := service.GetMemoryHistory(context.Background(), other, personal.ObjectTypeMemory, "global", page.NextCursor, 5); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("cross-owner history cursor error = %v, want invalid_argument", err)
+	}
+	if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "user", page.NextCursor, 5); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("cross-object history cursor error = %v, want invalid_argument", err)
+	}
+	if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeProfile, "default", "", 5); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("profile history error = %v, want invalid_argument", err)
+	}
+	if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", "", 101); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("out-of-range history limit error = %v, want invalid_argument", err)
+	}
+	apiKeyPrincipal := principal
+	apiKeyPrincipal.Kind = identity.KindAPIKey
+	if _, err := service.GetMemoryHistory(context.Background(), apiKeyPrincipal, personal.ObjectTypeMemory, "global", "", 10); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("API Key history authorization error = %v, want unauthenticated", err)
+	}
+	if store.historyCalls != 2 {
+		t.Fatalf("invalid history request reached store; calls=%d", store.historyCalls)
+	}
+}
+
+func TestPersonalMemoryHistoryRejectsInvalidProvenanceAndBodyCombinations(t *testing.T) {
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	for _, revision := range []personal.MemoryRevision{
+		{Revision: 1, ChangedAt: time.Now(), Body: json.RawMessage(`{"content":"x"}`), Restorable: true,
+			SourceStatus: personal.MemoryHistorySourceUnavailable, Sources: []personal.MemoryHistorySource{}},
+		{Revision: 1, ChangedAt: time.Now(), Restorable: true,
+			SourceStatus: personal.MemoryHistorySourceUnrecorded, Sources: []personal.MemoryHistorySource{}},
+		{Revision: 1, ChangedAt: time.Now(), Body: json.RawMessage(`{"content":"x"}`), Restorable: true,
+			SourceStatus: personal.MemoryHistorySourceAvailable, Sources: nil},
+	} {
+		store := &personalSyncStoreStub{historyBatch: personal.MemoryHistoryBatch{
+			ServiceInstanceID: "00000000-0000-4000-8000-000000000001", Items: []personal.MemoryRevision{revision},
+		}}
+		service, err := NewPersonalSyncService(store, []byte(strings.Repeat("k", 32)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", "", 10); domain.CodeOf(err) != domain.CodeInternal {
+			t.Errorf("invalid history revision %+v error = %v, want internal", revision, err)
+		}
 	}
 }

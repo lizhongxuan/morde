@@ -14,11 +14,12 @@ import {
   synchronizePersonalData,
   type PersonalDataAPI,
   type PersonalDataState,
+  type PersonalMemoryRevision,
   type PersonalObject,
   type PersonalObjectBody,
   type PersonalObjectType,
 } from './personal-data-store';
-import { FloatingError } from '../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type Section = 'profile' | 'soul' | 'memory' | 'feed' | 'ideas' | 'library' | 'preferences';
 type ProfileBody = { name: string; avatar: 'dragon' | 'emoji'; emoji?: string; color?: string; description?: string; style?: string };
@@ -494,7 +495,7 @@ export function PersonalData() {
       <p className="muted">{syncing ? '正在更新云端数据…' : state?.syncError ? '云端更新待重试' : '保存后自动更新云端'} · {pendingCount} 项待提交 · {conflicts.length} 条冲突草稿</p>
     </div>
 
-    {!serviceInstanceID && <p className="notice notice-warning" role="status">正在确认服务实例；此期间新保存内容只会保存在本机，不会提交到未确认的服务。</p>}
+    {!serviceInstanceID && <FloatingNotice className="notice-warning">正在确认服务实例；此期间新保存内容只会保存在本机，不会提交到未确认的服务。</FloatingNotice>}
 
     {localError && <FloatingError className="error-card" role="alert">{localError}<button type="button" className="button button-secondary" onClick={() => void refreshLocal()}>重试</button></FloatingError>}
     {state?.syncError && <FloatingError className="error-card" role="alert">云端更新未完成：{state.syncError} 本地草稿和附件仍保留。<button type="button" className="button button-secondary" disabled={syncing} onClick={() => void sync()}>重试保存</button></FloatingError>}
@@ -586,8 +587,11 @@ export function PersonalData() {
       {memoryObjects.length === 0 ? <p className="empty-card">还没有记忆。</p> : <ScreenPagination
         items={memoryObjects} getKey={(item) => item.object_id} estimatedItemHeight={156} height={300}
         ariaLabel="已保存记忆" className="personal-data-pager"
-        renderItem={(item) => <MemoryRow key={`${item.object_id}:${item.revision}:${JSON.stringify(item.body)}`} item={item}
-          onSave={(body) => void saveObject('memory', item.object_id, body)} onDelete={() => void deleteObject('memory', item.object_id)} />}
+        renderItem={(item) => <MemoryRow key={`${storeScope}:${item.object_id}:${item.revision}:${JSON.stringify(item.body)}`} item={item}
+          api={personalAPI} canRestore={Boolean(state.snapshotComplete && !syncing && serviceInstanceID)}
+          onSave={(body) => void saveObject('memory', item.object_id, body)}
+          onRestore={(body) => saveObject('memory', item.object_id, body)}
+          onDelete={() => void deleteObject('memory', item.object_id)} />}
       />}
     </section>}
 
@@ -749,12 +753,74 @@ function SoulEditor({ value, hasConflict, onSave, onDelete, onInvalid }: {
   </>;
 }
 
-function MemoryRow({ item, onSave, onDelete }: { item: PersonalObject; onSave: (body: MemoryBody) => void; onDelete: () => void }) {
+function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
+  item: PersonalObject;
+  api: PersonalDataAPI;
+  canRestore: boolean;
+  onSave: (body: MemoryBody) => void;
+  onRestore: (body: MemoryBody) => Promise<boolean>;
+  onDelete: () => void;
+}) {
   const [content, setContent] = useState(asString(item.body.content));
   const [category, setCategory] = useState(asString(item.body.category));
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<PersonalMemoryRevision[] | null>(null);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
+  const requestVersion = useRef(0);
+  useEffect(() => () => { requestVersion.current++; }, [api, item.object_id]);
+  const loadHistory = async (cursor?: string) => {
+    const request = ++requestVersion.current;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const page = await api.personalMemoryHistory(item.object_id, cursor, 25);
+      if (requestVersion.current !== request) return;
+      setHistory((current) => cursor && current ? [...current, ...page.items] : page.items);
+      setHistoryCursor(page.next_cursor);
+    } catch (error) {
+      if (requestVersion.current === request) setHistoryError(error instanceof Error ? error.message : '无法读取记忆历史。');
+    } finally {
+      if (requestVersion.current === request) setHistoryLoading(false);
+    }
+  };
+  const toggleHistory = () => {
+    const open = !historyOpen;
+    setHistoryOpen(open);
+    if (open && history === null) void loadHistory();
+  };
+  const restore = async (revision: PersonalMemoryRevision) => {
+    if (!revision.restorable || !revision.body || revision.revision === item.revision || !canRestore) return;
+    const saved = await onRestore({ content: asString(revision.body.content),
+      ...(asString(revision.body.category).trim() ? { category: asString(revision.body.category).trim() } : {}) });
+    setRestoreNotice(saved ? `第 ${revision.revision} 版已加入同步；服务端确认后会成为新版本。` : null);
+  };
   return <article className="model-connection-card">
     <div className="model-connection-main"><label>记忆内容<textarea value={content} maxLength={65536} onChange={(event) => setContent(event.target.value)} /></label><label>分类<input value={category} maxLength={64} onChange={(event) => setCategory(event.target.value)} /></label></div>
-    <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => onSave({ content: content.trim(), ...(category.trim() ? { category: category.trim() } : {}) })}>保存修改</button><button type="button" className="button button-secondary" onClick={onDelete}>删除</button></div>
+    <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => onSave({ content: content.trim(), ...(category.trim() ? { category: category.trim() } : {}) })}>保存修改</button>
+      <button type="button" className="button button-secondary" aria-expanded={historyOpen} onClick={toggleHistory}>历史版本</button>
+      <button type="button" className="button button-secondary" onClick={() => {
+        if (window.confirm('删除这条记忆会同时清理它的历史正文；历史正文无法恢复。确定删除吗？')) onDelete();
+      }}>删除</button></div>
+    {restoreNotice && <p className="muted" role="status">{restoreNotice}</p>}
+    {historyOpen && <section className="memory-history" aria-label="记忆历史版本">
+      {historyLoading && <p className="muted" role="status">正在读取记忆历史…</p>}
+      {historyError && <p className="error-inline" role="alert">历史读取失败：{historyError} <button type="button" className="button button-small button-secondary" disabled={historyLoading} onClick={() => void loadHistory()}>重试</button></p>}
+      {history?.map((revision) => <article className="memory-history-revision" key={revision.revision}>
+        <div><strong>第 {revision.revision} 版</strong><small>{Number.isFinite(Date.parse(revision.changed_at)) ? new Date(revision.changed_at).toLocaleString() : '时间未知'}</small></div>
+        {revision.body ? <><p>{asString(revision.body.content) || '（空内容）'}</p>{asString(revision.body.category) && <small>分类：{asString(revision.body.category)}</small>}</>
+          : <p className="muted">{revision.source_status === 'unavailable' ? '来源当前不可访问，正文已隐藏，无法恢复。' : '未保存该版本正文，无法恢复。'}</p>}
+        {revision.sources.length > 0 && <small>来源：{revision.sources.map((source) => source.kind === 'conversation_message'
+          ? `会话消息 ${source.id}` : `修改记录 ${source.id}`).join('、')}</small>}
+        {revision.restorable && revision.revision !== item.revision && <button type="button" className="button button-small button-secondary"
+          disabled={!canRestore} onClick={() => void restore(revision)}>恢复此版本</button>}
+      </article>)}
+      {history && history.length === 0 && <p className="muted">暂无历史版本。</p>}
+      {historyCursor && <button type="button" className="button button-small button-secondary" disabled={historyLoading}
+        onClick={() => void loadHistory(historyCursor)}>{historyLoading ? '正在读取…' : '加载更多历史'}</button>}
+    </section>}
   </article>;
 }
 

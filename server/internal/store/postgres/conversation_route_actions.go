@@ -39,9 +39,11 @@ func lockConversationRouteClaim(ctx context.Context, tx pgx.Tx, claim app.Conver
 	}
 	var content, role, sourceKind, clientID string
 	var sequence, routeAttempt int64
-	var createdAt time.Time
+	var createdAt, aggregationStartedAt, aggregationDeadline time.Time
+	var aggregationState string
 	var metadata, authorization []byte
-	err := tx.QueryRow(ctx, `SELECT m.content,m.role,m.source_kind,m.sequence,m.created_at,r.client_message_id,r.request_metadata,r.authorization_snapshot,r.route_attempt
+	err := tx.QueryRow(ctx, `SELECT m.content,m.role,m.source_kind,m.sequence,m.created_at,r.client_message_id,r.request_metadata,r.authorization_snapshot,r.route_attempt,
+r.aggregation_started_at,r.aggregation_deadline,r.aggregation_state
 FROM conversation_message_routes r
 JOIN service_identity i ON i.singleton=true AND i.instance_id=r.service_instance_id
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id
@@ -50,7 +52,7 @@ WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.owner_id=$3 AND r
  AND r.state='processing' AND r.lease_owner=$6 AND r.lease_version=$7 AND r.lease_expires_at>clock_timestamp()
 FOR UPDATE OF r`, claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID,
 		claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion).Scan(&content, &role, &sourceKind, &sequence, &createdAt, &clientID,
-		&metadata, &authorization, &routeAttempt)
+		&metadata, &authorization, &routeAttempt, &aggregationStartedAt, &aggregationDeadline, &aggregationState)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeConflict, "conversation route lease is no longer current")
 	}
@@ -61,6 +63,8 @@ FOR UPDATE OF r`, claim.ServiceInstanceID, claim.Message.ID, claim.Message.Owner
 	var auth task.Authorization
 	if json.Unmarshal(metadata, &input) != nil || json.Unmarshal(authorization, &auth) != nil ||
 		!reflect.DeepEqual(input, claim.Input) || !reflect.DeepEqual(auth, claim.Authorization) || routeAttempt != claim.RouteAttempt || routeAttempt < 0 ||
+		!aggregationStartedAt.Equal(claim.AggregationStartedAt) || !aggregationDeadline.Equal(claim.AggregationDeadline) ||
+		aggregationState != claim.AggregationState ||
 		content != claim.Message.Content || role != string(conversation.RoleUser) ||
 		(claim.Message.SourceKind != "" && sourceKind != claim.Message.SourceKind) || sequence != claim.Message.Sequence ||
 		clientID != claim.Message.ClientMessageID || !createdAt.Equal(claim.Message.CreatedAt) {
@@ -148,6 +152,94 @@ func (s *Store) LoadConversationRouteSnapshot(ctx context.Context, claim app.Con
 	return snapshot, err
 }
 
+// BeginConversationRouteAggregation schedules final classification without
+// extending the receipt deadline and fences the first classifier lease.
+func (s *Store) BeginConversationRouteAggregation(ctx context.Context, claim app.ConversationRouteClaim,
+	_ app.ConversationRouteSnapshot, decision app.ConversationRouteDecision) (bool, error) {
+	if decision.Action != app.ConversationRouteNew || decision.ExplicitNew || len(decision.AggregateMessageIDs) != 0 ||
+		claim.Input.ResultReviewID != "" || len(claim.Input.ClientAttachmentIDs) != 0 {
+		return false, nil
+	}
+	var started bool
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
+			return err
+		}
+		if claim.AggregationState != "open" ||
+			claim.AggregationDeadline.Sub(claim.AggregationStartedAt) != app.ConversationRouteAggregationWindow {
+			return nil
+		}
+		progress, err := conversationRouteAggregationProgress(ctx, tx, claim.Message.ID)
+		if err != nil {
+			return err
+		}
+		if progress.deadlinePassed && progress.candidates == 0 {
+			return nil
+		}
+		if claim.RouteAttempt >= int64(^uint64(0)>>1) {
+			return domain.NewError(domain.CodeInvalidState, "conversation route attempt limit reached")
+		}
+		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET aggregation_state='waiting',
+state='pending',route_attempt=route_attempt+1,lease_owner='',lease_expires_at=NULL,
+lease_version=lease_version+1,updated_at=clock_timestamp()
+WHERE message_id=$1 AND state='processing' AND aggregation_state='open'
+ AND lease_owner=$2 AND lease_version=$3 AND route_attempt=$4`, claim.Message.ID, claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt)
+		if err != nil {
+			return fmt.Errorf("start fixed conversation aggregation window: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "conversation aggregation window changed")
+		}
+		if err := syncConversationDuplicateMessages(ctx, tx, claim.Message.ID); err != nil {
+			return err
+		}
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
+			ObjectType: "message", ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID}); err != nil {
+			return err
+		}
+		started = true
+		return nil
+	})
+	return started, err
+}
+
+// ResolveConversationRouteAggregation uses the conversation lock to decide
+// whether a candidate is still unresolved. A reply or independent task may
+// have committed after the worker read its snapshot and must not fail the root.
+func (s *Store) ResolveConversationRouteAggregation(ctx context.Context, claim app.ConversationRouteClaim) error {
+	if claim.AggregationState != "waiting" {
+		return domain.InvalidArgument("route_aggregation", "conversation route is not waiting for aggregation")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
+			return err
+		}
+		progress, err := conversationRouteAggregationProgress(ctx, tx, claim.Message.ID)
+		if err != nil {
+			return err
+		}
+		state, reason := "pending", ""
+		if progress.unresolved > 0 && progress.clarification == 0 && (progress.attention > 0 || progress.waitExpired) {
+			state, reason = "failed", "routing_context_unavailable"
+		}
+		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state=$2,failure_reason=$3,
+lease_owner='',lease_expires_at=NULL,available_after=clock_timestamp(),updated_at=clock_timestamp()
+WHERE message_id=$1 AND state='processing' AND lease_owner=$4 AND lease_version=$5 AND lease_expires_at>clock_timestamp()`,
+			claim.Message.ID, state, reason, claim.LeaseOwner, claim.LeaseVersion)
+		if err != nil {
+			return fmt.Errorf("resolve conversation aggregation wait: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "conversation route lease is no longer current")
+		}
+		if err := syncConversationDuplicateMessages(ctx, tx, claim.Message.ID); err != nil {
+			return err
+		}
+		return recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
+			ObjectType: "message", ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID})
+	})
+}
+
 // A later client message can have a smaller server sequence when uploads arrive
 // out of order. Do not expose any causal descendant as this message's history.
 func conversationRouteDescendantIDs(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) ([]string, error) {
@@ -225,12 +317,17 @@ func loadConversationRouteSnapshotInTx(ctx context.Context, tx pgx.Tx, claim app
 		Content: claim.Message.Content, TimeZone: claim.Input.TimeZone, ServerReceivedAt: claim.Message.CreatedAt,
 		ReferenceTaskID: claim.Input.ReferenceTaskID,
 		History:         []app.ConversationRouteHistory{}, Candidates: []app.ConversationRouteCandidate{},
-		RequestCandidates: []app.ConversationRouteRequestCandidate{}}}
+		RequestCandidates: []app.ConversationRouteRequestCandidate{}, AggregationCandidates: []app.ConversationRouteAggregationCandidate{}}}
 	scopeDigest, err := app.ConversationRouteExecutionScopeDigest(claim.Input)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, err
 	}
 	value.Context.ExecutionScopeDigest = scopeDigest
+	controlScopeDigest, err := app.ConversationRouteControlScopeDigest(claim.Input)
+	if err != nil {
+		return app.ConversationRouteSnapshot{}, err
+	}
+	value.Context.ControlScopeDigest = controlScopeDigest
 	if claim.Input.ResultReviewID != "" {
 		resultReview, err := loadConversationTaskResultReviewInTx(ctx, tx, claim)
 		if err != nil {
@@ -492,14 +589,26 @@ ORDER BY id LIMIT 65`
 	if len(value.Context.Candidates) > 64 {
 		return app.ConversationRouteSnapshot{}, domain.NewError(domain.CodeInvalidState, "too many active tasks to route safely")
 	}
-	value.Context.Content, err = joinedConversationRouteContent(ctx, tx, claim)
-	if err != nil {
-		return app.ConversationRouteSnapshot{}, err
+	if claim.AggregationState == "waiting" && claim.Message.TaskID == "" {
+		progress, err := conversationRouteAggregationProgress(ctx, tx, claim.Message.ID)
+		if err != nil {
+			return app.ConversationRouteSnapshot{}, err
+		}
+		value.AggregationUnresolved = progress.unresolved > 0
+		value.AggregationNeedsClarification = progress.clarification > 0
+		value.AggregationCanWait = progress.unresolved > 0 && progress.attention == 0 && !progress.waitExpired
+		value.Context.Content = claim.Message.Content
+	} else {
+		value.Context.Content, err = joinedConversationRouteContent(ctx, tx, claim)
+		if err != nil {
+			return app.ConversationRouteSnapshot{}, err
+		}
 	}
 	requestRows, err := tx.Query(ctx, `SELECT r.message_id,m.sequence,m.content,r.state,COALESCE(m.task_id,''),
-COALESCE(t.status,''),EXISTS(SELECT 1 FROM conversation_route_model_calls call
+COALESCE(t.status,''),r.aggregation_state IN ('open','waiting'),
+r.aggregation_state IN ('open','waiting') AND $10::timestamptz>r.aggregation_deadline,EXISTS(SELECT 1 FROM conversation_route_model_calls call
  WHERE call.message_id=r.message_id AND call.actor_id=r.actor_id AND call.phase='normal'
-  AND call.attempt=r.route_attempt AND call.state='settled' AND call.decision->>'Action'='reply'),r.request_metadata
+  AND call.attempt=r.route_attempt AND call.state='settled' AND call.decision->>'Action'='reply'),r.request_metadata,r.authorization_snapshot
 FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
  AND m.conversation_id=r.conversation_id
@@ -518,17 +627,17 @@ ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_ad
  OR t.status IN ('queued','running','waiting_user','pausing','paused','cancelling') THEN 0 ELSE 1 END,
 		m.sequence DESC LIMIT 101`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
 		claim.Message.ConversationID, claim.Message.ID, claim.Message.Sequence, claim.Input.PreviousClientMessageID,
-		claim.Message.CreatedAt, claim.Input.ResultReviewID)
+		claim.Message.CreatedAt, claim.Input.ResultReviewID, claim.AggregationStartedAt)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read prior conversation route candidates: %w", err)
 	}
 	for requestRows.Next() {
 		var candidate app.ConversationRouteRequestCandidate
 		var routeStatus, taskStatus string
-		var directReply bool
-		var metadata []byte
+		var directReply, aggregationWaiting, aggregationClosed bool
+		var metadata, authorization []byte
 		if err := requestRows.Scan(&candidate.MessageID, &candidate.Sequence, &candidate.Content, &routeStatus,
-			&candidate.TaskID, &taskStatus, &directReply, &metadata); err != nil {
+			&candidate.TaskID, &taskStatus, &aggregationWaiting, &aggregationClosed, &directReply, &metadata, &authorization); err != nil {
 			requestRows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("scan prior conversation route candidate: %w", err)
 		}
@@ -542,6 +651,8 @@ ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_ad
 		}
 		candidate.RoutingStatus = conversation.RoutingStatus(routeStatus)
 		candidate.DirectReply = candidate.TaskID == "" && directReply
+		candidate.AggregationWaiting = candidate.TaskID == "" && aggregationWaiting
+		candidate.AggregationClosed = candidate.TaskID == "" && aggregationClosed
 		if candidate.TaskID != "" {
 			candidate.TaskStatus = task.Status(taskStatus)
 		}
@@ -549,18 +660,74 @@ ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_ad
 			requestRows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("decode prior route candidate input: %w", err)
 		}
+		if err := json.Unmarshal(authorization, &candidate.Authorization); err != nil {
+			requestRows.Close()
+			return app.ConversationRouteSnapshot{}, fmt.Errorf("decode prior route authorization: %w", err)
+		}
+		candidate.SameAuthorization = reflect.DeepEqual(candidate.Authorization, claim.Authorization)
 		candidate.ExecutionScopeDigest, err = app.ConversationRouteExecutionScopeDigest(candidate.RequestInput)
 		if err != nil {
 			requestRows.Close()
 			return app.ConversationRouteSnapshot{}, err
 		}
 		candidate.SameExecutionScope = bytes.Equal(candidate.ExecutionScopeDigest, value.Context.ExecutionScopeDigest)
+		candidate.ControlScopeDigest, err = app.ConversationRouteControlScopeDigest(candidate.RequestInput)
+		if err != nil {
+			requestRows.Close()
+			return app.ConversationRouteSnapshot{}, err
+		}
+		candidate.SameControlScope = bytes.Equal(candidate.ControlScopeDigest, value.Context.ControlScopeDigest)
 		value.Context.RequestCandidates = append(value.Context.RequestCandidates, candidate)
 	}
 	err = requestRows.Err()
 	requestRows.Close()
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read prior conversation route candidates: %w", err)
+	}
+	if claim.AggregationState == "waiting" && claim.Message.TaskID == "" && len(claim.Input.ClientAttachmentIDs) == 0 {
+		linkedRows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.content,r.request_metadata,r.authorization_snapshot
+FROM conversation_message_routes r
+JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
+ AND m.conversation_id=r.conversation_id
+WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+ AND r.duplicate_of_message_id=$5 AND r.state='routed' AND m.role='user' AND m.task_id IS NULL
+ AND r.aggregation_started_at<=$6 AND COALESCE(r.request_metadata->'client_attachment_ids','[]'::jsonb)='[]'::jsonb
+ORDER BY m.sequence,m.id LIMIT $7`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
+			claim.Message.ConversationID, claim.Message.ID, claim.AggregationDeadline, app.MaxConversationRouteAggregateMessages+1)
+		if err != nil {
+			return app.ConversationRouteSnapshot{}, fmt.Errorf("read linked conversation aggregation candidates: %w", err)
+		}
+		for linkedRows.Next() {
+			var candidate app.ConversationRouteAggregationCandidate
+			var metadata, authorization []byte
+			if err := linkedRows.Scan(&candidate.MessageID, &candidate.Sequence, &candidate.Content, &metadata, &authorization); err != nil {
+				linkedRows.Close()
+				return app.ConversationRouteSnapshot{}, fmt.Errorf("scan linked conversation aggregation candidate: %w", err)
+			}
+			var input app.ConversationRoutingInput
+			var auth task.Authorization
+			if json.Unmarshal(metadata, &input) != nil || json.Unmarshal(authorization, &auth) != nil ||
+				!reflect.DeepEqual(auth, claim.Authorization) || len(input.ClientAttachmentIDs) != 0 || len(candidate.Content) > 4096 {
+				continue
+			}
+			digest, err := app.ConversationRouteExecutionScopeDigest(input)
+			if err != nil {
+				linkedRows.Close()
+				return app.ConversationRouteSnapshot{}, err
+			}
+			if !bytes.Equal(digest, value.Context.ExecutionScopeDigest) {
+				continue
+			}
+			if len(value.Context.AggregationCandidates) == app.MaxConversationRouteAggregateMessages {
+				continue
+			}
+			value.Context.AggregationCandidates = append(value.Context.AggregationCandidates, candidate)
+		}
+		err = linkedRows.Err()
+		linkedRows.Close()
+		if err != nil {
+			return app.ConversationRouteSnapshot{}, fmt.Errorf("read linked conversation aggregation candidates: %w", err)
+		}
 	}
 	if value.Context.ResultReview == nil {
 		stored, err := loadConversationRouteSummaryInTx(ctx, tx, claim, value.PreviousMessageID, descendants)
@@ -656,8 +823,19 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if current.ResultReviewSuperseded {
 			return finishConversationRoute(ctx, tx, claim, "routed", "", "", true)
 		}
+		if current.AggregationUnresolved {
+			if current.AggregationNeedsClarification && decision.Action == app.ConversationRouteClarify &&
+				strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
+				!strings.ContainsRune(decision.Question, '\x00') && utf8.RuneCountInString(decision.Question) <= 200 {
+				return finishConversationRoute(ctx, tx, claim, "waiting_user", strings.TrimSpace(decision.Question), "", false)
+			}
+			return requeueConversationRouteForReclassification(ctx, tx, claim)
+		}
 		if !app.ValidConversationRouteModelOutput(decision.ModelOutput) {
 			return domain.InvalidArgument("route_decision", "conversation route model output is invalid")
+		}
+		if decision.Action != app.ConversationRouteNew && len(decision.AggregateMessageIDs) != 0 {
+			return domain.InvalidArgument("route_decision", "aggregation candidates are only valid for a new Task")
 		}
 		if decision.Action == app.ConversationRouteReply {
 			if decision.TaskID != "" || decision.ExpectedRevision != 0 || decision.Question != "" ||
@@ -718,8 +896,10 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 				break
 			}
 		}
+		pendingRootStop := decision.Action == app.ConversationRouteStop && decision.TargetMessageID != "" && decision.TaskID == "" &&
+			app.ValidConversationRoutePendingRootStop(decision.TargetMessageID, current.Context.RequestCandidates)
 		if decision.Action == app.ConversationRouteUpdate || decision.Action == app.ConversationRouteStatus || decision.Action == app.ConversationRouteStop {
-			if candidate == nil || (claim.Input.ReferenceTaskID != "" && claim.Input.ReferenceTaskID != decision.TaskID) {
+			if !pendingRootStop && (candidate == nil || (claim.Input.ReferenceTaskID != "" && claim.Input.ReferenceTaskID != decision.TaskID)) {
 				question := "无法确认目标任务，请说明要处理哪个任务。"
 				if current.Context.ReferenceUnavailable {
 					question = app.UnavailableRouteReferenceMessage
@@ -731,12 +911,22 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		case app.ConversationRouteJoin:
 			return linkDuplicateConversationRouteInTx(ctx, tx, claim, current, decision.TargetMessageID)
 		case app.ConversationRouteNew:
+			if !app.ValidConversationRouteAggregateIDs(decision.AggregateMessageIDs, current.Context.AggregationCandidates) {
+				return domain.NewError(domain.CodeConflict, "conversation aggregation candidates changed")
+			}
 			if !decision.ExplicitNew {
 				if duplicate := exactConversationRouteDuplicate(current.Context.RequestCandidates, claim); duplicate != "" {
 					return linkDuplicateConversationRouteInTx(ctx, tx, claim, current, duplicate)
 				}
 			}
-			return createConversationRouteTask(ctx, tx, claim, current.Context.Content, modelID, decision.DependencyTaskIDs,
+			routedContent := current.Context.Content
+			if claim.AggregationState == "waiting" {
+				routedContent, err = prepareConversationRouteAggregation(ctx, tx, claim, current, decision.AggregateMessageIDs)
+				if err != nil {
+					return err
+				}
+			}
+			return createConversationRouteTask(ctx, tx, claim, routedContent, modelID, decision.DependencyTaskIDs,
 				current.Context.Candidates, current.Summary)
 		case app.ConversationRouteReply:
 			if current.Context.ResultReview != nil {
@@ -796,6 +986,9 @@ COALESCE((SELECT expected_revision FROM task_revision_intents WHERE task_id=$1 O
 		case app.ConversationRouteStop:
 			if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskControl); err != nil {
 				return err
+			}
+			if pendingRootStop {
+				return cancelPendingConversationRouteRoot(ctx, tx, claim, current, decision.TargetMessageID)
 			}
 			if _, err := tx.Exec(ctx, `UPDATE task_mcp_connector_operations SET cancel_requested=true,updated_at=clock_timestamp()
 WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, candidate.TaskID); err != nil {
@@ -1005,6 +1198,227 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 	return merged.String(), nil
 }
 
+func prepareConversationRouteAggregation(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
+	snapshot app.ConversationRouteSnapshot, selectedIDs []string) (string, error) {
+	if !app.ValidConversationRouteAggregateIDs(selectedIDs, snapshot.Context.AggregationCandidates) {
+		return "", domain.NewError(domain.CodeConflict, "conversation aggregation candidate is no longer available")
+	}
+	selected := make(map[string]app.ConversationRouteAggregationCandidate, len(selectedIDs))
+	for _, id := range selectedIDs {
+		for _, candidate := range snapshot.Context.AggregationCandidates {
+			if candidate.MessageID == id {
+				selected[id] = candidate
+				break
+			}
+		}
+	}
+	if len(selected) != len(selectedIDs) {
+		return "", domain.NewError(domain.CodeConflict, "conversation aggregation candidate set changed")
+	}
+	var contents []string
+	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.content,r.request_metadata,r.authorization_snapshot,r.aggregation_started_at
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id
+ AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id
+WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+ AND r.duplicate_of_message_id=$5 AND r.state='routed' AND m.role='user' AND m.task_id IS NULL
+ AND m.id=ANY($6::text[])
+ORDER BY m.sequence,m.id FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
+		claim.Message.ConversationID, claim.Message.ID, selectedIDs)
+	if err != nil {
+		return "", fmt.Errorf("lock selected conversation aggregation candidates: %w", err)
+	}
+	for rows.Next() {
+		var id, content string
+		var sequence int64
+		var metadata, authorization []byte
+		var acceptedAt time.Time
+		if err := rows.Scan(&id, &sequence, &content, &metadata, &authorization, &acceptedAt); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("scan selected conversation aggregation candidate: %w", err)
+		}
+		candidate, ok := selected[id]
+		var input app.ConversationRoutingInput
+		var auth task.Authorization
+		if !ok || sequence != candidate.Sequence || content != candidate.Content || acceptedAt.After(claim.AggregationDeadline) ||
+			json.Unmarshal(metadata, &input) != nil || json.Unmarshal(authorization, &auth) != nil ||
+			!reflect.DeepEqual(auth, claim.Authorization) || len(input.ClientAttachmentIDs) != 0 {
+			rows.Close()
+			return "", domain.NewError(domain.CodeConflict, "selected conversation aggregation candidate changed")
+		}
+		digest, err := app.ConversationRouteExecutionScopeDigest(input)
+		if err != nil || !bytes.Equal(digest, snapshot.Context.ExecutionScopeDigest) {
+			rows.Close()
+			return "", domain.NewError(domain.CodeConflict, "selected conversation aggregation scope changed")
+		}
+		contents = append(contents, content)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return "", fmt.Errorf("read selected conversation aggregation candidates: %w", err)
+	}
+	if len(contents) != len(selectedIDs) {
+		return "", domain.NewError(domain.CodeConflict, "selected conversation aggregation candidate disappeared")
+	}
+	content := claim.Message.Content
+	if len(contents) > 0 {
+		var merged strings.Builder
+		merged.WriteString("用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n")
+		merged.WriteString(content)
+		for _, supplement := range contents {
+			merged.WriteString("\n\n--- 用户补充 ---\n\n")
+			merged.WriteString(supplement)
+		}
+		if merged.Len() > 32768 {
+			return "", domain.NewError(domain.CodeResultTooLarge, "conversation aggregation exceeds the routing limit")
+		}
+		content = merged.String()
+	}
+	rows, err = tx.Query(ctx, `WITH detached AS (
+ UPDATE conversation_message_routes SET duplicate_of_message_id=NULL,state='pending',aggregation_state='settled',
+  available_after=clock_timestamp(),lease_owner='',lease_expires_at=NULL,lease_version=lease_version+1,updated_at=clock_timestamp()
+ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4
+  AND duplicate_of_message_id=$5 AND state='routed' AND message_id<>ALL($6::text[])
+ RETURNING message_id,owner_id,client_message_id
+), reset_messages AS (
+ UPDATE conversation_messages m SET delivery_status='pending' FROM detached d
+ WHERE m.id=d.message_id AND m.owner_id=d.owner_id RETURNING m.id,d.owner_id,d.client_message_id
+)
+SELECT id,owner_id,client_message_id FROM reset_messages`, claim.ServiceInstanceID, claim.Message.OwnerID,
+		claim.Message.ActorID, claim.Message.ConversationID, claim.Message.ID, selectedIDs)
+	if err != nil {
+		return "", fmt.Errorf("release unselected conversation aggregation candidates: %w", err)
+	}
+	type releasedMessage struct{ id, owner, clientID string }
+	var released []releasedMessage
+	for rows.Next() {
+		var item releasedMessage
+		if err := rows.Scan(&item.id, &item.owner, &item.clientID); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("read released conversation aggregation candidate: %w", err)
+		}
+		released = append(released, item)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return "", fmt.Errorf("read released conversation aggregation candidates: %w", err)
+	}
+	for _, item := range released {
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: item.owner,
+			ObjectType: "message", ObjectID: item.id, Operation: "upsert", MutationID: item.clientID}); err != nil {
+			return "", err
+		}
+	}
+	return content, nil
+}
+
+func cancelPendingConversationRouteRoot(ctx context.Context, tx pgx.Tx, stopClaim app.ConversationRouteClaim,
+	snapshot app.ConversationRouteSnapshot, targetMessageID string) error {
+	if !app.ValidConversationRoutePendingRootStop(targetMessageID, snapshot.Context.RequestCandidates) {
+		return domain.NewError(domain.CodeConflict, "pending conversation route target is no longer authorized")
+	}
+	var root app.ConversationRouteClaim
+	var role, delivery, sourceKind, routeState, aggregationState string
+	var taskID string
+	var metadata, authorization []byte
+	err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,COALESCE(m.task_id,''),
+m.model_id,m.sequence,m.delivery_status,m.created_at,m.source_kind,r.client_message_id,r.request_metadata,
+r.authorization_snapshot,r.route_attempt,r.aggregation_started_at,r.aggregation_deadline,r.aggregation_state,r.state
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id
+ AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id
+WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+ AND r.message_id=$5 AND r.duplicate_of_message_id IS NULL
+FOR UPDATE OF r,m`, stopClaim.ServiceInstanceID, stopClaim.Message.OwnerID, stopClaim.Message.ActorID,
+		stopClaim.Message.ConversationID, targetMessageID).Scan(&root.Message.ID, &root.Message.ConversationID,
+		&root.Message.OwnerID, &root.Message.ActorID, &role, &root.Message.Content, &taskID, &root.Message.ModelID,
+		&root.Message.Sequence, &delivery, &root.Message.CreatedAt, &sourceKind, &root.Message.ClientMessageID,
+		&metadata, &authorization, &root.RouteAttempt, &root.AggregationStartedAt, &root.AggregationDeadline,
+		&aggregationState, &routeState)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return requeueConversationRouteForReclassification(ctx, tx, stopClaim)
+	}
+	if err != nil {
+		return fmt.Errorf("lock pending conversation route target: %w", err)
+	}
+	if json.Unmarshal(metadata, &root.Input) != nil || json.Unmarshal(authorization, &root.Authorization) != nil {
+		return requeueConversationRouteForReclassification(ctx, tx, stopClaim)
+	}
+	if taskID != "" || (routeState != "pending" && routeState != "processing") ||
+		(aggregationState != "open" && aggregationState != "waiting") ||
+		delivery != string(conversation.DeliveryPending) {
+		return requeueConversationRouteForReclassification(ctx, tx, stopClaim)
+	}
+	if !reflect.DeepEqual(root.Authorization, stopClaim.Authorization) {
+		return finishConversationRoute(ctx, tx, stopClaim, "waiting_user", "这条请求的授权范围已变化，请确认目标后重试。", "", false)
+	}
+	rootControlScopeDigest, err := app.ConversationRouteControlScopeDigest(root.Input)
+	if err != nil || !bytes.Equal(rootControlScopeDigest, snapshot.Context.ControlScopeDigest) {
+		return finishConversationRoute(ctx, tx, stopClaim, "waiting_user", "这条请求的执行范围已变化，请确认目标后重试。", "", false)
+	}
+	var candidate *app.ConversationRouteRequestCandidate
+	for index := range snapshot.Context.RequestCandidates {
+		item := &snapshot.Context.RequestCandidates[index]
+		if item.MessageID == targetMessageID {
+			candidate = item
+			break
+		}
+	}
+	if candidate == nil || candidate.Sequence != root.Message.Sequence || candidate.Content != root.Message.Content ||
+		candidate.RoutingStatus != conversation.RoutingStatus(routeState) || !candidate.SameControlScope || !candidate.SameAuthorization {
+		return requeueConversationRouteForReclassification(ctx, tx, stopClaim)
+	}
+	root.ServiceInstanceID = stopClaim.ServiceInstanceID
+	root.Message.Role = conversation.Role(role)
+	root.Message.SourceKind = sourceKind
+	root.Message.DeliveryStatus = conversation.DeliveryStatus(delivery)
+	root.Message.RoutingStatus = conversation.RoutingStatus(routeState)
+	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET aggregation_state='cancelled',updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND message_id=$2 AND state=$3 AND aggregation_state IN ('open','waiting')
+ AND route_attempt=$4`,
+		root.ServiceInstanceID, root.Message.ID, routeState, root.RouteAttempt)
+	if err != nil {
+		return fmt.Errorf("mark pending conversation route cancelled: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return requeueConversationRouteForReclassification(ctx, tx, stopClaim)
+	}
+	if err := finishConversationRoute(ctx, tx, root, "routed", "这条请求已在任务创建前取消；未创建 Task，也未执行。", "", true); err != nil {
+		return err
+	}
+	linkedRows, err := tx.Query(ctx, `UPDATE conversation_message_routes SET aggregation_state='cancelled',
+lease_owner='',lease_expires_at=NULL,lease_version=lease_version+1,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4
+ AND duplicate_of_message_id=$5 AND state='routed'
+RETURNING message_id,owner_id,client_message_id`, root.ServiceInstanceID, root.Message.OwnerID,
+		root.Message.ActorID, root.Message.ConversationID, root.Message.ID)
+	if err != nil {
+		return fmt.Errorf("mark linked conversation supplements cancelled: %w", err)
+	}
+	type linkedMessage struct{ id, owner, clientID string }
+	var linked []linkedMessage
+	for linkedRows.Next() {
+		var item linkedMessage
+		if err := linkedRows.Scan(&item.id, &item.owner, &item.clientID); err != nil {
+			linkedRows.Close()
+			return fmt.Errorf("read cancelled conversation supplement: %w", err)
+		}
+		linked = append(linked, item)
+	}
+	err = linkedRows.Err()
+	linkedRows.Close()
+	if err != nil {
+		return fmt.Errorf("read cancelled conversation supplements: %w", err)
+	}
+	for _, item := range linked {
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: item.owner,
+			ObjectType: "message", ObjectID: item.id, Operation: "upsert", MutationID: item.clientID}); err != nil {
+			return err
+		}
+	}
+	return finishConversationRoute(ctx, tx, stopClaim, "routed", "已取消这条仍在等待的请求；未创建 Task，也未执行。", "", true)
+}
+
 func markPendingTaskConversationMessagesUnknown(ctx context.Context, tx pgx.Tx, taskID, ownerID, conversationID string) error {
 	rows, err := tx.Query(ctx, `UPDATE conversation_messages message SET delivery_status='unknown'
 FROM tasks task
@@ -1055,19 +1469,22 @@ func linkDuplicateConversationRouteInTx(ctx context.Context, tx pgx.Tx, claim ap
 		return domain.NewError(domain.CodeConflict, "conversation join target is no longer authorized")
 	}
 	var rootSequence int64
-	var rootContent, rootClientID, rootState, rootTaskID, rootDelivery, rootSourceKind string
-	var rootMetadata []byte
+	var rootContent, rootClientID, rootState, rootTaskID, rootDelivery, rootSourceKind, rootAggregationState string
+	var rootMetadata, rootAuthorization []byte
 	var rootAttempt int64
+	var rootAggregationEligible bool
 	err := tx.QueryRow(ctx, `SELECT m.sequence,m.content,r.client_message_id,r.state,COALESCE(m.task_id,''),m.delivery_status,
-r.request_metadata,r.route_attempt,m.source_kind
+r.request_metadata,r.authorization_snapshot,r.route_attempt,m.source_kind,r.aggregation_state,
+$6::timestamptz BETWEEN r.aggregation_started_at AND r.aggregation_deadline
 FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
  AND m.conversation_id=r.conversation_id
 WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
  AND r.message_id=$5 AND r.duplicate_of_message_id IS NULL
 FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
-		claim.Message.ConversationID, targetMessageID).Scan(&rootSequence, &rootContent, &rootClientID, &rootState,
-		&rootTaskID, &rootDelivery, &rootMetadata, &rootAttempt, &rootSourceKind)
+		claim.Message.ConversationID, targetMessageID, claim.AggregationStartedAt).Scan(&rootSequence, &rootContent, &rootClientID, &rootState,
+		&rootTaskID, &rootDelivery, &rootMetadata, &rootAuthorization, &rootAttempt, &rootSourceKind,
+		&rootAggregationState, &rootAggregationEligible)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeConflict, "conversation join target changed")
 	}
@@ -1083,6 +1500,13 @@ FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Messag
 	rootDigest, err := app.ConversationRouteExecutionScopeDigest(rootInput)
 	if err != nil || !bytes.Equal(rootDigest, snapshot.Context.ExecutionScopeDigest) {
 		return domain.NewError(domain.CodeConflict, "conversation join execution scope changed")
+	}
+	if rootAggregationState == "open" || rootAggregationState == "waiting" {
+		var rootAuthorizationValue task.Authorization
+		if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil || !rootAggregationEligible ||
+			len(rootInput.ClientAttachmentIDs) != 0 || !reflect.DeepEqual(rootAuthorizationValue, claim.Authorization) {
+			return requeueConversationRouteForReclassification(ctx, tx, claim)
+		}
 	}
 	if rootTaskID != "" {
 		var status string
@@ -1519,7 +1943,9 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 			return err
 		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state=$2,lease_owner='',lease_expires_at=NULL,
+	if _, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state=$2,
+aggregation_state=CASE WHEN aggregation_state='cancelled' THEN 'cancelled' ELSE 'settled' END,
+lease_owner='',lease_expires_at=NULL,lease_version=lease_version+1,
 failure_reason='',awaiting_predecessor=false,updated_at=clock_timestamp() WHERE message_id=$1`, claim.Message.ID, state); err != nil {
 		return fmt.Errorf("complete conversation route: %w", err)
 	}

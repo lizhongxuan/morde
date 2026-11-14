@@ -353,6 +353,7 @@ const (
 	PendingRequestApproved  PendingRequestStatus = "approved"
 	PendingRequestRejected  PendingRequestStatus = "rejected"
 	PendingRequestCancelled PendingRequestStatus = "cancelled"
+	PendingRequestExpired   PendingRequestStatus = "expired"
 )
 
 type PendingDecision string
@@ -407,6 +408,7 @@ type PendingRequest struct {
 	Status                  PendingRequestStatus
 	Decision                PendingDecision
 	CreatedAt               time.Time
+	ExpiresAt               *time.Time
 	RespondedAt             *time.Time
 }
 

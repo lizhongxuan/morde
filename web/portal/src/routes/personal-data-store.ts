@@ -2,6 +2,8 @@ import type { components } from '../api/schema';
 
 export type PersonalObjectType = components['schemas']['PersonalObjectType'];
 export type PersonalObjectBody = Record<string, unknown>;
+export type PersonalMemoryRevision = components['schemas']['PersonalMemoryRevision'];
+export type PersonalMemoryHistoryPage = components['schemas']['PersonalMemoryHistoryPage'];
 
 export interface PersonalObject {
   object_type: PersonalObjectType;
@@ -108,6 +110,7 @@ export interface PersonalDataAPI {
   personalDataSnapshot(cursor?: string, limit?: number): Promise<PersonalSnapshotPage>;
   personalDataChanges(after: number, through?: number, limit?: number): Promise<PersonalChangePage>;
   getPersonalObject(type: PersonalObjectType, id: string): Promise<PersonalObject>;
+  personalMemoryHistory(id: string, cursor?: string, limit?: number): Promise<PersonalMemoryHistoryPage>;
   replacePersonalObject(type: PersonalObjectType, id: string, baseRevision: number, body: PersonalObjectBody, key?: string): Promise<{ result_revision: number; account_change_sequence: number }>;
   deletePersonalObject(type: PersonalObjectType, id: string, baseRevision: number, key?: string): Promise<{ result_revision: number; account_change_sequence: number }>;
   personalDataQuota(): Promise<{ used_bytes: number; reserved_bytes: number; quota_bytes: number; remaining_bytes: number; max_attachment_bytes: number }>;

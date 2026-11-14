@@ -7,7 +7,7 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 const { currentUser, apiMocks } = vi.hoisted(() => ({
   currentUser: { id: 'u_personal_page', name: 'Alice' },
   apiMocks: {
-    capabilities: vi.fn(), snapshot: vi.fn(), changes: vi.fn(), getObject: vi.fn(), replace: vi.fn(), delete: vi.fn(), quota: vi.fn(),
+    capabilities: vi.fn(), snapshot: vi.fn(), changes: vi.fn(), getObject: vi.fn(), memoryHistory: vi.fn(), replace: vi.fn(), delete: vi.fn(), quota: vi.fn(),
     createUpload: vi.fn(), putChunk: vi.fn(), commit: vi.fn(), cancelUpload: vi.fn(), getAttachment: vi.fn(), submitTask: vi.fn(),
   },
 }));
@@ -24,6 +24,7 @@ vi.mock('../app/api', async (importOriginal) => {
       personalDataSnapshot: apiMocks.snapshot,
       personalDataChanges: apiMocks.changes,
       getPersonalObject: apiMocks.getObject,
+      personalMemoryHistory: apiMocks.memoryHistory,
       replacePersonalObject: apiMocks.replace,
       deletePersonalObject: apiMocks.delete,
       personalDataQuota: apiMocks.quota,
@@ -96,6 +97,7 @@ beforeEach(() => {
   }));
   apiMocks.getObject.mockReset();
   apiMocks.getObject.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }));
+  apiMocks.memoryHistory.mockReset().mockResolvedValue({ items: [], next_cursor: null });
   apiMocks.replace.mockReset().mockResolvedValue({ result_revision: 1, account_change_sequence: 1 });
   apiMocks.delete.mockReset().mockResolvedValue({ result_revision: 1, account_change_sequence: 1 });
   apiMocks.quota.mockReset().mockResolvedValue({ used_bytes: 0, reserved_bytes: 0, quota_bytes: 1024, remaining_bytes: 1024, max_attachment_bytes: 1024 });
@@ -107,9 +109,10 @@ beforeEach(() => {
   apiMocks.submitTask.mockReset();
   localStorage.clear();
   Object.defineProperty(navigator, 'locks', { configurable: true, value: sharedTestLocks() });
+  vi.stubGlobal('confirm', vi.fn(() => true));
 });
 
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe('PersonalData', () => {
   it('waits for service identity before starting cloud sync', async () => {
@@ -414,6 +417,39 @@ describe('PersonalData', () => {
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
   });
 
+  it('shows memory history sources and restores a saved revision through the current CAS mutation', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 4,
+      items: [{ object_type: 'memory', object_id: 'm_history01', revision: 2, body: { content: '当前偏好' } }],
+      next_cursor: null,
+    });
+    apiMocks.memoryHistory
+      .mockResolvedValueOnce({ items: [
+        { revision: 2, changed_at: '2026-11-10T12:00:00Z', body: { content: '当前偏好' }, restorable: true,
+          source_status: 'available', sources: [{ kind: 'mutation_receipt', id: 'receipt-current' }] },
+      ], next_cursor: 'history-next-001' })
+      .mockResolvedValueOnce({ items: [
+        { revision: 1, changed_at: '2026-11-09T12:00:00Z', body: { content: '历史偏好', category: '沟通' }, restorable: true,
+          source_status: 'available', sources: [{ kind: 'conversation_message', id: 'm_source01', conversation_id: 'c_source01' }] },
+      ], next_cursor: null });
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.click(screen.getByRole('button', { name: '历史版本' }));
+
+    expect(await screen.findByText('当前偏好', { selector: '.memory-history-revision p' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '加载更多历史' }));
+    expect(await screen.findByText('历史偏好')).toBeInTheDocument();
+    expect(screen.getByText(/会话消息 m_source01/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '恢复此版本' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
+      'memory', 'm_history01', 2, { content: '历史偏好', category: '沟通' }, expect.any(String), currentUser.id, 'service-personal-test',
+    ));
+    expect(apiMocks.memoryHistory).toHaveBeenNthCalledWith(1, 'm_history01', undefined, 25);
+    expect(apiMocks.memoryHistory).toHaveBeenNthCalledWith(2, 'm_history01', 'history-next-001', 25);
+  });
+
   it('deletes an existing memory with its current revision', async () => {
     const user = userEvent.setup();
     apiMocks.snapshot.mockResolvedValue({
@@ -430,6 +466,24 @@ describe('PersonalData', () => {
       'memory', 'm_saved02', 7, expect.any(String), 'service-personal-test', currentUser.id,
     ));
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
+  });
+
+  it('explains permanent history cleanup before deleting a memory and honors cancellation', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 5,
+      items: [{ object_type: 'memory', object_id: 'm_saved03', revision: 1, body: { content: '保留历史的记忆' } }],
+      next_cursor: null,
+    });
+    const confirm = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirm);
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.click(screen.getByRole('button', { name: '删除' }));
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('历史正文无法恢复'));
+    expect(apiMocks.delete).not.toHaveBeenCalled();
   });
 
   it('saves a personal Morde SOUL override through the owner-scoped personal-object API', async () => {

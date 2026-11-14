@@ -174,7 +174,7 @@ export const portalApi = {
   clients: async () => unwrapApiResponse(await api.GET('/api/clients')),
   revokeClient: async (id: string) => unwrapApiResponse(await api.DELETE('/api/clients/{id}', { params: { path: { id } } })),
   capabilities: async () => unwrapApiResponse(await api.GET('/api/capabilities')),
-  conversations: async (cursor?: string, limit = 100) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit, ...(cursor ? { cursor } : {}) } } })),
+  conversations: async (cursor?: string, limit = 100, q?: string) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit, ...(q ? { q } : {}), ...(cursor ? { cursor } : {}) } } })),
   createConversation: async (body: components['schemas']['CreateConversationRequest'], idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
     if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
     return unwrapApiResponse(await api.POST('/api/conversations', {
@@ -306,6 +306,9 @@ export const portalApi = {
     params: { query: { after_sequence: afterSequence, limit, ...(throughSequence === undefined ? {} : { through_sequence: throughSequence }) } },
   })),
   getPersonalObject: async (type: components['schemas']['PersonalMutationObjectType'], id: string) => unwrapApiResponse(await api.GET('/api/personal-data/{type}/{id}', { params: { path: { type, id } } })),
+  personalMemoryHistory: async (id: string, cursor?: string, limit = 50) => unwrapApiResponse(await api.GET('/api/personal-data/{type}/{id}/history', {
+    params: { path: { type: 'memory', id }, query: { limit, ...(cursor ? { cursor } : {}) } },
+  })),
   replacePersonalObject: async (
     type: components['schemas']['PersonalMutationObjectType'], id: string, baseRevision: number,
     body: components['schemas']['PersonalObjectPutRequest']['body'], idempotencyKey = newIdempotencyKey(), actorID?: string, serviceInstanceID?: string,

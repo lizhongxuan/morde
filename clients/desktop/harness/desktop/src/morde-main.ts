@@ -1,11 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, Tray, WebContentsView, type Session, type WebContents } from "electron";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
+import { access, lstat, realpath } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
+import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
 
 app.setName("Morde");
 const userData = mordeUserDataDirectory(app.getPath("appData"), process.env.MORDE_TEST_USER_DATA);
@@ -130,6 +132,19 @@ let quitInProgress = false;
 const hostWindows = new Set<BrowserWindow>();
 const hostWorkbenchReturnHandlers = new Map<WebContents, () => boolean>();
 const api = new MordeAPI(() => credentials, () => app.getVersion());
+const codex = new MordeCodexRuntime(api, {
+  load: () => {
+    if (!activeProfile) throw new Error("Codex profile is unavailable");
+    const raw = readOptionalBuffer(profileFile("codex"));
+    if (raw === null) return null;
+    if (raw.byteLength > 10 * 1024 * 1024 || !safeStorageReady()) throw new Error("Codex encrypted profile is unavailable");
+    return JSON.parse(safeStorage.decryptString(raw)) as unknown;
+  },
+  save: (value: CodexPersistentState) => {
+    if (!credentials || !activeProfile || !safeStorageReady()) throw new Error("Codex secure storage is unavailable");
+    savePrivate(profileFile("codex"), safeStorage.encryptString(JSON.stringify(value)));
+  },
+}, () => notifyState());
 const syncBinary = () => app.isPackaged ? join(process.resourcesPath, "bin", process.platform === "win32" ? "morde-sync.exe" : "morde-sync") : process.env.MORDE_SYNC_BINARY || "";
 const workspaceNode = new MordeSyncthingNode(() => app.isPackaged
   ? join(process.resourcesPath, "bin", process.platform === "win32" ? "morde-syncthing.exe" : "morde-syncthing")
@@ -582,9 +597,9 @@ function accountProfileID(origin: string, accountName: string): string { return 
 function profileID(auth: Credentials): string {
   return createHash("sha256").update(`${auth.origin}\0${auth.serviceInstanceID}\0${auth.accountName}\0${auth.installationId}`).digest("hex");
 }
-function profileFile(name: "mappings" | "project-mappings" | "sync-checkpoint" | "workspace-sync" | "handoff" | "live-sync"): string {
+function profileFile(name: "mappings" | "project-mappings" | "sync-checkpoint" | "workspace-sync" | "handoff" | "live-sync" | "codex"): string {
   if (!activeProfile) throw new Error("Log in before changing local Workspace state");
-  return `${name}-${activeProfile}.${name === "workspace-sync" || name === "live-sync" ? "bin" : "json"}`;
+  return `${name}-${activeProfile}.${name === "workspace-sync" || name === "live-sync" || name === "codex" ? "bin" : "json"}`;
 }
 function savePrivate(name: string, value: string | Buffer): void {
   const target = settingsPath(name);
@@ -919,6 +934,7 @@ function loadProfile(auth: Credentials): void {
   } catch {
     liveSyncStateError = "本机实时同步恢复状态无法安全读取；相关操作已暂停。";
   }
+  codex.load(auth.serviceInstanceID, auth.installationId);
 }
 
 async function workspaceSyncManagedFolders(): Promise<ManagedWorkspaceFolder[]> {
@@ -1425,6 +1441,7 @@ function publicState(): unknown {
     liveSyncCapabilityMessage: credentials ? liveSyncCapabilityMessage : "",
     liveSyncs: credentials ? publicLiveSyncs() : {},
     handoff: credentials ? publicHandoff(handoffRecord) : null,
+    codex: credentials ? codex.publicState() : null,
     profileError: credentials ? profileError : null,
     workspaceSync: credentials ? {
       nodeState: workspaceNode.isRunning() ? "running" : workspaceNode.mayOwnWorkspace() ? "unknown" : "stopped",
@@ -1855,6 +1872,7 @@ function detachWeb(): void {
 
 function clearAuthorization(stopRuntime = true): void {
   if (!credentials) return;
+  void codex.stop();
   if (stopRuntime) {
     for (const [workspaceID, runner] of liveSyncRunners) {
       const record = liveSyncRecords[workspaceID];
@@ -2272,6 +2290,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     lastInstallation = { origin: credentials.origin, serviceInstanceID: credentials.serviceInstanceID, name: normalizedName, id: credentials.installationId };
     scheduleCredentialExpiry();
     scheduleAuthorizationCheck();
+    void codex.start().catch(() => notifyState());
     void refreshLiveSyncCapability(result.credentials);
     await openAssistant(result.webSession);
     void restoreWorkspaceNode(result.credentials);
@@ -2427,10 +2446,10 @@ function handler<T extends unknown[]>(channel: string, fn: (...args: T) => Promi
   });
 }
 
-function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown): void {
+function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown, workspacesOnly = false): void {
   ipcMain.handle(channel, async (event, ...args: unknown[]) => {
     const auth = credentials;
-    if (!auth || !trustedPortalBridgeEvent(event, auth)) throw new Error("Invalid Portal window or route");
+    if (!auth || !trustedPortalBridgeEvent(event, auth) || workspacesOnly && sameOriginURL(event.sender.getURL(), auth.origin)?.pathname !== "/workspaces") throw new Error("Invalid Portal window or route");
     if (logoutInProgress) throw new Error("Sign-out is in progress");
     if (credentialExpired(auth.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
     try { return await fn(...args); } catch (error) { return sendError(error); }
@@ -2447,6 +2466,50 @@ function register(): void {
     return { returned: true };
   });
   handler("morde:state", () => publicState());
+  handler("morde:open-assistant", async () => { await openAssistant(); return { opened: true }; });
+  handler("morde:codex-add-profile", async () => {
+    if (!credentials || !safeStorageReady()) throw new Error("Codex 需要有效的 Morde Client 授权和系统安全存储");
+    const homeChoice = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory"] });
+    if (homeChoice.canceled || !homeChoice.filePaths[0]) return codex.publicState();
+    const homeDirectory = await realpath(homeChoice.filePaths[0]);
+    if (!(await lstat(homeDirectory)).isDirectory()) throw new Error("所选 CODEX_HOME 必须是目录");
+    const executableChoice = await dialog.showOpenDialog(mainWindow!, { properties: ["openFile"] });
+    if (executableChoice.canceled || !executableChoice.filePaths[0]) return codex.publicState();
+    const executable = await realpath(executableChoice.filePaths[0]);
+    if (!(await lstat(executable)).isFile()) throw new Error("所选 Codex 命令必须是文件");
+    if (process.platform !== "win32") await access(executable, fsConstants.X_OK);
+    await codex.addProfile(homeDirectory, executable);
+    notifyState();
+    return codex.publicState();
+  });
+  handler("morde:codex-select-profile", (profileKey: unknown) => {
+    if (typeof profileKey !== "string") throw new Error("Invalid Codex profile");
+    codex.selectProfile(profileKey);
+    notifyState();
+    return codex.publicState();
+  });
+  handler("morde:codex-list-threads", (cursor: unknown) => {
+    if (!(cursor === null || cursor === undefined || typeof cursor === "string" && cursor.length <= 4096)) throw new Error("Invalid Codex thread cursor");
+    return codex.listThreads(cursor == null ? null : cursor);
+  });
+  handler("morde:codex-authorize-thread", async (threadID: unknown, scopes: unknown) => {
+    if (typeof threadID !== "string") throw new Error("Invalid Codex thread");
+    const result = await codex.authorize(threadID, scopes);
+    notifyState();
+    return result;
+  });
+  handler("morde:codex-update-scopes", async (sessionID: unknown, scopes: unknown) => {
+    if (typeof sessionID !== "string") throw new Error("Invalid Morde Codex session");
+    await codex.updateScopes(sessionID, scopes);
+    notifyState();
+    return codex.publicState();
+  });
+  handler("morde:codex-revoke", async (sessionID: unknown) => {
+    if (typeof sessionID !== "string") throw new Error("Invalid Morde Codex session");
+    await codex.revoke(sessionID);
+    notifyState();
+    return codex.publicState();
+  });
   handler("morde:login", login);
   handler("morde:logout", logout);
   handler("morde:public-page", (path: unknown, requestedOrigin?: unknown) => {
@@ -2485,6 +2548,25 @@ function register(): void {
   portalBridgeHandler("morde:portal-project-upload-targets", listProjectUploadTargets);
   portalBridgeHandler("morde:portal-project-select-directory", selectProjectDirectory);
   portalBridgeHandler("morde:portal-project-upload", uploadProject);
+  portalBridgeHandler("morde:portal-legacy-state", () => ({
+    mappings: mappings.map((mapping) => ({ ...publicMapping(mapping),
+      syncEnabled: Boolean(workspaceSyncProfile?.bindings[mapping.workspaceId]?.enabled),
+      liveRunning: activeLiveSync(mapping.workspaceId),
+    })),
+    syncState: sync.snapshot(),
+    safetyCopiesAvailable: !profileError && !preservedOperationBlocked(),
+    checkpoint: syncCheckpoint && syncCheckpoint.mode !== "project_upload"
+      ? { workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, scope: syncCheckpoint.scope } : null,
+    nodeState: workspaceNode.isRunning() ? "running" : workspaceNode.mayOwnWorkspace() ? "unknown" : "stopped",
+  }), true);
+  portalBridgeHandler("morde:portal-legacy-pause", async (workspaceID) => {
+    await setWorkspaceSyncEnabled(workspaceID, false);
+    return { paused: true };
+  }, true);
+  portalBridgeHandler("morde:portal-legacy-live-stop", async (workspaceID) => {
+    await stopLiveSync(workspaceID);
+    return { stopped: !activeLiveSync(checkedId("workspace", workspaceID)) };
+  }, true);
   handler("morde:workspace-sync-toggle", setWorkspaceSyncEnabled);
   handler("morde:live-sync-start", startLiveSync);
   handler("morde:live-sync-stop", stopLiveSync);
@@ -2548,7 +2630,7 @@ function register(): void {
       return publicMapping(mapping);
     } finally { directorySelectionInProgress = false; }
   });
-  handler("morde:sync", async (workspaceId: unknown, mode: Parameters<MordeSync["run"]>[2], scopeInput: unknown = [], confirmedQuiesced: unknown = false, handoffTargetInput: unknown = "cloud_workspace") => {
+  const runWorkspaceSync = async (workspaceId: unknown, mode: Parameters<MordeSync["run"]>[2], scopeInput: unknown = [], confirmedQuiesced: unknown = false, handoffTargetInput: unknown = "cloud_workspace") => {
     if (preservedOperationInProgress) throw new Error("Finish the local safety-copy operation before starting sync");
     if (directorySelectionInProgress || projectDirectorySelectionInProgress || projectUploadInProgress) throw new Error("Finish selecting the Workspace folder before starting sync");
     if (profileError) throw new Error(profileError);
@@ -2658,8 +2740,23 @@ function register(): void {
       }
       return { session: { id: session.id, workspace_id: id, state: String(session.state) }, conflicts };
     }
-  });
-  handler("morde:sync-stop", async () => {
+  };
+  handler("morde:sync", runWorkspaceSync);
+  portalBridgeHandler("morde:portal-legacy-resume", async (workspaceID) => {
+    const id = checkedId("workspace", workspaceID);
+    const auth = credentials;
+    const checkpoint = syncCheckpoint;
+    if (!checkpoint || checkpoint.mode === "project_upload" || checkpoint.workspaceId !== id) throw new Error("旧版同步恢复点已变化");
+    const handoff = checkpoint.mode === "handoff_checkpoint";
+    const answer = await dialog.showMessageBox(mainWindow!, { type: "warning", buttons: ["取消", "继续原同步"], defaultId: 0, cancelId: 0,
+      message: "按原模式和范围继续旧版同步？",
+      detail: handoff ? "继续前请确认 AI、IDE、终端和其他写入者均已停止，且关联的实时同步已暂停。" : "继续可能按原方向传输文件；请先核对同步范围。" });
+    if (answer.response !== 1) return { cancelled: true };
+    if (!auth || credentials !== auth || !webView || !isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)
+      || sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname !== "/workspaces" || syncCheckpoint !== checkpoint) throw new Error("账号、页面或同步恢复点已变化");
+    return runWorkspaceSync(id, checkpoint.mode, checkpoint.scope, handoff, checkpoint.handoffTarget ?? "cloud_workspace");
+  }, true);
+  const stopSync = async () => {
     if (preservedOperationInProgress) throw new Error("Finish the local safety-copy operation before stopping sync");
     if (priorSyncChildMayStillRun()) throw new Error("A prior sync process may still hold this folder. Its recovery point was kept");
     const stopped = await sync.stop();
@@ -2673,8 +2770,16 @@ function register(): void {
     }
     if (stopped && !clearConfirmedChild()) throw new Error("A prior sync process may still hold this folder. Its recovery point was kept");
     return stopped;
+  };
+  handler("morde:sync-stop", stopSync);
+  portalBridgeHandler("morde:portal-project-stop", async (selectionID: unknown) => {
+    if (typeof selectionID !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(selectionID) ||
+      !syncCheckpoint || syncCheckpoint.mode !== "project_upload" || syncCheckpoint.projectSelectionID !== selectionID) {
+      throw new Error("当前没有可停止的项目同步");
+    }
+    return stopSync();
   });
-  handler("morde:sync-discard", () => {
+  const discardSync = () => {
     if (preservedOperationInProgress) throw new Error("Finish the local safety-copy operation before changing the recovery point");
     if (profileError) throw new Error(profileError);
     if (sync.snapshot() === "running") throw new Error("Stop sync before discarding its recovery point");
@@ -2699,7 +2804,26 @@ function register(): void {
     syncRecoveryWarning = null;
     notifyState();
     return publicState();
-  });
+  };
+  handler("morde:sync-discard", discardSync);
+  portalBridgeHandler("morde:portal-legacy-stop", async (workspaceID) => {
+    const id = checkedId("workspace", workspaceID);
+    if (!syncCheckpoint || syncCheckpoint.mode === "project_upload" || syncCheckpoint.workspaceId !== id) throw new Error("当前没有可停止的旧版同步");
+    return stopSync();
+  }, true);
+  portalBridgeHandler("morde:portal-legacy-discard", async (workspaceID) => {
+    const id = checkedId("workspace", workspaceID);
+    const auth = credentials;
+    const checkpoint = syncCheckpoint;
+    if (!checkpoint || checkpoint.mode === "project_upload" || checkpoint.workspaceId !== id) throw new Error("旧版同步恢复点已变化");
+    const answer = await dialog.showMessageBox(mainWindow!, { type: "warning", buttons: ["保留恢复点", "放弃恢复点"], defaultId: 0, cancelId: 0,
+      message: "放弃这个旧版同步恢复点？", detail: "放弃后无法从此恢复点继续。不会删除本机文件或云端文件。" });
+    if (answer.response !== 1) return { cancelled: true };
+    if (!auth || credentials !== auth || !webView || !isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)
+      || sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname !== "/workspaces" || syncCheckpoint !== checkpoint) throw new Error("账号、页面或同步恢复点已变化");
+    discardSync();
+    return { discarded: true };
+  }, true);
   handler("morde:preserved-list", async (workspaceId: unknown) => withPreservedMapping(workspaceId, (mapping): Promise<PreservedFile[]> =>
     sync.listPreserved(mapping, workspaceSyncProfile?.bindings[mapping.workspaceId]?.folderID)));
   handler("morde:preserved-restore", async (workspaceId: unknown, preservedId: unknown) => {
@@ -2716,6 +2840,27 @@ function register(): void {
     });
     return { deleted: true };
   });
+  portalBridgeHandler("morde:portal-preserved-list", (workspaceID) => withPreservedMapping(workspaceID, (mapping) =>
+    sync.listPreserved(mapping, workspaceSyncProfile?.bindings[mapping.workspaceId]?.folderID)), true);
+  for (const action of ["restore", "delete"] as const) {
+    portalBridgeHandler(`morde:portal-preserved-${action}`, async (workspaceID, preservedID) => {
+      if (typeof preservedID !== "string" || !/^[a-f0-9]{32}$/.test(preservedID)) throw new Error("Invalid safety-copy ID");
+      const id = checkedId("workspace", workspaceID);
+      const auth = credentials;
+      const answer = await dialog.showMessageBox(mainWindow!, { type: "warning", buttons: ["取消", action === "restore" ? "恢复" : "删除"], defaultId: 0, cancelId: 0,
+        message: action === "restore" ? "恢复所选本机安全副本？" : "删除所选本机安全副本？",
+        detail: action === "restore" ? "目标路径必须为空；恢复后安全副本仍会保留。" : "删除后无法恢复，不影响云端文件。" });
+      if (answer.response !== 1) return { cancelled: true };
+      if (!auth || credentials !== auth || !webView || !isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)
+        || sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname !== "/workspaces") throw new Error("账号或页面已变化，请重新操作");
+      await withPreservedMapping(id, async (mapping) => {
+        const folderID = workspaceSyncProfile?.bindings[mapping.workspaceId]?.folderID;
+        if (action === "restore") await sync.restorePreserved(mapping, preservedID, folderID);
+        else await sync.deletePreserved(mapping, preservedID, folderID);
+      });
+      return action === "restore" ? { restored: true } : { deleted: true };
+    }, true);
+  }
 }
 
 function makeWindow(): BrowserWindow {
@@ -2738,8 +2883,19 @@ function showWindow(nextView: "web" | "sync" = "web"): void {
   if (created) mainWindow = makeWindow();
   if (credentials) {
     if (nextView === "sync") {
-      void refreshLiveSyncCapability();
-      showView("sync");
+      const owner = mainWindow;
+      const auth = credentials;
+      void (async () => {
+        if (!webView) await openAssistant();
+        if (!owner || mainWindow !== owner || owner.isDestroyed() || credentials !== auth || !webView) return;
+        const target = `${auth.origin}/workspaces`;
+        showView("web");
+        if (webView.webContents.getURL() !== target) await webView.webContents.loadURL(target, documentLoadOptions);
+      })().catch(() => {
+        if (!owner || mainWindow !== owner || owner.isDestroyed() || credentials !== auth) return;
+        owner.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
+        showView("sync");
+      });
     } else if (webView) showView("web");
     else {
       const owner = mainWindow;
@@ -2774,6 +2930,7 @@ else {
   app.on("second-instance", () => showWindow());
   app.whenReady().then(() => {
     loadState();
+    if (credentials) void codex.start().catch(() => notifyState());
     scheduleCredentialExpiry();
     scheduleAuthorizationCheck();
     register();
@@ -2806,6 +2963,7 @@ else {
     quitInProgress = true;
     void (async () => {
       try {
+        await codex.stop();
         if (!await stopAllLiveSyncs()) throw new Error("Live sync process shutdown was not confirmed");
         const stopped = !priorSyncChildMayStillRun() && await sync.stop();
         if (!stopped && !sync.discardCheckpoint(syncCheckpoint)) throw new Error("Sync process may still be running");

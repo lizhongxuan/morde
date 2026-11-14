@@ -204,6 +204,16 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("future_status"), AppLocalized("Status unknown"))
     }
 
+    func testChildJobLabelsKeepRunningFailureAndUnknownDistinct() {
+        XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("queued"), AppLocalized("Queued"))
+        XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("running"), AppLocalized("Running"))
+        XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("failed"), AppLocalized("Failed"))
+        XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("unknown"), AppLocalized("Status unknown"))
+        XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("succeeded"), AppLocalized("Completed"))
+        XCTAssertEqual(MIFTaskPresentation.agentStatusLabel("idle"), AppLocalized("Idle"))
+        XCTAssertEqual(MIFTaskPresentation.agentStatusLabel("future_status"), AppLocalized("Status unknown"))
+    }
+
     func testToolStepsUseReadableNamesAndKeepTheirRealStatuses() throws {
         let tool = MordeTask.Step(id: "s1234567", sequence: 1, kind: "tool", status: "failed",
             title: "Run cloud dsh tool: morde_web_search",
@@ -314,6 +324,17 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskPresentation.timelineMarker(taskStatus: "failed", index: 0, rowCount: 1), .failed)
         XCTAssertEqual(MIFTaskPresentation.timelineMarker(taskStatus: "completed", index: 0, rowCount: 1), .completed)
         XCTAssertEqual(MIFTaskPresentation.timelineMarker(taskStatus: "future_status", index: 0, rowCount: 1), .unconfirmed)
+    }
+
+    func testEventMarkersDoNotClaimUnknownStatusesCompleted() {
+        XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "future_status", taskStatus: "completed",
+                                                             index: 0, rowCount: 2), .unconfirmed)
+        XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "cancelled", taskStatus: "completed",
+                                                             index: 0, rowCount: 2), .unconfirmed)
+        XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "failed", taskStatus: "running",
+                                                             index: 0, rowCount: 2), .failed)
+        XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "waiting_user", taskStatus: "running",
+                                                             index: 1, rowCount: 2), .current)
     }
 
     private func makeTask(id: String, status: String, batchItems: [MordeBatchItem]? = nil,

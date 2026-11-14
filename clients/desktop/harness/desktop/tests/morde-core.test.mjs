@@ -226,6 +226,25 @@ test('project folder registration uses a Portal cookie and sends metadata only',
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('API failures include the request route without exposing credentials', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('not found', { status: 404 });
+  try {
+    const api = new MordeAPI(() => credentials);
+    await assert.rejects(() => api.workspaces(), (error) => {
+      assert.equal(error.message, 'Morde returned HTTP 404 (GET /api/workspaces)');
+      assert.equal(error.message.includes(credentials.clientCredential), false);
+      return true;
+    });
+    await assert.rejects(() => api.hostProjectFolders('h1234567', { credential: 'portal-cookie-secret', expiresAt: future }), (error) => {
+      assert.equal(error.message, 'Morde returned HTTP 404 (GET /api/hosts/h1234567/sync-folders)');
+      assert.equal(error.message.includes(credentials.clientCredential), false);
+      assert.equal(error.message.includes('portal-cookie-secret'), false);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('invalid login responses and expired Client credentials fail closed', async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

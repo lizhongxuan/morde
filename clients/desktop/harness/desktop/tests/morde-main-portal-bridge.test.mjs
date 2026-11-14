@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,11 +50,15 @@ function mockFetch(calls) {
   };
 }
 
-function harness() {
+function harness({ checkpoint } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'morde-p11-portal-'));
   const userData = join(root, 'Morde Client');
   mkdirSync(userData, { recursive: true });
   writeFileSync(join(userData, 'credentials.bin'), JSON.stringify({ version: 2, credentials: auth }));
+  if (checkpoint) {
+    const profile = createHash('sha256').update(`${auth.origin}\0${auth.serviceInstanceID}\0${auth.accountName}\0${auth.installationId}`).digest('hex');
+    writeFileSync(join(userData, `sync-checkpoint-${profile}.json`), JSON.stringify(checkpoint));
+  }
   const handlers = new Map(), windows = [], views = [], partitions = [], appEvents = new Map();
   let nextContentsID = 1;
 
@@ -178,6 +183,7 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     assert.match(portal.options.webPreferences.preload, /morde-preload\.js$/);
 
     portal.webContents.url = 'https://portal.example/hosts#host-h1234567';
+    await assert.rejects(h.invoke('morde:portal-legacy-state', portal.webContents), /Invalid Portal window or route/);
     const state = await h.invoke('morde:portal-state', portal.webContents);
     assertPortalProjectState(state);
     assert.deepEqual(state, { projectMappings: [], syncState: 'idle', syncCheckpoint: null, syncRecovery: null });
@@ -190,6 +196,14 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     portal.webContents.url = 'https://portal.example/assistant';
     await assert.rejects(h.invoke('morde:portal-state', portal.webContents), /Invalid Portal window or route/);
     portal.webContents.url = 'https://portal.example/workspaces?host=h1234567';
+
+    const legacy = await h.invoke('morde:portal-legacy-state', portal.webContents);
+    assert.deepEqual(legacy, { mappings: [], syncState: 'idle', checkpoint: null, nodeState: 'stopped', safetyCopiesAvailable: true });
+    await assert.rejects(h.invoke('morde:portal-legacy-stop', portal.webContents, ['w1234567']), /当前没有可停止的旧版同步/);
+    await assert.rejects(h.invoke('morde:portal-legacy-resume', portal.webContents, ['w1234567']), /旧版同步恢复点已变化/);
+    await assert.rejects(h.invoke('morde:portal-preserved-restore', portal.webContents, ['w1234567', '../bad']), /Invalid safety-copy ID/);
+    h.dialog.showMessageBox = async () => ({ response: 0 });
+    assert.deepEqual(await h.invoke('morde:portal-preserved-restore', portal.webContents, ['w1234567', 'a'.repeat(32)]), { cancelled: true });
 
     const targets = await h.invoke('morde:portal-project-upload-targets', portal.webContents);
     assert.deepEqual(targets.map(({ hostId, workspaceId }) => ({ hostId, workspaceId })), [{ hostId: 'h1234567', workspaceId: 'w1234567' }]);
@@ -215,11 +229,37 @@ test('Portal bridge requires the current trusted top-level route and returns onl
       h.invoke('morde:portal-project-upload', portal.webContents, ['00000000-0000-4000-8000-000000000000', 'empty-project']),
       /先选择本机项目文件夹/,
     );
+    await assert.rejects(h.invoke('morde:portal-project-stop', portal.webContents, [selection.selectionID]), /当前没有可停止的项目同步/);
+    portal.webContents.url = 'https://portal.example/assistant';
+    await assert.rejects(h.invoke('morde:portal-project-stop', portal.webContents, [selection.selectionID]), /Invalid Portal window or route/);
     assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync/')), false);
   } finally {
     globalThis.fetch = originalFetch;
     h.cleanup();
     rmSync(selectedRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy checkpoint recovery requires confirmation and the same trusted page afterward', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls);
+  const h = harness({ checkpoint: { serviceInstanceID, installationId: auth.installationId, workspaceId: 'w1234567',
+    directory: '/tmp/synthetic-project', dev: '1', ino: '1', mode: 'upload', scope: ['notes'], idempotencyKey: 'synthetic-checkpoint' } });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = 'https://portal.example/workspaces';
+    assert.deepEqual((await h.invoke('morde:portal-legacy-state', portal)).checkpoint,
+      { workspaceId: 'w1234567', mode: 'upload', scope: ['notes'] });
+    h.dialog.showMessageBox = async () => ({ response: 0 });
+    assert.deepEqual(await h.invoke('morde:portal-legacy-resume', portal, ['w1234567']), { cancelled: true });
+    h.dialog.showMessageBox = async () => { portal.url = 'https://portal.example/assistant'; return { response: 1 }; };
+    await assert.rejects(h.invoke('morde:portal-legacy-resume', portal, ['w1234567']), /账号、页面或同步恢复点已变化/);
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync/')), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
   }
 });
 

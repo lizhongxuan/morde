@@ -1326,9 +1326,24 @@ enum MordeClientVersion {
     }
 }
 
+struct MordeTaskAccessFence {
+    private(set) var deniedTaskIDs: Set<String> = []
+    private(set) var token = UUID()
+
+    mutating func deny(_ taskID: String) {
+        deniedTaskIDs.insert(taskID)
+        token = UUID()
+    }
+
+    mutating func confirm(_ taskIDs: [String], requestToken: UUID) {
+        guard token == requestToken else { return }
+        deniedTaskIDs.subtract(taskIDs)
+    }
+}
+
 enum MordeTaskSnapshotCursor {
-    /// A snapshot may advance beyond the event that triggered it; resume after the snapshot's
-    /// sequence so older events cannot replay stale state over the newer snapshot.
+    /// Validate that a snapshot covers an observed event and obtain its expiry-recovery cursor.
+    /// Ordinary event replay keeps its own cursor so later available timeline entries are not skipped.
     static func resumeCursor(eventID: String, snapshotSequence: Int64) -> String? {
         guard let observed = Int64(eventID), observed >= 0, snapshotSequence >= observed else { return nil }
         return String(snapshotSequence)
@@ -1357,12 +1372,24 @@ struct MordeTaskEventCursor: Equatable, Sendable {
         return true
     }
 
+    func advancing(eventID: String, for taskID: String) -> MordeTaskEventCursor? {
+        var candidate = self
+        return candidate.advance(eventID: eventID, for: taskID) ? candidate : nil
+    }
+
     mutating func resume(eventID: String, snapshotSequence: Int64) -> Bool {
         guard let value = MordeTaskSnapshotCursor.resumeCursor(eventID: eventID,
                                                                snapshotSequence: snapshotSequence),
               let sequence = Int64(value), sequence >= afterSequence else { return false }
         afterSequence = sequence
         return true
+    }
+}
+
+enum MordeTaskEventSnapshotPolicy {
+    static func requiresRefresh(type: String) -> Bool {
+        ["task.status", "task.step", "task.operation", "task.message", "task.batch_item",
+         "task.artifact", "task.waiting_user", "task.response", "task.result"].contains(type)
     }
 }
 
@@ -1605,6 +1632,12 @@ enum MordeConversationMessageReceiptPolicy {
                         conversationID: String, content: String) -> Bool {
         message.role == "user" && !message.id.isEmpty && message.client_message_id == clientMessageID &&
             message.conversation_id == conversationID && message.content.utf8.elementsEqual(content.utf8)
+    }
+}
+
+enum MordeConversationMessagePagePolicy {
+    static func matches(_ messages: [MordeClientMessage], conversationID: String) -> Bool {
+        messages.allSatisfy { $0.conversation_id == conversationID }
     }
 }
 

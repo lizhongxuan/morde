@@ -136,6 +136,25 @@ func TestCloudDSHMCPRejectedExternalCallNeverDispatches(t *testing.T) {
 	}
 }
 
+func TestCloudDSHMCPExpiredExternalCallNeverDispatches(t *testing.T) {
+	_, store, client, broker, claimed, _ := newCloudDSHMCPApprovalFixture(t)
+	call := selectedMCPCallForTest(t, "mcp-approval-expired-1", "k1234567", "send_email", `{"to":"demo@example.test","body":"synthetic expiry test"}`)
+	first, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || first.Status != AgentToolNeedsUser || client.callCalls != 0 {
+		t.Fatalf("initial approval request = %#v err=%v calls=%d", first, err, client.callCalls)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionReject)
+	expiresAt, respondedAt := time.Now().UTC().Add(-time.Minute), time.Now().UTC()
+	store.details.PendingRequest.Status = task.PendingRequestExpired
+	store.details.PendingRequest.ExpiresAt, store.details.PendingRequest.RespondedAt = &expiresAt, &respondedAt
+	claimed = store.details.Task
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolFailed || client.callCalls != 0 || len(store.operations) != 0 ||
+		!strings.Contains(result.Output, "expired") {
+		t.Fatalf("expired external call = %#v err=%v calls=%d operations=%d", result, err, client.callCalls, len(store.operations))
+	}
+}
+
 func TestCloudDSHMCPTradeApprovalShowsItemAndExactAmountBeforeDispatch(t *testing.T) {
 	_, store, client, broker, claimed, _ := newCloudDSHMCPApprovalFixture(t)
 	arguments, err := json.Marshal(map[string]any{

@@ -18,7 +18,7 @@ import { AssistantReplySpeech } from '../components/AssistantReplySpeech';
 import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { projectApi } from '../app/project-api';
 import type { CreateProjectWorkItemRequest, Project, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectRole, ProjectWorkItem, ProjectWorkItemCategory } from '../app/project-api';
-import { FloatingError } from '../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type RequestKeyRecord = { fingerprint: string; key: string };
 type ActionNotice = { kind: 'success' | 'error' | 'unknown'; message: string };
@@ -692,7 +692,7 @@ function UserProjects() {
   const canManageWork = Boolean(project && canEditWork);
 
   return <section className="projects-page">
-    {notice?.kind === 'error' ? <FloatingError>{notice.message}</FloatingError> : notice && <p className={`notice ${notice.kind === 'success' ? 'notice-success' : 'notice-warning'}`} role="status">{notice.message}</p>}
+    {notice?.kind === 'error' ? <FloatingError>{notice.message}</FloatingError> : notice && <FloatingNotice className={notice.kind === 'success' ? 'notice-success' : 'notice-warning'}>{notice.message}</FloatingNotice>}
 
     {!showProjectDetails && <section className="connection-section" aria-labelledby="project-select-title">
       <div className="connection-section-heading"><div><h2 id="project-select-title">我的项目</h2><p className="muted">个人会话仍属于个人，不会随项目成员共享。</p></div><button type="button" className="button button-primary" aria-expanded={showCreateProject} disabled={Boolean(pendingAction)} onClick={() => setShowCreateProject((open) => !open)}>{showCreateProject ? '收起' : '＋ 创建项目'}</button></div>
@@ -829,14 +829,14 @@ function UserProjects() {
       <section className="connection-section" aria-labelledby="project-conversations-title">
         <div className="connection-section-heading"><div><h2 id="project-conversations-title">项目共享 AI 对话</h2><p className="muted">已接受的项目成员共享对话历史；对话创建者与每次 Task 的实际发起人分别记录。</p></div></div>
         {projectTaskMock
-          ? <p className="notice notice-warning" role="note">本机 MSW 只模拟消息接收；不会预留预算、调用模型或读取、写入文件。</p>
-          : <p className="notice notice-info" role="note">项目执行和预算以服务端回执为准；消息受理不代表任务已开始或预算已预留。</p>}
+          ? <FloatingNotice className="notice-warning" data-notice-label="演示模式">本机 MSW 只模拟消息接收；不会预留预算、调用模型或读取、写入文件。</FloatingNotice>
+          : <FloatingNotice className="notice-info">项目执行和预算以服务端回执为准；消息受理不代表任务已开始或预算已预留。</FloatingNotice>}
         {!projectTaskMock && (projectTaskCapabilitiesQuery.isPending ? <p role="status">正在确认项目模型执行能力…</p>
             : projectTaskCapabilitiesQuery.isError ? <FloatingError className="error-inline" role="alert">无法确认项目模型执行能力，消息仍可先保存在本机。<button type="button" className="button button-small button-secondary" onClick={() => void projectTaskCapabilitiesQuery.refetch()}>重试</button></FloatingError>
-              : !projectTaskExecutionReady && <p className="notice notice-warning" role="note">服务端尚未声明项目模型执行能力；消息仍可先发送或保存在本机。</p>)}
+              : !projectTaskExecutionReady && <FloatingNotice className="notice-warning">服务端尚未声明项目模型执行能力；消息仍可先发送或保存在本机。</FloatingNotice>)}
         {!projectTaskMock && projectTaskCapabilitiesQuery.data &&
           !projectTaskCapabilitiesQuery.data.supported_features.includes('conversation_auto_routing_v1') &&
-          <p className="notice notice-warning" role="note">服务端尚未确认支持对话自动处理；仍会尝试发送，无法受理的消息会保留在本机。</p>}
+          <FloatingNotice className="notice-warning">服务端尚未确认支持对话自动处理；仍会尝试发送，无法受理的消息会保留在本机。</FloatingNotice>}
         <form onSubmit={(event) => { event.preventDefault(); createProjectConversation(); }} className="inline-form">
           <div><label htmlFor="project-conversation-title-input">新共享对话标题（可选）</label><input id="project-conversation-title-input" value={projectConversationTitle} maxLength={120} onChange={(event) => setProjectConversationTitle(event.target.value)} /></div>
           <button type="submit" className="button button-secondary" disabled={!currentMember || Boolean(pendingAction)}>{pendingAction === `create-project-conversation:${project.id}` ? '正在创建…' : '创建共享对话'}</button>

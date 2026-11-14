@@ -191,6 +191,34 @@ func (s *taskStoreStub) GetTask(context.Context, string, string) (TaskDetails, e
 	return s.details, s.storeErr
 }
 
+type pendingExpiryTaskStoreStub struct {
+	*taskStoreStub
+	initialDetails  TaskDetails
+	expiredDetails  TaskDetails
+	getCalls        int
+	expireCalls     int
+	expireActorID   string
+	expireTaskID    string
+	expirePendingID string
+	expireVersion   int64
+	expireChanged   bool
+	expireErr       error
+}
+
+func (s *pendingExpiryTaskStoreStub) GetTask(context.Context, string, string) (TaskDetails, error) {
+	s.getCalls++
+	if s.getCalls == 1 {
+		return s.initialDetails, s.storeErr
+	}
+	return s.expiredDetails, s.storeErr
+}
+
+func (s *pendingExpiryTaskStoreStub) ExpirePendingRequest(_ context.Context, actorID, taskID, pendingID string, version int64) (bool, error) {
+	s.expireCalls++
+	s.expireActorID, s.expireTaskID, s.expirePendingID, s.expireVersion = actorID, taskID, pendingID, version
+	return s.expireChanged, s.expireErr
+}
+
 func (s *taskStoreStub) RevokeTaskMCPConnectorGrant(_ context.Context, ownerID, taskID, connectorID string, expectedVersion int64) (TaskMCPConnectorGrant, error) {
 	s.grantRevokeCalls++
 	s.grantOwnerID, s.grantTaskID, s.grantConnectorID, s.grantVersion = ownerID, taskID, connectorID, expectedVersion
@@ -1032,6 +1060,42 @@ func TestTaskServiceRedactsArtifactsAfterWorkspaceOwnershipTransfer(t *testing.T
 				t.Fatalf("non-owner retained artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
 			}
 		})
+	}
+}
+
+func TestTaskServiceGetExpiresOnlyTheAuthorizedPendingRequestAndReloads(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(-time.Minute)
+	respondedAt := time.Now().UTC()
+	initial := TaskDetails{
+		Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", Status: task.StatusWaitingUser, WaitingReason: "approval_required"},
+		PendingRequest: &task.PendingRequest{
+			ID: "r1234567", TaskID: "q1234567", Version: 7, Kind: "approval", Title: "Approve write",
+			Object: "report.txt", Content: "Create report.txt", Impact: "Writes to the authorized Workspace",
+			Status: task.PendingRequestPending, ExpiresAt: &expiresAt,
+		},
+	}
+	resolved := initial
+	resolved.Task.Status, resolved.Task.WaitingReason = task.StatusQueued, ""
+	resolved.PendingRequest = &task.PendingRequest{
+		ID: "r1234567", TaskID: "q1234567", Version: 7, Kind: "approval", Title: "Approve write",
+		Object: "report.txt", Content: "Create report.txt", Impact: "Writes to the authorized Workspace",
+		Status: task.PendingRequestExpired, Decision: task.PendingDecisionReject,
+		ExpiresAt: &expiresAt, RespondedAt: &respondedAt,
+	}
+	store := &pendingExpiryTaskStoreStub{
+		taskStoreStub: &taskStoreStub{}, initialDetails: initial, expiredDetails: resolved, expireChanged: true,
+	}
+	authorizer := &taskAuthorizerStub{}
+	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	details, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567")
+	if err != nil || details.Task.Status != task.StatusQueued || details.PendingRequest == nil ||
+		details.PendingRequest.Status != task.PendingRequestExpired || store.getCalls != 2 || store.expireCalls != 1 ||
+		store.expireActorID != "u1234567" || store.expireTaskID != "q1234567" || store.expirePendingID != "r1234567" ||
+		store.expireVersion != 7 || authorizer.lastScope != identity.ScopeTaskRead {
+		t.Fatalf("Get after approval expiry = %#v err=%v store=%#v auth=%#v", details, err, store, authorizer)
 	}
 }
 

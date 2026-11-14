@@ -171,6 +171,66 @@ type ClientLoginRequest struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type CodexCommand struct {
+	ID                string             `json:"id"`
+	SessionID         string             `json:"session_id"`
+	OwnerID           string             `json:"owner_id"`
+	InstallationID    string             `json:"installation_id"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	RequestHash       []byte             `json:"request_hash"`
+	Type              string             `json:"type"`
+	Status            string             `json:"status"`
+	Payload           []byte             `json:"payload"`
+	GrantVersion      int64              `json:"grant_version"`
+	StatusVersion     int64              `json:"status_version"`
+	ResultCode        string             `json:"result_code"`
+	ProviderRequestID string             `json:"provider_request_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	ClaimedAt         pgtype.Timestamptz `json:"claimed_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CodexEvent struct {
+	SessionID       string             `json:"session_id"`
+	OwnerID         string             `json:"owner_id"`
+	InstallationID  string             `json:"installation_id"`
+	Sequence        int64              `json:"sequence"`
+	ProviderEventID string             `json:"provider_event_id"`
+	Kind            string             `json:"kind"`
+	OccurredAt      pgtype.Timestamptz `json:"occurred_at"`
+	TurnID          string             `json:"turn_id"`
+	ItemID          string             `json:"item_id"`
+	ParentItemID    string             `json:"parent_item_id"`
+	Status          string             `json:"status"`
+	Payload         []byte             `json:"payload"`
+	StoredAt        pgtype.Timestamptz `json:"stored_at"`
+}
+
+type CodexSession struct {
+	ID                string             `json:"id"`
+	OwnerID           string             `json:"owner_id"`
+	InstallationID    string             `json:"installation_id"`
+	ProfileKey        string             `json:"profile_key"`
+	ThreadID          string             `json:"thread_id"`
+	Title             string             `json:"title"`
+	CwdLabel          string             `json:"cwd_label"`
+	ProviderUpdatedAt pgtype.Timestamptz `json:"provider_updated_at"`
+	Status            string             `json:"status"`
+	LastSequence      int64              `json:"last_sequence"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CodexSessionGrant struct {
+	SessionID      string             `json:"session_id"`
+	OwnerID        string             `json:"owner_id"`
+	InstallationID string             `json:"installation_id"`
+	Scopes         []string           `json:"scopes"`
+	GrantVersion   int64              `json:"grant_version"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Conversation struct {
 	ID         string             `json:"id"`
 	OwnerID    string             `json:"owner_id"`
@@ -310,6 +370,9 @@ type ConversationMessageRoute struct {
 	DuplicateOfMessageID    pgtype.Text        `json:"duplicate_of_message_id"`
 	RouteAttempt            int64              `json:"route_attempt"`
 	AutoRetryCount          int16              `json:"auto_retry_count"`
+	AggregationStartedAt    pgtype.Timestamptz `json:"aggregation_started_at"`
+	AggregationDeadline     pgtype.Timestamptz `json:"aggregation_deadline"`
+	AggregationState        string             `json:"aggregation_state"`
 }
 
 type ConversationMessageUpload struct {
@@ -989,6 +1052,16 @@ type PersonalHistorySuppression struct {
 	OwnerID           string             `json:"owner_id"`
 	MessageID         string             `json:"message_id"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type PersonalMemoryHistory struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ObjectType        string             `json:"object_type"`
+	ObjectID          string             `json:"object_id"`
+	ObjectRevision    int64              `json:"object_revision"`
+	Body              []byte             `json:"body"`
+	ChangedAt         pgtype.Timestamptz `json:"changed_at"`
 }
 
 type PersonalMemorySource struct {
@@ -1911,6 +1984,7 @@ type TaskPendingRequest struct {
 	CreatedAt               pgtype.Timestamptz `json:"created_at"`
 	RespondedAt             pgtype.Timestamptz `json:"responded_at"`
 	MediaPreviewOperationID pgtype.Text        `json:"media_preview_operation_id"`
+	ExpiresAt               pgtype.Timestamptz `json:"expires_at"`
 }
 
 type TaskRevisionIntent struct {

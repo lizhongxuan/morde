@@ -15,6 +15,46 @@ import (
 	"morde/server/internal/domain/conversation"
 )
 
+// The first bounded set of same-scope receipts defines a root's collection
+// window. A pending child may still resolve as independent work or a reply.
+const conversationRouteAggregationProgressSQL = `SELECT count(*) AS candidate_count,
+count(*) FILTER (WHERE (candidate.state IN ('pending','processing','failed') AND candidate.aggregation_state='open')
+ OR candidate.state='waiting_user') AS unresolved_count,
+count(*) FILTER (WHERE (candidate.state='failed' AND candidate.aggregation_state='open')
+ OR candidate.state='waiting_user') AS attention_count,
+count(*) FILTER (WHERE candidate.state='waiting_user') AS clarification_count
+FROM (
+ SELECT child.state,child.aggregation_state FROM conversation_message_routes child
+ JOIN conversation_messages message ON message.id=child.message_id AND message.owner_id=child.owner_id
+  AND message.actor_id=child.actor_id AND message.conversation_id=child.conversation_id
+ WHERE child.service_instance_id=r.service_instance_id AND child.owner_id=r.owner_id AND child.actor_id=r.actor_id
+  AND child.conversation_id=r.conversation_id AND message.sequence>m.sequence
+  AND child.aggregation_started_at>=r.aggregation_started_at AND child.aggregation_started_at<=r.aggregation_deadline
+  AND (child.request_metadata-'previous_client_message_id')=(r.request_metadata-'previous_client_message_id')
+  AND child.authorization_snapshot=r.authorization_snapshot
+ ORDER BY message.sequence LIMIT $1
+) candidate`
+
+type conversationAggregationProgress struct {
+	candidates, unresolved, attention, clarification int64
+	deadlinePassed, waitExpired                      bool
+}
+
+func conversationRouteAggregationProgress(ctx context.Context, tx pgx.Tx, messageID string) (conversationAggregationProgress, error) {
+	var result conversationAggregationProgress
+	err := tx.QueryRow(ctx, `SELECT progress.candidate_count,progress.unresolved_count,progress.attention_count,progress.clarification_count,
+r.aggregation_deadline<=clock_timestamp(),r.aggregation_deadline+($3::bigint*interval '1 second')<=clock_timestamp()
+FROM conversation_message_routes r
+JOIN conversation_messages m ON m.id=r.message_id
+JOIN LATERAL (`+conversationRouteAggregationProgressSQL+`) progress ON true WHERE r.message_id=$2`,
+		app.MaxConversationRouteAggregateMessages, messageID, int64(app.ConversationRouteAggregationMaxWait/time.Second)).
+		Scan(&result.candidates, &result.unresolved, &result.attention, &result.clarification, &result.deadlinePassed, &result.waitExpired)
+	if err != nil {
+		return conversationAggregationProgress{}, fmt.Errorf("read conversation aggregation progress: %w", err)
+	}
+	return result, nil
+}
+
 // ClaimConversationRoute locks and leases one pending or expired routing row.
 func (s *Store) ClaimConversationRoute(ctx context.Context, workerID string, duration time.Duration) (app.ConversationRouteClaim, bool, error) {
 	if strings.TrimSpace(workerID) != workerID || workerID == "" || len(workerID) > 128 ||
@@ -28,12 +68,19 @@ func (s *Store) ClaimConversationRoute(ctx context.Context, workerID string, dur
 		var role, delivery, sourceKind string
 		err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,
 COALESCE(m.task_id,''),m.model_id,m.sequence,m.delivery_status,m.created_at,
-m.source_kind,r.service_instance_id::text,r.client_message_id,r.request_metadata,r.authorization_snapshot,r.route_attempt
+m.source_kind,r.service_instance_id::text,r.client_message_id,r.request_metadata,r.authorization_snapshot,r.route_attempt,
+r.aggregation_started_at,r.aggregation_deadline,r.aggregation_state
 FROM conversation_message_routes r
 JOIN service_identity i ON i.instance_id=r.service_instance_id AND i.singleton=true
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.conversation_id=r.conversation_id
+LEFT JOIN LATERAL (`+conversationRouteAggregationProgressSQL+`) progress ON r.aggregation_state='waiting'
 WHERE (r.state='pending' OR (r.state='processing' AND r.lease_expires_at<=clock_timestamp()))
   AND r.available_after<=clock_timestamp()
+  AND (r.aggregation_state<>'waiting' OR (
+    (r.aggregation_deadline<=clock_timestamp() OR progress.candidate_count>=$1)
+    AND (progress.unresolved_count=0 OR progress.attention_count>0
+      OR r.aggregation_deadline+($2::bigint*interval '1 second')<=clock_timestamp())
+  ))
   AND NOT EXISTS (
     SELECT 1 FROM jsonb_array_elements_text(COALESCE(r.request_metadata->'client_attachment_ids','[]'::jsonb)) AS expected(client_id)
     WHERE NOT (
@@ -52,11 +99,12 @@ WHERE (r.state='pending' OR (r.state='processing' AND r.lease_expires_at<=clock_
       ))
     )
   )
-ORDER BY r.created_at,r.message_id FOR UPDATE OF r SKIP LOCKED LIMIT 1`).Scan(
+ORDER BY r.created_at,r.message_id FOR UPDATE OF r SKIP LOCKED LIMIT 1`,
+			app.MaxConversationRouteAggregateMessages, int64(app.ConversationRouteAggregationMaxWait/time.Second)).Scan(
 			&claim.Message.ID, &claim.Message.ConversationID, &claim.Message.OwnerID, &claim.Message.ActorID, &role,
 			&claim.Message.Content, &claim.Message.TaskID, &claim.Message.ModelID, &claim.Message.Sequence,
 			&delivery, &claim.Message.CreatedAt, &sourceKind, &claim.ServiceInstanceID, &claim.Message.ClientMessageID, &metadata, &authorization,
-			&claim.RouteAttempt)
+			&claim.RouteAttempt, &claim.AggregationStartedAt, &claim.AggregationDeadline, &claim.AggregationState)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

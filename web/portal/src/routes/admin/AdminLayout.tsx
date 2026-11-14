@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { errorDetails } from '../../app/api';
 import { useAuth } from '../../app/auth';
@@ -25,9 +26,10 @@ const titles: Record<string, string> = {
 
 export function AdminLayout() {
   const { user, signOut } = useAuth();
-  const { notify } = useToast();
+  const { notify, closeNotices } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
+  useEffect(() => { closeNotices(); }, [closeNotices, location.pathname, location.search]);
   const title = titles[location.pathname] ?? (location.pathname.startsWith('/admin/users/') ? '用户详情' : location.pathname.startsWith('/admin/hosts/') ? '电脑详情' : location.pathname.startsWith('/admin/workspaces/') ? '工作区详情' : '管理后台');
   const logout = async () => {
     try { await signOut(); navigate('/admin/login', { replace: true }); }

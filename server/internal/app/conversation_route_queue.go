@@ -10,14 +10,17 @@ import (
 
 // ConversationRouteClaim identifies one leased, already accepted message.
 type ConversationRouteClaim struct {
-	Message           conversation.Message
-	ServiceInstanceID string
-	Input             ConversationRoutingInput
-	Authorization     task.Authorization
-	RouteAttempt      int64
-	LeaseOwner        string
-	LeaseVersion      int64
-	LeaseExpiresAt    time.Time
+	Message              conversation.Message
+	ServiceInstanceID    string
+	Input                ConversationRoutingInput
+	Authorization        task.Authorization
+	RouteAttempt         int64
+	AggregationStartedAt time.Time
+	AggregationDeadline  time.Time
+	AggregationState     string
+	LeaseOwner           string
+	LeaseVersion         int64
+	LeaseExpiresAt       time.Time
 }
 
 type ConversationRouteQueue interface {

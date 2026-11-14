@@ -32,6 +32,9 @@ const (
 	personalAttachmentJSONLimit  = 16 << 10
 	personalAttachmentChunkLimit = 4 << 20
 	personalHistoryImportLimit   = 8 << 20
+	codexDiscoverBodyLimit       = 16 << 10
+	codexCommandBodyLimit        = 72 << 10
+	codexCommandResultBodyLimit  = 1 << 10
 )
 
 type Deps struct {
@@ -58,6 +61,7 @@ type Deps struct {
 	Control                      ControlService
 	ExecutionControl             ExecutionControlService
 	Tasks                        TaskService
+	Codex                        CodexService
 	TaskArtifactContent          TaskArtifactContentEndpointService
 	TaskMedia                    TaskMediaService
 	TaskFileFetch                TaskFileFetchEndpointService
@@ -194,6 +198,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerControl(group, deps.Control)
 	h.registerExecutionControl(group, deps.ExecutionControl)
 	h.registerConversations(group, deps.Conversations, deps.Tasks)
+	registerCodexRoutes(group, deps.Codex)
 	RegisterProjectRoutes(group, deps.Projects)
 	RegisterProjectHostUsageRoutes(group, deps.HostUsage)
 	RegisterProjectConversationRoutes(group, deps.ProjectConversations)
@@ -233,6 +238,8 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	}
 	personalDataGroup := group.Group("/personal-data")
 	RegisterPersonalDataQuotaRoute(personalDataGroup, deps.PersonalDataQuotaUser)
+	personalMemoryHistoryService, _ := deps.PersonalSync.(personalMemoryHistoryService)
+	RegisterPersonalMemoryHistoryRoute(personalDataGroup, personalMemoryHistoryService)
 	RegisterPersonalAttachmentRoutes(personalDataGroup, deps.PersonalAttachments)
 	RegisterPersonalOfficePreviewRoute(personalDataGroup)
 	RegisterPersonalHistoryImportRoutes(personalDataGroup, deps.PersonalHistoryImport)
@@ -268,6 +275,15 @@ func (h *api) limitBody(c *gin.Context) {
 		limit = int64(app.PersonalOfficePreviewMaxBytes)
 	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/history/import":
 		limit = personalHistoryImportLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/codex/sessions/discover":
+		limit = codexDiscoverBodyLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/codex/sessions/:id/commands":
+		limit = codexCommandBodyLimit
+	case c.Request.Method == http.MethodPost && (c.FullPath() == "/api/codex/commands/claim" ||
+		c.FullPath() == "/api/codex/commands/:id/result"):
+		limit = codexCommandResultBodyLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/codex/sessions/:id/events":
+		limit = codexEventBatchBodyLimit
 	case c.Request.Method == http.MethodPut && c.FullPath() == "/api/personal-data/uploads/:upload_id/chunks/:sequence":
 		limit = personalAttachmentChunkLimit
 	case c.Request.Method == http.MethodPut && c.FullPath() == "/api"+projectConversationAttachmentBase+"/chunks/:sequence":
@@ -578,6 +594,7 @@ func clientCredentialRoute(method, path string) bool {
 		switch path {
 		case "/api/me", "/api/me/record-captures", "/api/me/main-conversation", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
 			"/api/hosts/:id/control",
+			"/api/codex/sessions", "/api/codex/sessions/:id/events", "/api/codex/sessions/:id/events/stream",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
 			"/api/conversations/:id/messages", "/api/conversations/:id/tasks", "/api/conversations/:id/message-uploads/:client_message_id",
 			"/api/projects", "/api/projects/:id", "/api/projects/:id/members", "/api/projects/:id/resources",
@@ -591,7 +608,7 @@ func clientCredentialRoute(method, path string) bool {
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id/content",
 			"/api/tasks", "/api/tasks/:id", "/api/tasks/:id/steps/:step_id", "/api/tasks/:id/events",
-			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id", "/api/personal-data/quota",
+			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id", "/api/personal-data/:type/:id/history", "/api/personal-data/quota",
 			"/api/personal-data/attachments/:attachment_id",
 			"/api/goals", "/api/goals/:id",
 			"/api/schedules", "/api/schedules/:id", "/api/schedules/:id/runs",
@@ -629,6 +646,9 @@ func clientCredentialRoute(method, path string) bool {
 			"/api/personal-data/office-preview":
 			return true
 		case "/api/me/main-conversation/ensure":
+			return true
+		case "/api/codex/sessions/discover", "/api/codex/sessions/:id/commands",
+			"/api/codex/commands/claim", "/api/codex/commands/:id/result", "/api/codex/sessions/:id/events":
 			return true
 		}
 	case http.MethodPut:

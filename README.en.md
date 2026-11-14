@@ -8,27 +8,26 @@
 
 **A real place for AI to work.**
 
-PC desktop · iOS and mobile web · Administration console · Cloud services and Agent Runtime
+Backend · iOS · PC · Administration Web
 
 </div>
 
-Morde is a multi-device cloud workspace built around AI agents. It brings conversations, tasks, cloud computers, workspaces, and administration together in one product, so users can collaborate with AI from a computer or phone and follow the progress and results of its work.
+Morde is a cloud workspace built around AI agents, with four product endpoints: the backend, iOS, PC, and Administration Web. The user-facing web interface belongs to the PC endpoint and is hosted by the PC client; there is no separate web or mobile-web user client. Users work with AI on PC or iOS, while administrators use Administration Web.
 
 Morde draws on Muse's interaction principles: **start with a conversation, use tools and computers when needed, and give work a visible process, a result, and clear authorization boundaries.** The project brings the user experience together with server, runtime, and administration infrastructure to build a complete product that can evolve over time.
 
 > **Project status: in development.** The cloud computer, workbench, and core services have local Linux validation records. Multi-device conversations, DSH sub-agents, task recovery, and manual folder synchronization have implementations and local tests. First-milestone acceptance is still incomplete for real models, the designated cloud computer, PC/iOS continuity, and actual file transfers. Project upload is disabled by default. See the [first-milestone requirements](AGENTS.md) and [acceptance record](docs/实施/Morde第一里程碑收口三会话并行实施/A-云端Agent与公共合同实施任务todo清单文档.md).
 
-## One platform, multiple interfaces
+## Four product endpoints
 
 | Component | Role and implementation |
 | --- | --- |
-| **PC desktop** | An Electron desktop client combined with the user web interface, with entry points for conversations, tasks, cloud computers, and local folder synchronization. |
-| **Mobile** | A native iOS project built on shared nanoMuse source, plus a mobile web interface for conversations, progress, approvals, and personal resources. Client integration is ongoing. |
-| **Administration console** | Manages users and registration reviews, cloud computers, workspaces, models, configuration, usage, and audit records through the shared backend and permission system. |
-| **Backend** | Go services handle accounts, APIs, tasks, data, authorization, gateways, and background work; PostgreSQL stores business data. |
-| **Cloud runtime** | DSH provides the cloud Agent Runtime, while the Host Runtime and workspace synchronization components connect cloud computers and workspaces. |
+| **PC** | The Electron desktop client hosts the user-facing workspace for conversations, tasks, cloud computers, and local folder synchronization. The user web interface is part of PC, not a separate product endpoint. |
+| **iOS** | A native client built on shared nanoMuse source for conversations, progress, results, and authorized capabilities. |
+| **Administration Web** | Manages users and registration reviews, cloud computers, workspaces, models, configuration, usage, and audit records through the shared backend and permission system. |
+| **Backend** | Go services handle accounts, APIs, tasks, data, authorization, gateways, and background work; PostgreSQL stores business data, DSH provides the cloud Agent Runtime, and Host Runtime and workspace synchronization support cloud computers and workspaces. |
 
-All of these components live in this repository, from user-facing clients to the infrastructure that runs and administers the platform.
+Cloud runtimes, cloud-computer workbenches, and shared UI code are implementation components of these four endpoints, not additional endpoints. Existing code under `web/mobile/` is a source for consolidating its user-facing functionality into PC; it is not a separate product endpoint.
 
 ## Capabilities
 
@@ -48,7 +47,7 @@ All of these components live in this repository, from user-facing clients to the
 
 ## Experience preview
 
-The first row shows the current PC user interface and administration console in local demo mode with simulated data. The second row shows AI assistant and iOS design concepts. The screenshots are in Chinese; they do not demonstrate completed real tasks or acceptance.
+The first row shows the current PC user interface and Administration Web in local demo mode with simulated data. The second row shows AI assistant and iOS design concepts. The screenshots are in Chinese; they do not demonstrate completed real tasks or acceptance.
 
 <table>
   <tr>
@@ -67,11 +66,11 @@ More design references: [PC workbench](images/readme/pc-workspace.png) · [Cloud
 
 ```mermaid
 flowchart TB
-    User[User] --> PC[PC desktop / user web]
-    User --> Mobile[iOS / mobile web]
-    Admin[Administrator] --> Console[Administration console]
+    User[User] --> PC[PC (Electron and user interface)]
+    User --> IOS[iOS]
+    Admin[Administrator] --> Console[Administration Web]
     PC --> Server[Morde backend]
-    Mobile --> Server
+    IOS --> Server
     Console --> Server
     Server --> DB[(PostgreSQL)]
     Server --> DSH[DSH cloud Agent Runtime]
@@ -88,7 +87,7 @@ Cloud agents use **DeepSeek Harness (DSH)** as their single Agent Runtime, conne
 
 ## First milestone
 
-The current priority is the **foundational PC, iOS, and cloud-agent workflow**:
+The current priority is the **foundational PC, iOS, and backend-agent workflow**:
 
 1. **Continuity across devices:** Converse on PC and iOS and see real replies, task progress, and results. After closing a client or a brief disconnection, users can resume viewing accepted tasks; retries must not repeat execution.
 2. **Long and multiple conversations:** Preserve original chat history and use authorized history. Keep messages, tasks, and results isolated across conversations and accounts.
@@ -102,20 +101,17 @@ These are **goals and acceptance requirements**, not a list of completed feature
 
 | Path | Contents |
 | --- | --- |
-| [`clients/desktop/`](clients/desktop/) | PC desktop client, local bridges, and desktop components |
+| [`clients/desktop/`](clients/desktop/) · [`web/portal/`](web/portal/) | PC client, local bridges, PC user interface, and Administration Web pages |
 | [`clients/nanoMuse/`](clients/nanoMuse/) | Native iOS project, shared nanoMuse source, and third-party notices |
-| [`web/portal/`](web/portal/) | User web interface and administration console |
-| [`web/mobile/`](web/mobile/) | Mobile web client |
-| [`web/workbench/`](web/workbench/) | Cloud-computer web workbench |
-| [`server/`](server/) | Go services, APIs, Gateway, MCP, background tasks, and database migrations |
-| [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | DSH cloud Agent Runtime and locked dependencies |
+| [`web/mobile/`](web/mobile/) · [`web/workbench/`](web/workbench/) | Existing mobile UI code to consolidate into PC and cloud-computer workbench implementation, treated as PC-related code rather than separate product endpoints |
+| [`server/`](server/) · [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | Go services, APIs, Gateway, MCP, background tasks, database migrations, and DSH cloud Agent Runtime |
 | [`runtime/morde-runtime/`](runtime/morde-runtime/) · [`runtime/morde-sync/`](runtime/morde-sync/) | Host Runtime and Workspace synchronization engine |
 | [`images/`](images/) · [`deploy/`](deploy/) | Runtime images and deployment configuration |
 | [`docs/`](docs/) · [`examples/`](examples/) | Design, implementation, and acceptance documentation, plus integration examples |
 
 ## Development and deployment
 
-### Preview the user interface and administration console locally
+### Preview the PC user interface and Administration Web locally
 
 With Node.js 24, run the following from the repository root:
 
@@ -124,7 +120,7 @@ npm --prefix web/portal ci
 VITE_MOCK_API=1 npm --prefix web/portal run dev
 ```
 
-Open `http://127.0.0.1:5173/` for the user interface or `http://127.0.0.1:5173/admin/login` for the administration console. The local demo username and password are both `demo`. Demo mode uses simulated data and does not connect to a real AI service or cloud computer.
+Open `http://127.0.0.1:5173/` to preview the PC user interface or `http://127.0.0.1:5173/admin/login` to preview Administration Web. Browser preview is a development method for the PC interface, not a separate web user client. The local demo username and password are both `demo`. Demo mode uses simulated data and does not connect to a real AI service or cloud computer.
 
 ### Continue development
 

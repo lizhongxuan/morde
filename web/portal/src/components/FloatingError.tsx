@@ -1,13 +1,14 @@
 import { useLayoutEffect, useRef, useState, type HTMLAttributes, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { useToastOverlayRegion } from '../app/toast';
+import { useNoticeOverlayRegion, useToastOverlayRegion } from '../app/toast';
 
-export function FloatingError({ children, className = '', role = 'alert', ...props }: HTMLAttributes<HTMLDivElement> & { children: ReactNode }) {
-  const overlayRegion = useToastOverlayRegion();
+type OverlayProps = HTMLAttributes<HTMLDivElement> & { children: ReactNode };
+
+function FloatingOverlay({ children, className = '', role, region, dismissible, ...props }: OverlayProps & { region: HTMLElement | null; dismissible: boolean }) {
   const [dismissed, setDismissed] = useState(false);
   const [sourceVisible, setSourceVisible] = useState(false);
   const anchor = useRef<HTMLSpanElement>(null);
-  const target = overlayRegion ?? (typeof document === 'undefined' ? null : document.body);
+  const target = region ?? (typeof document === 'undefined' ? null : document.body);
   useLayoutEffect(() => {
     const ancestors: HTMLElement[] = [];
     for (let ancestor = anchor.current?.parentElement ?? null; ancestor; ancestor = ancestor.parentElement) ancestors.push(ancestor);
@@ -22,9 +23,19 @@ export function FloatingError({ children, className = '', role = 'alert', ...pro
   }, [target]);
   return <>
     <span ref={anchor} hidden aria-hidden="true" />
-    {target && sourceVisible && !dismissed && createPortal(<div {...props} className={`toast-error-notice ${className}`.trim()} role={role}>
+    {target && sourceVisible && !dismissed && createPortal(<div {...props} className={className} role={role}>
     {children}
-    <button type="button" className="icon-button" aria-label="关闭错误提示" onClick={() => setDismissed(true)}>×</button>
+    {dismissible && <button type="button" className="icon-button" aria-label="关闭错误提示" onClick={() => setDismissed(true)}>×</button>}
     </div>, target)}
   </>;
+}
+
+export function FloatingError({ className = '', role = 'alert', ...props }: OverlayProps) {
+  const region = useToastOverlayRegion();
+  return <FloatingOverlay {...props} className={`toast-error-notice ${className}`.trim()} role={role} region={region} dismissible />;
+}
+
+export function FloatingNotice({ className = '', role = 'status', ...props }: OverlayProps) {
+  const region = useNoticeOverlayRegion();
+  return <FloatingOverlay {...props} className={`notice ${className}`.trim()} role={role} region={region} dismissible={false} />;
 }

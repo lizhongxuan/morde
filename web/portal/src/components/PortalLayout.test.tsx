@@ -27,6 +27,7 @@ describe('PortalLayout', () => {
     expect(within(workNavigation).getAllByRole('link', { name: '云端电脑' })).toHaveLength(1);
     const settingsNavigation = screen.getByRole('navigation', { name: '设置导航' });
     expect(within(settingsNavigation).getByRole('link', { name: '模型与工具' })).toHaveAttribute('href', '/connections');
+    expect(within(settingsNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/workspaces');
     expect(within(settingsNavigation).getByRole('link', { name: '客户端' })).toHaveAttribute('href', '/clients');
     expect(within(settingsNavigation).getByRole('link', { name: 'API Key' })).toHaveAttribute('href', '/apikeys');
     expect(within(settingsNavigation).getByRole('link', { name: '账户' })).toHaveAttribute('href', '/settings');

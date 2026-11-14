@@ -1,6 +1,510 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Approval is no longer valid." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Genehmigung nicht mehr gültig." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approval is no longer valid." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La aprobación ya no es válida." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’approbation n’est plus valide." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "承認は無効になりました。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인이 더 이상 유효하지 않습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подтверждение больше недействительно." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "审批已失效。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "核准已失效。" } }
+      }
+    },
+    "Approval permission is unavailable." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Genehmigungsberechtigung nicht verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approval permission is unavailable." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se dispone del permiso de aprobación." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Autorisation d’approbation indisponible." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "承認権限を利用できません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인 권한을 사용할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Разрешение на подтверждение недоступно." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "审批权限不可用。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "核准權限無法使用。" } }
+      }
+    },
+    "Approval validity is unknown." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Gültigkeit der Genehmigung unbekannt." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approval validity is unknown." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se desconoce la validez de la aprobación." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La validité de l’approbation est inconnue." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "承認の有効性を確認できません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인 유효성을 알 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Срок действия подтверждения неизвестен." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "审批有效性未知。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "核准有效性未知。" } }
+      }
+    },
+    "Codex assistant" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Assistent" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex assistant" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Asistente de Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Assistant Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex アシスタント" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 어시스턴트" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ассистент Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 助手" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 助理" } }
+      }
+    },
+    "Codex sessions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Sitzungen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex sessions" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Sesiones de Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Sessions Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex セッション" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 세션" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сеансы Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 会话" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 工作階段" } }
+      }
+    },
+    "Delete Codex session" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Sitzung löschen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete Codex session" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Eliminar sesión de Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Supprimer la session Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex セッションを削除" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 세션 삭제" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить сеанс Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除 Codex 会话" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除 Codex 工作階段" } }
+      }
+    },
+    "Delete this Codex mirror session?" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Diese Codex-Spiegelsitzung löschen?" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete this Codex mirror session?" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "¿Eliminar esta sesión espejo de Codex?" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Supprimer cette session miroir Codex ?" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "この Codex ミラーセッションを削除しますか？" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 Codex 미러 세션을 삭제할까요?" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить это зеркальное представление сеанса Codex?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除此 Codex 镜像会话？" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除此 Codex 鏡像工作階段？" } }
+      }
+    },
+    "Deleting this mirror removes its cloud history and pending commands. It does not stop a turn already running on the PC." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Beim Löschen dieses Spiegels werden der Cloud-Verlauf und ausstehende Befehle entfernt. Ein bereits auf dem PC laufender Durchgang wird dadurch nicht beendet." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Deleting this mirror removes its cloud history and pending commands. It does not stop a turn already running on the PC." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Al eliminar este espejo se borran el historial en la nube y los comandos pendientes. No se detiene una ejecución que ya esté en curso en el PC." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La suppression de ce miroir efface son historique cloud et ses commandes en attente. Elle n’arrête pas un tour déjà en cours sur le PC." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "このミラーを削除するとクラウド上の履歴と保留中のコマンドが削除されます。PC で実行中のターンは停止しません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 미러를 삭제하면 클라우드 기록과 대기 중인 명령이 삭제됩니다. PC에서 이미 실행 중인 턴은 중지되지 않습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удаление зеркала удалит облачную историю и ожидающие команды. Уже выполняющийся на ПК ход не остановится." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "删除此镜像会清除云端历史和待处理命令，但不会停止 PC 上已在运行的轮次。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "刪除此鏡像會清除雲端歷史和待處理命令，但不會停止 PC 上已在執行的回合。" } }
+      }
+    },
+    "Event history has a gap. Refresh to repair it." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "In der Ereignishistorie fehlt ein Abschnitt. Aktualisieren, um ihn zu laden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Event history has a gap. Refresh to repair it." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Hay un salto en el historial de eventos. Actualiza para corregirlo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Il manque des événements dans l’historique. Actualisez pour récupérer la suite." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "イベント履歴に欠落があります。更新して補完してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이벤트 기록에 누락된 구간이 있습니다. 새로고침해 복구하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "В истории событий есть пропуск. Обновите, чтобы восстановить данные." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "事件历史存在缺口。刷新以修复。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "事件歷史有缺漏。請重新整理以修復。" } }
+      }
+    },
+    "File change summary" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Zusammenfassung der Dateiänderungen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "File change summary" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Resumen de cambios en archivos" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Résumé des modifications de fichiers" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ファイル変更の概要" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "파일 변경 요약" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сводка изменений файлов" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件变更摘要" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檔案變更摘要" } }
+      }
+    },
+    "Forwarded" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Weitergeleitet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Forwarded" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Reenviado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Transmis" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "転送済み" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "전달됨" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Передано" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已转发" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已轉送" } }
+      }
+    },
+    "Interrupt" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Unterbrechen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Interrupt" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Interrumpir" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Interrompre" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "中断" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "중단" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Прервать" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "中断" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "中斷" } }
+      }
+    },
+    "Load earlier events" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ältere Ereignisse laden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Load earlier events" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Cargar eventos anteriores" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Charger les événements précédents" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "以前のイベントを読み込む" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이전 이벤트 불러오기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загрузить более ранние события" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "加载更早的事件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "載入較早的事件" } }
+      }
+    },
+    "Load more sessions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Weitere Sitzungen laden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Load more sessions" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Cargar más sesiones" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Charger plus de sessions" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "さらにセッションを読み込む" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세션 더 불러오기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загрузить ещё сеансы" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "加载更多会话" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "載入更多工作階段" } }
+      }
+    },
+    "Message Codex" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Nachricht an Codex" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Message Codex" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Mensaje para Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Message à Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex にメッセージ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex에 메시지" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сообщение Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "发送消息给 Codex" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "傳送訊息給 Codex" } }
+      }
+    },
+    "No Codex sessions were found." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine Codex-Sitzungen gefunden." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No Codex sessions were found." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se encontraron sesiones de Codex." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucune session Codex trouvée." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex セッションが見つかりません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 세션을 찾을 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сеансы Codex не найдены." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "未找到 Codex 会话。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "找不到 Codex 工作階段。" } }
+      }
+    },
+    "No authorized PC installations are available." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine autorisierten PC-Installationen verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No authorized PC installations are available." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No hay instalaciones de PC autorizadas disponibles." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucune installation PC autorisée n’est disponible." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "利用可能な許可済み PC インストールがありません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "사용 가능한 승인된 PC 설치가 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Нет доступных авторизованных установок на ПК." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "没有可用的已授权 PC 安装。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "沒有可用的已授權 PC 安裝。" } }
+      }
+    },
+    "No visible events yet." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Noch keine sichtbaren Ereignisse." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No visible events yet." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Aún no hay eventos visibles." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucun événement visible pour le moment." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "表示できるイベントはまだありません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "아직 표시할 이벤트가 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Пока нет видимых событий." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "暂无可显示的事件。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目前沒有可顯示的事件。" } }
+      }
+    },
+    "Plan" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Plan" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Plan" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Plan" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Plan" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "計画" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "계획" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "План" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "计划" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "计划" } }
+      }
+    },
+    "Read history permission is unavailable." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine Berechtigung zum Lesen des Verlaufs verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Read history permission is unavailable." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se dispone del permiso para leer el historial." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’autorisation de lire l’historique est indisponible." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "履歴を読む権限がありません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "기록 읽기 권한을 사용할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Разрешение на чтение истории недоступно." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法读取历史记录：权限不可用。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法讀取歷史記錄：權限無法使用。" } }
+      }
+    },
+    "Reasoning summary" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Zusammenfassung der Überlegungen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Reasoning summary" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Resumen del razonamiento" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Résumé du raisonnement" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "推論の要約" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "추론 요약" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Краткое изложение рассуждений" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "推理摘要" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "推理摘要" } }
+      }
+    },
+    "Refresh status" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Status aktualisieren" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Refresh status" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Actualizar estado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Actualiser l’état" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "状態を更新" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "상태 새로고침" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Обновить статус" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "刷新状态" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重新整理狀態" } }
+      }
+    },
+    "Retry the same request" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dieselbe Anfrage erneut versuchen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Retry the same request" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Reintentar la misma solicitud" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réessayer la même demande" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "同じリクエストを再試行" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "같은 요청 다시 시도" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторить тот же запрос" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重试同一请求" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重試相同請求" } }
+      }
+    },
+    "Session access was revoked." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Der Sitzungszugriff wurde widerrufen." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Session access was revoked." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se revocó el acceso a la sesión." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’accès à la session a été révoqué." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "セッションへのアクセス権が取り消されました。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세션 접근 권한이 취소되었습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Доступ к сеансу отозван." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "会话访问权限已撤销。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "工作階段存取權限已撤銷。" } }
+      }
+    },
+    "Sign in to Morde to view Codex sessions." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Melde dich bei Morde an, um Codex-Sitzungen anzuzeigen." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sign in to Morde to view Codex sessions." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Inicia sesión en Morde para ver las sesiones de Codex." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Connectez-vous à Morde pour afficher les sessions Codex." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Morde にログインして Codex セッションを表示してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Morde에 로그인해 Codex 세션을 확인하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Войдите в Morde, чтобы просмотреть сеансы Codex." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "登录 Morde 以查看 Codex 会话。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "登入 Morde 以檢視 Codex 工作階段。" } }
+      }
+    },
+    "Status is unknown. Refresh the session before sending again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Der Status ist unbekannt. Aktualisiere die Sitzung, bevor du erneut sendest." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Status is unknown. Refresh the session before sending again." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se desconoce el estado. Actualiza la sesión antes de volver a enviar." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’état est inconnu. Actualisez la session avant de renvoyer le message." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "状態を確認できません。再送信する前にセッションを更新してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "상태를 알 수 없습니다. 다시 보내기 전에 세션을 새로고침하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Статус неизвестен. Обновите сеанс перед повторной отправкой." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "状态未知。再次发送前请刷新会话。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "狀態未知。再次傳送前請重新整理工作階段。" } }
+      }
+    },
+    "Subagent activity" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Aktivität von Unteragenten" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Subagent activity" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Actividad de subagentes" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Activité des sous-agents" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "サブエージェントのアクティビティ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "하위 에이전트 활동" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Активность подагентов" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "子代理活动" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "子代理活動" } }
+      }
+    },
+    "The request result is unknown; retrying uses the same request ID." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Das Ergebnis der Anfrage ist unbekannt. Bei einem erneuten Versuch wird dieselbe Anfrage-ID verwendet." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The request result is unknown; retrying uses the same request ID." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se desconoce el resultado; al reintentar se usará el mismo ID de solicitud." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le résultat de la demande est inconnu ; une nouvelle tentative utilisera le même identifiant." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "リクエストの結果は不明です。再試行では同じリクエスト ID が使われます。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "요청 결과를 알 수 없습니다. 재시도하면 같은 요청 ID를 사용합니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Результат запроса неизвестен; при повторе используется тот же ID запроса." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "请求结果未知；重试时会使用相同的请求 ID。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "請求結果未知；重試時會使用相同的請求 ID。" } }
+      }
+    },
+    "This PC installation has been revoked." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Diese PC-Installation wurde widerrufen." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This PC installation has been revoked." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se revocó esta instalación de PC." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Cette installation PC a été révoquée." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "この PC インストールは取り消されました。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 PC 설치 권한이 취소되었습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Авторизация этой установки на ПК отозвана." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此 PC 安装已撤权。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "此 PC 安裝已撤權。" } }
+      }
+    },
+    "Tool activity" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Werkzeugaktivität" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Tool activity" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Actividad de herramientas" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Activité des outils" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ツールのアクティビティ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "도구 활동" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Активность инструментов" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "工具活动" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "工具活動" } }
+      }
+    },
+    "Turn status" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Status des Durchgangs" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Turn status" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Estado de la ejecución" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "État du tour" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ターンの状態" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "턴 상태" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Статус хода" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "轮次状态" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "回合狀態" } }
+      }
+    },
+    "Unsupported event" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Nicht unterstütztes Ereignis" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Unsupported event" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Evento no compatible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Événement non pris en charge" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "未対応のイベント" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "지원되지 않는 이벤트" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Неподдерживаемое событие" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "不支持的事件" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "不支援的事件" } }
+      }
+    },
+    "You" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Du" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "You" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tú" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Vous" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "あなた" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "나" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Вы" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "你" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "你" } }
+      }
+    },
+    "Authorized PC installation" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Autorisierte PC-Installation" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Authorized PC installation" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Instalación de PC autorizada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Installation PC autorisée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "認証済み PC インストール" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인된 PC 설치" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Авторизованная установка на ПК" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已授权的 PC 安装" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已授權的 PC 安裝" } }
+      }
+    },
+    "Claimed by PC" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Vom PC übernommen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Claimed by PC" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Reclamado por el PC" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Pris en charge par le PC" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "PC が受付済み" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "PC가 접수함" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Принято ПК" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已由 PC 领取" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已由 PC 接手" } }
+      }
+    },
+    "Command status" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Befehlsstatus" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Command status" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Estado del comando" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "État de la commande" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "コマンドの状態" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "명령 상태" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Состояние команды" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "命令状态" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "命令狀態" } }
+      }
+    },
     "" : {
 
     },
@@ -23544,6 +24048,48 @@
             "value" : "審批結果未知，且重新整理狀態失敗；審批數量也未知。重試相同決定時會重用用戶端儲存的要求。"
           }
         }
+      }
+    },
+    "Approval deadline passed; refresh to confirm its status." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Genehmigungsfrist ist abgelaufen. Aktualisieren Sie, um den Status zu bestätigen." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approval deadline passed; refresh to confirm its status." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El plazo de aprobación terminó; actualiza para confirmar su estado." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le délai d’approbation est écoulé ; actualisez pour confirmer son état." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "承認期限が過ぎました。状態を確認するために更新してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인 기한이 지났습니다. 상태를 확인하려면 새로 고침하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Срок одобрения истёк. Обновите данные, чтобы проверить статус." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "审批期限已到；请刷新确认状态。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "審批期限已到；請重新整理確認狀態。" } }
+      }
+    },
+    "Approval expired; the requested action was not run." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Genehmigung ist abgelaufen; die angeforderte Aktion wurde nicht ausgeführt." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approval expired; the requested action was not run." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La aprobación venció; no se ejecutó la acción solicitada." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’approbation a expiré ; l’action demandée n’a pas été exécutée." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "承認の有効期限が切れたため、要求された操作は実行されませんでした。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인이 만료되어 요청된 작업은 실행되지 않았습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Срок одобрения истёк; запрошенное действие не было выполнено." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "审批已过期；请求的操作未执行。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "審批已過期；要求的操作未執行。" } }
+      }
+    },
+    "Approval status is unknown; refresh task details before acting." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Der Genehmigungsstatus ist unbekannt. Aktualisieren Sie die Aufgabendetails, bevor Sie fortfahren." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Approval status is unknown; refresh task details before acting." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se desconoce el estado de aprobación; actualiza los detalles de la tarea antes de actuar." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’état de l’approbation est inconnu ; actualisez les détails de la tâche avant d’agir." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "承認状態を確認できません。操作する前にタスクの詳細を更新してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "승인 상태를 알 수 없습니다. 작업을 수행하기 전에 작업 세부 정보를 새로 고침하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Статус одобрения неизвестен. Обновите сведения о задаче перед действием." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "审批状态未知；请先刷新任务详情再操作。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "審批狀態未知；請先重新整理任務詳細資料再操作。" } }
       }
     },
     "Approvals" : {
@@ -60892,6 +61438,20 @@
             "value" : "到期時間"
           }
         }
+      }
+    },
+    "Expires: %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Läuft ab: %@" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Expires: %@" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Caduca: %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Expire le : %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "有効期限：%@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "만료 시각: %@" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Истекает: %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "到期时间：%@" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "到期時間：%@" } }
       }
     },
     "Export" : {
@@ -164171,6 +164731,20 @@
             "value" : "本週"
           }
         }
+      }
+    },
+    "This tool did not provide cost, alternatives, or a revocation method." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dieses Tool hat keine Angaben zu Kosten, Alternativen oder zum Widerruf gemacht." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This tool did not provide cost, alternatives, or a revocation method." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esta herramienta no proporcionó información sobre el costo, las alternativas ni la revocación." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Cet outil n’a fourni aucune information sur le coût, les alternatives ou la révocation." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "このツールは費用、代替手段、取り消し方法を提示していません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 도구는 비용, 대안 또는 취소 방법을 제공하지 않았습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Этот инструмент не предоставил сведения о стоимости, альтернативах или отзыве." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "当前工具未提供费用、替代方案或撤销方式。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目前工具未提供費用、替代方案或撤銷方式。" } }
       }
     },
     "This will backup /root directory before resetting. You can restore it later." : {

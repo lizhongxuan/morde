@@ -26,6 +26,27 @@ type replicaTestManager struct {
 	deleteErr    error
 }
 
+func TestProjectConflictImpactsMatchCaseFoldedPaths(t *testing.T) {
+	for _, test := range []struct {
+		project   string
+		conflicts []string
+		want      string
+	}{
+		{"project/demo", []string{"PROJECT/DEMO/src/Readme.md", "project/demo-other/file", "PROJECT"}, ".,src/Readme.md"},
+		{"project/demo", []string{"project/demo/src/Readme.md", "project/DEMO/SRC/readme.md"}, "src/Readme.md"},
+		{"project/Kelvin", []string{"PROJECT/kelvin/内容.txt"}, "内容.txt"},
+	} {
+		impacts := projectConflictImpacts(test.project, test.conflicts)
+		var paths []string
+		for _, impact := range impacts {
+			paths = append(paths, impact.Path)
+		}
+		if got := strings.Join(paths, ","); got != test.want {
+			t.Errorf("projectConflictImpacts(%q) = %q, want %q", test.project, got, test.want)
+		}
+	}
+}
+
 func TestProjectUploadApplicationsReportOnlyVerifiedAppliedOrKnownConflict(t *testing.T) {
 	const hostID = "h1234567"
 	const sourceBindingID = "12345678-1234-4234-8234-123456789abc"
@@ -80,15 +101,18 @@ func TestProjectUploadApplicationsReportOnlyVerifiedAppliedOrKnownConflict(t *te
 		"w3456789": {WorkspaceID: "w3456789", State: "active", SyncState: "healthy", BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p3456789")},
 		"w4567890": {
 			WorkspaceID: "w4567890", State: "active", SyncState: "conflict", SyncConflicts: []string{
-				"project/demo/src/main.go", "project/demo/src/main.go", "project/demo", "project/other/keep.txt", "outside.txt",
+				"project/demo/src/main.go", "project/demo/src/main.go", "project/demo", "project", "project/other/keep.txt", "outside.txt",
 			}, BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p4567890"),
 		},
+		"w5678901": {WorkspaceID: "w5678901", State: "active", SyncState: "conflict", SyncConflicts: []string{"project/demo"}, BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p5678901")},
+		"w6789012": {WorkspaceID: "w6789012", State: "active", SyncState: "conflict", SyncConflicts: []string{"project"}, BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p6789012")},
+		"w7890123": {WorkspaceID: "w7890123", State: "active", SyncState: "conflict", SyncConflicts: []string{"project/demo-other/file"}, BindingVersion: 1, AppliedRevision: 7, ProjectUploadApplications: makeApplication("p7890123")},
 	}
 	if err := controller.applyProjectUploadApplications(context.Background(), items); err != nil {
 		t.Fatalf("apply project upload applications: %v", err)
 	}
-	if len(receipts) != 3 {
-		t.Fatalf("reported %d applications, want exact, high, and conflict only: %#v", len(receipts), receipts)
+	if len(receipts) != 6 {
+		t.Fatalf("reported %d applications, want exact, high, conflict, and unknown: %#v", len(receipts), receipts)
 	}
 	got := make(map[string]receipt, len(receipts))
 	for _, value := range receipts {
@@ -107,7 +131,10 @@ func TestProjectUploadApplicationsReportOnlyVerifiedAppliedOrKnownConflict(t *te
 	}{
 		{"w1234567", "p1234567", "applied", "healthy", 8, []string{}},
 		{"w2345678", "p2345678", "applied", "healthy", 9, []string{}},
-		{"w4567890", "p4567890", "conflict", "conflict", 0, []string{"src/main.go"}},
+		{"w4567890", "p4567890", "conflict", "conflict", 0, []string{".", "src/main.go"}},
+		{"w5678901", "p5678901", "conflict", "conflict", 0, []string{"."}},
+		{"w6789012", "p6789012", "conflict", "conflict", 0, []string{"."}},
+		{"w7890123", "p7890123", "unknown", "conflict", 0, []string{}},
 	} {
 		value, exists := got[test.workspaceID]
 		if !exists {

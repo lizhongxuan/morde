@@ -86,6 +86,45 @@ func TestSnapshotCursorRejectsMalformedTokensAndInvalidCursors(t *testing.T) {
 	}
 }
 
+func TestMemoryHistoryCursorBindsOwnerAndObjectAndRejectsTampering(t *testing.T) {
+	key := []byte(strings.Repeat("h", 32))
+	want := MemoryHistoryCursor{
+		Version: MemoryHistoryCursorVersion, OwnerID: "u1234567", ServiceInstanceID: "00000000-0000-4000-8000-000000000001",
+		ObjectType: ObjectTypeMemory, ObjectID: "global", AfterRevision: 5,
+	}
+	encoded, err := EncodeMemoryHistoryCursor(want, key)
+	if err != nil {
+		t.Fatalf("encode memory history cursor: %v", err)
+	}
+	got, err := DecodeMemoryHistoryCursor(encoded, key)
+	if err != nil || got != want {
+		t.Fatalf("decoded memory history cursor = %+v, %v; want %+v", got, err, want)
+	}
+	if _, err := DecodeMemoryHistoryCursor(encoded, []byte("short")); err == nil {
+		t.Fatal("cursor decoded with an invalid signing key")
+	}
+	parts := strings.Split(encoded, ".")
+	parts[0] = base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"owner_id":"u7654321"}`))
+	if _, err := DecodeMemoryHistoryCursor(strings.Join(parts, "."), key); err == nil {
+		t.Fatal("cursor accepted a changed payload without a matching signature")
+	}
+	parts = strings.Split(encoded, ".")
+	replacement := "A"
+	if parts[1][len(parts[1])-1] == 'A' {
+		replacement = "B"
+	}
+	parts[1] = parts[1][:len(parts[1])-1] + replacement
+	if _, err := DecodeMemoryHistoryCursor(strings.Join(parts, "."), key); err == nil {
+		t.Fatal("cursor accepted a changed signature")
+	}
+	if _, err := EncodeMemoryHistoryCursor(MemoryHistoryCursor{
+		Version: MemoryHistoryCursorVersion, OwnerID: want.OwnerID, ServiceInstanceID: want.ServiceInstanceID,
+		ObjectType: ObjectTypeMemory, ObjectID: want.ObjectID, AfterRevision: 0,
+	}, key); err == nil {
+		t.Fatal("cursor accepted an invalid revision boundary")
+	}
+}
+
 func signSnapshotCursorTestPayload(t *testing.T, payload, dataKey []byte) string {
 	t.Helper()
 	key, err := deriveSnapshotCursorKey(dataKey)

@@ -422,7 +422,7 @@ struct NanoMuseHomeView: View {
     @State private var taskHomeDestination: MIFTaskHomeDestination = .tasks
     @State private var resourceShowsLibrary = false
     @State private var placeholderDestination: MIFDrawerDestination?
-    @State private var approvalCount: Int?
+    @StateObject private var approvalCountTracker = MIFApprovalCountTracker()
     @State private var drawerOpen = false
     @State private var chatPath: [String] = []
     /// The Muse header's measured height over the main chat (`nmTopOverlay`), without the status bar.
@@ -501,7 +501,7 @@ struct NanoMuseHomeView: View {
             // nanoMuse: honor Reduce Motion when switching root rooms.
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: tab)
             if !bottomBarHidden {
-                NanoMuseBottomBar(selected: $tab, approvalCount: approvalCount) { picked in
+                NanoMuseBottomBar(selected: $tab, approvalCount: approvalCountTracker.count) { picked in
                     if picked == tab, picked != .chat { return }
                     tab = picked
                     resourceShowsLibrary = false
@@ -603,9 +603,10 @@ struct NanoMuseHomeView: View {
             openSideChat(NanoMuseMainChat.draftPrefix + UUID().uuidString)
         }
         .nmOnChange(of: mordeAuthorization.personalDataScopeKey) { _ in
-            approvalCount = nil
+            approvalCountTracker.clear()
         }
-        .nmOnChange(of: mordeAuthorization.signedIn) { _ in
+        .nmOnChange(of: mordeAuthorization.signedIn) { signedIn in
+            if !signedIn { approvalCountTracker.clear() }
             keyboard.reset()
         }
     }
@@ -832,7 +833,7 @@ struct NanoMuseHomeView: View {
             .toolbar(.hidden, for: .navigationBar)
         case .approvals:
             NavigationStack {
-                MIFApprovalRoom(onConfirmedCount: { approvalCount = $0 }, chrome: chrome)
+                MIFApprovalRoom(onConfirmedCount: { approvalCountTracker.update($0) }, chrome: chrome)
             }
             .toolbar(.hidden, for: .navigationBar)
         case .resources:

@@ -959,7 +959,8 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if approvalCall && (pendingApproval.TaskID != current.ID || pendingApproval.Kind != "approval" || pendingApproval.ToolName != call.Name ||
 		!bytes.Equal(pendingApproval.RequestHash, hash[:]) ||
 		(pendingApproval.Status == task.PendingRequestApproved && pendingApproval.Decision != task.PendingDecisionApprove) ||
-		(pendingApproval.Status == task.PendingRequestRejected && pendingApproval.Decision != task.PendingDecisionReject)) {
+		((pendingApproval.Status == task.PendingRequestRejected || pendingApproval.Status == task.PendingRequestExpired) && pendingApproval.Decision != task.PendingDecisionReject) ||
+		(pendingApproval.Status == task.PendingRequestExpired && (pendingApproval.ExpiresAt == nil || pendingApproval.RespondedAt == nil || pendingApproval.RespondedAt.Before(*pendingApproval.ExpiresAt)))) {
 		return b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)
 	}
 	usage := cloneTaskUsage(current.Usage)
@@ -990,9 +991,16 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			recoveryOperation = true
 		}
 	}
-	if approvalCall && pendingApproval.Status == task.PendingRequestRejected {
+	if approvalCall && (pendingApproval.Status == task.PendingRequestRejected || pendingApproval.Status == task.PendingRequestExpired) {
 		if recoveryOperation {
-			return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "A rejected approval has a conflicting operation ledger entry.")
+			reason := "A rejected approval has a conflicting operation ledger entry."
+			if pendingApproval.Status == task.PendingRequestExpired {
+				reason = "An expired approval has a conflicting operation ledger entry."
+			}
+			return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, reason)
+		}
+		if pendingApproval.Status == task.PendingRequestExpired {
+			return b.expireApprovedToolCall(ctx, current, step, usage, request)
 		}
 		return b.rejectApprovedToolCall(ctx, current, step, usage, request)
 	}
@@ -1221,19 +1229,29 @@ func (b *CloudDSHToolBroker) executeApprovedTaskMediaSave(ctx context.Context, c
 			return AgentToolResult{}, err
 		}
 		return AgentToolResult{Status: AgentToolNeedsUser}, nil
-	case task.PendingRequestRejected:
+	case task.PendingRequestRejected, task.PendingRequestExpired:
 		if pending.Decision != task.PendingDecisionReject {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task media rejection decision is invalid")
 		}
 		output := "The user declined to save the generated media. No Workspace file was written."
+		reason := "reject"
+		summary := "The user declined to save the generated media."
+		if pending.Status == task.PendingRequestExpired {
+			if pending.ExpiresAt == nil || pending.RespondedAt == nil || pending.RespondedAt.Before(*pending.ExpiresAt) {
+				return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task media approval expiry is invalid")
+			}
+			output = "The approval to save generated media expired. No Workspace file was written."
+			reason = "expired"
+			summary = "The approval to save generated media expired; no Workspace file was written."
+		}
 		if checkpointOutput != nil && *checkpointOutput != output {
 			return b.pauseUnknown(ctx, current, step, usage, "task-media-save:"+pending.MediaPreviewOperationID,
 				"The checkpointed media result differs from the approved Task decision.")
 		}
 		if step.Status != task.StepFailed {
-			step.Status, step.Summary = task.StepFailed, "The user declined to save the generated media."
+			step.Status, step.Summary = task.StepFailed, summary
 			if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-				"tool": call.Name, "approval_decision": "reject", "workspace_published": false,
+				"tool": call.Name, "approval_decision": reason, "workspace_published": false,
 			}); err != nil {
 				return AgentToolResult{}, err
 			}
@@ -1502,11 +1520,21 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 			!bytes.Equal(pendingApproval.RequestHash, hash[:]) {
 			return pause("The saved approval does not match this exact checkpointed tool call.")
 		}
-		if pendingApproval.Status == task.PendingRequestRejected {
+		if pendingApproval.Status == task.PendingRequestRejected || pendingApproval.Status == task.PendingRequestExpired {
 			if pendingApproval.Decision != task.PendingDecisionReject {
 				return pause("The saved rejection decision is invalid.")
 			}
 			result := AgentToolResult{Status: AgentToolFailed, Output: "The user rejected this exact action. It was not executed."}
+			decision := "reject"
+			failureSummary := "The user rejected this exact action; it was not dispatched."
+			if pendingApproval.Status == task.PendingRequestExpired {
+				if pendingApproval.ExpiresAt == nil || pendingApproval.RespondedAt == nil || pendingApproval.RespondedAt.Before(*pendingApproval.ExpiresAt) {
+					return pause("The saved approval expiry is invalid.")
+				}
+				result.Output = "The approval expired. This exact action was not executed."
+				decision = "expired"
+				failureSummary = "The approval expired; this exact action was not dispatched."
+			}
 			if checkpointOutput != nil && *checkpointOutput != dshToolResultText(result) {
 				return pause("The checkpointed rejection result differs from the saved user decision.")
 			}
@@ -1515,9 +1543,9 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 				return pause("A rejected approval has a conflicting operation ledger entry.")
 			}
 			if checkpointOutput == nil {
-				step.Status, step.Summary = task.StepFailed, "The user rejected this exact action; it was not dispatched."
+				step.Status, step.Summary = task.StepFailed, failureSummary
 				if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-					"tool": call.Name, "operation_key": operationKey, "operation_status": result.Status, "approval_decision": "reject",
+					"tool": call.Name, "operation_key": operationKey, "operation_status": result.Status, "approval_decision": decision,
 				}); err != nil {
 					return AgentToolResult{}, true, err
 				}
@@ -1785,6 +1813,17 @@ func (b *CloudDSHToolBroker) rejectApprovedToolCall(ctx context.Context, current
 	result := AgentToolResult{Status: AgentToolFailed, Output: "The user rejected this exact action. It was not executed."}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
 		"tool": request.Call.Name, "operation_key": request.OperationKey, "operation_status": result.Status, "approval_decision": "reject",
+	}); err != nil {
+		return AgentToolResult{}, err
+	}
+	return result, nil
+}
+
+func (b *CloudDSHToolBroker) expireApprovedToolCall(ctx context.Context, current task.Task, step task.Step, usage task.Usage, request AgentToolRequest) (AgentToolResult, error) {
+	step.Status, step.Summary = task.StepFailed, "The approval expired; this exact action was not dispatched."
+	result := AgentToolResult{Status: AgentToolFailed, Output: "The approval expired. This exact action was not executed."}
+	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+		"tool": request.Call.Name, "operation_key": request.OperationKey, "operation_status": result.Status, "approval_decision": "expired",
 	}); err != nil {
 		return AgentToolResult{}, err
 	}

@@ -29,7 +29,8 @@ func (s *Store) RespondToPendingRequest(ctx context.Context, record app.Idempote
 	if record.Operation != "task.pending.respond" || record.ResourceID != taskID || record.RelatedID != pendingID {
 		return domain.InvalidArgument("idempotency", "pending request idempotency identity is invalid")
 	}
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+	requestExpired := false
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if _, replayed, err := findIdempotency(ctx, tx, record); err != nil {
 			return err
 		} else if replayed {
@@ -57,11 +58,9 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).Scan(&status, &lea
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
 		}
-		stored, replayed, err := reserveIdempotency(ctx, tx, record, taskID, pendingID)
-		if err != nil {
+		if _, replayed, err := findIdempotency(ctx, tx, record); err != nil {
 			return err
-		}
-		if replayed {
+		} else if replayed {
 			return nil
 		}
 		if status != string(task.StatusWaitingUser) {
@@ -72,14 +71,31 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).Scan(&status, &lea
 		}
 		var storedVersion int64
 		var requestStatus, mediaPreviewOperationID string
-		if err := tx.QueryRow(ctx, `SELECT version, status, COALESCE(media_preview_operation_id,'') FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, taskID).
-			Scan(&storedVersion, &requestStatus, &mediaPreviewOperationID); errors.Is(err, pgx.ErrNoRows) {
+		var expired bool
+		if err := tx.QueryRow(ctx, `SELECT version, status, COALESCE(media_preview_operation_id,''),
+(expires_at IS NOT NULL AND expires_at <= clock_timestamp())
+FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, taskID).
+			Scan(&storedVersion, &requestStatus, &mediaPreviewOperationID, &expired); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "pending request is no longer active")
 		} else if err != nil {
 			return fmt.Errorf("lock pending request: %w", err)
 		}
 		if storedVersion != version || requestStatus != string(task.PendingRequestPending) {
 			return domain.NewError(domain.CodeConflict, "pending request version is stale or already resolved")
+		}
+		if expired {
+			if err := expirePendingRequestTx(ctx, tx, taskID, pendingID, version, leaseVersion); err != nil {
+				return err
+			}
+			requestExpired = true
+			return nil
+		}
+		stored, replayed, err := reserveIdempotency(ctx, tx, record, taskID, pendingID)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
 		}
 		if mediaPreviewOperationID != "" {
 			if !domain.ValidOperationID(mediaPreviewOperationID) {
@@ -131,6 +147,149 @@ RETURNING event_seq`, taskID, taskOwnerID).Scan(&sequence)
 		_ = stored
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if requestExpired {
+		return domain.NewError(domain.CodeConflict, "pending request has expired")
+	}
+	return nil
+}
+
+// ExpirePendingRequest rejects an expired approval, records the Task event, and
+// requeues only the Task waiting on that exact request version. The database
+// clock is authoritative; a stale read or concurrent response is a no-op.
+func (s *Store) ExpirePendingRequest(ctx context.Context, actorID, taskID, pendingID string, version int64) (bool, error) {
+	if !domain.ValidUserID(actorID) || !domain.ValidTaskID(taskID) || !domain.ValidPendingRequestID(pendingID) || version < 1 {
+		return false, domain.InvalidArgument("pending_request", "pending request expiry identity is invalid")
+	}
+	expired := false
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, actorID, false, true)
+		if err != nil {
+			return err
+		}
+		var taskStatus, waitingReason, workspaceID, initiatorID, leaseOwner string
+		var leaseVersion int64
+		var leaseExpiresAt pgtype.Timestamptz
+		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, COALESCE(workspace_id,''), initiator_id,
+lease_owner, lease_expires_at FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
+			Scan(&taskStatus, &waitingReason, &leaseVersion, &workspaceID, &initiatorID, &leaseOwner, &leaseExpiresAt); errors.Is(err, pgx.ErrNoRows) {
+			return missingTaskError()
+		} else if err != nil {
+			return fmt.Errorf("lock Task for pending approval expiry: %w", err)
+		}
+		if taskStatus != string(task.StatusWaitingUser) || waitingReason != "approval_required" || leaseOwner != "" || leaseExpiresAt.Valid {
+			return nil
+		}
+		if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+			return err
+		}
+		var storedVersion int64
+		var requestStatus string
+		var due bool
+		if err := tx.QueryRow(ctx, `SELECT version, status, expires_at IS NOT NULL AND expires_at <= clock_timestamp()
+FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, taskID).
+			Scan(&storedVersion, &requestStatus, &due); errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("lock pending approval for expiry: %w", err)
+		}
+		if storedVersion != version || requestStatus != string(task.PendingRequestPending) || !due {
+			return nil
+		}
+		if leaseVersion == int64(^uint64(0)>>1) {
+			return domain.NewError(domain.CodeInvalidState, "task lease version is exhausted")
+		}
+		if err := expirePendingRequestTx(ctx, tx, taskID, pendingID, version, leaseVersion); err != nil {
+			return err
+		}
+		expired = true
+		return nil
+	})
+	return expired, err
+}
+
+// ExpireNextPendingRequest advances one due approval without a client request.
+// Lock the Task before its request, matching response and explicit expiry; the
+// row lock also prevents multiple service instances from applying it twice.
+func (s *Store) ExpireNextPendingRequest(ctx context.Context) (bool, error) {
+	expired := false
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var taskID, pendingID, workspaceID, initiatorID string
+		var version, leaseVersion int64
+		err := tx.QueryRow(ctx, `SELECT t.id,p.id,p.version,t.lease_version,COALESCE(t.workspace_id,''),t.initiator_id
+FROM task_pending_requests p JOIN tasks t ON t.id=p.task_id
+WHERE p.status='pending' AND p.expires_at IS NOT NULL AND p.expires_at<=clock_timestamp()
+ AND t.status='waiting_user' AND t.waiting_reason='approval_required'
+ AND t.lease_owner='' AND t.lease_expires_at IS NULL AND t.lease_version<9223372036854775807
+ AND (t.workspace_id IS NULL OR EXISTS (
+   SELECT 1 FROM workspaces w WHERE w.id=t.workspace_id AND w.owner_id=t.initiator_id
+    AND NOT EXISTS (SELECT 1 FROM workspace_ownership_transfers transfer WHERE transfer.workspace_id=w.id
+      AND transfer.state IN ('pending','accepting','unknown'))
+    AND NOT EXISTS (SELECT 1 FROM workspace_copy_reservations copy
+      WHERE (copy.source_workspace_id=w.id OR copy.target_workspace_id=w.id)
+        AND (copy.state IN ('reserved','copying','unknown') OR copy.host_copy_pending))
+ ))
+ORDER BY p.expires_at,p.task_id,p.id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`).
+			Scan(&taskID, &pendingID, &version, &leaseVersion, &workspaceID, &initiatorID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("select expired pending approval: %w", err)
+		}
+		if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+			return err
+		}
+		var due bool
+		err = tx.QueryRow(ctx, `SELECT status='pending' AND expires_at IS NOT NULL AND expires_at<=clock_timestamp()
+FROM task_pending_requests WHERE id=$1 AND task_id=$2 AND version=$3 FOR UPDATE`, pendingID, taskID, version).Scan(&due)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && !due {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lock expired pending approval: %w", err)
+		}
+		if err := expirePendingRequestTx(ctx, tx, taskID, pendingID, version, leaseVersion); err != nil {
+			return err
+		}
+		expired = true
+		return nil
+	})
+	return expired, err
+}
+
+func expirePendingRequestTx(ctx context.Context, tx pgx.Tx, taskID, pendingID string, version, leaseVersion int64) error {
+	updated, err := tx.Exec(ctx, `UPDATE task_pending_requests SET status='expired', decision='reject', responded_at=clock_timestamp()
+WHERE id=$1 AND task_id=$2 AND version=$3 AND status='pending' AND expires_at IS NOT NULL AND expires_at <= clock_timestamp()`,
+		pendingID, taskID, version)
+	if err != nil {
+		return fmt.Errorf("reject expired pending approval: %w", err)
+	}
+	if updated.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeConflict, "pending request changed while expiring")
+	}
+	var sequence int64
+	err = tx.QueryRow(ctx, `UPDATE tasks SET status='queued', lease_version=lease_version+1,
+waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
+WHERE id=$1 AND status='waiting_user' AND waiting_reason='approval_required' AND lease_owner='' AND lease_expires_at IS NULL
+RETURNING event_seq`, taskID).Scan(&sequence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeConflict, "Task changed while expiring its approval")
+	}
+	if err != nil {
+		return fmt.Errorf("requeue Task after approval expiry: %w", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"pending_id": pendingID, "pending_version": version, "decision": string(task.PendingDecisionReject),
+		"reason": "approval_expired", "idempotency_replayed": false,
+		"status": string(task.StatusQueued), "lease_version": leaseVersion + 1,
+	})
+	if err != nil {
+		return fmt.Errorf("encode expired approval event: %w", err)
+	}
+	return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.response", Payload: payload})
 }
 
 // AnswerClarificationRequest stores a free-form answer and requeues only the

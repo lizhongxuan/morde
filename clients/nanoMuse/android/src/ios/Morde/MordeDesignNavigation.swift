@@ -98,6 +98,7 @@ enum MordeDesignRoute: Hashable {
     case chat
     case tasks
     case approvals
+    case codexSessions
     case eventChain
     case resources
     case library
@@ -120,7 +121,7 @@ enum MordeDesignRoute: Hashable {
         case .tasks: .tasks
         case .approvals: .approvals
         case .resources: .resources
-        case .eventChain, .library, .projects, .workItems, .friends, .toolChats,
+        case .codexSessions, .eventChain, .library, .projects, .workItems, .friends, .toolChats,
              .settings, .settingsDetail, .search, .task, .workspace, .computer, .file: nil
         }
     }

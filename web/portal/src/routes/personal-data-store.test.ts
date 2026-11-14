@@ -19,6 +19,7 @@ function api(overrides: Partial<PersonalDataAPI> = {}): PersonalDataAPI {
       items: [], through_sequence: through ?? after, next_after_sequence: through ?? after, has_more: false,
     })),
     getPersonalObject: vi.fn(),
+    personalMemoryHistory: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
     replacePersonalObject: vi.fn().mockResolvedValue({ result_revision: 1, account_change_sequence: 1 }),
     deletePersonalObject: vi.fn().mockResolvedValue({ result_revision: 1, account_change_sequence: 1 }),
     personalDataQuota: vi.fn().mockResolvedValue({ used_bytes: 0, reserved_bytes: 0, quota_bytes: 1000, remaining_bytes: 1000, max_attachment_bytes: 1000 }),

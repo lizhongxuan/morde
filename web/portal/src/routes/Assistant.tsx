@@ -27,7 +27,7 @@ import { extractAssistantPDFText } from './assistant-pdf';
 import { assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
 import type { AssistantComposerDraft } from './assistant-drafts';
 import './AssistantSidebar.css';
-import { FloatingError } from '../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items'][number];
 type ConversationMessage = Awaited<ReturnType<typeof portalApi.conversationMessages>>['items'][number];
@@ -72,6 +72,18 @@ function conversationTitleFromMessages(messages: readonly Pick<ConversationMessa
 
 function isPlaceholderConversationTitle(title?: string): boolean {
   return !title?.trim() || ['新对话', '新旁聊', '对话'].includes(title.trim());
+}
+
+function AssistantConversationRow({ item, isMain, selected, recent, previewTitle, onSelect }: {
+  item: Conversation; isMain?: boolean; selected: boolean; recent: boolean; previewTitle?: string | null; onSelect: (id: string) => void;
+}) {
+  return <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`}>
+    <button type="button" className={`conversation-item ${selected ? 'is-selected' : ''}`} onClick={() => onSelect(item.id)}>
+      <strong>{isMain ? '主会话' : isPlaceholderConversationTitle(item.title) ? previewTitle || item.title || '新对话' : item.title}</strong>
+      {recent && !isMain && <small>本机最近查看</small>}
+      <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
+    </button>
+  </div>;
 }
 
 function conversationMessageStatus(message: AssistantDisplayMessage, task?: Task): string | null {
@@ -814,6 +826,7 @@ export function Assistant() {
   }, []);
   const taskCardButtons = useRef(new Map<string, HTMLButtonElement>());
   const [sideConversationsOpen, setSideConversationsOpen] = useState(false);
+  const [conversationSearch, setConversationSearch] = useState('');
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [historyPageLoadVersion, setHistoryPageLoadVersion] = useState(0);
   const [openingTaskID, setOpeningTaskID] = useState('');
@@ -838,6 +851,7 @@ export function Assistant() {
   const activeComposerDraftIdentity = useRef<string | null>(null);
   const composerDraftWrite = useRef<Promise<void>>(Promise.resolve());
   const composerEditRevision = useRef(0);
+  const composerSwitchGeneration = useRef(0);
   const activeDraftLoad = useRef<string | null>(null);
   const localConversationKeyRef = useRef<string | null>(null);
   const taskPanelToggle = useRef<HTMLButtonElement>(null);
@@ -856,9 +870,9 @@ export function Assistant() {
   const activeOutboxScope = useRef(outbox.currentScope);
   useLayoutEffect(() => { activeOutboxScope.current = outbox.currentScope; }, [outbox.currentScope]);
   const conversations = useInfiniteQuery({
-    queryKey: ['conversations'],
+    queryKey: ['conversations', conversationSearch.trim()],
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => portalApi.conversations(pageParam, 5),
+    queryFn: ({ pageParam }) => portalApi.conversations(pageParam, 5, conversationSearch.trim() || undefined),
     getNextPageParam: (page) => page.next_cursor ?? undefined,
   });
   const mainConversation = useQuery({
@@ -974,6 +988,25 @@ export function Assistant() {
     .sort((left, right) => right.updatedAt - left.updatedAt);
   const latestComposerDraft = useRef<{ scope: string; identity: string; draft: AssistantComposerDraft } | null>(null);
   const composerDraftSnapshots = useRef(new Map<string, { scope: string; draft: AssistantComposerDraft }>());
+  const migratedComposerDrafts = useRef(new Map<string, string>());
+  const preparationKeysForIdentity = useCallback((identity: string) => {
+    const keys = [identity];
+    for (const [source, target] of migratedComposerDrafts.current) {
+      const [scope] = JSON.parse(source) as [string, string];
+      if (JSON.stringify([scope, target]) === identity) keys.push(source);
+    }
+    return keys;
+  }, []);
+  const updateComposerDraftSnapshot = (change: Partial<AssistantComposerDraft>) => {
+    const current = latestComposerDraft.current;
+    if (!current || current.identity !== composerDraftIdentity) return;
+    const draft = { ...current.draft, ...change };
+    latestComposerDraft.current = { ...current, draft };
+    composerDraftSnapshots.current.set(current.identity, { scope: current.scope, draft });
+    const migratedID = migratedComposerDrafts.current.get(current.identity);
+    if (migratedID) composerDraftSnapshots.current.set(JSON.stringify([current.scope, migratedID]),
+      { scope: current.scope, draft: { ...draft, id: migratedID, conversationID: migratedID } });
+  };
   const composerInputSnapshot = useRef({ content, attachments: composerAttachments.length });
   const draftSnapshot: AssistantComposerDraft | null = composerDraftScope && composerDraftID ? {
     id: composerDraftID,
@@ -993,22 +1026,27 @@ export function Assistant() {
   } : null;
   useLayoutEffect(() => {
     activeComposerDraftIdentity.current = composerDraftIdentity;
-    const currentDraft = draftSnapshot ? { ...draftSnapshot, updatedAt: Date.now() } : null;
+    const currentDraft = draftSnapshot;
     latestComposerDraft.current = currentDraft && composerDraftScope && composerDraftIdentity
       ? { scope: composerDraftScope, identity: composerDraftIdentity, draft: currentDraft } : null;
     composerInputSnapshot.current = { content, attachments: composerAttachments.length };
     if (currentDraft && composerDraftScope && composerDraftIdentity) {
       composerDraftSnapshots.current.set(composerDraftIdentity, { scope: composerDraftScope, draft: currentDraft });
+      const migratedID = migratedComposerDrafts.current.get(composerDraftIdentity);
+      if (migratedID) composerDraftSnapshots.current.set(JSON.stringify([composerDraftScope, migratedID]),
+        { scope: composerDraftScope, draft: { ...currentDraft, id: migratedID, conversationID: migratedID } });
     }
   });
   useLayoutEffect(() => {
-    const count = composerDraftIdentity ? attachmentPreparationCounts.current.get(composerDraftIdentity) ?? 0 : 0;
+    const count = composerDraftIdentity ? preparationKeysForIdentity(composerDraftIdentity)
+      .reduce((total, key) => total + (attachmentPreparationCounts.current.get(key) ?? 0), 0) : 0;
     preparingAttachmentCountRef.current = count;
     setPreparingAttachmentCount(count);
-  }, [composerDraftIdentity]);
+  }, [composerDraftIdentity, preparationKeysForIdentity]);
   const persistComposerDraft = useCallback(async (scope: string, draft: AssistantComposerDraft) => {
-    const identity = JSON.stringify([scope, draft.id]);
-    const currentDraft = { ...draft, updatedAt: Date.now() };
+    const migratedID = migratedComposerDrafts.current.get(JSON.stringify([scope, draft.id]));
+    const currentDraft = { ...draft, ...(migratedID ? { id: migratedID, conversationID: migratedID } : {}), updatedAt: Date.now() };
+    const identity = JSON.stringify([scope, currentDraft.id]);
     client.setQueryData<AssistantComposerDraft[]>(['assistant-composer-drafts', scope], (previous) => {
       const next = (previous ?? []).filter((item) => item.id !== currentDraft.id);
       return [...next, currentDraft].sort((left, right) => right.updatedAt - left.updatedAt);
@@ -1026,8 +1064,9 @@ export function Assistant() {
   }, [client]);
   const persistActiveComposerDraft = useCallback(async () => {
     const current = latestComposerDraft.current;
-    if (!current) return;
-    try { await persistComposerDraft(current.scope, current.draft); } catch { /* the memory fallback retains this page's draft */ }
+    if (!current) return true;
+    try { await persistComposerDraft(current.scope, current.draft); return true; }
+    catch { return false; }
   }, [persistComposerDraft]);
   const restoreComposerDraft = useCallback((draft: AssistantComposerDraft | null, scope: string, id: string) => {
     setContent(draft?.content ?? '');
@@ -1057,6 +1096,7 @@ export function Assistant() {
   }, []);
   useEffect(() => {
     const draftSnapshots = composerDraftSnapshots.current;
+    const migratedDrafts = migratedComposerDrafts.current;
     if (!composerDraftScope || !composerDraftID || !composerDraftIdentity) {
       activeDraftLoad.current = null;
       return;
@@ -1105,7 +1145,9 @@ export function Assistant() {
     return () => {
       cancelled = true;
       const previous = draftSnapshots.get(composerDraftIdentity);
-      if (previous) void persistComposerDraft(previous.scope, previous.draft).catch(() => undefined);
+      if (previous && !migratedDrafts.has(composerDraftIdentity)) {
+        void persistComposerDraft(previous.scope, previous.draft).catch(() => undefined);
+      }
     };
   }, [composerDraftID, composerDraftIdentity, composerDraftScope, hydratedComposerDraftKey, persistComposerDraft, restoreComposerDraft]);
   useEffect(() => {
@@ -1457,22 +1499,31 @@ export function Assistant() {
         checkScope();
         message = { ...message, conversationID: targetID };
         const localDraftID = `local:${message.conversationCreateKey}`;
+        const draftScope = assistantComposerDraftScope(message.serviceInstanceID!, message.actorID);
+        const localDraftIdentity = JSON.stringify([draftScope, localDraftID]);
+        let canSelectCreatedConversation = true;
         if (localConversationKeyRef.current === message.conversationCreateKey) await persistActiveComposerDraft();
         try {
-          const localDraft = await assistantDraftStorage.get(scope, localDraftID);
+          const localDraft = await assistantDraftStorage.get(draftScope, localDraftID);
           if (localDraft) {
-            const migratedDraft = { ...localDraft, id: targetID, conversationID: targetID };
-            await persistComposerDraft(scope, migratedDraft);
-            await assistantDraftStorage.remove(scope, localDraftID);
-            client.setQueryData<AssistantComposerDraft[]>(['assistant-composer-drafts', scope], (previous) =>
+            const latest = composerDraftSnapshots.current.get(localDraftIdentity)?.draft ?? localDraft;
+            const migratedDraft = { ...latest, id: targetID, conversationID: targetID };
+            migratedComposerDrafts.current.set(localDraftIdentity, targetID);
+            composerDraftSnapshots.current.set(JSON.stringify([draftScope, targetID]), { scope: draftScope, draft: migratedDraft });
+            await persistComposerDraft(draftScope, migratedDraft);
+            await assistantDraftStorage.remove(draftScope, localDraftID);
+            composerDraftSnapshots.current.delete(localDraftIdentity);
+            client.setQueryData<AssistantComposerDraft[]>(['assistant-composer-drafts', draftScope], (previous) =>
               (previous ?? []).filter((item) => item.id !== localDraftID));
           }
         } catch (error) {
+          migratedComposerDrafts.current.delete(localDraftIdentity);
+          canSelectCreatedConversation = false;
           setComposerDraftError(errorDetails(error).message);
         }
-        if (localConversationKeyRef.current === message.conversationCreateKey && activeOutboxScope.current === scope) {
+        if (canSelectCreatedConversation && localConversationKeyRef.current === message.conversationCreateKey && activeOutboxScope.current === scope) {
           newConversationKey.current = null;
-          activeDraftLoad.current = JSON.stringify([scope, targetID]);
+          activeDraftLoad.current = JSON.stringify([draftScope, targetID]);
           setHydratedComposerDraftKey(activeDraftLoad.current);
           setConversationID(targetID);
         }
@@ -1678,18 +1729,21 @@ export function Assistant() {
   const cancelComposerAttachmentPreparation = () => {
     const identity = activeComposerDraftIdentity.current;
     if (!identity) return;
-    attachmentPreparationGenerations.current.set(identity, (attachmentPreparationGenerations.current.get(identity) ?? 0) + 1);
-    for (const controller of pdfPreparationControllers.current.get(identity) ?? []) controller.abort();
-    pdfPreparationControllers.current.delete(identity);
-    const cancelledIDs = preparingAttachmentIDsByDraft.current.get(identity) ?? new Set<string>();
+    const cancelledIDs = new Set<string>();
+    for (const key of preparationKeysForIdentity(identity)) {
+      attachmentPreparationGenerations.current.set(key, (attachmentPreparationGenerations.current.get(key) ?? 0) + 1);
+      for (const controller of pdfPreparationControllers.current.get(key) ?? []) controller.abort();
+      pdfPreparationControllers.current.delete(key);
+      for (const id of preparingAttachmentIDsByDraft.current.get(key) ?? []) cancelledIDs.add(id);
+      preparingAttachmentIDsByDraft.current.delete(key);
+      attachmentPreparationCounts.current.set(key, 0);
+    }
     for (const id of cancelledIDs) preparingAttachmentIDs.current.delete(id);
     setPreparingAttachmentIDsForRender((current) => {
       const next = new Set(current);
       for (const id of cancelledIDs) next.delete(id);
       return next;
     });
-    preparingAttachmentIDsByDraft.current.delete(identity);
-    attachmentPreparationCounts.current.set(identity, 0);
     preparingAttachmentCountRef.current = 0;
     setPreparingAttachmentCount(0);
     setComposerAttachments((current) => current.map((item) => item.needsPreparation
@@ -1777,34 +1831,54 @@ export function Assistant() {
       if (activeIDs && !activeIDs.size) preparingAttachmentIDsByDraft.current.delete(preparationKey);
       const nextCount = Math.max(0, (attachmentPreparationCounts.current.get(preparationKey) ?? 0) - pending.length);
       attachmentPreparationCounts.current.set(preparationKey, nextCount);
-      if (identity && activeComposerDraftIdentity.current === identity) {
-        preparingAttachmentCountRef.current = nextCount;
-        setPreparingAttachmentCount(nextCount);
+      const activeIdentity = activeComposerDraftIdentity.current;
+      if (activeIdentity && preparationKeysForIdentity(activeIdentity).includes(preparationKey)) {
+        const total = preparationKeysForIdentity(activeIdentity)
+          .reduce((count, key) => count + (attachmentPreparationCounts.current.get(key) ?? 0), 0);
+        preparingAttachmentCountRef.current = total;
+        setPreparingAttachmentCount(total);
       }
     }
     if (generation === (attachmentPreparationGenerations.current.get(preparationKey) ?? 0)) {
-      const targetLocalKey = draftID?.startsWith('local:') ? draftID.slice('local:'.length) : null;
-      const isCurrent = draftID ? targetLocalKey ? localConversationKeyRef.current === targetLocalKey : selectedConversation.current === draftID : false;
+      let effectiveDraftID = (identity && migratedComposerDrafts.current.get(identity)) || draftID;
+      const targetLocalKey = effectiveDraftID?.startsWith('local:') ? effectiveDraftID.slice('local:'.length) : null;
+      const isCurrent = effectiveDraftID ? targetLocalKey ? localConversationKeyRef.current === targetLocalKey : selectedConversation.current === effectiveDraftID : false;
       if (isCurrent && (accepted.size || rejected.size)) {
         setComposerAttachments((current) => current.filter((item) => !rejected.has(item.id)).map((item) => accepted.get(item.id) ?? item));
       }
-      if (scope && draftID) {
+      if (scope && effectiveDraftID) {
         try {
-          const stored = await assistantDraftStorage.get(scope, draftID);
-          if (stored) {
-            const attachments = stored.attachments.flatMap((item) => {
+          let stored = await assistantDraftStorage.get(scope, effectiveDraftID);
+          const migratedID = identity && migratedComposerDrafts.current.get(identity);
+          if (migratedID && migratedID !== effectiveDraftID) {
+            effectiveDraftID = migratedID;
+            stored = await assistantDraftStorage.get(scope, effectiveDraftID);
+            if (selectedConversation.current === effectiveDraftID && (accepted.size || rejected.size)) {
+              setComposerAttachments((current) => current.filter((item) => !rejected.has(item.id)).map((item) => accepted.get(item.id) ?? item));
+            }
+          }
+          const effectiveIdentity = JSON.stringify([scope, effectiveDraftID]);
+          const snapshot = effectiveIdentity ? composerDraftSnapshots.current.get(effectiveIdentity) : undefined;
+          const base = snapshot?.scope === scope ? snapshot.draft : stored;
+          if (base) {
+            const attachments = base.attachments.flatMap((item) => {
               if (rejected.has(item.id)) return [];
               const ready = accepted.get(item.id);
               if (!ready) return [item];
               return [{ ...item, name: ready.file.name, ...(ready.displayName ? { displayName: ready.displayName } : {}),
                 mediaType: assistantFileMediaType(ready.file), blob: ready.file, needsPreparation: undefined, preparationCancelled: undefined }];
             });
-            await persistComposerDraft(scope, { ...stored, attachments });
+            const draft = { ...base, attachments };
+            if (effectiveIdentity) {
+              composerDraftSnapshots.current.set(effectiveIdentity, { scope, draft });
+              if (latestComposerDraft.current?.identity === effectiveIdentity) latestComposerDraft.current = { scope, identity: effectiveIdentity, draft };
+            }
+            await persistComposerDraft(scope, draft);
           }
         } catch (error) { setComposerDraftError(errorDetails(error).message); }
       }
     }
-  }, [notify, persistComposerDraft]);
+  }, [notify, persistComposerDraft, preparationKeysForIdentity]);
 
   const addComposerFiles = async (fileList: FileList | null) => {
     if (!fileList) return;
@@ -1833,16 +1907,23 @@ export function Assistant() {
           ...(item.preparationCancelled ? { preparationCancelled: true } : {}) })),
         updatedAt: 0,
       } satisfies AssistantComposerDraft;
+      const draft = { ...base, attachments: [...base.attachments, ...staged.map((item) => ({
+        id: item.id, name: item.file.name, mediaType: assistantFileMediaType(item.file), blob: item.file,
+        objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
+        needsPreparation: true,
+      }))] };
+      if (scope && targetIdentity) {
+        composerDraftSnapshots.current.set(targetIdentity, { scope, draft });
+        if (!active || active.identity === targetIdentity) latestComposerDraft.current = { scope, identity: targetIdentity, draft };
+      }
+      const isCurrent = draftID.startsWith('local:') ? localConversationKeyRef.current === draftID.slice('local:'.length)
+        : selectedConversation.current === draftID;
+      if (isCurrent) setComposerAttachments((current) => [...current, ...staged]);
       if (scope) {
         try {
-          await persistComposerDraft(scope, { ...base, attachments: [...base.attachments, ...staged.map((item) => ({
-            id: item.id, name: item.file.name, mediaType: assistantFileMediaType(item.file), blob: item.file,
-            objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
-            needsPreparation: true,
-          }))] });
+          await persistComposerDraft(scope, draft);
         } catch { /* the resilient draft store keeps the staged file in memory */ }
       }
-      setComposerAttachments((current) => [...current, ...staged]);
       void prepareComposerAttachmentItems(staged, scope, draftID);
     }
     if (incoming.length > available) notify('每条消息最多添加 16 个附件。', 'error');
@@ -1943,11 +2024,22 @@ export function Assistant() {
   };
 
   const startNew = async () => {
+    const generation = ++composerSwitchGeneration.current;
     if (!composerDraftScope && (content || composerAttachments.length)) {
       notify('账号或服务身份尚未确认；当前草稿仍留在此页面，请待服务恢复后再切换。', 'error');
       return;
     }
-    await persistActiveComposerDraft();
+    const revision = composerEditRevision.current;
+    const saved = await persistActiveComposerDraft();
+    if (generation !== composerSwitchGeneration.current) return;
+    if (!saved) {
+      notify('当前草稿尚未可靠保存，已留在此会话，请重试。', 'error');
+      return;
+    }
+    if (revision !== composerEditRevision.current) {
+      notify('输入已变化，请再次选择新建旁聊。', 'error');
+      return;
+    }
     const key = newIdempotencyKey();
     const id = `local:${key}`;
     newConversationKey.current = key;
@@ -1968,19 +2060,33 @@ export function Assistant() {
   };
 
   const selectConversationID = async (id: string) => {
+    const generation = ++composerSwitchGeneration.current;
     if (!composerDraftScope && (content || composerAttachments.length)) {
       notify('账号或服务身份尚未确认；当前草稿仍留在此页面，请待服务恢复后再切换。', 'error');
+      return;
+    }
+    const revision = composerEditRevision.current;
+    const saved = await persistActiveComposerDraft();
+    if (generation !== composerSwitchGeneration.current) return;
+    if (!saved) {
+      notify('当前草稿尚未可靠保存，已留在此会话，请重试。', 'error');
       return;
     }
     if (composerDraftScope) {
       try { await assistantDraftStorage.get(composerDraftScope, id); }
       catch (error) {
+        if (generation !== composerSwitchGeneration.current) return;
         setComposerDraftError(errorDetails(error).message);
         notify('无法恢复目标会话草稿；当前输入仍已保留。', 'error');
         return;
       }
     }
-    setConversationID(id);
+    if (generation !== composerSwitchGeneration.current) return;
+    if (revision !== composerEditRevision.current) {
+      notify('输入已变化，请再次选择会话。', 'error');
+      return;
+    }
+    setConversationSelection({ scope: conversationScope, id });
     if (recentConversationKey && !id.startsWith('local:')) {
       writeRecentConversation(recentConversationKey, id);
       client.setQueryData(['assistant-recent-conversation', recentConversationKey], id);
@@ -2060,14 +2166,6 @@ export function Assistant() {
       </button>
     </div>;
   };
-  const renderConversationItem = (item: Conversation, isMain = false) => <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`} key={item.id}>
-    <button type="button" className={`conversation-item ${conversationID === item.id ? 'is-selected' : ''}`}
-      onClick={selectConversationID.bind(undefined, item.id)}>
-      <strong>{isMain ? '主会话' : isPlaceholderConversationTitle(item.title) ? conversationPreviewTitles.get(item.id) || item.title || '新对话' : item.title}</strong>
-      {item.id === recentConversationID && !isMain && <small>本机最近查看</small>}
-      <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
-    </button>
-  </div>;
   const renderCachedMainConversation = () => mainConversationID ? <div className="conversation-row conversation-row-main" key={mainConversationID}>
     <button type="button" className={`conversation-item ${conversationID === mainConversationID ? 'is-selected' : ''}`}
       onClick={() => selectConversationID(mainConversationID)}>
@@ -2263,18 +2361,22 @@ export function Assistant() {
           <small>更新于 {formatDate(task.updated_at)}</small></div>
         <span className={`task-activity-status status-${task.status}`}>{taskActivityStatusText(summary, task)}</span>
       </header>
-      {task.pending_request && <section className="notice notice-warning task-detail-attention" aria-label="需要批准的操作">
+      {task.pending_request && <section className="notice notice-warning task-detail-attention"
+        aria-label={task.pending_request.status === 'expired' ? '审批已到期' : '需要批准的操作'}>
         <h3>{task.pending_request.title}</h3><p>{task.pending_request.object}</p><p>{task.pending_request.content}</p><p>可能影响：{task.pending_request.impact}</p>
-        <div className="inline-actions">{(['approve', 'reject'] as const).map((decision) => <button key={decision} type="button"
-          className={`button ${decision === 'approve' ? 'button-primary' : 'button-secondary'}`} disabled={respondToApproval.isPending}
-          onClick={() => {
-            const request = task.pending_request!;
-            const actionScope = `approval:${task.id}:${request.id}`;
-            const fingerprint = JSON.stringify({ version: request.version, decision });
-            const key = taskActionKey(actionScope, fingerprint);
-            respondToApproval.mutate({ taskID: task.id, approvalID: request.id, version: request.version,
-              decision, actionScope, key });
-          }}>{decision === 'approve' ? '批准并继续' : '拒绝'}</button>)}</div>
+        <p>费用、替代方案和撤销方式：当前工具未提供。</p>
+        {task.pending_request.expires_at && <p>审批到期：{formatDate(task.pending_request.expires_at)}</p>}
+        {task.pending_request.status === 'expired' ? <p role="status">审批已到期；该操作已被拒绝并未执行。</p>
+          : <div className="inline-actions">{(['approve', 'reject'] as const).map((decision) => <button key={decision} type="button"
+            className={`button ${decision === 'approve' ? 'button-primary' : 'button-secondary'}`} disabled={respondToApproval.isPending}
+            onClick={() => {
+              const request = task.pending_request!;
+              const actionScope = `approval:${task.id}:${request.id}`;
+              const fingerprint = JSON.stringify({ version: request.version, decision });
+              const key = taskActionKey(actionScope, fingerprint);
+              respondToApproval.mutate({ taskID: task.id, approvalID: request.id, version: request.version,
+                decision, actionScope, key });
+            }}>{decision === 'approve' ? '批准并继续' : '拒绝'}</button>)}</div>}
       </section>}
       {task.clarification_request && <form className="notice notice-warning task-detail-attention" aria-label="补充任务信息"
         onSubmit={(event) => {
@@ -2471,37 +2573,49 @@ export function Assistant() {
   const selectedConversationTitle = selected && !isPlaceholderConversationTitle(selected.title) ? selected.title
     : conversationTitleFromMessages(conversationMessageItems) ?? (conversationID ? conversationPreviewTitles.get(conversationID) : null)
       ?? (conversationID ? '对话' : '新旁聊');
+  const showConversationWelcome = Boolean(conversationID && messages.isSuccess && displayMessages.length === 0 && pendingMessages.length === 0);
+  const conversationWelcome = <div className="assistant-welcome"><span className="assistant-mark assistant-logo" aria-hidden="true" />
+    <h2>今天想聊些什么？</h2><p>告诉我你想完成的事情。</p>
+  </div>;
 
   return <section className="assistant-page">
-    {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-warning" role="status">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</p>}
-    {mainConversation.isPending && <p className="notice notice-info" role="status">正在读取服务端主会话…</p>}
+    {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <FloatingNotice className="notice-warning" data-notice-label="演示模式">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</FloatingNotice>}
+    {mainConversation.isPending && <FloatingNotice className="notice-info">正在读取服务端主会话…</FloatingNotice>}
     {mainConversation.isError && !showConsolidatedNetworkError && <FloatingError role="alert">无法刷新服务端主会话{cachedMainConversationID ? '，已保留上次记录' : '，请重试'}。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></FloatingError>}
-    {mainConversation.data?.status === 'uninitialized' && <p className="notice notice-info" role="status">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</p>}
-    {capabilities.isPending && <p className="notice notice-info" role="status">正在检查服务能力…</p>}
+    {mainConversation.data?.status === 'uninitialized' && <FloatingNotice className="notice-info">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</FloatingNotice>}
+    {capabilities.isPending && <FloatingNotice className="notice-info">正在检查服务能力…</FloatingNotice>}
     {capabilities.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></FloatingError>}
-    {capabilities.isSuccess && conversationAutoRoutingAvailable === false && <div className="notice notice-warning" role="status">
+    {capabilities.isSuccess && conversationAutoRoutingAvailable === false && <FloatingNotice className="notice-warning">
       服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。
-    </div>}
-    {capabilities.isSuccess && cloudTasksAvailable === false && <div className="notice notice-warning" role="status">
+    </FloatingNotice>}
+    {capabilities.isSuccess && cloudTasksAvailable === false && <FloatingNotice className="notice-warning">
       云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
-    </div>}
+    </FloatingNotice>}
     <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' ? ' assistant-layout-with-computer-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' && computerControlExpanded ? ' assistant-layout-computer-expanded' : ''}`}>
       <aside id="context-sidebar" className="assistant-sidebar" aria-label="对话">
         <div className="assistant-sidebar-heading">
           <button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表和当前消息" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); void messages.refetch(); }}><MordeIcon name="refresh" /></button>
         </div>
         <div id="conversation-history" className="assistant-history-content">
-          {mainConversationID && (mainConversationItem ? renderConversationItem(mainConversationItem, true)
+          {mainConversationID && (mainConversationItem ? <AssistantConversationRow item={mainConversationItem} isMain selected={conversationID === mainConversationItem.id}
+            recent={false} onSelect={selectConversationID} />
             : renderCachedMainConversation())}
           {!mainConversationID && mainConversation.isPending && <p className="muted" role="status">正在读取主会话…</p>}
           {conversations.isPending && !conversations.data && <p className="muted" role="status">正在读取旁聊…</p>}
           {conversations.isError && !conversations.data && <p className="muted" role="status">旁聊历史暂不可用</p>}
+          <label className="conversation-search">
+            <span className="sr-only">搜索旁聊标题</span>
+            <input type="search" aria-label="搜索旁聊标题" placeholder="搜索旁聊标题" value={conversationSearch}
+              onChange={(event) => { setConversationSearch(event.currentTarget.value); setVisibleSideConversationCount(5);
+                if (event.currentTarget.value.trim()) setSideConversationsOpen(true); }} />
+          </label>
           <div className="conversation-group">
             <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
               <summary>旁聊</summary>
               <div className="conversation-list">
                 {localComposerDrafts.slice(0, visibleSideConversationCount).map(renderLocalDraftItem)}
-                {sideConversations.slice(0, visibleSideConversationCount).map((item) => renderConversationItem(item))}
+                {sideConversations.slice(0, visibleSideConversationCount).map((item) => <AssistantConversationRow key={item.id} item={item}
+                  selected={conversationID === item.id} recent={recentConversationID === item.id} previewTitle={conversationPreviewTitles.get(item.id)} onSelect={selectConversationID} />)}
               </div>
               {composerDrafts.isError && <FloatingError className="error-inline" role="alert">未发送草稿暂不可用：{errorDetails(composerDrafts.error).message}
                 <button type="button" className="button button-small button-secondary" onClick={() => void composerDrafts.refetch()}>重试</button></FloatingError>}
@@ -2511,7 +2625,7 @@ export function Assistant() {
                 disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
                 {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
               </button>}
-              {!conversations.isError && conversations.isSuccess && !sideConversations.length && !localComposerDrafts.length && !conversations.hasNextPage && !composerDrafts.isPending && <p className="muted assistant-sidebar-empty">还没有旁聊。</p>}
+              {!conversations.isError && conversations.isSuccess && !sideConversations.length && !localComposerDrafts.length && !conversations.hasNextPage && !composerDrafts.isPending && <p className="muted assistant-sidebar-empty">{conversationSearch.trim() ? '没有找到匹配标题的旁聊。' : '还没有旁聊。'}</p>}
               {composerDrafts.isPending && !localComposerDrafts.length && <p className="muted assistant-sidebar-empty" role="status">正在读取未发送草稿…</p>}
             </details>
             <button type="button" className="button button-secondary conversation-new" aria-label="新建旁聊" title="新建旁聊" onClick={startNew}>+</button>
@@ -2535,15 +2649,13 @@ export function Assistant() {
           </button>}
         </header>
         {streamedTasks.map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
-        <div className={`conversation-view${conversationID ? '' : ' conversation-view-welcome'}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
+        <div className={`conversation-view${!conversationID || showConversationWelcome ? ' conversation-view-welcome' : ''}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
           const view = event.currentTarget;
           const atLatest = view.scrollHeight - view.scrollTop - view.clientHeight < 80;
           followConversation.current = atLatest;
           setShowJumpToLatest(!atLatest);
         }}>
-          {!conversationID ? <><div className="assistant-welcome"><span className="assistant-mark assistant-logo" aria-hidden="true" />
-            <h2>今天想聊些什么？</h2><p>告诉我你想完成的事情。</p>
-          </div>{pendingMessages.map(renderPendingMessage)}</> : <>
+          {!conversationID ? <>{conversationWelcome}{pendingMessages.map(renderPendingMessage)}</> : <>
           {conversationContentAccessRevoked ? <div className="empty-card" role="alert">
             <strong>当前对话内容暂不可访问。</strong><p className="muted">可以重试，或从左侧切换其他会话。</p>
             <button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试读取对话</button>
@@ -2551,6 +2663,7 @@ export function Assistant() {
             : messages.isError && displayMessages.length === 0 ? showConsolidatedNetworkError ? <div className="loading-card">消息暂不可用</div>
               : <FloatingError className="error-card" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>
               : <div className="message-list">
+                {showConversationWelcome && conversationWelcome}
                 {messages.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>}
                 {messages.hasNextPage && <div className="conversation-history-load">
                   {messages.isFetchNextPageError && <FloatingError className="error-inline" role="alert">更早的消息暂不可用：{errorDetails(messages.error).message}</FloatingError>}
@@ -2602,14 +2715,14 @@ export function Assistant() {
           {pendingMessages.map(renderPendingMessage)}
           </>}
           {models.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取模型：{errorDetails(models.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void models.refetch()}>重试</button></FloatingError>}
-          {modelConfigurationKnown && models.data?.configuration_status === 'not_configured' && <div className="notice notice-warning assistant-setup-notice" role="status">还没有配置云端模型。<Link to="/connections">配置模型</Link></div>}
-          {modelConfigurationKnown && models.data?.configuration_status === 'configured' && !readyModels.length && <div className="notice notice-warning assistant-setup-notice" role="status">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></div>}
+          {modelConfigurationKnown && models.data?.configuration_status === 'not_configured' && <FloatingNotice className="notice-warning">还没有配置云端模型。<Link to="/connections">配置模型</Link></FloatingNotice>}
+          {modelConfigurationKnown && models.data?.configuration_status === 'configured' && !readyModels.length && <FloatingNotice className="notice-warning">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></FloatingNotice>}
           {outbox.storageError && <FloatingError className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</FloatingError>}
           {execution.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></FloatingError>}
-          {execution.data?.state === 'stopping' && <p className="notice notice-warning" role="status">AI 服务正在停止；消息仍可先发送。</p>}
+          {execution.data?.state === 'stopping' && <FloatingNotice className="notice-warning">AI 服务正在停止；消息仍可先发送。</FloatingNotice>}
           {hosts.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取目标电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
-          {preferredHostID && !selectedHost && !hosts.isPending && !hosts.isError && <p className="notice notice-warning" role="status">所选电脑状态待核对；实际使用该目标时会检查权限和状态。</p>}
-          {selectedHost && !hostIsReady && <p className="notice notice-warning" role="status">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</p>}
+          {preferredHostID && !selectedHost && !hosts.isPending && !hosts.isError && <FloatingNotice className="notice-warning">所选电脑状态待核对；实际使用该目标时会检查权限和状态。</FloatingNotice>}
+          {selectedHost && !hostIsReady && <FloatingNotice className="notice-warning">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</FloatingNotice>}
         </div>
         {showJumpToLatest && conversationID && <div className="assistant-jump-latest"><button type="button" className="button button-secondary"
           onClick={() => { followConversation.current = true; if (conversationView.current) conversationView.current.scrollTop = conversationView.current.scrollHeight; setShowJumpToLatest(false); }}>
@@ -2622,7 +2735,9 @@ export function Assistant() {
             <textarea id="assistant-content" value={visibleComposerContent} style={{ resize: 'none' }} onChange={(event) => {
               composerEditRevision.current += 1;
               if (!conversationID) ensureLocalConversationKey();
-              setContent(event.target.value);
+              const value = event.target.value;
+              updateComposerDraftSnapshot({ content: value });
+              setContent(value);
             }} onKeyDown={(event) => {
               if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
               event.preventDefault();
@@ -2644,6 +2759,10 @@ export function Assistant() {
                       onClick={() => void previewOfficeAttachment(item)}>{preview?.status === 'loading' ? '预览中…' : '预览文本'}</button>}
                     <button type="button" aria-label={`移除附件 ${item.file.name}`} onClick={() => {
                       composerEditRevision.current += 1;
+                      const snapshot = latestComposerDraft.current;
+                      if (snapshot?.identity === composerDraftIdentity) {
+                        updateComposerDraftSnapshot({ attachments: snapshot.draft.attachments.filter((candidate) => candidate.id !== item.id) });
+                      }
                       setComposerAttachments((current) => current.filter((candidate) => candidate.id !== item.id));
                       setOfficePreviews((current) => {
                         const next = { ...current };
@@ -2669,17 +2788,21 @@ export function Assistant() {
                 <AssistantVoiceInput compact onTranscript={(transcript) => {
                   composerEditRevision.current += 1;
                   if (!conversationID) ensureLocalConversationKey();
-                  setContent((current) => current.trim() ? `${current.trimEnd()} ${transcript}` : transcript);
+                  const snapshot = latestComposerDraft.current;
+                  const current = snapshot?.identity === composerDraftIdentity ? snapshot.draft.content : content;
+                  const value = current.trim() ? `${current.trimEnd()} ${transcript}` : transcript;
+                  updateComposerDraftSnapshot({ content: value });
+                  setContent(value);
                 }} />
               </div>
               <div className="assistant-selectors">
                 <label className="assistant-selector"><MordeIcon name="spark" /><span className="sr-only">AI 模型</span><select aria-label="选择 AI 模型"
-                  value={composerDraftReady ? effectiveModelID : ''} onChange={(event) => { composerEditRevision.current += 1; setModelID(event.target.value); }} disabled={!composerDraftReady || models.isPending}>
+                  value={composerDraftReady ? effectiveModelID : ''} onChange={(event) => { composerEditRevision.current += 1; updateComposerDraftSnapshot({ modelID: event.target.value }); setModelID(event.target.value); }} disabled={!composerDraftReady || models.isPending}>
                   <option value="">自动选择模型</option>{effectiveModelID && !readyModels.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
                 </select></label>
                 <div className="assistant-target-row">
                   <label className="assistant-selector"><MordeIcon name="monitor" /><span className="sr-only">目标电脑</span><select aria-label="选择目标电脑" value={composerDraftReady ? selectedHost?.id ?? hostSelection ?? '' : ''}
-                    disabled={!composerDraftReady || hosts.isPending} onChange={(event) => { composerEditRevision.current += 1; setHostSelection(event.target.value); }}>
+                    disabled={!composerDraftReady || hosts.isPending} onChange={(event) => { composerEditRevision.current += 1; updateComposerDraftSnapshot({ hostID: event.target.value }); setHostSelection(event.target.value); }}>
                     <option value="">无电脑目标</option>
                     {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
                     {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
@@ -2698,8 +2821,14 @@ export function Assistant() {
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
                     <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
                       <input type="checkbox" checked={composerDraftReady && mcpConnectorIDs.includes(connector.id)} disabled={!composerDraftReady}
-                        onChange={(event) => { composerEditRevision.current += 1; setMcpConnectorIDs((current) => event.target.checked
-                          ? [...new Set([...current, connector.id])] : current.filter((id) => id !== connector.id)); }} />
+                        onChange={(event) => {
+                          composerEditRevision.current += 1;
+                          const snapshot = latestComposerDraft.current;
+                          const current = snapshot?.identity === composerDraftIdentity ? snapshot.draft.mcpConnectorIDs : mcpConnectorIDs;
+                          const next = event.target.checked ? [...new Set([...current, connector.id])] : current.filter((id) => id !== connector.id);
+                          updateComposerDraftSnapshot({ mcpConnectorIDs: next });
+                          setMcpConnectorIDs(next);
+                        }} />
                       <span>{connector.name}</span>
                     </label>)}</div>
                   </fieldset>

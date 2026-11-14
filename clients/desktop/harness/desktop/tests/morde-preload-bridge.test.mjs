@@ -35,21 +35,28 @@ function loadBridge(mode) {
   return { exposed, calls, listeners, removed };
 }
 
-test('Portal preload exposes only project directory operations and redacted state subscriptions', async () => {
+test('Portal preload exposes project and restricted local recovery operations', async () => {
   const bridge = loadBridge('portal');
   assert.equal(bridge.exposed.name, 'morde');
   assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
-    'onState', 'onSync', 'projectUploadTargets', 'selectProjectDirectory', 'state', 'uploadProject',
+    'deletePreserved', 'legacyDiscardSync', 'legacyPauseSync', 'legacyResumeSync', 'legacyStopLiveSync', 'legacyStopSync', 'legacySyncState',
+    'onState', 'onSync', 'preserved', 'projectUploadTargets', 'restorePreserved', 'selectProjectDirectory', 'state', 'stopProjectSync', 'uploadProject',
   ]);
   await bridge.exposed.value.projectUploadTargets();
   await bridge.exposed.value.selectProjectDirectory('h1234567', 'w1234567');
   await bridge.exposed.value.uploadProject('selection', 'project');
+  await bridge.exposed.value.stopProjectSync('selection');
   await bridge.exposed.value.state();
+  await bridge.exposed.value.legacySyncState();
+  await bridge.exposed.value.restorePreserved('w1234567', 'a'.repeat(32));
   assert.deepEqual(bridge.calls, [
     ['morde:portal-project-upload-targets'],
     ['morde:portal-project-select-directory', 'h1234567', 'w1234567'],
     ['morde:portal-project-upload', 'selection', 'project'],
+    ['morde:portal-project-stop', 'selection'],
     ['morde:portal-state'],
+    ['morde:portal-legacy-state'],
+    ['morde:portal-preserved-restore', 'w1234567', 'a'.repeat(32)],
   ]);
 
   const received = [];

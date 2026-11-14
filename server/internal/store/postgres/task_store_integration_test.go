@@ -1934,11 +1934,13 @@ func TestPostgresPendingApprovalResponseIsVersionedAndAtomic(t *testing.T) {
 	}
 	stepID := mustID(t, domain.NewStepID)
 	pendingID := mustID(t, domain.NewPendingRequestID)
+	expiresAt := time.Now().UTC().Add(time.Hour)
 	request := &task.PendingRequest{
 		ID: pendingID, TaskID: claimed.ID, Version: 4, Kind: "approval", Title: "Approve export",
 		Object: "report.txt", Content: "Export this file?", Impact: "The file will leave this Host.",
 		CallID: "call-export", ToolName: "file_export", RequestHash: hashBytes("exact-export-call"),
 		RuntimeGeneration: 2, RuntimeInstanceID: "runtime-instance-2", ControlVersion: 3, Status: task.PendingRequestPending,
+		ExpiresAt: &expiresAt,
 	}
 	usage := task.Usage{ActiveSeconds: 3, ToolCalls: 1}
 	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
@@ -1950,7 +1952,8 @@ func TestPostgresPendingApprovalResponseIsVersionedAndAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
-	if err != nil || details.PendingRequest == nil || details.PendingRequest.ID != pendingID || details.PendingRequest.Version != 4 || details.PendingRequest.Status != task.PendingRequestPending {
+	if err != nil || details.PendingRequest == nil || details.PendingRequest.ID != pendingID || details.PendingRequest.Version != 4 ||
+		details.PendingRequest.Status != task.PendingRequestPending || details.PendingRequest.ExpiresAt == nil || !details.PendingRequest.ExpiresAt.Equal(expiresAt) {
 		t.Fatalf("GetTask() pending = %#v, err=%v", details.PendingRequest, err)
 	}
 	record := app.IdempotencyRecord{
@@ -1978,6 +1981,79 @@ func TestPostgresPendingApprovalResponseIsVersionedAndAtomic(t *testing.T) {
 	}
 	if err := store.RespondToPendingRequest(ctx, stale, claimed.ID, pendingID, 3, task.PendingDecisionReject); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("stale response error = %v, want conflict", err)
+	}
+}
+
+func TestPostgresExpiredPendingApprovalCannotBeApprovedAndRequeuesExactTask(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "approval-expiry", "approve a bounded action"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "approval-expiry-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("ClaimNextTask() = %#v found=%t err=%v", claimed, found, err)
+	}
+	stepID, pendingID := mustID(t, domain.NewStepID), mustID(t, domain.NewPendingRequestID)
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	request := &task.PendingRequest{
+		ID: pendingID, TaskID: claimed.ID, Version: 1, Kind: "approval", Title: "Approve export",
+		Object: "report.txt", Content: "Export this exact file?", Impact: "The file will leave this Host.",
+		CallID: "call-approval-expiry", ToolName: "file_export", RequestHash: hashBytes("approval-expiry-call"),
+		RuntimeGeneration: 1, RuntimeInstanceID: "approval-expiry-runtime", ControlVersion: 1,
+		Status: task.PendingRequestPending, ExpiresAt: &expiresAt,
+	}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusWaitingUser, CurrentStep: stepID, WaitingReason: "approval_required",
+		Usage: task.Usage{ActiveSeconds: 1, ToolCalls: 1},
+		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "tool", Status: task.StepWaitingUser, Title: request.Title, Summary: request.Content}},
+		Event: task.Event{TaskID: claimed.ID, Type: "task.waiting_user", Payload: []byte(`{"reason":"approval_required"}`)}, PendingRequest: request,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET created_at=clock_timestamp()-interval '2 seconds',
+expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, pendingID); err != nil {
+		t.Fatalf("expire synthetic pending approval: %v", err)
+	}
+	var persistedExpiry time.Time
+	if err := store.pool.QueryRow(ctx, `SELECT expires_at FROM task_pending_requests WHERE id=$1`, pendingID).Scan(&persistedExpiry); err != nil {
+		t.Fatal(err)
+	}
+	record := app.IdempotencyRecord{
+		OwnerID: owner.ID, Operation: "task.pending.respond", Key: "expired-approval-key",
+		RequestHash: hashBytes("approve-expired:" + pendingID), ResourceID: claimed.ID, RelatedID: pendingID,
+	}
+	if err := store.RespondToPendingRequest(ctx, record, claimed.ID, pendingID, 1, task.PendingDecisionApprove); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("approve expired request error = %v, want conflict", err)
+	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusQueued || details.PendingRequest == nil ||
+		details.PendingRequest.Status != task.PendingRequestExpired || details.PendingRequest.Decision != task.PendingDecisionReject ||
+		details.PendingRequest.ExpiresAt == nil || !details.PendingRequest.ExpiresAt.Equal(persistedExpiry) ||
+		details.PendingRequest.RespondedAt == nil || details.PendingRequest.RespondedAt.Before(persistedExpiry) {
+		t.Fatalf("expired approval transition = task %#v pending %#v err=%v", details.Task, details.PendingRequest, err)
+	}
+	events, err := store.ListTaskEvents(ctx, owner.ID, claimed.ID, 0, 20)
+	if err != nil || len(events) == 0 || events[len(events)-1].Type != "task.response" {
+		t.Fatalf("expired approval event = %#v err=%v", events, err)
+	}
+	var event struct {
+		PendingID      string `json:"pending_id"`
+		PendingVersion int64  `json:"pending_version"`
+		Reason         string `json:"reason"`
+		Decision       string `json:"decision"`
+		Status         string `json:"status"`
+	}
+	if err := json.Unmarshal(events[len(events)-1].Payload, &event); err != nil || event.PendingID != pendingID ||
+		event.PendingVersion != 1 || event.Reason != "approval_expired" || event.Decision != "reject" || event.Status != "queued" {
+		t.Fatalf("expired approval event payload = %+v err=%v", event, err)
+	}
+	if err := store.RespondToPendingRequest(ctx, record, claimed.ID, pendingID, 1, task.PendingDecisionApprove); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("replay of expired approval error = %v, want conflict", err)
 	}
 }
 

@@ -17,6 +17,20 @@ describe('typed Portal API client', () => {
     await expect(portalApi.mainConversation()).resolves.toEqual({ status: 'selection_required', conversation_id: null, version: 0 });
   });
 
+  it('reads owner-scoped memory history using the signed cursor and fixed memory route', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ items: [], next_cursor: null });
+    }));
+
+    await portalApi.personalMemoryHistory('global', 'signed-history-cursor', 25);
+
+    expect([request!.method, new URL(request!.url).pathname, new URL(request!.url).search]).toEqual([
+      'GET', '/api/personal-data/memory/global/history', '?limit=25&cursor=signed-history-cursor',
+    ]);
+  });
+
   it('sends only the username and password during registration', async () => {
     let request: Request | undefined;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -594,6 +608,7 @@ describe('typed Portal API client', () => {
 
     await portalApi.capabilities();
     await portalApi.conversations();
+    await portalApi.conversations(undefined, 5, 'planning notes');
     const serviceID = '00000000-0000-4000-8000-000000000001';
     await portalApi.conversationMessages('c1234567', undefined, 'task-message-key-001', serviceID, 'u1234567');
     await portalApi.submitTask({ model_id: 'p1234567', objective: '你好' }, 'task-submit-key-001');
@@ -607,6 +622,7 @@ describe('typed Portal API client', () => {
     expect(requests.map((request) => [request.method, new URL(request.url).pathname, new URL(request.url).search])).toEqual([
       ['GET', '/api/capabilities', ''],
       ['GET', '/api/conversations', '?limit=100'],
+      ['GET', '/api/conversations', '?limit=5&q=planning%20notes'],
       ['GET', '/api/conversations/c1234567/messages', '?limit=100&client_message_id=task-message-key-001'],
       ['POST', '/api/tasks', ''],
       ['POST', '/api/conversations/c1234567/messages', ''],
@@ -614,16 +630,16 @@ describe('typed Portal API client', () => {
       ['POST', '/api/tasks/q1234567/inputs', ''],
       ['POST', '/api/tasks/q1234567/approvals/k7654321/responses', ''],
     ]);
-    expect(requests[3]?.headers.get('Idempotency-Key')).toBe('task-submit-key-001');
-    expect(requests[4]?.headers.get('Idempotency-Key')).toBe('task-message-key-001');
-    expect(requests[2]?.headers.get('X-Morde-Service-Instance-ID')).toBe(serviceID);
-    expect(requests[4]?.headers.get('X-Morde-Service-Instance-ID')).toBe(serviceID);
-    expect(requests[2]?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
-    expect(requests[4]?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
-    expect(requests[6]?.headers.get('Idempotency-Key')).toBe('task-input-key-001');
-    expect(requests[7]?.headers.get('Idempotency-Key')).toBe('task-approval-key-001');
-    expect(await requests[3]?.json()).toEqual({ model_id: 'p1234567', objective: '你好' });
-    expect(await requests[4]?.json()).toEqual({ client_message_id: 'task-message-key-001', model_id: 'p1234567', content: '继续' });
+    expect(requests[4]?.headers.get('Idempotency-Key')).toBe('task-submit-key-001');
+    expect(requests[5]?.headers.get('Idempotency-Key')).toBe('task-message-key-001');
+    expect(requests[3]?.headers.get('X-Morde-Service-Instance-ID')).toBe(serviceID);
+    expect(requests[5]?.headers.get('X-Morde-Service-Instance-ID')).toBe(serviceID);
+    expect(requests[3]?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
+    expect(requests[5]?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
+    expect(requests[7]?.headers.get('Idempotency-Key')).toBe('task-input-key-001');
+    expect(requests[8]?.headers.get('Idempotency-Key')).toBe('task-approval-key-001');
+    expect(await requests[4]?.json()).toEqual({ model_id: 'p1234567', objective: '你好' });
+    expect(await requests[5]?.json()).toEqual({ client_message_id: 'task-message-key-001', model_id: 'p1234567', content: '继续' });
     expect(requests.every((request) => request.credentials === 'include')).toBe(true);
   });
 

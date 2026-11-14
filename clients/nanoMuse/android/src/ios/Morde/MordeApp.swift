@@ -4419,6 +4419,7 @@ private struct MordeWorkspaceShareAccepted: Decodable {
 private struct MordeClientInstallation: Decodable, Identifiable {
     let id: String
     let display_name: String
+    let platform: String
     let revoked: Bool
 }
 private struct MordeDeviceInstallation: Decodable, Identifiable {
@@ -4639,6 +4640,31 @@ struct MordeTask: Decodable, Identifiable {
     struct Pending: Decodable {
         let id: String; let version: Int; let title: String; let content: String; let impact: String
         let kind: String?; let object: String?; let media_preview_operation_id: String?
+        let status: String?; let expires_at: String?
+
+        var isExpired: Bool { status == "expired" }
+        var isPendingStatus: Bool { status == nil || status == "pending" }
+        var expirationDate: Date? {
+            guard let expires_at else { return nil }
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return fractional.date(from: expires_at) ?? ISO8601DateFormatter().date(from: expires_at)
+        }
+        var hasInvalidExpiration: Bool { expires_at != nil && expirationDate == nil }
+        func isPending(at now: Date = Date()) -> Bool {
+            guard isPendingStatus else { return false }
+            guard expires_at != nil else { return true }
+            guard let expirationDate else { return false }
+            return expirationDate > now
+        }
+        func canRespond(taskStatus: String, at now: Date = Date()) -> Bool {
+            taskStatus == "waiting_user" && (kind == nil || kind == "approval") && version > 0 &&
+                MordeTaskResponsePolicy.hasValidRequestID(id) && isPending(at: now)
+        }
+        func deadlineHasPassed(at now: Date = Date()) -> Bool {
+            guard let expirationDate else { return false }
+            return expirationDate <= now
+        }
     }
     struct Clarification: Decodable { let id: String; let version: Int; let question: String }
     struct StopRequest: Decodable { let status: String; let unsettled_operation_ids: [String] }
@@ -4966,14 +4992,15 @@ private struct MordeTaskMediaPreviewControls: View {
     }
 
     private func loadPreview() async {
-        guard let operationID = pending.media_preview_operation_id,
+        guard canRespond, pending.canRespond(taskStatus: task.status), isPendingCurrent(), !busy, !loadingPreview, !responding,
+              let operationID = pending.media_preview_operation_id,
               MordeTaskResponsePolicy.mediaPreviewPath(taskID: task.id, operationID: operationID) != nil else { return }
         loadingPreview = true
         previewFailure = nil
         defer { loadingPreview = false }
         do {
             let file = try await client.downloadTaskMediaPreview(taskID: task.id, operationID: operationID)
-            guard client.signedIn, isPendingCurrent() else {
+            guard client.signedIn, pending.canRespond(taskStatus: task.status), isPendingCurrent() else {
                 try? FileManager.default.removeItem(at: file.fileURL)
                 return
             }
@@ -4985,7 +5012,7 @@ private struct MordeTaskMediaPreviewControls: View {
     }
 
     private func decide(_ decision: String) async {
-        guard canRespond, isPendingCurrent(), !busy, !responding,
+        guard canRespond, pending.canRespond(taskStatus: task.status), isPendingCurrent(), !busy, !responding,
               decision == "reject" || client.taskMediaGenerationAvailable == true else { return }
         responding = true
         defer { responding = false }
@@ -6115,6 +6142,7 @@ private struct MordeIndependentSendTarget {
     @Published var loadingEarlierMessages = false
     @Published var messageHistoryError: String?
     @Published var tasks: [MordeTask] = []
+    @Published private(set) var taskAccessFence = MordeTaskAccessFence()
     @Published private(set) var taskPageDetails: [String: MordeTask] = [:]
     @Published private(set) var taskFileFetches: [String: [MordeTaskFileFetch]] = [:]
     @Published private(set) var taskTimelineEvents: [String: [MordeTaskTimelineEvent]] = [:]
@@ -6477,6 +6505,7 @@ private struct MordeIndependentSendTarget {
         if let status { components.queryItems?.append(URLQueryItem(name: "status", value: status)) }
         if let cursor, !cursor.isEmpty { components.queryItems?.append(URLQueryItem(name: "cursor", value: cursor)) }
         guard let path = components.string else { throw URLError(.badURL) }
+        let accessToken = taskAccessFence.token
         let page: MordePage<MordeTask> = try await call(path)
         guard scope == currentDataScope, page.next_cursor.map({ $0.count <= 2048 }) ?? true,
               page.next_cursor.map({ !$0.isEmpty && $0 != cursor }) ?? true,
@@ -6484,22 +6513,46 @@ private struct MordeIndependentSendTarget {
               Set(page.items.map(\.id)).count == page.items.count else {
             throw URLError(.cannotParseResponse)
         }
+        taskAccessFence.confirm(page.items.map(\.id), requestToken: accessToken)
         return page
     }
 
-    func task(id: String) async throws -> MordeTask {
+    func task(id: String, minimumEventSequence: Int64? = nil) async throws -> MordeTask {
         guard MordeTaskResponsePolicy.hasValidTaskID(id), let scope = currentDataScope else {
             throw URLError(.badURL)
         }
         let generation = UUID()
+        let accessToken = taskAccessFence.token
         taskDetailLoadGenerations[id] = generation
         defer { if taskDetailLoadGenerations[id] == generation { taskDetailLoadGenerations.removeValue(forKey: id) } }
-        let value: MordeTask = try await call("/api/tasks/\(id)")
+        let value: MordeTask
+        do {
+            value = try await call("/api/tasks/\(id)")
+        } catch {
+            let failure = error as NSError
+            if scope == currentDataScope, taskDetailLoadGenerations[id] == generation,
+               failure.domain == "Morde", [403, 404].contains(failure.code) {
+                let wasCurrent = conversationTasks.contains { $0.id == id && $0.conversation_id == currentConversation }
+                let message = AppLocalized("Current account can no longer read this task")
+                discardTaskProjection(taskID: id)
+                taskTimelineErrors[id] = message
+                if wasCurrent {
+                    setResourceState(.failed(message), for: .taskDetail)
+                    self.error = message
+                }
+            }
+            throw error
+        }
         guard scope == currentDataScope, taskDetailLoadGenerations[id] == generation else {
             throw CancellationError()
         }
-        guard value.id == id else { throw URLError(.cannotParseResponse) }
+        let requiredSequence = [minimumEventSequence, taskPageDetails[id]?.event_sequence].compactMap { $0 }.max()
+        guard value.id == id,
+              requiredSequence.map({ (value.event_sequence ?? -1) >= $0 }) ?? true else {
+            throw URLError(.cannotParseResponse)
+        }
         taskPageDetails[id] = value
+        taskAccessFence.confirm([id], requestToken: accessToken)
         return value
     }
 
@@ -6623,7 +6676,7 @@ private struct MordeIndependentSendTarget {
 
     @discardableResult
     func actOnTaskPage(taskID: String, action: MordeTaskPageAction) async -> Bool {
-        guard let task = taskPageDetails[taskID],
+        guard let task = taskPageDetails[taskID], task.id == taskID,
               let path = MordeTaskResponsePolicy.actionPath(taskID: taskID) else { return false }
         let body: [String: Any]
         switch action {
@@ -6652,7 +6705,7 @@ private struct MordeIndependentSendTarget {
                                    decision: String) async -> Bool {
         guard let task = taskPageDetails[taskID],
               let pending = task.pending_request, pending.id == approvalID, pending.version == version,
-              pending.kind == nil || pending.kind == "approval",
+              pending.canRespond(taskStatus: task.status),
               let path = MordeTaskResponsePolicy.approvalPath(taskID: taskID, approvalID: approvalID),
               ["approve", "reject"].contains(decision) else {
             taskPageActionErrors[taskID] = "审批请求已失效，请刷新 Task 后重试。"
@@ -8257,6 +8310,7 @@ private struct MordeIndependentSendTarget {
         conversations = []; conversationNextCursor = nil; loadingMoreConversations = false
         messages = []; messageNextCursor = nil; loadingEarlierMessages = false; messageHistoryError = nil
         tasks = []; notifications = []; notificationNextCursor = nil
+        taskAccessFence = MordeTaskAccessFence()
         taskPageDetails = [:]; taskFileFetches = [:]; taskTimelineEvents = [:]; taskTimelineErrors = [:]
         taskFileFetchErrors = [:]
         taskTimelineHistoryExpired = []; taskTimelineLoading = []; taskTimelineNoHistory = []
@@ -9386,6 +9440,7 @@ private struct MordeIndependentSendTarget {
 
     private func conversationActiveTasks(_ conversationID: String, projectID: String?,
                                          scope: MordeClientDataScope) async throws -> [MordeTask] {
+        let accessToken = taskAccessFence.token
         let path = projectID.map { "/api/projects/\($0)/conversations/\(conversationID)/tasks" }
             ?? "/api/conversations/\(conversationID)/tasks"
         var cursor: String?
@@ -9408,16 +9463,29 @@ private struct MordeIndependentSendTarget {
             guard let next = page.next_cursor else {
                 var snapshots: [MordeTask] = []
                 for summary in summaries {
-                    let snapshot: MordeTask = try await call("/api/tasks/\(summary.id)")
+                    let snapshot: MordeTask
+                    do {
+                        snapshot = try await call("/api/tasks/\(summary.id)")
+                    } catch {
+                        let failure = error as NSError
+                        if scope == currentDataScope, taskAccessFence.token == accessToken,
+                           failure.domain == "Morde", [403, 404].contains(failure.code) {
+                            discardTaskProjection(taskID: summary.id)
+                            taskTimelineErrors[summary.id] = AppLocalized("Current account can no longer read this task")
+                        }
+                        throw error
+                    }
                     guard scope == currentDataScope, snapshot.id == summary.id,
                           MordeConversationTasksPolicy.valid([snapshot], conversationID: conversationID),
                           let snapshotSequence = snapshot.event_sequence,
                           let summarySequence = summary.event_sequence,
-                          snapshotSequence >= summarySequence else {
+                          snapshotSequence >= max(summarySequence, taskPageDetails[summary.id]?.event_sequence ?? 0) else {
                         throw URLError(.cannotParseResponse)
                     }
                     snapshots.append(snapshot)
                 }
+                guard taskAccessFence.token == accessToken else { throw CancellationError() }
+                taskAccessFence.confirm(snapshots.map(\.id), requestToken: accessToken)
                 return snapshots
             }
             guard !next.isEmpty, next.utf8.count <= 1024,
@@ -9437,11 +9505,15 @@ private struct MordeIndependentSendTarget {
             do {
                 let snapshot: MordeTask = try await call("/api/tasks/\(old.id)")
                 guard scope == currentDataScope, snapshot.id == old.id, snapshot.conversation_id == conversationID,
-                      (snapshot.event_sequence ?? -1) >= (old.event_sequence ?? -1) else { continue }
+                      (snapshot.event_sequence ?? -1) >= max(old.event_sequence ?? -1,
+                                                               taskPageDetails[old.id]?.event_sequence ?? -1) else { continue }
                 if snapshot.result_message_pending == true || snapshot.result_message_published == true { result.append(snapshot) }
             } catch {
                 let failure = error as NSError
-                if scope == currentDataScope && !(failure.domain == "Morde" && [403, 404].contains(failure.code)) {
+                if scope == currentDataScope && failure.domain == "Morde" && [403, 404].contains(failure.code) {
+                    discardTaskProjection(taskID: old.id)
+                    taskTimelineErrors[old.id] = AppLocalized("Current account can no longer read this task")
+                } else if scope == currentDataScope {
                     result.append(old)
                 }
             }
@@ -9752,12 +9824,13 @@ private struct MordeIndependentSendTarget {
             if failure.domain == "Morde" && [403, 404].contains(failure.code) { return }
         }
         do {
+            let taskAccessToken = taskAccessFence.token
             let fetched = try await conversationActiveTasks(conversationID, projectID: projectID, scope: scope)
             let active = await includePendingResultSnapshots(fetched, previous: projectConversationTasks,
                                                              conversationID: conversationID, scope: scope)
             guard generation == projectConversationMessagesGeneration,
                   selectedProjectID == projectID, selectedProjectConversationID == conversationID,
-                  scope == currentDataScope else { return }
+                  scope == currentDataScope, taskAccessFence.token == taskAccessToken else { return }
             projectConversationTasks = active
             updateProjectAssistantSnapshots(active, conversationID: conversationID)
             let selectedTask = projectConversationTask?.conversation_id == conversationID ? projectConversationTask : nil
@@ -9947,7 +10020,8 @@ private struct MordeIndependentSendTarget {
     func respondToProjectConversationApproval(taskID: String, approvalID: String,
                                               version: Int, decision: String) async -> Bool {
         guard let task = projectConversationTask, task.id == taskID,
-              task.pending_request?.id == approvalID, task.pending_request?.version == version,
+              let pending = task.pending_request, pending.id == approvalID, pending.version == version,
+              pending.canRespond(taskStatus: task.status),
               ["approve", "reject"].contains(decision),
               let path = MordeTaskResponsePolicy.approvalPath(taskID: taskID, approvalID: approvalID) else {
             projectConversationError = "审批请求已变化，请刷新 Task 后重试。"
@@ -11362,7 +11436,12 @@ private struct MordeIndependentSendTarget {
             let page: MordePage<MordeClientInstallation> = try await call("/api/clients")
             guard generation == clientInstallationsLoadGeneration,
                   requestScope == currentDataScope, !Task.isCancelled else { return }
-            guard page.items.allSatisfy({ MordeClientInstallationPolicy.isValidID($0.id) }) else {
+            guard page.items.allSatisfy({ installation in
+                MordeClientInstallationPolicy.isValidID(installation.id) &&
+                    ["desktop", "android", "ios"].contains(installation.platform) &&
+                    !installation.display_name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                    installation.display_name.unicodeScalars.count <= 100
+            }) else {
                 throw URLError(.cannotParseResponse)
             }
             clientInstallations = page.items
@@ -11405,6 +11484,126 @@ private struct MordeIndependentSendTarget {
             guard generation == devicesLoadGeneration, requestScope == currentDataScope, !Task.isCancelled else { return }
             devices = []
             devicesState = .failed(error.localizedDescription)
+        }
+    }
+
+    func codexSessionPage(installationID: String, cursor: String? = nil) async throws -> MordePage<MordeCodexSession> {
+        guard MordeClientInstallationPolicy.isValidID(installationID),
+              clientInstallations.contains(where: { $0.id == installationID && $0.platform == "desktop" && !$0.revoked }),
+              cursor.map(MordeCodexEventPolicy.isValidSessionID) ?? true else {
+            throw NSError(domain: "Morde.Codex", code: 403)
+        }
+        var components = URLComponents()
+        components.path = "/api/codex/sessions"
+        components.queryItems = [URLQueryItem(name: "installation_id", value: installationID),
+                                 URLQueryItem(name: "limit", value: "100")]
+        if let cursor { components.queryItems?.append(URLQueryItem(name: "cursor", value: cursor)) }
+        guard let path = components.string else { throw URLError(.badURL) }
+        let page: MordePage<MordeCodexSession> = try await call(path)
+        guard Set(page.items.map(\.id)).count == page.items.count,
+              page.next_cursor.map(MordeCodexEventPolicy.isValidSessionID) ?? true,
+              page.items.allSatisfy({
+                  MordeCodexEventPolicy.isValidSessionID($0.id) && $0.installation_id == installationID
+              }) else {
+            throw URLError(.cannotParseResponse)
+        }
+        return page
+    }
+
+    func codexEventPage(sessionID: String, afterSequence: Int64, limit: Int = 100) async throws -> MordeCodexEventPage {
+        guard MordeCodexEventPolicy.isValidSessionID(sessionID), afterSequence >= 0,
+              (1...100).contains(limit) else { throw URLError(.badURL) }
+        var components = URLComponents()
+        components.path = "/api/codex/sessions/\(sessionID)/events"
+        components.queryItems = [URLQueryItem(name: "after_sequence", value: String(afterSequence)),
+                                 URLQueryItem(name: "limit", value: String(limit))]
+        guard let path = components.string else { throw URLError(.badURL) }
+        let page: MordeCodexEventPage = try await call(path)
+        _ = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: sessionID,
+                                             afterSequence: afterSequence)
+        let highestPageSequence = page.items.map(\.sequence).max() ?? afterSequence
+        guard page.current_sequence >= afterSequence && page.current_sequence >= highestPageSequence else {
+            throw URLError(.cannotParseResponse)
+        }
+        return page
+    }
+
+    func codexCommand(session: MordeCodexSession, installationID: String, requiredScope: String,
+                      body: [String: Any], idempotencyKey: String) async throws -> MordeCodexCommandReceipt {
+        let hasRequiredScope = ["send", "interrupt", "approval"].contains(requiredScope) &&
+            session.hasScope("read") && session.hasScope(requiredScope)
+        guard MordeCodexEventPolicy.isValidSessionID(session.id),
+              session.installation_id == installationID,
+              MordeClientInstallationPolicy.isValidID(installationID),
+              clientInstallations.contains(where: { $0.id == installationID && $0.platform == "desktop" && !$0.revoked }),
+              hasRequiredScope,
+              idempotencyKey.count >= 8, idempotencyKey.count <= 128,
+              idempotencyKey.utf8.allSatisfy({
+                  ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) ||
+                      ($0 >= 97 && $0 <= 122) || $0 == 45 || $0 == 95
+              }) else { throw NSError(domain: "Morde.Codex", code: 403) }
+        let receipt: MordeCodexCommandReceipt = try await call(
+            "/api/codex/sessions/\(session.id)/commands", method: "POST", body: body, key: idempotencyKey)
+        guard MordeCodexEventPolicy.isValidCommandID(receipt.command_id), receipt.session_id == session.id,
+              receipt.type == (body["type"] as? String), !receipt.status.isEmpty else {
+            throw URLError(.cannotParseResponse)
+        }
+        return receipt
+    }
+
+    func deleteCodexSession(sessionID: String) async throws {
+        guard MordeCodexEventPolicy.isValidSessionID(sessionID) else { throw URLError(.badURL) }
+        let _: MordeEmpty = try await call("/api/codex/sessions/\(sessionID)", method: "DELETE")
+    }
+
+    func codexEventStream(installationID: String, sessionID: String, afterSequence: Int64,
+                          onEvent: (MordeCodexEvent) async throws -> Void) async throws {
+        refreshExpiredAuthorization()
+        guard MordeCodexEventPolicy.isValidSessionID(sessionID), afterSequence >= 0,
+              MordeClientInstallationPolicy.isValidID(installationID),
+              clientInstallations.contains(where: { $0.id == installationID && $0.platform == "desktop" && !$0.revoked }),
+              signedIn,
+              let requestInstallation = installation,
+              let requestScope = authorizationScope(for: requestInstallation),
+              requestScope == currentDataScope,
+              let credential = token else { throw NSError(domain: "Morde.Codex", code: 403) }
+        var components = URLComponents(string: "\(requestScope.serviceOrigin)/api/codex/sessions/\(sessionID)/events/stream")
+        components?.queryItems = [URLQueryItem(name: "after_sequence", value: String(afterSequence))]
+        guard let url = components?.url else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
+        request.httpShouldHandleCookies = false
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        let (bytes, response) = try await urlSession.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard !Task.isCancelled, signedIn, requestScope == currentDataScope else { throw CancellationError() }
+        if http.statusCode == 401 {
+            if MordeUnauthorizedResponsePolicy.shouldClearAuthorization(
+                requestCredential: credential, currentCredential: token, requestScope: requestScope,
+                currentScope: installation.flatMap { authorizationScope(for: $0) },
+                hasPendingLoginIntent: loginStateStore.hasPendingIntent(
+                    origin: requestScope.serviceOrigin, accountName: requestInstallation.accountName),
+                isCancelled: Task.isCancelled) {
+                signOutLocally(installation: requestInstallation)
+            }
+            throw NSError(domain: "Morde", code: 401)
+        }
+        guard http.statusCode == 200 else {
+            if http.statusCode == 204 { return }
+            throw NSError(domain: "Morde.Codex", code: http.statusCode)
+        }
+        var parser = MordeCodexSSEParser()
+        for try await byte in bytes {
+            guard !Task.isCancelled, signedIn, requestScope == currentDataScope else { throw CancellationError() }
+            guard let frame = try parser.append(byte) else { continue }
+            guard let rawSequence = frame.id, let sequence = Int64(rawSequence), sequence > 0,
+                  let event = try? JSONDecoder().decode(MordeCodexEvent.self, from: Data(frame.data.utf8)),
+                  event.sequence == sequence, event.session_id == sessionID else {
+                throw URLError(.cannotParseResponse)
+            }
+            try await onEvent(event)
         }
     }
 
@@ -11917,13 +12116,17 @@ private struct MordeIndependentSendTarget {
             let page: MordePage<MordeClientMessage> = try await call(path)
             guard scope == currentDataScope, generation == conversationLoadGeneration,
                   currentConversation == id else { return }
+            guard MordeConversationMessagePagePolicy.matches(page.items, conversationID: id) else {
+                throw URLError(.cannotParseResponse)
+            }
             messages = mergingLocalConversationReceipts(page.items, with: messages, conversationID: id)
             messageNextCursor = page.next_cursor
             setResourceState(.loaded, for: .messages)
             loadingResource = .taskDetail
+            let taskAccessToken = taskAccessFence.token
             let active = try await conversationActiveTasks(id, projectID: nil, scope: scope)
             guard scope == currentDataScope, generation == conversationLoadGeneration,
-                  currentConversation == id else { return }
+                  currentConversation == id, taskAccessFence.token == taskAccessToken else { return }
             conversationTasks = active
             conversationTasksLoaded = true
             currentTask = active.first { $0.id == selectedTaskID }
@@ -11932,6 +12135,9 @@ private struct MordeIndependentSendTarget {
             guard scope == currentDataScope, generation == conversationLoadGeneration,
                   currentConversation == id else { return }
             if refreshGeneration == conversationMessagesRefreshGeneration {
+                guard MordeConversationMessagePagePolicy.matches(latestPage.items, conversationID: id) else {
+                    throw URLError(.cannotParseResponse)
+                }
                 messages = mergingLocalConversationReceipts(latestPage.items, with: messages, conversationID: id)
                 messageNextCursor = latestPage.next_cursor
             }
@@ -11984,7 +12190,8 @@ private struct MordeIndependentSendTarget {
             let page: MordePage<MordeClientMessage> = try await call(path)
             guard scope == currentDataScope, conversationGeneration == conversationLoadGeneration,
                   generation == messageLoadMoreGeneration, currentConversation == id else { return }
-            guard page.items.allSatisfy({ $0.conversation_id == id }), page.next_cursor != cursor else {
+            guard MordeConversationMessagePagePolicy.matches(page.items, conversationID: id),
+                  page.next_cursor != cursor else {
                 throw URLError(.cannotParseResponse)
             }
             var existingIDs = Set(messages.map(\.id))
@@ -12353,7 +12560,9 @@ private struct MordeIndependentSendTarget {
 
     @discardableResult func respondToApproval(taskID: String, approvalID: String, version: Int,
                                               decision: String) async -> Bool {
-        guard taskID == currentTask?.id,
+        guard let task = currentTask, taskID == task.id,
+              let pending = task.pending_request, pending.id == approvalID, pending.version == version,
+              pending.canRespond(taskStatus: task.status),
               let path = MordeTaskResponsePolicy.approvalPath(taskID: taskID, approvalID: approvalID), version > 0,
               ["approve", "reject"].contains(decision) else {
             error = "审批请求已失效，请刷新 Task 后重试。"
@@ -12511,6 +12720,9 @@ private struct MordeIndependentSendTarget {
         let page: MordePage<MordeClientMessage> = try await call(path)
         guard currentDataScope == scope, currentConversation == task.conversation_id,
               generation == conversationMessagesRefreshGeneration else { return }
+        guard MordeConversationMessagePagePolicy.matches(page.items, conversationID: task.conversation_id) else {
+            throw URLError(.cannotParseResponse)
+        }
         let earliest = page.items.compactMap(\.sequence).min()
         let earlier = messages.filter { message in
             guard let earliest, let sequence = message.sequence else { return false }
@@ -12547,6 +12759,9 @@ private struct MordeIndependentSendTarget {
                 let page: MordePage<MordeClientMessage> = try await call(path)
                 guard !Task.isCancelled, currentDataScope == scope, currentConversation == conversationID else { return }
                 if generation == conversationMessagesRefreshGeneration {
+                    guard MordeConversationMessagePagePolicy.matches(page.items, conversationID: conversationID) else {
+                        throw URLError(.cannotParseResponse)
+                    }
                     let earliest = page.items.compactMap(\.sequence).min()
                     let earlier = messages.filter { message in
                         guard let earliest, let sequence = message.sequence else { return false }
@@ -12563,11 +12778,12 @@ private struct MordeIndependentSendTarget {
                 // Keep the last confirmed messages while the network is unavailable.
             }
             do {
+                let taskAccessToken = taskAccessFence.token
                 let fetched = try await conversationActiveTasks(conversationID, projectID: nil, scope: scope)
                 let active = await includePendingResultSnapshots(fetched, previous: conversationTasks,
                                                                  conversationID: conversationID, scope: scope)
                 guard !Task.isCancelled, currentDataScope == scope, currentConversation == conversationID else { return }
-                if generation == conversationMessagesRefreshGeneration {
+                if generation == conversationMessagesRefreshGeneration && taskAccessFence.token == taskAccessToken {
                     conversationTasks = active
                     conversationTasksLoaded = true
                     for task in active {
@@ -12628,6 +12844,25 @@ private struct MordeIndependentSendTarget {
         taskTimelineErrors.removeValue(forKey: event.task_id)
     }
 
+    private func discardTaskProjection(taskID: String) {
+        taskAccessFence.deny(taskID)
+        taskDetailLoadGenerations.removeValue(forKey: taskID)
+        taskStepDetailLoadGenerations = taskStepDetailLoadGenerations.filter { !$0.key.hasPrefix("\(taskID):") }
+        taskFileFetchLoadGenerations.removeValue(forKey: taskID)
+        taskPageDetails.removeValue(forKey: taskID)
+        taskPageActionErrors.removeValue(forKey: taskID)
+        taskFileFetches.removeValue(forKey: taskID)
+        taskFileFetchErrors.removeValue(forKey: taskID)
+        tasks.removeAll { $0.id == taskID }
+        conversationTasks.removeAll { $0.id == taskID }
+        projectConversationTasks.removeAll { $0.id == taskID }
+        if currentTask?.id == taskID { currentTask = nil }
+        if projectConversationTask?.id == taskID { projectConversationTask = nil }
+        taskTimelineEvents.removeValue(forKey: taskID)
+        taskTimelineHistoryExpired.remove(taskID)
+        taskTimelineNoHistory.remove(taskID)
+    }
+
     private func watchTaskEvents(taskID: String, updatesCurrentConversation: Bool) async {
         guard let taskScope = currentDataScope else { return }
         let selectedConversationID = updatesCurrentConversation ? currentConversation : nil
@@ -12671,14 +12906,11 @@ private struct MordeIndependentSendTarget {
                 }
                 if http.statusCode == 403 || http.statusCode == 404 {
                     let message = AppLocalized("Current account can no longer read this task")
-                    taskPageDetails.removeValue(forKey: taskID)
-                    taskPageActionErrors.removeValue(forKey: taskID)
-                    taskTimelineEvents.removeValue(forKey: taskID)
-                    taskTimelineHistoryExpired.remove(taskID)
-                    taskTimelineNoHistory.remove(taskID)
+                    let wasCurrent = updatesCurrentConversation && selectedTaskIsCurrent()
+                    discardTaskProjection(taskID: taskID)
                     taskTimelineErrors[taskID] = message
                     taskTimelineLoading.remove(taskID)
-                    if updatesCurrentConversation && selectedTaskIsCurrent() {
+                    if wasCurrent {
                         setResourceState(.failed(message), for: .taskDetail)
                         self.error = message
                     }
@@ -12688,9 +12920,12 @@ private struct MordeIndependentSendTarget {
                     if updatesCurrentConversation {
                         let snapshot: MordeTask = try await call("/api/tasks/\(taskID)")
                         guard snapshot.id == taskID, snapshot.conversation_id == selectedConversationID,
-                              snapshot.event_sequence.map({ $0 >= initialSequence }) == true,
+                              snapshot.event_sequence.map({ $0 >= max(initialSequence, cursor.afterSequence) }) == true,
                               selectedTaskIsCurrent() else { throw URLError(.cannotParseResponse) }
                         try await refreshConversationSnapshot(snapshot, scope: taskScope)
+                    } else {
+                        _ = try await task(id: taskID,
+                                           minimumEventSequence: cursor.afterSequence > 0 ? cursor.afterSequence : nil)
                     }
                     if cursor.queryValue == nil && (taskTimelineEvents[taskID] ?? []).isEmpty {
                         taskTimelineNoHistory.insert(taskID)
@@ -12727,17 +12962,25 @@ private struct MordeIndependentSendTarget {
                             struct SnapshotRequired: Decodable { let sequence: Int64 }
                             let required = try JSONDecoder().decode(SnapshotRequired.self, from: Data(data.utf8))
                             guard required.sequence == sequence else { throw URLError(.cannotParseResponse) }
-                            let snapshot: MordeTask = try await call("/api/tasks/\(taskID)")
+                            let snapshot: MordeTask
+                            if updatesCurrentConversation {
+                                snapshot = try await call("/api/tasks/\(taskID)")
+                            } else {
+                                snapshot = try await task(id: taskID, minimumEventSequence: max(sequence, cursor.afterSequence))
+                            }
                             guard snapshot.id == taskID else { throw URLError(.cannotParseResponse) }
+                            var recoveredCursor = cursor
                             guard let snapshotSequence = snapshot.event_sequence,
-                                  cursor.resume(eventID: eventID, snapshotSequence: snapshotSequence) else {
+                                  recoveredCursor.resume(eventID: eventID, snapshotSequence: snapshotSequence) else {
                                 throw URLError(.cannotParseResponse)
                             }
-                            taskTimelineHistoryExpired.insert(taskID)
                             if updatesCurrentConversation {
-                                guard selectedTaskIsCurrent(), snapshot.conversation_id == selectedConversationID else { return }
+                                guard selectedTaskIsCurrent(), taskScope == currentDataScope,
+                                      snapshot.conversation_id == selectedConversationID else { return }
                                 try await refreshConversationSnapshot(snapshot, scope: taskScope)
                             }
+                            cursor = recoveredCursor
+                            taskTimelineHistoryExpired.insert(taskID)
                             if ["completed", "failed", "cancelled"].contains(snapshot.status) {
                                 taskTimelineLoading.remove(taskID)
                                 return
@@ -12747,40 +12990,56 @@ private struct MordeIndependentSendTarget {
                         let streamed = try JSONDecoder().decode(MordeTaskTimelineEvent.self, from: Data(data.utf8))
                         guard streamed.task_id == taskID, streamed.sequence == sequence,
                               streamed.type == event,
-                              cursor.advance(eventID: eventID, for: streamed.task_id) else {
+                              let nextCursor = cursor.advancing(eventID: eventID, for: streamed.task_id) else {
                             throw URLError(.cannotParseResponse)
                         }
                         if updatesCurrentConversation &&
                             !MordeTaskEventCursor.shouldPresent(sequence: sequence, initialSequence: initialSequence) {
+                            cursor = nextCursor
                             event = ""; eventID = ""; data = ""
                             continue
                         }
                         appendTaskTimelineEvent(streamed)
                         if updatesCurrentConversation {
                             let snapshot: MordeTask = try await call("/api/tasks/\(taskID)")
+                            var snapshotCursor = nextCursor
                             guard snapshot.id == taskID, let snapshotSequence = snapshot.event_sequence,
                                   snapshot.conversation_id == selectedConversationID,
-                                  cursor.resume(eventID: eventID, snapshotSequence: snapshotSequence) else {
+                                  snapshotCursor.resume(eventID: eventID, snapshotSequence: snapshotSequence) else {
                                 throw URLError(.cannotParseResponse)
                             }
                             guard selectedTaskIsCurrent(), taskScope == currentDataScope else { return }
                             try await refreshConversationSnapshot(snapshot, scope: taskScope)
-                            if ["completed", "failed", "cancelled"].contains(snapshot.status) {
+                            cursor = nextCursor
+                            if ["completed", "failed", "cancelled"].contains(snapshot.status),
+                               sequence >= snapshotSequence {
                                 taskTimelineLoading.remove(taskID)
                                 return
                             }
-                        } else if ["task.status", "task.waiting_user", "task.result"].contains(event) {
-                            let snapshot = try await task(id: taskID)
-                            if ["completed", "failed", "cancelled"].contains(snapshot.status) {
-                                taskTimelineLoading.remove(taskID)
-                                return
+                        } else {
+                            if MordeTaskEventSnapshotPolicy.requiresRefresh(type: event) {
+                                _ = try await task(id: taskID, minimumEventSequence: sequence)
                             }
+                            cursor = nextCursor
                         }
                         event = ""; eventID = ""; data = ""
                     }
                 }
             } catch {
                 if !Task.isCancelled && taskScope == currentDataScope {
+                    let failure = error as NSError
+                    if failure.domain == "Morde", [403, 404].contains(failure.code) {
+                        let wasCurrent = updatesCurrentConversation && selectedTaskIsCurrent()
+                        let message = AppLocalized("Current account can no longer read this task")
+                        discardTaskProjection(taskID: taskID)
+                        taskTimelineErrors[taskID] = message
+                        if wasCurrent {
+                            setResourceState(.failed(message), for: .taskDetail)
+                            self.error = message
+                        }
+                        taskTimelineLoading.remove(taskID)
+                        return
+                    }
                     let message = updatesCurrentConversation
                         ? error.localizedDescription
                         : AppLocalized("Task event connection interrupted. Retrying…")
@@ -12789,7 +13048,6 @@ private struct MordeIndependentSendTarget {
                         setResourceState(.failed(error.localizedDescription), for: .taskDetail)
                         self.error = error.localizedDescription
                     }
-                    let failure = error as NSError
                     if failure.domain == "Morde", [401, 403, 404].contains(failure.code) {
                         taskTimelineLoading.remove(taskID)
                         return
@@ -12987,6 +13245,7 @@ private struct MordeIndependentSendTarget {
     var workspaceSyncAvailable: Bool? { client.workspaceSyncAvailable }
     var taskMediaGenerationAvailable: Bool? { client.taskMediaGenerationAvailable }
     var tasks: [MordeTask] { client.tasks }
+    var inaccessibleTaskIDs: Set<String> { client.taskAccessFence.deniedTaskIDs }
     var details: [String: MordeTask] { client.taskPageDetails }
     var fileFetches: [String: [MordeTaskFileFetch]] { client.taskFileFetches }
     var timelineEvents: [String: [MordeTaskTimelineEvent]] { client.taskTimelineEvents }
@@ -13039,8 +13298,9 @@ private struct MordeIndependentSendTarget {
             client: client, task: task, pending: pending,
             canRespond: client.signedIn, busy: client.busy,
             isPendingCurrent: {
-                guard let current = self.client.taskPageDetails[task.id]?.pending_request else { return false }
-                return current.id == pending.id && current.version == pending.version &&
+                guard let currentTask = self.client.taskPageDetails[task.id], currentTask.id == task.id,
+                      let current = currentTask.pending_request else { return false }
+                return current.canRespond(taskStatus: currentTask.status) && current.id == pending.id && current.version == pending.version &&
                     current.media_preview_operation_id == pending.media_preview_operation_id
             },
             onDecision: { decision in
@@ -13100,6 +13360,578 @@ struct MIFConversationDrawerItem: Identifiable {
     func choose(_ id: String) async { await client.chooseConversation(id) }
     func create() async { await client.startNewConversation() }
     func followMain() async { await client.followMainConversation() }
+}
+
+struct MIFCodexInstallation: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    let revoked: Bool
+}
+
+private enum MIFCodexCommandAction {
+    case send(String)
+    case interrupt(String)
+    case approval(MordeCodexApproval, String)
+
+    var requiredScope: String {
+        switch self {
+        case .send: "send"
+        case .interrupt: "interrupt"
+        case .approval: "approval"
+        }
+    }
+
+    var body: [String: Any] {
+        switch self {
+        case .send(let text): ["type": "send", "text": text]
+        case .interrupt(let turnID): ["type": "interrupt", "turn_id": turnID]
+        case .approval(let approval, let decision):
+            ["type": "approval", "approval_id": approval.id,
+             "approval_version": approval.version, "decision": decision]
+        }
+    }
+}
+
+private struct MIFCodexPendingCommand {
+    let installationID: String
+    let sessionID: String
+    let action: MIFCodexCommandAction
+    let idempotencyKey: String
+}
+
+@MainActor final class MIFCodexSessionStore: ObservableObject {
+    static let shared = MIFCodexSessionStore()
+
+    @Published private(set) var installations: [MIFCodexInstallation] = []
+    @Published private(set) var selectedInstallationID: String?
+    @Published private(set) var selectedSessionID: String?
+    @Published private(set) var sessionsByInstallation: [String: [MordeCodexSession]] = [:]
+    @Published private(set) var nextSessionCursorByInstallation: [String: String] = [:]
+    @Published private(set) var installationErrors: [String: String] = [:]
+    @Published private(set) var revokedInstallations: Set<String> = []
+    @Published private(set) var eventPagesBySession: [String: [MordeCodexEvent]] = [:]
+    @Published private(set) var eventCursorBySession: [String: Int64] = [:]
+    @Published private(set) var eventErrors: [String: String] = [:]
+    @Published private(set) var revokedSessions: Set<String> = []
+    @Published private(set) var commandStatusBySession: [String: String] = [:]
+    @Published private(set) var commandErrors: [String: String] = [:]
+    @Published private(set) var deleteErrors: [String: String] = [:]
+    @Published private(set) var deletingSessions: Set<String> = []
+    @Published private(set) var loadingSessions: Set<String> = []
+    @Published private(set) var loadingEvents: Set<String> = []
+    @Published private(set) var loadingEarlierEvents: Set<String> = []
+    @Published private(set) var loadingInstallations = false
+    @Published private(set) var installationLoadError: String?
+    @Published private(set) var submittingSessions: Set<String> = []
+    @Published private(set) var pendingCommands: [String: MIFCodexPendingCommand] = [:]
+
+    private let client = MordeClient.shared
+    private var observation: AnyCancellable?
+    private var scopeKey: String?
+    private var isSignedInScope: Bool
+
+    private init() {
+        isSignedInScope = client.signedIn
+        scopeKey = client.signedIn ? client.taskPageScopeKey : nil
+        observation = client.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.synchronizeScope() }
+        }
+    }
+
+    var isSignedIn: Bool { client.signedIn }
+    var cacheScopeIdentity: String? { client.signedIn ? client.taskPageScopeKey : nil }
+    var sessions: [MordeCodexSession] { selectedInstallationID.flatMap { sessionsByInstallation[$0] } ?? [] }
+    var selectedSession: MordeCodexSession? {
+        guard let selectedSessionID, let selectedInstallationID else { return nil }
+        return sessionsByInstallation[selectedInstallationID]?.first { $0.id == selectedSessionID }
+    }
+    var events: [MordeCodexEvent] { selectedSessionID.flatMap { eventPagesBySession[$0] } ?? [] }
+    var timeline: [MordeCodexTimelineItem] { MordeCodexEventPolicy.timelineItems(events) }
+    var selectedInstallation: MIFCodexInstallation? {
+        installations.first { $0.id == selectedInstallationID }
+    }
+    var selectedStreamIdentity: String? {
+        guard let scopeKey, let selectedInstallationID, let selectedSessionID else { return nil }
+        return "\(scopeKey)|\(selectedInstallationID)|\(selectedSessionID)"
+    }
+    var selectedSessionHasRead: Bool { selectedSession?.hasScope("read") == true }
+    var selectedSessionHasLive: Bool { selectedSession?.hasScope("live") == true }
+    var selectedSessionHasSend: Bool { selectedSession?.hasScope("send") == true }
+    var selectedSessionHasApproval: Bool { selectedSession?.hasScope("approval") == true }
+    var selectedSessionHasInterrupt: Bool { selectedSession?.hasScope("interrupt") == true }
+    var selectedSessionStatus: String {
+        guard let id = selectedSessionID else { return "unknown" }
+        if let value = commandStatusBySession[id] { return value }
+        if let event = events.last(where: { $0.visibleStatus != nil && $0.isSessionStatus }),
+           let status = event.visibleStatus { return eventStatus(event, status: status) }
+        return selectedSession.map { normalizedStatus($0.status) } ?? "unknown"
+    }
+    var canSend: Bool {
+        guard let id = selectedSessionID, selectedSessionHasRead, selectedSessionHasSend,
+              !revokedSessions.contains(id), pendingCommands[id] == nil,
+              !submittingSessions.contains(id) else { return false }
+        return selectedSessionStatus != "unknown" && selectedSessionStatus != "claimed"
+    }
+    var canInterrupt: Bool {
+        guard let id = selectedSessionID, selectedSessionHasRead, selectedSessionHasInterrupt,
+              selectedSessionStatus == "running", pendingCommands[id] == nil,
+              !submittingSessions.contains(id) else { return false }
+        return activeTurnID != nil
+    }
+    var activeTurnID: String? {
+        selectedSession?.turn_id ?? events.last(where: { $0.status == "running" })?.turn_id
+    }
+    var hasEarlierEvents: Bool { events.first.map { $0.sequence > 1 } ?? false }
+    var canLoadMoreSessions: Bool { selectedInstallationID.flatMap { nextSessionCursorByInstallation[$0] } != nil }
+    var selectedPendingCommand: Bool { selectedSessionID.flatMap { pendingCommands[$0] } != nil }
+
+    func loadInstallations() async {
+        synchronizeScope()
+        guard client.signedIn else {
+            installations = []
+            installationLoadError = nil
+            return
+        }
+        loadingInstallations = true
+        installationLoadError = nil
+        defer { loadingInstallations = false }
+        if client.user == nil { await client.load() }
+        await client.loadClientInstallations()
+        synchronizeScope()
+        guard client.signedIn else {
+            installations = []
+            installationLoadError = nil
+            return
+        }
+        if case .failed(let message) = client.clientInstallationsState {
+            installationLoadError = message
+            return
+        }
+        let desktopInstallations = client.clientInstallations.filter { $0.platform == "desktop" }
+        let authorizedInstallationIDs = Set(desktopInstallations.filter { !$0.revoked }.map(\.id))
+        for installationID in Array(sessionsByInstallation.keys) where !authorizedInstallationIDs.contains(installationID) {
+            clearSessions(installationID: installationID)
+        }
+        revokedInstallations = Set(desktopInstallations.filter(\.revoked).map(\.id))
+        installations = desktopInstallations.map {
+            MIFCodexInstallation(id: $0.id, displayName: $0.display_name, revoked: $0.revoked)
+        }
+        if let selectedInstallationID,
+           !installations.contains(where: { $0.id == selectedInstallationID }) {
+            self.selectedInstallationID = nil
+            selectedSessionID = nil
+        }
+        if selectedInstallationID == nil {
+            selectedInstallationID = installations.first(where: { !$0.revoked })?.id ?? installations.first?.id
+        }
+        if let id = selectedInstallationID, installations.first(where: { $0.id == id })?.revoked != true {
+            await loadSessions(installationID: id)
+        }
+    }
+
+    func refresh() async {
+        await loadInstallations()
+        if let id = selectedInstallationID, installations.first(where: { $0.id == id })?.revoked != true {
+            await loadSessions(installationID: id)
+        }
+        if selectedSessionID != nil { await loadTimeline(reset: true) }
+    }
+
+    func selectInstallation(_ id: String) async {
+        guard installations.contains(where: { $0.id == id }) else { return }
+        selectedInstallationID = id
+        selectedSessionID = nil
+        if installations.first(where: { $0.id == id })?.revoked != true {
+            await loadSessions(installationID: id)
+        }
+    }
+
+    func selectSession(_ id: String) {
+        guard sessions.contains(where: { $0.id == id }) else { return }
+        selectedSessionID = id
+        eventErrors[id] = nil
+        if revokedSessions.contains(id) { eventPagesBySession[id] = nil; eventCursorBySession[id] = nil }
+    }
+
+    func closeSession() { selectedSessionID = nil }
+
+    func loadSessions(installationID: String, cursor: String? = nil) async {
+        guard client.signedIn, let scope = scopeKey, scope == client.taskPageScopeKey,
+              installations.first(where: { $0.id == installationID })?.revoked == false else { return }
+        loadingSessions.insert(installationID)
+        installationErrors[installationID] = nil
+        defer { loadingSessions.remove(installationID) }
+        do {
+            let page = try await client.codexSessionPage(installationID: installationID, cursor: cursor)
+            guard client.signedIn, scope == client.taskPageScopeKey else { return }
+            let current = sessionsByInstallation[installationID] ?? []
+            if let cursor {
+                guard page.next_cursor.map({ !$0.isEmpty && $0 != cursor }) ?? true else { throw URLError(.cannotParseResponse) }
+                var merged = current
+                var indexes = Dictionary(uniqueKeysWithValues: merged.enumerated().map { ($0.element.id, $0.offset) })
+                for session in page.items {
+                    if let index = indexes[session.id] { merged[index] = session }
+                    else { indexes[session.id] = merged.count; merged.append(session) }
+                }
+                sessionsByInstallation[installationID] = merged
+            } else {
+                sessionsByInstallation[installationID] = page.items
+            }
+            nextSessionCursorByInstallation[installationID] = page.next_cursor
+            revokedInstallations.remove(installationID)
+        } catch {
+            guard client.signedIn, scope == client.taskPageScopeKey else { return }
+            let failure = error as NSError
+            if [403, 404].contains(failure.code) {
+                revokedInstallations.insert(installationID)
+                clearSessions(installationID: installationID)
+            }
+            installationErrors[installationID] = error.localizedDescription
+        }
+    }
+
+    func loadMoreSessions() async {
+        guard let installationID = selectedInstallationID,
+              let cursor = nextSessionCursorByInstallation[installationID] else { return }
+        await loadSessions(installationID: installationID, cursor: cursor)
+    }
+
+    func loadTimeline(reset: Bool = false) async {
+        guard let session = selectedSession, session.hasScope("read"),
+              client.signedIn, !revokedSessions.contains(session.id), let installationID = selectedInstallationID,
+              let scope = scopeKey, scope == client.taskPageScopeKey else { return }
+        loadingEvents.insert(session.id)
+        eventErrors[session.id] = nil
+        if reset { eventPagesBySession[session.id] = nil; eventCursorBySession[session.id] = nil }
+        defer { loadingEvents.remove(session.id) }
+        do {
+            var target: Int64? = session.current_sequence
+            var firstPage: MordeCodexEventPage?
+            if target == nil {
+                firstPage = try await client.codexEventPage(sessionID: session.id, afterSequence: 0)
+                target = firstPage?.current_sequence ?? firstPage?.items.last?.sequence
+            }
+            let targetSequence = max(target ?? 0, 0)
+            var after = max(0, targetSequence - 100)
+            var page = after == 0 ? firstPage ?? (try await client.codexEventPage(sessionID: session.id, afterSequence: 0))
+                : try await client.codexEventPage(sessionID: session.id, afterSequence: after)
+            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            var events = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
+                                                         afterSequence: after)
+            var last = events.last?.sequence ?? after
+            let latest = max(targetSequence, page.current_sequence)
+            while last < latest {
+                page = try await client.codexEventPage(sessionID: session.id, afterSequence: last)
+                let next = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
+                                                           afterSequence: last)
+                guard let nextLast = next.last?.sequence, nextLast > last else { throw URLError(.cannotParseResponse) }
+                events = try MordeCodexEventPolicy.merge(events, incoming: next, sessionID: session.id)
+                last = nextLast
+            }
+            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            eventPagesBySession[session.id] = events
+            eventCursorBySession[session.id] = last
+            if let event = events.last(where: { $0.visibleStatus != nil && $0.isSessionStatus }),
+               let status = event.visibleStatus {
+                commandStatusBySession[session.id] = eventStatus(event, status: status)
+            } else {
+                commandStatusBySession[session.id] = normalizedStatus(session.status)
+            }
+            revokedSessions.remove(session.id)
+        } catch {
+            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            let failure = error as NSError
+            if [403, 404].contains(failure.code) {
+                revokedSessions.insert(session.id)
+                eventPagesBySession[session.id] = nil
+                eventCursorBySession[session.id] = nil
+            }
+            eventErrors[session.id] = eventErrorValue(error)
+        }
+    }
+
+    func loadEarlierEvents() async {
+        guard let session = selectedSession, session.hasScope("read"), let first = events.first, first.sequence > 1,
+              let scope = scopeKey, scope == client.taskPageScopeKey,
+              !loadingEarlierEvents.contains(session.id) else { return }
+        loadingEarlierEvents.insert(session.id)
+        defer { loadingEarlierEvents.remove(session.id) }
+        let after = max(0, first.sequence - 101)
+        do {
+            let page = try await client.codexEventPage(sessionID: session.id, afterSequence: after)
+            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            let incoming = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
+                                                           afterSequence: after)
+            let earlier = incoming.filter { $0.sequence < first.sequence }
+            guard !earlier.isEmpty else { return }
+            eventPagesBySession[session.id] = try MordeCodexEventPolicy.merge(
+                earlier, incoming: events, sessionID: session.id)
+        } catch {
+            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            eventErrors[session.id] = eventErrorValue(error)
+        }
+    }
+
+    func followSelectedSession() async {
+        guard let session = selectedSession, let installationID = selectedInstallationID,
+              session.installation_id == installationID,
+              let scope = scopeKey else { return }
+        if session.hasScope("read"), eventPagesBySession[session.id] == nil { await loadTimeline() }
+        guard session.hasScope("live"), !revokedSessions.contains(session.id) else { return }
+        while !Task.isCancelled, client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id {
+            do {
+                try await client.codexEventStream(installationID: installationID, sessionID: session.id,
+                    afterSequence: eventCursorBySession[session.id] ?? session.current_sequence) { [weak self] event in
+                        guard let self else { throw CancellationError() }
+                        try await self.receive(event, session: session, scope: scope)
+                    }
+                if Task.isCancelled { return }
+            } catch {
+                if Task.isCancelled || error is CancellationError || !client.signedIn || scope != client.taskPageScopeKey ||
+                    selectedSessionID != session.id { return }
+                let failure = error as NSError
+                if [403, 404].contains(failure.code) {
+                    revokedSessions.insert(session.id)
+                    eventPagesBySession[session.id] = nil
+                    eventCursorBySession[session.id] = nil
+                    eventErrors[session.id] = error.localizedDescription
+                    return
+                }
+                if isEventGap(error) {
+                    if session.hasScope("read") {
+                        await loadTimeline(reset: true)
+                    } else {
+                        eventErrors[session.id] = "event_gap"
+                        return
+                    }
+                } else {
+                    eventErrors[session.id] = eventErrorValue(error)
+                }
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    func sendMessage(_ text: String) async -> Bool {
+        guard canSend, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return await submit(MIFCodexPendingCommand(installationID: selectedInstallationID!, sessionID: selectedSessionID!,
+            action: .send(text), idempotencyKey: UUID().uuidString.lowercased()))
+    }
+
+    func interrupt() async -> Bool {
+        guard canInterrupt, let turnID = activeTurnID, let installationID = selectedInstallationID,
+              let sessionID = selectedSessionID else { return false }
+        return await submit(MIFCodexPendingCommand(installationID: installationID, sessionID: sessionID,
+            action: .interrupt(turnID), idempotencyKey: UUID().uuidString.lowercased()))
+    }
+
+    func respondToApproval(_ approval: MordeCodexApproval, decision: String) async -> Bool {
+        guard selectedSessionHasRead, selectedSessionHasApproval, approval.canRespond(),
+              ["approve", "reject"].contains(decision),
+              let installationID = selectedInstallationID, let sessionID = selectedSessionID,
+              !selectedPendingCommand else { return false }
+        return await submit(MIFCodexPendingCommand(installationID: installationID, sessionID: sessionID,
+            action: .approval(approval, decision), idempotencyKey: UUID().uuidString.lowercased()))
+    }
+
+    func retryUnconfirmedCommand() async -> Bool {
+        guard let sessionID = selectedSessionID, let command = pendingCommands[sessionID] else { return false }
+        return await submit(command)
+    }
+
+    func deleteSession(_ session: MordeCodexSession) async {
+        guard client.signedIn, !deletingSessions.contains(session.id), let scope = scopeKey,
+              scope == client.taskPageScopeKey else { return }
+        deletingSessions.insert(session.id)
+        deleteErrors[session.id] = nil
+        do {
+            try await client.deleteCodexSession(sessionID: session.id)
+            guard client.signedIn, scope == client.taskPageScopeKey else { return }
+            for installationID in sessionsByInstallation.keys {
+                sessionsByInstallation[installationID]?.removeAll { $0.id == session.id }
+            }
+            eventPagesBySession[session.id] = nil
+            eventCursorBySession[session.id] = nil
+            commandStatusBySession[session.id] = nil
+            commandErrors[session.id] = nil
+            pendingCommands[session.id] = nil
+            if selectedSessionID == session.id { selectedSessionID = nil }
+        } catch {
+            guard client.signedIn, scope == client.taskPageScopeKey else { return }
+            deleteErrors[session.id] = error.localizedDescription
+        }
+        deletingSessions.remove(session.id)
+    }
+
+    private func submit(_ command: MIFCodexPendingCommand) async -> Bool {
+        guard client.signedIn, let scope = scopeKey, scope == client.taskPageScopeKey,
+              let session = sessionsByInstallation[command.installationID]?.first(where: { $0.id == command.sessionID }),
+              session.hasScope("read"), session.hasScope(command.action.requiredScope),
+              !revokedSessions.contains(session.id),
+              submittingSessions.insert(session.id).inserted else { return false }
+        commandErrors[session.id] = nil
+        defer { submittingSessions.remove(session.id) }
+        do {
+            let receipt = try await client.codexCommand(session: session, installationID: command.installationID,
+                requiredScope: command.action.requiredScope, body: command.action.body,
+                idempotencyKey: command.idempotencyKey)
+            guard client.signedIn, scope == client.taskPageScopeKey else { return false }
+            commandStatusBySession[session.id] = normalizedStatus(receipt.status)
+            commandErrors[session.id] = nil
+            pendingCommands[session.id] = nil
+            return true
+        } catch {
+            guard client.signedIn, scope == client.taskPageScopeKey else { return false }
+            let failure = error as NSError
+            if [403, 404].contains(failure.code) {
+                revokedSessions.insert(session.id)
+                eventPagesBySession[session.id] = nil
+                eventCursorBySession[session.id] = nil
+            }
+            if failure.domain == NSURLErrorDomain || (500...599).contains(failure.code) {
+                commandStatusBySession[session.id] = "unknown"
+                commandErrors[session.id] = error.localizedDescription
+                pendingCommands[session.id] = command
+            } else {
+                commandStatusBySession[session.id] = "failed"
+                commandErrors[session.id] = error.localizedDescription
+                pendingCommands[session.id] = nil
+            }
+            return false
+        }
+    }
+
+    private func receive(_ event: MordeCodexEvent, session: MordeCodexSession, scope: String) async throws {
+        guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { throw CancellationError() }
+        var cursor = MordeCodexEventCursor(afterSequence: eventCursorBySession[session.id] ?? 0)
+        switch cursor.accept(event, sessionID: session.id) {
+        case .duplicate:
+            if let existing = eventPagesBySession[session.id]?.first(where: { $0.sequence == event.sequence }),
+               existing != event { throw MordeCodexEventPolicy.MergeError.conflictingDuplicate }
+            return
+        case .invalid: throw URLError(.cannotParseResponse)
+        case .accepted: break
+        case .gap(let expected, _):
+            guard session.hasScope("read") else {
+                throw NSError(domain: "Morde.Codex", code: 409,
+                              userInfo: [NSLocalizedDescriptionKey: "Codex event history has a sequence gap."])
+            }
+            var last = cursor.sequence
+            while last < event.sequence {
+                let page = try await client.codexEventPage(sessionID: session.id, afterSequence: last)
+                let missing = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
+                                                              afterSequence: last)
+                let throughEvent = missing.filter { $0.sequence <= event.sequence }
+                guard let finalSequence = throughEvent.last?.sequence, finalSequence > last else {
+                    throw NSError(domain: "Morde.Codex", code: 409,
+                                  userInfo: [NSLocalizedDescriptionKey: "Codex event history has a sequence gap."])
+                }
+                for next in throughEvent {
+                    guard cursor.accept(next, sessionID: session.id) == .accepted else { throw URLError(.cannotParseResponse) }
+                }
+                eventPagesBySession[session.id] = try MordeCodexEventPolicy.merge(
+                    eventPagesBySession[session.id] ?? [], incoming: throughEvent, sessionID: session.id)
+                eventCursorBySession[session.id] = cursor.sequence
+                last = finalSequence
+            }
+            guard cursor.sequence == event.sequence else {
+                throw NSError(domain: "Morde.Codex", code: 409,
+                              userInfo: [NSLocalizedDescriptionKey: "Codex event history has a sequence gap."])
+            }
+            eventErrors[session.id] = nil
+            updateStatus(event)
+            return
+        }
+        eventPagesBySession[session.id] = try MordeCodexEventPolicy.merge(
+            eventPagesBySession[session.id] ?? [], incoming: [event], sessionID: session.id)
+        eventCursorBySession[session.id] = cursor.sequence
+        eventErrors[session.id] = nil
+        updateStatus(event)
+    }
+
+    private func updateStatus(_ event: MordeCodexEvent) {
+        guard let status = event.visibleStatus, event.isSessionStatus else { return }
+        commandStatusBySession[event.session_id] = eventStatus(event, status: status)
+        if commandStatusBySession[event.session_id] != "unknown" { pendingCommands[event.session_id] = nil }
+    }
+
+    private func eventStatus(_ event: MordeCodexEvent, status: String) -> String {
+        if event.normalizedKind == "command_status", event.values["result_code"]?.stringValue == "turn_interrupted" {
+            return "cancelled"
+        }
+        return normalizedStatus(status)
+    }
+
+    private func normalizedStatus(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "queued": "waiting_pc"
+        case "claimed": "claimed"
+        case "in_progress", "active": "running"
+        case "approval", "approval_required", "waiting_for_approval": "waiting_approval"
+        case "interrupted", "cancelled", "canceled": "cancelled"
+        case "waiting_pc", "forwarded", "running", "waiting_approval", "completed", "failed", "unknown", "idle": raw.lowercased()
+        default: "unknown"
+        }
+    }
+
+    private func isEventGap(_ error: Error) -> Bool {
+        if let merge = error as? MordeCodexEventPolicy.MergeError,
+           case .sequenceGap = merge { return true }
+        let failure = error as NSError
+        return failure.domain == "Morde.Codex" && [409, 410].contains(failure.code)
+    }
+
+    private func eventErrorValue(_ error: Error) -> String {
+        isEventGap(error) ? "event_gap" : error.localizedDescription
+    }
+
+    private func clearSessions(installationID: String) {
+        let ids = Set((sessionsByInstallation[installationID] ?? []).map(\.id))
+        sessionsByInstallation[installationID] = nil
+        nextSessionCursorByInstallation[installationID] = nil
+        for id in ids {
+            eventPagesBySession[id] = nil
+            eventCursorBySession[id] = nil
+            eventErrors[id] = nil
+            revokedSessions.remove(id)
+            commandStatusBySession[id] = nil
+            commandErrors[id] = nil
+            pendingCommands[id] = nil
+            deleteErrors[id] = nil
+            deletingSessions.remove(id)
+            submittingSessions.remove(id)
+        }
+        if selectedSessionID.map(ids.contains) == true { selectedSessionID = nil }
+    }
+
+    private func synchronizeScope() {
+        let signedIn = client.signedIn
+        let current = signedIn ? client.taskPageScopeKey : nil
+        guard current != scopeKey || signedIn != isSignedInScope else { return }
+        isSignedInScope = signedIn
+        scopeKey = current
+        installations = []
+        selectedInstallationID = nil
+        selectedSessionID = nil
+        sessionsByInstallation = [:]
+        nextSessionCursorByInstallation = [:]
+        installationErrors = [:]
+        revokedInstallations = []
+        eventPagesBySession = [:]
+        eventCursorBySession = [:]
+        eventErrors = [:]
+        revokedSessions = []
+        commandStatusBySession = [:]
+        commandErrors = [:]
+        deleteErrors = [:]
+        pendingCommands = [:]
+        deletingSessions = []
+        loadingSessions = []
+        loadingEvents = []
+        loadingEarlierEvents = []
+        submittingSessions = []
+        loadingInstallations = false
+    }
 }
 
 @MainActor final class MIFResourcePageStore: ObservableObject {
@@ -15689,7 +16521,7 @@ private struct MordeRoot: View {
     @State private var drawerSearchText = ""
     // nanoMuse: Preserve a last-row appearance that precedes its page cursor.
     @State private var drawerPaginationPendingConversationID: String?
-    @State private var approvalCount: Int?
+    @StateObject private var approvalCountTracker = MIFApprovalCountTracker()
     @State private var eventChainTaskID: String?
     @State private var confirmsSignOut = false
     @State private var presentedClientError: String?
@@ -16234,6 +17066,7 @@ private struct MordeRoot: View {
     }
     private func signedInChanged(_ signedIn: Bool) {
         if !signedIn {
+            approvalCountTracker.clear()
             clearChatAttachmentPreview()
             if client.expiredConversationAvailable { return }
             clearComposer()
@@ -17011,9 +17844,12 @@ private struct MordeRoot: View {
                 MordeDesignDrawerItem(id: "tasks", title: "任务", systemImage: "checkmark.square",
                                       route: .tasks, isSelected: visibleDesignRoute.primaryTab == .tasks),
                 MordeDesignDrawerItem(id: "approvals", title: "审批", systemImage: "checkmark.shield",
-                                      route: .approvals, badge: approvalCount, isSelected: visibleDesignRoute.primaryTab == .approvals),
+                                      route: .approvals, badge: approvalCountTracker.count, isSelected: visibleDesignRoute.primaryTab == .approvals),
                 MordeDesignDrawerItem(id: "eventChain", title: "事件链", systemImage: "clock.arrow.circlepath",
                                       route: .eventChain, isSelected: visibleDesignRoute == .eventChain),
+                // nanoMuse: Keep the Codex mirror separate from cloud Agent Tasks.
+                MordeDesignDrawerItem(id: "codexSessions", title: AppLocalized("Codex sessions"), systemImage: "desktopcomputer",
+                                      route: .codexSessions, isSelected: visibleDesignRoute == .codexSessions),
                 MordeDesignDrawerItem(id: "resources", title: "资源", systemImage: nil,
                                       route: .resources, customGlyph: .resources,
                                       isSelected: visibleDesignRoute.primaryTab == .resources),
@@ -17047,7 +17883,7 @@ private struct MordeRoot: View {
         MordeDesignNavigationShell(
             selectedRoute: selectedDesignRoute,
             selectedTab: visibleDesignRoute.primaryTab,
-            approvalCount: approvalCount,
+            approvalCount: approvalCountTracker.count,
             drawerSections: designDrawerSections,
             footer: MordeDesignDrawerFooter(settingsTitle: "设置", searchPlaceholder: "搜索", newChatTitle: "新聊天"),
             searchText: $drawerSearchText,
@@ -17145,8 +17981,10 @@ private struct MordeRoot: View {
         case .tasks:
             MIFTaskListRoom(onMenu: onMenu, onNewConversation: createDesignConversation)
         case .approvals:
-            MIFApprovalInboxRoom(onConfirmedCount: { approvalCount = $0 }, onMenu: onMenu,
+            MIFApprovalInboxRoom(onConfirmedCount: { approvalCountTracker.update($0) }, onMenu: onMenu,
                                  onOpenEventChain: { openEventChain(taskID: $0) })
+        case .codexSessions:
+            MordeCodexSessionsRoom(onMenu: onMenu)
         case .eventChain:
             MIFTaskEventChainRoom(onMenu: onMenu, taskID: eventChainTaskID)
         case .resources:
@@ -17156,7 +17994,7 @@ private struct MordeRoot: View {
         case .library:
             MIFLibraryRoot(onMenu: onMenu, personalDataRoot: MordePersonalStorage.root,
                            previewNavigation: MordeFilePreviewNavigation(
-                            selectedTab: nil, approvalCount: approvalCount,
+                            selectedTab: nil, approvalCount: approvalCountTracker.count,
                             onSelectTab: { tab in
                                 designNavigationPath = []
                                 selectedDesignTab = tab
@@ -17413,7 +18251,10 @@ private struct MordeRoot: View {
             startLocalChatAttachmentFixtureIfNeeded()
             prefillLocalMessageUploadRecoveryDraftIfNeeded()
         }
-        .nmOnChange(of: authorization.personalDataScopeKey) { _ in clearChatAttachmentPreview() }
+        .nmOnChange(of: authorization.personalDataScopeKey) { _ in
+            clearChatAttachmentPreview()
+            approvalCountTracker.clear()
+        }
         .nmOnChange(of: personal.syncEnabled) { enabled in
             if !enabled { clearChatAttachmentPreview() }
         }
@@ -17461,7 +18302,7 @@ private struct MordeRoot: View {
         .fullScreenCover(item: $chatAttachmentPreviewItem, onDismiss: chatAttachmentPreviewDismissed) { item in
             MIFPersonalAttachmentPreview(item: item.previewItem,
                 navigation: MordeFilePreviewNavigation(
-                    selectedTab: nil, approvalCount: approvalCount,
+                    selectedTab: nil, approvalCount: approvalCountTracker.count,
                     onSelectTab: { tab in
                         designNavigationPath = []
                         selectedDesignTab = tab
@@ -19184,41 +20025,65 @@ private struct MordeProjectsRoom: View {
     private func projectConversationApprovalControls(_ task: MordeTask, pending: MordeTask.Pending) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(pending.title).font(.headline)
+            if let object = pending.object, !object.isEmpty { Text(object).font(.footnote) }
             Text(pending.content)
             Text(pending.impact).font(.footnote).foregroundStyle(.secondary)
-            if pending.media_preview_operation_id != nil {
-                MordeTaskMediaPreviewControls(
-                    client: client, task: task, pending: pending,
-                    canRespond: canManageProjectConversationTask, busy: client.projectActionInFlight,
-                    isPendingCurrent: {
-                        guard let current = client.projectConversationTasks.first(where: { $0.id == task.id }) else { return false }
-                        return current.pending_request?.id == pending.id &&
-                            current.pending_request?.version == pending.version &&
-                            current.pending_request?.media_preview_operation_id == pending.media_preview_operation_id
-                    },
-                    onDecision: { decision in
-                        client.projectConversationTask = task
-                        return await client.respondToProjectConversationApproval(
-                            taskID: task.id, approvalID: pending.id, version: pending.version, decision: decision)
-                    })
-            } else if canManageProjectConversationTask {
-                HStack {
-                    Button("批准") {
-                        Task {
+            Text(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
+                .font(.footnote).foregroundStyle(.secondary)
+            if let expiresAt = pending.expirationDate {
+                Text(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                if pending.isExpired {
+                    Text(AppLocalized("Approval expired; the requested action was not run."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("morde.projectConversation.approval.expired.\(pending.id)")
+                } else if pending.deadlineHasPassed(at: timeline.date) {
+                    Text(AppLocalized("Approval deadline passed; refresh to confirm its status."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("morde.projectConversation.approval.deadline.\(pending.id)")
+                } else if !pending.canRespond(taskStatus: task.status, at: timeline.date) {
+                    Text(AppLocalized("Approval status is unknown; refresh task details before acting."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("morde.projectConversation.approval.unknown.\(pending.id)")
+                } else if pending.media_preview_operation_id != nil {
+                    MordeTaskMediaPreviewControls(
+                        client: client, task: task, pending: pending,
+                        canRespond: canManageProjectConversationTask, busy: client.projectActionInFlight,
+                        isPendingCurrent: {
+                            guard let currentTask = client.projectConversationTasks.first(where: { $0.id == task.id }),
+                                  let current = currentTask.pending_request else { return false }
+                            return current.canRespond(taskStatus: currentTask.status) && current.id == pending.id &&
+                                current.version == pending.version &&
+                                current.media_preview_operation_id == pending.media_preview_operation_id
+                        },
+                        onDecision: { decision in
                             client.projectConversationTask = task
-                            await client.respondToProjectConversationApproval(
-                                taskID: task.id, approvalID: pending.id, version: pending.version, decision: "approve")
+                            return await client.respondToProjectConversationApproval(
+                                taskID: task.id, approvalID: pending.id, version: pending.version, decision: decision)
+                        })
+                } else if canManageProjectConversationTask {
+                    HStack {
+                        Button("批准") {
+                            Task {
+                                client.projectConversationTask = task
+                                _ = await client.respondToProjectConversationApproval(
+                                    taskID: task.id, approvalID: pending.id, version: pending.version, decision: "approve")
+                            }
                         }
-                    }
-                    Button("拒绝", role: .destructive) {
-                        Task {
-                            client.projectConversationTask = task
-                            await client.respondToProjectConversationApproval(
-                                taskID: task.id, approvalID: pending.id, version: pending.version, decision: "reject")
+                        .accessibilityIdentifier("morde.projectConversation.approval.approve.\(pending.id)")
+                        Button("拒绝", role: .destructive) {
+                            Task {
+                                client.projectConversationTask = task
+                                _ = await client.respondToProjectConversationApproval(
+                                    taskID: task.id, approvalID: pending.id, version: pending.version, decision: "reject")
+                            }
                         }
+                        .accessibilityIdentifier("morde.projectConversation.approval.reject.\(pending.id)")
                     }
+                    .disabled(client.projectActionInFlight || !pending.canRespond(taskStatus: task.status, at: timeline.date))
                 }
-                .disabled(client.projectActionInFlight)
             }
         }
     }

@@ -881,7 +881,7 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 	}
 	current.Usage = usage
 	if call.Name == cloudDSHWorkspaceWriteToolName {
-		approval, handled, err := b.authorizeWorkspaceWrite(ctx, details, current, step, usage, call)
+		approval, handled, err := b.authorizeWorkspaceWrite(ctx, details, current, step, usage, call, checkpointOutput)
 		if err != nil || handled {
 			return approval, err
 		}
@@ -916,7 +916,7 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 }
 
 func (b *CloudDSHToolBroker) authorizeWorkspaceWrite(ctx context.Context, details TaskDetails, current task.Task, step task.Step,
-	usage task.Usage, call ModelToolCall) (AgentToolResult, bool, error) {
+	usage task.Usage, call ModelToolCall, checkpointOutput *string) (AgentToolResult, bool, error) {
 	arguments, err := validateAgentToolArguments(call.Arguments)
 	if err != nil {
 		return AgentToolResult{}, true, domain.InvalidArgument("tool_call.arguments", "Workspace write arguments are invalid")
@@ -951,6 +951,25 @@ func (b *CloudDSHToolBroker) authorizeWorkspaceWrite(ctx context.Context, detail
 			}
 			request := AgentToolRequest{Task: current, Call: call, Arguments: arguments, OperationKey: agentOperationKey(call.CallID)}
 			result, err := b.rejectApprovedToolCall(ctx, current, step, usage, request)
+			return result, true, err
+		case task.PendingRequestExpired:
+			if pending.Decision != task.PendingDecisionReject || pending.ExpiresAt == nil || pending.RespondedAt == nil ||
+				pending.RespondedAt.Before(*pending.ExpiresAt) {
+				result, err := b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)
+				return result, true, err
+			}
+			operationKey := agentOperationKey(call.CallID)
+			if b.workspaceTools == nil || b.workspaceTools.workspaces == nil {
+				return AgentToolResult{}, true, domain.NewError(domain.CodeUnsupported, "Workspace publish receipt storage is unavailable")
+			}
+			_, receiptErr := b.workspaceTools.workspaces.FindTaskWorkspacePublishReceipt(ctx, current.OwnerID, current.ID, current.WorkspaceID, operationKey)
+			if receiptErr == nil || domain.CodeOf(receiptErr) != domain.CodeNotFound || checkpointOutput != nil {
+				result, err := b.pauseUnknown(ctx, current, step, usage, operationKey,
+					"The expired Workspace approval has a prior or checkpointed result that cannot be replayed safely.")
+				return result, true, err
+			}
+			request := AgentToolRequest{Task: current, Call: call, Arguments: arguments, OperationKey: operationKey}
+			result, err := b.expireApprovedToolCall(ctx, current, step, usage, request)
 			return result, true, err
 		default:
 			result, err := b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)

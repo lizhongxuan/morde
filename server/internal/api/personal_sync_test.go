@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain/identity"
@@ -21,6 +23,13 @@ type personalSyncServiceStub struct {
 	throughSequence   *int64
 	changeLimit       int32
 	changePage        personal.ChangePage
+	historyPrincipal  identity.Principal
+	historyType       string
+	historyObjectID   string
+	historyCursor     string
+	historyLimit      int32
+	historyPage       app.PersonalMemoryHistoryPage
+	historyCalls      int
 	snapshotCalls     int
 	changeCalls       int
 }
@@ -35,6 +44,12 @@ func (s *personalSyncServiceStub) GetChanges(_ context.Context, principal identi
 	s.changeCalls++
 	s.changePrincipal, s.afterSequence, s.throughSequence, s.changeLimit = principal, after, through, limit
 	return s.changePage, nil
+}
+
+func (s *personalSyncServiceStub) GetMemoryHistory(_ context.Context, principal identity.Principal, objectType, objectID, cursor string, limit int32) (app.PersonalMemoryHistoryPage, error) {
+	s.historyCalls++
+	s.historyPrincipal, s.historyType, s.historyObjectID, s.historyCursor, s.historyLimit = principal, objectType, objectID, cursor, limit
+	return s.historyPage, nil
 }
 
 func TestPersonalSyncRoutesUseClientCredentialAndKeepFixedWatermarks(t *testing.T) {
@@ -121,5 +136,60 @@ func TestPersonalSyncChangesRejectInvalidSequencesBeforeServiceCall(t *testing.T
 	}
 	if syncService.changeCalls != 0 {
 		t.Fatalf("invalid queries reached service %d times", syncService.changeCalls)
+	}
+}
+
+func TestPersonalMemoryHistoryRouteAllowsClientWithBoundPaging(t *testing.T) {
+	services := newServices()
+	syncService := &personalSyncServiceStub{historyPage: app.PersonalMemoryHistoryPage{
+		Items: []personal.MemoryRevision{
+			{Revision: 4, ChangedAt: time.Date(2026, 11, 14, 3, 0, 0, 0, time.UTC),
+				Body: json.RawMessage(`{"content":"memory"}`), Restorable: true,
+				SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-123"}}},
+			{Revision: 3, ChangedAt: time.Date(2026, 11, 13, 3, 0, 0, 0, time.UTC),
+				Restorable: false, SourceStatus: personal.MemoryHistorySourceUnrecorded, Sources: []personal.MemoryHistorySource{}},
+		},
+		NextCursor: "next-signed-cursor",
+	}}
+	deps := services.deps()
+	deps.PersonalSync = syncService
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, _, err := identity.NewCredential(identity.KindClient, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(router, http.MethodGet, "/api/personal-data/memory/global/history?cursor=previous-page&limit=1", "", "Bearer "+credential, "")
+	var page personalMemoryHistoryPageResponse
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &page) != nil || syncService.historyCalls != 1 ||
+		syncService.historyPrincipal.Kind != identity.KindClient || syncService.historyPrincipal.UserID != testUserID ||
+		syncService.historyType != personal.ObjectTypeMemory || syncService.historyObjectID != "global" ||
+		syncService.historyCursor != "previous-page" || syncService.historyLimit != 1 || len(page.Items) != 2 ||
+		page.Items[0].Revision != 4 || page.Items[0].SourceStatus != personal.MemoryHistorySourceAvailable ||
+		page.Items[1].Revision != 3 || string(page.Items[1].Body) != "null" || page.Items[1].Restorable || !strings.Contains(response.Body.String(), `"body":null`) ||
+		page.NextCursor == nil || *page.NextCursor != "next-signed-cursor" {
+		t.Fatalf("memory history = %d %+v calls=%d owner=%s type=%s id=%s cursor=%s limit=%d body=%s", response.Code, page,
+			syncService.historyCalls, syncService.historyPrincipal.UserID, syncService.historyType, syncService.historyObjectID,
+			syncService.historyCursor, syncService.historyLimit, response.Body)
+	}
+	for _, path := range []string{
+		"/api/personal-data/memory/global/history?limit=0",
+		"/api/personal-data/memory/global/history?limit=101",
+		"/api/personal-data/memory/global/history?cursor=a&cursor=b",
+	} {
+		bad := request(router, http.MethodGet, path, "", "Bearer "+credential, "")
+		if bad.Code != http.StatusBadRequest {
+			t.Errorf("invalid history query %s = %d %s; want 400", path, bad.Code, bad.Body)
+		}
+	}
+	if !clientCredentialRoute(http.MethodGet, "/api/personal-data/:type/:id/history") ||
+		clientCredentialRoute(http.MethodPut, "/api/personal-data/:type/:id/history") {
+		t.Fatal("client credential route allowlist does not contain only memory history GET")
+	}
+	unauthorized := request(router, http.MethodGet, "/api/personal-data/memory/global/history", "", "", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated history request = %d %s; want 401", unauthorized.Code, unauthorized.Body)
 	}
 }

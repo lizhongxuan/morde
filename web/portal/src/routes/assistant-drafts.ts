@@ -118,26 +118,49 @@ export class IndexedDBAssistantDraftStorage implements AssistantDraftStorage {
  */
 export class ResilientAssistantDraftStorage implements AssistantDraftStorage {
   private readonly memory = new Map<string, AssistantComposerDraft>();
+  private readonly dirty = new Map<string, AssistantComposerDraft>();
+  private readonly removed = new Set<string>();
+  private readonly revisions = new Map<string, number>();
+  private readonly writes = new Map<string, Promise<void>>();
 
   constructor(private readonly durable: AssistantDraftStorage) {}
 
+  private write(key: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.writes.get(key) ?? Promise.resolve();
+    const write = previous.catch(() => undefined).then(operation);
+    this.writes.set(key, write);
+    const clear = () => { if (this.writes.get(key) === write) this.writes.delete(key); };
+    void write.then(clear, clear);
+    return write;
+  }
+
   async get(scope: string, id: string): Promise<AssistantComposerDraft | null> {
+    const key = `${scope}\u0000${id}`;
+    const before = this.revisions.get(key);
     try {
       const draft = await this.durable.get(scope, id);
-      if (draft) this.memory.set(`${scope}\u0000${id}`, draft);
-      return draft ?? this.memory.get(`${scope}\u0000${id}`) ?? null;
+      const cached = this.memory.get(key);
+      if (this.removed.has(key)) return null;
+      if (this.dirty.has(key) || this.revisions.get(key) !== before) return cached ?? null;
+      if (draft) this.memory.set(key, draft);
+      return draft ?? cached ?? null;
     } catch (error) {
-      const draft = this.memory.get(`${scope}\u0000${id}`);
+      if (this.removed.has(key)) return null;
+      const draft = this.memory.get(key);
       if (draft) return draft;
       throw error;
     }
   }
 
   async list(scope: string): Promise<AssistantComposerDraft[]> {
+    const before = new Map(this.revisions);
     try {
       const durable = await this.durable.list(scope);
-      for (const draft of durable) this.memory.set(`${scope}\u0000${draft.id}`, draft);
-      const byID = new Map(durable.map((draft) => [draft.id, draft]));
+      for (const draft of durable) {
+        const key = `${scope}\u0000${draft.id}`;
+        if (!this.removed.has(key) && !this.dirty.has(key) && this.revisions.get(key) === before.get(key)) this.memory.set(key, draft);
+      }
+      const byID = new Map<string, AssistantComposerDraft>();
       for (const [key, draft] of this.memory) {
         if (key.startsWith(`${scope}\u0000`)) byID.set(draft.id, draft);
       }
@@ -150,13 +173,22 @@ export class ResilientAssistantDraftStorage implements AssistantDraftStorage {
   }
 
   async put(scope: string, draft: AssistantComposerDraft): Promise<void> {
-    this.memory.set(`${scope}\u0000${draft.id}`, draft);
-    await this.durable.put(scope, draft);
+    const key = `${scope}\u0000${draft.id}`;
+    this.revisions.set(key, (this.revisions.get(key) ?? 0) + 1);
+    this.removed.delete(key);
+    this.memory.set(key, draft);
+    this.dirty.set(key, draft);
+    await this.write(key, () => this.durable.put(scope, draft));
+    if (this.dirty.get(key) === draft) this.dirty.delete(key);
   }
 
   async remove(scope: string, id: string): Promise<void> {
-    this.memory.delete(`${scope}\u0000${id}`);
-    await this.durable.remove(scope, id);
+    const key = `${scope}\u0000${id}`;
+    this.revisions.set(key, (this.revisions.get(key) ?? 0) + 1);
+    this.removed.add(key);
+    this.memory.delete(key);
+    this.dirty.delete(key);
+    await this.write(key, () => this.durable.remove(scope, id));
   }
 }
 

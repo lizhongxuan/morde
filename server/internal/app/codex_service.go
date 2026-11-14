@@ -1,0 +1,164 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"morde/server/internal/domain"
+	"morde/server/internal/domain/codex"
+	"morde/server/internal/domain/identity"
+)
+
+type CodexStore interface {
+	DiscoverCodexSession(context.Context, identity.Principal, codex.Discover) (codex.Session, error)
+	ListCodexSessions(context.Context, string, string, string, int32) (codex.SessionPage, error)
+	GetCodexEvents(context.Context, string, string, codex.Scope, int64, int32) (codex.EventPage, error)
+	CreateCodexCommand(context.Context, string, string, string, string, codex.CommandInput, []byte) (codex.Command, error)
+	ClaimCodexCommand(context.Context, string, string) ([]codex.Command, error)
+	ApplyCodexCommandResult(context.Context, string, string, string, codex.CommandResult) (codex.Command, error)
+	AppendCodexEvents(context.Context, string, string, string, codex.EventBatch) (codex.EventBatchAck, error)
+	DeleteCodexSession(context.Context, string, string) error
+}
+
+type CodexService struct{ store CodexStore }
+
+var codexResultCodePattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{0,128}$`)
+
+func NewCodexService(store CodexStore) (*CodexService, error) {
+	if store == nil {
+		return nil, domain.NewError(domain.CodeInvalidArgument, "Codex service store is required")
+	}
+	return &CodexService{store: store}, nil
+}
+
+func (s *CodexService) Discover(ctx context.Context, principal identity.Principal, request codex.Discover) (codex.Session, error) {
+	if err := validateCodexClient(principal); err != nil {
+		return codex.Session{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return codex.Session{}, domain.InvalidArgument("discover", err.Error())
+	}
+	return s.store.DiscoverCodexSession(ctx, principal, request)
+}
+
+func (s *CodexService) List(ctx context.Context, principal identity.Principal, installationID, cursor string, limit int32) (codex.SessionPage, error) {
+	if err := validateCodexUser(principal); err != nil {
+		return codex.SessionPage{}, err
+	}
+	if !domain.ValidClientInstallationID(installationID) || limit < 1 || limit > codex.MaxSessionPageSize ||
+		(cursor != "" && !domain.ValidCodexSessionID(cursor)) {
+		return codex.SessionPage{}, domain.InvalidArgument("page", "Codex session page request is invalid")
+	}
+	return s.store.ListCodexSessions(ctx, principal.UserID, installationID, cursor, limit)
+}
+
+func (s *CodexService) Events(ctx context.Context, principal identity.Principal, sessionID string, afterSequence int64, limit int32) (codex.EventPage, error) {
+	return s.events(ctx, principal, sessionID, codex.ScopeRead, afterSequence, limit)
+}
+
+func (s *CodexService) LiveEvents(ctx context.Context, principal identity.Principal, sessionID string, afterSequence int64, limit int32) (codex.EventPage, error) {
+	return s.events(ctx, principal, sessionID, codex.ScopeLive, afterSequence, limit)
+}
+
+func (s *CodexService) events(ctx context.Context, principal identity.Principal, sessionID string, requiredScope codex.Scope, afterSequence int64, limit int32) (codex.EventPage, error) {
+	if err := validateCodexUser(principal); err != nil {
+		return codex.EventPage{}, err
+	}
+	if !codex.ValidateSessionID(sessionID) || afterSequence < 0 || limit < 1 || limit > codex.MaxEventPageSize {
+		return codex.EventPage{}, domain.InvalidArgument("page", "Codex event page request is invalid")
+	}
+	return s.store.GetCodexEvents(ctx, principal.UserID, sessionID, requiredScope, afterSequence, limit)
+}
+
+func (s *CodexService) CreateCommand(ctx context.Context, principal identity.Principal, sessionID, idempotencyKey string, input codex.CommandInput) (codex.Command, error) {
+	if err := validateCodexUser(principal); err != nil {
+		return codex.Command{}, err
+	}
+	if !codex.ValidateSessionID(sessionID) {
+		return codex.Command{}, domain.NewError(domain.CodeNotFound, "Codex session not found")
+	}
+	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+		return codex.Command{}, err
+	}
+	if err := input.Validate(); err != nil {
+		return codex.Command{}, domain.InvalidArgument("command", err.Error())
+	}
+	hash, err := hashIdempotencyRequest(input)
+	if err != nil {
+		return codex.Command{}, fmt.Errorf("hash Codex command: %w", err)
+	}
+	installationID := ""
+	if principal.Kind == identity.KindClient {
+		installationID = principal.ClientInstallationID
+	}
+	return s.store.CreateCodexCommand(ctx, principal.UserID, installationID, sessionID, idempotencyKey, input, hash)
+}
+
+func (s *CodexService) Claim(ctx context.Context, principal identity.Principal) ([]codex.Command, error) {
+	if err := validateCodexClient(principal); err != nil {
+		return nil, err
+	}
+	return s.store.ClaimCodexCommand(ctx, principal.UserID, principal.ClientInstallationID)
+}
+
+func (s *CodexService) Result(ctx context.Context, principal identity.Principal, commandID string, result codex.CommandResult) (codex.Command, error) {
+	if err := validateCodexClient(principal); err != nil {
+		return codex.Command{}, err
+	}
+	if !codex.ValidateCommandID(commandID) || !result.Status.ValidResult() ||
+		len(result.ProviderRequestID) > 512 || strings.ContainsAny(result.ProviderRequestID, "\x00\r\n") ||
+		!codexResultCodePattern.MatchString(result.ResultCode) {
+		return codex.Command{}, domain.InvalidArgument("result", "Codex command result is invalid")
+	}
+	return s.store.ApplyCodexCommandResult(ctx, principal.UserID, principal.ClientInstallationID, commandID, result)
+}
+
+func (s *CodexService) AppendEvents(ctx context.Context, principal identity.Principal, sessionID string, batch codex.EventBatch) (codex.EventBatchAck, error) {
+	if err := validateCodexClient(principal); err != nil {
+		return codex.EventBatchAck{}, err
+	}
+	if !codex.ValidateSessionID(sessionID) {
+		return codex.EventBatchAck{}, domain.NewError(domain.CodeNotFound, "Codex session not found")
+	}
+	if _, err := batch.Validate(); err != nil {
+		return codex.EventBatchAck{}, domain.InvalidArgument("events", err.Error())
+	}
+	return s.store.AppendCodexEvents(ctx, principal.UserID, principal.ClientInstallationID, sessionID, batch)
+}
+
+func (s *CodexService) Delete(ctx context.Context, principal identity.Principal, sessionID string) error {
+	if principal.Kind != identity.KindSession {
+		return domain.NewError(domain.CodeForbidden, "an owner session is required to delete a Codex mirror")
+	}
+	if err := validateCodexUser(principal); err != nil {
+		return err
+	}
+	if !codex.ValidateSessionID(sessionID) {
+		return domain.NewError(domain.CodeNotFound, "Codex session not found")
+	}
+	return s.store.DeleteCodexSession(ctx, principal.UserID, sessionID)
+}
+
+func validateCodexUser(principal identity.Principal) error {
+	if !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) {
+		return domain.NewError(domain.CodeUnauthenticated, "authentication required")
+	}
+	if principal.Kind != identity.KindSession && principal.Kind != identity.KindClient {
+		return domain.NewError(domain.CodeForbidden, "Codex session or client credential required")
+	}
+	if principal.Kind == identity.KindClient {
+		return validateCodexClient(principal)
+	}
+	return nil
+}
+
+func validateCodexClient(principal identity.Principal) error {
+	if !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		principal.Kind != identity.KindClient || !domain.ValidClientInstallationID(principal.ClientInstallationID) ||
+		len(principal.Scopes) != 0 || len(principal.WorkspaceIDs) != 0 || len(principal.HostIDs) != 0 || principal.HostScope != "" {
+		return domain.NewError(domain.CodeForbidden, "active Codex client installation is required")
+	}
+	return nil
+}

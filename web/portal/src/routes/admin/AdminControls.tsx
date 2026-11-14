@@ -3,7 +3,7 @@ import type { FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatDate } from '../../app/format';
-import { FloatingError } from '../../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../../components/FloatingError';
 
 type ControlsData = Awaited<ReturnType<typeof portalApi.adminControls>>;
 type ControlRule = ControlsData['rules'][number];
@@ -203,7 +203,7 @@ export function AdminControls() {
 
   return <section className="admin-content">
     {versionConflict && <FloatingError className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></FloatingError>}
-    {notice && <p className="notice notice-info" role="status">{notice}</p>}
+    {notice && <FloatingNotice className="notice-info">{notice}</FloatingNotice>}
 
     {query.isPending ? <div className="loading-card" role="status">正在加载通知规则…</div>
       : query.isError ? <ErrorCard error={query.error} retry={() => void query.refetch()} />

@@ -14,6 +14,10 @@ let projectSelection = null;
 let selectedProjectTargetKey = '';
 let projectUploadResult = null;
 let projectUploadError = '';
+let codexThreads = [];
+let codexThreadsProfileKey = '';
+let codexThreadCursor = null;
+let codexThreadNextCursor = null;
 
 function message(value, error = false) {
   $('message').textContent = value;
@@ -566,6 +570,133 @@ function stopSyncButton() {
   return stop;
 }
 
+const codexScopeLabels = {
+  read: '读取并同步 App Server 可见历史',
+  live: '同步 Morde Provider 即时通知',
+  send: '发送消息',
+  interrupt: '中断指定 turn',
+  approval: '响应审批请求',
+};
+function codexScopePicker(currentScopes = ['read']) {
+  const wrapper = text('div', '', 'codex-scopes');
+  for (const [scope, label] of Object.entries(codexScopeLabels)) {
+    const row = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = scope;
+    checkbox.dataset.codexScope = scope;
+    checkbox.checked = currentScopes.includes(scope);
+    row.append(checkbox, document.createTextNode(label));
+    wrapper.append(row);
+  }
+  return wrapper;
+}
+function selectedCodexScopes(wrapper) {
+  return [...wrapper.querySelectorAll('input[data-codex-scope]:checked')].map((input) => input.dataset.codexScope);
+}
+function codexSnapshotLabel(value) {
+  return ({ available: 'App Server 可见历史已回填', limited: '历史回填未完成', unknown: '状态未知', disabled: '未授权读取', pending: '等待稳定快照' })[value] || '状态未知';
+}
+function renderCodex(current = state) {
+  const root = $('codex-content');
+  if (!root || !current?.codex) return;
+  root.replaceChildren();
+  const codex = current.codex;
+  const profiles = Array.isArray(codex.profiles) ? codex.profiles : [];
+  const bar = text('div', '', 'codex-profile-controls');
+  const profile = document.createElement('select');
+  profile.setAttribute('aria-label', 'Codex profile');
+  for (const item of profiles) {
+    const option = document.createElement('option');
+    option.value = item.profileKey;
+    option.textContent = `${item.label} · ${item.state}`;
+    option.selected = item.profileKey === codex.selectedProfileKey;
+    profile.append(option);
+  }
+  profile.disabled = profiles.length === 0;
+  profile.onchange = () => {
+    codexThreads = [];
+    codexThreadsProfileKey = '';
+    codexThreadCursor = null;
+    codexThreadNextCursor = null;
+    void run(() => api.codexSelectProfile(profile.value));
+  };
+  bar.append(profile, button('添加 Codex profile', () => api.codexAddProfile()));
+  root.append(bar);
+
+  const selected = profiles.find((item) => item.profileKey === codex.selectedProfileKey);
+  if (codex.error) root.append(text('p', codex.error, 'error'));
+  if (selected) {
+    const status = selected.state === 'connected' ? '本机 App Server 已连接' : selected.state === 'connecting' ? '正在连接本机 App Server' :
+      selected.state === 'unavailable' ? `本机 App Server 不可用${selected.error ? `：${selected.error}` : ''}` : '本机 App Server 尚未连接';
+    root.append(text('p', status, selected.state === 'connected' ? 'success' : selected.state === 'unavailable' ? 'error' : 'muted'));
+  } else {
+    root.append(text('p', '请添加并选择一个 CODEX_HOME 目录和本机 codex 命令。目录路径保存在本机系统安全存储中。', 'muted'));
+  }
+  root.append(text('p', `能力边界：${codex.realtimeCapability === 'unverified' ? 'App Server 通知只覆盖 Morde 自己启动的 turn；Codex Desktop GUI 即时变化、共享 profile 刷新时延与同线程并发写入尚未验证。' : 'Provider 状态未知。'} 已授权线程使用有界 thread/read 与 turns/list 快照对账；question 会显示但目前不能回答。`, 'muted'));
+
+  if (selected) {
+    const controls = text('div', '', 'codex-profile-controls');
+    controls.append(button('发现本机线程', async () => {
+      codexThreadCursor = null;
+      const result = await api.codexListThreads(null);
+      codexThreads = Array.isArray(result?.items) ? result.items : [];
+      codexThreadNextCursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
+      codexThreadsProfileKey = codex.selectedProfileKey;
+      renderCodex(state);
+    }));
+    root.append(controls);
+  }
+
+  if (codexThreadsProfileKey === codex.selectedProfileKey && codexThreads.length) {
+    const list = text('div', '', 'codex-thread-list');
+    const authorized = Array.isArray(codex.sessions) ? codex.sessions : [];
+    for (const thread of codexThreads) {
+      const existing = authorized.find((item) => item.profileKey === codex.selectedProfileKey && item.threadId === thread.id);
+      const card = text('article', '', 'codex-thread card');
+      card.append(text('strong', thread.title || 'Codex conversation'));
+      card.append(text('p', `${thread.cwdLabel || '目录未知'} · ${displayTime(thread.updatedAt)} · ${thread.status || '状态未知'}`, 'muted'));
+      const picker = codexScopePicker(existing?.scopes || ['read']);
+      card.append(picker);
+      card.append(button(existing ? '更新授权范围' : '授权并同步', async () => {
+        const scopes = selectedCodexScopes(picker);
+        await api.codexAuthorizeThread(thread.id, scopes);
+        message(existing ? '已更新 Codex 授权范围。' : '已授权此 Codex 线程。');
+      }));
+      list.append(card);
+    }
+    list.append(text('p', `当前页 ${codexThreads.length} 个线程；线程发现按 Codex 游标分页。`, 'muted'));
+    if (codexThreadNextCursor) list.append(button('发现下一页线程', async () => {
+      codexThreadCursor = codexThreadNextCursor;
+      const result = await api.codexListThreads(codexThreadCursor);
+      codexThreads = Array.isArray(result?.items) ? result.items : [];
+      codexThreadNextCursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
+      renderCodex(state);
+    }));
+    root.append(list);
+  } else if (selected && codexThreadsProfileKey === codex.selectedProfileKey) {
+    root.append(text('p', '当前 profile 没有可发现的线程。', 'muted'));
+  }
+
+  const grants = (Array.isArray(codex.sessions) ? codex.sessions : []).filter((item) => item.profileKey === codex.selectedProfileKey);
+  if (grants.length) {
+    root.append(text('h3', '已授权线程'));
+    for (const grant of grants) {
+      const card = text('article', '', 'codex-grant card');
+      card.append(text('strong', grant.title || grant.threadId));
+      card.append(text('p', `${grant.cwdLabel} · ${grant.scopes.map((scope) => codexScopeLabels[scope] || scope).join('、') || '无授权范围'}`, 'muted'));
+      card.append(text('p', `GUI 历史对账：${codexSnapshotLabel(grant.snapshotState)}${grant.snapshotMessage ? ` · ${grant.snapshotMessage}` : ''}`, grant.snapshotState === 'unknown' ? 'error' : 'muted'));
+      if (grant.pendingEvents) card.append(text('p', `本机未确认事件：${grant.pendingEvents}${grant.blockedEvents ? `（${grant.blockedEvents} 条因当前授权范围暂停上传）` : ''}。只有收到 Morde 服务端确认后才会清除缓冲。`, 'muted'));
+      card.append(button('撤销授权', async () => {
+        if (!window.confirm(`撤销“${grant.title || grant.threadId}”的 Morde 授权并停止上传未确认事件？`)) return;
+        await api.codexRevoke(grant.id);
+        message('已移除此线程的授权范围。');
+      }));
+      root.append(card);
+    }
+  }
+}
+
 function renderState(value) {
   state = value;
   $('login').hidden = value.authenticated;
@@ -575,6 +706,7 @@ function renderState(value) {
     if (value.origin && !$('origin').value) $('origin').value = value.origin;
     if (!value.storageReady) message('系统安全存储不可用，请解锁 Keychain、GNOME Keyring 或 KDE Wallet。', true);
   } else if (value.view === 'sync') {
+    renderCodex(value);
     void renderProjectUpload(value);
     void renderWorkspaces();
   }
@@ -897,6 +1029,7 @@ $('login-form').onsubmit = (event) => {
 };
 $('register').onclick = () => void run(() => api.publicPage('register', $('origin').value.trim()));
 $('download').onclick = () => void run(() => api.publicPage('download', $('origin').value.trim()));
+$('open-assistant').onclick = () => void run(() => api.openAssistant());
 api.onState(renderState);
 if (typeof api.onLiveSync === 'function') api.onLiveSync((value) => {
   const workspaceId = value?.workspaceId;

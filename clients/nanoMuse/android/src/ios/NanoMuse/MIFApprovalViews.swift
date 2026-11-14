@@ -7,7 +7,7 @@ struct MIFApprovalInboxRoom: View {
     private let onMenu: (() -> Void)?
     @StateObject private var store = MIFTaskPageStore.shared
     @Environment(\.dismiss) private var dismiss
-    private let onConfirmedCount: ((Int?) -> Void)?
+    private let onConfirmedCount: ((MIFApprovalCountSnapshot) -> Void)?
     private let onOpenEventChain: ((String) -> Void)?
     @State private var taskIDs: [String] = []
     @State private var details: [String: MordeTask] = [:]
@@ -20,9 +20,10 @@ struct MIFApprovalInboxRoom: View {
     @State private var isSubmitting = false
     @State private var actionMessage: String?
     @State private var submissionLedger = MIFApprovalSubmissionLedger()
+    @State private var expiryRevision = 0
     @Environment(\.colorScheme) private var colorScheme
 
-    init(onConfirmedCount: ((Int?) -> Void)? = nil, chrome: NanoMuseRoomChrome? = nil,
+    init(onConfirmedCount: ((MIFApprovalCountSnapshot) -> Void)? = nil, chrome: NanoMuseRoomChrome? = nil,
          onMenu: (() -> Void)? = nil, onOpenEventChain: ((String) -> Void)? = nil) {
         self.onConfirmedCount = onConfirmedCount
         self.chrome = chrome
@@ -31,6 +32,7 @@ struct MIFApprovalInboxRoom: View {
     }
 
     private var summary: MIFApprovalInboxSummary {
+        _ = expiryRevision
         let currentDetails = details.merging(store.details) { _, refreshed in refreshed }
         return MIFApprovalInboxSummary.make(taskIDs: taskIDs, details: currentDetails,
                                      failedTaskIDs: failedTaskIDs, pageReadFailed: pageReadFailed)
@@ -117,6 +119,11 @@ struct MIFApprovalInboxRoom: View {
         }
         .background(approvalCanvasColor.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .onChange(of: confirmedCount) { snapshot in
+            guard store.isSignedIn, let scopeKey = store.scopeKey,
+                  hasLoaded, loadedScopeKey == scopeKey else { return }
+            onConfirmedCount?(snapshot)
+        }
         .task(id: store.scopeKey) {
             let scopeKey = store.scopeKey
             await reload(scopeKey: scopeKey)
@@ -131,9 +138,11 @@ struct MIFApprovalInboxRoom: View {
 
     private var confirmedHeaderCountText: String? {
         guard store.isSignedIn, let scopeKey = store.scopeKey,
-              hasLoaded, loadedScopeKey == scopeKey, !summary.isPartial else { return nil }
-        return String(format: AppLocalized("%d approvals pending"), summary.approvals.count)
+              hasLoaded, loadedScopeKey == scopeKey, let count = confirmedCount.count else { return nil }
+        return String(format: AppLocalized("%d approvals pending"), count)
     }
+
+    private var confirmedCount: MIFApprovalCountSnapshot { summary.confirmedCount }
 
     private func approvalDesignHeader(onMenu: @escaping () -> Void) -> some View {
         HStack(spacing: 10) {
@@ -201,7 +210,6 @@ struct MIFApprovalInboxRoom: View {
     private func approvalCard(_ approval: MIFApprovalEntry) -> some View {
         let task = approval.task
         let pending = approval.pending
-        let canRespondInInbox = MIFApprovalInboxPolicy.canRespond(pending: pending)
         let decisionWasAccepted = submissionLedger.contains(approval.id, scopeKey: store.scopeKey)
         let taskStateConfirmsDecision = details[task.id].map {
             !taskStillHasPendingRequest($0, matching: approval)
@@ -210,6 +218,10 @@ struct MIFApprovalInboxRoom: View {
         if let object = pending.object, !object.isEmpty { factLines.append(object) }
         if !pending.content.isEmpty { factLines.append(pending.content) }
         if !pending.impact.isEmpty { factLines.append(pending.impact) }
+        factLines.append(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
+        if let expiresAt = pending.expirationDate {
+            factLines.append(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
+        }
 
         return VStack(alignment: .leading, spacing: 0) {
             Text(pending.title)
@@ -232,36 +244,63 @@ struct MIFApprovalInboxRoom: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if decisionWasAccepted {
-                Text(AppLocalized("Decision submitted; final status depends on refreshed task details."))
-                    .font(.system(size: 14.5, weight: .semibold))
-                    .foregroundStyle(NanoMuseTones.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 14)
-            } else if !canRespondInInbox {
-                Text(AppLocalized("Media approvals must be handled in the Task view with preview; this inbox does not offer approve or reject."))
-                    .font(.footnote)
-                    .foregroundStyle(NanoMuseTones.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                GeometryReader { geometry in
-                    let availableWidth = max(0, geometry.size.width - 8)
-                    HStack(spacing: 8) {
-                        approvalActionButton(AppLocalized("Reject"), isPrimary: false, isReject: true,
-                                             id: "mif.approval.reject.\(approval.id)", title: pending.title) {
-                            Task { await respond(to: approval, decision: "reject") }
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                Group {
+                    if pending.isExpired {
+                        Text(AppLocalized("Approval expired; the requested action was not run."))
+                            .font(.system(size: 14.5, weight: .semibold))
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 14)
+                            .accessibilityIdentifier("mif.approval.expired")
+                    } else if pending.deadlineHasPassed(at: timeline.date) {
+                        Text(AppLocalized("Approval deadline passed; refresh to confirm its status."))
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 14)
+                    } else if !pending.canRespond(taskStatus: task.status, at: timeline.date) {
+                        Text(AppLocalized("Approval status is unknown; refresh task details before acting."))
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 14)
+                    } else if decisionWasAccepted {
+                        Text(AppLocalized("Decision submitted; final status depends on refreshed task details."))
+                            .font(.system(size: 14.5, weight: .semibold))
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 14)
+                    } else if pending.media_preview_operation_id != nil {
+                        Text(AppLocalized("Media approvals must be handled in the Task view with preview; this inbox does not offer approve or reject."))
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        GeometryReader { geometry in
+                            let availableWidth = max(0, geometry.size.width - 8)
+                            HStack(spacing: 8) {
+                                approvalActionButton(AppLocalized("Reject"), isPrimary: false, isReject: true,
+                                                     id: "mif.approval.reject.\(approval.id)", title: pending.title) {
+                                    Task { await respond(to: approval, decision: "reject") }
+                                }
+                                .frame(width: availableWidth / 2.25)
+                                approvalActionButton(AppLocalized("Approve"), isPrimary: true, isReject: false,
+                                                     id: "mif.approval.approve.\(approval.id)", title: pending.title) {
+                                    Task { await respond(to: approval, decision: "approve") }
+                                }
+                                .frame(width: availableWidth * 1.25 / 2.25)
+                            }
                         }
-                        .frame(width: availableWidth / 2.25)
-                        approvalActionButton(AppLocalized("Approve"), isPrimary: true, isReject: false,
-                                             id: "mif.approval.approve.\(approval.id)", title: pending.title) {
-                            Task { await respond(to: approval, decision: "approve") }
-                        }
-                        .frame(width: availableWidth * 1.25 / 2.25)
+                        .frame(height: 44)
+                        .padding(.top, 14)
+                        .disabled(isSubmitting || store.actionInFlight ||
+                                  !MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: task.status, at: timeline.date))
                     }
                 }
-                .frame(height: 44)
-                .padding(.top, 14)
-                .disabled(isSubmitting || store.actionInFlight)
+                .onChange(of: pending.deadlineHasPassed(at: timeline.date)) { passed in
+                    if passed && pending.isPendingStatus { expiryRevision &+= 1 }
+                }
             }
 
             if summary.eventChainApprovalID == approval.id, !taskStateConfirmsDecision {
@@ -332,7 +371,7 @@ struct MIFApprovalInboxRoom: View {
             hasLoaded = false
             loadedScopeKey = nil
             actionMessage = nil
-            onConfirmedCount?(nil)
+            onConfirmedCount?(.unknown)
         }
 
         guard let scopeKey else {
@@ -403,7 +442,7 @@ struct MIFApprovalInboxRoom: View {
 
     @MainActor
     private func respond(to approval: MIFApprovalEntry, decision: String) async {
-        guard MIFApprovalInboxPolicy.canRespond(pending: approval.pending) else { return }
+        guard MIFApprovalInboxPolicy.canRespond(pending: approval.pending, taskStatus: approval.task.status) else { return }
         guard !isSubmitting, let scopeKey = store.scopeKey else { return }
         isSubmitting = true
         defer { isSubmitting = false }
@@ -450,7 +489,7 @@ struct MIFApprovalInboxRoom: View {
             guard store.scopeKey == scopeKey else { return }
             details.removeValue(forKey: approval.task.id)
             failedTaskIDs.insert(approval.task.id)
-            onConfirmedCount?(nil)
+            onConfirmedCount?(.unknown)
             actionMessage = accepted
                 ? AppLocalized("Decision accepted, but current status cannot be confirmed; approval count is unknown. Refresh task details to check.")
                 : AppLocalized("Approval result is unknown and status refresh failed; approval count is unknown. Retrying the same decision will reuse the client's saved request.")
@@ -467,14 +506,14 @@ struct MIFApprovalInboxRoom: View {
         guard task.status == "waiting_user",
               let pending = task.pending_request,
               pending.id == approval.pending.id,
-              pending.version == approval.pending.version else { return false }
+              pending.version == approval.pending.version,
+              pending.isPendingStatus else { return false }
         return pending.kind == nil || pending.kind == "approval"
     }
 
     private func publishConfirmedCount(for scopeKey: String) {
         guard store.scopeKey == scopeKey else { return }
-        let currentSummary = summary
-        onConfirmedCount?(currentSummary.isPartial ? nil : currentSummary.approvals.count)
+        onConfirmedCount?(summary.confirmedCount)
     }
 }
 
@@ -485,18 +524,28 @@ struct MIFApprovalEntry: Identifiable {
 }
 
 enum MIFApprovalInboxPolicy {
-    static func canRespond(pending: MordeTask.Pending) -> Bool {
-        pending.media_preview_operation_id == nil
+    static func canRespond(pending: MordeTask.Pending, taskStatus: String, at now: Date = Date()) -> Bool {
+        pending.canRespond(taskStatus: taskStatus, at: now) && pending.media_preview_operation_id == nil
     }
 }
 
 struct MIFApprovalInboxSummary {
     let approvals: [MIFApprovalEntry]
     let unresolvedCount: Int
+    let evaluatedAt: Date
 
     var eventChainApprovalID: String? { approvals.first?.id }
     var isPartial: Bool { unresolvedCount > 0 }
     var isConfirmedEmpty: Bool { approvals.isEmpty && !isPartial }
+    var pendingCount: Int { approvals.filter { $0.pending.canRespond(taskStatus: $0.task.status, at: evaluatedAt) }.count }
+    var confirmedCount: MIFApprovalCountSnapshot {
+        guard !isPartial else { return .unknown }
+        let deadline = approvals.compactMap { entry -> Date? in
+            guard entry.pending.canRespond(taskStatus: entry.task.status, at: evaluatedAt) else { return nil }
+            return entry.pending.expirationDate
+        }.min()
+        return MIFApprovalCountSnapshot(count: pendingCount, validUntil: deadline)
+    }
 
     private static let knownTaskStatuses: Set<String> = [
         "queued", "running", "waiting_user", "pausing", "paused", "cancelling", "completed", "failed", "cancelled"
@@ -511,7 +560,7 @@ struct MIFApprovalInboxSummary {
     }
 
     static func make(taskIDs: [String], details: [String: MordeTask],
-                     failedTaskIDs: Set<String>, pageReadFailed: Bool) -> MIFApprovalInboxSummary {
+                     failedTaskIDs: Set<String>, pageReadFailed: Bool, at now: Date = Date()) -> MIFApprovalInboxSummary {
         var approvals: [MIFApprovalEntry] = []
         var unresolvedCount = pageReadFailed ? 1 : 0
 
@@ -522,13 +571,25 @@ struct MIFApprovalInboxSummary {
             }
 
             if let pending = task.pending_request {
-                guard pending.kind == nil || pending.kind == "approval" else {
+                guard (pending.kind == nil || pending.kind == "approval"), pending.version > 0,
+                      MordeTaskResponsePolicy.hasValidRequestID(pending.id) else {
+                    unresolvedCount += 1
+                    continue
+                }
+                if pending.isExpired {
+                    approvals.append(MIFApprovalEntry(task: task, pending: pending))
+                    continue
+                }
+                guard pending.isPendingStatus else {
                     unresolvedCount += 1
                     continue
                 }
                 guard task.status == "waiting_user" else {
                     unresolvedCount += 1
                     continue
+                }
+                if pending.hasInvalidExpiration || pending.deadlineHasPassed(at: now) {
+                    unresolvedCount += 1
                 }
                 approvals.append(MIFApprovalEntry(task: task, pending: pending))
                 continue
@@ -544,8 +605,48 @@ struct MIFApprovalInboxSummary {
             }
         }
 
-        return MIFApprovalInboxSummary(approvals: approvals, unresolvedCount: unresolvedCount)
+        return MIFApprovalInboxSummary(approvals: approvals, unresolvedCount: unresolvedCount, evaluatedAt: now)
     }
+}
+
+struct MIFApprovalCountSnapshot: Equatable {
+    let count: Int?
+    let validUntil: Date?
+    static let unknown = MIFApprovalCountSnapshot(count: nil, validUntil: nil)
+}
+
+@MainActor
+final class MIFApprovalCountTracker: ObservableObject {
+    @Published private(set) var count: Int?
+    private var expiryTask: Task<Void, Never>?
+    private var generation: UInt64 = 0
+
+    func update(_ snapshot: MIFApprovalCountSnapshot) {
+        generation &+= 1
+        expiryTask?.cancel()
+        expiryTask = nil
+        guard let value = snapshot.count else { count = nil; return }
+        guard let deadline = snapshot.validUntil else { count = value; return }
+        guard deadline > Date() else { count = nil; return }
+        count = value
+        let currentGeneration = generation
+        expiryTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining <= 0 {
+                    guard let self, self.generation == currentGeneration else { return }
+                    self.count = nil
+                    self.expiryTask = nil
+                    return
+                }
+                do { try await Task.sleep(nanoseconds: UInt64(min(remaining, 86_400) * 1_000_000_000)) }
+                catch { return }
+            }
+        }
+    }
+
+    func clear() { update(.unknown) }
+    deinit { expiryTask?.cancel() }
 }
 
 // Keep the existing root call site source-compatible until the integration pass renames it.

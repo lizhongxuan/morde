@@ -511,6 +511,14 @@ func TestConversationRouteRetryAttemptsMigrationKeepsUnknownEvidence(t *testing.
 	if _, err := provider.UpTo(ctx, 195); err != nil {
 		t.Fatalf("reapply retry-attempt migration: %v", err)
 	}
+	if _, err := provider.UpTo(ctx, 198); err != nil {
+		t.Fatalf("restore current schema before exercising the route worker: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT aggregation_started_at,aggregation_deadline,aggregation_state
+FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).
+		Scan(&claim.AggregationStartedAt, &claim.AggregationDeadline, &claim.AggregationState); err != nil {
+		t.Fatalf("reload the migrated route claim: %v", err)
+	}
 
 	if _, err := gateway.ClassifyConversationRoute(ctx, claim, value); err == nil {
 		t.Fatal("first provider interruption reported a route decision")

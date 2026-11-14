@@ -355,6 +355,9 @@ func (e *RuntimeToolExecutor) hasCurrentRuntimeToolApproval(ctx context.Context,
 		!bytes.Equal(pending.RequestHash, hash[:]) || !bytes.Equal(decision.RequestHash, hash[:]) {
 		return false, domain.NewError(domain.CodeForbidden, "Host action approval does not match this exact tool call")
 	}
+	if pending.Status == task.PendingRequestExpired {
+		return false, domain.NewError(domain.CodeForbidden, "Host action approval has expired")
+	}
 	if pending.Status == task.PendingRequestRejected || decision.Decision != task.PendingDecisionApprove {
 		return false, domain.NewError(domain.CodeForbidden, "Host action approval was rejected")
 	}

@@ -398,6 +398,26 @@ func TestCloudDSHWorkspaceWriteRejectsWithoutChangingWorkspace(t *testing.T) {
 	}
 }
 
+func TestCloudDSHWorkspaceWriteExpiredApprovalDoesNotCommit(t *testing.T) {
+	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-expired", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/expired.txt", Content: "must not be saved",
+	})
+	first, err := broker.Execute(context.Background(), current, call)
+	if err != nil || first.Status != AgentToolNeedsUser || store.details.PendingRequest == nil {
+		t.Fatalf("initial Workspace write = %#v err=%v; want approval", first, err)
+	}
+	resumed := resumeCloudDSHT08WorkspaceApproval(store, task.PendingRequestExpired, task.PendingDecisionReject)
+	expiresAt, respondedAt := time.Now().UTC().Add(-time.Minute), time.Now().UTC()
+	store.details.PendingRequest.ExpiresAt, store.details.PendingRequest.RespondedAt = &expiresAt, &respondedAt
+	result, err := broker.Reconcile(context.Background(), resumed, call, nil)
+	if err != nil || result.Status != AgentToolFailed || !strings.Contains(result.Output, "expired") ||
+		workspaceStore.commits != 0 || workspaceStore.workspace.Revision != 0 || len(workspaceStore.snapshots[0]) != 0 {
+		t.Fatalf("expired Workspace write = %#v err=%v commits=%d revision=%d files=%#v",
+			result, err, workspaceStore.commits, workspaceStore.workspace.Revision, workspaceStore.snapshots[0])
+	}
+}
+
 func TestCloudDSHWorkspaceWriteApprovalCannotAuthorizeChangedContent(t *testing.T) {
 	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
 	original := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-changed", cloudDSHWorkspaceWriteArguments{

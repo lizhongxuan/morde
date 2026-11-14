@@ -36,6 +36,19 @@ type routeWorkerStub struct {
 	classified   app.ConversationRouteContext
 }
 
+type routeAggregationWorkerStub struct {
+	*routeWorkerStub
+	beginCalls int
+	started    bool
+	beginErr   error
+}
+
+func (s *routeAggregationWorkerStub) BeginConversationRouteAggregation(context.Context, app.ConversationRouteClaim,
+	app.ConversationRouteSnapshot, app.ConversationRouteDecision) (bool, error) {
+	s.beginCalls++
+	return s.started, s.beginErr
+}
+
 func (s *routeWorkerStub) ClaimConversationRoute(context.Context, string, time.Duration) (app.ConversationRouteClaim, bool, error) {
 	return s.claim, true, nil
 }
@@ -97,6 +110,52 @@ func TestConversationRouteWorkerRoutesFirstMessageAfterModelClassification(t *te
 	if err != nil || !found || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteNew ||
 		stub.snapshot.Context.ModelID != "p1234567" || stub.classifies != 1 {
 		t.Fatalf("first route = %+v, model=%q classifications=%d found=%t err=%v", stub.applied, stub.snapshot.Context.ModelID, stub.classifies, found, err)
+	}
+}
+
+func TestConversationRouteWorkerWaitsOnlyAfterClassifiedNewAndNeverSlidesTheWindow(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		decision  app.ConversationRouteDecision
+		modelErr  error
+		wantWait  bool
+		wantApply bool
+	}{
+		{name: "new", decision: app.ConversationRouteDecision{Action: app.ConversationRouteNew}, wantWait: true},
+		{name: "reply", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "Not a task."}, wantApply: true},
+		{name: "status", decision: app.ConversationRouteDecision{Action: app.ConversationRouteStatus, TaskID: "q1234567", ExpectedRevision: 1}, wantApply: true},
+		{name: "stop pending root", decision: app.ConversationRouteDecision{Action: app.ConversationRouteStop,
+			TargetMessageID: "m2345678"}, wantApply: true},
+		{name: "unknown model call", modelErr: errors.New("route result or usage is unknown")},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			stub.decision, stub.classifyErr = scenario.decision, scenario.modelErr
+			if scenario.name == "status" {
+				stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+					Status: task.StatusRunning, Revision: 1}}
+			}
+			if scenario.name == "stop pending root" {
+				stub.snapshot.Context.RequestCandidates = []app.ConversationRouteRequestCandidate{{MessageID: "m2345678",
+					Sequence: 1, Content: "root", RoutingStatus: conversation.RoutingProcessing,
+					SameExecutionScope: true, SameControlScope: true, SameAuthorization: true, AggregationWaiting: true}}
+			}
+			actions := &routeAggregationWorkerStub{routeWorkerStub: stub, started: true}
+			worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: stub, Actions: actions, Models: stub,
+				WorkerID: "route-aggregation-test", LeaseDuration: time.Minute, PollInterval: time.Millisecond,
+				MaxConcurrent: 1, Logger: zap.NewNop()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = worker.RunOnce(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (actions.beginCalls == 1) != scenario.wantWait || (len(stub.applied) != 0) != scenario.wantApply {
+				t.Fatalf("aggregation start status = calls:%d applied:%+v failures:%v, wantWait=%t",
+					actions.beginCalls, stub.applied, stub.failures, scenario.wantWait)
+			}
+		})
 	}
 }
 

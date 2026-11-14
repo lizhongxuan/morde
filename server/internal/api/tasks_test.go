@@ -641,11 +641,12 @@ func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 	}
 	view, err := toTaskResponse(value)
 	if err != nil || view.PendingRequest == nil || view.PendingRequest.ID != "r1234567" || view.PendingRequest.Version != 2 ||
-		view.PendingRequest.Impact != "The file will leave this Host." || view.PendingRequest.MediaPreviewOperationID != "o1234567" {
+		view.PendingRequest.Status != "pending" || view.PendingRequest.Impact != "The file will leave this Host." || view.PendingRequest.MediaPreviewOperationID != "o1234567" {
 		t.Fatalf("active pending request response = %#v, %v", view.PendingRequest, err)
 	}
 	encoded, err := json.Marshal(view.PendingRequest)
-	if err != nil || !strings.Contains(string(encoded), `"media_preview_operation_id":"o1234567"`) {
+	if err != nil || !strings.Contains(string(encoded), `"status":"pending"`) || !strings.Contains(string(encoded), `"media_preview_operation_id":"o1234567"`) ||
+		!strings.Contains(string(encoded), `"expires_at":null`) {
 		t.Fatalf("pending media preview JSON = %s, err=%v", encoded, err)
 	}
 	value.PendingRequest.MediaPreviewOperationID = "invalid"
@@ -657,6 +658,38 @@ func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 	view, err = toTaskResponse(value)
 	if err != nil || view.PendingRequest != nil {
 		t.Fatalf("resolved pending request must not be offered again: %#v, %v", view.PendingRequest, err)
+	}
+}
+
+func TestTaskResponseShowsOnlyServerExpiredApprovalAsExpired(t *testing.T) {
+	now := time.Now().UTC()
+	expiresAt := now.Add(-time.Minute)
+	respondedAt := now
+	current := apiTestTask()
+	current.Status, current.WaitingReason = task.StatusQueued, ""
+	value := app.TaskDetails{
+		Task: current,
+		PendingRequest: &task.PendingRequest{
+			ID: "r1234567", TaskID: current.ID, Version: 2, Kind: "approval", Title: "Approve file write",
+			Object: "report.txt", Content: "Write this file?", Impact: "The authorized Workspace will change.",
+			Status: task.PendingRequestExpired, Decision: task.PendingDecisionReject,
+			ExpiresAt: &expiresAt, RespondedAt: &respondedAt,
+		},
+	}
+	view, err := toTaskResponse(value)
+	if err != nil || view.PendingRequest == nil || view.PendingRequest.Status != "expired" || view.PendingRequest.ExpiresAt == nil ||
+		!view.PendingRequest.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expired approval response = %#v, err=%v", view.PendingRequest, err)
+	}
+	encoded, err := json.Marshal(view.PendingRequest)
+	if err != nil || !strings.Contains(string(encoded), `"status":"expired"`) || !strings.Contains(string(encoded), `"expires_at":"`) {
+		t.Fatalf("expired approval JSON = %s, err=%v", encoded, err)
+	}
+
+	value.PendingRequest.Status = task.PendingRequestRejected
+	value.PendingRequest.ExpiresAt = nil
+	if response, err := toTaskResponse(value); err != nil || response.PendingRequest != nil {
+		t.Fatalf("ordinary rejection without expiry was exposed as expired: %#v err=%v", response.PendingRequest, err)
 	}
 }
 
@@ -1584,6 +1617,30 @@ func TestTaskEventPayloadsExposeOnlyTypeAllowlistedFields(t *testing.T) {
 				t.Errorf("safe step detail was removed: %s", payload)
 			}
 		})
+	}
+}
+
+func TestTaskEventPayloadsDropUnexpectedValueShapes(t *testing.T) {
+	payload, err := publicTaskEventPayload(task.Event{Type: "task.step", Payload: []byte(
+		`{"step_id":"s1234567","status":{"credential":"nested-secret"},"title":"Read file","summary":["private-array"],"detail":{"tool":{"secret":"nested-tool-secret"},"usage_known":true,"phase":["private-phase"]}}`,
+	)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("public payload is invalid JSON: %v", err)
+	}
+	if _, ok := decoded["status"]; ok {
+		t.Errorf("object-shaped status survived projection: %s", payload)
+	}
+	if _, ok := decoded["summary"]; ok {
+		t.Errorf("array-shaped summary survived projection: %s", payload)
+	}
+	if !strings.Contains(string(payload), `"step_id":"s1234567"`) || !strings.Contains(string(payload), `"title":"Read file"`) ||
+		!strings.Contains(string(payload), `"usage_known":true`) || strings.Contains(string(payload), "nested-secret") ||
+		strings.Contains(string(payload), "nested-tool-secret") || strings.Contains(string(payload), "private-phase") {
+		t.Fatalf("projection removed known scalar data or leaked nested unknown values: %s", payload)
 	}
 }
 

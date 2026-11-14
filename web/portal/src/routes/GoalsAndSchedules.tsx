@@ -6,7 +6,7 @@ import type { components } from '../api/schema';
 import { api, unwrapApiResponse } from '../api/client';
 import { errorDetails, portalApi } from '../app/api';
 import { ScreenPagination } from '../components/ScreenPagination';
-import { FloatingError } from '../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type GoalBody = components['schemas']['GoalBody'];
 type GoalStep = components['schemas']['GoalStep'];
@@ -261,8 +261,8 @@ export function GoalsAndSchedules() {
         <span>{hosts.isError ? `无法读取可用主机：${errorDetails(hosts.error).message}` : `无法读取可用模型：${errorDetails(models.error).message}`}</span>
         <button type="button" className="button button-secondary" onClick={() => { if (hosts.isError) void hosts.refetch(); if (models.isError) void models.refetch(); }}>重试</button>
       </FloatingError>}
-      {!hosts.isPending && !hosts.isError && !hostItems.length && <p className="notice notice-warning">当前没有可访问的主机。可以创建仅文本计划；使用浏览器观察时必须选择 Host。</p>}
-      {!models.isPending && !models.isError && !modelItems.length && <p className="notice notice-warning">当前没有可用模型。创建计划需要先配置模型。</p>}
+      {!hosts.isPending && !hosts.isError && !hostItems.length && <FloatingNotice className="notice-warning" data-notice-label="主机不可用">当前没有可访问的主机。可以创建仅文本计划；使用浏览器观察时必须选择 Host。</FloatingNotice>}
+      {!models.isPending && !models.isError && !modelItems.length && <FloatingNotice className="notice-warning" data-notice-label="模型不可用">当前没有可用模型。创建计划需要先配置模型。</FloatingNotice>}
       {schedules.isPending ? <div className="loading-card" role="status">正在读取定时计划…</div>
         : schedules.isError ? <FloatingError className="error-card" role="alert">{errorDetails(schedules.error).message}<button type="button" className="button button-secondary" onClick={() => void schedules.refetch()}>重试</button></FloatingError>
           : scheduleRecords.length === 0 ? <div className="empty-card"><h3>还没有云端计划</h3><p>只有通过上方按钮提交创建后，计划才会写入云端。</p></div>

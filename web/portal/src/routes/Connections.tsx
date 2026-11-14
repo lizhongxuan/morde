@@ -8,7 +8,7 @@ import { modelConnectionPresets } from '../app/model-presets';
 import { useToast } from '../app/toast';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { MCPConnectorsPanel } from './MCPConnectorsPanel';
-import { FloatingError } from '../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type ModelConnection = Awaited<ReturnType<typeof api.modelConnections>>['items'][number];
 type PersonalModelDraft = { name: string; baseURL: string; modelName: string; contextWindowTokens: string; apiKey: string };
@@ -132,7 +132,7 @@ export function Connections() {
 
   return <section className="connections-page">
     <div className="page-heading"><div><p className="eyebrow">接入与设置</p><h1>模型连接</h1><p className="muted">可使用管理员配置的共享模型，也可添加仅自己可见的模型。密钥只提交给 Morde 服务端，不会回显或保存在浏览器存储中。</p></div></div>
-    {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-warning" role="status">当前为演示模式，没有连接真实服务。模型密钥不会保存到数据库，请勿输入真实 API 密钥。</p>}
+    {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <FloatingNotice className="notice-warning" data-notice-label="演示模式">当前为演示模式，没有连接真实服务。模型密钥不会保存到数据库，请勿输入真实 API 密钥。</FloatingNotice>}
     <div className="connection-area-tabs" role="group" aria-label="模型与工具分类">
       <button type="button" className={`button button-small ${activeArea === 'personal' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'personal'} onClick={() => setActiveArea('personal')}>个人模型{personalModels.length ? ` · ${personalModels.length}` : ''}</button>
       <button type="button" className={`button button-small ${activeArea === 'team' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'team'} onClick={() => setActiveArea('team')}>团队模型{sharedModels.length ? ` · ${sharedModels.length}` : ''}</button>

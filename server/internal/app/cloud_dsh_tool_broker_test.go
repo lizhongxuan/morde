@@ -727,6 +727,29 @@ func TestCloudDSHToolBrokerRejectedApprovalReturnsWithoutDispatch(t *testing.T) 
 	}
 }
 
+func TestCloudDSHToolBrokerExpiredApprovalReturnsWithoutDispatch(t *testing.T) {
+	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
+	first, err := broker.Execute(context.Background(), store.details.Task, call)
+	if err != nil || first.Status != AgentToolNeedsUser {
+		t.Fatalf("initial sensitive call = %#v, %v; want approval pause", first, err)
+	}
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestExpired, task.PendingDecisionReject)
+	store.mu.Lock()
+	expiresAt := time.Now().Add(-time.Minute).UTC()
+	respondedAt := time.Now().UTC()
+	store.details.PendingRequest.ExpiresAt = &expiresAt
+	store.details.PendingRequest.RespondedAt = &respondedAt
+	store.mu.Unlock()
+	result, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || result.Status != AgentToolFailed || result.Output != "The approval expired. This exact action was not executed." {
+		t.Fatalf("expired exact call = %#v, %v; want expiry failure", result, err)
+	}
+	if store.details.Task.Usage.ToolCalls != 1 || fixture.handlers["shell.exec"].calls.Load() != 0 || len(fixture.store.operations) != 0 {
+		t.Fatalf("expired action crossed dispatch or counted twice: usage=%+v dispatches=%d operations=%d", store.details.Task.Usage,
+			fixture.handlers["shell.exec"].calls.Load(), len(fixture.store.operations))
+	}
+}
+
 func TestCloudDSHToolRejectedApprovalUpdatesSameFencedActivityStep(t *testing.T) {
 	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
 	current := &store.details.Task

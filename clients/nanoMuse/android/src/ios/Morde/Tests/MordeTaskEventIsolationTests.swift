@@ -8,6 +8,19 @@ final class MordeTaskEventIsolationTests: XCTestCase {
         XCTAssertTrue(MordeTaskEventCursor.shouldPresent(sequence: 9, initialSequence: 8))
     }
 
+    func testRevokedTaskStaysHiddenUntilANewerAuthorizedRead() {
+        var fence = MordeTaskAccessFence()
+        let stalePageToken = fence.token
+        fence.deny("q1234567")
+        fence.confirm(["q1234567"], requestToken: stalePageToken)
+        XCTAssertEqual(fence.deniedTaskIDs, ["q1234567"])
+        let currentToken = fence.token
+        fence.confirm(["q2345678"], requestToken: currentToken)
+        XCTAssertEqual(fence.deniedTaskIDs, ["q1234567"])
+        fence.confirm(["q1234567"], requestToken: currentToken)
+        XCTAssertTrue(fence.deniedTaskIDs.isEmpty)
+    }
+
     func testSameConversationTaskCursorsResumeIndependently() async {
         let first = MordeTaskEventCursor(taskID: "q1234567", afterSequence: 3)
         let second = MordeTaskEventCursor(taskID: "q2345678", afterSequence: 11)
@@ -24,6 +37,34 @@ final class MordeTaskEventIsolationTests: XCTestCase {
         XCTAssertEqual(secondResult.queryValue, "14", "Recovering one task snapshot must not move the other task cursor.")
         XCTAssertFalse(firstResult.advance(eventID: "15", for: second.taskID))
         XCTAssertEqual(firstResult.queryValue, "9")
+    }
+
+    func testEventCursorIsNotCommittedUntilSnapshotRecoverySucceeds() throws {
+        var cursor = MordeTaskEventCursor(taskID: "q1234567", afterSequence: 3)
+        let candidate = try XCTUnwrap(cursor.advancing(eventID: "4", for: cursor.taskID))
+        XCTAssertEqual(cursor.queryValue, "3", "A failed snapshot fetch must retry from the old cursor.")
+        var snapshotCursor = candidate
+        XCTAssertFalse(snapshotCursor.resume(eventID: "4", snapshotSequence: 3))
+        XCTAssertEqual(cursor.queryValue, "3")
+        XCTAssertTrue(snapshotCursor.resume(eventID: "4", snapshotSequence: 9))
+        cursor = candidate
+        XCTAssertEqual(cursor.queryValue, "4", "An ahead-of-stream snapshot must not skip available events on reconnect.")
+        var expiredCursor = cursor
+        XCTAssertTrue(expiredCursor.resume(eventID: "5", snapshotSequence: 9))
+        cursor = expiredCursor
+        XCTAssertEqual(cursor.queryValue, "9")
+        XCTAssertNil(cursor.advancing(eventID: "10", for: "q2345678"))
+    }
+
+    func testKnownEventsRefreshSnapshotAndUnknownEventsCanAdvance() throws {
+        for type in ["task.status", "task.step", "task.operation", "task.message", "task.batch_item",
+                     "task.artifact", "task.waiting_user", "task.response", "task.result"] {
+            XCTAssertTrue(MordeTaskEventSnapshotPolicy.requiresRefresh(type: type), type)
+        }
+        XCTAssertFalse(MordeTaskEventSnapshotPolicy.requiresRefresh(type: "task.future_safe_event"))
+        let cursor = MordeTaskEventCursor(taskID: "q1234567", afterSequence: 3)
+        let unknownEvent = try XCTUnwrap(cursor.advancing(eventID: "4", for: cursor.taskID))
+        XCTAssertEqual(unknownEvent.queryValue, "4")
     }
 
     func testStoppingSelectedTaskTargetsOnlyThatTaskInSameConversation() throws {

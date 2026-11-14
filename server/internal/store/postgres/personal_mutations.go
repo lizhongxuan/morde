@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
+	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -90,9 +90,10 @@ func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identit
 	var storedObjectID string
 	var previousObjectBytes int64
 	var previousBody []byte
-	objectErr := tx.QueryRow(ctx, `SELECT object_id, COALESCE(octet_length(body::text),0), COALESCE(body::text,'') FROM personal_objects
+	var previousObjectUpdatedAt time.Time
+	objectErr := tx.QueryRow(ctx, `SELECT object_id, COALESCE(octet_length(body::text),0), COALESCE(body::text,''), updated_at FROM personal_objects
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR UPDATE`,
-		instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&storedObjectID, &previousObjectBytes, &previousBody)
+		instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&storedObjectID, &previousObjectBytes, &previousBody, &previousObjectUpdatedAt)
 	objectExists := objectErr == nil
 	if objectErr != nil && !errors.Is(objectErr, pgx.ErrNoRows) {
 		return personal.MutationReceipt{}, fmt.Errorf("lock personal object: %w", objectErr)
@@ -141,6 +142,20 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	if err != nil {
 		return personal.MutationReceipt{}, err
 	}
+	var memoryHistoryDelta int64
+	if mutation.ObjectType == personal.ObjectTypeMemory {
+		if mutation.Delete {
+			var purgedHistoryBytes int64
+			purgedHistoryBytes, err = purgePersonalMemoryHistoryBodiesInTx(ctx, tx, instanceID, mutation.OwnerID, mutation.ObjectID)
+			memoryHistoryDelta = -purgedHistoryBytes
+		} else if objectExists {
+			memoryHistoryDelta, err = storePersonalMemoryRevisionInTx(ctx, tx, instanceID, mutation.OwnerID, mutation.ObjectID,
+				currentRevision, previousBody, previousObjectUpdatedAt)
+		}
+		if err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
 	if mutation.Delete {
 		if _, err := tx.Exec(ctx, `UPDATE personal_objects SET body=NULL, updated_at=clock_timestamp()
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4`,
@@ -172,11 +187,15 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 		return personal.MutationReceipt{}, err
 	}
 	objectDelta, attachmentDelta := nextObjectBytes-previousObjectBytes, nextAttachmentBytes-previousAttachmentBytes
-	if (attachmentDelta > 0 && objectDelta > math.MaxInt64-attachmentDelta) ||
-		(attachmentDelta < 0 && objectDelta < math.MinInt64-attachmentDelta) {
+	usageDelta, ok := addPersonalQuotaBytes(objectDelta, attachmentDelta)
+	if !ok {
 		return personal.MutationReceipt{}, domain.NewError(domain.CodeInternal, "personal data usage delta overflowed")
 	}
-	if err := applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, mutation.OwnerID, objectDelta+attachmentDelta); err != nil {
+	usageDelta, ok = addPersonalQuotaBytes(usageDelta, memoryHistoryDelta)
+	if !ok {
+		return personal.MutationReceipt{}, domain.NewError(domain.CodeInternal, "personal data usage delta overflowed")
+	}
+	if err := applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, mutation.OwnerID, usageDelta); err != nil {
 		return personal.MutationReceipt{}, err
 	}
 	operation := "upsert"

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -12,7 +12,8 @@ import type { PendingWorkspaceRestore } from '../app/workspace-restore';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { WorkspaceTransferPreview } from '../components/WorkspaceTransferPreview';
-import { FloatingError } from '../components/FloatingError';
+import { FloatingError, FloatingNotice } from '../components/FloatingError';
+import { LocalWorkspaceRecovery } from '../components/LocalWorkspaceRecovery';
 
 type Workspace = Awaited<ReturnType<typeof portalApi.workspaces>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
@@ -36,6 +37,17 @@ type ProjectDirectorySelection = {
 type PortalProjectBridge = {
   projectUploadTargets?: () => Promise<unknown>;
   selectProjectDirectory?: (hostId: string, workspaceId: string) => Promise<unknown>;
+  uploadProject?: (selectionID: string, projectName: string) => Promise<unknown>;
+  stopProjectSync?: (selectionID: string) => Promise<unknown>;
+  state?: () => Promise<unknown>;
+  onState?: (listener: (value: unknown) => void) => () => void;
+  onSync?: (listener: (value: unknown) => void) => () => void;
+};
+type LocalProjectState = {
+  projectMappings: ProjectDirectorySelection[];
+  syncState: 'idle' | 'running' | 'shutdown_unknown';
+  syncCheckpoint: { workspaceId: string; projectSelectionID?: string; projectName?: string; sessionState?: string; hostApplicationStatus?: string } | null;
+  syncRecovery: { state: string; message?: string } | null;
 };
 type PendingWorkspaceCreate = { version: 1; name: string; idempotencyKey: string };
 type WorkspaceRevisionDiff = components['schemas']['WorkspaceDiff'];
@@ -134,6 +146,71 @@ function parseProjectDirectorySelection(value: unknown, target: ProjectUploadTar
   };
 }
 
+function parseLocalProjectState(value: unknown): LocalProjectState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('本机同步状态无效');
+  const state = value as Record<string, unknown>;
+  if (!Array.isArray(state.projectMappings) || state.projectMappings.length > 1000
+    || !['idle', 'running', 'shutdown_unknown'].includes(String(state.syncState))) throw new Error('本机同步状态无效');
+  const mappings = state.projectMappings.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('本机项目目录状态无效');
+    const mapping = item as Record<string, unknown>;
+    if (typeof mapping.hostId !== 'string' || !/^h[a-z0-9]{7}$/.test(mapping.hostId)
+      || typeof mapping.workspaceId !== 'string' || !/^w[a-z0-9]{7}$/.test(mapping.workspaceId)) throw new Error('本机项目目录状态无效');
+    return parseProjectDirectorySelection(item, { hostId: mapping.hostId, workspaceId: mapping.workspaceId,
+      hostName: '', hostState: 'stopped', workspaceName: '', folders: [] })!;
+  });
+  const checkpoint = state.syncCheckpoint;
+  if (checkpoint !== null && (!checkpoint || typeof checkpoint !== 'object' || Array.isArray(checkpoint))) throw new Error('本机同步恢复点无效');
+  const saved = checkpoint as Record<string, unknown> | null;
+  if (saved && (saved.mode !== 'project_upload' || typeof saved.workspaceId !== 'string' || !/^w[a-z0-9]{7}$/.test(saved.workspaceId)
+    || ['projectSelectionID', 'projectName', 'sessionState', 'hostApplicationStatus'].some((key) => saved[key] !== undefined && typeof saved[key] !== 'string'))) {
+    throw new Error('本机同步恢复点无效');
+  }
+  const recovery = state.syncRecovery;
+  if (recovery !== null && (!recovery || typeof recovery !== 'object' || Array.isArray(recovery)
+    || typeof (recovery as Record<string, unknown>).state !== 'string'
+    || ((recovery as Record<string, unknown>).message !== undefined && typeof (recovery as Record<string, unknown>).message !== 'string'))) {
+    throw new Error('本机同步恢复状态无效');
+  }
+  return { projectMappings: mappings, syncState: state.syncState as LocalProjectState['syncState'],
+    syncCheckpoint: saved as LocalProjectState['syncCheckpoint'], syncRecovery: recovery as LocalProjectState['syncRecovery'] };
+}
+
+function projectUploadStatus(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '同步结果未知，请核对状态。';
+  const result = value as Record<string, unknown>;
+  if (result.cancelled === true) return '已取消，未开始同步。';
+  const session = result.session && typeof result.session === 'object' && !Array.isArray(result.session)
+    ? result.session as Record<string, unknown> : {};
+  const receipt = result.hostApplication && typeof result.hostApplication === 'object' && !Array.isArray(result.hostApplication)
+    ? result.hostApplication as Record<string, unknown> : {};
+  if (session.state === 'completed' && result.cloudStatus === 'confirmed') {
+    if (result.hostStatus === 'applied' && receipt.status === 'applied'
+      && Number.isSafeInteger(receipt.targetRevision) && Number.isSafeInteger(receipt.appliedRevision)
+      && Number(receipt.targetRevision) >= 0 && Number(receipt.appliedRevision) >= Number(receipt.targetRevision)
+      && Array.isArray(receipt.impacts) && receipt.impacts.length === 0) return '同步完成，目标电脑已应用本次项目。';
+    if (receipt.status === 'conflict') return `云端已确认，目标电脑存在冲突；恢复点已保留。${projectConflictPaths(receipt.impacts)}`;
+    if (receipt.status === 'unknown' || result.hostStatus === 'unknown') return '云端已确认，目标电脑应用状态未知；恢复点已保留。';
+    return '云端已确认，等待目标电脑应用。';
+  }
+  const messages: Record<string, string> = { running: '同步仍在进行，恢复点已保留。', conflict: '发现冲突，本次同步未提交。',
+    failed: '同步失败，云端未确认完成。', cancelled: '同步已取消，云端未确认完成。', expired: '同步会话已过期，云端未确认完成。' };
+  return typeof session.state === 'string' ? `${messages[session.state] ?? '同步结果待确认。'}${session.state === 'conflict' ? projectConflictPaths(result.conflicts) : ''}` : '同步结果未知，请核对状态。';
+}
+
+function projectConflictPaths(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  const paths = value.slice(0, 8).flatMap((item: unknown) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const path = (item as Record<string, unknown>).path;
+    if (path === '.') return ['项目根目录'];
+    if (typeof path !== 'string' || path.length > 4096 || path.includes('\\') || hasControlCharacters(path)
+      || path.split('/').some((part) => !part || part === '.' || part === '..')) return [];
+    return [path];
+  });
+  return paths.length ? ` 受影响路径：${paths.join('、')}。` : '';
+}
+
 function validateProjectName(value: string): { name: string; error: string | null } {
   const name = value.normalize('NFC');
   if (!name || name.trim() !== name || [...name].length > 120 || name === '.' || name === '..'
@@ -211,8 +288,12 @@ function readPendingWorkspaceCreate(userID?: string): { pending: PendingWorkspac
 }
 
 export function Workspaces() {
-  const client = useQueryClient();
   const { user } = useAuth();
+  return <WorkspacesContent key={user?.id ?? 'anonymous'} user={user} />;
+}
+
+function WorkspacesContent({ user }: { user: ReturnType<typeof useAuth>['user'] }) {
+  const client = useQueryClient();
   const { notify } = useToast();
   const [searchParams] = useSearchParams();
   const computerID = searchParams.get('host') ?? '';
@@ -250,7 +331,43 @@ export function Workspaces() {
   const [projectDirectoryError, setProjectDirectoryError] = useState('');
   const [projectDirectoryNotice, setProjectDirectoryNotice] = useState('');
   const [projectNameError, setProjectNameError] = useState('');
+  const [localProjectState, setLocalProjectState] = useState<LocalProjectState | null>(null);
+  const [localProjectError, setLocalProjectError] = useState('');
+  const [projectUploadBusy, setProjectUploadBusy] = useState(false);
+  const [projectStopBusy, setProjectStopBusy] = useState(false);
+  const [projectUploadMessage, setProjectUploadMessage] = useState('');
+  const projectStateRevision = useRef(0);
+  const projectSelectionRevision = useRef(0);
+  const currentProjectOwner = useRef(user?.id);
   const revisionRequestID = useRef(0);
+  useEffect(() => {
+    currentProjectOwner.current = user?.id;
+    return () => { currentProjectOwner.current = undefined; };
+  }, [user?.id]);
+  useEffect(() => {
+    if (!projectBridge?.state || !user?.id) return;
+    let active = true;
+    const apply = (value: unknown) => {
+      if (!active) return;
+      projectStateRevision.current += 1;
+      try { setLocalProjectState(parseLocalProjectState(value)); setLocalProjectError(''); }
+      catch { setLocalProjectState(null); setLocalProjectError('无法确认本机同步状态，请重试。'); }
+    };
+    const stopState = projectBridge.onState?.(apply);
+    const stopSync = projectBridge.onSync?.((value) => {
+      if (!active || !value || typeof value !== 'object' || Array.isArray(value)) return;
+      const event = value as Record<string, unknown>;
+      if (event.mode !== 'project_upload') return;
+      if (event.state === 'running') setProjectUploadMessage('同步进行中…');
+      else if (event.state === 'shutdown_unknown' || event.state === 'offline') setProjectUploadMessage('同步状态未知，恢复点已保留。');
+    });
+    const startedAt = projectStateRevision.current;
+    void projectBridge.state().then((value) => { if (active && startedAt === projectStateRevision.current) apply(value); })
+      .catch(() => { if (active && startedAt === projectStateRevision.current) {
+        setLocalProjectState(null); setLocalProjectError('无法读取本机同步状态，请重试。');
+      } });
+    return () => { active = false; stopState?.(); stopSync?.(); };
+  }, [projectBridge, user?.id]);
   const projectCapabilities = useQuery({
     queryKey: ['project-upload-capabilities'],
     queryFn: portalApi.capabilities,
@@ -290,9 +407,29 @@ export function Workspaces() {
   const selectedProjectTarget = projectTargets.data?.find((target) => `${target.hostId}/${target.workspaceId}` === selectedProjectTargetKey)
     ?? configuredDefaultProjectTarget
     ?? (projectPreferences.isSuccess && !projectPreferences.data.default_host_id ? projectTargets.data?.[0] : undefined);
-  const projectSelectionMatchesTarget = Boolean(selectedProjectTarget && projectDirectorySelection
-    && projectDirectorySelection.hostId === selectedProjectTarget.hostId
-    && projectDirectorySelection.workspaceId === selectedProjectTarget.workspaceId);
+  const scopedProjectState = localProjectState;
+  const scopedProjectSelection = projectDirectorySelection;
+  const savedProjectSelection = scopedProjectState?.projectMappings.find((item) => item.hostId === selectedProjectTarget?.hostId
+    && item.workspaceId === selectedProjectTarget.workspaceId);
+  const projectSelectionMatchesTarget = Boolean(selectedProjectTarget && scopedProjectSelection
+    && scopedProjectSelection.hostId === selectedProjectTarget.hostId
+    && scopedProjectSelection.workspaceId === selectedProjectTarget.workspaceId);
+  useEffect(() => {
+    if (!savedProjectSelection || scopedProjectSelection || !user?.id) return;
+    // Restore a saved native directory selection into the editable form once it arrives.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setProjectDirectorySelection(savedProjectSelection);
+    setProjectNameDraft(savedProjectSelection.projectName);
+    setConfirmedProjectName('');
+  }, [savedProjectSelection, scopedProjectSelection, user?.id]);
+  const projectCheckpoint = scopedProjectState?.syncCheckpoint;
+  const checkpointMatchesSelection = Boolean(projectCheckpoint && scopedProjectSelection
+    && projectCheckpoint.workspaceId === scopedProjectSelection.workspaceId
+    && projectCheckpoint.projectSelectionID === scopedProjectSelection.selectionID
+    && projectCheckpoint.projectName === confirmedProjectName);
+  const receiptSelection = projectCheckpoint?.sessionState === 'completed' && projectCheckpoint.projectName
+    ? scopedProjectState?.projectMappings.find((item) => item.selectionID === projectCheckpoint.projectSelectionID
+      && item.workspaceId === projectCheckpoint.workspaceId && item.projectName === projectCheckpoint.projectName) : undefined;
   const projectNameValidation = validateProjectName(projectNameDraft);
   const query = useQuery({
     queryKey: ['workspaces'], queryFn: portalApi.workspaces,
@@ -600,14 +737,17 @@ export function Workspaces() {
   };
   const chooseProjectDirectory = async () => {
     if (!selectedProjectTarget || !projectUploadGateEnabled || !projectBridge?.selectProjectDirectory) return;
+    const target = selectedProjectTarget;
+    const ownerID = user?.id;
+    const revision = ++projectSelectionRevision.current;
     setProjectDirectoryBusy(true);
     setProjectDirectoryError('');
     setProjectDirectoryNotice('');
     try {
       const selection = parseProjectDirectorySelection(
-        await projectBridge.selectProjectDirectory(selectedProjectTarget.hostId, selectedProjectTarget.workspaceId),
-        selectedProjectTarget,
+        await projectBridge.selectProjectDirectory(target.hostId, target.workspaceId), target,
       );
+      if (revision !== projectSelectionRevision.current || ownerID !== currentProjectOwner.current) return;
       if (!selection) {
         setProjectDirectoryNotice('已取消本机目录选择。');
         return;
@@ -618,39 +758,100 @@ export function Workspaces() {
       setProjectNameError('');
       setProjectDirectoryNotice(`已选择本机目录“${selection.directoryName}”。`);
     } catch (error) {
-      setProjectDirectoryError(`选择本机目录失败：${errorDetails(error).message}`);
+      if (revision === projectSelectionRevision.current && ownerID === currentProjectOwner.current) setProjectDirectoryError(`选择本机目录失败：${errorDetails(error).message}`);
     } finally {
-      setProjectDirectoryBusy(false);
+      if (ownerID === currentProjectOwner.current) setProjectDirectoryBusy(false);
     }
   };
   const confirmProjectName = () => {
     const validation = validateProjectName(projectNameDraft);
     setProjectNameError(validation.error ?? '');
-    if (!validation.error && projectDirectorySelection) setConfirmedProjectName(validation.name);
+    if (!validation.error && scopedProjectSelection) setConfirmedProjectName(validation.name);
+  };
+  const refreshLocalProjectState = async () => {
+    if (!projectBridge?.state || !user?.id) return;
+    const ownerID = user.id;
+    const revision = projectStateRevision.current;
+    try {
+      const value = await projectBridge.state();
+      if (ownerID !== currentProjectOwner.current || revision !== projectStateRevision.current) return;
+      setLocalProjectState(parseLocalProjectState(value));
+      setLocalProjectError('');
+    } catch {
+      if (ownerID !== currentProjectOwner.current || revision !== projectStateRevision.current) return;
+      setLocalProjectState(null);
+      setLocalProjectError('无法读取本机同步状态，请重试。');
+    }
+  };
+  const startProjectUpload = async (selection: ProjectDirectorySelection, name: string, receiptOnly = false) => {
+    if (!projectBridge?.uploadProject || !scopedProjectState || projectUploadBusy || !user?.id) return;
+    if (!receiptOnly && (!projectUploadGateEnabled || !projectSelectionMatchesTarget || selection.selectionID !== scopedProjectSelection?.selectionID
+      || !name || name !== confirmedProjectName || scopedProjectState.syncState !== 'idle'
+      || (projectCheckpoint && !checkpointMatchesSelection) || scopedProjectState.syncRecovery?.state === 'unknown')) return;
+    if (receiptOnly && (scopedProjectState.syncState === 'running' || projectCheckpoint?.sessionState !== 'completed' || receiptSelection?.selectionID !== selection.selectionID
+      || projectCheckpoint.projectName !== name)) return;
+    const ownerID = user.id;
+    setProjectUploadBusy(true);
+    setProjectUploadMessage(receiptOnly ? '正在核对目标电脑应用状态…' : '正在准备同步…');
+    try {
+      const result = await projectBridge.uploadProject(selection.selectionID, name);
+      if (ownerID === currentProjectOwner.current) setProjectUploadMessage(projectUploadStatus(result));
+    } catch (error) {
+      if (ownerID === currentProjectOwner.current) setProjectUploadMessage(`同步未确认：${errorDetails(error).message}`);
+    } finally {
+      if (ownerID === currentProjectOwner.current) {
+        await refreshLocalProjectState();
+        setProjectUploadBusy(false);
+      }
+    }
+  };
+  const stopProjectUpload = async () => {
+    const selectionID = projectCheckpoint?.projectSelectionID;
+    if (!selectionID || !projectBridge?.stopProjectSync || projectStopBusy || !user?.id) return;
+    const ownerID = user.id;
+    setProjectStopBusy(true);
+    try {
+      const stopped = await projectBridge.stopProjectSync(selectionID);
+      if (ownerID === currentProjectOwner.current) setProjectUploadMessage(stopped === true
+        ? '同步已停止，恢复点已保留。' : '同步停止状态未知，恢复点已保留。');
+    } catch (error) {
+      if (ownerID === currentProjectOwner.current) setProjectUploadMessage(`同步停止未确认：${errorDetails(error).message}`);
+    } finally {
+      if (ownerID === currentProjectOwner.current) { await refreshLocalProjectState(); setProjectStopBusy(false); }
+    }
   };
 
   return <section className="workspace-route">
-    {import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-info" role="status">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实云端文件。</p>}
-    {computerID && hosts.isSuccess && !computer && <p className="notice notice-warning" role="status">无法确认这台云端电脑的文件访问权限。</p>}
+    {import.meta.env.VITE_MOCK_API === '1' && <FloatingNotice className="notice-info" data-notice-label="演示模式">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实云端文件。</FloatingNotice>}
+    {computerID && hosts.isSuccess && !computer && <FloatingNotice className="notice-warning">无法确认这台云端电脑的文件访问权限。</FloatingNotice>}
     {restoreRecovery.invalid && <FloatingError>本机文件恢复记录无法读取。请先在云端电脑列表核对状态，不能直接开始另一项恢复。<button type="button" className="button button-secondary" disabled={restoreWorkflowBusy} onClick={abandonWorkspaceRestoreRecord}>我已核对服务端状态，清除损坏记录</button></FloatingError>}
-    {restoreRecovery.pending && <div className="notice notice-warning" role="status">
+    {restoreRecovery.pending && <FloatingNotice className="notice-warning">
       <p>云端文件安全恢复在“{restorePhaseLabel[restoreRecovery.pending.phase]}”阶段待核对。继续前请再次确认所有外部写入者仍已停止；系统会先读取服务端状态，再复用原幂等键。</p>
       {restoreWorkflowError && <FloatingError>{restoreWorkflowError}</FloatingError>}
       <button type="button" className="button button-secondary" disabled={restoreWorkflowBusy} onClick={() => {
         setWritersStoppedConfirmed(false);
         setRestoreConfirmationOpen(true);
       }}>{restoreWorkflowBusy ? '正在核对并恢复…' : '核对状态并继续恢复'}</button>
-    </div>}
+    </FloatingNotice>}
     <section className="design-panel" aria-labelledby="project-upload-title">
-      <div className="design-panel-header"><div><h2 id="project-upload-title">本机项目目录</h2><p>选择云端电脑和本机文件夹，确认项目名后即可准备单向同步。</p></div></div>
-      {!projectBridgeAvailable && <p className="notice notice-warning" role="status">本机目录选择需要 Morde 桌面客户端。当前浏览器无法安全访问本机文件夹，请在桌面客户端继续。</p>}
-      {projectBridgeAvailable && projectCapabilities.isPending && <p className="notice notice-info" role="status">正在确认服务端项目同步能力…</p>}
+      <div className="design-panel-header"><div><h2 id="project-upload-title">文件同步</h2><p>选择云端电脑和本机文件夹，手动单向同步到电脑的项目目录。</p></div></div>
+      {!projectBridgeAvailable && <p className="muted" role="status">本机文件同步需要 Morde 桌面客户端，请在桌面客户端继续。</p>}
+      {projectBridgeAvailable && projectCapabilities.isPending && <FloatingNotice className="notice-info">正在确认服务端文件同步能力…</FloatingNotice>}
       {projectBridgeAvailable && projectCapabilities.isError && <FloatingError>无法确认服务端项目同步能力。为保护云端数据，项目目录和同步操作已关闭。<button type="button" className="button button-secondary button-small" onClick={() => void projectCapabilities.refetch()}>重试</button></FloatingError>}
-      {projectBridgeAvailable && projectCapabilities.isSuccess && !projectUploadGateEnabled && <p className="notice notice-info" role="status">服务端尚未开放项目目录同步（workspace_sync / project_upload）。目标列表和目录选择保持关闭；上传功能需等待 CFS-11 验收。</p>}
+      {projectBridgeAvailable && projectCapabilities.isSuccess && !projectUploadGateEnabled && <p className="muted" role="status">当前服务尚未开放本机文件同步。</p>}
+      {projectBridgeAvailable && !projectBridge?.state && <p className="muted" role="status">当前桌面客户端不支持读取本机同步状态，请更新客户端。</p>}
+      {localProjectError && <p className="muted" role="status">{localProjectError} <button type="button" className="button button-secondary button-small" onClick={() => void refreshLocalProjectState()}>重试</button></p>}
+      {receiptSelection && projectCheckpoint?.projectName && <div className="inline-actions">
+        <span role="status">云端已确认，目标电脑应用状态待核对。</span>
+        <button type="button" className="button button-secondary button-small" disabled={projectUploadBusy || scopedProjectState?.syncState === 'running' || !projectBridge?.uploadProject}
+          onClick={() => void startProjectUpload(receiptSelection, projectCheckpoint.projectName!, true)}>核对电脑应用状态</button>
+      </div>}
+      {scopedProjectState?.syncState === 'running' && projectCheckpoint?.projectSelectionID && <button type="button" className="button button-secondary button-small"
+        disabled={!projectBridge?.stopProjectSync || projectStopBusy} onClick={() => void stopProjectUpload()}>{projectStopBusy ? '正在停止…' : '停止同步'}</button>}
       {projectBridgeAvailable && projectUploadGateEnabled && <>
-        {projectPreferences.isPending && <p className="notice notice-info" role="status">正在读取设置中的默认电脑与 Workspace…</p>}
+        {projectPreferences.isPending && <FloatingNotice className="notice-info">正在读取设置中的默认电脑与 Workspace…</FloatingNotice>}
         {projectPreferences.isError && <FloatingError>无法读取默认电脑设置。请重试，或在下方手动选择已授权目标。<button type="button" className="button button-secondary button-small" onClick={() => void projectPreferences.refetch()}>重试</button></FloatingError>}
-        {projectTargets.isPending && <p className="notice notice-info" role="status">正在读取当前账号可用的云端电脑与工作区…</p>}
+        {projectTargets.isPending && <FloatingNotice className="notice-info">正在读取当前账号可用的云端电脑与工作区…</FloatingNotice>}
         {projectTargets.isError && <FloatingError>无法读取云端电脑列表。请检查桌面连接后重试。 <button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></FloatingError>}
         {projectTargets.isSuccess && !projectTargets.data.length && <p className="empty-card">当前账号没有可用于项目同步的云端电脑工作区。</p>}
         {projectTargets.isSuccess && projectTargets.data.length > 0 && <>
@@ -676,8 +877,10 @@ export function Workspaces() {
                 <div className="schedule-card-heading">
                   <div><strong>{target.hostName}{isConfiguredDefault && <small className="table-sub"> · 默认</small>}</strong><span>{target.hostState === 'running' ? '运行中' : '已停止'} · {target.workspaceName} · 已有项目 {target.folders.length} 个</span></div>
                   <button type="button" className={`button ${isSelected ? 'button-primary' : 'button-secondary'} button-small`} aria-pressed={isSelected}
+                    disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running'}
                     onClick={() => {
                       if (selectedProjectTargetKey === key) return;
+                      projectSelectionRevision.current += 1;
                       setSelectedProjectTargetKey(key);
                       setProjectDirectorySelection(null);
                       setProjectNameDraft('');
@@ -694,16 +897,16 @@ export function Workspaces() {
           {selectedProjectTarget && <div className="form-stack" style={{ marginTop: 10 }}>
             {selectedProjectTarget.blockedMessage && <p className="notice notice-warning" role="status">{selectedProjectTarget.blockedMessage}</p>}
             <div className="inline-actions">
-              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || Boolean(selectedProjectTarget.blockedMessage)} onClick={() => void chooseProjectDirectory()}>
+              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running' || Boolean(selectedProjectTarget.blockedMessage)} onClick={() => void chooseProjectDirectory()}>
                 {projectDirectoryBusy ? '正在打开目录选择器…' : projectSelectionMatchesTarget ? '重新选择本机目录' : '选择本机目录'}
               </button>
-              {projectSelectionMatchesTarget && projectDirectorySelection && <span role="status">已选：{projectDirectorySelection.directoryName}</span>}
+              {projectSelectionMatchesTarget && scopedProjectSelection && <span role="status">已选：{scopedProjectSelection.directoryName}</span>}
             </div>
-            {projectDirectoryNotice && <p className="notice notice-info" role="status">{projectDirectoryNotice}</p>}
+            {projectDirectoryNotice && <FloatingNotice className="notice-info">{projectDirectoryNotice}</FloatingNotice>}
             {projectDirectoryError && <FloatingError>{projectDirectoryError}</FloatingError>}
-            {projectSelectionMatchesTarget && projectDirectorySelection && <>
+            {projectSelectionMatchesTarget && scopedProjectSelection && <>
               <label htmlFor="project-upload-name">项目名</label>
-              <input id="project-upload-name" value={projectNameDraft} maxLength={120} onChange={(event) => {
+              <input id="project-upload-name" value={projectNameDraft} maxLength={120} disabled={projectUploadBusy || scopedProjectState?.syncState === 'running'} onChange={(event) => {
                 setProjectNameDraft(event.target.value);
                 setConfirmedProjectName('');
                 setProjectNameError('');
@@ -712,15 +915,25 @@ export function Workspaces() {
               <div className="inline-actions">
                 <button type="button" className="button button-secondary" disabled={!projectNameDraft || confirmedProjectName === projectNameValidation.name} onClick={confirmProjectName}>确认项目名</button>
                 {confirmedProjectName && <span role="status">项目名已确认：{confirmedProjectName}</span>}
-                {confirmedProjectName && <button type="button" className="button button-primary" disabled title="CFS-11验收完成前，上传保持关闭">上传功能等待 CFS-11 验收</button>}
+                {confirmedProjectName && <button type="button" className="button button-primary"
+                  disabled={!projectBridge?.uploadProject || !scopedProjectState || projectUploadBusy || scopedProjectState.syncState !== 'idle'
+                    || Boolean(projectCheckpoint && !checkpointMatchesSelection)
+                    || (scopedProjectState.syncRecovery?.state === 'unknown' && projectCheckpoint?.sessionState !== 'completed')}
+                  onClick={() => void startProjectUpload(scopedProjectSelection, confirmedProjectName, projectCheckpoint?.sessionState === 'completed')}>
+                  {projectUploadBusy ? '正在处理…' : projectCheckpoint?.sessionState === 'completed' && checkpointMatchesSelection ? '核对电脑应用状态' : checkpointMatchesSelection ? '恢复同步' : '开始同步'}
+                </button>}
               </div>
             </>}
           </div>}
         </>}
       </>}
+      <p className="project-sync-status" role="status" aria-live="polite">{projectUploadMessage || (scopedProjectState?.syncState === 'running' ? '同步进行中…'
+        : scopedProjectState?.syncState === 'shutdown_unknown' ? '同步状态未知，恢复点已保留。'
+          : projectCheckpoint ? '存在待处理的同步恢复点。' : '仅在点击同步后更新云端；云端变更不会下载到本机。')}</p>
+      <LocalWorkspaceRecovery key={user?.id} bridge={projectBridge} workspaceNames={Object.fromEntries((query.data?.items ?? []).map((item) => [item.id, item.name]))} />
     </section>
     <section className="design-panel" aria-labelledby="workspace-list-title">
-      <div className="design-panel-header"><div><h2 id="workspace-list-title">{computer ? `${computer.name || '云端电脑'} · 文件与版本` : '云端文件与版本'}</h2><p>{computer ? '查看这台电脑已保存的文件和历史版本；手动单向同步入口尚未开放。' : '以下为历史文件；新建和使用文件请从云端电脑入口开始。'}</p></div>{!computerID && !recoveryPending && !recoveryError && <Link className="button button-primary" to="/hosts/new">＋ 创建云端电脑</Link>}</div>
+      <div className="design-panel-header"><div><h2 id="workspace-list-title">{computer ? `${computer.name || '云端电脑'} · 文件与版本` : '云端文件与版本'}</h2><p>{computer ? '查看这台电脑已保存的文件和历史版本。' : '查看云端文件和历史版本。'}</p></div>{!computerID && !recoveryPending && !recoveryError && <Link className="button button-primary" to="/hosts/new">＋ 创建云端电脑</Link>}</div>
     {!computerID && (recoveryPending || recoveryError) && <form className="form-card form-stack workspace-create-form" aria-label="恢复历史文件空间创建" onSubmit={createWorkspace}>
       <h2>恢复历史文件创建请求</h2>
       {create.isError && <FloatingError className="error-inline" role="alert">创建失败：{errorDetails(create.error).message}</FloatingError>}

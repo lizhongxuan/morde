@@ -14,6 +14,25 @@ export type Credentials = {
 export type WebSession = { credential: string; expiresAt: string };
 export type ClientLoginAttempt = { clientInstanceID: string; attemptGeneration: string; idempotencyKey: string };
 export type ProjectSyncFolder = { folderID: string; workspaceID: string; folderKind: "workspace_root" | "project"; projectName?: string; relativePath: string; state: "pending_node" | "active" | "revoked"; syncAvailable: boolean };
+export type CodexScope = "read" | "live" | "send" | "interrupt" | "approval";
+export type CodexDiscoverInput = {
+  profile_key: string;
+  thread_id: string;
+  title: string;
+  cwd_label: string;
+  updated_at: string | null;
+  status: "idle" | "in_progress" | "waiting_approval" | "completed" | "failed" | "unknown";
+  scopes: CodexScope[];
+};
+export type CodexQueuedCommand = {
+  id: string;
+  session_id: string;
+  profile_key: string;
+  thread_id: string;
+  grant_version: number;
+  type: "send" | "interrupt" | "approval";
+  input: { text?: string; turn_id?: string; approval_id?: string; approval_version?: string; decision?: "approve" | "reject" };
+};
 
 const IDS = { host: /^h[a-z0-9]{7}$/, workspace: /^w[a-z0-9]{7}$/ };
 const SYNC_DEVICE_ID = /^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){7}$/;
@@ -294,8 +313,15 @@ export class MordeAPI {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: "error", signal: AbortSignal.timeout(20_000),
     });
-    if (!response.ok) throw new Error(response.status === 401 ? "Authorization expired or revoked" : `Morde returned HTTP ${response.status}`);
+    if (!response.ok) throw new Error(response.status === 401 ? "Authorization expired or revoked" : `Morde returned HTTP ${response.status} (${method} ${path})`);
     return response.status === 204 ? null : response.json();
+  }
+
+  private async codexRequest(path: string, method = "GET", body?: unknown): Promise<unknown> {
+    const auth = this.credentials();
+    if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
+    if (new URL(auth.origin).protocol !== "https:") throw new Error("Codex synchronization requires an HTTPS Morde origin");
+    return this.request(path, method, body);
   }
 
   async webSession(): Promise<WebSession> {
@@ -304,6 +330,82 @@ export class MordeAPI {
 
   async logout(): Promise<void> {
     await this.request("/api/auth/client-logout", "POST");
+  }
+
+  async codexDiscover(input: CodexDiscoverInput): Promise<{ id: string; scopes: CodexScope[]; grant_version: number }> {
+    const response = await this.codexRequest("/api/codex/sessions/discover", "POST", input) as Record<string, unknown> | null;
+    const value = response && typeof response.session === "object" && response.session !== null
+      ? response.session as Record<string, unknown>
+      : response;
+    if (!value || typeof value.id !== "string" || !/^l[a-z0-9]{7}$/.test(value.id) ||
+      !Array.isArray(value.scopes) || !value.scopes.every((scope) => ["read", "live", "send", "interrupt", "approval"].includes(String(scope))) ||
+      !Number.isSafeInteger(value.grant_version) || (value.grant_version as number) < 1) {
+      throw new Error("Invalid Morde Codex session response");
+    }
+    return { id: value.id, scopes: value.scopes as CodexScope[], grant_version: value.grant_version as number };
+  }
+
+  async codexClaim(): Promise<CodexQueuedCommand[]> {
+    const value = await this.codexRequest("/api/codex/commands/claim", "POST", {}) as unknown;
+    const rows = Array.isArray(value) ? value : (value as { items?: unknown; commands?: unknown } | null)?.items ?? (value as { commands?: unknown } | null)?.commands;
+    if (!Array.isArray(rows) || rows.length > 64) throw new Error("Invalid Morde Codex command response");
+    return rows.map((value) => {
+      const row = value as Record<string, unknown> | null;
+      const input = row?.input as Record<string, unknown> | null;
+      if (!row || typeof row.id !== "string" || !/^g[a-z0-9]{7}$/.test(row.id) ||
+        typeof row.session_id !== "string" || !/^l[a-z0-9]{7}$/.test(row.session_id) ||
+        typeof row.profile_key !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(row.profile_key) ||
+        typeof row.thread_id !== "string" || !row.thread_id || row.thread_id.length > 512 ||
+        !Number.isSafeInteger(row.grant_version) || !["send", "interrupt", "approval"].includes(String(row.type)) ||
+        !input || typeof input !== "object") throw new Error("Invalid Morde Codex command");
+      const normalized: CodexQueuedCommand["input"] = {};
+      if (input.text !== undefined) {
+        if (typeof input.text !== "string" || !input.text.trim() || input.text.length > 32768) throw new Error("Invalid Morde Codex send command");
+        normalized.text = input.text;
+      }
+      if (input.turn_id !== undefined) {
+        if (typeof input.turn_id !== "string" || !input.turn_id || input.turn_id.length > 512) throw new Error("Invalid Morde Codex interrupt command");
+        normalized.turn_id = input.turn_id;
+      }
+      if (input.approval_id !== undefined) {
+        if (typeof input.approval_id !== "string" || !input.approval_id || input.approval_id.length > 512) throw new Error("Invalid Morde Codex approval command");
+        normalized.approval_id = input.approval_id;
+      }
+      if (input.approval_version !== undefined) {
+        if (typeof input.approval_version !== "string" || !input.approval_version || input.approval_version.length > 256) throw new Error("Invalid Morde Codex approval command");
+        normalized.approval_version = input.approval_version;
+      }
+      if (input.decision !== undefined) {
+        if (input.decision !== "approve" && input.decision !== "reject") throw new Error("Invalid Morde Codex approval decision");
+        normalized.decision = input.decision;
+      }
+      const complete = row.type === "send" ? typeof normalized.text === "string" : row.type === "interrupt" ? Boolean(normalized.turn_id) :
+        Boolean(normalized.approval_id && normalized.approval_version && normalized.decision);
+      if (!complete) throw new Error("Incomplete Morde Codex command");
+      return {
+        id: row.id, session_id: row.session_id, profile_key: row.profile_key, thread_id: row.thread_id,
+        grant_version: row.grant_version as number, type: row.type as CodexQueuedCommand["type"], input: normalized,
+      };
+    });
+  }
+
+  async codexCommandResult(commandID: string, result: { status: "forwarded" | "running" | "waiting_approval" | "completed" | "failed" | "unknown"; provider_request_id?: string; result_code?: string }): Promise<void> {
+    if (!/^g[a-z0-9]{7}$/.test(commandID)) throw new Error("Invalid Morde Codex command ID");
+    await this.codexRequest(`/api/codex/commands/${commandID}/result`, "POST", result);
+  }
+
+  async codexEvents(sessionID: string, events: unknown[]): Promise<{ provider_event_ids: string[]; last_sequence: number }> {
+    if (!/^l[a-z0-9]{7}$/.test(sessionID) || !Array.isArray(events) || events.length < 1 || events.length > 128) {
+      throw new Error("Invalid Morde Codex event batch");
+    }
+    const value = await this.codexRequest(`/api/codex/sessions/${sessionID}/events`, "POST", { events }) as Record<string, unknown> | null;
+    if (!value || !Array.isArray(value.items) || !Number.isSafeInteger(value.last_sequence)) throw new Error("Invalid Morde Codex event acknowledgement");
+    const ids = value.items.map((item) => {
+      const row = item as Record<string, unknown> | null;
+      if (!row || typeof row.provider_event_id !== "string" || !Number.isSafeInteger(row.sequence)) throw new Error("Invalid Morde Codex event acknowledgement");
+      return row.provider_event_id;
+    });
+    return { provider_event_ids: ids, last_sequence: value.last_sequence as number };
   }
 
   private async portalRequest(path: string, session: WebSession, method = "GET", body?: unknown, idempotencyKey?: string): Promise<unknown> {
@@ -321,7 +423,7 @@ export class MordeAPI {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
     });
-    if (!response.ok) throw new Error(response.status === 401 ? "Portal authorization expired or revoked" : `Morde returned HTTP ${response.status}`);
+    if (!response.ok) throw new Error(response.status === 401 ? "Portal authorization expired or revoked" : `Morde returned HTTP ${response.status} (${method} ${path})`);
     return response.status === 204 ? null : response.json();
   }
 

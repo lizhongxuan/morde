@@ -1304,6 +1304,75 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
   assert.ok(pagesBySession.get(childIdentity.session_id)?.length > 0)
 })
 
+test('starts a dependent child only after the prerequisite result is settled', { timeout: 10000 }, async t => {
+  const throughBySession = new Map()
+  const settled = []
+  let parentModels = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool] })
+    if (frame.type === 'checkpoint') {
+      assert.equal(frame.from_seq, (throughBySession.get(frame.session_id) ?? -1) + 1)
+      throughBySession.set(frame.session_id, frame.through_seq)
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      parentModels += 1
+      if (parentModels === 3) {
+        assert.deepEqual(settled, ['child_dependency_1', 'child_dependency_2'])
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_dependency_2')
+        assert.equal(result?.content[0].text, 'dependent result')
+        replyWithText(proc, frame, 'Both results reviewed.')
+        return
+      }
+      if (parentModels === 2) {
+        assert.deepEqual(settled, ['child_dependency_1'])
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_dependency_1')
+        assert.equal(result?.content[0].text, 'prerequisite result')
+      }
+      const id = `call_dependency_${parentModels}`
+      const objective = parentModels === 1 ? 'Prepare a result.' : 'Use prerequisite result to finish.'
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id, name: delegateTool.name,
+          argumentsDelta: JSON.stringify({ title: `Dependency ${parentModels}`, objective, tool_names: ['file_read'] }) },
+        { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+    }
+    if (frame.type === 'model' && frame.session_id !== start.session_id) {
+      assert.deepEqual(frame.request.tools, [fileReadTool])
+      if (frame.session_id === 'child_dependency_2') {
+        assert.deepEqual(settled, ['child_dependency_1'])
+        assert.ok(frame.request.messages.some(message => message.role === 'user' &&
+          message.content.some(block => block.text?.includes('Use prerequisite result to finish.'))))
+      }
+      replyWithText(proc, frame, frame.session_id === 'child_dependency_1' ? 'prerequisite result' : 'dependent result')
+    }
+    if (frame.type === 'child_create') {
+      const second = frame.call_id === 'call_dependency_2'
+      assert.equal(frame.call_id, settled.length === 0 ? 'call_dependency_1' : 'call_dependency_2')
+      if (second) assert.deepEqual(settled, ['child_dependency_1'])
+      send(proc, { type: 'child_session', call_id: frame.call_id, ...taskFence(frame),
+        session_id: second ? 'child_dependency_2' : 'child_dependency_1', parent_session_id: frame.session_id,
+        objective: frame.arguments.objective, tools: [fileReadTool], checkpoint_through_seq: -1,
+        checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'child_settle') {
+      assert.equal(frame.status, 'succeeded')
+      assert.equal(frame.summary, frame.session_id === 'child_dependency_1' ? 'prerequisite result' : 'dependent result')
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      settled.push(frame.session_id)
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(parentModels, 3)
+  assert.equal(frames.filter(frame => frame.type === 'child_create').length, 2)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
 test('runs a background child beside the parent and exposes durable job status tools', async () => {
   const childIdentity = {
     task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
@@ -1661,6 +1730,16 @@ test('replays an interrupted delegate using the stored child summary, and fails 
   assert.equal(resumed.frames.some(frame => frame.type === 'tool_call' || frame.type === 'child_settle'), false)
   assert.equal(resumed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_delegate_1')?.content[0].text,
     'Previously completed summary.')
+
+  const failed = await resumeSession(pages, {
+    tools: [delegateTool, fileReadTool],
+    onChildCreate: frame => ({ ...childSession(frame), step_status: 'failed', summary: 'The child could not read the requested file.' }),
+  })
+  assert.equal(failed.code, 0, `frames: ${failed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(failed.modelCalls, 1)
+  const failedResult = failed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_delegate_1')
+  assert.equal(failedResult?.content[0].text, 'Tool failed: The child could not read the requested file.')
+  assert.equal(failed.frames.some(frame => frame.type === 'tool_call' || frame.type === 'child_settle'), false)
 
   const unknown = await resumeSession(pages, {
     tools: [delegateTool, fileReadTool],

@@ -48,7 +48,10 @@ function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace']
 }
 
 function setProjectBridge(value: unknown) {
-  Object.defineProperty(window, 'morde', { configurable: true, value });
+  Object.defineProperty(window, 'morde', { configurable: true, value: {
+    state: vi.fn().mockResolvedValue({ projectMappings: [], syncState: 'idle', syncCheckpoint: null, syncRecovery: null }),
+    ...(value as object),
+  } });
 }
 
 describe('Workspaces', () => {
@@ -68,7 +71,7 @@ describe('Workspaces', () => {
     const capabilities = vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
     renderWorkspaces();
 
-    expect(await screen.findByRole('status')).toHaveTextContent('本机目录选择需要 Morde 桌面客户端');
+    expect(await screen.findByText(/本机文件同步需要 Morde 桌面客户端/)).toBeInTheDocument();
     expect(capabilities).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: /上传/ })).not.toBeInTheDocument();
   });
@@ -80,7 +83,7 @@ describe('Workspaces', () => {
     const capabilities = vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ ...projectCapabilities, supported_features: [] });
     renderWorkspaces();
 
-    expect(await screen.findByText(/服务端尚未开放项目目录同步/)).toBeInTheDocument();
+    expect(await screen.findByText(/当前服务尚未开放本机文件同步/)).toBeInTheDocument();
     expect(capabilities).toHaveBeenCalledTimes(1);
     expect(projectUploadTargets).not.toHaveBeenCalled();
     expect(selectProjectDirectory).not.toHaveBeenCalled();
@@ -98,13 +101,14 @@ describe('Workspaces', () => {
     expect(screen.queryByRole('button', { name: /上传/ })).not.toBeInTheDocument();
   });
 
-  it('lets the user choose a target and local directory and confirm a project name without starting an upload', async () => {
+  it('starts project sync only after an explicit click and verifies the applied receipt', async () => {
     const projectUploadTargets = vi.fn().mockResolvedValue([projectTarget]);
     const selectProjectDirectory = vi.fn().mockResolvedValue({
       selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
       projectName: 'demo', directoryName: 'demo',
     });
-    const uploadProject = vi.fn();
+    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
+      hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } });
     setProjectBridge({ projectUploadTargets, selectProjectDirectory, uploadProject });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
     vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
@@ -123,8 +127,77 @@ describe('Workspaces', () => {
     await user.click(screen.getByRole('button', { name: '确认项目名' }));
 
     expect(screen.getByText('项目名已确认：release-notes')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '上传功能等待 CFS-11 验收' })).toBeDisabled();
     expect(uploadProject).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(uploadProject).toHaveBeenCalledOnce();
+    expect(uploadProject).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111112', 'release-notes');
+    expect(await screen.findByText('同步完成，目标电脑已应用本次项目。')).toBeInTheDocument();
+  });
+
+  it('does not claim success when the application receipt lacks revision evidence', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      uploadProject: vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
+        hostApplication: { status: 'applied', impacts: [] } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText('云端已确认，等待目标电脑应用。')).toBeInTheDocument();
+    expect(screen.queryByText('同步完成，目标电脑已应用本次项目。')).not.toBeInTheDocument();
+  });
+
+  it('shows safe conflict paths and retains the unconfirmed result', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      uploadProject: vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed',
+        hostApplication: { status: 'conflict', impacts: [{ path: 'notes/a.txt', state: 'conflict' }, { path: '../outside', state: 'conflict' }] } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText(/目标电脑存在冲突.*notes\/a\.txt/)).toBeInTheDocument();
+    expect(screen.queryByText(/\.\.\/outside/)).not.toBeInTheDocument();
+    expect(screen.queryByText('同步完成，目标电脑已应用本次项目。')).not.toBeInTheDocument();
+  });
+
+  it('allows checking a completed recovery receipt even when new uploads are unavailable', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'pending_apply',
+      hostApplication: { status: 'pending_apply', impacts: [] } });
+    setProjectBridge({ projectUploadTargets: vi.fn(), selectProjectDirectory: vi.fn(), uploadProject,
+      state: vi.fn().mockResolvedValue({ projectMappings: [selection], syncState: 'idle', syncRecovery: null,
+        syncCheckpoint: { mode: 'project_upload', workspaceId: workspace.id, projectSelectionID: selection.selectionID,
+          projectName: 'demo', sessionState: 'completed', hostApplicationStatus: 'pending_apply' } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ ...projectCapabilities, supported_features: [] });
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '核对电脑应用状态' }));
+    expect(uploadProject).toHaveBeenCalledWith(selection.selectionID, 'demo');
+    expect(await screen.findByText('云端已确认，等待目标电脑应用。')).toBeInTheDocument();
+  });
+
+  it('stops only the identified running project sync through the desktop bridge', async () => {
+    const selectionID = '11111111-1111-4111-8111-111111111112';
+    const stopProjectSync = vi.fn().mockResolvedValue(true);
+    setProjectBridge({ projectUploadTargets: vi.fn(), selectProjectDirectory: vi.fn(), stopProjectSync,
+      state: vi.fn().mockResolvedValue({ projectMappings: [], syncState: 'running', syncRecovery: null,
+        syncCheckpoint: { mode: 'project_upload', workspaceId: workspace.id, projectSelectionID: selectionID, projectName: 'demo' } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ ...projectCapabilities, supported_features: [] });
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '停止同步' }));
+    expect(stopProjectSync).toHaveBeenCalledWith(selectionID);
+    expect(await screen.findByText('同步已停止，恢复点已保留。')).toBeInTheDocument();
   });
 
   it('preselects the configured default computer and its bound Workspace', async () => {

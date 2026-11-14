@@ -8,27 +8,26 @@
 
 **让 AI 有一个真正工作的地方。**
 
-PC 桌面端 · iOS 与手机 Web · 管理后台 · 云端服务与 Agent Runtime
+服务端 · iOS 端 · PC 端 · 后台 Web 端
 
 </div>
 
-Morde 是一套以 AI Agent 为核心的多端云端工作平台。它把对话、任务、云端电脑、工作区和管理能力放在同一个产品里，让用户可以在电脑或手机上与 AI 协作，并持续跟进工作的进展和结果。
+Morde 是一套以 AI Agent 为核心的云端工作平台，产品端固定为服务端、iOS 端、PC 端和后台 Web 端。面向普通用户的 Web 界面归入 PC 端，由 PC 客户端承载；不设独立 Web 用户端或手机 Web 端。用户通过 PC 或 iOS 与 AI 协作，管理员通过后台 Web 管理平台。
 
 Morde 参考 Muse 的交互理念：**从对话开始，根据需要使用工具和电脑，让工作有过程、有结果，也有清晰的授权边界。** 项目既关注个人使用体验，也重视服务端、运行环境与管理后台等基础设施，目标是形成可持续演进的完整产品。
 
 > **项目状态：持续开发中。** 云端电脑、工作台与基础服务已有本机 Linux 验证记录；多端对话、DSH 子 Agent、任务恢复及手动文件夹同步等已有实现和本地测试。第一里程碑的真实模型、指定电脑、PC/iOS 跨端及文件数据面尚未完成整体验收，项目上传开关默认关闭。详见[第一里程碑约定](AGENTS.md)与[验收记录](docs/实施/Morde第一里程碑收口三会话并行实施/A-云端Agent与公共合同实施任务todo清单文档.md)。
 
-## 一套平台，多端协同
+## 四个产品端
 
 | 产品组成 | 职责与实现 |
 | --- | --- |
-| **PC 桌面端** | 基于 Electron 的桌面客户端，结合用户 Web 界面，提供对话、任务、云端电脑和本地文件夹同步入口。 |
-| **移动端** | 基于 nanoMuse 共享源码的 iOS 原生工程，以及手机 Web 入口，用于查看会话、进度、审批和个人资源；客户端整合仍在进行。 |
-| **管理后台** | 管理用户与注册审核、云端电脑、工作区、模型、配置、用量和审计等，使用统一服务端和权限体系。 |
-| **服务端** | Go 服务负责账号、API、任务、数据、授权、网关和后台工作；PostgreSQL 承载业务数据。 |
-| **云端运行环境** | DSH 负责云端 Agent Runtime，Host Runtime 和 Workspace 同步组件连接云端电脑与工作区。 |
+| **PC 端** | Electron 桌面客户端承载面向普通用户的工作界面，提供对话、任务、云端电脑和本地文件夹同步入口。用户 Web 界面是 PC 端的组成部分，不是独立产品端。 |
+| **iOS 端** | 基于 nanoMuse 共享源码的 iOS 原生客户端，用于对话、查看进度与结果，并在授权范围内使用相关能力。 |
+| **后台 Web 端** | 管理用户与注册审核、云端电脑、工作区、模型、配置、用量和审计等，使用统一服务端和权限体系。 |
+| **服务端** | Go 服务负责账号、API、任务、数据、授权、网关和后台工作；PostgreSQL 承载业务数据，DSH 提供云端 Agent Runtime，Host Runtime 与 Workspace 同步组件支撑云端电脑和工作区。 |
 
-这些组成部分都在本仓库中：既有面向用户的客户端，也有支撑运行与管理的服务端基础设施。
+仓库中的云端运行环境、云端电脑工作台及共享界面代码是上述四端的实现组成，不另构成产品端。`web/mobile/` 中现存的移动 Web 代码作为并入 PC 端的整合来源，其用户功能统一由 PC 端承载，不单独定义为产品端。
 
 ## 能力概览
 
@@ -48,7 +47,7 @@ Morde 参考 Muse 的交互理念：**从对话开始，根据需要使用工具
 
 ## 体验预览
 
-第一行的 PC 用户端与管理后台截图来自本地演示模式，展示当前页面和模拟数据；第二行是 AI 助手与 iOS 的设计示意。它们不代表真实任务已经执行或功能已经验收。
+第一行的 PC 用户端与后台 Web 截图来自本地演示模式，展示当前页面和模拟数据；第二行是 AI 助手与 iOS 的设计示意。它们不代表真实任务已经执行或功能已经验收。
 
 <table>
   <tr>
@@ -67,11 +66,11 @@ Morde 参考 Muse 的交互理念：**从对话开始，根据需要使用工具
 
 ```mermaid
 flowchart TB
-    User[用户] --> PC[PC 桌面端 / 用户 Web]
-    User --> Mobile[iOS / 手机 Web]
-    Admin[管理员] --> Console[管理后台]
+    User[用户] --> PC[PC 端（Electron 与用户界面）]
+    User --> IOS[iOS 端]
+    Admin[管理员] --> Console[后台 Web 端]
     PC --> Server[Morde 服务端]
-    Mobile --> Server
+    IOS --> Server
     Console --> Server
     Server --> DB[(PostgreSQL)]
     Server --> DSH[DSH 云端 Agent Runtime]
@@ -88,7 +87,7 @@ flowchart TB
 
 ## 第一里程碑
 
-当前优先收口 **PC、iOS 与云端 Agent 的基础闭环**：
+当前优先收口 **PC、iOS 与服务端 Agent 的基础闭环**：
 
 1. **两端接续：** 在 PC 和 iOS 对话，查看真实回复、任务进度与结果；关闭客户端或短暂断网后，已受理任务可恢复查看，重试不重复执行。
 2. **长会话与多会话：** 保留原始聊天记录，在授权范围内利用历史；会话和账号之间的消息、任务和结果保持隔离。
@@ -102,20 +101,17 @@ flowchart TB
 
 | 路径 | 内容 |
 | --- | --- |
-| [`clients/desktop/`](clients/desktop/) | PC 桌面客户端、本地桥接和桌面相关组件 |
+| [`clients/desktop/`](clients/desktop/) · [`web/portal/`](web/portal/) | PC 客户端、本地桥接、PC 用户界面及后台 Web 页面 |
 | [`clients/nanoMuse/`](clients/nanoMuse/) | iOS 原生工程 |
-| [`web/portal/`](web/portal/) | 用户 Web 和管理后台 |
-| [`web/mobile/`](web/mobile/) | 手机 Web 客户端 |
-| [`web/workbench/`](web/workbench/) | 云端电脑网页工作台 |
-| [`server/`](server/) | Go 服务、API、Gateway、MCP、后台任务与数据库迁移 |
-| [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | DSH 云端 Agent Runtime 及锁定依赖 |
+| [`web/mobile/`](web/mobile/) · [`web/workbench/`](web/workbench/) | 待并入 PC 端的现存移动界面代码与云端电脑工作台实现，均作为 PC 端相关代码，不定义为独立产品端 |
+| [`server/`](server/) · [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | Go 服务、API、Gateway、MCP、后台任务、数据库迁移及 DSH 云端 Agent Runtime |
 | [`runtime/morde-runtime/`](runtime/morde-runtime/) · [`runtime/morde-sync/`](runtime/morde-sync/) | Host Runtime 与 Workspace 同步引擎 |
 | [`images/`](images/) · [`deploy/`](deploy/) | 运行环境镜像与部署配置 |
 | [`docs/`](docs/) · [`examples/`](examples/) | 设计、实施与验收文档，以及接入示例 |
 
 ## 开发与部署
 
-### 本地预览用户端和管理后台
+### 本地预览 PC 用户界面和后台 Web
 
 使用 Node.js 24，在仓库根目录执行：
 
@@ -124,7 +120,7 @@ npm --prefix web/portal ci
 VITE_MOCK_API=1 npm --prefix web/portal run dev
 ```
 
-打开 `http://127.0.0.1:5173/` 查看用户端，或打开 `http://127.0.0.1:5173/admin/login` 查看管理后台。本地演示账号和密码均为 `demo`。演示模式使用模拟数据，不连接真实 AI 或云端电脑。
+打开 `http://127.0.0.1:5173/` 预览 PC 端用户界面，或打开 `http://127.0.0.1:5173/admin/login` 预览后台 Web。浏览器预览只是 PC 用户界面的开发方式，不代表另有 Web 用户端。本地演示账号和密码均为 `demo`。演示模式使用模拟数据，不连接真实 AI 或云端电脑。
 
 ### 继续开发
 

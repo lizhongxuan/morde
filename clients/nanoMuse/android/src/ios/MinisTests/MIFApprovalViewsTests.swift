@@ -171,8 +171,136 @@ final class MIFApprovalViewsTests: XCTestCase {
             clarification: "null"
         )
 
-        XCTAssertTrue(MIFApprovalInboxPolicy.canRespond(pending: try XCTUnwrap(ordinary.pending_request)))
-        XCTAssertFalse(MIFApprovalInboxPolicy.canRespond(pending: try XCTUnwrap(media.pending_request)))
+        XCTAssertTrue(MIFApprovalInboxPolicy.canRespond(pending: try XCTUnwrap(ordinary.pending_request), taskStatus: ordinary.status))
+        XCTAssertFalse(MIFApprovalInboxPolicy.canRespond(pending: try XCTUnwrap(media.pending_request), taskStatus: media.status))
+    }
+
+    func testExpiredApprovalIsReadOnlyInInboxAndNotCountedAsPending() throws {
+        let expired = try task(
+            id: "q1234567", status: "running",
+            pending: #"{"id":"r1234567","version":1,"kind":"approval","title":"Approve change","object":"Workspace file","content":"Save the output?","impact":"Publishes one file.","status":"expired","expires_at":"2000-01-01T00:00:00Z"}"#,
+            clarification: "null"
+        )
+
+        let summary = MIFApprovalInboxSummary.make(
+            taskIDs: [expired.id], details: [expired.id: expired], failedTaskIDs: [], pageReadFailed: false
+        )
+        let pending = try XCTUnwrap(expired.pending_request)
+
+        XCTAssertEqual(summary.approvals.map(\.task.id), [expired.id])
+        XCTAssertEqual(summary.pendingCount, 0)
+        XCTAssertFalse(summary.isPartial)
+        XCTAssertEqual(summary.confirmedCount, MIFApprovalCountSnapshot(count: 0, validUntil: nil))
+        XCTAssertTrue(pending.isExpired)
+        XCTAssertFalse(MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: expired.status))
+    }
+
+    func testApprovalDeadlinePreventsActionsAndLegacyPendingRemainsCompatible() throws {
+        let passed = try task(
+            id: "q1234567",
+            pending: #"{"id":"r1234567","version":1,"kind":"approval","title":"Expired by time","object":"Workspace file","content":"Save the output?","impact":"Publishes one file.","status":"pending","expires_at":"2000-01-01T00:00:00Z"}"#,
+            clarification: "null"
+        )
+        let legacy = try task(
+            id: "q2345678",
+            pending: #"{"id":"r2345678","version":1,"kind":"approval","title":"Legacy approval","object":"Workspace file","content":"Save the output?","impact":"Publishes one file."}"#,
+            clarification: "null"
+        )
+
+        XCTAssertFalse(MIFApprovalInboxPolicy.canRespond(pending: try XCTUnwrap(passed.pending_request), taskStatus: passed.status))
+        let legacyPending = try XCTUnwrap(legacy.pending_request)
+        XCTAssertNil(legacyPending.status)
+        XCTAssertNil(legacyPending.expires_at)
+        XCTAssertTrue(MIFApprovalInboxPolicy.canRespond(pending: legacyPending, taskStatus: legacy.status))
+    }
+
+    func testFractionalExpiryParsesAndMalformedExpiryFailsClosed() throws {
+        let fractional = try task(
+            id: "q1234567",
+            pending: #"{"id":"r1234567","version":1,"kind":"approval","title":"Fractional expiry","object":"Workspace file","content":"Save the output?","impact":"Publishes one file.","status":"pending","expires_at":"2099-12-31T23:59:59.123456Z"}"#,
+            clarification: "null"
+        )
+        let malformed = try task(
+            id: "q2345678",
+            pending: #"{"id":"r2345678","version":1,"kind":"approval","title":"Malformed expiry","object":"Workspace file","content":"Save the output?","impact":"Publishes one file.","status":"pending","expires_at":"tomorrow"}"#,
+            clarification: "null"
+        )
+
+        let fractionalPending = try XCTUnwrap(fractional.pending_request)
+        let malformedPending = try XCTUnwrap(malformed.pending_request)
+        XCTAssertNotNil(fractionalPending.expirationDate)
+        XCTAssertTrue(MIFApprovalInboxPolicy.canRespond(pending: fractionalPending, taskStatus: fractional.status,
+                                                        at: Date(timeIntervalSince1970: 2_000_000_000)))
+        XCTAssertTrue(malformedPending.hasInvalidExpiration)
+        XCTAssertFalse(MIFApprovalInboxPolicy.canRespond(pending: malformedPending, taskStatus: malformed.status))
+        let summary = MIFApprovalInboxSummary.make(taskIDs: [malformed.id], details: [malformed.id: malformed],
+                                                   failedTaskIDs: [], pageReadFailed: false)
+        XCTAssertTrue(summary.isPartial)
+        XCTAssertFalse(summary.isConfirmedEmpty)
+    }
+
+    func testLocalDeadlineCannotConfirmAnApprovalExpiredOrAZeroCount() throws {
+        let task = try task(
+            id: "q1234567",
+            pending: #"{"id":"r1234567","version":1,"kind":"approval","title":"Review","content":"Proceed?","impact":"A change","status":"pending","expires_at":"2030-01-01T00:00:00Z"}"#,
+            clarification: "null"
+        )
+        let pending = try XCTUnwrap(task.pending_request)
+        let deadline = try XCTUnwrap(pending.expirationDate)
+        let before = MIFApprovalInboxSummary.make(taskIDs: [task.id], details: [task.id: task],
+                                                 failedTaskIDs: [], pageReadFailed: false, at: deadline.addingTimeInterval(-1))
+        let atDeadline = MIFApprovalInboxSummary.make(taskIDs: [task.id], details: [task.id: task],
+                                                     failedTaskIDs: [], pageReadFailed: false, at: deadline)
+        XCTAssertEqual(before.pendingCount, 1)
+        XCTAssertFalse(before.isPartial)
+        XCTAssertEqual(before.confirmedCount, MIFApprovalCountSnapshot(count: 1, validUntil: deadline))
+        XCTAssertTrue(atDeadline.isPartial)
+        XCTAssertFalse(atDeadline.isConfirmedEmpty)
+        XCTAssertEqual(atDeadline.confirmedCount, .unknown)
+        XCTAssertFalse(pending.isExpired)
+        XCTAssertFalse(pending.canRespond(taskStatus: task.status, at: deadline))
+    }
+
+    @MainActor
+    func testApprovalBadgeExpiresAfterInboxIsClosed() async throws {
+        let tracker = MIFApprovalCountTracker()
+        tracker.update(MIFApprovalCountSnapshot(count: 2, validUntil: Date().addingTimeInterval(0.05)))
+        XCTAssertEqual(tracker.count, 2)
+        for _ in 0..<50 where tracker.count != nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(tracker.count)
+    }
+
+    @MainActor
+    func testNewApprovalBadgeSnapshotCancelsOlderDeadline() async throws {
+        let tracker = MIFApprovalCountTracker()
+        tracker.update(MIFApprovalCountSnapshot(count: 1, validUntil: Date().addingTimeInterval(0.05)))
+        tracker.update(MIFApprovalCountSnapshot(count: 3, validUntil: nil))
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(tracker.count, 3)
+        tracker.clear()
+        XCTAssertNil(tracker.count)
+    }
+
+    func testApprovalActionRequiresMatchingTaskStateAndValidRequest() throws {
+        let approval = try task(
+            id: "q1234567",
+            pending: #"{"id":"r1234567","version":1,"kind":"approval","title":"Review","content":"Proceed?","impact":"A change"}"#,
+            clarification: "null"
+        )
+        let pending = try XCTUnwrap(approval.pending_request)
+        XCTAssertTrue(pending.canRespond(taskStatus: "waiting_user"))
+        XCTAssertFalse(pending.canRespond(taskStatus: "running"))
+        let invalid = try task(
+            id: "q2345678",
+            pending: #"{"id":"invalid","version":0,"kind":"approval","title":"Review","content":"Proceed?","impact":"A change"}"#,
+            clarification: "null"
+        )
+        XCTAssertFalse(try XCTUnwrap(invalid.pending_request).canRespond(taskStatus: invalid.status))
+        let summary = MIFApprovalInboxSummary.make(taskIDs: [invalid.id], details: [invalid.id: invalid],
+                                                   failedTaskIDs: [], pageReadFailed: false)
+        XCTAssertTrue(summary.isPartial)
     }
 
     func testAcceptedDecisionIsScopedAndPersistsAcrossRefreshes() {

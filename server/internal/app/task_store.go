@@ -375,6 +375,12 @@ type TaskStore interface {
 	RecordValidatedArtifact(context.Context, string, task.Artifact, string, int64) (task.Artifact, error)
 }
 
+// TaskPendingRequestExpirer atomically rejects an expired pending approval and
+// resumes only the Task waiting on that exact request version.
+type TaskPendingRequestExpirer interface {
+	ExpirePendingRequest(context.Context, string, string, string, int64) (bool, error)
+}
+
 // TaskActionRequester owns the atomic, idempotent user-facing state transition.
 type TaskActionRequester interface {
 	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, *TaskActionRevisionFence, string) (TaskActionResult, error)

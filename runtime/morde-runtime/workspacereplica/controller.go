@@ -713,21 +713,32 @@ func (c *Controller) applyProjectUploadApplications(ctx context.Context, items m
 }
 
 func projectConflictImpacts(projectPath string, conflicts []string) []projectUploadImpact {
-	prefix := projectPath + "/"
+	projectFolded := strings.ToLower(projectPath)
 	result := make([]projectUploadImpact, 0, len(conflicts))
 	seen := make(map[string]struct{}, len(conflicts))
 	for _, conflictPath := range conflicts {
-		if !validSyncConflictPath(conflictPath) || !strings.HasPrefix(conflictPath, prefix) {
+		if !validSyncConflictPath(conflictPath) {
 			continue
 		}
-		relative := strings.TrimPrefix(conflictPath, prefix)
-		if !validSyncConflictPath(relative) {
+		var relative string
+		conflictFolded := strings.ToLower(conflictPath)
+		switch {
+		case conflictFolded == projectFolded || strings.HasPrefix(projectFolded, conflictFolded+"/"):
+			relative = "."
+		case strings.HasPrefix(conflictFolded, projectFolded+"/"):
+			parts := strings.SplitN(conflictPath, "/", strings.Count(projectPath, "/")+2)
+			relative = parts[len(parts)-1]
+			if !validSyncConflictPath(relative) {
+				continue
+			}
+		default:
 			continue
 		}
-		if _, exists := seen[relative]; exists {
+		key := strings.ToLower(relative)
+		if _, exists := seen[key]; exists {
 			continue
 		}
-		seen[relative] = struct{}{}
+		seen[key] = struct{}{}
 		result = append(result, projectUploadImpact{Path: relative, State: "conflict", Reason: "workspace_conflict"})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })

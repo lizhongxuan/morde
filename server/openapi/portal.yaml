@@ -34,6 +34,8 @@ tags:
     description: Desktop and mobile client installations authorized by account login.
   - name: Hub
     description: Installation-bound realtime presence and request routing for a user's own devices.
+  - name: Codex
+    description: Durable, owner and installation scoped mirrors of explicitly authorized PC Codex threads.
   - name: Personal Data
     description: Owner-scoped personal-data objects, attachments, quotas, snapshots, and incremental change metadata.
   - name: Projects
@@ -102,6 +104,246 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '503': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/sessions/discover:
+    post:
+      tags: [Codex]
+      operationId: discoverCodexSession
+      summary: Register an explicitly authorized native Codex thread
+      description: Requires an active installation-bound Client credential. The owner and installation come from authentication; request bodies cannot select either. profile_key must be an opaque local identifier and must not contain CODEX_HOME or an absolute path. The supplied scopes replace the selected thread grant exactly; removing scopes blocks access while preserving stored history. Session, grant, commands and normalized events have no automatic TTL and remain until explicit session or account deletion. Re-discovering a deleted thread creates a new mirror ID.
+      security:
+        - clientCredential: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexDiscoverRequest' }
+      responses:
+        '200':
+          description: Current mirror mapping and grant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: '#/components/schemas/CodexSession' }
+                additionalProperties: false
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/sessions:
+    get:
+      tags: [Codex]
+      operationId: listCodexSessions
+      summary: List authorized Codex session mirrors for one PC installation
+      description: Requires an owner Portal Session or owner Client credential and the read scope for each returned mirror. installation_id selects the owner's active desktop PC installation and may differ from the reader Client installation. Cursors are opaque session IDs; revoked grants are omitted, while their retained history becomes readable again only after explicit re-authorization.
+      security:
+        - portalSession: []
+        - clientCredential: []
+      parameters:
+        - name: installation_id
+          in: query
+          required: true
+          schema: { type: string, pattern: '^i[a-z0-9]{7}$' }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string, pattern: '^l[a-z0-9]{7}$' }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Authorized session page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexSessionPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/sessions/{id}/events:
+    get:
+      tags: [Codex]
+      operationId: listCodexSessionEvents
+      summary: Read a durable Codex event page
+      description: Requires an owner Portal Session or owner Client credential and the session read scope. The reader Client installation may differ from the PC installation that owns the session. Sequences are strictly increasing and never gap over retained data; after_sequence greater than the current sequence is rejected. Each event is limited to 64 KiB and its normalized payload is validated against an event-kind allowlist. The history includes server-managed command_status events for durable command progress.
+      security:
+        - portalSession: []
+        - clientCredential: []
+      parameters:
+        - { $ref: '#/components/parameters/CodexSessionId' }
+        - name: after_sequence
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: Ordered event page and current session sequence
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexEventPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Codex]
+      operationId: appendCodexSessionEvents
+      summary: Persist normalized events from the bound PC installation
+      description: Requires the same active Client installation bound to the session. Each event declares source=snapshot, live or approval and requires the matching read, live or approval grant. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. Source is used only for authorization and is not stored or returned as presentation data. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files. command_status events are server-managed and rejected from PC batches.
+      security:
+        - clientCredential: []
+      parameters:
+        - { $ref: '#/components/parameters/CodexSessionId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexEventBatch' }
+      responses:
+        '200':
+          description: Committed event acknowledgements
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexEventBatchAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/sessions/{id}/events/stream:
+    get:
+      tags: [Codex]
+      operationId: streamCodexSessionEvents
+      summary: Stream newly stored Codex events with SSE
+      description: Requires an owner Portal Session or owner Client credential and the session live scope. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
+      security:
+        - portalSession: []
+        - clientCredential: []
+      parameters:
+        - { $ref: '#/components/parameters/CodexSessionId' }
+        - name: after_sequence
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Server-sent event stream; each id is a contiguous event sequence.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/sessions/{id}/commands:
+    post:
+      tags: [Codex]
+      operationId: createCodexSessionCommand
+      summary: Queue an idempotent command for an authorized PC session
+      description: Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc and its server-managed command_status event is appended in the same transaction using provider_event_id morde:command:<command-id>:<status-version>:<status>. Idempotency-Key retries return the original command without adding another event; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
+      security:
+        - portalSession: []
+        - clientCredential: []
+      parameters:
+        - { $ref: '#/components/parameters/CodexSessionId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexCommandInput' }
+      responses:
+        '202':
+          description: Durably accepted command
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexCommand' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/commands/claim:
+    post:
+      tags: [Codex]
+      operationId: claimCodexCommand
+      summary: Claim at most one waiting command for this PC installation
+      description: Requires the active installation-bound Client credential. The PC polls over HTTPS every two seconds. The queue is database-backed and unrelated to Hub presence. Claim uses a conditional row lock; only waiting_pc commands with a current grant version are returned. Claim appends the claimed command_status event in the same transaction. A claimed command with no result for 60 seconds becomes unknown on the next PC poll and is never returned to the queue.
+      security:
+        - clientCredential: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: Zero or one claimed command
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 1
+                    items: { $ref: '#/components/schemas/CodexCommand' }
+                additionalProperties: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/commands/{id}/result:
+    post:
+      tags: [Codex]
+      operationId: reportCodexCommandResult
+      summary: Persist a PC command result
+      description: Requires the original active PC installation, current session grant version and session authorization. Updates are idempotent and validated against allowed state transitions; each new status transition is appended as a command_status event in the same transaction. A result of unknown is terminal and never requeued. Grant-version changes fail commands not yet claimed and mark already claimed or in-flight commands unknown.
+      security:
+        - clientCredential: []
+      parameters:
+        - { $ref: '#/components/parameters/CodexCommandId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexCommandResult' }
+      responses:
+        '200':
+          description: Persisted command state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexCommand' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/sessions/{id}:
+    delete:
+      tags: [Codex]
+      operationId: deleteCodexSession
+      summary: Delete a Codex mirror session and its retained cloud records
+      description: Requires the owner Portal Session. Deleting the mirror cascades to its grant, event history and queued command records. This does not claim to stop a PC turn that already began. Account deletion also cascades; no automatic TTL is applied. Grant revocation preserves history and blocks access, while this operation permanently removes the mirror data.
+      security:
+        - portalSession: []
+      parameters:
+        - { $ref: '#/components/parameters/CodexSessionId' }
+      responses:
+        '204': { description: Mirror session and associated cloud records deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/model/v1/chat/completions:
     post:
@@ -5925,7 +6167,7 @@ paths:
       tags: [Personal Data]
       operationId: getPersonalDataQuota
       summary: Read the authenticated account's personal-data quota
-      description: Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
+      description: Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, retained personal-memory history bodies, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       responses:
         '200':
@@ -6018,6 +6260,49 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/personal-data/{type}/{id}/history:
+    parameters:
+      - name: type
+        in: path
+        required: true
+        schema: { type: string, const: memory }
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/PersonalObjectId' }
+        description: Memory ID; only the memory object type has revision history.
+      - name: cursor
+        in: query
+        required: false
+        schema: { type: string, maxLength: 2048 }
+        description: Signed keyset cursor bound to the authenticated owner and memory object.
+      - name: limit
+        in: query
+        required: false
+        schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+    get:
+      tags: [Personal Data]
+      operationId: getPersonalMemoryHistory
+      summary: Read revision history for a personal memory
+      description: >
+        Requires an approved Portal Session or active Client credential. Returns current and prior
+        memory revisions newest first. Historical bodies that were never retained are null and are
+        never reconstructed. A body is restorable only when present and its recorded provenance is
+        still authorized. Suppressed or invalid provenance withholds the body and all source references.
+        Existing PUT with base_revision and Idempotency-Key is used to restore an available body.
+        Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward
+        personal-data quota and are purged when the memory is deleted.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Owner-scoped memory revisions and a signed next-page cursor
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalMemoryHistoryPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/personal-data/uploads:
     post:
@@ -7081,7 +7366,7 @@ paths:
       tags: [Admin]
       operationId: getAdminPersonalDataQuota
       summary: Read a user's personal-data usage and limits
-      description: Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
+      description: Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, retained personal-memory history bodies, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
       security: [{ portalSession: [] }]
       responses:
         '200':
@@ -7998,6 +8283,16 @@ components:
       required: true
       description: Reuse only for an exact retry of the same operation and normalized request.
       schema: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
+    CodexSessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^l[a-z0-9]{7}$' }
+    CodexCommandId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^g[a-z0-9]{7}$' }
     ServiceInstanceID:
       name: X-Morde-Service-Instance-ID
       in: header
@@ -8091,6 +8386,244 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    CodexDiscoverRequest:
+      type: object
+      additionalProperties: false
+      required: [profile_key, thread_id, title, cwd_label, status, scopes]
+      properties:
+        profile_key: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$', description: Opaque stable local profile identifier. Never an absolute path or CODEX_HOME value. }
+        thread_id: { type: string, minLength: 1, maxLength: 512 }
+        title: { type: string, maxLength: 512 }
+        cwd_label: { type: string, maxLength: 256, description: Display-only project label, not a path to read or execute. }
+        updated_at: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [idle, in_progress, waiting_approval, completed, failed, unknown] }
+        scopes:
+          type: array
+          uniqueItems: true
+          items: { type: string, enum: [read, live, send, interrupt, approval] }
+    CodexSession:
+      type: object
+      additionalProperties: false
+      required: [id, installation_id, profile_key, thread_id, title, cwd_label, updated_at, status, scopes, grant_version, last_sequence, created_at]
+      properties:
+        id: { type: string, pattern: '^l[a-z0-9]{7}$' }
+        installation_id: { type: string, pattern: '^i[a-z0-9]{7}$' }
+        profile_key: { type: string, maxLength: 128 }
+        thread_id: { type: string, maxLength: 512 }
+        title: { type: string, maxLength: 512 }
+        cwd_label: { type: string, maxLength: 256 }
+        updated_at: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [idle, in_progress, waiting_approval, completed, failed, unknown] }
+        scopes:
+          type: array
+          uniqueItems: true
+          items: { type: string, enum: [read, live, send, interrupt, approval] }
+        grant_version: { type: integer, format: int64, minimum: 1 }
+        last_sequence: { type: integer, format: int64, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    CodexSessionPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CodexSession' } }
+        next_cursor: { type: [string, 'null'], pattern: '^l[a-z0-9]{7}$' }
+    CodexEventInput:
+      type: object
+      additionalProperties: false
+      required: [provider_event_id, kind, source, occurred_at, payload]
+      properties:
+        provider_event_id: { type: string, minLength: 1, maxLength: 512 }
+        kind: { type: string, enum: [user_message, assistant_message, assistant_delta, reasoning_summary, plan, turn_started, turn_completed, turn_failed, turn_cancelled, tool_call, tool_result, tool_call_summary, tool_result_summary, command_summary, file_change, file_change_summary, child_agent, subagent_summary, question, approval_request, approval_status, unsupported] }
+        source: { type: string, enum: [snapshot, live, approval], description: 'Authorization source only; it is not stored or returned as event content.' }
+        occurred_at: { type: string, format: date-time }
+        turn_id: { type: string, maxLength: 512 }
+        item_id: { type: string, maxLength: 512 }
+        parent_item_id: { type: string, maxLength: 512 }
+        status: { type: string, maxLength: 128 }
+        payload:
+          type: object
+          additionalProperties: false
+          properties:
+            text: { type: string }
+            segment_id: { type: string }
+            delta_index: { type: number }
+            summary: { type: string }
+            items: { type: array, items: { type: string, maxLength: 4096 }, maxItems: 256 }
+            explanation: { type: string }
+            status: { type: string }
+            error_code: { type: string }
+            tool: { type: string }
+            call_id: { type: string }
+            output: { type: string }
+            output_summary: { type: string }
+            exit_code: { type: number }
+            path_label: { type: string }
+            change: { type: string }
+            changes: { type: array, items: { type: string, maxLength: 4096 }, maxItems: 256 }
+            agent_label: { type: string }
+            approval_id: { type: string }
+            approval_version: { type: string }
+            kind: { type: string }
+            object: { type: string, maxLength: 4096, description: Bounded user-visible request object; paths are reduced to display labels. }
+            detail: { type: string, maxLength: 4096, description: Bounded operation detail or requested permission scope. }
+            impact: { type: string, maxLength: 4096, description: Bounded provider reason when available. }
+            questions:
+              type: array
+              minItems: 1
+              maxItems: 64
+              items: { $ref: '#/components/schemas/CodexUserQuestion' }
+            provider_type: { type: string }
+            diagnostic: { type: string }
+    CodexEventBatch:
+      type: object
+      additionalProperties: false
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items: { $ref: '#/components/schemas/CodexEventInput' }
+    CodexQuestionOption:
+      type: object
+      additionalProperties: false
+      required: [label]
+      properties:
+        label: { type: string, minLength: 1, maxLength: 4096 }
+        description: { type: string, maxLength: 4096 }
+    CodexUserQuestion:
+      type: object
+      additionalProperties: false
+      required: [id, header, question, options]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 512 }
+        header: { type: string, minLength: 1, maxLength: 4096 }
+        question: { type: string, minLength: 1, maxLength: 4096 }
+        options:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/CodexQuestionOption' }
+    CodexEvent:
+      type: object
+      additionalProperties: false
+      required: [session_id, sequence, provider_event_id, kind, occurred_at, payload, stored_at]
+      properties:
+        session_id: { type: string, pattern: '^l[a-z0-9]{7}$' }
+        sequence: { type: integer, format: int64, minimum: 1 }
+        provider_event_id: { type: string, minLength: 1, maxLength: 512 }
+        kind: { type: string, enum: [user_message, assistant_message, assistant_delta, reasoning_summary, plan, turn_started, turn_completed, turn_failed, turn_cancelled, tool_call, tool_result, tool_call_summary, tool_result_summary, command_summary, file_change, file_change_summary, child_agent, subagent_summary, question, approval_request, approval_status, command_status, unsupported] }
+        occurred_at: { type: string, format: date-time }
+        turn_id: { type: string, maxLength: 512 }
+        item_id: { type: string, maxLength: 512 }
+        parent_item_id: { type: string, maxLength: 512 }
+        status: { type: string, maxLength: 128 }
+        payload:
+          type: object
+          additionalProperties: false
+          properties:
+            text: { type: string }
+            segment_id: { type: string }
+            delta_index: { type: number }
+            summary: { type: string }
+            items: { type: array, items: { type: string, maxLength: 4096 }, maxItems: 256 }
+            explanation: { type: string }
+            status: { type: string }
+            error_code: { type: string }
+            tool: { type: string }
+            call_id: { type: string }
+            output: { type: string }
+            output_summary: { type: string }
+            exit_code: { type: number }
+            path_label: { type: string }
+            change: { type: string }
+            changes: { type: array, items: { type: string, maxLength: 4096 }, maxItems: 256 }
+            agent_label: { type: string }
+            approval_id: { type: string }
+            approval_version: { type: string }
+            kind: { type: string }
+            command_id: { type: string, pattern: '^g[a-z0-9]{7}$' }
+            type: { type: string, enum: [send, interrupt, approval] }
+            result_code: { type: string, maxLength: 128 }
+            questions:
+              type: array
+              minItems: 1
+              maxItems: 64
+              items: { $ref: '#/components/schemas/CodexUserQuestion' }
+            provider_type: { type: string }
+            diagnostic: { type: string }
+        stored_at: { type: string, format: date-time }
+    CodexEventPage:
+      type: object
+      additionalProperties: false
+      required: [items, current_sequence, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CodexEvent' } }
+        current_sequence: { type: integer, format: int64, minimum: 0 }
+        next_cursor: { type: [string, 'null'], pattern: '^[0-9]+$' }
+    CodexEventAck:
+      type: object
+      additionalProperties: false
+      required: [provider_event_id, sequence]
+      properties:
+        provider_event_id: { type: string }
+        sequence: { type: integer, format: int64, minimum: 1 }
+    CodexEventBatchAck:
+      type: object
+      additionalProperties: false
+      required: [items, last_sequence]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CodexEventAck' } }
+        last_sequence: { type: integer, format: int64, minimum: 0 }
+    CodexCommandInput:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, text]
+          properties:
+            type: { type: string, const: send }
+            text: { type: string, minLength: 1, maxLength: 32768 }
+        - type: object
+          additionalProperties: false
+          required: [type, turn_id]
+          properties:
+            type: { type: string, const: interrupt }
+            turn_id: { type: string, minLength: 1, maxLength: 512 }
+        - type: object
+          additionalProperties: false
+          required: [type, approval_id, approval_version, decision]
+          properties:
+            type: { type: string, const: approval }
+            approval_id: { type: string, minLength: 1, maxLength: 512 }
+            approval_version: { type: string, minLength: 1, maxLength: 256 }
+            decision: { type: string, enum: [approve, reject] }
+    CodexCommand:
+      type: object
+      additionalProperties: false
+      required: [id, session_id, grant_version, type, status, input, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^g[a-z0-9]{7}$' }
+        session_id: { type: string, pattern: '^l[a-z0-9]{7}$' }
+        installation_id: { type: string, pattern: '^i[a-z0-9]{7}$' }
+        profile_key: { type: string }
+        thread_id: { type: string }
+        grant_version: { type: integer, format: int64, minimum: 1 }
+        type: { type: string, enum: [send, interrupt, approval] }
+        status: { type: string, enum: [waiting_pc, claimed, forwarded, running, waiting_approval, completed, failed, unknown] }
+        input: { $ref: '#/components/schemas/CodexCommandInput' }
+        result_code: { type: string, maxLength: 128 }
+        provider_request_id: { type: string, maxLength: 512 }
+        created_at: { type: string, format: date-time }
+        claimed_at: { type: [string, 'null'], format: date-time }
+        updated_at: { type: string, format: date-time }
+    CodexCommandResult:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, enum: [forwarded, running, waiting_approval, completed, failed, unknown] }
+        provider_request_id: { type: string, maxLength: 512 }
+        result_code: { type: string, maxLength: 128 }
     ExecutionControlMutationRequest:
       type: object
       additionalProperties: false
@@ -10215,6 +10748,42 @@ components:
             - { $ref: '#/components/schemas/PersonalLibraryItem' }
             - { $ref: '#/components/schemas/PersonalSkillSetting' }
             - { $ref: '#/components/schemas/PersonalConnectorSetting' }
+    PersonalMemoryHistorySource:
+      type: object
+      additionalProperties: false
+      required: [kind, id]
+      properties:
+        kind: { type: string, enum: [conversation_message, mutation_receipt] }
+        id: { type: string, minLength: 1, maxLength: 128 }
+        conversation_id: { type: string, minLength: 1, maxLength: 128, description: Present only for an authorized private conversation message source. }
+    PersonalMemoryRevision:
+      type: object
+      additionalProperties: false
+      required: [revision, changed_at, body, restorable, source_status, sources]
+      properties:
+        revision: { type: integer, format: int64, minimum: 1 }
+        changed_at: { type: string, format: date-time }
+        body:
+          anyOf:
+            - { $ref: '#/components/schemas/PersonalMemory' }
+            - { type: 'null' }
+          description: Null when a legacy body was not retained or provenance policy requires withholding it.
+        restorable: { type: boolean, description: True only when the complete body is available and authorized for restoration. }
+        source_status: { type: string, enum: [available, unrecorded, unavailable] }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/PersonalMemoryHistorySource' }
+          description: Only currently authorized source references are returned; withheld provenance yields an empty array.
+    PersonalMemoryHistoryPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/PersonalMemoryRevision' }
+        next_cursor: { type: [string, 'null'], maxLength: 2048, description: Signed cursor bound to the owner and memory object; null when complete. }
     PersonalMutationReceipt:
       type: object
       additionalProperties: false
@@ -11401,15 +11970,18 @@ components:
         created_at: { type: string, format: date-time }
     TaskPendingRequest:
       type: object
-      required: [id, version, kind, title, object, content, impact]
+      description: Exact, versioned approval context. The latest expired request remains a read-only snapshot; approved, rejected, or cancelled requests keep the existing hidden behavior. expires_at is null unless a trusted service policy explicitly sets an expiry.
+      required: [id, version, status, kind, title, object, content, impact, expires_at]
       properties:
         id: { $ref: '#/components/schemas/ClarificationId' }
         version: { type: integer, minimum: 1 }
+        status: { type: string, enum: [pending, approved, rejected, cancelled, expired] }
         kind: { const: approval }
         title: { type: string }
         object: { type: string }
         content: { type: string }
         impact: { type: string }
+        expires_at: { type: [string, 'null'], format: date-time, description: Null unless a trusted service policy explicitly sets an expiry. }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId', description: Present only while an image, video or speech output awaits the Task owner's save decision; use it with the Task media preview route. }
     TaskClarificationRequest:
       type: object

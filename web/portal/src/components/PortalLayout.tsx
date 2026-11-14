@@ -16,6 +16,7 @@ const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: bool
 
 const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
   { to: '/connections', label: '模型与工具', icon: 'link' },
+  { to: '/workspaces', label: '文件同步', icon: 'folder' },
   { to: '/clients', label: '客户端', icon: 'panel' },
   { to: '/apikeys', label: 'API Key', icon: 'key' },
   { to: '/settings', label: '账户', icon: 'user' },
@@ -100,7 +101,7 @@ function matchesPageItem(item: PageNavigationItem, pathname: string, search: str
 
 export function PortalLayout() {
   const { user, signOut } = useAuth();
-  const { notify } = useToast();
+  const { notify, closeNotices } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
   const { canGoBack, canGoForward, goBack, goForward } = useContext(RouteHistoryContext);
@@ -108,6 +109,8 @@ export function PortalLayout() {
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
   const pageNavigation = pageNavigationFor(location.pathname);
   const hasCollapsibleSidebar = Boolean(pageNavigation) || location.pathname === '/assistant';
+
+  useEffect(() => { closeNotices(); }, [closeNotices, location.pathname, location.search]);
 
   useEffect(() => {
     try { localStorage.setItem('morde:pc-context-sidebar-collapsed', contextSidebarCollapsed ? 'true' : 'false'); }

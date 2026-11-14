@@ -100,6 +100,20 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if snapshot.ResultReviewSuperseded {
 		return true, nil
 	}
+	if snapshot.AggregationCanWait {
+		return true, w.options.Actions.DeferConversationRoute(routeCtx, claim, time.Second)
+	}
+	if snapshot.AggregationNeedsClarification {
+		return true, w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, app.ConversationRouteDecision{
+			Action: app.ConversationRouteClarify, Question: "短时间内收到的消息关系尚不明确，请先处理澄清；若属于同一项工作，请重新发送完整要求。",
+		})
+	}
+	if snapshot.AggregationUnresolved {
+		if resolver, ok := w.options.Actions.(app.ConversationRouteAggregationResolution); ok {
+			return true, resolver.ResolveConversationRouteAggregation(routeCtx, claim)
+		}
+		return true, w.failRoute(ctx, claim, "routing_context_unavailable", errors.New("conversation aggregation contains unresolved messages"))
+	}
 	if len(snapshot.Context.Content) > app.MaxConversationAgentInputBytes {
 		return true, w.failRoute(ctx, claim, "message_too_long", errors.New("message exceeds the model input budget"))
 	}
@@ -206,6 +220,20 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if snapshot.PreviousMissing && decision.Action != app.ConversationRouteNew {
 		decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 	}
+	if decision.Action == app.ConversationRouteNew {
+		if aggregation, ok := w.options.Actions.(app.ConversationRouteAggregation); ok {
+			started, err := aggregation.BeginConversationRouteAggregation(routeCtx, claim, snapshot, decision)
+			if err != nil {
+				if domain.CodeOf(err) == domain.CodeConflict || routeCtx.Err() != nil {
+					return true, err
+				}
+				return true, w.failRoute(ctx, claim, "routing_action_unavailable", err)
+			}
+			if started {
+				return true, nil
+			}
+		}
+	}
 	if err := w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, decision); err != nil {
 		if domain.CodeOf(err) == domain.CodeConflict && (claim.Input.ResultReviewID != "" || routeCtx.Err() == nil) {
 			return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
@@ -257,27 +285,41 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	case app.ConversationRouteNew:
 		if decision.TaskID == "" && decision.TargetMessageID == "" && (!decision.ExplicitNew || app.ConversationRouteHasExplicitNewIntent(value.Content)) &&
 			decision.ExpectedRevision == 0 && decision.Question == "" &&
-			app.ValidConversationRouteDependencyIDs(decision.DependencyTaskIDs, value.Candidates) {
+			(!decision.ExplicitNew || len(decision.AggregateMessageIDs) == 0) &&
+			app.ValidConversationRouteDependencyIDs(decision.DependencyTaskIDs, value.Candidates) &&
+			app.ValidConversationRouteAggregateIDs(decision.AggregateMessageIDs, value.AggregationCandidates) {
 			return decision
 		}
 	case app.ConversationRouteJoin:
 		if decision.TaskID == "" && decision.TargetMessageID != "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 &&
 			decision.Question == "" && decision.Reply == "" && len(decision.DependencyTaskIDs) == 0 &&
+			len(decision.AggregateMessageIDs) == 0 &&
 			app.ValidConversationRouteJoinTarget(decision.TargetMessageID, value.RequestCandidates) {
 			return decision
 		}
 	case app.ConversationRouteReply:
 		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && decision.Question == "" &&
-			len(decision.DependencyTaskIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
+			len(decision.DependencyTaskIDs) == 0 && len(decision.AggregateMessageIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
 			return decision
 		}
 	case app.ConversationRouteClarify:
-		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
+		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 &&
+			len(decision.AggregateMessageIDs) == 0 && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
 			!strings.ContainsRune(decision.Question, '\x00') && len([]rune(decision.Question)) <= 200 {
 			return decision
 		}
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if decision.TargetMessageID != "" || decision.ExplicitNew || decision.Question != "" {
+		if decision.ExplicitNew || decision.Question != "" || decision.Reply != "" || len(decision.AggregateMessageIDs) != 0 {
+			return clarify
+		}
+		if decision.Action == app.ConversationRouteStop && decision.TargetMessageID != "" {
+			if decision.TaskID == "" && decision.ExpectedRevision == 0 &&
+				app.ValidConversationRoutePendingRootStop(decision.TargetMessageID, value.RequestCandidates) {
+				return decision
+			}
+			return clarify
+		}
+		if decision.TargetMessageID != "" {
 			return clarify
 		}
 		if value.ReferenceUnavailable {

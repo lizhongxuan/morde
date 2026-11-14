@@ -108,19 +108,23 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 		}
 		var pending task.PendingRequest
 		var requestHash []byte
-		var respondedAt pgtype.Timestamptz
+		var expiresAt, respondedAt pgtype.Timestamptz
 		err = tx.QueryRow(ctx, `SELECT id, task_id, version, kind, title, object, content, impact, call_id, COALESCE(media_preview_operation_id,''), tool_name,
-request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, responded_at
+request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at
 FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).Scan(
 			&pending.ID, &pending.TaskID, &pending.Version, &pending.Kind, &pending.Title, &pending.Object, &pending.Content,
 			&pending.Impact, &pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &requestHash, &pending.RuntimeGeneration,
-			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &respondedAt)
+			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read latest task pending request: %w", err)
 		}
 		var pendingRequest *task.PendingRequest
 		if err == nil {
 			pending.RequestHash = append([]byte(nil), requestHash...)
+			if expiresAt.Valid {
+				expires := expiresAt.Time
+				pending.ExpiresAt = &expires
+			}
 			if respondedAt.Valid {
 				responded := respondedAt.Time
 				pending.RespondedAt = &responded
@@ -1996,10 +2000,10 @@ RETURNING event_seq`,
 			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_pending_requests
 (id, task_id, version, kind, title, object, content, impact, call_id, media_preview_operation_id, tool_name, request_hash,
- runtime_generation, runtime_instance_id, control_version, status)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending')`,
+ runtime_generation, runtime_instance_id, control_version, status, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending',$16)`,
 				pending.ID, pending.TaskID, pending.Version, pending.Kind, pending.Title, pending.Object, pending.Content, pending.Impact,
-				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion)
+				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt)
 			if err != nil {
 				return fmt.Errorf("persist task pending request: %w", err)
 			}

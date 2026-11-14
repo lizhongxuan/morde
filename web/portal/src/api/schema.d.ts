@@ -46,6 +46,170 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/codex/sessions/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register an explicitly authorized native Codex thread
+         * @description Requires an active installation-bound Client credential. The owner and installation come from authentication; request bodies cannot select either. profile_key must be an opaque local identifier and must not contain CODEX_HOME or an absolute path. The supplied scopes replace the selected thread grant exactly; removing scopes blocks access while preserving stored history. Session, grant, commands and normalized events have no automatic TTL and remain until explicit session or account deletion. Re-discovering a deleted thread creates a new mirror ID.
+         */
+        post: operations["discoverCodexSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List authorized Codex session mirrors for one PC installation
+         * @description Requires an owner Portal Session or owner Client credential and the read scope for each returned mirror. installation_id selects the owner's active desktop PC installation and may differ from the reader Client installation. Cursors are opaque session IDs; revoked grants are omitted, while their retained history becomes readable again only after explicit re-authorization.
+         */
+        get: operations["listCodexSessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a durable Codex event page
+         * @description Requires an owner Portal Session or owner Client credential and the session read scope. The reader Client installation may differ from the PC installation that owns the session. Sequences are strictly increasing and never gap over retained data; after_sequence greater than the current sequence is rejected. Each event is limited to 64 KiB and its normalized payload is validated against an event-kind allowlist.
+         */
+        get: operations["listCodexSessionEvents"];
+        put?: never;
+        /**
+         * Persist normalized events from the bound PC installation
+         * @description Requires the same active Client installation bound to the session and its live scope. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files.
+         */
+        post: operations["appendCodexSessionEvents"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}/events/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stream newly stored Codex events with SSE
+         * @description Requires an owner Portal Session or owner Client credential and the session live scope. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
+         */
+        get: operations["streamCodexSessionEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue an idempotent command for an authorized PC session
+         * @description Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc. Idempotency-Key retries return the original command; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
+         */
+        post: operations["createCodexSessionCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/commands/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim at most one waiting command for this PC installation
+         * @description Requires the active installation-bound Client credential. The PC polls over HTTPS every two seconds. The queue is database-backed and unrelated to Hub presence. Claim uses a conditional row lock; only waiting_pc commands with a current grant version are returned. A claimed command is never automatically returned to the queue if the PC result is missing.
+         */
+        post: operations["claimCodexCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/commands/{id}/result": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Persist a PC command result
+         * @description Requires the original active PC installation, current session grant version and session authorization. Updates are idempotent and status transitions are one-way; a result of unknown is terminal and never requeued.
+         */
+        post: operations["reportCodexCommandResult"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a Codex mirror session and its retained cloud records
+         * @description Requires the owner Portal Session. Deleting the mirror cascades to its grant, event history and queued command records. This does not claim to stop a PC turn that already began. Account deletion also cascades; no automatic TTL is applied. Grant revocation preserves history and blocks access, while this operation permanently removes the mirror data.
+         */
+        delete: operations["deleteCodexSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/model/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -4085,7 +4249,7 @@ export interface paths {
         };
         /**
          * Read the authenticated account's personal-data quota
-         * @description Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
+         * @description Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, retained personal-memory history bodies, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
          */
         get: operations["getPersonalDataQuota"];
         put?: never;
@@ -4123,6 +4287,34 @@ export interface paths {
          * @description Requires an approved portal session or active Client credential. Deletion records a versioned tombstone; the same profile ID cannot be recreated. The body-free receipt is idempotent through Idempotency-Key.
          */
         delete: operations["deletePersonalObject"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/{type}/{id}/history": {
+        parameters: {
+            query?: {
+                /** @description Signed keyset cursor bound to the authenticated owner and memory object. */
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                type: "memory";
+                /** @description Memory ID; only the memory object type has revision history. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read revision history for a personal memory
+         * @description Requires an approved Portal Session or active Client credential. Returns current and prior memory revisions newest first. Historical bodies that were never retained are null and are never reconstructed. A body is restorable only when present and its recorded provenance is still authorized. Suppressed or invalid provenance withholds the body and all source references. Existing PUT with base_revision and Idempotency-Key is used to restore an available body. Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward personal-data quota and are purged when the memory is deleted.
+         */
+        get: operations["getPersonalMemoryHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4868,7 +5060,7 @@ export interface paths {
         };
         /**
          * Read a user's personal-data usage and limits
-         * @description Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
+         * @description Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, retained personal-memory history bodies, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
          */
         get: operations["getAdminPersonalDataQuota"];
         put?: never;
@@ -5541,6 +5733,200 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        CodexDiscoverRequest: {
+            /** @description Opaque stable local profile identifier. Never an absolute path or CODEX_HOME value. */
+            profile_key: string;
+            thread_id: string;
+            title: string;
+            /** @description Display-only project label */
+            cwd_label: string;
+            /** Format: date-time */
+            updated_at?: string | null;
+            /** @enum {string} */
+            status: "idle" | "in_progress" | "waiting_approval" | "completed" | "failed" | "unknown";
+            scopes: ("read" | "live" | "send" | "interrupt" | "approval")[];
+        };
+        CodexSession: {
+            id: string;
+            installation_id: string;
+            profile_key: string;
+            thread_id: string;
+            title: string;
+            cwd_label: string;
+            /** Format: date-time */
+            updated_at: string | null;
+            /** @enum {string} */
+            status: "idle" | "in_progress" | "waiting_approval" | "completed" | "failed" | "unknown";
+            scopes: ("read" | "live" | "send" | "interrupt" | "approval")[];
+            /** Format: int64 */
+            grant_version: number;
+            /** Format: int64 */
+            last_sequence: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        CodexSessionPage: {
+            items: components["schemas"]["CodexSession"][];
+            next_cursor: string | null;
+        };
+        CodexEventInput: {
+            provider_event_id: string;
+            /** @enum {string} */
+            kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "tool_call_summary" | "tool_result_summary" | "command_summary" | "file_change" | "file_change_summary" | "child_agent" | "subagent_summary" | "question" | "approval_request" | "approval_status" | "unsupported";
+            /** @description Authorization source only; it is not stored or returned as event content. @enum {string} */
+            source: "snapshot" | "live" | "approval";
+            /** Format: date-time */
+            occurred_at: string;
+            turn_id?: string;
+            item_id?: string;
+            parent_item_id?: string;
+            status?: string;
+            payload: {
+                text?: string;
+                segment_id?: string;
+                delta_index?: number;
+                summary?: string;
+                items?: string[];
+                explanation?: string;
+                status?: string;
+                error_code?: string;
+                tool?: string;
+                call_id?: string;
+                output?: string;
+                output_summary?: string;
+                exit_code?: number;
+                path_label?: string;
+                change?: string;
+                changes?: string[];
+                agent_label?: string;
+                approval_id?: string;
+                approval_version?: string;
+                kind?: string;
+                object?: string;
+                detail?: string;
+                impact?: string;
+                questions?: components["schemas"]["CodexUserQuestion"][];
+                provider_type?: string;
+                diagnostic?: string;
+            };
+        };
+        CodexEventBatch: {
+            events: components["schemas"]["CodexEventInput"][];
+        };
+        CodexQuestionOption: {
+            label: string;
+            description?: string;
+        };
+        CodexUserQuestion: {
+            id: string;
+            header: string;
+            question: string;
+            options: components["schemas"]["CodexQuestionOption"][];
+        };
+        CodexEvent: {
+            session_id: string;
+            /** Format: int64 */
+            sequence: number;
+            provider_event_id: string;
+            /** @enum {string} */
+            kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "tool_call_summary" | "tool_result_summary" | "command_summary" | "file_change" | "file_change_summary" | "child_agent" | "subagent_summary" | "question" | "approval_request" | "approval_status" | "command_status" | "unsupported";
+            /** Format: date-time */
+            occurred_at: string;
+            turn_id?: string;
+            item_id?: string;
+            parent_item_id?: string;
+            status?: string;
+            payload: {
+                text?: string;
+                segment_id?: string;
+                delta_index?: number;
+                summary?: string;
+                items?: string[];
+                explanation?: string;
+                status?: string;
+                error_code?: string;
+                tool?: string;
+                call_id?: string;
+                output?: string;
+                output_summary?: string;
+                exit_code?: number;
+                path_label?: string;
+                change?: string;
+                changes?: string[];
+                agent_label?: string;
+                approval_id?: string;
+                approval_version?: string;
+                kind?: string;
+                command_id?: string;
+                type?: "send" | "interrupt" | "approval";
+                result_code?: string;
+                questions?: components["schemas"]["CodexUserQuestion"][];
+                provider_type?: string;
+                diagnostic?: string;
+            };
+            /** Format: date-time */
+            stored_at: string;
+        };
+        CodexEventPage: {
+            items: components["schemas"]["CodexEvent"][];
+            /** Format: int64 */
+            current_sequence: number;
+            next_cursor: string | null;
+        };
+        CodexEventAck: {
+            provider_event_id: string;
+            /** Format: int64 */
+            sequence: number;
+        };
+        CodexEventBatchAck: {
+            items: components["schemas"]["CodexEventAck"][];
+            /** Format: int64 */
+            last_sequence: number;
+        };
+        CodexCommandInput: {
+            /** @constant */
+            type: "send";
+            text: string;
+        } | {
+            /** @constant */
+            type: "interrupt";
+            turn_id: string;
+        } | {
+            /** @constant */
+            type: "approval";
+            approval_id: string;
+            approval_version: string;
+            /** @enum {string} */
+            decision: "approve" | "reject";
+        };
+        CodexCommand: {
+            id: string;
+            session_id: string;
+            installation_id?: string;
+            profile_key?: string;
+            thread_id?: string;
+            /** Format: int64 */
+            grant_version: number;
+            /** @enum {string} */
+            type: "send" | "interrupt" | "approval";
+            /** @enum {string} */
+            status: "waiting_pc" | "claimed" | "forwarded" | "running" | "waiting_approval" | "completed" | "failed" | "unknown";
+            input: components["schemas"]["CodexCommandInput"];
+            result_code?: string;
+            provider_request_id?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            claimed_at?: string | null;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        CodexCommandResult: {
+            /** @enum {string} */
+            status: "forwarded" | "running" | "waiting_approval" | "completed" | "failed" | "unknown";
+            provider_request_id?: string;
+            result_code?: string;
+        };
         ExecutionControlMutationRequest: {
             expected_epoch: number;
         };
@@ -7341,6 +7727,32 @@ export interface components {
             revision: number;
             body: components["schemas"]["PersonalProfile"] | components["schemas"]["PersonalMemory"] | components["schemas"]["PersonalSoul"] | components["schemas"]["PersonalDiary"] | components["schemas"]["GoalBody"] | components["schemas"]["ScheduleSyncDefinition"] | components["schemas"]["PersonalFeedPost"] | components["schemas"]["PersonalFeedPreferences"] | components["schemas"]["PersonalIdeaMark"] | components["schemas"]["PersonalLibraryItem"] | components["schemas"]["PersonalSkillSetting"] | components["schemas"]["PersonalConnectorSetting"];
         };
+        PersonalMemoryHistorySource: {
+            /** @enum {string} */
+            kind: "conversation_message" | "mutation_receipt";
+            id: string;
+            /** @description Present only for an authorized private conversation message source. */
+            conversation_id?: string;
+        };
+        PersonalMemoryRevision: {
+            /** Format: int64 */
+            revision: number;
+            /** Format: date-time */
+            changed_at: string;
+            /** @description Null when a legacy body was not retained or provenance policy requires withholding it. */
+            body: components["schemas"]["PersonalMemory"] | null;
+            /** @description True only when the complete body is available and authorized for restoration. */
+            restorable: boolean;
+            /** @enum {string} */
+            source_status: "available" | "unrecorded" | "unavailable";
+            /** @description Only currently authorized source references are returned; withheld provenance yields an empty array. */
+            sources: components["schemas"]["PersonalMemoryHistorySource"][];
+        };
+        PersonalMemoryHistoryPage: {
+            items: components["schemas"]["PersonalMemoryRevision"][];
+            /** @description Signed cursor bound to the owner and memory object; null when complete. */
+            next_cursor: string | null;
+        };
         PersonalMutationReceipt: {
             object_type: components["schemas"]["PersonalMutationObjectType"];
             object_id: components["schemas"]["PersonalObjectId"];
@@ -8419,15 +8831,23 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        /** @description Exact, versioned approval context. The latest expired request remains a read-only snapshot; approved, rejected, or cancelled requests keep the existing hidden behavior. expires_at is null unless a trusted service policy explicitly sets an expiry. */
         TaskPendingRequest: {
             id: components["schemas"]["ClarificationId"];
             version: number;
+            /** @enum {string} */
+            status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
             /** @constant */
             kind: "approval";
             title: string;
             object: string;
             content: string;
             impact: string;
+            /**
+             * Format: date-time
+             * @description Null unless a trusted service policy explicitly sets an expiry.
+             */
+            expires_at: string | null;
             /** @description Present only while an image */
             media_preview_operation_id?: components["schemas"]["OperationId"];
         };
@@ -9405,6 +9825,8 @@ export interface components {
         ProjectWorkItemId: components["schemas"]["ProjectWorkItemId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
+        CodexSessionId: string;
+        CodexCommandId: string;
         /** @description Current service instance UUID; a mismatch fails without writing. */
         ServiceInstanceID: string;
         /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
@@ -9477,6 +9899,271 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             503: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    discoverCodexSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexDiscoverRequest"];
+            };
+        };
+        responses: {
+            /** @description Current mirror mapping and grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        session: components["schemas"]["CodexSession"];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCodexSessions: {
+        parameters: {
+            query: {
+                installation_id: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorized session page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexSessionPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCodexSessionEvents: {
+        parameters: {
+            query?: {
+                after_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ordered event page and current session sequence */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexEventPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    appendCodexSessionEvents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexEventBatch"];
+            };
+        };
+        responses: {
+            /** @description Committed event acknowledgements */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexEventBatchAck"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    streamCodexSessionEvents: {
+        parameters: {
+            query?: {
+                after_sequence?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent event stream; each id is a contiguous event sequence. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createCodexSessionCommand: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexCommandInput"];
+            };
+        };
+        responses: {
+            /** @description Durably accepted command */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexCommand"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    claimCodexCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Zero or one claimed command */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["CodexCommand"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reportCodexCommandResult: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexCommandId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexCommandResult"];
+            };
+        };
+        responses: {
+            /** @description Persisted command state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexCommand"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteCodexSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Mirror session and associated cloud records deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -16647,6 +17334,38 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalMemoryHistory: {
+        parameters: {
+            query?: {
+                /** @description Signed keyset cursor bound to the authenticated owner and memory object. */
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                type: "memory";
+                /** @description Memory ID; only the memory object type has revision history. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner-scoped memory revisions and a signed next-page cursor */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMemoryHistoryPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

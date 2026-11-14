@@ -197,8 +197,8 @@ enum MIFTaskPresentation {
         case "failed": return .failed
         case "running", "waiting_user", "pausing", "cancelling": return .current
         case "queued", "pending": return .upcoming
-        case "unknown": return .unconfirmed
-        default: return timelineMarker(taskStatus: taskStatus, index: index, rowCount: rowCount)
+        case .some(_): return .unconfirmed
+        case .none: return timelineMarker(taskStatus: taskStatus, index: index, rowCount: rowCount)
         }
     }
 
@@ -500,6 +500,9 @@ struct MIFTaskListRoom: View {
     @State private var didLoadInitial = false
     @State private var requestGeneration = UUID()
     @State private var isRefreshing = false
+    private var visibleTasks: [MordeTask] {
+        tasks.filter { !store.inaccessibleTaskIDs.contains($0.id) }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -557,7 +560,7 @@ struct MIFTaskListRoom: View {
             .simultaneousGesture(
                 // Short error lists have no scrollable content to reliably trigger .refreshable.
                 DragGesture(minimumDistance: 20).onEnded { value in
-                    guard tasks.isEmpty, pageError != nil,
+                    guard visibleTasks.isEmpty, pageError != nil,
                           value.startLocation.y < 80, value.translation.height > 100 else { return }
                     Task { await refreshCurrentScope() }
                 })
@@ -578,26 +581,28 @@ struct MIFTaskListRoom: View {
             MIFTaskNotice(text: AppLocalized("Sign in to view Morde tasks"), symbol: "person.crop.circle")
         } else if store.scopeKey == nil {
             MIFTaskNotice(text: AppLocalized("Confirming account scope…"), symbol: "arrow.triangle.2.circlepath")
-        } else if tasks.isEmpty && isLoadingInitial {
+        } else if visibleTasks.isEmpty && isLoadingInitial {
             ProgressView(AppLocalized("Loading tasks…"))
                 .frame(maxWidth: .infinity, minHeight: 150)
-        } else if tasks.isEmpty, let pageError, !isLoadingMore {
+        } else if visibleTasks.isEmpty, let pageError, !isLoadingMore {
             MIFTaskInlineError(message: pageError)
                 .accessibilityIdentifier("morde.tasks.loadError")
+        } else if visibleTasks.isEmpty && !tasks.isEmpty {
+            MIFTaskNotice(text: AppLocalized("Current account can no longer read this task"), symbol: "lock")
         } else if MIFTaskPageRules.isFinalEmptyPage(
-            itemCount: tasks.count, didLoadInitial: didLoadInitial, nextCursor: nextCursor) {
+            itemCount: visibleTasks.count, didLoadInitial: didLoadInitial, nextCursor: nextCursor) {
             MIFTaskNotice(text: AppLocalized("No tasks yet"), symbol: "checklist")
                 .accessibilityIdentifier("morde.tasks.empty")
-        } else if tasks.isEmpty && nextCursor != nil {
+        } else if visibleTasks.isEmpty && nextCursor != nil {
             EmptyView()
-        } else if tasks.isEmpty {
+        } else if visibleTasks.isEmpty {
             MIFTaskNotice(text: AppLocalized("Task list has not loaded"), symbol: "checklist")
         } else {
             if let pageError {
                 MIFTaskInlineError(message: pageError)
                     .accessibilityIdentifier("morde.tasks.loadError")
             }
-            ForEach(tasks) { task in
+            ForEach(visibleTasks) { task in
                     Group {
                         if onMenu != nil {
                             NavigationLink(value: MordeDesignRoute.task(task.id)) {
@@ -1325,6 +1330,12 @@ struct MIFTaskDetailView: View {
                     Text(pending.title)
                         .font(.body.weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
+                    if let object = pending.object, !object.isEmpty {
+                        Text(object)
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("morde.task.approval.object")
+                    }
                     Text(pending.content)
                         .font(.subheadline)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1332,26 +1343,55 @@ struct MIFTaskDetailView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Text(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                    if pending.kind == nil || pending.kind == "approval" {
-                        if pending.media_preview_operation_id != nil {
-                            store.mediaApprovalControls(task: task, pending: pending)
-                                .disabled(isLoadingDetail || detailError != nil)
-                        } else {
-                            HStack {
-                                Button(AppLocalized("Reject"), role: .destructive) {
-                                    Task { await respondToApproval(pending, taskID: task.id, decision: "reject") }
+                    if let expiresAt = pending.expirationDate {
+                        Text(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        if pending.isExpired {
+                            Text(AppLocalized("Approval expired; the requested action was not run."))
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("morde.task.approval.expired")
+                        } else if pending.deadlineHasPassed(at: timeline.date) {
+                            Text(AppLocalized("Approval deadline passed; refresh to confirm its status."))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("morde.task.approval.deadline.\(pending.id)")
+                        } else if !pending.canRespond(taskStatus: task.status, at: timeline.date) {
+                            Text(AppLocalized("Approval status is unknown; refresh task details before acting."))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("morde.task.approval.unknown.\(pending.id)")
+                        } else if pending.kind == nil || pending.kind == "approval" {
+                            if pending.media_preview_operation_id != nil {
+                                store.mediaApprovalControls(task: task, pending: pending)
+                                    .disabled(isLoadingDetail || detailError != nil)
+                            } else {
+                                HStack {
+                                    Button(AppLocalized("Reject"), role: .destructive) {
+                                        Task { await respondToApproval(pending, taskID: task.id, decision: "reject") }
+                                    }
+                                    .accessibilityIdentifier("morde.task.approval.reject.\(pending.id)")
+                                    Spacer()
+                                    Button(AppLocalized("Approve")) {
+                                        Task { await respondToApproval(pending, taskID: task.id, decision: "approve") }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(NanoMuseTones.action)
+                                    .accessibilityIdentifier("morde.task.approval.approve.\(pending.id)")
                                 }
-                                .accessibilityIdentifier("morde.task.approval.reject.\(pending.id)")
-                                Spacer()
-                                Button(AppLocalized("Approve")) {
-                                    Task { await respondToApproval(pending, taskID: task.id, decision: "approve") }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(NanoMuseTones.action)
-                                .accessibilityIdentifier("morde.task.approval.approve.\(pending.id)")
+                                .disabled(store.actionInFlight || isLoadingDetail || detailError != nil ||
+                                          !MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: task.status, at: timeline.date))
                             }
-                            .disabled(store.actionInFlight || isLoadingDetail || detailError != nil)
                         }
                     }
 
@@ -1418,7 +1458,9 @@ struct MIFTaskDetailView: View {
 
     private func respondToApproval(_ pending: MordeTask.Pending, taskID: String, decision: String) async {
         guard let scope = loadedScopeKey, scope == store.scopeKey, taskID == self.taskID,
-              !store.actionInFlight, !isLoadingDetail, detailError == nil else { return }
+              !store.actionInFlight, !isLoadingDetail, detailError == nil,
+              let task = store.details[taskID],
+              MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: task.status) else { return }
         _ = await store.respondToApproval(taskID: taskID, approvalID: pending.id,
                                           version: pending.version, decision: decision)
     }

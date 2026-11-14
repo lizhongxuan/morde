@@ -188,17 +188,25 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     const settings = appActions.find((item) => item.label === 'Settings').submenu;
     assert.deepEqual(settings.map((item) => item.label), ['Local Sync', 'Sign Out This PC']);
     settings[0].click();
-    assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'sync');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
+    assert.equal(contents.getURL(), 'https://portal.example/workspaces');
+    await handlers.get('morde:open-assistant')({ sender: mainWindow.webContents });
+    assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
+    assert.equal(contents.getURL(), assistantURL);
+    settings[0].click();
+    await new Promise((resolve) => setImmediate(resolve));
     appActions[0].click();
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
-    assert.deepEqual(contents.loaded, [assistantURL]);
+    const portalNavigation = [assistantURL, 'https://portal.example/workspaces', assistantURL, 'https://portal.example/workspaces'];
+    assert.deepEqual(contents.loaded, portalNavigation);
     assert.equal(handlers.has('morde:show-web'), false);
 
     let prevented = false;
     const navigate = contents.events.get('will-navigate');
     navigate({ preventDefault() { prevented = true; } }, 'https://evil.example/assistant');
     assert.equal(prevented, true);
-    assert.deepEqual(contents.loaded, [assistantURL]);
+    assert.deepEqual(contents.loaded, portalNavigation);
 
     const observationPopup = contents.open({ url: 'about:blank' });
     assert.equal(observationPopup.action, 'allow');
@@ -223,7 +231,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     navigate({ preventDefault() { prevented = true; } }, 'https://portal.example/login');
     assert.equal(prevented, true);
     for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(contents.loaded, [assistantURL, assistantURL]);
+    assert.deepEqual(contents.loaded, [...portalNavigation, assistantURL]);
 
     const invoke = handlers.get('morde:choose-directory');
     selectedDirectory = workspaceA;

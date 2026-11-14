@@ -8,6 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* Morde/MordeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* Morde/MordeApp.swift */; };
+		E50000000000000000000001 /* Morde/MordeCodexSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000000000000000000003 /* Morde/MordeCodexSessionPolicy.swift */; };
+		E50000000000000000000002 /* Morde/MordeCodexSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000000000000000000004 /* Morde/MordeCodexSessionsView.swift */; };
 		A10000000000000000000017 /* Morde/MordeCredentialExpiry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* Morde/MordeCredentialExpiry.swift */; };
 		A10000000000000000000019 /* ../../../LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* ../../../LICENSE */; };
 		A1000000000000000000001A /* ../../../NOTICE in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000024 /* ../../../NOTICE */; };
@@ -50,6 +52,8 @@
 
 /* Begin PBXFileReference section */
 		A10000000000000000000002 /* Morde/MordeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Morde/MordeApp.swift; sourceTree = "<group>"; };
+		E50000000000000000000003 /* Morde/MordeCodexSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Morde/MordeCodexSessionPolicy.swift; sourceTree = "<group>"; };
+		E50000000000000000000004 /* Morde/MordeCodexSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Morde/MordeCodexSessionsView.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* Morde.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Morde.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000018 /* Morde/MordeCredentialExpiry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Morde/MordeCredentialExpiry.swift; sourceTree = "<group>"; };
 		A10000000000000000000023 /* ../../../LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../../../LICENSE; sourceTree = "<group>"; };
@@ -105,6 +109,8 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000002 /* Morde/MordeApp.swift */,
+				E50000000000000000000003 /* Morde/MordeCodexSessionPolicy.swift */,
+				E50000000000000000000004 /* Morde/MordeCodexSessionsView.swift */,
 				A10000000000000000000030 /* Morde/MordeWorkspaceTransfer.swift */,
 				A10000000000000000000032 /* Morde/MordePortalNavigation.swift */,
 				C0DE00000000000000000002 /* Morde/MordeHubRelay.swift */,
@@ -265,6 +271,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000001 /* Morde/MordeApp.swift in Sources */,
+				E50000000000000000000001 /* Morde/MordeCodexSessionPolicy.swift in Sources */,
+				E50000000000000000000002 /* Morde/MordeCodexSessionsView.swift in Sources */,
 				A10000000000000000000027 /* Morde/MordeStandaloneApp.swift in Sources */,
 				A10000000000000000000017 /* Morde/MordeCredentialExpiry.swift in Sources */,
 				A10000000000000000000034 /* Morde/MordeHostStatusProjection.swift in Sources */,

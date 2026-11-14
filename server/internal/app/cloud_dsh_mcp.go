@@ -177,14 +177,14 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		activity.displayObject = source.connectorName
 		ctx = context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
 	}
-	if result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source); handled || err != nil {
+	if result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source, recovering, checkpointOutput); handled || err != nil {
 		return result, err
 	}
 	return b.executeMCPSource(ctx, details, call, arguments, source, recovering, checkpointOutput)
 }
 
 func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskDetails, call ModelToolCall,
-	arguments json.RawMessage, source cloudDSHMCPExecutionSource) (AgentToolResult, bool, error) {
+	arguments json.RawMessage, source cloudDSHMCPExecutionSource, recovering bool, checkpointOutput *string) (AgentToolResult, bool, error) {
 	current := details.Task
 	hash, err := cloudDSHMCPApprovalHash(current, call, arguments, source)
 	if err != nil {
@@ -220,6 +220,35 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 				return AgentToolResult{}, true, err
 			}
 			result, err := b.rejectApprovedToolCall(ctx, current, step, cloneTaskUsage(current.Usage), request)
+			return result, true, err
+		case task.PendingRequestExpired:
+			if pending.Decision != task.PendingDecisionReject || pending.ExpiresAt == nil || pending.RespondedAt == nil ||
+				pending.RespondedAt.Before(*pending.ExpiresAt) {
+				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+				return result, true, err
+			}
+			operationKey := agentOperationKey(call.CallID)
+			operationStore, ok := b.store.(MCPConnectorOperationStore)
+			if !ok {
+				return AgentToolResult{}, true, domain.NewError(domain.CodeUnsupported, "MCP connector operation storage is unavailable")
+			}
+			_, lookupErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, source.connectorID, operationKey)
+			if lookupErr == nil || (domain.CodeOf(lookupErr) != domain.CodeNotFound) || checkpointOutput != nil {
+				step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
+					"Review expired MCP approval", "The expired action has a prior result that must be reconciled safely.")
+				if err != nil {
+					return AgentToolResult{}, true, err
+				}
+				result, err := b.pauseMCPUnknown(ctx, current, step, cloneTaskUsage(current.Usage), operationKey,
+					"The expired MCP approval has a prior or checkpointed result that cannot be replayed safely.")
+				return result, true, err
+			}
+			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+				"Run cloud dsh MCP tool: "+source.remoteTool, "The approval expired before the connected service was called.")
+			if err != nil {
+				return AgentToolResult{}, true, err
+			}
+			result, err := b.expireApprovedToolCall(ctx, current, step, cloneTaskUsage(current.Usage), request)
 			return result, true, err
 		default:
 			result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)

@@ -30,6 +30,8 @@ extraResources:
     to: legal/THIRD_PARTY_NOTICES.syncthing.md
   - from: resources/THIRD_PARTY_NOTICES.morde-sync.md
     to: legal/THIRD_PARTY_NOTICES.morde-sync.md
+  - from: resources/THIRD_PARTY_NOTICES.t3code.md
+    to: legal/THIRD_PARTY_NOTICES.t3code.md
   - from: resources/MORDE_NOTICE.txt
     to: legal/MORDE_NOTICE.txt
 asar: true

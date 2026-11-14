@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -247,20 +248,6 @@ func publicTaskEventPayload(event task.Event) (json.RawMessage, error) {
 		return json.RawMessage(`{}`), nil
 	}
 	filtered := filterTaskEventFields(payload, allowed)
-	if event.Type == "task.step" {
-		if detailBytes, exists := filtered["detail"]; exists {
-			var detail map[string]json.RawMessage
-			if err := json.Unmarshal(detailBytes, &detail); err != nil || detail == nil {
-				filtered["detail"] = json.RawMessage(`{}`)
-			} else {
-				encodedDetail, err := json.Marshal(filterTaskEventFields(detail, []string{"phase", "status", "kind", "tool", "usage_known", "requires_reconciliation"}))
-				if err != nil {
-					return nil, err
-				}
-				filtered["detail"] = encodedDetail
-			}
-		}
-	}
 	encoded, err := json.Marshal(filtered)
 	if err != nil {
 		return nil, err
@@ -296,11 +283,47 @@ func publicTaskEventFields(eventType string) ([]string, bool) {
 func filterTaskEventFields(payload map[string]json.RawMessage, allowed []string) map[string]json.RawMessage {
 	filtered := make(map[string]json.RawMessage, len(allowed))
 	for _, key := range allowed {
-		if value, exists := payload[key]; exists {
+		value, exists := payload[key]
+		if !exists {
+			continue
+		}
+		if key == "detail" {
+			var detail map[string]json.RawMessage
+			if err := json.Unmarshal(value, &detail); err != nil || detail == nil {
+				filtered[key] = json.RawMessage(`{}`)
+				continue
+			}
+			encoded, err := json.Marshal(filterTaskEventFields(detail, []string{"phase", "status", "kind", "tool", "usage_known", "requires_reconciliation"}))
+			if err != nil {
+				filtered[key] = json.RawMessage(`{}`)
+			} else {
+				filtered[key] = encoded
+			}
+			continue
+		}
+		if validPublicTaskEventField(key, value) {
 			filtered[key] = value
 		}
 	}
 	return filtered
+}
+
+func validPublicTaskEventField(field string, raw json.RawMessage) bool {
+	if strings.TrimSpace(string(raw)) == "null" {
+		return true
+	}
+	switch field {
+	case "done", "requires_reconciliation", "usage_known", "redacted", "idempotency_replayed":
+		var value bool
+		return json.Unmarshal(raw, &value) == nil
+	case "batch_attempt", "task_revision", "revision", "size_bytes", "required_revision", "applied_revision",
+		"pending_version", "clarification_version", "lease_version", "attempt":
+		var value int64
+		return json.Unmarshal(raw, &value) == nil && value >= 0
+	default:
+		var value string
+		return json.Unmarshal(raw, &value) == nil && utf8.ValidString(value) && len(value) <= 8192 && !strings.ContainsRune(value, '\x00')
+	}
 }
 
 func validateTaskEvents(events []task.Event, after int64) error {

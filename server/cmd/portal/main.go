@@ -537,6 +537,10 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 	defer hubService.Close()
+	codexService, err := app.NewCodexService(store)
+	if err != nil {
+		return fmt.Errorf("initialize Codex mirror service: %w", err)
+	}
 	credentials, err := app.NewCredentialServiceWithHub(store, store, store, countedAudit, app.CredentialOptions{
 		SessionTTL: cfg.Security.SessionTTL, TicketTTL: cfg.Security.TicketTTL,
 		LoginLimit: loginLimit(cfg.Security.LoginRateLimit), LoginWindow: time.Minute,
@@ -748,7 +752,7 @@ func serve(ctx context.Context, configPath string) error {
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskArtifactContent: tasks, TaskFileFetch: tasks,
-		TaskObservationTickets: tasks, Conversations: conversations,
+		TaskObservationTickets: tasks, Conversations: conversations, Codex: codexService,
 		ProjectConversations:           projectConversations,
 		ProjectConversationAttachments: projectConversationAttachments,
 		ProjectWorkItems:               projectWorkItems,
