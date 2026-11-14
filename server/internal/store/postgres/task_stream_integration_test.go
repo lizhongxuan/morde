@@ -320,6 +320,160 @@ WHERE task_id=$1`, f.task.ID, mustID(t, domain.NewMessageID)); err != nil {
 	}
 }
 
+func TestContinueGenerationPersistsNewAssistantVariantWithoutChangingInterruptedVersion(t *testing.T) {
+	f := newCloudDSHStreamFixture(t)
+	ctx := context.Background()
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, f.delta); err != nil || !appended {
+		t.Fatalf("initial assistant stream: appended=%t err=%v", appended, err)
+	}
+	var inputMessageID string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT id FROM conversation_messages
+WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, f.task.ID).Scan(&inputMessageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET output_status='interrupted'
+WHERE id=$1 AND task_id=$2 AND output_status='streaming'`, f.delta.MessageID, f.task.ID); err != nil {
+		t.Fatalf("interrupt original assistant message: %v", err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE task_assistant_message_snapshots SET status='interrupted'
+WHERE task_id=$1 AND message_id=$2 AND status='streaming'`, f.task.ID, f.delta.MessageID); err != nil {
+		t.Fatalf("interrupt original assistant output: %v", err)
+	}
+	operationID := seedUnknownContinuationVariant(t, f, f.delta.MessageID, inputMessageID, "continue-stream-001")
+
+	continued := f.delta
+	continued.MessageID = mustID(t, domain.NewMessageID)
+	continued.TurnID = mustID(t, domain.NewStepID)
+	continued.Text = "Continued partial"
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, continued); err != nil || !appended {
+		t.Fatalf("continued assistant stream: appended=%t err=%v", appended, err)
+	}
+	var oldContent, oldStatus, newContent, newStatus, newOperationID string
+	var oldVersion, newVersion int64
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content,output_status,variant_version FROM conversation_messages
+WHERE id=$1`, f.delta.MessageID).Scan(&oldContent, &oldStatus, &oldVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content,output_status,variant_version,variant_operation_id
+FROM conversation_messages WHERE id=$1`, continued.MessageID).Scan(&newContent, &newStatus, &newVersion, &newOperationID); err != nil {
+		t.Fatal(err)
+	}
+	if oldContent != f.delta.Text || oldStatus != "interrupted" || oldVersion != 1 ||
+		newContent != continued.Text || newStatus != "streaming" || newVersion != 2 || newOperationID != operationID {
+		t.Fatalf("continuation projection changed the previous assistant version: old=%q/%s/v%d new=%q/%s/v%d/op=%s",
+			oldContent, oldStatus, oldVersion, newContent, newStatus, newVersion, newOperationID)
+	}
+
+	step := task.Step{ID: continued.TurnID, TaskID: f.task.ID, Sequence: 2, Kind: "result", Status: task.StepSucceeded, Title: "Result"}
+	result := "Continued partial answer"
+	if _, err := f.route.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: f.task.ID, LeaseOwner: f.task.Lease.Owner,
+		LeaseVersion: f.task.Lease.Version, Status: task.StatusCompleted, CurrentStep: step.ID, Result: result,
+		Steps: []task.Step{step}, PublishResultMessage: true,
+		Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"Continued partial answer"}`)}}); err != nil {
+		t.Fatalf("complete continuation: %v", err)
+	}
+	var finalMessageID, variantState string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT assistant_message_id,state FROM conversation_message_variants WHERE operation_id=$1`, operationID).
+		Scan(&finalMessageID, &variantState); err != nil {
+		t.Fatal(err)
+	}
+	if finalMessageID != continued.MessageID || variantState != "completed" {
+		t.Fatalf("completed continuation points to a different assistant version: message=%s state=%s", finalMessageID, variantState)
+	}
+	var finalContent, finalStatus string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content,output_status FROM conversation_messages WHERE id=$1`, continued.MessageID).
+		Scan(&finalContent, &finalStatus); err != nil || finalContent != result || finalStatus != "completed" {
+		t.Fatalf("continued assistant version did not complete in place: content=%q status=%s err=%v", finalContent, finalStatus, err)
+	}
+	page, err := f.route.store.ListMessages(ctx, f.task.OwnerID, f.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldListed, newListed bool
+	for _, message := range page.Items {
+		if message.ID == f.delta.MessageID {
+			oldListed = message.VariantGroupID == inputMessageID && message.VariantVersion == 1 && message.VariantAction == "original"
+		}
+		if message.ID == continued.MessageID {
+			newListed = message.VariantGroupID == inputMessageID && message.VariantVersion == 2 && message.VariantAction == "continue_generation"
+		}
+	}
+	if !oldListed || !newListed {
+		t.Fatalf("message list lost immutable continuation projections: old=%t new=%t messages=%+v", oldListed, newListed, page.Items)
+	}
+}
+
+func TestContinueGenerationWithoutNewStreamCreatesNewAssistantVersion(t *testing.T) {
+	f := newCloudDSHStreamFixture(t)
+	ctx := context.Background()
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, f.delta); err != nil || !appended {
+		t.Fatalf("initial assistant stream: appended=%t err=%v", appended, err)
+	}
+	var inputMessageID string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT id FROM conversation_messages
+WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, f.task.ID).Scan(&inputMessageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET output_status='interrupted'
+WHERE id=$1 AND task_id=$2 AND output_status='streaming'`, f.delta.MessageID, f.task.ID); err != nil {
+		t.Fatalf("interrupt original assistant message: %v", err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE task_assistant_message_snapshots SET status='interrupted'
+WHERE task_id=$1 AND message_id=$2 AND status='streaming'`, f.task.ID, f.delta.MessageID); err != nil {
+		t.Fatalf("interrupt original assistant output: %v", err)
+	}
+	operationID := seedUnknownContinuationVariant(t, f, f.delta.MessageID, inputMessageID, "continue-final-only-001")
+
+	result := "Hello again after continue"
+	step := task.Step{ID: f.delta.TurnID, TaskID: f.task.ID, Sequence: 2, Kind: "result", Status: task.StepSucceeded, Title: "Result"}
+	if _, err := f.route.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: f.task.ID, LeaseOwner: f.task.Lease.Owner,
+		LeaseVersion: f.task.Lease.Version, Status: task.StatusCompleted, CurrentStep: step.ID, Result: result,
+		Steps: []task.Step{step}, PublishResultMessage: true,
+		Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"Hello again after continue"}`)}}); err != nil {
+		t.Fatalf("complete final-only continuation: %v", err)
+	}
+	var finalMessageID, variantState string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT assistant_message_id,state FROM conversation_message_variants WHERE operation_id=$1`, operationID).
+		Scan(&finalMessageID, &variantState); err != nil {
+		t.Fatal(err)
+	}
+	if finalMessageID == f.delta.MessageID || variantState != "completed" {
+		t.Fatalf("final-only continuation did not create a distinct assistant version: message=%s state=%s", finalMessageID, variantState)
+	}
+	var oldContent, oldStatus, oldVariantAction string
+	var oldVersion int64
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content,output_status,variant_version,variant_action
+FROM conversation_messages WHERE id=$1`, f.delta.MessageID).Scan(&oldContent, &oldStatus, &oldVersion, &oldVariantAction); err != nil {
+		t.Fatal(err)
+	}
+	if oldContent != f.delta.Text || oldStatus != "interrupted" || oldVersion != 1 || oldVariantAction != "original" {
+		t.Fatalf("final-only continuation modified source assistant version: content=%q status=%s version=%d action=%s",
+			oldContent, oldStatus, oldVersion, oldVariantAction)
+	}
+	var newContent, newAction string
+	var newVersion int64
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content,variant_version,variant_action FROM conversation_messages WHERE id=$1`,
+		finalMessageID).Scan(&newContent, &newVersion, &newAction); err != nil || newContent != result || newVersion != 2 || newAction != "continue_generation" {
+		t.Fatalf("final-only assistant version projection is invalid: content=%q version=%d action=%s err=%v",
+			newContent, newVersion, newAction, err)
+	}
+}
+
+func seedUnknownContinuationVariant(t *testing.T, f cloudDSHStreamFixture, sourceMessageID, inputMessageID, idempotencyKey string) string {
+	t.Helper()
+	operationID := mustID(t, domain.NewOperationID)
+	requestHash := sha256.Sum256([]byte(idempotencyKey))
+	if _, err := f.route.store.pool.Exec(context.Background(), `INSERT INTO conversation_message_variants
+(operation_id,service_instance_id,owner_id,actor_id,conversation_id,source_message_id,input_source_message_id,
+ attachment_source_message_id,variant_group_id,expected_version,variant_version,action,state,idempotency_key,request_hash,task_id)
+VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,NULL,$7,1,2,'continue_generation','unknown',$8,$9,$10)`,
+		operationID, f.instanceID, f.task.OwnerID, f.task.InitiatorID, f.conversationID, sourceMessageID,
+		inputMessageID, idempotencyKey, requestHash[:], f.task.ID); err != nil {
+		t.Fatalf("insert continuation operation: %v", err)
+	}
+	return operationID
+}
+
 func TestCloudDSHStreamFirstDeltaRejectsCompetingConversationWork(t *testing.T) {
 	f := newCloudDSHStreamFixture(t)
 	ctx := context.Background()

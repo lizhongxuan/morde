@@ -253,6 +253,55 @@ func TestVerifyWorkspaceVolumeRejectsMissingVolumeWithoutCreating(t *testing.T) 
 	}
 }
 
+func TestDeleteWorkspaceVolumeVerifiesOwnershipBeforeRemoval(t *testing.T) {
+	const volumeName = "workspace-w1234567"
+	labels, err := workspaceVolumeLabels(volumeName, "instance-a", "u1234567", "w1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels["morde.owner_id"] = "u8765432"
+	volume := dockerVolumeIdentity{Name: volumeName, Driver: "local", Labels: labels}
+	var deleteCalls int
+	client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1.44/volumes/"+volumeName {
+			_ = json.NewEncoder(w).Encode(volume)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			deleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	if err := client.DeleteWorkspaceVolume(context.Background(), volumeName, "instance-a", "u1234567", "w1234567"); err == nil {
+		t.Fatal("DeleteWorkspaceVolume() error = nil, want ownership mismatch")
+	}
+	if deleteCalls != 0 {
+		t.Fatalf("mismatched Workspace volume was deleted; delete calls = %d", deleteCalls)
+	}
+}
+
+func TestDeleteWorkspaceVolumeAllowsAbsentVolumeForSafeRetry(t *testing.T) {
+	var deleteCalls int
+	client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1.44/volumes/workspace-w1234567" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			deleteCalls++
+		}
+		http.NotFound(w, r)
+	}))
+	if err := client.DeleteWorkspaceVolume(context.Background(), "workspace-w1234567", "instance-a", "u1234567", "w1234567"); err != nil {
+		t.Fatalf("DeleteWorkspaceVolume(missing retry) = %v, want nil", err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("safe retry delete requests = %d, want one idempotent DELETE", deleteCalls)
+	}
+}
+
 func TestOpenLegacyVolumeReturnsReadOnlyRootForUnattachedLocalVolume(t *testing.T) {
 	dockerRoot := t.TempDir()
 	dockerRoot, err := filepath.EvalSymlinks(dockerRoot)

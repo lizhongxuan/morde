@@ -1,6 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render, screen } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import type { components } from '../../api/schema';
@@ -62,20 +61,14 @@ describe('admin workspaces', () => {
     expect(screen.getByText(/不包含目录路径、文件正文或恢复操作/)).toBeInTheDocument();
   });
 
-  it('shows the user workspace metadata and finds it across pages', async () => {
+  it('keeps user details focused on cloud computers without listing standalone workspaces', async () => {
     mockUserDetails();
     vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'adminModelAccountBudget').mockResolvedValue({ owner_id: user.id, configured: false, token_limit: 0, max_concurrent: 0, used_tokens: 0, in_flight: 0, has_unknown: false });
-    const list = vi.spyOn(portalApi, 'adminWorkspaces')
-      .mockResolvedValueOnce({ items: [], next_cursor: 'next' })
-      .mockResolvedValueOnce({ items: [workspace], next_cursor: null });
-    const input = userEvent.setup();
+    const list = vi.spyOn(portalApi, 'adminWorkspaces');
     renderPage('/admin/users/u1234567');
 
-    expect(await screen.findByText(/暂未找到该用户的工作区/)).toBeInTheDocument();
-    await input.click(screen.getByRole('button', { name: '继续查找工作区' }));
-    expect(await screen.findByRole('link', { name: /示例工作区/ })).toHaveAttribute('href', '/admin/workspaces/w1234567');
-    expect(screen.getByRole('row', { name: /1,024 B.*4,096 B/ })).toBeInTheDocument();
-    expect(list).toHaveBeenLastCalledWith('next');
+    expect(await screen.findByText('该用户还没有云端电脑。')).toBeInTheDocument();
+    expect(list).not.toHaveBeenCalled();
   });
 });

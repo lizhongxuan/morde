@@ -20,6 +20,409 @@ import (
 	"morde/server/internal/store/postgres/sqlcgen"
 )
 
+func (s *Store) ConnectCodexProfile(ctx context.Context, principal identity.Principal, request codex.ProfileConnectionRequest) (codex.ProfileConnection, error) {
+	if principal.Kind != identity.KindClient || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		!domain.ValidClientInstallationID(principal.ClientInstallationID) {
+		return codex.ProfileConnection{}, domain.NewError(domain.CodeForbidden, "active Codex client installation is required")
+	}
+	if err := request.Validate(); err != nil {
+		return codex.ProfileConnection{}, domain.InvalidArgument("connection", err.Error())
+	}
+	var result codex.ProfileConnection
+	scopes := codexScopeStrings(request.Scopes)
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := checkCodexInstallation(ctx, tx, principal.UserID, principal.ClientInstallationID); err != nil {
+			return err
+		}
+		if err := lockCodexProfile(ctx, tx, principal.UserID, principal.ClientInstallationID, request.ProfileKey); err != nil {
+			return err
+		}
+		var storedScopes []string
+		var revokedAt pgtype.Timestamptz
+		var updatedAt pgtype.Timestamptz
+		if err := tx.QueryRow(ctx, `INSERT INTO codex_profile_connections (
+owner_id,installation_id,profile_key,scopes,revoked_at
+) VALUES ($1,$2,$3,$4,NULL)
+ON CONFLICT (owner_id,installation_id,profile_key) DO UPDATE SET
+  grant_version=codex_profile_connections.grant_version + CASE
+    WHEN codex_profile_connections.revoked_at IS NOT NULL OR codex_profile_connections.scopes IS DISTINCT FROM EXCLUDED.scopes
+    THEN 1 ELSE 0 END,
+  scopes=EXCLUDED.scopes,
+  revoked_at=NULL,
+  updated_at=CASE
+    WHEN codex_profile_connections.revoked_at IS NOT NULL OR codex_profile_connections.scopes IS DISTINCT FROM EXCLUDED.scopes
+    THEN statement_timestamp() ELSE codex_profile_connections.updated_at END
+RETURNING scopes,grant_version,revoked_at,updated_at`, principal.UserID, principal.ClientInstallationID,
+			request.ProfileKey, scopes).Scan(&storedScopes, &result.GrantVersion, &revokedAt, &updatedAt); err != nil {
+			return fmt.Errorf("upsert Codex profile connection: %w", err)
+		}
+
+		rows, err := tx.Query(ctx, `UPDATE codex_session_grants g SET
+  grant_version=g.grant_version+1,
+  scopes=$4::text[],
+  revoked_at=CASE WHEN cardinality($4::text[])=0 THEN statement_timestamp() ELSE NULL END,
+  updated_at=statement_timestamp()
+FROM codex_sessions s
+WHERE s.id=g.session_id AND s.owner_id=g.owner_id AND s.installation_id=g.installation_id
+  AND s.owner_id=$1 AND s.installation_id=$2 AND s.profile_key=$3
+  AND (g.scopes IS DISTINCT FROM $4::text[]
+       OR (g.revoked_at IS NOT NULL AND cardinality($4::text[])>0)
+       OR (g.revoked_at IS NULL AND cardinality($4::text[])=0))
+RETURNING s.id,g.grant_version`, principal.UserID, principal.ClientInstallationID, request.ProfileKey, scopes)
+		if err != nil {
+			return fmt.Errorf("update Codex profile session grants: %w", err)
+		}
+		changed := make([]struct {
+			sessionID string
+			version   int64
+		}, 0)
+		for rows.Next() {
+			var item struct {
+				sessionID string
+				version   int64
+			}
+			if err := rows.Scan(&item.sessionID, &item.version); err != nil {
+				rows.Close()
+				return fmt.Errorf("read updated Codex profile grant: %w", err)
+			}
+			changed = append(changed, item)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read updated Codex profile grants: %w", err)
+		}
+		rows.Close()
+		for _, item := range changed {
+			if err := invalidateCodexCommandsForGrant(ctx, tx, principal.UserID, item.sessionID,
+				principal.ClientInstallationID, item.version, false, "profile_scope_changed"); err != nil {
+				return err
+			}
+		}
+		if err := insertCodexAudit(ctx, tx, audit.Entry{
+			ActorID: principal.UserID, ActorKind: audit.ActorClient, Action: audit.ActionCodexProfileConnection,
+			Target: principal.ClientInstallationID + ":" + request.ProfileKey,
+			Detail: map[string]any{"installation_id": principal.ClientInstallationID, "profile_key": request.ProfileKey,
+				"scopes": storedScopes, "status": "connected", "updated_session_count": len(changed)},
+		}); err != nil {
+			return err
+		}
+		result = codex.ProfileConnection{InstallationID: principal.ClientInstallationID, ProfileKey: request.ProfileKey,
+			Scopes: codexScopes(storedScopes), GrantVersion: result.GrantVersion, Connected: !revokedAt.Valid, UpdatedAt: updatedAt.Time}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) RevokeCodexProfile(ctx context.Context, principal identity.Principal, profileKey string) error {
+	if principal.Kind != identity.KindClient || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		!domain.ValidClientInstallationID(principal.ClientInstallationID) || !codex.ValidProfileKey(profileKey) {
+		return domain.NewError(domain.CodeForbidden, "active Codex client installation is required")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := checkCodexInstallation(ctx, tx, principal.UserID, principal.ClientInstallationID); err != nil {
+			return err
+		}
+		if err := lockCodexProfile(ctx, tx, principal.UserID, principal.ClientInstallationID, profileKey); err != nil {
+			return err
+		}
+		var connectionVersion int64
+		if err := tx.QueryRow(ctx, `INSERT INTO codex_profile_connections (
+owner_id,installation_id,profile_key,scopes,revoked_at
+) VALUES ($1,$2,$3,'{}'::text[],statement_timestamp())
+ON CONFLICT (owner_id,installation_id,profile_key) DO UPDATE SET
+  grant_version=codex_profile_connections.grant_version + CASE
+    WHEN codex_profile_connections.revoked_at IS NULL OR cardinality(codex_profile_connections.scopes)>0
+    THEN 1 ELSE 0 END,
+  scopes='{}'::text[],
+  revoked_at=COALESCE(codex_profile_connections.revoked_at,statement_timestamp()),
+  session_discovery_state=NULL,
+  session_discovery_error_code=NULL,
+  history_discovered_sessions=NULL,
+  history_complete_sessions=NULL,
+  pending_upload_event_count=NULL,
+  session_discovery_updated_at=NULL,
+  updated_at=CASE
+    WHEN codex_profile_connections.revoked_at IS NULL OR cardinality(codex_profile_connections.scopes)>0
+    THEN statement_timestamp() ELSE codex_profile_connections.updated_at END
+RETURNING grant_version`, principal.UserID, principal.ClientInstallationID, profileKey).Scan(&connectionVersion); err != nil {
+			return fmt.Errorf("revoke Codex profile connection: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE codex_session_grants g SET
+  grant_version=g.grant_version+1,scopes='{}'::text[],revoked_at=statement_timestamp(),updated_at=statement_timestamp()
+FROM codex_sessions s
+WHERE s.id=g.session_id AND s.owner_id=g.owner_id AND s.installation_id=g.installation_id
+  AND s.owner_id=$1 AND s.installation_id=$2 AND s.profile_key=$3
+  AND (cardinality(g.scopes)>0 OR g.revoked_at IS NULL)`, principal.UserID, principal.ClientInstallationID, profileKey); err != nil {
+			return fmt.Errorf("revoke Codex profile session grants: %w", err)
+		}
+		rows, err := tx.Query(ctx, `SELECT s.id,g.grant_version
+FROM codex_sessions s JOIN codex_session_grants g
+  ON g.session_id=s.id AND g.owner_id=s.owner_id AND g.installation_id=s.installation_id
+WHERE s.owner_id=$1 AND s.installation_id=$2 AND s.profile_key=$3 ORDER BY s.id`,
+			principal.UserID, principal.ClientInstallationID, profileKey)
+		if err != nil {
+			return fmt.Errorf("list Codex profile sessions for command revocation: %w", err)
+		}
+		var affected []struct {
+			sessionID string
+			version   int64
+		}
+		for rows.Next() {
+			var item struct {
+				sessionID string
+				version   int64
+			}
+			if err := rows.Scan(&item.sessionID, &item.version); err != nil {
+				rows.Close()
+				return fmt.Errorf("read Codex profile session for command revocation: %w", err)
+			}
+			affected = append(affected, item)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read Codex profile sessions for command revocation: %w", err)
+		}
+		rows.Close()
+		for _, item := range affected {
+			if err := invalidateCodexCommandsForGrant(ctx, tx, principal.UserID, item.sessionID,
+				principal.ClientInstallationID, item.version, true, "profile_revoked"); err != nil {
+				return err
+			}
+		}
+		return insertCodexAudit(ctx, tx, audit.Entry{
+			ActorID: principal.UserID, ActorKind: audit.ActorClient, Action: audit.ActionCodexProfileConnection,
+			Target: principal.ClientInstallationID + ":" + profileKey,
+			Detail: map[string]any{"installation_id": principal.ClientInstallationID, "profile_key": profileKey,
+				"grant_version": connectionVersion, "status": "revoked", "revoked_session_count": len(affected)},
+		})
+	})
+}
+
+func (s *Store) UpdateCodexProfileSessionDiscovery(ctx context.Context, principal identity.Principal, profileKey string,
+	update codex.ProfileSessionDiscoveryUpdate) (codex.ProfileConnection, error) {
+	if principal.Kind != identity.KindClient || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		!domain.ValidClientInstallationID(principal.ClientInstallationID) || !codex.ValidProfileKey(profileKey) {
+		return codex.ProfileConnection{}, domain.NewError(domain.CodeForbidden, "active Codex client installation is required")
+	}
+	if err := update.Validate(); err != nil {
+		return codex.ProfileConnection{}, domain.InvalidArgument("session_discovery", err.Error())
+	}
+	var result codex.ProfileConnection
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := checkCodexInstallation(ctx, tx, principal.UserID, principal.ClientInstallationID); err != nil {
+			return err
+		}
+		if err := lockCodexProfile(ctx, tx, principal.UserID, principal.ClientInstallationID, profileKey); err != nil {
+			return err
+		}
+		var scopes []string
+		var grantVersion int64
+		var connectionUpdatedAt, statusUpdatedAt time.Time
+		err := tx.QueryRow(ctx, `UPDATE codex_profile_connections SET
+session_discovery_state=$4,
+session_discovery_error_code=$5,
+history_discovered_sessions=$6,
+history_complete_sessions=$7,
+pending_upload_event_count=$8,
+session_discovery_updated_at=statement_timestamp()
+WHERE owner_id=$1 AND installation_id=$2 AND profile_key=$3 AND revoked_at IS NULL
+RETURNING scopes,grant_version,updated_at,session_discovery_updated_at`, principal.UserID,
+			principal.ClientInstallationID, profileKey, string(update.SessionDiscovery.State), nullableDiscoveryErrorCode(update.SessionDiscovery.ErrorCode),
+			*update.HistorySync.DiscoveredSessions, *update.HistorySync.HistoryCompleteSessions,
+			*update.HistorySync.PendingUploadEventCount).Scan(&scopes, &grantVersion, &connectionUpdatedAt, &statusUpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeForbidden, "active Codex profile connection is required")
+		}
+		if err != nil {
+			return fmt.Errorf("update Codex profile session discovery status: %w", err)
+		}
+		var errorCode *codex.DiscoveryErrorCode
+		if update.SessionDiscovery.ErrorCode != nil {
+			value := *update.SessionDiscovery.ErrorCode
+			errorCode = &value
+		}
+		result = codex.ProfileConnection{
+			InstallationID: principal.ClientInstallationID,
+			ProfileKey:     profileKey,
+			Scopes:         codexScopes(scopes),
+			GrantVersion:   grantVersion,
+			Connected:      true,
+			UpdatedAt:      connectionUpdatedAt,
+			SessionDiscovery: &codex.SessionDiscoveryStatus{
+				State: update.SessionDiscovery.State, ErrorCode: errorCode, UpdatedAt: statusUpdatedAt,
+			},
+			HistorySync: &codex.HistorySyncProgress{
+				DiscoveredSessions:      *update.HistorySync.DiscoveredSessions,
+				HistoryCompleteSessions: *update.HistorySync.HistoryCompleteSessions,
+				PendingUploadEventCount: *update.HistorySync.PendingUploadEventCount,
+			},
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) ListCodexProfileConnections(ctx context.Context, principal identity.Principal,
+	installationID string) ([]codex.ProfileConnection, error) {
+	if !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		(principal.Kind != identity.KindSession && principal.Kind != identity.KindClient) ||
+		principal.Kind == identity.KindClient && !domain.ValidClientInstallationID(principal.ClientInstallationID) ||
+		!domain.ValidClientInstallationID(installationID) {
+		return nil, domain.NewError(domain.CodeForbidden, "an owner Session or Client credential and active desktop installation are required")
+	}
+	values := make([]codex.ProfileConnection, 0)
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if principal.Kind == identity.KindClient {
+			if err := checkCodexReaderInstallation(ctx, tx, principal.UserID, principal.ClientInstallationID); err != nil {
+				return err
+			}
+		}
+		if err := checkCodexProfileStatusReader(ctx, tx, principal.UserID, installationID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT installation_id,profile_key,scopes,grant_version,updated_at,
+  session_discovery_state,session_discovery_error_code,history_discovered_sessions,
+  history_complete_sessions,pending_upload_event_count,session_discovery_updated_at
+FROM codex_profile_connections
+WHERE owner_id=$1 AND installation_id=$2 AND revoked_at IS NULL
+ORDER BY profile_key FOR SHARE`, principal.UserID, installationID)
+		if err != nil {
+			return fmt.Errorf("list Codex profile connections: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var value codex.ProfileConnection
+			var scopes []string
+			var state, errorCode pgtype.Text
+			var discoveredSessions, historyCompleteSessions, pendingEvents pgtype.Int8
+			var statusUpdatedAt pgtype.Timestamptz
+			if err := rows.Scan(&value.InstallationID, &value.ProfileKey, &scopes, &value.GrantVersion, &value.UpdatedAt,
+				&state, &errorCode, &discoveredSessions, &historyCompleteSessions, &pendingEvents, &statusUpdatedAt); err != nil {
+				return fmt.Errorf("read Codex profile connection: %w", err)
+			}
+			value.Scopes = codexScopes(scopes)
+			value.Connected = true
+			if state.Valid {
+				discovery := &codex.SessionDiscoveryStatus{State: codex.DiscoveryState(state.String), UpdatedAt: statusUpdatedAt.Time}
+				if errorCode.Valid {
+					code := codex.DiscoveryErrorCode(errorCode.String)
+					discovery.ErrorCode = &code
+				}
+				value.SessionDiscovery = discovery
+				value.HistorySync = &codex.HistorySyncProgress{
+					DiscoveredSessions: discoveredSessions.Int64, HistoryCompleteSessions: historyCompleteSessions.Int64,
+					PendingUploadEventCount: pendingEvents.Int64,
+				}
+			}
+			values = append(values, value)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate Codex profile connections: %w", err)
+		}
+		return nil
+	})
+	return values, err
+}
+
+func nullableDiscoveryErrorCode(value *codex.DiscoveryErrorCode) any {
+	if value == nil {
+		return nil
+	}
+	return string(*value)
+}
+
+func lockCodexProfile(ctx context.Context, tx pgx.Tx, ownerID, installationID, profileKey string) error {
+	key := ownerID + "|" + installationID + "|" + profileKey
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, key); err != nil {
+		return fmt.Errorf("serialize Codex profile access: %w", err)
+	}
+	return nil
+}
+
+func readCodexProfileConnection(ctx context.Context, tx pgx.Tx, ownerID, installationID, profileKey string) ([]string, bool, bool, error) {
+	var scopes []string
+	var revokedAt pgtype.Timestamptz
+	err := tx.QueryRow(ctx, `SELECT scopes,revoked_at FROM codex_profile_connections
+WHERE owner_id=$1 AND installation_id=$2 AND profile_key=$3 FOR SHARE`, ownerID, installationID, profileKey).
+		Scan(&scopes, &revokedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, false, nil
+	}
+	if err != nil {
+		return nil, false, false, fmt.Errorf("read Codex profile connection: %w", err)
+	}
+	return scopes, true, revokedAt.Valid, nil
+}
+
+func codexScopeSubset(requested, granted []string) bool {
+	allowed := make(map[string]struct{}, len(granted))
+	for _, scope := range granted {
+		allowed[scope] = struct{}{}
+	}
+	for _, scope := range requested {
+		if _, ok := allowed[scope]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func invalidateCodexCommandsForGrant(ctx context.Context, tx pgx.Tx, ownerID, sessionID, installationID string,
+	grantVersion int64, force bool, resultCode string) error {
+	rows, err := tx.Query(ctx, `UPDATE codex_commands SET
+status=CASE WHEN status='waiting_pc' THEN 'failed' ELSE 'unknown' END,
+result_code=$5,status_version=status_version+1,updated_at=statement_timestamp()
+WHERE session_id=$1 AND owner_id=$2 AND installation_id=$3
+  AND status IN ('waiting_pc','claimed','forwarded','running','waiting_approval')
+  AND ($6 OR grant_version<>$4)
+RETURNING id,type,COALESCE(payload->>'decision',''),status,status_version`,
+		sessionID, ownerID, installationID, grantVersion, resultCode, force)
+	if err != nil {
+		return fmt.Errorf("invalidate stale Codex commands: %w", err)
+	}
+	type invalidatedCommand struct {
+		id, commandType, decision, status string
+		statusVersion                     int64
+	}
+	var invalidated []invalidatedCommand
+	for rows.Next() {
+		var command invalidatedCommand
+		if err := rows.Scan(&command.id, &command.commandType, &command.decision, &command.status, &command.statusVersion); err != nil {
+			rows.Close()
+			return fmt.Errorf("read invalidated Codex command: %w", err)
+		}
+		invalidated = append(invalidated, command)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read invalidated Codex commands: %w", err)
+	}
+	rows.Close()
+	for _, command := range invalidated {
+		if err := insertCodexCommandStatusEvent(ctx, tx, sessionID, ownerID, installationID,
+			command.id, codex.CommandType(command.commandType), codex.CommandStatus(command.status), command.statusVersion, resultCode); err != nil {
+			return err
+		}
+		if err := insertCodexAudit(ctx, tx, audit.Entry{
+			ActorID: ownerID, ActorKind: audit.ActorClient, Action: audit.ActionCodexCommandResult, Target: sessionID,
+			Detail: map[string]any{"installation_id": installationID, "command_id": command.id, "status": command.status,
+				"result_code": resultCode},
+		}); err != nil {
+			return err
+		}
+		if command.commandType == string(codex.CommandApproval) {
+			if err := insertCodexAudit(ctx, tx, audit.Entry{
+				ActorID: ownerID, ActorKind: audit.ActorClient, Action: audit.ActionCodexApprovalResult, Target: sessionID,
+				Detail: map[string]any{"installation_id": installationID, "command_id": command.id,
+					"decision": command.decision, "status": command.status, "result_code": resultCode},
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Store) DiscoverCodexSession(ctx context.Context, principal identity.Principal, request codex.Discover) (codex.Session, error) {
 	if !domain.ValidUserID(principal.UserID) || !domain.ValidClientInstallationID(principal.ClientInstallationID) ||
 		principal.Kind != identity.KindClient || !domain.ValidTokenID(principal.TokenID) {
@@ -34,6 +437,21 @@ func (s *Store) DiscoverCodexSession(ctx context.Context, principal identity.Pri
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := checkCodexInstallation(ctx, tx, principal.UserID, principal.ClientInstallationID); err != nil {
 			return err
+		}
+		if err := lockCodexProfile(ctx, tx, principal.UserID, principal.ClientInstallationID, request.ProfileKey); err != nil {
+			return err
+		}
+		profileScopes, connected, revoked, err := readCodexProfileConnection(ctx, tx, principal.UserID, principal.ClientInstallationID, request.ProfileKey)
+		if err != nil {
+			return err
+		}
+		if connected {
+			if revoked {
+				return domain.NewError(domain.CodeForbidden, "Codex profile connection was revoked")
+			}
+			if !codexScopeSubset(scopes, profileScopes) {
+				return domain.NewError(domain.CodeForbidden, "Codex session scopes exceed the profile connection grant")
+			}
 		}
 		var providerUpdatedAt pgtype.Timestamptz
 		if request.UpdatedAt != nil {
@@ -64,7 +482,7 @@ ON CONFLICT (owner_id,installation_id,profile_key,thread_id) DO UPDATE SET
 		var previousGrantVersion int64
 		var previousRevokedAt pgtype.Timestamptz
 		previousGrantFound := true
-		err := tx.QueryRow(ctx, `SELECT scopes,grant_version,revoked_at FROM codex_session_grants
+		err = tx.QueryRow(ctx, `SELECT scopes,grant_version,revoked_at FROM codex_session_grants
 WHERE session_id=$1 AND owner_id=$2 AND installation_id=$3 FOR UPDATE`, value.ID, value.OwnerID, value.InstallationID).
 			Scan(&previousScopes, &previousGrantVersion, &previousRevokedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -91,54 +509,8 @@ ON CONFLICT (session_id) DO UPDATE SET
 			return fmt.Errorf("upsert Codex session grant: %w", err)
 		}
 		value.GrantVersion, value.Scopes = grantVersion, codexScopes(storedScopes)
-		rows, err := tx.Query(ctx, `UPDATE codex_commands SET
-status=CASE WHEN status='waiting_pc' THEN 'failed' ELSE 'unknown' END,
-result_code='grant_changed',status_version=status_version+1,updated_at=statement_timestamp()
-WHERE session_id=$1 AND owner_id=$2 AND installation_id=$3
-  AND status IN ('waiting_pc','claimed','forwarded','running','waiting_approval') AND grant_version<>$4
-RETURNING id,type,COALESCE(payload->>'decision',''),status,status_version`, value.ID, value.OwnerID, value.InstallationID, grantVersion)
-		if err != nil {
-			return fmt.Errorf("invalidate stale Codex commands: %w", err)
-		}
-		type invalidatedCommand struct {
-			id, commandType, decision, status string
-			statusVersion                     int64
-		}
-		var invalidated []invalidatedCommand
-		for rows.Next() {
-			var command invalidatedCommand
-			if err := rows.Scan(&command.id, &command.commandType, &command.decision, &command.status, &command.statusVersion); err != nil {
-				rows.Close()
-				return fmt.Errorf("read invalidated Codex command: %w", err)
-			}
-			invalidated = append(invalidated, command)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("read invalidated Codex commands: %w", err)
-		}
-		rows.Close()
-		for _, command := range invalidated {
-			if err := insertCodexCommandStatusEvent(ctx, tx, value.ID, value.OwnerID, value.InstallationID,
-				command.id, codex.CommandType(command.commandType), codex.CommandStatus(command.status), command.statusVersion, "grant_changed"); err != nil {
-				return err
-			}
-			if err := insertCodexAudit(ctx, tx, audit.Entry{
-				ActorID: principal.UserID, ActorKind: audit.ActorClient, Action: audit.ActionCodexCommandResult, Target: value.ID,
-				Detail: map[string]any{"installation_id": value.InstallationID, "command_id": command.id,
-					"status": command.status},
-			}); err != nil {
-				return err
-			}
-			if command.commandType == string(codex.CommandApproval) {
-				if err := insertCodexAudit(ctx, tx, audit.Entry{
-					ActorID: principal.UserID, ActorKind: audit.ActorClient, Action: audit.ActionCodexApprovalResult, Target: value.ID,
-					Detail: map[string]any{"installation_id": value.InstallationID, "command_id": command.id,
-						"decision": command.decision, "status": command.status},
-				}); err != nil {
-					return err
-				}
-			}
+		if err := invalidateCodexCommandsForGrant(ctx, tx, principal.UserID, value.ID, value.InstallationID, grantVersion, false, "grant_changed"); err != nil {
+			return err
 		}
 		if grantChanged {
 			grantStatus := "active"
@@ -356,12 +728,8 @@ func (s *Store) ClaimCodexCommand(ctx context.Context, ownerID, installationID s
 		if err := expireStaleCodexCommandClaims(ctx, tx, ownerID, installationID); err != nil {
 			return err
 		}
-		var value codex.Command
-		var commandType, commandStatus string
-		var input []byte
-		var createdAt, claimedAt, updatedAt pgtype.Timestamptz
-		err := tx.QueryRow(ctx, `SELECT c.id,c.session_id,c.installation_id,s.profile_key,s.thread_id,c.grant_version,c.type,c.status,
-       c.payload,c.result_code,c.provider_request_id,c.created_at,c.claimed_at,c.updated_at
+		var candidateProfile string
+		err := tx.QueryRow(ctx, `SELECT s.profile_key
 FROM codex_commands c
 JOIN codex_sessions s ON s.id=c.session_id AND s.owner_id=c.owner_id AND s.installation_id=c.installation_id
 JOIN codex_session_grants g ON g.session_id=s.id AND g.owner_id=s.owner_id AND g.installation_id=s.installation_id
@@ -374,8 +742,38 @@ WHERE c.owner_id=$1 AND c.installation_id=$2 AND c.status='waiting_pc'
                   WHEN 'answer_question' THEN 'send'=ANY(g.scopes)
                   WHEN 'interrupt' THEN 'interrupt'=ANY(g.scopes)
                   WHEN 'approval' THEN 'approval'=ANY(g.scopes) ELSE false END
+ORDER BY c.created_at,c.id LIMIT 1`, ownerID, installationID).Scan(&candidateProfile)
+		if errors.Is(err, pgx.ErrNoRows) {
+			result = []codex.Command{}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("find Codex profile with a claimable command: %w", err)
+		}
+		if err := lockCodexProfile(ctx, tx, ownerID, installationID, candidateProfile); err != nil {
+			return err
+		}
+		var value codex.Command
+		var commandType, commandStatus string
+		var input []byte
+		var createdAt, claimedAt, updatedAt pgtype.Timestamptz
+		err = tx.QueryRow(ctx, `SELECT c.id,c.session_id,c.installation_id,s.profile_key,s.thread_id,c.grant_version,c.type,c.status,
+       c.payload,c.result_code,c.provider_request_id,c.created_at,c.claimed_at,c.updated_at
+FROM codex_commands c
+JOIN codex_sessions s ON s.id=c.session_id AND s.owner_id=c.owner_id AND s.installation_id=c.installation_id
+JOIN codex_session_grants g ON g.session_id=s.id AND g.owner_id=s.owner_id AND g.installation_id=s.installation_id
+JOIN client_installations i ON i.id=c.installation_id AND i.owner_id=c.owner_id
+WHERE c.owner_id=$1 AND c.installation_id=$2 AND c.status='waiting_pc'
+  AND s.profile_key=$3
+  AND g.revoked_at IS NULL AND c.grant_version=g.grant_version
+  AND i.revoked_at IS NULL AND (i.expires_at IS NULL OR i.expires_at>statement_timestamp())
+  AND 'read'=ANY(g.scopes)
+  AND CASE c.type WHEN 'send' THEN 'send'=ANY(g.scopes)
+                  WHEN 'answer_question' THEN 'send'=ANY(g.scopes)
+                  WHEN 'interrupt' THEN 'interrupt'=ANY(g.scopes)
+                  WHEN 'approval' THEN 'approval'=ANY(g.scopes) ELSE false END
 ORDER BY c.created_at,c.id
-LIMIT 1 FOR UPDATE OF c SKIP LOCKED`, ownerID, installationID).Scan(
+LIMIT 1 FOR UPDATE OF c SKIP LOCKED`, ownerID, installationID, candidateProfile).Scan(
 			&value.ID, &value.SessionID, &value.InstallationID, &value.ProfileKey, &value.ThreadID, &value.GrantVersion,
 			&commandType, &commandStatus, &input, &value.ResultCode, &value.ProviderRequestID, &createdAt, &claimedAt, &updatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -593,6 +991,9 @@ WHERE id=$1 RETURNING status,result_code,provider_request_id,claimed_at,updated_
 
 func (s *Store) AppendCodexEvents(ctx context.Context, ownerID, installationID, sessionID string, batch codex.EventBatch) (codex.EventBatchAck, error) {
 	var result codex.EventBatchAck
+	if _, err := batch.Validate(); err != nil {
+		return result, domain.InvalidArgument("events", err.Error())
+	}
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		session, scopes, err := getCodexSessionForWrite(ctx, tx, ownerID, installationID, sessionID, true)
 		if err != nil {
@@ -751,6 +1152,20 @@ FROM client_installations WHERE id=$1 AND owner_id=$2 FOR SHARE`, installationID
 	}
 	if err != nil {
 		return fmt.Errorf("verify Codex reader installation: %w", err)
+	}
+	return nil
+}
+
+func checkCodexProfileStatusReader(ctx context.Context, tx pgx.Tx, ownerID, installationID string) error {
+	var active bool
+	err := tx.QueryRow(ctx, `SELECT revoked_at IS NULL AND platform='desktop'
+  AND (expires_at IS NULL OR expires_at>statement_timestamp())
+FROM client_installations WHERE id=$1 AND owner_id=$2 FOR SHARE`, installationID, ownerID).Scan(&active)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && !active {
+		return domain.NewError(domain.CodeForbidden, "active owner desktop installation is required")
+	}
+	if err != nil {
+		return fmt.Errorf("verify Codex profile status installation: %w", err)
 	}
 	return nil
 }

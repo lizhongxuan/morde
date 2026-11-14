@@ -1724,6 +1724,111 @@ func TestRuntimeToolExecutorVerifyAgainstWorkspaceFileHandler(t *testing.T) {
 	}
 }
 
+func TestRuntimeToolExecutorPublishesBinaryTaskWorkspaceOutputFromHostShell(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run",
+		result: `{"exit_code":0,"stdout":"Office export complete","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	request, preparation := fixture.prepared(runtimeToolShellExec, `{"command":"office-cli export"}`, identity.ScopeComputerOperate)
+	request.OperationKey = agentOperationKey(request.Call.CallID)
+	preparation.Token = runtimeToolPreparationToken(request, preparation.Fence, preparation.BindingVersion)
+	fixture.persistOperation(request)
+	shellResult, err := fixture.executor.Execute(context.Background(), request, preparation)
+	if err != nil || shellResult.Status != AgentToolSucceeded {
+		t.Fatalf("Execute(shell_exec) = %#v, %v; want durable success", shellResult, err)
+	}
+	fixture.store.mu.Lock()
+	operation := fixture.store.operations[request.OperationKey]
+	operation.Status, operation.ExternalID = task.OperationSucceeded, request.OperationID
+	operation.Result = `{"exit_code":0,"stdout":"Office export complete","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`
+	fixture.store.operations[request.OperationKey], fixture.store.operation = operation, operation
+	fixture.store.mu.Unlock()
+
+	filePath := "exports/quarterly.xlsx"
+	privateView := filepath.Join(fixture.workspaceRoot, ".morde-task-views", request.Task.ID, testTaskWorkspaceViewID(request.Task, request.WorkspaceID, preparation.BindingVersion), "workspace")
+	absolutePath := filepath.Join(privateView, filepath.FromSlash(filePath))
+	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, (1<<20)+73) // Larger than file.verify's per-file cap.
+	for index := range data {
+		data[index] = byte(index*31 + 7)
+	}
+	if err := os.WriteFile(absolutePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	inputs := []ModelInput{
+		{Type: "function_call", CallID: request.Call.CallID, Name: request.Call.Name, Arguments: string(request.Arguments)},
+		{Type: "function_call_output", CallID: request.Call.CallID, Output: shellResult.Output},
+	}
+	verified, err := fixture.executor.VerifyTaskWorkspaceOutput(context.Background(), fixture.store.details.Task, "s1234567", inputs, request.Fence)
+	if err != nil || verified.Status != AgentVerified || len(verified.Artifacts) != 1 {
+		t.Fatalf("VerifyTaskWorkspaceOutput() = %#v, %v; want one verified binary artifact", verified, err)
+	}
+	artifact := verified.Artifacts[0]
+	if artifact.Path != filePath || artifact.SizeBytes != int64(len(data)) || artifact.SHA256 != hex.EncodeToString(digest[:]) || artifact.Revision != 1 {
+		t.Fatalf("verified artifact = %#v; want exact private-view bytes committed at revision 1", artifact)
+	}
+	receipt, err := fixture.executor.workspaces.FindTaskWorkspacePublishReceipt(context.Background(), fixture.store.details.Task.OwnerID,
+		fixture.store.details.Task.ID, fixture.store.details.Task.WorkspaceID, taskWorkspacePublishOperationKey("s1234567", "w1234567"))
+	if err != nil || receipt.State != TaskWorkspacePublishSucceeded || receipt.BaseRevision != 0 || receipt.PublishedRevision != artifact.Revision {
+		t.Fatalf("publish receipt = %#v, %v; want revision-bound success", receipt, err)
+	}
+	replayed, err := fixture.executor.VerifyTaskWorkspaceOutput(context.Background(), fixture.store.details.Task, "s1234567", inputs, request.Fence)
+	if err != nil || replayed.Status != AgentVerified || len(replayed.Artifacts) != 1 || replayed.Artifacts[0] != artifact {
+		t.Fatalf("VerifyTaskWorkspaceOutput() receipt replay = %#v, %v; want same committed artifact", replayed, err)
+	}
+}
+
+func TestRuntimeToolExecutorWorkspaceOutputDiffRejectsUnsafeCandidates(t *testing.T) {
+	content := []byte("synthetic")
+	digest := sha256.Sum256(content)
+	regular := func(filePath string) workspace.File {
+		return workspace.File{Path: filePath, SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Mode: 0o600,
+			Chunks: []workspace.Chunk{{SHA256: hex.EncodeToString(digest[:]), SizeBytes: int64(len(content))}}}
+	}
+	target := "target.bin"
+	targetDigest := sha256.Sum256([]byte(target))
+	cases := []struct {
+		name  string
+		files []workspace.File
+		quota int64
+	}{
+		{name: "sensitive path", files: []workspace.File{regular("private/.env")}},
+		{name: "symlink", files: []workspace.File{{Kind: workspace.FileKindSymlink, Path: "exports/current", SymlinkTarget: target,
+			SizeBytes: int64(len(target)), SHA256: hex.EncodeToString(targetDigest[:])}}},
+		{name: "hardlink", files: []workspace.File{regular("exports/a.bin"), {
+			Path: "exports/b.bin", HardlinkTo: "exports/a.bin", SizeBytes: int64(len(content)),
+			SHA256: hex.EncodeToString(digest[:]), Mode: 0o600,
+			Chunks: []workspace.Chunk{{SHA256: hex.EncodeToString(digest[:]), SizeBytes: int64(len(content))}},
+		}}},
+		{name: "total byte quota", files: []workspace.File{regular("exports/result.bin")}, quota: int64(len(content) - 1)},
+	}
+	tooMany := make([]workspace.File, 0, maxAgentVerifiedArtifacts+1)
+	for index := 0; index <= maxAgentVerifiedArtifacts; index++ {
+		tooMany = append(tooMany, regular(fmt.Sprintf("exports/file-%02d.bin", index)))
+	}
+	cases = append(cases, struct {
+		name  string
+		files []workspace.File
+		quota int64
+	}{name: "artifact count", files: tooMany})
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			if test.quota > 0 {
+				fixture.executor.workspaces.maxOwnerBytes = test.quota
+			}
+			artifacts, err := fixture.executor.workspaceOutputDeltaArtifacts(context.Background(), fixture.store.details.Task, 0, test.files, nil)
+			if err == nil || len(artifacts) != 0 {
+				t.Fatalf("workspaceOutputDeltaArtifacts() = %#v, %v; want fail-closed rejection", artifacts, err)
+			}
+		})
+	}
+}
+
 func TestRuntimeToolExecutorVerifyRejectsMismatchedRuntimeEvidence(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
 		capability: runtimeFileVerifyCapability, action: runtimeFileVerifyAction,

@@ -4,7 +4,7 @@ import XCTest
 final class MIFResourceViewsTests: XCTestCase {
     func testResourceSectionsFollowDesignOrder() {
         XCTAssertEqual(MIFResourcePageSection.allCases, [
-            .cloudComputers, .cloudPhones, .workspaces, .aiTools,
+            .cloudComputers, .cloudPhones, .aiTools,
         ])
         XCTAssertEqual(MIFResourcePageSection.cloudPhones.title, AppLocalized("Cloud phones"))
         XCTAssertEqual(MIFResourcePageSection.aiTools.title, AppLocalized("AI tools"))
@@ -22,36 +22,17 @@ final class MIFResourceViewsTests: XCTestCase {
         XCTAssertFalse(aiTools.contains("Claude"))
     }
 
-    func testHostAndWorkspaceEmptyStatesRequireConfirmedLists() {
+    func testHostEmptyStateRequiresConfirmedList() {
         let loadedEmpty = resourceState(isLoading: false, loadError: nil)
         XCTAssertTrue(MIFResourcePageRules.showsEmptyState(for: .cloudComputers, state: loadedEmpty))
-        XCTAssertTrue(MIFResourcePageRules.showsEmptyState(for: .workspaces, state: loadedEmpty))
 
         let failed = resourceState(isLoading: false, loadError: "resource list failed")
         XCTAssertFalse(MIFResourcePageRules.showsEmptyState(for: .cloudComputers, state: failed))
-        XCTAssertFalse(MIFResourcePageRules.showsEmptyState(for: .workspaces, state: failed))
 
         let loading = resourceState(isLoading: true, loadError: nil)
         XCTAssertFalse(MIFResourcePageRules.showsEmptyState(for: .cloudComputers, state: loading))
-        XCTAssertFalse(MIFResourcePageRules.showsEmptyState(for: .workspaces, state: loading))
         XCTAssertTrue(MIFResourcePageRules.showsEmptyState(for: .cloudPhones, state: failed))
         XCTAssertTrue(MIFResourcePageRules.showsEmptyState(for: .aiTools, state: failed))
-    }
-
-    func testResourceListFailureDoesNotHideOtherConfirmedEmptySection() {
-        let workspaceFailure = resourceState(
-            isLoading: false, loadError: "Workspace list failed",
-            hostsState: .init(isLoading: false, loadError: nil),
-            workspacesState: .init(isLoading: false, loadError: "Workspace list failed"))
-        XCTAssertTrue(MIFResourcePageRules.showsEmptyState(for: .cloudComputers, state: workspaceFailure))
-        XCTAssertFalse(MIFResourcePageRules.showsEmptyState(for: .workspaces, state: workspaceFailure))
-
-        let hostFailure = resourceState(
-            isLoading: false, loadError: "Host list failed",
-            hostsState: .init(isLoading: false, loadError: "Host list failed"),
-            workspacesState: .init(isLoading: false, loadError: nil))
-        XCTAssertFalse(MIFResourcePageRules.showsEmptyState(for: .cloudComputers, state: hostFailure))
-        XCTAssertTrue(MIFResourcePageRules.showsEmptyState(for: .workspaces, state: hostFailure))
     }
 
     func testSharedHostNeverOffersControlActions() {
@@ -158,13 +139,11 @@ final class MIFResourceViewsTests: XCTestCase {
     }
 
     private func resourceState(isLoading: Bool, loadError: String?,
-                               hostsState: MIFResourcePageState.ListState? = nil,
-                               workspacesState: MIFResourcePageState.ListState? = nil) -> MIFResourcePageState {
+                               hostsState: MIFResourcePageState.ListState? = nil) -> MIFResourcePageState {
         MIFResourcePageState(isLoading: isLoading, loadError: loadError,
                              hostsState: hostsState ?? .init(isLoading: isLoading, loadError: loadError),
-                             workspacesState: workspacesState ?? .init(isLoading: isLoading, loadError: loadError),
                              defaultTarget: .unknown,
-                             hosts: [], workspaces: [])
+                             hosts: [])
     }
 
     private func control(

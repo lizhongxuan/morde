@@ -309,7 +309,7 @@ func TestHostCreateIdempotencyReplaysAtomically(t *testing.T) {
 	}
 }
 
-func TestWorkspaceBindingCanMoveBetweenHosts(t *testing.T) {
+func TestWorkspaceBindingCannotMoveBetweenHosts(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
@@ -335,13 +335,12 @@ func TestWorkspaceBindingCanMoveBetweenHosts(t *testing.T) {
 		t.Fatal(err)
 	}
 	params := testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID})
-	second, _, err := store.CreateHost(ctx, params)
-	if err != nil {
-		t.Fatal(err)
+	if _, _, err := store.CreateHost(ctx, params); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("create second Host with the same storage = %v, want workspace conflict", err)
 	}
 	bindings, err := store.GetWorkspaceBindingsByWorkspace(ctx, value.ID)
-	if err != nil || len(bindings) != 2 || bindings[0].State != workspace.BindingDetached || bindings[1].HostID != second.ID || bindings[1].State != workspace.BindingPreparing {
-		t.Fatalf("workspace bindings after rebind = %#v, err=%v", bindings, err)
+	if err != nil || len(bindings) != 1 || bindings[0].HostID != first.ID || bindings[0].State != workspace.BindingDetached {
+		t.Fatalf("computer storage binding after rejected move = %#v, err=%v", bindings, err)
 	}
 }
 

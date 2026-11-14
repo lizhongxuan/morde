@@ -22,7 +22,7 @@ func TestAuthorizeToolUsesCurrentAPIKeyAbilities(t *testing.T) {
 		{name: "host create needs no preexisting host grant", key: key, tool: "host_create"},
 		{name: "key can operate without stored scope grants", key: key, tool: "browser_click", args: map[string]any{"host_id": "h1234567"}},
 		{name: "key can read without stored host grants", key: key, tool: "host_get", args: map[string]any{"host_id": "h1234567"}},
-		{name: "host delete retains independent workspace data", key: key, tool: "host_delete", args: map[string]any{"host_id": "h1234567"}},
+		{name: "host delete accepts explicit workspace confirmation", key: key, tool: "host_delete", args: map[string]any{"host_id": "h1234567", "confirm_workspace_deletion": true}},
 		{name: "malformed host id has no authority", key: key, tool: "host_get", args: map[string]any{"host_id": "host_test"}, wantErr: domain.CodeNotFound},
 		{name: "session is not an API key", key: identity.Principal{Kind: identity.KindSession}, tool: "host_get", args: map[string]any{"host_id": "h1234567"}, wantErr: domain.CodeUnauthenticated},
 		{name: "retired task tool is denied", key: key, tool: "task_get", args: map[string]any{"host_id": "h1234567"}, wantErr: domain.CodeForbidden},

@@ -435,6 +435,9 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	} else if e.options.Tools != nil || e.options.Children != nil {
 		return errors.New("dsh model tool capability is unavailable")
 	}
+	if value.ToolsDisabled {
+		toolsAllowed = false
+	}
 	streamAllowed := false
 	if !toolsAllowed && e.options.TextStreams != nil && e.options.StreamCapability != nil {
 		// An unavailable optional display capability must never prevent the

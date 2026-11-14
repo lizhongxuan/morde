@@ -173,6 +173,14 @@ struct MIFLibraryAccountItem: Identifiable, Equatable, Sendable {
 /// Pure gate for page actions. The caller owns permission checks and handle
 /// creation; this view only exposes a callback for an already verified handle.
 enum MIFLibraryPreviewPolicy {
+    static func hasCompleteVerifiedProof(_ artifact: MIFLibraryTaskArtifact) -> Bool {
+        artifact.verified == true && !artifact.id.isEmpty &&
+            artifact.workspaceID?.range(of: "^w[a-z0-9]{7}$", options: .regularExpression) != nil &&
+            artifact.workspaceRevision.map { $0 >= 0 } == true && artifact.sizeBytes.map { $0 >= 0 } == true &&
+            artifact.sha256?.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil &&
+            !artifact.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !artifact.mediaType.isEmpty
+    }
+
     static func normalizedPersonalAttachmentMediaType(_ value: String?) -> String? {
         guard let value else { return nil }
         let mediaType = value.split(separator: ";", maxSplits: 1).first?
@@ -208,16 +216,30 @@ enum MIFLibraryPreviewPolicy {
             mediaType.hasPrefix("video/") || mediaType.hasPrefix("audio/")
         guard access == .available, workspaceSyncAvailable == true,
               !requiresMediaCapability || taskMediaGenerationAvailable == true,
-              !artifact.id.isEmpty,
-              artifact.verified == true,
-              let workspaceID = artifact.workspaceID,
-              workspaceID.range(of: "^w[a-z0-9]{7}$", options: .regularExpression) != nil,
-              let revision = artifact.workspaceRevision, revision >= 0,
-              let sizeBytes = artifact.sizeBytes, sizeBytes >= 0,
-              let sha256 = artifact.sha256,
-              sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+              hasCompleteVerifiedProof(artifact),
               let handle = artifact.previewHandle else { return nil }
         return handle
+    }
+
+    static func taskPreviewUnavailableReason(for artifact: MIFLibraryTaskArtifact,
+                                             access: MIFLibraryAccessState,
+                                             workspaceSyncAvailable: Bool?,
+                                             taskMediaGenerationAvailable: Bool?) -> String? {
+        if taskHandle(for: artifact, access: access, workspaceSyncAvailable: workspaceSyncAvailable,
+                      taskMediaGenerationAvailable: taskMediaGenerationAvailable) != nil { return nil }
+        guard access == .available else { return AppLocalized("Artifact details unavailable") }
+        guard hasCompleteVerifiedProof(artifact) else {
+            return AppLocalized("Artifact is not verified or its proof is incomplete; metadata only")
+        }
+        guard workspaceSyncAvailable == true else {
+            return AppLocalized("Workspace sync is unavailable; metadata only")
+        }
+        let mediaType = artifact.mediaType.lowercased()
+        if (mediaType.hasPrefix("image/") || mediaType.hasPrefix("video/") || mediaType.hasPrefix("audio/")) &&
+            taskMediaGenerationAvailable != true {
+            return AppLocalized("Media preview is unavailable for this task; metadata only")
+        }
+        return AppLocalized("The matching Workspace file could not be verified; retry or sync the exact version")
     }
 }
 
@@ -580,11 +602,12 @@ struct MIFLibraryPage: View {
             parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
         }
         if let revision = artifact.workspaceRevision, revision >= 0 { parts.append("v\(revision)") }
-        if MIFLibraryPreviewPolicy.taskHandle(
+        if let reason = MIFLibraryPreviewPolicy.taskPreviewUnavailableReason(
             for: artifact, access: taskAccess,
             workspaceSyncAvailable: workspaceSyncAvailable,
-            taskMediaGenerationAvailable: taskMediaGenerationAvailable) == nil {
+            taskMediaGenerationAvailable: taskMediaGenerationAvailable) {
             parts.append(AppLocalized("Metadata only"))
+            parts.append(reason)
         }
         return parts.isEmpty ? AppLocalized("Metadata only") : parts.joined(separator: " · ")
     }

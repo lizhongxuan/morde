@@ -48,7 +48,6 @@ type taskServiceStub struct {
 	stepRetryStepID        string
 	stepRetryRevision      int64
 	stepRetryAttempt       int64
-	stepRetryDigest        string
 	stepRetryIdempotency   string
 	actionTaskID           string
 	action                 task.Action
@@ -223,11 +222,11 @@ func (s *taskServiceStub) GetStepDetail(_ context.Context, _ identity.Principal,
 }
 
 func (s *taskServiceStub) RetryStep(_ context.Context, _ identity.Principal, taskID, stepID string, revision, attempt int64,
-	digest, idempotencyKey string) (app.TaskStepRetryResult, error) {
+	idempotencyKey string) (app.TaskStepRetryResult, error) {
 	s.stepRetryCalls++
 	s.stepRetryTaskID, s.stepRetryStepID = taskID, stepID
 	s.stepRetryRevision, s.stepRetryAttempt = revision, attempt
-	s.stepRetryDigest, s.stepRetryIdempotency = digest, idempotencyKey
+	s.stepRetryIdempotency = idempotencyKey
 	return s.stepRetryResult, s.err
 }
 
@@ -858,6 +857,26 @@ func TestGetTaskCountsStepsExcludingBudget(t *testing.T) {
 	}
 }
 
+func TestTaskStepProjectionDisablesRetryAfterAttemptExists(t *testing.T) {
+	current := apiTestTask()
+	now := time.Now().UTC()
+	revision := int64(0)
+	source := task.Step{ID: "s1234567", TaskID: current.ID, Sequence: 1, Attempt: 1, Kind: "tool", Status: task.StepFailed,
+		Title: "Read selected file", FailureReason: "not_dispatched", Retryable: true, AgentSessionID: "session-1",
+		TaskRevision: &revision, ToolName: "file_read", Phase: "prepare", CreatedAt: now}
+	available, err := toTaskResponse(app.TaskDetails{Task: current, Steps: []task.Step{source}})
+	if err != nil || len(available.Steps) != 1 || !available.Steps[0].Retryable {
+		t.Fatalf("failed TaskStep before retry projection=%+v err=%v; want retryable", available.Steps, err)
+	}
+	attempt := task.Step{ID: "s7654321", TaskID: current.ID, Sequence: 2, Attempt: 2, RetryOfStepID: source.ID,
+		Kind: "tool", Status: task.StepQueued, Title: "Retry read selected file", CreatedAt: now}
+	reserved, err := toTaskResponse(app.TaskDetails{Task: current, Steps: []task.Step{source, attempt}})
+	if err != nil || len(reserved.Steps) != 2 || reserved.Steps[0].Retryable || reserved.Steps[1].Retryable ||
+		reserved.Steps[1].RetryOfStepID == nil || *reserved.Steps[1].RetryOfStepID != source.ID {
+		t.Fatalf("TaskStep retry projection after attempt=%+v err=%v; want source no longer retryable", reserved.Steps, err)
+	}
+}
+
 func TestTaskDetailAllowsRestrictedStepDetails(t *testing.T) {
 	current := apiTestTask()
 	view, err := toTaskResponse(app.TaskDetails{Task: current, Steps: []task.Step{{
@@ -913,7 +932,7 @@ func TestTaskStepRetryRouteBindsRequestAndRejectsReplacementArguments(t *testing
 		AttemptStepID: "s7654321", Attempt: 2, Status: "queued"}}
 	engine := taskAPIRouter(service, nil)
 	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries",
-		strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`"}`))
+		strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "step-retry-0001")
 	response := httptest.NewRecorder()
@@ -921,14 +940,15 @@ func TestTaskStepRetryRouteBindsRequestAndRejectsReplacementArguments(t *testing
 	if response.Code != http.StatusAccepted || response.Header().Get("Cache-Control") != "no-store" ||
 		!strings.Contains(response.Body.String(), `"attempt_step_id":"s7654321"`) || service.stepRetryCalls != 1 ||
 		service.stepRetryTaskID != "q1234567" || service.stepRetryStepID != "s1234567" || service.stepRetryRevision != 4 ||
-		service.stepRetryAttempt != 1 || service.stepRetryDigest != strings.Repeat("a", 64) || service.stepRetryIdempotency != "step-retry-0001" {
+		service.stepRetryAttempt != 1 || service.stepRetryIdempotency != "step-retry-0001" {
 		t.Fatalf("step retry response=%d headers=%v body=%s service=%+v", response.Code, response.Header(), response.Body.String(), service)
 	}
 
 	for _, request := range []*http.Request{
-		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries?force=true", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`"}`)),
-		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`","arguments":{"path":"different"}}`)),
-		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"bad"}`)),
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries?force=true", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1}`)),
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"arguments":{"path":"different"}}`)),
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`"}`)),
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":0}`)),
 	} {
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", "step-retry-0001")

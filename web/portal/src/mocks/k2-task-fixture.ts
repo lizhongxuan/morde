@@ -46,8 +46,8 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
       ...taskBase("q0000001", messages[0]!.content, "running", 7, 2, 2, "s0000001", 2, 1,
         "任务 A 原始结果：资料已整理一半。", null),
       steps: [
-        { id: "s0000001", sequence: 1, kind: "subagent", status: "running", title: "整理来源 A", summary: "继续处理中。", created_at: timestamp },
-        { id: "s0000002", sequence: 2, kind: "subagent", status: "succeeded", title: "抽取来源 B", summary: "已返回原始材料。", created_at: timestamp },
+        { id: "s0000001", sequence: 1, attempt: 1, retryable: false, kind: "subagent", status: "running", title: "整理来源 A", summary: "继续处理中。", created_at: timestamp },
+        { id: "s0000002", sequence: 2, attempt: 1, retryable: false, kind: "subagent", status: "succeeded", title: "抽取来源 B", summary: "已返回原始材料。", created_at: timestamp },
       ],
       dependencies: [],
       child_jobs: [
@@ -61,8 +61,8 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
       ...taskBase("q0000002", messages[1]!.content, "completed", 9, 2, 2, null, 2, 1,
         "任务 B 原始结果：有一项来源未通过校验。", timestamp),
       steps: [
-        { id: "s0000003", sequence: 1, kind: "subagent", status: "succeeded", title: "交叉核对来源", summary: "结果已返回。", created_at: timestamp },
-        { id: "s0000004", sequence: 2, kind: "subagent", status: "failed", title: "校验补充来源", summary: "远端样本缺少必要字段。", created_at: timestamp },
+        { id: "s0000003", sequence: 1, attempt: 1, retryable: false, kind: "subagent", status: "succeeded", title: "交叉核对来源", summary: "结果已返回。", created_at: timestamp },
+        { id: "s0000004", sequence: 2, attempt: 1, retryable: false, kind: "subagent", status: "failed", title: "校验补充来源", summary: "远端样本缺少必要字段。", created_at: timestamp },
       ],
       dependencies: [],
       child_jobs: [
@@ -82,7 +82,7 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
     {
       ...taskBase("q0000004", messages[4]!.content, "failed", 4, 1, 1, null, 1, 0,
         "任务 D 原始结果：执行失败前的部分输出。", timestamp),
-      steps: [{ id: "s0000005", sequence: 1, kind: "subagent", status: "failed", title: "执行失败分支", summary: "子工作返回错误。", created_at: timestamp }],
+      steps: [{ id: "s0000005", sequence: 1, attempt: 1, retryable: false, kind: "subagent", status: "failed", title: "执行失败分支", summary: "子工作返回错误。", created_at: timestamp }],
       dependencies: [],
       child_jobs: [{ job_id: "child-d-failed", task_step_id: "s0000005", title: "执行失败分支", task_revision: 1, status: "failed" }],
       result_review: { state: "failed", source_task_id: "q0000004", source_task_revision: 1,

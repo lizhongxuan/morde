@@ -111,7 +111,7 @@ enum MordeDesignRoute: Hashable {
     case search
     case chatConversation(String)
     case task(String)
-    case workspace(String)
+    case computerFiles(String, shared: Bool)
     case computer(String, shared: Bool)
     case file(String)
 
@@ -122,7 +122,7 @@ enum MordeDesignRoute: Hashable {
         case .approvals: .approvals
         case .resources: .resources
         case .codexSessions, .eventChain, .library, .projects, .workItems, .friends, .toolChats,
-             .settings, .settingsDetail, .search, .task, .workspace, .computer, .file: nil
+             .settings, .settingsDetail, .search, .task, .computerFiles, .computer, .file: nil
         }
     }
 

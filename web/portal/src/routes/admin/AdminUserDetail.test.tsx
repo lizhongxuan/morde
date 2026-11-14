@@ -33,7 +33,6 @@ describe('admin user personal-data quota', () => {
     const input = userEvent.setup();
     vi.spyOn(portalApi, 'adminUser').mockResolvedValue(user);
     vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
-    vi.spyOn(portalApi, 'adminWorkspaces').mockResolvedValue({ items: [], next_cursor: null });
     vi.spyOn(portalApi, 'adminUserInstallations').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
     vi.spyOn(portalApi, 'adminUserAuthorizations').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
     vi.spyOn(portalApi, 'adminUserModelCalls').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
@@ -62,6 +61,6 @@ describe('admin user personal-data quota', () => {
       max_attachment_bytes: updated.max_attachment_bytes,
     });
     expect(await screen.findByText('个人数据额度已保存。')).toBeInTheDocument();
-    expect(screen.getByText('版本 v4。额度只用于个人附件，与聊天、Workspace 和记录额度分开计算。')).toBeInTheDocument();
+    expect(screen.getByText('版本 v4。额度只用于个人附件，与聊天、电脑文件和记录额度分开计算。')).toBeInTheDocument();
   });
 });

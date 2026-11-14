@@ -96,8 +96,13 @@ export const portalApi = {
   renewHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/renew', { params: { path: { id } } })),
   releaseHost: async (id: string, confirmProcessTermination: boolean) => unwrapApiResponse(await api.POST('/api/hosts/{id}/release', { params: { path: { id } }, body: { confirm_process_termination: confirmProcessTermination } })),
   restoreHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/restore', { params: { path: { id } } })),
-  deleteHost: async (id: string) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}', { params: { path: { id } } })),
+  deleteHost: async (id: string, confirmDeleteWorkspace: true) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}', {
+    params: { path: { id }, query: { confirm_delete_workspace: confirmDeleteWorkspace } },
+  })),
   workspaces: async () => unwrapApiResponse(await api.GET('/api/workspaces')),
+  codexSessionEvents: async (id: string, afterSequence = 0, limit = 100) => unwrapApiResponse(await api.GET('/api/codex/sessions/{id}/events', {
+    params: { path: { id }, query: { after_sequence: afterSequence, limit } },
+  })),
   sites: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/sites', {
     params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } },
   })),
@@ -113,21 +118,12 @@ export const portalApi = {
   materializeSiteRelease: async (id: string, releaseId: string) => unwrapApiResponse(await api.POST('/api/sites/{id}/releases/{release_id}/materialize', {
     params: { path: { id, release_id: releaseId } },
   })),
-  createWorkspace: async (body: components['schemas']['CreateWorkspaceRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/workspaces', {
-    params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
-  })),
-  bindWorkspaceToHost: async (id: string, body: components['schemas']['BindWorkspaceRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/hosts/{id}/workspace-bindings', {
-    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
-  })),
   retryHostWorkspaceSync: async (hostID: string, workspaceID: string, expectedBindingVersion: number) => {
     const response = await requestFetch(`/api/hosts/${encodeURIComponent(hostID)}/workspace-bindings/${encodeURIComponent(workspaceID)}/retry-sync`, {
       method: 'POST', body: JSON.stringify({ expected_binding_version: expectedBindingVersion }),
     });
     if (!response.ok) await throwResponseError(response);
   },
-  unbindWorkspaceFromHost: async (id: string, workspaceID: string, body: operations['unbindWorkspaceFromHost']['requestBody']['content']['application/json'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}/workspace-bindings/{workspace_id}', {
-    params: { path: { id, workspace_id: workspaceID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
-  })),
   deleteWorkspace: async (id: string) => unwrapApiResponse(await api.DELETE('/api/workspaces/{id}', { params: { path: { id } } })),
   workspaceManifest: async (id: string, query: NonNullable<operations['getWorkspaceManifest']['parameters']['query']> = {}) =>
     unwrapApiResponse(await api.GET('/api/workspaces/{id}/manifest', { params: { path: { id }, query } })),
@@ -245,6 +241,18 @@ export const portalApi = {
   taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
     params: { path: { id, step_id: stepID } },
   })),
+  retryTaskStep: async (id: string, stepID: string, body: components['schemas']['TaskStepRetryRequest'], idempotencyKey: string) => {
+    const result = await api.POST('/api/tasks/{id}/steps/{step_id}/retries', {
+      params: { path: { id, step_id: stepID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+    });
+    const retry = unwrapApiResponse(result);
+    if (result.response.status !== 202 || retry.task_id !== id || retry.source_step_id !== stepID || retry.status !== 'queued' ||
+      !/^s[a-z0-9]{7}$/u.test(retry.attempt_step_id) || !Number.isSafeInteger(retry.attempt) || retry.attempt <= body.expected_attempt ||
+      typeof retry.replayed !== 'boolean') {
+      throw new Error('服务端未确认步骤重试，请核对任务状态。');
+    }
+    return retry;
+  },
   taskFileFetches: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/file-fetches', { params: { path: { id } } })),
   deleteTaskFileFetchContent: async (id: string, fetchID: string): Promise<void> => {
     unwrapApiResponse(await api.DELETE('/api/tasks/{id}/file-fetches/{fetch_id}/content', { params: { path: { id, fetch_id: fetchID } } }));

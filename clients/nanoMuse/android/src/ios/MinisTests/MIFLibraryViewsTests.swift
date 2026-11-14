@@ -117,6 +117,31 @@ final class MIFLibraryViewsTests: XCTestCase {
             for: complete, access: .available, workspaceSyncAvailable: true, taskMediaGenerationAvailable: nil))
     }
 
+    func testUnpreviewableVerifiedTaskArtifactsShowTheReasonAndMetadata() {
+        let available = MIFLibraryPreviewPolicy.taskPreviewUnavailableReason(
+            for: artifact(previewHandle: nil), access: .available,
+            workspaceSyncAvailable: true, taskMediaGenerationAvailable: true)
+        XCTAssertEqual(available,
+                       AppLocalized("The matching Workspace file could not be verified; retry or sync the exact version"))
+
+        let unverified = MIFLibraryPreviewPolicy.taskPreviewUnavailableReason(
+            for: artifact(verified: false), access: .available,
+            workspaceSyncAvailable: true, taskMediaGenerationAvailable: true)
+        XCTAssertEqual(unverified,
+                       AppLocalized("Artifact is not verified or its proof is incomplete; metadata only"))
+
+        let unsynced = MIFLibraryPreviewPolicy.taskPreviewUnavailableReason(
+            for: artifact(previewHandle: nil), access: .available,
+            workspaceSyncAvailable: false, taskMediaGenerationAvailable: true)
+        XCTAssertEqual(unsynced, AppLocalized("Workspace sync is unavailable; metadata only"))
+
+        let mediaDisabled = MIFLibraryPreviewPolicy.taskPreviewUnavailableReason(
+            for: artifact(previewHandle: nil), access: .available,
+            workspaceSyncAvailable: true, taskMediaGenerationAvailable: false)
+        XCTAssertEqual(mediaDisabled,
+                       AppLocalized("Media preview is unavailable for this task; metadata only"))
+    }
+
     func testTaskPreviewRequiresWorkspaceSyncForEveryArtifact() {
         let document = artifact(mediaType: "application/pdf")
         XCTAssertNil(MIFLibraryPreviewPolicy.taskHandle(

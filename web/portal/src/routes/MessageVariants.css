@@ -1,0 +1,7 @@
+.message-variant-controls, .message-variant-control-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.message-variant-controls { margin-top: 9px; padding-top: 8px; border-top: 1px solid rgba(120, 137, 160, .2); }
+.message-variant-picker { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: .76rem; }
+.message-variant-picker select { max-width: 180px; min-height: 28px; padding: 3px 7px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: inherit; }
+.message-variant-edit { display: grid; gap: 8px; min-width: min(420px, 70vw); }
+.message-variant-edit textarea { min-height: 88px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; font: inherit; color: inherit; resize: vertical; }
+.message-variant-operation { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 7px; color: var(--muted); font-size: .76rem; }

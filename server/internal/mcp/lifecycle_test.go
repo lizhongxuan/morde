@@ -24,6 +24,8 @@ func TestLifecycleAndPrivatePreviewTools(t *testing.T) {
 		args := map[string]any{"host_id": "h1234567"}
 		if name == "host_list" {
 			args = map[string]any{}
+		} else if name == "host_delete" {
+			args["confirm_workspace_deletion"] = true
 		}
 		value, err := service.lifecycle(ctx, principal, name, args)
 		if err != nil || value == nil {

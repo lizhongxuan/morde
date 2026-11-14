@@ -133,8 +133,11 @@ type Task struct {
 	ProjectID string
 	// InitiatorID is the account whose authorization and resources execute this Task.
 	// OwnerID remains the conversation owner so the historical association is stable.
-	InitiatorID       string
-	ConversationID    string
+	InitiatorID    string
+	ConversationID string
+	// ToolsDisabled is set for text-only regeneration variants. It is transient
+	// claim metadata sourced from the conversation variant operation ledger.
+	ToolsDisabled     bool `json:"-"`
 	HostID            string
 	ExecutionLocation string
 	ApplicationID     string

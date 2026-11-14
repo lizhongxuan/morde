@@ -75,6 +75,9 @@ type messageResponse struct {
 	OutputStatus              conversation.OutputStatus         `json:"output_status,omitempty"`
 	OutputTaskRevision        *int64                            `json:"output_task_revision,omitempty"`
 	OutputResultEventSequence *int64                            `json:"output_result_event_sequence,omitempty"`
+	VariantGroupID            string                            `json:"variant_group_id,omitempty"`
+	VariantVersion            int64                             `json:"variant_version,omitempty"`
+	VariantAction             string                            `json:"variant_action,omitempty"`
 	CreatedAt                 time.Time                         `json:"created_at"`
 }
 
@@ -184,6 +187,10 @@ func (h *api) registerConversations(group *gin.RouterGroup, conversations Conver
 		group.PUT("/conversations/:id/messages/:message_id/attachments/:client_attachment_id", h.associateConversationMessageAttachment(tasks))
 		group.POST("/conversations/:id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
 		group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
+		if variants, ok := tasks.(ConversationMessageVariantService); ok {
+			group.POST("/conversations/:id/messages/:message_id/variants", h.createConversationMessageVariant(variants))
+			group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/variants", h.createConversationMessageVariant(variants))
+		}
 		group.GET("/conversations/:id/tasks", h.listConversationActiveTasks(tasks))
 		registerConversationMessageUploads(group, tasks)
 	}
@@ -609,6 +616,7 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
 		Sources:        append([]conversation.MessageSource(nil), value.Sources...),
 		DeliveryStatus: deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,
-		OutputResultEventSequence: value.OutputResultEventSequence, CreatedAt: value.CreatedAt,
+		OutputResultEventSequence: value.OutputResultEventSequence, VariantGroupID: value.VariantGroupID,
+		VariantVersion: value.VariantVersion, VariantAction: value.VariantAction, CreatedAt: value.CreatedAt,
 	}, nil
 }

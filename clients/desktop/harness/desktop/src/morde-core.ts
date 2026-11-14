@@ -24,6 +24,11 @@ export type CodexDiscoverInput = {
   status: "idle" | "in_progress" | "waiting_approval" | "completed" | "failed" | "unknown";
   scopes: CodexScope[];
 };
+export type CodexConnection = { profile_key: string; scopes: CodexScope[]; grant_version: number };
+export type CodexProfileSyncStatus = {
+  session_discovery: { state: "syncing" | "synced" | "partial"; error_code: "profile_unavailable" | "session_list_failed" | "connection_lost" | "unknown" | null };
+  history_sync: { discovered_sessions: number; history_complete_sessions: number; pending_upload_event_count: number };
+};
 export type CodexQueuedCommand = {
   id: string;
   session_id: string;
@@ -248,6 +253,16 @@ export class MordeAPI {
     }
   }
 
+  async requireLegacyProjectUploadRecoveryCapability(): Promise<void> {
+    const auth = this.credentials();
+    if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
+    const capabilities = await this.checkCapabilities(auth.origin);
+    if (capabilities.serviceInstanceID !== auth.serviceInstanceID) throw new Error("Morde service identity changed; log in again");
+    if (!capabilities.supportedFeatures.includes("workspace_sync_checkpoint_recovery")) {
+      throw new Error("此 Morde 服务无法安全核对旧项目上传恢复点；恢复点已保留，请升级服务后重试");
+    }
+  }
+
   async login(originInput: unknown, name: unknown, password: unknown, attempt: ClientLoginAttempt, renewal?: { installationID: string; serviceInstanceID: string }): Promise<{ credentials: Credentials; webSession: WebSession }> {
     const origin = portalOrigin(originInput);
     if (typeof name !== "string" || !name.trim() || typeof password !== "string" || !password ||
@@ -343,6 +358,40 @@ export class MordeAPI {
       throw new Error("Invalid Morde Codex session response");
     }
     return { id: value.id, scopes: value.scopes as CodexScope[], grant_version: value.grant_version as number };
+  }
+
+  async codexAuthorizeConnection(profileKey: string, scopes: CodexScope[]): Promise<CodexConnection> {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(profileKey) || !Array.isArray(scopes) || scopes.length < 2 ||
+      !scopes.every((scope) => ["read", "live", "send", "interrupt", "approval"].includes(scope)) ||
+      new Set(scopes).size !== scopes.length || !scopes.includes("read") || !scopes.includes("live")) {
+      throw new Error("Invalid Codex connection authorization");
+    }
+    const response = await this.codexRequest("/api/codex/connections", "POST", { profile_key: profileKey, scopes }) as Record<string, unknown> | null;
+    const value = response && typeof response.connection === "object" && response.connection !== null
+      ? response.connection as Record<string, unknown> : response;
+    if (!value || value.profile_key !== profileKey || !Array.isArray(value.scopes) ||
+      !value.scopes.every((scope) => ["read", "live", "send", "interrupt", "approval"].includes(String(scope))) ||
+      !value.scopes.includes("read") || !value.scopes.includes("live") || !Number.isSafeInteger(value.grant_version) || (value.grant_version as number) < 1) {
+      throw new Error("Invalid Morde Codex connection response");
+    }
+    return { profile_key: profileKey, scopes: value.scopes as CodexScope[], grant_version: value.grant_version as number };
+  }
+
+  async codexRevokeConnection(profileKey: string): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(profileKey)) throw new Error("Invalid Codex profile");
+    await this.codexRequest(`/api/codex/connections/${encodeURIComponent(profileKey)}`, "DELETE");
+  }
+
+  async codexReportSessionDiscoveryStatus(profileKey: string, status: CodexProfileSyncStatus): Promise<void> {
+    const { session_discovery: discovery, history_sync: history } = status;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(profileKey) || !discovery ||
+      !["syncing", "synced", "partial"].includes(discovery.state) ||
+      !(discovery.error_code === null || ["profile_unavailable", "session_list_failed", "connection_lost", "unknown"].includes(discovery.error_code)) ||
+      !history || ![history.discovered_sessions, history.history_complete_sessions, history.pending_upload_event_count].every((value) =>
+        Number.isSafeInteger(value) && value >= 0) || history.history_complete_sessions > history.discovered_sessions) {
+      throw new Error("Invalid Codex profile sync status");
+    }
+    await this.codexRequest(`/api/codex/connections/${encodeURIComponent(profileKey)}/session-discovery-status`, "PUT", status);
   }
 
   async codexClaim(): Promise<CodexQueuedCommand[]> {

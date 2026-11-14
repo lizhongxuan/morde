@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router';
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router';
 import { AuthProvider } from './app/auth';
 import { AdminGuard, RouteGuard } from './app/RouteGuard';
 import { ToastProvider } from './app/toast';
@@ -20,7 +20,7 @@ import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
 import { PersonalData } from './routes/PersonalData';
 import { Projects } from './routes/Projects';
-import { Workspaces } from './routes/Workspaces';
+import { Codex } from './routes/Codex';
 import { AdminAudit } from './routes/admin/AdminAudit';
 import { AdminHosts } from './routes/admin/AdminHosts';
 import { AdminLayout } from './routes/admin/AdminLayout';
@@ -33,8 +33,6 @@ import { AdminControls } from './routes/admin/AdminControls';
 import { AdminRecords } from './routes/admin/AdminRecords';
 import { AdminHostDetail } from './routes/admin/AdminHostDetail';
 import { AdminUserDetail } from './routes/admin/AdminUserDetail';
-import { AdminWorkspaces } from './routes/admin/AdminWorkspaces';
-import { AdminWorkspaceDetail } from './routes/admin/AdminWorkspaceDetail';
 import { AdminSettings } from './routes/admin/AdminSettings';
 import { RecoverablePageBoundary } from './app/PageErrorBoundary';
 import { RecoverableError } from './components/RecoverableError';
@@ -49,6 +47,23 @@ function AdminAccessDenied() {
   return <RecoverableError title="没有管理权限" message="此账号不能查看管理后台数据。" homePath="/" homeLabel="返回 PC 用户端" />;
 }
 
+function localProjectSearch(search: string) {
+  const host = new URLSearchParams(search).get('host') ?? '';
+  const params = new URLSearchParams({ sync: '1' });
+  if (/^h[a-z0-9]{7}$/.test(host)) params.set('host', host);
+  return `?${params.toString()}`;
+}
+
+function LegacyLocalProjectsRedirect() {
+  const location = useLocation();
+  return <Navigate to={{ pathname: '/hosts', search: localProjectSearch(location.search) }} replace />;
+}
+
+function LegacyWorkspaceRedirect() {
+  const location = useLocation();
+  return <Navigate to={{ pathname: '/hosts', search: localProjectSearch(location.search) }} replace />;
+}
+
 function UserRoutes() {
   return <Routes>
     <Route path="/login" element={<Login />} />
@@ -61,12 +76,14 @@ function UserRoutes() {
         <Route index element={<Navigate to="/assistant" replace />} />
         <Route path="assistant" element={<Assistant />} />
         <Route path="projects" element={<Projects />} />
+        <Route path="local-projects" element={<LegacyLocalProjectsRedirect />} />
+        <Route path="codex" element={<Codex />} />
         <Route path="personal" element={<PersonalData />} />
         <Route path="goals" element={<GoalsAndSchedules />} />
         <Route path="hosts" element={<Hosts />} />
         <Route path="hosts/new" element={<NewHost />} />
         <Route path="notifications" element={<Notifications />} />
-        <Route path="workspaces" element={<Workspaces />} />
+        <Route path="workspaces" element={<LegacyWorkspaceRedirect />} />
         <Route path="connections" element={<Connections />} />
         <Route path="apikeys" element={<ApiKeys />} />
         <Route path="clients" element={<Clients />} />
@@ -96,8 +113,6 @@ function AdminRoutes() {
           <Route path="controls" element={<AdminControls />} />
           <Route path="hosts" element={<AdminHosts />} />
           <Route path="hosts/:id" element={<AdminHostDetail />} />
-          <Route path="workspaces" element={<AdminWorkspaces />} />
-          <Route path="workspaces/:id" element={<AdminWorkspaceDetail />} />
           <Route path="audit" element={<AdminAudit />} />
         </Route>
       </Route>

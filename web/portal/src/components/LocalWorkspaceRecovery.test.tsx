@@ -16,7 +16,7 @@ it('keeps legacy safety copies in the PC page and restores only after a user act
   };
   const user = userEvent.setup();
   render(<LocalWorkspaceRecovery bridge={bridge} workspaceNames={{ [id]: '项目' }} />);
-  await user.click(await screen.findByText('已有 Workspace 本机同步与安全副本'));
+  await user.click(await screen.findByText('旧版目录同步与安全副本'));
   expect(screen.getByText('项目')).toBeInTheDocument();
   expect(bridge.preserved).not.toHaveBeenCalled();
   await user.click(screen.getByRole('button', { name: '查看本机安全副本' }));
@@ -32,7 +32,7 @@ it('keeps safety-copy actions disabled while the old node may still own the dire
     syncState: 'idle', nodeState: 'unknown', safetyCopiesAvailable: false, checkpoint: null }), preserved: vi.fn(), legacyPauseSync: vi.fn() };
   const user = userEvent.setup();
   render(<LocalWorkspaceRecovery bridge={bridge} workspaceNames={{}} />);
-  await user.click(await screen.findByText('已有 Workspace 本机同步与安全副本'));
+  await user.click(await screen.findByText('旧版目录同步与安全副本'));
   expect(screen.getByRole('button', { name: '查看本机安全副本' })).toBeDisabled();
   expect(bridge.preserved).not.toHaveBeenCalled();
 });
@@ -54,7 +54,7 @@ it('can stop an explicitly resumed legacy checkpoint without claiming it complet
   };
   const user = userEvent.setup();
   render(<LocalWorkspaceRecovery bridge={bridge} workspaceNames={{}} />);
-  await user.click(await screen.findByText('已有 Workspace 本机同步与安全副本'));
+  await user.click(await screen.findByText('旧版目录同步与安全副本'));
   expect(screen.getByText('同步范围：notes')).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: '按原模式继续同步' }));
   const stop = await screen.findByRole('button', { name: '停止旧版同步' });

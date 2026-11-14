@@ -57,10 +57,36 @@ describe('Hosts', () => {
   beforeEach(() => {
     vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
+    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
   });
   afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
-  it('sets an owned default computer and links to that computer Workspace settings', async () => {
+  it('opens the existing workspace and file-sync view inside cloud computers', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
+    await user.click(screen.getByRole('link', { name: '文件同步' }));
+    expect(await screen.findByRole('heading', { name: '文件同步' })).toBeInTheDocument();
+    expect(document.querySelector('.hosts-page > .workspace-route')).toBeInTheDocument();
+    expect(document.querySelector('.hosts-page .page-heading')).toBeNull();
+  });
+
+  it('links each Host card and its detail panel to that Host project sync target', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    await openMoreActions(user, ownedHost);
+    expect(screen.getByRole('link', { name: '项目目录与同步' })).toHaveAttribute('href', `/hosts?sync=1&host=${ownedHost.id}`);
+    await user.click(screen.getByRole('button', { name: '详情与管理' }));
+    expect(screen.getByRole('link', { name: '管理本机项目同步' })).toHaveAttribute('href', `/hosts?sync=1&host=${ownedHost.id}`);
+  });
+
+  it('sets an owned default computer and links to that computer file sync', async () => {
     const nextHost: Host = { ...ownedHost, id: 'h7654321', name: '第二台电脑', workspaces: [{
       ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, id: 'w7654321', name: '第二默认工作区' },
     }] };
@@ -88,8 +114,8 @@ describe('Hosts', () => {
 
     await waitFor(() => expect(setDefault).toHaveBeenCalledWith({ host_id: nextHost.id }));
     await waitFor(() => expect(selector).toHaveValue(nextHost.id));
-    expect(document.querySelector('.host-default-workspace strong')).toHaveTextContent('第二默认工作区');
-    expect(screen.getByRole('link', { name: '管理 Workspace' })).toHaveAttribute('href', `/workspaces?host=${nextHost.id}`);
+    expect(document.querySelector('.host-default-workspace strong')).toHaveTextContent('~/workspace/（随电脑持久保存）');
+    expect(document.querySelector('.host-default-workspace a')).toHaveAttribute('href', `/hosts?sync=1&host=${nextHost.id}`);
   });
 
   it('keeps the previous default computer and the page usable when saving a new default fails', async () => {
@@ -148,7 +174,6 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: sharedItems });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const ownerPagination = await screen.findByRole('navigation', { name: '我的电脑分页' });
@@ -183,11 +208,11 @@ describe('Hosts', () => {
     await openHostDetails(user, ownedHost.id);
     expect(document.getElementById(`host-details-${ownedHost.id}`)).toBeVisible();
     expect(await within(card).findByText('运行状态')).toBeVisible();
-    expect(within(card).getByText('旧数据迁移状态未知')).toBeVisible();
+    expect(within(card).getByText('已就绪 · v2')).toBeVisible();
     expect(within(card).getByRole('button', { name: /管理共享成员/ })).toBeVisible();
   });
 
-  it('deletes a host without consulting templates and retains its independent workspaces', async () => {
+  it('requires a second confirmation and submits permanent host and computer-data deletion', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{
       id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '',
       workspaces: [hostWorkspaceBinding],
@@ -208,14 +233,18 @@ describe('Hosts', () => {
     expect(screen.queryByRole('button', { name: /暂停主机|恢复云端电脑|管理主机令牌/ })).not.toBeInTheDocument();
     await openMoreActions(user, ownedHost);
     await user.click(await screen.findByRole('button', { name: '删除云端电脑 测试主机' }));
-    expect(screen.getByText(/云端电脑的运行环境和专属资料卷会被删除，正在运行的终端命令及服务会中止/)).toBeInTheDocument();
-    expect(screen.getByText(/关联的云端文件会自动解除关联并保留在服务端，不随电脑删除/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: /^删除电脑$/ }));
-    await waitFor(() => expect(deleteHost).toHaveBeenCalledWith('h1234567'));
+    expect(screen.getByText(/永久删除这台电脑及其专属 ~\/workspace\/ 目录/)).toBeInTheDocument();
+    expect(deleteHost).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    expect(deleteHost).not.toHaveBeenCalled();
+    await openMoreActions(user, { id: 'h1234567', name: '测试主机' });
+    await user.click(screen.getByRole('button', { name: '删除云端电脑 测试主机' }));
+    await user.click(screen.getByRole('button', { name: '永久删除电脑和数据' }));
+    await waitFor(() => expect(deleteHost).toHaveBeenCalledWith('h1234567', true));
     expect(portalApi.templates).not.toHaveBeenCalled();
   });
 
-  it('keeps management actions available but prevents entering another owner\'s host', async () => {
+  it('does not show another owner\'s host or management actions', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{
       id: 'h8765432', name: '他人主机', owner_id: 'u8765432', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '',
       workspaces: [],
@@ -228,19 +257,14 @@ describe('Hosts', () => {
         workspace_size_mib: 1024, ttl_seconds: 3600, idle_timeout_seconds: 0, on_idle: 'disabled', keep_workspace_default: true,
     }] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const user = userEvent.setup();
 
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '查看云端电脑 他人主机' })).toBeDisabled();
-    expect(screen.getByText('仅主机所有者可以进入工作环境。')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /管理共享成员/ })).not.toBeInTheDocument();
-    await openMoreActions(user, { id: 'h8765432', name: '他人主机' });
-    expect(screen.getByRole('button', { name: '续期主机 他人主机' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: '删除云端电脑 他人主机' })).toBeEnabled();
+    expect(await screen.findByText('还没有主机')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /他人主机/ })).not.toBeInTheDocument();
   });
 
-  it('requires one fully applied Workspace before opening or restoring an owned host', async () => {
+  it('requires ready computer files before opening or restoring without exposing Workspace binding controls', async () => {
     const runningHost = { ...ownedHost, id: 'h0000001', name: '未绑定运行中主机', workspaces: [] };
     const multipleBindingHost = { ...ownedHost, id: 'h0000003', name: '多绑定运行中主机', workspaces: [hostWorkspaceBinding,
       { ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, id: 'w7654321', name: '另一个工作区' } }] };
@@ -258,15 +282,17 @@ describe('Hosts', () => {
     expect(await screen.findByRole('button', { name: '查看云端电脑 未绑定运行中主机' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '查看云端电脑 多绑定运行中主机' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '查看云端电脑 工作区版本未同步主机' })).toBeDisabled();
-    expect(screen.getByText('云端电脑的文件正在准备、同步或存在冲突；打开和移交操作暂不可用。')).toBeInTheDocument();
-    expect(screen.getAllByText(/请先关联并准备好这台电脑的文件/)).toHaveLength(3);
+    expect(screen.getByText('电脑文件正在准备、同步或存在冲突；打开和移交操作暂不可用。')).toBeInTheDocument();
+    expect(screen.getAllByText(/电脑文件尚未准备好，暂不能打开。/)).toHaveLength(3);
     await openHostDetails(user, stoppedHost.id);
     await openMoreActions(user, stoppedHost);
     expect(screen.getByRole('button', { name: '恢复云端电脑 未绑定已停止主机' })).toBeDisabled();
-    expect(screen.getByLabelText('恢复前关联已有云端文件')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/关联已有云端文件/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^关联所选文件$/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^绑定$/ })).not.toBeInTheDocument();
   });
 
-  it('shows Workspace Runtime heartbeat separately from Host and noVNC desktop status', async () => {
+  it('shows computer file-service heartbeat separately from Host and noVNC desktop status', async () => {
     const host: Host = {
       ...ownedHost,
       workspace_runtime_online: false,
@@ -283,7 +309,7 @@ describe('Hosts', () => {
       return item;
     });
     await openHostDetails(user, host.id);
-    const runtime = within(card).getByText('Workspace Runtime').parentElement;
+    const runtime = within(card).getByText('电脑文件服务').parentElement;
     expect(runtime).toHaveTextContent('离线');
     expect(runtime).toHaveTextContent('最近观测：');
     expect(within(card).getByText('运行中')).toBeInTheDocument();
@@ -302,50 +328,28 @@ describe('Hosts', () => {
       return item;
     });
     await openHostDetails(user, ownedHost.id);
-    expect(within(card).getByText('Workspace Runtime').parentElement).toHaveTextContent('未知');
+    expect(within(card).getByText('电脑文件服务').parentElement).toHaveTextContent('未知');
     expect(within(card).getByText('桌面连接').parentElement).toHaveTextContent('由 noVNC 工作台单独检测');
   });
 
-  it('binds one ready Workspace to a stopped legacy host before enabling restore', async () => {
+  it('does not allow binding independent cloud files to a stopped computer', async () => {
     const stoppedHost = { ...ownedHost, state: 'stopped' as const, workspaces: [] };
-    const workspace = {
-      id: 'w7654321', name: '旧电脑工作区', revision: 4, used_bytes: 0, quota_bytes: 1024, is_read_only: false,
-      state: 'ready' as const, created_at: '', updated_at: '',
-    };
-    const preparingBinding: Host['workspaces'][number] = {
-      workspace: { id: workspace.id, name: workspace.name, revision: workspace.revision, used_bytes: workspace.used_bytes, state: workspace.state },
-      directory: workspace.id, state: 'preparing', binding_version: 1, desired_revision: workspace.revision,
-      applied_revision: 0, sync_state: 'healthy', sync_conflicts: [],
-    };
-    let currentHost: Host = stoppedHost;
-    vi.spyOn(portalApi, 'hosts').mockImplementation(async () => ({ items: [currentHost] }));
-    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [workspace] });
-    const bind = vi.spyOn(portalApi, 'bindWorkspaceToHost').mockImplementation(async (hostID, request) => {
-      expect(hostID).toBe(stoppedHost.id);
-      expect(request).toEqual({ workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 });
-      currentHost = { ...stoppedHost, workspaces: [preparingBinding] };
-      return preparingBinding;
-    });
-    const restore = vi.spyOn(portalApi, 'restoreHost').mockResolvedValue({ ...stoppedHost, state: 'creating', workspaces: [preparingBinding] });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [stoppedHost] });
+    const restore = vi.spyOn(portalApi, 'restoreHost').mockResolvedValue({ ...stoppedHost, state: 'creating' });
+    const bind = vi.spyOn(portalApi, 'bindWorkspaceToHost');
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${stoppedHost.name}` });
     await openHostDetails(user, stoppedHost.id);
-    const workspaceSelect = await screen.findByLabelText('恢复前关联已有云端文件');
-    await screen.findByRole('option', { name: /旧电脑工作区/ });
-    await user.selectOptions(workspaceSelect, workspace.id);
-    await user.click(screen.getByRole('button', { name: '关联所选文件' }));
-    expect(await screen.findByText(/已绑定 旧电脑工作区；恢复电脑后会继续应用/)).toBeInTheDocument();
     await openMoreActions(user, stoppedHost);
     const restoreButton = await screen.findByRole('button', { name: `恢复云端电脑 ${stoppedHost.name}` });
-    expect(restoreButton).toBeEnabled();
-
-    await user.click(restoreButton);
-    await user.click(screen.getByRole('button', { name: '恢复主机' }));
-    await waitFor(() => expect(restore).toHaveBeenCalledWith(stoppedHost.id));
-    expect(bind).toHaveBeenCalledOnce();
+    expect(restoreButton).toBeDisabled();
+    expect(screen.queryByLabelText(/关联已有云端文件/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /关联所选文件|绑定/ })).not.toBeInTheDocument();
+    expect(restore).not.toHaveBeenCalled();
+    expect(bind).not.toHaveBeenCalled();
   });
 
   it('confirms compute release and calls the release endpoint', async () => {
@@ -626,27 +630,26 @@ describe('Hosts', () => {
     expect(screen.getByText(`当前由你人工控制。交还完成后，云端 AI 才能恢复操作。`)).toBeInTheDocument();
   });
 
-  it('confirms handing control back to AI and refreshes Host and Workspace versions', async () => {
+  it('confirms handing control back to AI and refreshes host computer-file status', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{ ...ownedHost, control_state: 'user', control_version: 7 }] });
     vi.spyOn(portalApi, 'hostControl').mockResolvedValue(userControl(7));
     const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockResolvedValue({
       ...aiControl(9), pending_operation_ids: [],
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    client.setQueryData(['workspaces'], { items: [] });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openHostDetails(user, ownedHost.id);
     expect(await screen.findByText('电脑控制：人工控制')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '交还 AI' }));
-    expect(screen.getByText(/重新读取主机和工作区版本/)).toBeInTheDocument();
+    expect(screen.getByText(/重新读取主机和电脑文件状态/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '交还给 AI' }));
     await waitFor(() => expect(controlAction).toHaveBeenCalledWith(ownedHost.id, {
       action: 'release', request_id: expect.any(String), expected_control_version: 7,
     }));
-    await waitFor(() => expect(client.getQueryState(['workspaces'])?.isInvalidated).toBe(true));
-    expect(await screen.findByText('已交还 AI，主机和工作区版本已刷新。')).toBeInTheDocument();
+    await waitFor(() => expect(portalApi.hosts).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('已交还 AI，主机和电脑文件状态已刷新。')).toBeInTheDocument();
   });
 
   it('shows shared desktop control state to viewers without exposing control actions', async () => {

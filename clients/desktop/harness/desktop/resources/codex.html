@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'">
+  <title>Codex 会话 · Morde</title>
+  <link rel="stylesheet" href="morde.css">
+  <link rel="stylesheet" href="codex.css">
+</head>
+<body>
+  <main class="codex-page">
+    <header class="page-head">
+      <div class="eyebrow">MORDE · PC</div>
+      <h1>Codex 会话</h1>
+      <p>连接本机 Codex 配置后，Morde 会同步该配置下可读取的普通与归档会话，供 iOS 查看和接续。</p>
+    </header>
+
+    <section class="panel" aria-labelledby="profile-heading">
+      <div class="section-head">
+        <div><h2 id="profile-heading">本机 Codex</h2><p id="account-status" class="subtle">正在读取状态…</p></div>
+        <button id="add-profile" type="button">添加 Codex 配置</button>
+      </div>
+      <label for="profile-select">配置</label>
+      <select id="profile-select" disabled><option value="">尚未添加配置</option></select>
+      <p id="profile-status" class="subtle">选择包含 Codex 登录状态的 CODEX_HOME 文件夹和 Codex 命令文件。</p>
+      <div id="connection-scopes" class="scope-list" aria-label="Codex 连接权限"></div>
+      <div class="thread-actions">
+        <button id="connect-profile" type="button" disabled>授权并同步全部会话</button>
+        <button id="revoke-profile" class="danger" type="button" hidden>撤销配置连接</button>
+      </div>
+      <p id="sync-status" class="subtle" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="threads-heading">
+      <div class="section-head">
+        <div><h2 id="threads-heading">本机 Codex 会话</h2><p class="subtle">连接配置后自动同步全部可读取会话，无需逐条授权。</p></div>
+        <button id="refresh" class="secondary" type="button" disabled>刷新会话</button>
+      </div>
+      <div id="message" role="status" aria-live="polite"></div>
+      <div id="threads" class="threads"></div>
+      <button id="load-more" class="secondary load-more" type="button" hidden>加载更多</button>
+    </section>
+    <footer>PC 端保持运行并联网，才能接收 iOS 消息并同步授权范围内的 Codex 可见状态。</footer>
+  </main>
+  <script src="codex.js"></script>
+</body>
+</html>

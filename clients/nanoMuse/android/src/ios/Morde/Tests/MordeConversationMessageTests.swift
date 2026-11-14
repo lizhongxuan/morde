@@ -36,6 +36,104 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(message.routing_status, "pending")
     }
 
+    func testClientMessageDecodesVariantProjection() throws {
+        let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":8,"role":"assistant","content":"second answer","variant_group_id":"m7654321","variant_version":2,"variant_action":"regenerate_text","output_status":"completed"}"#.utf8)
+
+        let message = try JSONDecoder().decode(MordeClientMessage.self, from: data)
+
+        XCTAssertEqual(message.variant_group_id, "m7654321")
+        XCTAssertEqual(message.variant_version, 2)
+        XCTAssertEqual(message.variant_action, "regenerate_text")
+        XCTAssertTrue(MordeConversationVariantPresentation.hasValidProjection(message))
+    }
+
+    func testVariantPresentationKeepsOldContentAndDefaultsToNewestVersion() {
+        let versionOneUser = MordeClientMessage(id: "m0000001", conversation_id: "c1234567", sequence: 1,
+            role: "user", content: "original prompt", variant_group_id: "m0000001", variant_version: 1,
+            variant_action: "original")
+        let versionOneAssistant = MordeClientMessage(id: "m0000002", conversation_id: "c1234567", sequence: 2,
+            role: "assistant", content: "original answer", output_status: "completed",
+            variant_group_id: "m0000001", variant_version: 1, variant_action: "original")
+        let versionTwoUser = MordeClientMessage(id: "m0000003", conversation_id: "c1234567", sequence: 3,
+            role: "user", content: "revised prompt", variant_group_id: "m0000001", variant_version: 2,
+            variant_action: "edit_resend")
+        let versionTwoAssistant = MordeClientMessage(id: "m0000004", conversation_id: "c1234567", sequence: 4,
+            role: "assistant", content: "revised answer", output_status: "completed",
+            variant_group_id: "m0000001", variant_version: 2, variant_action: "edit_resend")
+        let otherGroup = MordeClientMessage(id: "m0000005", conversation_id: "c1234567", sequence: 5,
+            role: "user", content: "another turn", variant_group_id: "m0000005", variant_version: 1)
+        let messages = [versionOneUser, versionOneAssistant, versionTwoUser, versionTwoAssistant, otherGroup]
+
+        XCTAssertEqual(MordeConversationVariantPresentation.latestVersion(in: messages, groupID: "m0000001"), 2)
+        XCTAssertEqual(MordeConversationVariantPresentation.visibleMessages(messages, selectedVersions: [:]).map(\.id),
+                       ["m0000003", "m0000004", "m0000005"])
+        XCTAssertEqual(MordeConversationVariantPresentation.visibleMessages(messages,
+            selectedVersions: ["m0000001": 1]).map(\.content), ["original prompt", "original answer", "another turn"])
+        XCTAssertEqual(versionOneAssistant.content, "original answer")
+    }
+
+    func testVariantActionsRequireCorrectMessageRoleAndRecoverableOutput() {
+        let user = MordeClientMessage(id: "m0000001", conversation_id: "c1234567", role: "user",
+            content: "prompt", variant_group_id: "m0000001", variant_version: 1)
+        let complete = MordeClientMessage(id: "m0000002", conversation_id: "c1234567", task_id: "q1234567",
+            role: "assistant", content: "answer", status: "completed",
+            variant_group_id: "m0000001", variant_version: 1)
+        let interrupted = MordeClientMessage(id: "m0000003", conversation_id: "c1234567", task_id: "q1234567",
+            role: "assistant", content: "partial", status: "interrupted",
+            variant_group_id: "m0000001", variant_version: 1)
+        let streaming = MordeClientMessage(id: "m0000004", conversation_id: "c1234567", task_id: "q1234567",
+            role: "assistant", content: "partial", status: "streaming",
+            variant_group_id: "m0000001", variant_version: 1)
+
+        XCTAssertTrue(MordeConversationVariantPresentation.allows(.editResend, for: user))
+        XCTAssertFalse(MordeConversationVariantPresentation.allows(.regenerateText, for: user))
+        XCTAssertTrue(MordeConversationVariantPresentation.allows(.regenerateText, for: complete))
+        XCTAssertFalse(MordeConversationVariantPresentation.allows(.continueGeneration, for: complete))
+        XCTAssertTrue(MordeConversationVariantPresentation.allows(.continueGeneration, for: interrupted))
+        XCTAssertFalse(MordeConversationVariantPresentation.allows(.continueGeneration, for: streaming))
+    }
+
+    func testVariantRequestAndOperationReceiptMatchContract() throws {
+        let edit = MordeConversationVariantOperationRequest(action: .editResend, expectedVersion: 3,
+                                                           content: "new prompt")
+        XCTAssertTrue(edit.isValid)
+        XCTAssertEqual(edit.fields["action"] as? String, "edit_resend")
+        XCTAssertEqual(edit.fields["expected_version"] as? Int64, 3)
+        XCTAssertEqual(edit.fields["content"] as? String, "new prompt")
+        XCTAssertFalse(MordeConversationVariantOperationRequest(action: .editResend, expectedVersion: 1,
+                                                                content: " \n ").isValid)
+        XCTAssertFalse(MordeConversationVariantOperationRequest(action: .regenerateText, expectedVersion: 1,
+                                                                content: "not allowed").isValid)
+
+        let data = Data(#"{"operation_id":"variant-op-1","variant_group_id":"m1234567","variant_version":4,"action":"edit_resend","state":"accepted","task_id":"q1234567","user_message_id":"m1234568","assistant_message_id":"m1234569"}"#.utf8)
+        let receipt = try JSONDecoder().decode(MordeConversationVariantOperationResponse.self, from: data)
+        XCTAssertTrue(receipt.isValid)
+        XCTAssertTrue(receipt.hasKnownOutcome)
+        XCTAssertEqual(receipt.variant_version, 4)
+        XCTAssertEqual(receipt.action, .editResend)
+
+        let unknownData = Data(String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: #""state":"accepted""#, with: #""state":"unknown""#).utf8)
+        let unknownReceipt = try JSONDecoder().decode(MordeConversationVariantOperationResponse.self, from: unknownData)
+        XCTAssertTrue(unknownReceipt.isValid)
+        XCTAssertFalse(unknownReceipt.hasKnownOutcome)
+
+        let invalidData = Data(String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: #""state":"accepted""#, with: #""state":"queued""#).utf8)
+        XCTAssertFalse(try JSONDecoder().decode(MordeConversationVariantOperationResponse.self, from: invalidData).isValid)
+    }
+
+    func testVariantEditContentUsesServerUnicodeScalarLimit() {
+        let maximum = String(repeating: "你", count: 32_768)
+        let overLimit = maximum + "你"
+
+        XCTAssertEqual(maximum.unicodeScalars.count, MordeConversationVariantOperationRequest.maximumContentScalars)
+        XCTAssertTrue(MordeConversationVariantOperationRequest(action: .editResend, expectedVersion: 1,
+                                                               content: maximum).isValid)
+        XCTAssertFalse(MordeConversationVariantOperationRequest(action: .editResend, expectedVersion: 1,
+                                                                content: overLimit).isValid)
+    }
+
     func testClientMessageDecodesDuplicateAssociationAndKeepsItsTask() throws {
         let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":3,"role":"user","content":"相同请求","delivery_status":"pending","created_at":"2026-11-13T12:00:00Z","client_message_id":"client-message-3","routing_status":"waiting_user","duplicate_of_message_id":"m7654321","related_task_id":"q1234567"}"#.utf8)
 
@@ -157,6 +255,59 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertTrue(try MordeMessageOutbox(root: root).messages(scope: changedScope).isEmpty)
         XCTAssertNotEqual(firstScope.messageOutboxKey, changedScope.messageOutboxKey)
         XCTAssertFalse(firstScope.hasSameAccount(as: changedScope))
+    }
+
+    func testVariantOperationOutboxReusesExactRequestAcrossRestartAndVersions() throws {
+        let scope = try makeScope()
+        let otherAccount = try makeScope(accountID: "user-other")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("morde-variant-operation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let key = MordeConversationVariantPresentation.attemptStorageKey(scope: scope, projectID: "p1234567",
+            conversationID: "c1234567", groupID: "m1234567", action: .editResend)
+        let proposed = MordeConversationVariantOperationAttempt(idempotencyKey: "variant-attempt-0001",
+            action: .editResend, expectedVersion: 2, projectID: "p1234567", conversationID: "c1234567",
+            messageID: "m1234567", groupID: "m1234567", content: "edited")
+        let outbox = MordeMessageOutbox(root: root)
+        let attempt = try outbox.beginVariantOperation(storageKey: key, proposed: proposed, scope: scope)
+        XCTAssertEqual(try MordeMessageOutbox(root: root).pendingVariantOperation(storageKey: key, scope: scope), proposed)
+
+        let staleRetry = MordeConversationVariantOperationAttempt(idempotencyKey: "newly-generated-key",
+            action: .editResend, expectedVersion: 3, projectID: "p1234567", conversationID: "c1234567",
+            messageID: "m1234568", groupID: "m1234567", content: "different text")
+        XCTAssertEqual(try MordeMessageOutbox(root: root).beginVariantOperation(storageKey: key,
+            proposed: staleRetry, scope: scope), attempt)
+        XCTAssertEqual(attempt.expectedVersion, 2)
+        XCTAssertEqual(attempt.content, "edited")
+
+        let accountScopedKey = MordeConversationVariantPresentation.attemptStorageKey(scope: otherAccount,
+            projectID: "p1234567", conversationID: "c1234567", groupID: "m1234567", action: .editResend)
+        let otherAccountAttempt = try outbox.beginVariantOperation(storageKey: accountScopedKey,
+            proposed: MordeConversationVariantOperationAttempt(idempotencyKey: "other-attempt-0001",
+                action: .editResend, expectedVersion: 2, projectID: "p1234567", conversationID: "c1234567",
+                messageID: "m1234567", groupID: "m1234567", content: "edited"), scope: otherAccount)
+        XCTAssertNotEqual(otherAccountAttempt.idempotencyKey, attempt.idempotencyKey)
+
+        try outbox.finishVariantOperation(storageKey: key, attempt: attempt, scope: scope)
+        XCTAssertNil(try outbox.pendingVariantOperation(storageKey: key, scope: scope))
+    }
+
+    func testVariantSelectionPersistsPerAccountAndProjectConversation() throws {
+        let scope = try makeScope()
+        let otherAccount = try makeScope(accountID: "user-other")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("morde-variant-selection-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outbox = MordeMessageOutbox(root: root)
+
+        try outbox.setVariantSelection(storageKey: "p1234567:c1234567:m1234567", version: 1, scope: scope)
+        try outbox.setVariantSelection(storageKey: "personal:c1234567:m1234567", version: 3, scope: scope)
+
+        let reopened = MordeMessageOutbox(root: root)
+        XCTAssertEqual(try reopened.variantSelections(scope: scope)["p1234567:c1234567:m1234567"], 1)
+        XCTAssertEqual(try reopened.variantSelections(scope: scope)["personal:c1234567:m1234567"], 3)
+        XCTAssertTrue(try reopened.variantSelections(scope: otherAccount).isEmpty)
     }
 
     func testOutboxRestartPreservesClientAndPredecessorMessageIDs() throws {

@@ -740,10 +740,10 @@ func (s *TaskService) RetryStep(ctx context.Context, principal identity.Principa
 	request := TaskStepRetryRequest{TaskID: taskID, StepID: stepID, ExpectedTaskRevision: expectedRevision,
 		ExpectedAttempt: expectedAttempt, AttemptStepID: attemptStepID, RetryCallID: "morde_step_retry_" + attemptStepID}
 	idempotency, err := idempotencyRecord(principal.UserID, "task.step.retry", idempotencyKey, struct {
-		TaskID        string `json:"task_id"`
-		StepID        string `json:"step_id"`
-		Revision      int64  `json:"expected_task_revision"`
-		Attempt       int64  `json:"expected_attempt"`
+		TaskID   string `json:"task_id"`
+		StepID   string `json:"step_id"`
+		Revision int64  `json:"expected_task_revision"`
+		Attempt  int64  `json:"expected_attempt"`
 	}{taskID, stepID, expectedRevision, expectedAttempt}, attemptStepID, stepID)
 	if err != nil {
 		return TaskStepRetryResult{}, err
@@ -1110,7 +1110,7 @@ func validTaskStatus(status task.Status) bool {
 
 func validTaskEventType(value string) bool {
 	switch value {
-	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result":
+	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan":
 		return true
 	default:
 		return false

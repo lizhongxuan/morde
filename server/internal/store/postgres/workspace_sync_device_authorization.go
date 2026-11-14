@@ -372,6 +372,51 @@ func requireActiveWorkspaceSyncDeviceBinding(ctx context.Context, tx pgx.Tx, acc
 	return nil
 }
 
+func requireActiveWorkspaceSyncDeviceWorkspaceAccess(ctx context.Context, tx pgx.Tx, access *workspaceSyncDeviceAccess) error {
+	if access == nil {
+		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	if err := requireActiveWorkspaceSyncDeviceBinding(ctx, tx, access); err == nil {
+		return nil
+	} else if domain.CodeOf(err) != domain.CodeNotFound {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT f.folder_id
+FROM workspace_sync_device_bindings b
+JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id
+JOIN workspace_sync_folders f ON f.workspace_id=b.workspace_id AND f.owner_id=b.owner_id AND f.folder_id=b.folder_id
+JOIN workspaces w ON w.id=b.workspace_id AND w.owner_id=b.owner_id
+WHERE b.owner_id=$1 AND b.workspace_id=$2 AND b.client_installation_id=$3
+  AND b.state='active' AND i.revoked_at IS NULL AND f.folder_kind='project'
+  AND f.state IN ('pending_node','active') AND w.state='ready' AND w.deleted_at IS NULL
+ORDER BY f.folder_id`, access.ownerID, access.workspaceID, access.installationID)
+	if err != nil {
+		return fmt.Errorf("list active Workspace project device bindings: %w", err)
+	}
+	folderIDs := make([]string, 0)
+	for rows.Next() {
+		var folderID string
+		if err := rows.Scan(&folderID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read Workspace project device binding: %w", err)
+		}
+		folderIDs = append(folderIDs, folderID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate Workspace project device bindings: %w", err)
+	}
+	rows.Close()
+	for _, folderID := range folderIDs {
+		if err := requireWorkspaceSyncProjectHostBinding(ctx, tx, access.ownerID, access.workspaceID, folderID); err == nil {
+			return nil
+		} else if domain.CodeOf(err) != domain.CodeWorkspaceUnavailable && domain.CodeOf(err) != domain.CodeNotFound {
+			return err
+		}
+	}
+	return domain.NewError(domain.CodeNotFound, "workspace not found")
+}
+
 func prepareWorkspaceSyncDeviceReplica(ctx context.Context, tx pgx.Tx, ownerID, workspaceID, replicaID string) (*workspaceSyncDeviceAccess, error) {
 	if !strings.HasPrefix(replicaID, "device:") {
 		return nil, nil

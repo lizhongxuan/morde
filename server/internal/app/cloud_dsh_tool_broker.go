@@ -203,6 +203,9 @@ func (b *CloudDSHToolBroker) currentTaskDetails(ctx context.Context, claimed tas
 
 func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task) ([]AgentToolDefinition, error) {
 	definitions := make([]AgentToolDefinition, 0)
+	if claimed.ToolsDisabled {
+		return definitions, nil
+	}
 	claimed, target, routed, err := b.refreshDeferredTask(ctx, claimed)
 	if err != nil {
 		return nil, err
@@ -229,6 +232,9 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		if cloudDSHCurrentConversationHistoryEligible(details.Task) {
 			definitions = append(definitions, cloudDSHCurrentConversationHistoryDefinition())
 		}
+		if !goalFollowupReadOnly {
+			definitions = append(definitions, cloudDSHTaskPlanDefinition())
+		}
 		if b.workspaceTools != nil && routed && details.Task.HostID == "" {
 			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization)...)
 		} else if b.workspaceTools != nil && cloudDSHWorkspaceToolsEligible(details.Task) {
@@ -238,7 +244,8 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 			definitions = append(definitions, cloudDSHBuiltinSearchDefinitions()...)
 		}
 		if b.authorizeSkillTask(ctx, details.Task) == nil {
-			definitions = append(definitions, cloudDSHSkillReadDefinition())
+			hostAvailable := domain.ValidHostID(claimed.HostID) || routed && !target.Unavailable && domain.ValidHostID(target.HostID)
+			definitions = append(definitions, cloudDSHSkillReadDefinition(hostAvailable))
 		}
 		if b.personalData != nil && cloudDSHPersonalContextEligible(details.Task) {
 			definitions = append(definitions, cloudDSHPersonalUpdateDefinition())
@@ -400,20 +407,22 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 
 	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs)
 	if evidenceErr == nil && !cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) && len(evidence) == 0 {
-		if fileIntent != task.FileDeliveryNone {
+		if fileIntent != task.FileDeliveryNone && fileIntent != task.FileDeliveryRequired {
 			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
 		}
-		if HasUnverifiedFileDeliveryClaim(completion.Result) {
+		if fileIntent != task.FileDeliveryRequired && HasUnverifiedFileDeliveryClaim(completion.Result) {
 			return b.pauseForUnverifiedFileClaim(ctx, current, details)
 		}
-		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
-			"Complete cloud task", "The cloud dsh session completed without producing a Workspace file.")
-		if err != nil {
-			return err
+		if fileIntent != task.FileDeliveryRequired {
+			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
+				"Complete cloud task", "The cloud dsh session completed without producing a Workspace file.")
+			if err != nil {
+				return err
+			}
+			useCloudDSHStreamResultStep(&step, details, completion)
+			return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
+				map[string]any{"source": "cloud_dsh"}, "", nil)
 		}
-		useCloudDSHStreamResultStep(&step, details, completion)
-		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
-			map[string]any{"source": "cloud_dsh"}, "", nil)
 	}
 	step, err := cloudDSHCompletionVerificationStep(current, details.Steps)
 	if err != nil {
@@ -424,16 +433,23 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	}); err != nil {
 		return err
 	}
-	if evidenceErr != nil || cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) || len(evidence) == 0 {
+	if evidenceErr != nil || cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) ||
+		(len(evidence) == 0 && fileIntent != task.FileDeliveryRequired) {
 		return b.pauseCompletion(ctx, current, step, "output_verification_pending", "The task output has no verifiable successful Workspace file write.")
 	}
 	fence, err := b.runtime.readFence(ctx, current, nil)
 	if err != nil {
 		return b.pauseCompletion(ctx, current, step, "output_verification_pending", "Host authorization or control changed before output verification.")
 	}
-	verification, verifyErr := b.runtime.Verify(ctx, AgentVerificationRequest{
-		Task: current, StepID: step.ID, Claim: completion.Result, Evidence: evidence, Fence: fence,
-	})
+	var verification AgentVerificationResult
+	var verifyErr error
+	if len(evidence) == 0 {
+		verification, verifyErr = b.runtime.VerifyTaskWorkspaceOutput(ctx, current, step.ID, completion.Inputs, fence)
+	} else {
+		verification, verifyErr = b.runtime.Verify(ctx, AgentVerificationRequest{
+			Task: current, StepID: step.ID, Claim: completion.Result, Evidence: evidence, Fence: fence,
+		})
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -441,6 +457,10 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		len(verification.Artifacts) == 0 {
 		_, err := b.pauseForWorkspaceInputChange(ctx, current, step, current.Usage, "file.verify")
 		return err
+	}
+	if verifyErr == nil && len(evidence) == 0 && verification.Status == AgentNotVerified {
+		return b.pauseCompletion(ctx, current, step, "file_delivery_required",
+			safeStepSummary(verification.Summary, "No new or modified Host Workspace file was produced for delivery."))
 	}
 	if verifyErr != nil || verification.Status != AgentVerified || validateAgentVerificationArtifacts(verification) != nil || len(verification.Artifacts) == 0 {
 		return b.pauseCompletion(ctx, current, step, "output_verification_pending",
@@ -830,6 +850,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	if cloudDSHGoalFollowupReadOnlyTask(claimed) && !goalFollowupReadOnlyToolAllowed(call.Name) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "tool is not available to read-only Goal follow-up Tasks")
+	}
+	if call.Name == cloudDSHTaskPlanToolName {
+		return b.executeTaskPlan(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	claimed, target, routed, err := b.refreshDeferredTask(ctx, claimed)
 	if err != nil {

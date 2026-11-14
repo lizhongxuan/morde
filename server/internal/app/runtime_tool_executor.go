@@ -836,7 +836,11 @@ func (e *RuntimeToolExecutor) Verify(ctx context.Context, request AgentVerificat
 		if receiptErr == nil {
 			switch receipt.State {
 			case TaskWorkspacePublishSucceeded:
-				result := e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, nil)
+				artifacts, artifactErr := e.committedWorkspaceOutputArtifacts(ctx, current, group, receipt, fileEvidenceArtifacts(group))
+				if artifactErr != nil {
+					return unknownAgentVerification("The committed Task Workspace output could not be compared with its fixed base revision."), nil
+				}
+				result := e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &artifacts)
 				if result.Status != AgentVerified {
 					return result, nil
 				}
@@ -876,6 +880,14 @@ type runtimeFileEvidenceGroup struct {
 	bindingVersion int64
 	viewID         string
 	files          []AgentFileEvidence
+	output         *runtimeTaskWorkspaceOutput
+}
+
+type runtimeTaskWorkspaceOutput struct {
+	files            []workspace.File
+	emptyDirectories []string
+	directories      []workspace.Directory
+	manifestSHA256   string
 }
 
 func (e *RuntimeToolExecutor) groupFileEvidence(ctx context.Context, current task.Task, evidence []AgentFileEvidence) ([]runtimeFileEvidenceGroup, AgentVerificationResult) {
@@ -926,6 +938,172 @@ func (e *RuntimeToolExecutor) groupFileEvidence(ctx context.Context, current tas
 		})
 	}
 	return result, AgentVerificationResult{}
+}
+
+// VerifyTaskWorkspaceOutput discovers deliverable files from the Host's exact
+// Task Workspace snapshot. Model-supplied paths, sizes, and hashes are ignored.
+func (e *RuntimeToolExecutor) VerifyTaskWorkspaceOutput(ctx context.Context, claimed task.Task, stepID string, inputs []ModelInput, expected AgentHostFence) (AgentVerificationResult, error) {
+	if !domain.ValidStepID(stepID) || len(inputs) > int(task.MaxToolCalls)*2 {
+		return unknownAgentVerification("The Task Workspace output request is invalid."), nil
+	}
+	current, err := e.currentTask(ctx, claimed)
+	if err != nil || current.HostID == "" || !domain.ValidWorkspaceID(current.WorkspaceID) || current.InputRevision == nil ||
+		current.WorkspaceCheckpointRevision == nil || *current.WorkspaceCheckpointRevision < *current.InputRevision {
+		return unknownAgentVerification("The Task Workspace checkpoint is unavailable."), nil
+	}
+	if err := e.authorize(ctx, current, identity.ScopeComputerObserve); err != nil {
+		return unknownAgentVerification("Current Task Workspace observation permission is unavailable."), nil
+	}
+	fence, err := e.readFence(ctx, current, &expected)
+	if err != nil {
+		return unknownAgentVerification("Host control changed before Task Workspace output verification."), nil
+	}
+	current, err = e.renewTaskWorkspaceLease(ctx, current)
+	if err != nil {
+		return unknownAgentVerification("Workspace access is unavailable while ownership transfer is in progress."), nil
+	}
+	session, err := e.connect(ctx, current, fence)
+	if err != nil {
+		return unknownAgentVerification("The current Host runtime is unavailable."), nil
+	}
+	defer session.Close()
+	fence = agentFenceFromRuntime(session.Fence)
+	if !session.Supports("workspace.task_view") || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
+		return unknownAgentVerification("The current Host cannot expose a fenced Task Workspace output snapshot."), nil
+	}
+	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, true); err != nil {
+		return unknownAgentVerification("The Runtime task lease could not be synchronized for output verification."), nil
+	}
+	publishKey := taskWorkspacePublishOperationKey(stepID, current.WorkspaceID)
+	if publishKey == "" {
+		return unknownAgentVerification("The Task Workspace publish identity is invalid."), nil
+	}
+	receipt, receiptErr := e.workspaces.FindTaskWorkspacePublishReceipt(ctx, current.OwnerID, current.ID, current.WorkspaceID, publishKey)
+	if receiptErr != nil && domain.CodeOf(receiptErr) != domain.CodeNotFound {
+		return unknownAgentVerification("The Task Workspace publish receipt could not be read."), nil
+	}
+	baseRevision := *current.WorkspaceCheckpointRevision
+	if receiptErr == nil && (receipt.State == TaskWorkspacePublishSucceeded || receipt.State == TaskWorkspacePublishPending) {
+		baseRevision = receipt.BaseRevision
+	}
+	bindingVersion, hasShellEvidence := e.successfulShellExecCompletion(ctx, current, inputs, baseRevision)
+	if !hasShellEvidence {
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "No successful durable Host shell operation at the fixed Workspace revision can support output discovery."}, nil
+	}
+	group := runtimeFileEvidenceGroup{workspaceID: current.WorkspaceID, bindingVersion: bindingVersion}
+	if receiptErr == nil {
+		switch receipt.State {
+		case TaskWorkspacePublishSucceeded:
+			artifacts, artifactErr := e.committedWorkspaceOutputArtifacts(ctx, current, group, receipt, nil)
+			if artifactErr != nil {
+				return unknownAgentVerification("The committed Task Workspace output could not be compared with its fixed base revision."), nil
+			}
+			if len(artifacts.Artifacts) == 0 {
+				return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}, nil
+			}
+			return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &artifacts), nil
+		case TaskWorkspacePublishConflict:
+			return workspaceInputChangedVerification(), nil
+		case TaskWorkspacePublishQuotaRejected:
+			return workspacePublishQuotaVerification(), nil
+		case TaskWorkspacePublishPending:
+			if receipt.BaseRevision != *current.WorkspaceCheckpointRevision {
+				return unknownAgentVerification("The pending Task Workspace receipt no longer matches the active checkpoint."), nil
+			}
+		default:
+			return unknownAgentVerification("The Task Workspace publish receipt is invalid."), nil
+		}
+	}
+	bindingVersion, viewID, err := session.SetTaskWorkspaceView(ctx, current, current.WorkspaceID, bindingVersion)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			return workspaceInputChangedVerification(), nil
+		}
+		return unknownAgentVerification("The Host Task Workspace view is unavailable."), nil
+	}
+	group.bindingVersion, group.viewID = bindingVersion, viewID
+	files, emptyDirectories, directories, manifestSHA, err := taskWorkspaceOutputManifest(ctx, session, current, group)
+	if err != nil {
+		return taskWorkspacePublishErrorVerification(err), nil
+	}
+	group.output = &runtimeTaskWorkspaceOutput{files: files, emptyDirectories: emptyDirectories, directories: directories, manifestSHA256: manifestSHA}
+	artifacts, err := e.workspaceOutputDeltaArtifacts(ctx, current, *current.WorkspaceCheckpointRevision, files, nil)
+	if err != nil {
+		return unknownAgentVerification("The Task Workspace output diff is invalid or exceeds artifact limits."), nil
+	}
+	if len(artifacts) == 0 {
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}, nil
+	}
+	result := AgentVerificationResult{Status: AgentVerified, Artifacts: artifacts}
+	return e.publishWorkspaceArtifacts(ctx, session, current, fence, stepID, group, result), nil
+}
+
+func (e *RuntimeToolExecutor) successfulShellExecCompletion(ctx context.Context, current task.Task, inputs []ModelInput, expectedBaseRevision int64) (int64, bool) {
+	type indexedInput struct {
+		index int
+		item  ModelInput
+	}
+	calls := make(map[string][]indexedInput)
+	outputs := make(map[string][]indexedInput)
+	for index, item := range inputs {
+		switch item.Type {
+		case "function_call":
+			if item.Name == runtimeToolShellExec {
+				calls[item.CallID] = append(calls[item.CallID], indexedInput{index: index, item: item})
+			}
+		case "function_call_output":
+			outputs[item.CallID] = append(outputs[item.CallID], indexedInput{index: index, item: item})
+		}
+	}
+	if len(calls) == 0 {
+		return 0, false
+	}
+	mapping, ok := runtimeToolMappingByName(runtimeToolShellExec)
+	if !ok {
+		return 0, false
+	}
+	var bindingVersion int64
+	for callID, callItems := range calls {
+		outputItems := outputs[callID]
+		if callID == "" || len(callID) > 256 || len(callItems) != 1 || len(outputItems) != 1 ||
+			outputItems[0].index <= callItems[0].index {
+			return 0, false
+		}
+		call := callItems[0].item
+		arguments := json.RawMessage(strings.TrimSpace(call.Arguments))
+		if !validAgentJSONObject(arguments, maxAgentToolArgsBytes) || !validRuntimeToolArguments(mapping, arguments) ||
+			runtimeToolWorkspaceID(mapping, arguments) != current.WorkspaceID {
+			return 0, false
+		}
+		requestHash, err := agentOperationHash(runtimeToolShellExec, arguments)
+		if err != nil {
+			return 0, false
+		}
+		operation, err := e.store.GetOperation(ctx, current.OwnerID, current.ID, agentOperationKey(callID))
+		if err != nil || !domain.ValidOperationID(operation.ID) || operation.TaskID != current.ID ||
+			operation.Key != agentOperationKey(callID) || operation.HostID != current.HostID ||
+			operation.WorkspaceID != current.WorkspaceID || operation.BindingVersion < 1 ||
+			!sameTaskInputRevision(operation.InputRevision, current.InputRevision) || operation.WorkspaceCheckpointRevision == nil ||
+			*operation.WorkspaceCheckpointRevision != expectedBaseRevision ||
+			!bytes.Equal(operation.RequestHash, requestHash[:]) || operation.Status != task.OperationSucceeded ||
+			operation.RuntimeGeneration < 1 || operation.RuntimeInstanceID == "" || operation.ControlVersion < 0 ||
+			operation.RuntimeLeaseVersion < 1 || operation.LeaseVersion < operation.RuntimeLeaseVersion ||
+			!domain.ValidOperationID(operation.ExternalID) {
+			return 0, false
+		}
+		if bindingVersion == 0 {
+			bindingVersion = operation.BindingVersion
+		} else if bindingVersion != operation.BindingVersion {
+			return 0, false
+		}
+		mapped, err := mapRuntimeToolResult(mapping, runtimeclient.Operation{
+			OperationID: operation.ExternalID, Status: runtimeclient.OperationSucceeded, Result: []byte(operation.Result),
+		}, arguments)
+		if err != nil || mapped.Status != AgentToolSucceeded || mapped.Output != outputItems[0].item.Output {
+			return 0, false
+		}
+	}
+	return bindingVersion, bindingVersion > 0
 }
 
 func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID string, group runtimeFileEvidenceGroup) AgentVerificationResult {
@@ -1453,6 +1631,14 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 		return taskWorkspacePublishErrorVerification(err)
 	}
 	if receipt.State == TaskWorkspacePublishSucceeded {
+		artifacts, artifactErr := e.committedWorkspaceOutputArtifacts(ctx, current, group, receipt, result.Artifacts)
+		if artifactErr != nil {
+			return unknownAgentVerification("The committed Task Workspace output could not be compared with its fixed base revision.")
+		}
+		if artifacts.Status != AgentVerified || len(artifacts.Artifacts) == 0 {
+			return artifacts
+		}
+		result.Artifacts = artifacts.Artifacts
 		return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result)
 	}
 	if receipt.State == TaskWorkspacePublishConflict {
@@ -1461,12 +1647,23 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 	if receipt.State == TaskWorkspacePublishQuotaRejected {
 		return workspacePublishQuotaVerification()
 	}
-	files, emptyDirectories, directories, manifestSHA, err := taskWorkspaceOutputManifest(ctx, session, current, group)
-	if err != nil {
-		return taskWorkspacePublishErrorVerification(err)
+	if group.output == nil {
+		files, emptyDirectories, directories, manifestSHA, outputErr := taskWorkspaceOutputManifest(ctx, session, current, group)
+		if outputErr != nil {
+			return taskWorkspacePublishErrorVerification(outputErr)
+		}
+		group.output = &runtimeTaskWorkspaceOutput{files: files, emptyDirectories: emptyDirectories, directories: directories, manifestSHA256: manifestSHA}
 	}
-	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, directories, manifestSHA, func(ctx context.Context, digest string) ([]byte, error) {
-		block, err := session.ReadTaskWorkspaceBlock(ctx, current, group.bindingVersion, group.viewID, manifestSHA, digest)
+	artifacts, artifactErr := e.workspaceOutputDeltaArtifacts(ctx, current, *current.WorkspaceCheckpointRevision, group.output.files, result.Artifacts)
+	if artifactErr != nil {
+		return unknownAgentVerification("The Task Workspace output diff is invalid or exceeds artifact limits.")
+	}
+	if len(artifacts) == 0 {
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}
+	}
+	result.Artifacts = artifacts
+	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, group.output.files, group.output.emptyDirectories, group.output.directories, group.output.manifestSHA256, func(ctx context.Context, digest string) ([]byte, error) {
+		block, err := session.ReadTaskWorkspaceBlock(ctx, current, group.bindingVersion, group.viewID, group.output.manifestSHA256, digest)
 		if err != nil {
 			return nil, err
 		}
@@ -1582,6 +1779,168 @@ func workspaceNativeMetadataFromRuntime(xattrs []contract.WorkspaceExtendedAttri
 		return converted, nil
 	}
 	return converted, &workspace.NativeACL{Platform: acl.Platform, Format: acl.Format, Data: append([]byte(nil), acl.Data...)}
+}
+
+func fileEvidenceArtifacts(group runtimeFileEvidenceGroup) []AgentVerifiedArtifact {
+	artifacts := make([]AgentVerifiedArtifact, 0, len(group.files))
+	for _, file := range group.files {
+		mediaType := mime.TypeByExtension(path.Ext(file.Path))
+		if mediaType == "" {
+			mediaType = "application/octet-stream"
+		}
+		artifacts = append(artifacts, AgentVerifiedArtifact{
+			Label: path.Base(file.Path), Path: file.Path, MediaType: mediaType,
+			WorkspaceID: group.workspaceID, SizeBytes: file.Size, SHA256: file.SHA256,
+		})
+	}
+	return artifacts
+}
+
+func (e *RuntimeToolExecutor) readTaskWorkspaceRevisionManifest(ctx context.Context, current task.Task, revision int64) (runtimeTaskWorkspaceOutput, error) {
+	if e == nil || e.workspaces == nil || revision < 0 || !domain.ValidWorkspaceID(current.WorkspaceID) {
+		return runtimeTaskWorkspaceOutput{}, domain.InvalidArgument("task_workspace_manifest", "Task Workspace revision is invalid")
+	}
+	var files []workspace.File
+	var emptyDirectories []string
+	var directories []workspace.Directory
+	read := func(readCtx context.Context) error {
+		var err error
+		files, emptyDirectories, directories, err = e.workspaces.readManifest(readCtx, taskWorkspaceOwner(current), current.WorkspaceID, revision, nil)
+		return err
+	}
+	if current.ProjectID != "" {
+		guard, ok := e.store.(projectTaskWorkspaceGuard)
+		if !ok {
+			return runtimeTaskWorkspaceOutput{}, domain.NewError(domain.CodeForbidden, "project Workspace manifest authorization is unavailable")
+		}
+		if err := guard.WithProjectTaskWorkspaceAccess(ctx, current, false, read); err != nil {
+			return runtimeTaskWorkspaceOutput{}, err
+		}
+	} else if err := read(ctx); err != nil {
+		return runtimeTaskWorkspaceOutput{}, err
+	}
+	manifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+	if err != nil {
+		return runtimeTaskWorkspaceOutput{}, err
+	}
+	return runtimeTaskWorkspaceOutput{
+		files: files, emptyDirectories: emptyDirectories, directories: directories, manifestSHA256: manifestSHA,
+	}, nil
+}
+
+// workspaceOutputDeltaArtifacts derives candidates only from actual Host output
+// manifest bytes, compared to one fixed committed Workspace revision.
+func (e *RuntimeToolExecutor) workspaceOutputDeltaArtifacts(ctx context.Context, current task.Task, baseRevision int64, outputFiles []workspace.File, prior []AgentVerifiedArtifact) ([]AgentVerifiedArtifact, error) {
+	base, err := e.readTaskWorkspaceRevisionManifest(ctx, current, baseRevision)
+	if err != nil {
+		return nil, err
+	}
+	baseByPath := make(map[string]workspace.File, len(base.files))
+	for _, file := range base.files {
+		if err := validateTaskWorkspaceRelativePath(file.Path); err != nil || workspace.ValidateFile(file) != nil {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace base manifest contains an invalid file")
+		}
+		key := strings.ToLower(file.Path)
+		if _, exists := baseByPath[key]; exists {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace base manifest contains case-colliding paths")
+		}
+		baseByPath[key] = file
+	}
+	outputByPath := make(map[string]workspace.File, len(outputFiles))
+	for _, file := range outputFiles {
+		if err := validateTaskWorkspaceRelativePath(file.Path); err != nil || workspace.ValidateFile(file) != nil {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest contains an invalid file")
+		}
+		key := strings.ToLower(file.Path)
+		if _, exists := outputByPath[key]; exists {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest contains case-colliding paths")
+		}
+		outputByPath[key] = file
+	}
+	changed := make(map[string]AgentVerifiedArtifact)
+	var totalBytes int64
+	for key, file := range outputByPath {
+		before, exists := baseByPath[key]
+		if exists && before.Path == file.Path && workspace.CanonicalFileKind(before.Kind) == workspace.CanonicalFileKind(file.Kind) &&
+			before.HardlinkTo == file.HardlinkTo && before.SizeBytes == file.SizeBytes && before.SHA256 == file.SHA256 {
+			continue
+		}
+		if workspace.CanonicalFileKind(file.Kind) != workspace.FileKindRegular || file.HardlinkTo != "" {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace deliverable must be a regular unlinked file")
+		}
+		if err := validateTaskWorkspaceOutputPath(file.Path); err != nil {
+			return nil, err
+		}
+		if file.SizeBytes > workspace.MaxSyncFileBytes || len(changed) >= maxAgentVerifiedArtifacts ||
+			e.workspaces.maxOwnerBytes <= 0 || totalBytes > e.workspaces.maxOwnerBytes-file.SizeBytes {
+			return nil, domain.NewError(domain.CodeRequestTooLarge, "Task Workspace deliverable exceeds artifact limits")
+		}
+		totalBytes += file.SizeBytes
+		mediaType := mime.TypeByExtension(path.Ext(file.Path))
+		if mediaType == "" {
+			mediaType = "application/octet-stream"
+		}
+		changed[key] = AgentVerifiedArtifact{
+			Label: path.Base(file.Path), Path: file.Path, MediaType: mediaType, WorkspaceID: current.WorkspaceID,
+			SizeBytes: file.SizeBytes, SHA256: file.SHA256,
+		}
+	}
+	if len(prior) > maxAgentVerifiedArtifacts {
+		return nil, domain.NewError(domain.CodeRequestTooLarge, "Task Workspace file evidence exceeds artifact limits")
+	}
+	for _, expected := range prior {
+		if expected.WorkspaceID != current.WorkspaceID || validateTaskWorkspaceOutputPath(expected.Path) != nil || expected.SizeBytes < 0 || !validSyncDigest(expected.SHA256) {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace file evidence is invalid")
+		}
+		key := strings.ToLower(expected.Path)
+		actual, exists := changed[key]
+		if !exists || actual.Path != expected.Path || actual.SizeBytes != expected.SizeBytes || actual.SHA256 != expected.SHA256 {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output does not match durable file evidence")
+		}
+	}
+	result := make([]AgentVerifiedArtifact, 0, len(changed))
+	for _, artifact := range changed {
+		result = append(result, artifact)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result, nil
+}
+
+func validateTaskWorkspaceOutputPath(value string) error {
+	if err := validateTaskWorkspaceRelativePath(value); err != nil || cloudDSHWorkspacePathIsSensitive(value) {
+		return domain.NewError(domain.CodeForbidden, "Task Workspace artifact path is not allowed")
+	}
+	return nil
+}
+
+func validateTaskWorkspaceRelativePath(value string) error {
+	if err := workspace.ValidateRelativePath(value); err != nil || len(value) > workspace.MaxSyncPathBytes || strings.TrimSpace(value) != value {
+		return domain.NewError(domain.CodeInvalidArgument, "Task Workspace path is invalid")
+	}
+	return nil
+}
+
+func (e *RuntimeToolExecutor) committedWorkspaceOutputArtifacts(ctx context.Context, current task.Task, group runtimeFileEvidenceGroup, receipt TaskWorkspacePublishReceipt, prior []AgentVerifiedArtifact) (AgentVerificationResult, error) {
+	if receipt.State != TaskWorkspacePublishSucceeded || receipt.WorkspaceID != group.workspaceID || group.workspaceID != current.WorkspaceID ||
+		receipt.BaseRevision < 0 || receipt.PublishedRevision <= receipt.BaseRevision || !validSyncDigest(receipt.ManifestSHA256) ||
+		current.InputRevision == nil || receipt.BaseRevision < *current.InputRevision {
+		return AgentVerificationResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace publish receipt is invalid")
+	}
+	output, err := e.readTaskWorkspaceRevisionManifest(ctx, current, receipt.PublishedRevision)
+	if err != nil {
+		return AgentVerificationResult{}, err
+	}
+	if output.manifestSHA256 != receipt.ManifestSHA256 {
+		return AgentVerificationResult{}, domain.NewError(domain.CodeWorkspaceConflict, "committed Workspace manifest does not match its receipt")
+	}
+	artifacts, err := e.workspaceOutputDeltaArtifacts(ctx, current, receipt.BaseRevision, output.files, prior)
+	if err != nil {
+		return AgentVerificationResult{}, err
+	}
+	if len(artifacts) == 0 {
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The committed Task Workspace has no new or modified deliverable files."}, nil
+	}
+	return AgentVerificationResult{Status: AgentVerified, Artifacts: artifacts}, nil
 }
 
 func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifacts(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup, receipt TaskWorkspacePublishReceipt, result *AgentVerificationResult) AgentVerificationResult {

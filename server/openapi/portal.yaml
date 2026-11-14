@@ -82,7 +82,7 @@ paths:
                   minimum_client_version: { type: [string, 'null'] }
                   supported_features:
                     type: array
-                    description: An absent feature is unavailable or not yet declared. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
+                    description: An absent feature is unavailable or not yet declared. workspace_sync_checkpoint_recovery means POST /api/workspaces/{id}/sync-sessions/recover is assembled; clients must require this feature before treating its 404 as a recovery miss instead of an older server's route-not-found response. On an authorized owner/workspace request, a missing idempotency record is tombstoned before the recovery miss is returned, preventing a delayed create from creating a session later. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
                     items: { type: string }
                   default_max_request_bytes: { type: integer, format: int64, minimum: 1 }
         '503': { $ref: '#/components/responses/Error' }
@@ -110,7 +110,7 @@ paths:
       tags: [Codex]
       operationId: discoverCodexSession
       summary: Register an explicitly authorized native Codex thread
-      description: Requires an active installation-bound Client credential. The owner and installation come from authentication; request bodies cannot select either. profile_key must be an opaque local identifier and must not contain CODEX_HOME or an absolute path. The supplied scopes replace the selected thread grant exactly; removing scopes blocks access while preserving stored history. Session, grant, commands and normalized events have no automatic TTL and remain until explicit session or account deletion. Re-discovering a deleted thread creates a new mirror ID.
+      description: Requires an active installation-bound desktop Client credential. The owner and installation come from authentication; request bodies cannot select either. profile_key must be an opaque local identifier and must not contain CODEX_HOME or an absolute path. If a profile connection exists, requested thread scopes must be a subset of its exact grant; a revoked profile tombstone blocks discovery until explicitly reconnected. For older clients without a profile connection record, discovery retains its existing per-thread grant behavior. The supplied scopes replace the selected thread grant exactly; removing scopes blocks access while preserving stored history. Session, grant, commands and normalized events have no automatic TTL and remain until explicit session or account deletion. Re-discovering a deleted thread creates a new mirror ID.
       security:
         - clientCredential: []
       requestBody:
@@ -133,6 +133,101 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/connections:
+    get:
+      tags: [Codex]
+      operationId: listCodexProfileConnections
+      summary: Read Codex profile connection and sync status for one owned PC installation
+      description: Requires an owner Portal Session or an active Client credential owned by the same user. A Client reader installation must also be active. The queried installation must belong to the owner and be an active desktop installation. Revoked profiles are omitted. session_discovery describes only local session discovery state; history_sync separately reports PC-reported session and pending event counts and does not assert that an iOS client has loaded every event.
+      security:
+        - portalSession: []
+        - clientCredential: []
+      parameters:
+        - name: installation_id
+          in: query
+          required: true
+          schema: { type: string, pattern: '^i[a-z0-9]{7}$' }
+      responses:
+        '200':
+          description: Active Codex profile connections and the latest client-reported progress
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexProfileConnectionList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Codex]
+      operationId: connectCodexProfile
+      summary: Grant one PC installation access to a local Codex profile
+      description: Requires the active Client credential for a desktop installation. Owner and installation are taken from authentication. profile_key is an opaque local identifier and cannot contain a path or CODEX_HOME value. The exact profile scope set must include read and live; each already discovered session for this profile has its scopes atomically replaced and its grant version advanced when changed. Future discovery requests may select only a subset of the connected profile scopes. A previously revoked profile must be explicitly reconnected before it can be discovered again.
+      security:
+        - clientCredential: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexProfileConnectionRequest' }
+      responses:
+        '200':
+          description: Current profile connection and exact grant set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexProfileConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/connections/{profile_key}/session-discovery-status:
+    put:
+      tags: [Codex]
+      operationId: updateCodexProfileSessionDiscoveryStatus
+      summary: Report session discovery and historical event sync counts for the active Codex profile
+      description: Requires the active Client credential for the desktop installation that owns the profile. The authenticated installation is used; owner and installation IDs are never accepted from the body. Session discovery state and error code describe only discovery. history_sync is a separate PC-reported summary containing discovered sessions, sessions whose historical event upload is complete, and events still pending upload. It is not a claim that a mobile client has loaded all server events. Revoked profiles cannot report status.
+      security:
+        - clientCredential: []
+      parameters:
+        - name: profile_key
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexProfileSessionDiscoveryUpdate' }
+      responses:
+        '200':
+          description: Current profile connection with the accepted discovery state and PC-reported sync counts
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexProfileConnection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/codex/connections/{profile_key}:
+    delete:
+      tags: [Codex]
+      operationId: revokeCodexProfileConnection
+      summary: Revoke one PC installation's access to a Codex profile
+      description: Requires the same active desktop Client installation that owns the profile connection. Revocation atomically tombstones the profile connection, revokes every discovered session grant, and marks pending commands failed or in-flight commands unknown. It blocks future discovery, event writes/reads and command access while preserving the event and command history; reconnecting explicitly may restore only newly granted scopes.
+      security:
+        - clientCredential: []
+      parameters:
+        - name: profile_key
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+      responses:
+        '204': { description: Profile connection revoked; repeated revocation is idempotent. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
   /api/codex/sessions:
     get:
@@ -890,7 +985,7 @@ paths:
       tags: [Hosts]
       operationId: createHost
       summary: Create a host
-      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host binds exactly one owned, ready Workspace. Portal Sessions may omit workspace_ids to let the server select an available Workspace; API keys and Client credentials must provide one authorized Workspace ID. Reuse the Idempotency-Key only to retry the exact normalized request.
+      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. The server creates and assigns a new private persistent workspace directory to this Host; clients cannot select or reuse another Host's storage. Reuse the Idempotency-Key only to retry the exact normalized request.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -933,7 +1028,13 @@ paths:
       tags: [Hosts]
       operationId: deleteHost
       summary: Delete a host
-      description: API keys require current account ownership of this host. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
+      description: Permanently deletes this Host and its exclusively assigned ~/workspace directory after explicit confirmation. Requires confirm_delete_workspace=true. The request is accepted asynchronously; poll GET /api/hosts/{id} until deleted. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
+      parameters:
+        - name: confirm_delete_workspace
+          in: query
+          required: true
+          description: Must be true to confirm permanent deletion of the Host and its workspace directory.
+          schema: { type: boolean, enum: [true] }
       responses:
         '202':
           description: Host is being deleted
@@ -1902,33 +2003,6 @@ paths:
                     items: { $ref: '#/components/schemas/Workspace' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Workspaces]
-      operationId: createWorkspace
-      summary: Create an independent workspace
-      description: Creates metadata and an empty durable file root without creating or starting a Host. Requires an idempotency key.
-      security:
-        - portalSession: []
-      parameters:
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: { type: string, minLength: 1, maxLength: 128 }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CreateWorkspaceRequest' }
-      responses:
-        '201':
-          description: Workspace created
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Workspace' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
   /api/workspaces/{id}:
     parameters:
       - $ref: '#/components/parameters/WorkspaceId'
@@ -2189,7 +2263,7 @@ paths:
       tags: [Workspaces]
       operationId: createWorkspaceShareLink
       summary: Create a single-recipient Workspace copy link
-      description: Portal owner sessions only. The link expires after seven days if unclaimed. The response contains the random token once; only its SHA-256 hash is stored. A successful claim creates an independent Workspace owned by the recipient. View permission is enforced by the server and prevents Workspace writes and Host attachment.
+      description: Portal owner sessions only and only for an independent Workspace that has never been bound to a Host. Host-bound computer storage cannot be shared or copied through this endpoint. The link expires after seven days if unclaimed. The response contains the random token once; only its SHA-256 hash is stored. A successful claim creates an independent Workspace owned by the recipient. View permission is enforced by the server and prevents Workspace writes and Host attachment.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -2216,7 +2290,7 @@ paths:
       tags: [Workspaces]
       operationId: previewWorkspaceShareLink
       summary: Preview a Workspace copy link
-      description: Portal session only. The token is sent in the request body and responses are not cacheable. Preview does not claim or consume the link.
+      description: Portal session only. The token is sent in the request body and responses are not cacheable. Preview does not claim or consume the link. Links whose source has since become Host-bound are unavailable.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -2241,7 +2315,7 @@ paths:
       tags: [Workspaces]
       operationId: acceptWorkspaceShareLink
       summary: Claim a Workspace copy link
-      description: Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. The server creates the recipient-owned copy with the selected view/edit permission when it reserves the copy; neither successful nor recovery paths use ownership transfer or transfer the original Workspace or its Host bindings. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
+      description: Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account while its source remains an independent Workspace; if the source becomes Host-bound, the link cannot be claimed or copied. The server creates the recipient-owned copy with the selected view/edit permission when it reserves the copy; neither successful nor recovery paths use ownership transfer or transfer the original Workspace or its Host bindings. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -2270,7 +2344,7 @@ paths:
       tags: [Workspaces]
       operationId: restoreWorkspacePaths
       summary: Restore selected paths from an immutable revision
-      description: Portal owner sessions only. The current Workspace revision is checked atomically; active Host bindings, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
+      description: Portal owner sessions only. The current Workspace revision is checked atomically; any current or historical Host binding, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
       security: [{ portalSession: [] }]
       parameters:
         - name: Idempotency-Key
@@ -2302,7 +2376,7 @@ paths:
       tags: [Workspaces]
       operationId: applyWorkspaceFileOperation
       summary: Rename, move, or delete Workspace paths
-      description: Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of active Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
+      description: Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of current or historical Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
       security: [{ portalSession: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -2491,7 +2565,7 @@ paths:
       operationId: createWorkspaceSyncSession
       summary: Plan an upload, missing-only download, merge, or live synchronization batch
       description: >-
-        The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; the same Idempotency-Key and canonical request return the original session, while a different request body conflicts. Omitted files never imply deletion. Requests with folder_id are explicit PC-to-cloud project uploads and must include source_binding_id; the authenticated principal supplies the verified client installation identity. The server accepts only one complete relative source manifest, derives the cloud path and safe deletion plan, and never trusts client installation, Host, Workspace, path, scope, or delete-list claims. Old sessions and last_upload_revision values do not prove PC ownership; old project sessions receive no deletion baseline. SyncSession.state=completed confirms only server commit; Host application is tracked separately. GET exposes a session-bound host_application projection, and only a verified receipt for the recorded Host, Workspace binding version, exact target_revision and authenticated Host runtime generation can confirm application. Receipt handling rechecks the current Host generation, binding version, and authorization in the committing transaction. An applied_revision above target_revision is accepted only when the server verifies revision lineage and the affected project paths; a larger numeric revision alone never proves application. An unresolved application prevents a different destructive project upload; retries with the original idempotency key recover the original session. Only an installation-bound session/client credential is authorized. Platform API keys and credentials without a verified installation are rejected. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
+        The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; the same Idempotency-Key and canonical request return the original session, while a different request body conflicts. Omitted files never imply deletion. When folder_id is omitted, root synchronization remains available to HostReplica internal sessions and to historical unbound Workspaces; non-HostReplica sessions are rejected for any Workspace with a current or historical Host binding. Requests with folder_id are explicit PC-to-cloud project uploads and must include source_binding_id; the authenticated principal supplies the verified client installation identity. The server accepts only one complete relative source manifest, derives the cloud path and safe deletion plan, and never trusts client installation, Host, Workspace, path, scope, or delete-list claims. Old sessions and last_upload_revision values do not prove PC ownership; old project sessions receive no deletion baseline. SyncSession.state=completed confirms only server commit; Host application is tracked separately. GET exposes a session-bound host_application projection, and only a verified receipt for the recorded Host, Workspace binding version, exact target_revision and authenticated Host runtime generation can confirm application. Receipt handling rechecks the current Host generation, binding version, and authorization in the committing transaction. An applied_revision above target_revision is accepted only when the server verifies revision lineage and the affected project paths; a larger numeric revision alone never proves application. An unresolved application prevents a different destructive project upload; retries with the original idempotency key recover the original session. Only an installation-bound session/client credential is authorized. Platform API keys and credentials without a verified installation are rejected. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
       security:
         - portalSession: []
         - bearerToken: []
@@ -2517,6 +2591,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/sync-sessions/recover:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: recoverWorkspaceSyncSession
+      summary: Recover a resumable sync session by its idempotency key
+      description: >-
+        Call only when api/capabilities advertises workspace_sync_checkpoint_recovery. Requires an owner Portal Session or the same installation-bound Device credential used to create the session; HostReplica credentials are rejected. The caller must be authorized for the owner and Workspace. The Idempotency-Key is scoped by owner and workspace for the recovery lookup, and the stored session must also match the authenticated replica. A matching session returns the same SyncSession model as create. If no reservation exists after authorization, the server inserts an immutable tombstone under the original global idempotency primary key before returning 404, so a late in-flight create cannot commit. A key that points to another Workspace, replica, quota rejection, tombstone, or missing session returns the same 404 without revealing session data; existing idempotency rows are never overwritten. This endpoint never deletes Workspace data or sessions.
+      security:
+        - portalSession: []
+        - bearerToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: The exact key used by the create request.
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
+      responses:
+        '200':
+          description: Existing owner-, Workspace-, and replica-scoped resumable session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncSession' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: No recoverable session is visible for this owner, Workspace, and replica. After successful authorization, an unused key is permanently tombstoned before this response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         default: { $ref: '#/components/responses/Error' }
   /api/workspaces/{id}/sync-sessions/{session_id}:
     parameters:
@@ -2552,7 +2659,7 @@ paths:
       tags: [Workspaces]
       operationId: commitWorkspaceSyncSession
       summary: Verify and commit the transfer plan
-      description: Rechecks the pinned base revision and received chunks. Changed paths return conflicts; unrelated files may commit independently. Durable block acknowledgement is separate from destination application acknowledgement.
+      description: Rechecks the pinned base revision and received chunks. A non-HostReplica root session cannot commit after its Workspace has any current or historical Host binding; use the registered project-upload contract for PC changes. Changed paths return conflicts; unrelated files may commit independently. Durable block acknowledgement is separate from destination application acknowledgement.
       security:
         - portalSession: []
         - bearerToken: []
@@ -2732,8 +2839,9 @@ paths:
     post:
       tags: [Hosts]
       operationId: bindWorkspaceToHost
-      summary: Bind a ready workspace without restarting the host
-      description: The server creates the workspace directory under the Host-level workspace root and requests the current revision. Directory paths are never accepted from the caller.
+      deprecated: true
+      summary: Rebinding computer storage is disabled
+      description: A cloud computer's persistent storage is assigned at creation and cannot be rebound. This legacy endpoint always returns 403; clients should show storage readiness from the Host response instead.
       security:
         - portalSession: []
       parameters:
@@ -2747,14 +2855,8 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/BindWorkspaceRequest' }
       responses:
-        '201':
-          description: Binding created or found idempotently
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/WorkspaceBinding' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
   /api/hosts/{id}/sync-folders:
     parameters:
@@ -3172,8 +3274,9 @@ paths:
     delete:
       tags: [Hosts]
       operationId: unbindWorkspaceFromHost
-      summary: Unbind a workspace while retaining its server content
-      description: The caller must stop AI tools, IDEs, and other external writers and explicitly confirm that they have stopped. The runtime then blocks new Morde operations, waits for in-flight operations, syncs and verifies a stable checkpoint, and detaches the binding. The independent server workspace is retained; the detached Host copy remains on its volume.
+      deprecated: true
+      summary: Unbinding computer storage is disabled
+      description: A cloud computer's persistent storage remains assigned for its lifetime. This legacy endpoint always returns 403. Permanently deleting the Host requires the explicit confirmation query on DELETE /api/hosts/{id}.
       security:
         - portalSession: []
       parameters:
@@ -3193,14 +3296,8 @@ paths:
                 writers_stopped: { type: boolean, enum: [true], description: 'Confirms the user has stopped external AI, IDE, and application processes that may write this workspace.' }
               additionalProperties: false
       responses:
-        '202':
-          description: Unbind accepted; status remains queryable from the Host binding list
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/WorkspaceBinding' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
   /api/hosts/{id}/workspace-bindings/{workspace_id}/retry-sync:
     parameters:
@@ -3981,6 +4078,40 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AcceptedProjectConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/variants:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - { $ref: '#/components/parameters/IdempotencyKey' }
+    post:
+      tags: [Projects]
+      operationId: createProjectConversationMessageVariant
+      summary: Create an immutable version of a shared conversation message
+      description: expected_version must equal the group's highest accepted version. Only the source message actor may edit or regenerate it; stale requests return 409. Edit-resend preserves the source message's authorized attachments. Text regeneration uses the same DSH runtime with an empty tool set. Continue-generation is accepted only for a verified checkpoint of the same Task revision.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversationMessageVariantRequest' }
+      responses:
+        '202':
+          description: Variant operation durably accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageVariantOperation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -5117,6 +5248,42 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/variants:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - { $ref: '#/components/parameters/IdempotencyKey' }
+    post:
+      tags: [Tasks]
+      operationId: createConversationMessageVariant
+      summary: Create an immutable version of a conversation message
+      description: expected_version must equal the group's highest accepted version. Only the source message actor may edit or regenerate it; stale requests return 409. Edit-resend preserves the source message's authorized attachments. Text regeneration uses the same DSH runtime with an empty tool set. Continue-generation is accepted only for a verified checkpoint of the same Task revision.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversationMessageVariantRequest' }
+      responses:
+        '202':
+          description: Variant operation durably accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageVariantOperation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/conversations/{id}/messages/{message_id}/attachments/{client_attachment_id}:
     parameters:
       - name: id
@@ -5379,11 +5546,21 @@ paths:
               schema: { $ref: '#/components/schemas/TaskStepDetail' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/steps/{step_id}/retries:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: step_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/StepId' }
     post:
       tags: [Tasks]
       operationId: retryTaskStep
       summary: Queue one verified safe retry of a Task step
-      description: Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. Request parameters cannot replace the tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
+      description: Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - name: Idempotency-Key
@@ -8416,6 +8593,129 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    CodexProfileConnectionRequest:
+      type: object
+      required: [profile_key, scopes]
+      properties:
+        profile_key: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$', description: Opaque stable local profile identifier. Never an absolute path or CODEX_HOME value. }
+        scopes:
+          type: array
+          minItems: 2
+          maxItems: 5
+          uniqueItems: true
+          description: Exact profile grant; must include read and live. Other scopes are optional.
+          items: { type: string, enum: [read, live, send, interrupt, approval] }
+      allOf:
+        - properties:
+            scopes: { contains: { const: read } }
+        - properties:
+            scopes: { contains: { const: live } }
+      additionalProperties: false
+    CodexProfileConnection:
+      type: object
+      required: [installation_id, profile_key, scopes, grant_version, connected, updated_at, session_discovery, history_sync]
+      properties:
+        installation_id: { type: string, pattern: '^i[a-z0-9]{7}$' }
+        profile_key: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+        scopes:
+          type: array
+          minItems: 2
+          uniqueItems: true
+          items: { type: string, enum: [read, live, send, interrupt, approval] }
+        grant_version: { type: integer, format: int64, minimum: 1 }
+        connected: { type: boolean, enum: [true] }
+        updated_at: { type: string, format: date-time }
+        session_discovery:
+          oneOf:
+            - $ref: '#/components/schemas/CodexSessionDiscoveryStatus'
+            - type: 'null'
+        history_sync:
+          oneOf:
+            - $ref: '#/components/schemas/CodexHistorySyncProgress'
+            - type: 'null'
+      allOf:
+        - properties:
+            scopes: { contains: { const: read } }
+        - properties:
+            scopes: { contains: { const: live } }
+      additionalProperties: false
+    CodexProfileConnectionList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CodexProfileConnection' }
+      additionalProperties: false
+    CodexSessionDiscoveryUpdate:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [syncing, synced, partial], description: Describes local session discovery only. }
+        error_code:
+          type: [string, 'null']
+          enum: [profile_unavailable, session_list_failed, connection_lost, unknown, null]
+      allOf:
+        - if:
+            properties:
+              state: { const: partial }
+          then:
+            required: [error_code]
+            properties:
+              error_code: { type: string, enum: [profile_unavailable, session_list_failed, connection_lost, unknown] }
+        - if:
+            properties:
+              state: { enum: [syncing, synced] }
+          then:
+            properties:
+              error_code: { type: 'null' }
+      additionalProperties: false
+    CodexHistorySyncProgressUpdate:
+      type: object
+      required: [discovered_sessions, history_complete_sessions, pending_upload_event_count]
+      properties:
+        discovered_sessions: { type: integer, format: int64, minimum: 0, description: Number of sessions discovered on the PC for this profile. }
+        history_complete_sessions: { type: integer, format: int64, minimum: 0, description: Number of discovered sessions whose PC-side historical event upload is complete. Must not exceed discovered_sessions. }
+        pending_upload_event_count: { type: integer, format: int64, minimum: 0, description: Number of historical events still queued for upload by the PC. }
+      additionalProperties: false
+    CodexProfileSessionDiscoveryUpdate:
+      type: object
+      required: [session_discovery, history_sync]
+      properties:
+        session_discovery: { $ref: '#/components/schemas/CodexSessionDiscoveryUpdate' }
+        history_sync: { $ref: '#/components/schemas/CodexHistorySyncProgressUpdate' }
+      additionalProperties: false
+    CodexSessionDiscoveryStatus:
+      type: object
+      required: [state, error_code, updated_at]
+      properties:
+        state: { type: string, enum: [syncing, synced, partial], description: Describes local session discovery only. }
+        error_code:
+          type: [string, 'null']
+          enum: [profile_unavailable, session_list_failed, connection_lost, unknown, null]
+        updated_at: { type: string, format: date-time, description: Server time when this discovery state and accompanying counters were recorded. }
+      allOf:
+        - if:
+            properties:
+              state: { const: partial }
+          then:
+            properties:
+              error_code: { type: string, enum: [profile_unavailable, session_list_failed, connection_lost, unknown] }
+        - if:
+            properties:
+              state: { enum: [syncing, synced] }
+          then:
+            properties:
+              error_code: { type: 'null' }
+      additionalProperties: false
+    CodexHistorySyncProgress:
+      type: object
+      required: [discovered_sessions, history_complete_sessions, pending_upload_event_count]
+      properties:
+        discovered_sessions: { type: integer, format: int64, minimum: 0 }
+        history_complete_sessions: { type: integer, format: int64, minimum: 0, description: PC-reported count of sessions whose historical event upload has completed. }
+        pending_upload_event_count: { type: integer, format: int64, minimum: 0, description: PC-reported number of historical events still queued for upload. }
+      additionalProperties: false
     CodexDiscoverRequest:
       type: object
       additionalProperties: false
@@ -8486,6 +8786,14 @@ components:
             tool: { type: string }
             call_id: { type: string }
             output: { type: string }
+            input:
+              type: string
+              maxLength: 24576
+              description: One UTF-8-safe tool argument chunk, at most 24 KiB encoded as UTF-8. Sent with call_id, input_part and input_parts.
+            input_part: { type: integer, format: int32, minimum: 0, maximum: 4095, description: Zero-based input chunk index. }
+            input_parts: { type: integer, format: int32, minimum: 1, maximum: 4096, description: Total number of tool input chunks. }
+            output_part: { type: integer, format: int32, minimum: 0, maximum: 4095, description: Zero-based output chunk or live delta index. }
+            output_parts: { type: integer, format: int32, minimum: 1, maximum: 4096, description: Total number of output chunks for snapshots; omitted for live output deltas. }
             output_summary: { type: string }
             exit_code: { type: number }
             path_label: { type: string }
@@ -8614,6 +8922,14 @@ components:
             tool: { type: string }
             call_id: { type: string }
             output: { type: string }
+            input:
+              type: string
+              maxLength: 24576
+              description: One UTF-8-safe tool argument chunk, at most 24 KiB encoded as UTF-8. Sent with call_id, input_part and input_parts.
+            input_part: { type: integer, format: int32, minimum: 0, maximum: 4095, description: Zero-based input chunk index. }
+            input_parts: { type: integer, format: int32, minimum: 1, maximum: 4096, description: Total number of tool input chunks. }
+            output_part: { type: integer, format: int32, minimum: 0, maximum: 4095, description: Zero-based output chunk or live delta index. }
+            output_parts: { type: integer, format: int32, minimum: 1, maximum: 4096, description: Total number of output chunks for snapshots; omitted for live output deltas. }
             output_summary: { type: string }
             exit_code: { type: number }
             path_label: { type: string }
@@ -9457,6 +9773,7 @@ components:
         url: { type: string, format: uri }
         workspaces:
           type: array
+          description: Internal storage binding metadata. New Hosts have exactly one binding; clients should present its state as computer storage readiness and hide Workspace terminology.
           items: { $ref: '#/components/schemas/WorkspaceBinding' }
         resources: { $ref: '#/components/schemas/Resources' }
         expires_at: { type: [string, 'null'], format: date-time }
@@ -9786,12 +10103,6 @@ components:
           type: array
           items: { $ref: '#/components/schemas/SiteRelease' }
         next_cursor: { type: [string, 'null'], minLength: 1, description: Opaque cursor for the next page; null when exhausted. }
-      additionalProperties: false
-    CreateWorkspaceRequest:
-      type: object
-      required: [name]
-      properties:
-        name: { type: string, minLength: 1, maxLength: 120 }
       additionalProperties: false
     BindWorkspaceRequest:
       type: object
@@ -11161,13 +11472,6 @@ components:
       type: object
       properties:
         name: { type: string }
-        workspace_ids:
-          type: array
-          description: Required for API keys and Client credentials. Portal Sessions may omit it for server-side Workspace selection.
-          minItems: 1
-          maxItems: 1
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/WorkspaceId' }
       additionalProperties: false
     CreateAPIKeyRequest:
       type: object
@@ -11751,6 +12055,9 @@ components:
         output_status: { type: string, enum: [streaming, interrupted, completed], description: Status of a persisted streamed assistant message. }
         output_task_revision: { type: integer, format: int64, minimum: 0, description: Task revision that produced this streamed message. }
         output_result_event_sequence: { type: integer, format: int64, minimum: 1, description: Present only after completion and identifies the corresponding Task result event. }
+        variant_group_id: { $ref: '#/components/schemas/MessageId', description: Root user message that owns this immutable version group. }
+        variant_version: { type: integer, format: int64, minimum: 1, description: Immutable version number within the root message group. }
+        variant_action: { type: string, enum: [original, edit_resend, regenerate_text, continue_generation] }
         sources:
           type: array
           description: Confirmed task results combined into this assistant message, in display order.
@@ -11824,6 +12131,26 @@ components:
       properties:
         message: { $ref: '#/components/schemas/ConversationMessage' }
         replayed: { type: boolean, description: True when an identical message receipt was returned. }
+    CreateConversationMessageVariantRequest:
+      type: object
+      additionalProperties: false
+      required: [action, expected_version]
+      properties:
+        action: { type: string, enum: [edit_resend, regenerate_text, continue_generation] }
+        expected_version: { type: integer, format: int64, minimum: 1 }
+        content: { type: string, maxLength: 32768, description: Required for edit_resend and forbidden for the other actions. }
+    ConversationMessageVariantOperation:
+      type: object
+      required: [operation_id, variant_group_id, variant_version, action, state]
+      properties:
+        operation_id: { $ref: '#/components/schemas/OperationId' }
+        variant_group_id: { $ref: '#/components/schemas/MessageId' }
+        variant_version: { type: integer, format: int64, minimum: 2 }
+        action: { type: string, enum: [edit_resend, regenerate_text, continue_generation] }
+        state: { type: string, enum: [accepted, running, completed, failed, unknown] }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        user_message_id: { $ref: '#/components/schemas/MessageId' }
+        assistant_message_id: { $ref: '#/components/schemas/MessageId' }
     ProjectConversationAttachmentInit:
       type: object
       additionalProperties: false
@@ -12025,12 +12352,35 @@ components:
         title: { type: string }
         summary: { type: string }
         failure_reason: { type: [string, 'null'], enum: [not_dispatched, tool_failed_after_dispatch, side_effect_unknown, authorization_changed, resource_changed, null] }
-        retryable: { type: boolean, description: True only when the persisted Host evidence confirms the previous tool attempt was not dispatched. }
+        retryable: { type: boolean, description: True only when persisted Host evidence confirms the tool attempt was not dispatched and no retry attempt has been created for this step. }
         agent_id: { type: string, maxLength: 128, description: Opaque Agent session ID that actually emitted this step. }
         task_revision: { type: integer, format: int64, minimum: 0 }
         tool_name: { type: string, maxLength: 128 }
         phase: { type: string, maxLength: 64 }
         detail_state: { type: string, enum: [not_recorded, available, expired, restricted] }
+        created_at: { type: string, format: date-time }
+    TaskPlanStep:
+      type: object
+      additionalProperties: false
+      required: [id, title, description, depends_on, outputs, completion_criteria, status]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 40 }
+        title: { type: string, minLength: 1, maxLength: 160 }
+        description: { type: string, maxLength: 1024 }
+        depends_on: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 40 } }
+        outputs: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 256 } }
+        completion_criteria: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
+        status: { type: string, enum: [pending, in_progress, completed, blocked] }
+    TaskPlan:
+      type: object
+      additionalProperties: false
+      required: [task_revision, revision, goal, cost_estimate_state, steps]
+      properties:
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        revision: { type: integer, format: int64, minimum: 1 }
+        goal: { type: string, minLength: 1, maxLength: 2048 }
+        cost_estimate_state: { type: string, const: unknown, description: Cost is unknown unless an independently verified estimate is later provided. }
+        steps: { type: array, minItems: 1, maxItems: 32, items: { $ref: '#/components/schemas/TaskPlanStep' } }
         created_at: { type: string, format: date-time }
     TaskStepRetryRequest:
       type: object
@@ -12323,6 +12673,7 @@ components:
             result_message_published: { type: boolean, description: The final result is published as a conversation message with sources; use that message rather than displaying a separate Task result. }
             waiting_reason: { type: [string, 'null'], description: 'Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available.' }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
+            plan: { oneOf: [{ $ref: '#/components/schemas/TaskPlan' }, { type: 'null' }], description: Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. }
             agents: { type: array, items: { $ref: '#/components/schemas/TaskAgentExecution' } }
             batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
             artifacts: { type: array, items: { $ref: '#/components/schemas/TaskArtifact' } }

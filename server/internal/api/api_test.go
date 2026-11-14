@@ -362,12 +362,12 @@ func TestHostCreateMapsDTOAndDoesNotExposeCredentialMaterial(t *testing.T) {
 	services.hosts.item.SandboxID = "private-sandbox-id"
 	services.hosts.item.AIOKeyEnc = []byte("encrypted-aio-key")
 	router := newRouter(t, services, Options{CookieSecure: true})
-	body := `{"name":"work","workspace_ids":["w1234567"]}`
+	body := `{"name":"work"}`
 	response := requestWithHeader(router, http.MethodPost, "/api/hosts", body, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-host-create-01")
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-	if services.hosts.created.Name != "work" || len(services.hosts.created.WorkspaceIDs) != 1 || services.hosts.created.WorkspaceIDs[0] != testWorkspaceID || services.hosts.created.IdempotencyKey != "route-host-create-01" {
+	if services.hosts.created.Name != "work" || services.hosts.created.WorkspaceIDs != nil || services.hosts.created.IdempotencyKey != "route-host-create-01" {
 		t.Fatalf("create command = %#v", services.hosts.created)
 	}
 	if services.hosts.principal.Kind != identity.KindAPIKey || services.hosts.principal.UserID != testUserID {
@@ -393,6 +393,17 @@ func TestHostCreateMapsDTOAndDoesNotExposeCredentialMaterial(t *testing.T) {
 	}
 }
 
+func TestDeleteHostPassesExplicitStorageConfirmation(t *testing.T) {
+	services := newServices()
+	router := newRouter(t, services, Options{})
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	response := requestWithCookie(router, http.MethodDelete,
+		"/api/hosts/"+testHostID+"?confirm_delete_workspace=true", cookie, "https://portal.example.test")
+	if response.Code != http.StatusAccepted || services.hosts.deleted.HostID != testHostID || !services.hosts.deleted.ConfirmWorkspaceDeletion {
+		t.Fatalf("delete status/body/command = %d %s / %#v", response.Code, response.Body, services.hosts.deleted)
+	}
+}
+
 func TestHostCreateLetsPortalSessionOmitWorkspaceIDs(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
@@ -407,21 +418,23 @@ func TestHostCreateLetsPortalSessionOmitWorkspaceIDs(t *testing.T) {
 	}
 }
 
-func TestHostCreateDoesNotAllowAPIKeyToOmitWorkspaceIDs(t *testing.T) {
+func TestHostCreatePassesAPIKeyRequestWithoutClientSelectedWorkspace(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
 	response := requestWithHeader(router, http.MethodPost, "/api/hosts", `{"name":"work"}`,
 		"Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-host-create-no-auto-01")
-	assertError(t, response, http.StatusForbidden, "forbidden")
-	if services.hosts.created.IdempotencyKey != "" {
-		t.Fatalf("Host service was called for an unauthorized automatic Workspace request: %#v", services.hosts.created)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	if services.hosts.principal.Kind != identity.KindAPIKey || services.hosts.created.WorkspaceIDs != nil {
+		t.Fatalf("create principal/command = %#v / %#v", services.hosts.principal, services.hosts.created)
 	}
 }
 
 func TestHostCreateRequiresOneValidIdempotencyKey(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
-	body := `{"template_id":"std-2c4g","workspace_ids":["w1234567"]}`
+	body := `{"name":"work"}`
 	key := "Bearer " + apiKeyCredential()
 
 	assertError(t, request(router, http.MethodPost, "/api/hosts", body, key, ""), http.StatusBadRequest, "invalid_argument")
@@ -438,6 +451,10 @@ func TestHostCreateRequiresOneValidIdempotencyKey(t *testing.T) {
 	assertError(t, response, http.StatusBadRequest, "invalid_argument")
 	if services.hosts.created.IdempotencyKey != "" {
 		t.Fatal("host service was called with duplicate idempotency keys")
+	}
+	assertError(t, requestWithHeader(router, http.MethodPost, "/api/hosts", body, key, "", "Idempotency-Key", ""), http.StatusBadRequest, "invalid_argument")
+	if services.hosts.created.IdempotencyKey != "" {
+		t.Fatal("host service was called with an empty idempotency key")
 	}
 }
 
@@ -480,12 +497,13 @@ func TestBindAndUnbindHostWorkspaceRoutes(t *testing.T) {
 	services := newServices()
 	services.hosts.bindingResult = services.hosts.item.Workspaces[0]
 	services.hosts.bindingResult.State = workspace.BindingPreparing
+	services.hosts.err = domain.NewError(domain.CodeForbidden, "computer storage cannot be rebound")
 	router := newRouter(t, services, Options{})
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	bind := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/hosts/"+testHostID+"/workspace-bindings",
 		`{"workspace_id":"`+testWorkspaceID+`","expected_revision":2,"expected_binding_version":0}`, cookie,
 		"https://portal.example.test", "Idempotency-Key", "bind-workspace-01")
-	if bind.Code != http.StatusCreated || services.hosts.bindHostID != testHostID || services.hosts.bindWorkspaceID != testWorkspaceID ||
+	if bind.Code != http.StatusForbidden || services.hosts.bindHostID != testHostID || services.hosts.bindWorkspaceID != testWorkspaceID ||
 		services.hosts.bindRevision == nil || *services.hosts.bindRevision != 2 || services.hosts.bindVersion != 0 || services.hosts.idempotencyKey != "bind-workspace-01" {
 		t.Fatalf("bind status/body/call = %d %s / %#v", bind.Code, bind.Body, services.hosts)
 	}
@@ -500,7 +518,7 @@ func TestBindAndUnbindHostWorkspaceRoutes(t *testing.T) {
 	unbind := requestWithCookieBodyAndHeader(router, http.MethodDelete,
 		"/api/hosts/"+testHostID+"/workspace-bindings/"+testWorkspaceID, `{"expected_binding_version":2,"writers_stopped":true}`, cookie,
 		"https://portal.example.test", "Idempotency-Key", "unbind-workspace-01")
-	if unbind.Code != http.StatusAccepted || services.hosts.bindingResult.State != workspace.BindingUnbinding ||
+	if unbind.Code != http.StatusForbidden || services.hosts.bindingResult.State != workspace.BindingUnbinding ||
 		services.hosts.idempotencyKey != "unbind-workspace-01" || services.hosts.unbindVersion != 2 || !services.hosts.writersStopped || services.hosts.unbindCalls != 1 {
 		t.Fatalf("unbind status/body/call = %d %s / %#v", unbind.Code, unbind.Body, services.hosts)
 	}
@@ -531,7 +549,7 @@ func TestAuthRequiredAndApplicationErrorsAreSafe(t *testing.T) {
 	assertError(t, response, http.StatusUnauthorized, "unauthenticated")
 
 	services.hosts.err = &domain.Error{Code: domain.CodeQuotaExceeded, Message: "private-aio-key must not appear", Details: map[string]any{"key": "private-aio-key"}}
-	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-error-host-01")
+	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"name":"work"}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-error-host-01")
 	assertError(t, response, http.StatusConflict, "quota_exceeded")
 	if strings.Contains(response.Body.String(), "private-aio-key") || strings.Contains(response.Body.String(), "key\"") {
 		t.Fatalf("error response leaked secret details: %s", response.Body)
@@ -741,6 +759,9 @@ func TestHostValidationAndServiceErrors(t *testing.T) {
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["bad"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["w1234567","w1234567"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace":{"mode":"new"}}`},
+		{http.MethodDelete, "/api/hosts/" + testHostID, ""},
+		{http.MethodDelete, "/api/hosts/" + testHostID + "?confirm_delete_workspace=false", ""},
+		{http.MethodDelete, "/api/hosts/" + testHostID + "?confirm_delete_workspace=true&extra=1", ""},
 		{http.MethodDelete, "/api/hosts/" + testHostID + "?keepWorkspace=true", ""},
 	}
 	for _, tt := range checks {
@@ -824,31 +845,17 @@ func TestTemplateWorkspaceAndAPIKeyRoutes(t *testing.T) {
 	}
 }
 
-func TestWorkspaceCRUDUsesNewContractAndIdempotencyKey(t *testing.T) {
+func TestWorkspaceRoutesDoNotCreateIndependentResources(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 
 	response := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/workspaces", `{"name":"项目代码"}`, cookie, "https://portal.example.test", "Idempotency-Key", "workspace-create-01")
-	if response.Code != http.StatusCreated {
-		t.Fatalf("POST workspace = %d %s", response.Code, response.Body)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("POST workspace = %d %s; want route unavailable", response.Code, response.Body)
 	}
-	if services.workspaceOps.createP.Kind != identity.KindSession || services.workspaceOps.createCmd.Name != "项目代码" || services.workspaceOps.createKey != "workspace-create-01" {
-		t.Fatalf("create workspace arguments = principal:%#v command:%#v key:%q", services.workspaceOps.createP, services.workspaceOps.createCmd, services.workspaceOps.createKey)
-	}
-	var result map[string]any
-	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
-		t.Fatal(err)
-	}
-	for _, field := range []string{"id", "name", "revision", "used_bytes", "quota_bytes", "state", "created_at", "updated_at"} {
-		if _, ok := result[field]; !ok {
-			t.Fatalf("workspace response missing %q: %#v", field, result)
-		}
-	}
-	for _, obsolete := range []string{"size_mib", "attached_host_id", "last_error"} {
-		if _, ok := result[obsolete]; ok {
-			t.Fatalf("workspace response exposed obsolete field %q: %#v", obsolete, result)
-		}
+	if services.workspaceOps.createP.Kind != "" || services.workspaceOps.createCmd.Name != "" || services.workspaceOps.createKey != "" {
+		t.Fatalf("public route invoked independent Workspace creation: %#v", services.workspaceOps)
 	}
 	if response = requestWithCookie(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID, cookie, ""); response.Code != http.StatusOK || services.workspaceOps.getID != testWorkspaceID {
 		t.Fatalf("GET workspace = %d %s; getID=%q", response.Code, response.Body, services.workspaceOps.getID)
@@ -856,8 +863,8 @@ func TestWorkspaceCRUDUsesNewContractAndIdempotencyKey(t *testing.T) {
 	if response = requestWithCookie(router, http.MethodGet, "/api/workspaces/bad", cookie, ""); response.Code != http.StatusBadRequest {
 		t.Fatalf("GET invalid workspace = %d %s", response.Code, response.Body)
 	}
-	if response = requestWithCookieBody(router, http.MethodPost, "/api/workspaces", `{"name":"no key"}`, cookie, "https://portal.example.test"); response.Code != http.StatusBadRequest {
-		t.Fatalf("POST workspace without key = %d %s", response.Code, response.Body)
+	if response = requestWithCookieBody(router, http.MethodPost, "/api/workspaces", `{"name":"no key"}`, cookie, "https://portal.example.test"); response.Code != http.StatusNotFound {
+		t.Fatalf("POST workspace without key = %d %s; want route unavailable", response.Code, response.Body)
 	}
 }
 
@@ -1154,7 +1161,7 @@ func TestHostOperationsAndMissingDependencyResponses(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/hosts", "", http.StatusOK},
 		{http.MethodGet, "/api/hosts/" + testHostID, "", http.StatusOK},
-		{http.MethodDelete, "/api/hosts/" + testHostID, "", http.StatusAccepted},
+		{http.MethodDelete, "/api/hosts/" + testHostID + "?confirm_delete_workspace=true", "", http.StatusAccepted},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/release", "", http.StatusAccepted},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/restore", "", http.StatusAccepted},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/renew", "", http.StatusOK},
@@ -1199,14 +1206,14 @@ func TestReleaseHostPassesOptionalProcessTerminationConfirmation(t *testing.T) {
 func TestInvalidRequestsAndOriginAreRejected(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{APIMaxBodyBytes: 80})
-	response := requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"Bad","workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-invalid-host-02")
+	response := requestWithHeader(router, http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-invalid-host-02")
 	assertError(t, response, http.StatusBadRequest, "invalid_argument")
 	largeBody := `{"template_id":"std-2c4g","pad":"` + strings.Repeat("x", 100) + `"}`
 	response = requestWithHeader(router, http.MethodPost, "/api/hosts", largeBody, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-invalid-host-03")
 	assertError(t, response, http.StatusRequestEntityTooLarge, "request_too_large")
 	response = request(router, http.MethodGet, "/api/hosts/bad", "", "Bearer "+apiKeyCredential(), "")
 	assertError(t, response, http.StatusBadRequest, "invalid_argument")
-	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "https://evil.example", "Idempotency-Key", "route-invalid-host-04")
+	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"name":"work"}`, "Bearer "+apiKeyCredential(), "https://evil.example", "Idempotency-Key", "route-invalid-host-04")
 	assertError(t, response, http.StatusForbidden, "forbidden")
 }
 
@@ -1375,7 +1382,6 @@ func TestMissingOptionalPortsReturnSanitizedUnavailable(t *testing.T) {
 	for _, route := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/templates", ""},
 		{http.MethodGet, "/api/workspaces", ""},
-		{http.MethodPost, "/api/workspaces", `{"name":"new"}`},
 		{http.MethodGet, "/api/workspaces/" + testWorkspaceID, ""},
 		{http.MethodDelete, "/api/workspaces/" + testWorkspaceID, ""},
 		{http.MethodGet, "/api/admin/users", ""},
@@ -1500,15 +1506,14 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	for _, route := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/hosts", ""},
-		{http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567"]}`},
-		{http.MethodDelete, "/api/hosts/" + testHostID, ""},
+		{http.MethodPost, "/api/hosts", `{"name":"work"}`},
+		{http.MethodDelete, "/api/hosts/" + testHostID + "?confirm_delete_workspace=true", ""},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/renew", ""},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/enter", ""},
 		{http.MethodGet, "/api/templates", ""},
 		{http.MethodGet, "/api/workspaces", ""},
 		{http.MethodGet, "/api/workspaces/" + testWorkspaceID, ""},
 		{http.MethodDelete, "/api/workspaces/" + testWorkspaceID, ""},
-		{http.MethodPost, "/api/workspaces", `{"name":"workspace"}`},
 		{http.MethodGet, "/api/admin/hosts", ""},
 		{http.MethodGet, "/api/admin/users", ""},
 		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"expected_status":"approved","status":"disabled"}`},
@@ -1518,8 +1523,6 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 		var response *httptest.ResponseRecorder
 		if route.method == http.MethodGet {
 			response = requestWithCookie(router, route.method, route.path, cookie, "")
-		} else if route.path == "/api/workspaces" {
-			response = requestWithCookieBodyAndHeader(router, route.method, route.path, route.body, cookie, "https://portal.example.test", "Idempotency-Key", "workspace-create-error")
 		} else if route.path == "/api/hosts" && route.method == http.MethodPost {
 			response = requestWithCookieBodyAndHeader(router, route.method, route.path, route.body, cookie, "https://portal.example.test", "Idempotency-Key", "host-create-error")
 		} else {
@@ -1923,7 +1926,6 @@ func TestClientCredentialRouteFence(t *testing.T) {
 		{http.MethodGet, "/api/admin/users", ""},
 		{http.MethodGet, "/api/apikeys", ""},
 		{http.MethodGet, "/api/device/workspaces", ""},
-		{http.MethodPost, "/api/workspaces", `{}`},
 		{http.MethodDelete, "/api/workspaces/" + testWorkspaceID + "/sync-devices/d1234567", ""},
 		{http.MethodGet, "/api/workspaces/" + testWorkspaceID + "/sync-devices", ""},
 		{http.MethodDelete, "/api/hosts/" + testHostID, ""},

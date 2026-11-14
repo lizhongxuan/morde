@@ -1,11 +1,11 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, Tray, WebContentsView, type Session, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, Tray, WebContentsView, type MessageBoxOptions, type Session, type WebContents } from "electron";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import { access, lstat, realpath } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type ProjectSyncFolder, type WebSession } from "./morde-core";
-import { checkedDirectory, MordeSync, pathsOverlap, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
+import { checkedDirectory, MordeSync, pathsOverlap, SyncRunError, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
 
@@ -15,6 +15,7 @@ mkdirSync(userData, { recursive: true, mode: 0o700 });
 app.setPath("userData", userData);
 const zh = (app.getLocale() || "").toLowerCase().startsWith("zh");
 let mainWindow: BrowserWindow | null = null;
+let codexWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let credentials: Credentials | null = null;
 let lastOrigin: string | null = null;
@@ -137,7 +138,7 @@ const codex = new MordeCodexRuntime(api, {
     if (!activeProfile) throw new Error("Codex profile is unavailable");
     const raw = readOptionalBuffer(profileFile("codex"));
     if (raw === null) return null;
-    if (raw.byteLength > 10 * 1024 * 1024 || !safeStorageReady()) throw new Error("Codex encrypted profile is unavailable");
+    if (raw.byteLength > 64 * 1024 * 1024 || !safeStorageReady()) throw new Error("Codex encrypted profile is unavailable");
     return JSON.parse(safeStorage.decryptString(raw)) as unknown;
   },
   save: (value: CodexPersistentState) => {
@@ -501,7 +502,7 @@ function sendSyncState(state: string, progress?: unknown, message?: string): voi
   };
   mainWindow?.webContents.send("morde:sync-state", payload);
   const auth = credentials;
-  if (auth && webView && isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)) {
+  if (auth && webView && isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin)) {
     const portalCheckpoint = checkpoint?.mode === "project_upload" ? checkpoint : null;
     const recovery = syncRecoveryView();
     webView.webContents.send("morde:portal-sync-state", {
@@ -538,6 +539,10 @@ function publicSyncConflicts(value: unknown): { path: string; reason?: string }[
 
 function syncRecoveryView(): { state: "pending" | "unknown" | "failed"; workspaceId?: string; mode?: SyncCheckpoint["mode"]; message?: string } | null {
   if (syncRecoveryWarning) return syncRecoveryWarning;
+  if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.syncOutcome) {
+    return { state: syncCheckpoint.syncOutcome, workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode,
+      ...(syncCheckpoint.syncMessage ? { message: syncCheckpoint.syncMessage } : {}) };
+  }
   if (syncCheckpoint) {
     if (sync.snapshot() === "shutdown_unknown" || childMayStillRun(syncCheckpoint)) {
       return { state: "unknown", workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, message: "上次同步的停止状态未确认；检查点仍保留。" };
@@ -546,6 +551,25 @@ function syncRecoveryView(): { state: "pending" | "unknown" | "failed"; workspac
   }
   if (profileError) return { state: "unknown", message: "本机同步状态无法读取；本机同步已暂停。" };
   return null;
+}
+
+function markProjectUploadRecovery(outcome: "failed" | "unknown", message: string): void {
+  const checkpoint = syncCheckpoint?.mode === "project_upload" ? syncCheckpoint : null;
+  let state = outcome;
+  let safeMessage = safePortalProjectMessage(message).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 512);
+  if (checkpoint) {
+    checkpoint.syncOutcome = state;
+    checkpoint.syncMessage = safeMessage;
+    try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(checkpoint)); }
+    catch {
+      state = "unknown";
+      safeMessage = "同步结果或本机恢复点状态未知；恢复点已保留。";
+      checkpoint.syncOutcome = state;
+      checkpoint.syncMessage = safeMessage;
+    }
+  }
+  syncRecoveryWarning = { state, ...(checkpoint ? { workspaceId: checkpoint.workspaceId, mode: "project_upload" } : {}), message: safeMessage };
+  notifyState();
 }
 
 function publicPortalProjectState(): unknown {
@@ -570,6 +594,7 @@ function publicPortalProjectState(): unknown {
       ...(projectUploadCheckpoint.sessionId ? { sessionId: projectUploadCheckpoint.sessionId } : {}),
       ...(projectUploadCheckpoint.sessionState ? { sessionState: projectUploadCheckpoint.sessionState } : {}),
       ...(projectUploadCheckpoint.hostApplicationStatus ? { hostApplicationStatus: projectUploadCheckpoint.hostApplicationStatus } : {}),
+      ...(!projectUploadCheckpoint.sourceBindingID ? { legacyRecovery: true } : {}),
     } : null,
     syncRecovery: projectRecovery,
   };
@@ -882,6 +907,8 @@ function loadProfile(auth: Credentials): void {
       if (!saved || saved.serviceInstanceID !== auth.serviceInstanceID || saved.installationId !== auth.installationId || !/^w[a-z0-9]{7}$/.test(saved.workspaceId) || typeof saved.directory !== "string" || typeof saved.dev !== "string" || typeof saved.ino !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(saved.idempotencyKey) || !["upload", "download", "bidirectional", "live_sync", "handoff_checkpoint", "project_upload"].includes(saved.mode) || (saved.sessionId && !/^p[a-z0-9]{7}$/.test(saved.sessionId)) || (saved.childPid !== undefined && (!Number.isSafeInteger(saved.childPid) || saved.childPid <= 0)) || (saved.handoffTarget !== undefined && (saved.mode !== "handoff_checkpoint" || !["desktop", "cloud_workspace"].includes(saved.handoffTarget))) ||
         (saved.sessionState !== undefined && (saved.mode !== "project_upload" || !["running", "completed", "conflict", "cancelled", "failed", "expired"].includes(saved.sessionState))) ||
         (saved.hostApplicationStatus !== undefined && (saved.mode !== "project_upload" || !["pending_apply", "applied", "conflict", "unknown"].includes(saved.hostApplicationStatus))) ||
+        (saved.syncOutcome !== undefined && (saved.mode !== "project_upload" || !["failed", "unknown"].includes(saved.syncOutcome))) ||
+        (saved.syncMessage !== undefined && (saved.mode !== "project_upload" || typeof saved.syncMessage !== "string" || saved.syncMessage.length > 512 || /[\u0000-\u001f\u007f]/.test(saved.syncMessage))) ||
         (saved.mode === "project_upload" && saved.sessionState === "completed" && !saved.sessionId) ||
         (saved.mode === "project_upload" && (typeof saved.projectSelectionID !== "string" || !/^[0-9a-f-]{36}$/i.test(saved.projectSelectionID) ||
           (saved.sourceBindingID !== undefined && (typeof saved.sourceBindingID !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(saved.sourceBindingID))) ||
@@ -1435,6 +1462,7 @@ function publicState(): unknown {
       ...(syncCheckpoint.mode === "project_upload" && syncCheckpoint.sessionId ? { sessionId: syncCheckpoint.sessionId } : {}),
       ...(syncCheckpoint.mode === "project_upload" && syncCheckpoint.sessionState ? { sessionState: syncCheckpoint.sessionState } : {}),
       ...(syncCheckpoint.mode === "project_upload" && syncCheckpoint.hostApplicationStatus ? { hostApplicationStatus: syncCheckpoint.hostApplicationStatus } : {}),
+      ...(syncCheckpoint.mode === "project_upload" && !syncCheckpoint.sourceBindingID ? { legacyRecovery: true } : {}),
       ...(syncCheckpoint.handoffTarget ? { handoffTarget: syncCheckpoint.handoffTarget } : {}) } : null,
     syncRecovery: credentials ? syncRecoveryView() : null,
     liveSyncCapability: credentials ? liveSyncCapability : "disabled",
@@ -1455,9 +1483,14 @@ function publicState(): unknown {
 function notifyState(): void {
   const state = publicState();
   mainWindow?.webContents.send("morde:state", state);
+  if (codexWindow && !codexWindow.isDestroyed()) {
+    codexWindow.webContents.send("morde:codex-state", { authenticated: Boolean(credentials), codex: credentials ? codex.publicState() : null });
+  }
   const auth = credentials;
   if (auth && webView && isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)) {
-    webView.webContents.send("morde:portal-state", publicPortalProjectState());
+    const route = sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname;
+    if (isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin)) webView.webContents.send("morde:portal-state", publicPortalProjectState());
+    if (route === "/codex") webView.webContents.send("morde:codex-state", { authenticated: true, codex: codex.publicState() });
   }
 }
 function clearTimer(timer: NodeJS.Timeout | null): null { if (timer) clearTimeout(timer); return null; }
@@ -1473,12 +1506,12 @@ async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown
   if (credentials !== auth || activeProfile !== profileID(auth)) throw new Error("Authorization changed while checking the cloud computer");
   if (!meValue || typeof meValue.id !== "string" || hostValue?.id !== hostID || hostValue.owner_id !== meValue.id ||
     !["running", "stopped"].includes(String(hostValue.state)) || !Array.isArray(workspaces) || workspaces.length !== 1) {
-    throw new Error("请选择自己拥有且已绑定工作区的云端电脑");
+    throw new Error("请选择自己拥有且文件目录已就绪的云端电脑");
   }
   const binding = workspaces[0] as Record<string, unknown> | null;
   const workspace = binding?.workspace as Record<string, unknown> | null;
   if (!binding || binding.state !== "active" || !workspace || workspace.id !== workspaceID || workspace.state !== "ready") {
-    throw new Error("云端电脑的工作区未就绪或与所选目标不匹配");
+    throw new Error("云端电脑的文件目录未就绪或与所选目标不匹配");
   }
   return { host: hostValue, workspaceBinding: binding };
 }
@@ -1511,7 +1544,7 @@ async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
       hostState: host.state as "running" | "stopped",
       workspaceId: workspace.id, workspaceName: typeof workspace.name === "string" && workspace.name ? workspace.name : workspace.id,
       folders: projectFolders,
-      ...(rootFolder ? { blockedMessage: "此云端工作区仍登记为整个工作区根目录，不能同时登记项目目录。" } : {}),
+      ...(rootFolder ? { blockedMessage: "此电脑仍有旧版整目录同步，不能同时启用项目同步。" } : {}),
     });
   }
   return targets;
@@ -1529,9 +1562,9 @@ async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: un
   const portalSession = await api.webSession();
   const folders = await api.hostProjectFolders(hostID, portalSession);
   if (folders.some((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked")) {
-    throw new Error("此云端工作区仍使用整个工作区根目录同步，暂不能登记独立项目目录");
+    throw new Error("此电脑仍有旧版整目录同步，暂不能启用项目同步");
   }
-  if (workspaceSyncProfile?.bindings[workspaceID]?.enabled) throw new Error("先暂停此工作区已有的固定同步绑定");
+  if (workspaceSyncProfile?.bindings[workspaceID]?.enabled) throw new Error("先暂停此电脑原有的固定目录同步");
   if (directorySelectionInProgress) throw new Error("另一项本机目录选择正在进行");
   projectDirectorySelectionInProgress = true;
   try {
@@ -1565,7 +1598,7 @@ async function ensureProjectFolder(auth: Credentials, mapping: ProjectMapping, p
   const session = await api.webSession();
   const folders = await api.hostProjectFolders(mapping.hostId, session);
   if (folders.some((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked")) {
-    throw new Error("目标工作区仍登记为整体同步目录；项目目录同步已停止");
+    throw new Error("目标电脑仍登记为旧版整目录同步；项目同步已停止");
   }
   let folder: ProjectSyncFolder | undefined;
   if (mapping.folderId) {
@@ -1694,6 +1727,13 @@ async function uploadProject(selectionIDInput: unknown, projectNameInput: unknow
   if (projectUploadInProgress) throw new Error("A project upload is already being prepared or transferred");
   projectUploadInProgress = true;
   try { return await performProjectUpload(selectionIDInput, projectNameInput); }
+  catch (error) {
+    if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.projectSelectionID === selectionIDInput &&
+      syncCheckpoint.projectName === projectNameInput && !syncCheckpoint.syncOutcome && syncRecoveryWarning?.mode !== "project_upload") {
+      markProjectUploadRecovery("failed", error instanceof Error ? error.message : "Project upload failed");
+    }
+    throw error;
+  }
   finally { projectUploadInProgress = false; }
 }
 
@@ -1747,7 +1787,7 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
   if (mapping.folderId && mapping.projectName !== projectName) throw new Error("项目名已绑定到云端目录；如需更名，请重新选择文件夹并创建新项目目录");
   if (sync.snapshot() !== "idle" || childMayStillRun(syncCheckpoint)) throw new Error("先停止并核对已有的同步操作");
   if (syncCheckpoint?.mode === "project_upload" && !syncCheckpoint.sourceBindingID) {
-    throw new Error("旧版项目同步恢复点没有来源身份；恢复点已保留，请先处理后再选择项目目录");
+    throw new Error("旧版项目上传恢复点缺少服务端来源身份；恢复点已保留，不能自动续传");
   }
   if (syncCheckpoint && (syncCheckpoint.mode !== "project_upload" || syncCheckpoint.projectSelectionID !== selectionID ||
     syncCheckpoint.hostId !== mapping.hostId || syncCheckpoint.folderId !== mapping.folderId || syncCheckpoint.projectName !== projectName ||
@@ -1803,19 +1843,35 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
     syncRecoveryWarning = null;
   }
   let result: unknown;
+  if (syncCheckpoint?.mode === "project_upload" && (syncCheckpoint.syncOutcome || syncCheckpoint.syncMessage)) {
+    delete syncCheckpoint.syncOutcome;
+    delete syncCheckpoint.syncMessage;
+    try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(syncCheckpoint)); }
+    catch {
+      markProjectUploadRecovery("unknown", "无法更新本机恢复点；同步未启动。恢复点已保留。");
+      throw new Error("Could not update the project upload recovery point; upload was not started");
+    }
+  }
+  syncRecoveryWarning = null;
   try {
     result = await sync.run(auth, projectAsMapping(currentMapping), "project_upload", [], syncCheckpoint,
       () => credentials === auth && !logoutInProgress,
       () => confirmProjectMapping(currentMapping));
+  } catch (error) {
+    const failureState = error instanceof SyncRunError ? error.outcome : "failed";
+    markProjectUploadRecovery(failureState, error instanceof Error ? error.message : "Project upload failed");
+    throw error;
   } finally { if (sync.snapshot() === "idle" && !childMayStillRun(syncCheckpoint)) clearConfirmedChild(); }
   const outcome = result && typeof result === "object" ? result as { session?: { id?: unknown; workspace_id?: unknown; folder_id?: unknown; state?: unknown }; conflicts?: unknown } : null;
   const session = outcome?.session;
   const conflicts = publicSyncConflicts(outcome?.conflicts);
   if (!session || typeof session.id !== "string" || !/^p[a-z0-9]{7}$/.test(session.id) || session.workspace_id !== currentMapping.workspaceId ||
     session.folder_id !== folder.folderID || !["running", "completed", "conflict", "cancelled", "failed", "expired"].includes(String(session.state)) || conflicts === null) {
+    markProjectUploadRecovery("unknown", "上传结果无法核实；本机恢复点已保留。");
     throw new Error("Project upload result is unknown; the recovery point was retained");
   }
   if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.sessionId && syncCheckpoint.sessionId !== session.id) {
+    markProjectUploadRecovery("unknown", "上传返回的 session 与本机恢复点不一致；恢复点已保留。");
     throw new Error("Project upload returned a different session than its recovery point; the recovery point was retained");
   }
   if (session.state === "completed" && conflicts.length === 0) {
@@ -1934,12 +1990,20 @@ function sameOriginURL(value: string, origin: string): URL | null {
   try { const url = new URL(value); return url.origin === origin && !url.username && !url.password ? url : null; } catch { return null; }
 }
 
+function isTrustedProjectSyncPage(value: string, origin: string): boolean {
+  const url = sameOriginURL(value, origin);
+  return Boolean(url && url.pathname === "/hosts" && !url.hash && url.searchParams.getAll("sync").length === 1 &&
+    url.searchParams.get("sync") === "1" && [...url.searchParams.keys()].every((key) => key === "sync" || key === "host") &&
+    url.searchParams.getAll("host").length <= 1 && (!url.searchParams.has("host") || /^h[a-z0-9]{7}$/.test(url.searchParams.get("host") ?? "")));
+}
+
 function isTrustedPortalBridgePage(value: string, origin: string): boolean {
   const url = sameOriginURL(value, origin);
-  if (!url || !["/hosts", "/workspaces"].includes(url.pathname)) return false;
+  if (!url || !["/hosts", "/local-projects", "/codex"].includes(url.pathname)) return false;
   if (url.pathname === "/hosts") {
-    return !url.search && (!url.hash || /^#host-h[a-z0-9]{7}$/.test(url.hash));
+    return !url.search ? (!url.hash || /^#host-h[a-z0-9]{7}$/.test(url.hash)) : isTrustedProjectSyncPage(value, origin);
   }
+  if (url.pathname === "/codex") return !url.search && !url.hash;
   return !url.hash && [...url.searchParams.keys()].every((key) => key === "host") && url.searchParams.getAll("host").length <= 1 &&
     (!url.searchParams.has("host") || /^h[a-z0-9]{7}$/.test(url.searchParams.get("host") ?? ""));
 }
@@ -1951,7 +2015,7 @@ function isTrustedHostWorkbenchPage(value: string, origin: string): boolean {
     (!url.searchParams.has("tab") || url.searchParams.get("tab") === "workspace");
 }
 
-function preloadArguments(mode: "portal" | "host-workbench", inherited?: string[]): string[] {
+function preloadArguments(mode: "portal" | "host-workbench" | "codex", inherited?: string[]): string[] {
   return [...(inherited ?? []).filter((argument) => !argument.startsWith("--morde-preload-mode=")), `--morde-preload-mode=${mode}`];
 }
 
@@ -2257,7 +2321,7 @@ function openAssistant(initial?: WebSession): Promise<void> {
 }
 
 async function login(origin: unknown, name: unknown, password: unknown): Promise<unknown> {
-  if (preservedOperationInProgress || workspaceSyncOperationInProgress || workspaceNode.mayOwnWorkspace() || activeLiveSync()) throw new Error("Stop local Workspace operations before changing accounts");
+  if (preservedOperationInProgress || workspaceSyncOperationInProgress || projectUploadInProgress || workspaceNode.mayOwnWorkspace() || activeLiveSync()) throw new Error("Stop local Workspace operations before changing accounts");
   if (credentials) throw new Error("Sign out before changing accounts");
   if (sync.snapshot() !== "idle" || childMayStillRun(syncCheckpoint)) throw new Error("Finish the previous Workspace sync before changing accounts");
   if (!safeStorageReady()) throw new Error("Secure operating system storage is unavailable");
@@ -2450,10 +2514,24 @@ function handler<T extends unknown[]>(channel: string, fn: (...args: T) => Promi
   });
 }
 
-function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown, workspacesOnly = false): void {
+function codexBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown): void {
   ipcMain.handle(channel, async (event, ...args: unknown[]) => {
     const auth = credentials;
-    if (!auth || !trustedPortalBridgeEvent(event, auth) || workspacesOnly && sameOriginURL(event.sender.getURL(), auth.origin)?.pathname !== "/workspaces") throw new Error("Invalid Portal window or route");
+    const localWindow = Boolean(codexWindow && !codexWindow.isDestroyed() && event.sender === codexWindow.webContents && event.senderFrame === event.sender.mainFrame);
+    const portalPage = Boolean(auth && trustedPortalBridgeEvent(event, auth) && sameOriginURL(event.sender.getURL(), auth.origin)?.pathname === "/codex");
+    if (!localWindow && !portalPage) {
+      throw new Error("Invalid Codex settings window");
+    }
+    if (!credentials || logoutInProgress) throw new Error("请先登录 Morde，并保持此电脑授权有效");
+    if (credentialExpired(credentials.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
+    try { return await fn(...args); } catch (error) { return sendError(error); }
+  });
+}
+
+function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown, localProjectsOnly = false): void {
+  ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+    const auth = credentials;
+    if (!auth || !trustedPortalBridgeEvent(event, auth) || localProjectsOnly && !isTrustedProjectSyncPage(event.sender.getURL(), auth.origin)) throw new Error("Invalid Portal window or route");
     if (logoutInProgress) throw new Error("Sign-out is in progress");
     if (credentialExpired(auth.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
     try { return await fn(...args); } catch (error) { return sendError(error); }
@@ -2471,13 +2549,15 @@ function register(): void {
   });
   handler("morde:state", () => publicState());
   handler("morde:open-assistant", async () => { await openAssistant(); return { opened: true }; });
-  handler("morde:codex-add-profile", async () => {
+  codexBridgeHandler("morde:codex-state", () => ({ authenticated: Boolean(credentials), codex: credentials ? codex.publicState() : null }));
+  codexBridgeHandler("morde:codex-add-profile", async () => {
     if (!credentials || !safeStorageReady()) throw new Error("Codex 需要有效的 Morde Client 授权和系统安全存储");
-    const homeChoice = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory"] });
+    const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const homeChoice = await (parent ? dialog.showOpenDialog(parent, { properties: ["openDirectory"] }) : dialog.showOpenDialog({ properties: ["openDirectory"] }));
     if (homeChoice.canceled || !homeChoice.filePaths[0]) return codex.publicState();
     const homeDirectory = await realpath(homeChoice.filePaths[0]);
     if (!(await lstat(homeDirectory)).isDirectory()) throw new Error("所选 CODEX_HOME 必须是目录");
-    const executableChoice = await dialog.showOpenDialog(mainWindow!, { properties: ["openFile"] });
+    const executableChoice = await (parent ? dialog.showOpenDialog(parent, { properties: ["openFile"] }) : dialog.showOpenDialog({ properties: ["openFile"] }));
     if (executableChoice.canceled || !executableChoice.filePaths[0]) return codex.publicState();
     const executable = await realpath(executableChoice.filePaths[0]);
     if (!(await lstat(executable)).isFile()) throw new Error("所选 Codex 命令必须是文件");
@@ -2486,29 +2566,57 @@ function register(): void {
     notifyState();
     return codex.publicState();
   });
-  handler("morde:codex-select-profile", (profileKey: unknown) => {
+  codexBridgeHandler("morde:codex-select-profile", (profileKey: unknown) => {
     if (typeof profileKey !== "string") throw new Error("Invalid Codex profile");
     codex.selectProfile(profileKey);
     notifyState();
     return codex.publicState();
   });
-  handler("morde:codex-list-threads", (cursor: unknown) => {
-    if (!(cursor === null || cursor === undefined || typeof cursor === "string" && cursor.length <= 4096)) throw new Error("Invalid Codex thread cursor");
+  codexBridgeHandler("morde:codex-authorize-profile", async (profileKey: unknown, scopes: unknown) => {
+    if (typeof profileKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(profileKey) || !Array.isArray(scopes) || !scopes.every((scope) => typeof scope === "string")) {
+      throw new Error("Invalid Codex connection authorization");
+    }
+    const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const updating = codex.publicState().profiles.some((profile) => profile.profileKey === profileKey && profile.connectionAuthorized);
+    const action = updating ? "更新授权并重新同步" : "授权并同步全部会话";
+    const options: MessageBoxOptions = { type: "warning", buttons: ["取消", action], defaultId: 0, cancelId: 0,
+      message: updating ? "更新此 Codex 配置的 Morde 连接权限？" : "连接此 Codex 配置并同步全部会话？",
+      detail: "Morde 将把此配置可读取的历史、运行事件、推理摘要和工具输入/输出同步到当前 Morde 账号；你可选择是否允许从 iOS 向原会话发送消息。普通与归档会话都会纳入。" };
+    const answer = await (parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options));
+    if (answer.response !== 1) return { cancelled: true };
+    await codex.authorizeProfile(profileKey, scopes);
+    notifyState();
+    return codex.publicState();
+  });
+  codexBridgeHandler("morde:codex-revoke-profile", async (profileKey: unknown) => {
+    if (typeof profileKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(profileKey)) throw new Error("Invalid Codex profile");
+    const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const options: MessageBoxOptions = { type: "warning", buttons: ["取消", "撤销此配置"], defaultId: 0, cancelId: 0,
+      message: "撤销这个 Codex 配置的 Morde 连接？",
+      detail: "将停止自动发现并撤销此配置下全部会话的 Morde 读取和发送权限。已同步的云端历史保留；尚未确认上传的本机事件会保留并暂停上传。" };
+    const answer = await (parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options));
+    if (answer.response !== 1) return { cancelled: true };
+    await codex.revokeProfile(profileKey);
+    notifyState();
+    return codex.publicState();
+  });
+  codexBridgeHandler("morde:codex-list-threads", (cursor: unknown) => {
+    if (!(cursor === null || cursor === undefined || typeof cursor === "string" && cursor.length <= 8192)) throw new Error("Invalid Codex thread cursor");
     return codex.listThreads(cursor == null ? null : cursor);
   });
-  handler("morde:codex-authorize-thread", async (threadID: unknown, scopes: unknown) => {
+  codexBridgeHandler("morde:codex-authorize-thread", async (threadID: unknown, scopes: unknown) => {
     if (typeof threadID !== "string") throw new Error("Invalid Codex thread");
     const result = await codex.authorize(threadID, scopes);
     notifyState();
     return result;
   });
-  handler("morde:codex-update-scopes", async (sessionID: unknown, scopes: unknown) => {
+  codexBridgeHandler("morde:codex-update-scopes", async (sessionID: unknown, scopes: unknown) => {
     if (typeof sessionID !== "string") throw new Error("Invalid Morde Codex session");
     await codex.updateScopes(sessionID, scopes);
     notifyState();
     return codex.publicState();
   });
-  handler("morde:codex-revoke", async (sessionID: unknown) => {
+  codexBridgeHandler("morde:codex-revoke", async (sessionID: unknown) => {
     if (typeof sessionID !== "string") throw new Error("Invalid Morde Codex session");
     await codex.revoke(sessionID);
     notifyState();
@@ -2548,10 +2656,10 @@ function register(): void {
   handler("morde:project-upload-targets", listProjectUploadTargets);
   handler("morde:project-select-directory", selectProjectDirectory);
   handler("morde:project-upload", uploadProject);
-  portalBridgeHandler("morde:portal-state", () => publicPortalProjectState());
-  portalBridgeHandler("morde:portal-project-upload-targets", listProjectUploadTargets);
-  portalBridgeHandler("morde:portal-project-select-directory", selectProjectDirectory);
-  portalBridgeHandler("morde:portal-project-upload", uploadProject);
+  portalBridgeHandler("morde:portal-state", () => publicPortalProjectState(), true);
+  portalBridgeHandler("morde:portal-project-upload-targets", listProjectUploadTargets, true);
+  portalBridgeHandler("morde:portal-project-select-directory", selectProjectDirectory, true);
+  portalBridgeHandler("morde:portal-project-upload", uploadProject, true);
   portalBridgeHandler("morde:portal-legacy-state", () => ({
     mappings: mappings.map((mapping) => ({ ...publicMapping(mapping),
       syncEnabled: Boolean(workspaceSyncProfile?.bindings[mapping.workspaceId]?.enabled),
@@ -2757,7 +2865,7 @@ function register(): void {
       detail: handoff ? "继续前请确认 AI、IDE、终端和其他写入者均已停止，且关联的实时同步已暂停。" : "继续可能按原方向传输文件；请先核对同步范围。" });
     if (answer.response !== 1) return { cancelled: true };
     if (!auth || credentials !== auth || !webView || !isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)
-      || sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname !== "/workspaces" || syncCheckpoint !== checkpoint) throw new Error("账号、页面或同步恢复点已变化");
+    || !isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin) || syncCheckpoint !== checkpoint) throw new Error("账号、页面或同步恢复点已变化");
     return runWorkspaceSync(id, checkpoint.mode, checkpoint.scope, handoff, checkpoint.handoffTarget ?? "cloud_workspace");
   }, true);
   const stopSync = async () => {
@@ -2782,13 +2890,13 @@ function register(): void {
       throw new Error("当前没有可停止的项目同步");
     }
     return stopSync();
-  });
-  const discardSync = () => {
+  }, true);
+  const discardSyncCheckpoint = (allowVerifiedLegacyProject: boolean) => {
     if (preservedOperationInProgress) throw new Error("Finish the local safety-copy operation before changing the recovery point");
     if (profileError) throw new Error(profileError);
     if (sync.snapshot() === "running") throw new Error("Stop sync before discarding its recovery point");
     if (childMayStillRun(syncCheckpoint)) throw new Error("A prior sync process may still hold this folder");
-    if (syncCheckpoint?.mode === "project_upload" && syncCheckpoint.sessionState === "completed" && syncCheckpoint.hostApplicationStatus !== "applied") {
+    if (!allowVerifiedLegacyProject && syncCheckpoint?.mode === "project_upload" && syncCheckpoint.sessionState === "completed" && syncCheckpoint.hostApplicationStatus !== "applied") {
       throw new Error("目标电脑的本次应用回执尚未确认；项目上传恢复点必须保留");
     }
     if (!sync.discardCheckpoint(syncCheckpoint)) throw new Error("A prior sync process may still hold this folder");
@@ -2809,22 +2917,162 @@ function register(): void {
     notifyState();
     return publicState();
   };
+  const discardSync = () => discardSyncCheckpoint(false);
   handler("morde:sync-discard", discardSync);
   portalBridgeHandler("morde:portal-legacy-stop", async (workspaceID) => {
     const id = checkedId("workspace", workspaceID);
     if (!syncCheckpoint || syncCheckpoint.mode === "project_upload" || syncCheckpoint.workspaceId !== id) throw new Error("当前没有可停止的旧版同步");
     return stopSync();
   }, true);
+  const discardLegacyProjectRecovery = async (workspaceID: string) => {
+    const auth = credentials;
+    const checkpoint = syncCheckpoint;
+    if (!auth || !auth.syncCredential || credentialExpired(auth.syncExpiresAt) || !checkpoint || checkpoint.mode !== "project_upload" ||
+      checkpoint.sourceBindingID || checkpoint.workspaceId !== workspaceID || !checkpoint.folderId ||
+      !checkpoint.hostId || !checkpoint.projectName || !checkpoint.projectSelectionID ||
+      !/^[A-Za-z0-9._~-]{1,128}$/.test(checkpoint.idempotencyKey)) {
+      throw new Error("旧版项目恢复点缺少可核对的本机身份；恢复点已保留");
+    }
+    if (profileError) throw new Error(profileError);
+    if (sync.snapshot() !== "idle" || projectUploadInProgress || childMayStillRun(checkpoint)) {
+      throw new Error("先停止并核对本机项目上传进程；恢复点已保留");
+    }
+    let sessionID = checkpoint.sessionId ?? "";
+    if (sessionID && !/^p[a-z0-9]{7}$/.test(sessionID)) throw new Error("旧版项目恢复点的 session 身份无效；恢复点已保留");
+    const mapping = projectMappings.find((item) => item.selectionID === checkpoint.projectSelectionID && item.hostId === checkpoint.hostId &&
+      item.workspaceId === checkpoint.workspaceId && (!item.folderId || item.folderId === checkpoint.folderId));
+    if (!mapping) throw new Error("本机项目映射与恢复点不匹配；恢复点已保留");
+    const projectName = normalizedProjectName(checkpoint.projectName);
+    await confirmProjectMapping(mapping);
+    await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
+    const webSession = await api.webSession();
+    const registeredFolders = await api.hostProjectFolders(mapping.hostId, webSession);
+    const folder = registeredFolders.find((item) => item.folderID === checkpoint.folderId && item.workspaceID === mapping.workspaceId &&
+      item.folderKind === "project" && item.projectName === projectName && item.relativePath === `project/${projectName}` && item.state !== "revoked");
+    if (!folder) throw new Error("云端电脑上的项目目录已变化或不可用；恢复点已保留");
+
+    const sessionURL = () => `${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/${sessionID}`;
+    const validateSession = (value: Record<string, unknown>): Record<string, unknown> => {
+      const recoveredID = typeof value.id === "string" ? value.id : "";
+      if (!/^p[a-z0-9]{7}$/.test(recoveredID) || (sessionID !== "" && recoveredID !== sessionID) ||
+        value.workspace_id !== workspaceID || value.folder_id !== folder.folderID ||
+        value.direction !== "upload" || value.policy !== "compare_merge" ||
+        !["planned", "transferring", "verifying", "applying", "completed", "conflict", "cancelled", "failed", "expired"].includes(String(value.state))) {
+        throw new Error("云端项目 session 与本机恢复点不匹配；恢复点已保留");
+      }
+      sessionID = recoveredID;
+      return value;
+    };
+    const parseSessionResponse = async (response: Response): Promise<Record<string, unknown>> => {
+      const value: unknown = await response.json().catch(() => null);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("云端项目 session 响应无效；恢复点已保留");
+      return validateSession(value as Record<string, unknown>);
+    };
+    const readSession = async (): Promise<Record<string, unknown> | null> => {
+      if (credentials !== auth || activeProfile !== profileID(auth) || !auth.syncCredential || credentialExpired(auth.syncExpiresAt)) {
+        throw new Error("账号或文件同步授权已变化；恢复点已保留");
+      }
+      if (!sessionID) await api.requireLegacyProjectUploadRecoveryCapability();
+      if (credentials !== auth || activeProfile !== profileID(auth) || syncCheckpoint !== checkpoint) {
+        throw new Error("账号或恢复点已变化；恢复点已保留");
+      }
+      const response = await fetch(sessionID ? sessionURL() : `${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/recover`, {
+        method: sessionID ? "GET" : "POST",
+        headers: {
+          authorization: `Bearer ${auth.syncCredential}`, accept: "application/json",
+          ...(!sessionID ? { "Idempotency-Key": checkpoint.idempotencyKey } : {}),
+        },
+        cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
+      });
+      if (credentials !== auth || activeProfile !== profileID(auth) || syncCheckpoint !== checkpoint) {
+        throw new Error("账号或恢复点已变化；恢复点已保留");
+      }
+      if (response.status === 404 && !sessionID) return null;
+      if (!response.ok) throw new Error("无法核对云端项目 session；恢复点已保留");
+      const recovered = await parseSessionResponse(response);
+      if (!checkpoint.sessionId) {
+        checkpoint.sessionId = sessionID;
+        try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(checkpoint)); }
+        catch {
+          syncRecoveryWarning = { state: "unknown", workspaceId: checkpoint.workspaceId, mode: "project_upload", message: "服务端 session 已找回，但本机恢复点保存状态未知；恢复点已保留，请检查本机同步状态。" };
+          notifyState();
+          throw new Error("找回的云端项目 session 无法写入本机恢复点；恢复点已保留");
+        }
+      }
+      return recovered;
+    };
+    let session = await readSession();
+    if (!session) {
+      await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
+      const answer = await dialog.showMessageBox(mainWindow!, {
+        type: "warning", buttons: ["取消", "清除本机恢复点"], defaultId: 0, cancelId: 0,
+        title: "清除旧版项目同步恢复点",
+        message: "没有找到可核对的云端项目 session。是否只清除本机恢复点？",
+        detail: "服务端已按此恢复点的幂等键完成核对，并阻止该旧键再次创建上传。确认后只清除本机恢复点，不会取消、删除或修改任何云端或本机文件；之后的新同步会使用新的恢复点。",
+        noLink: true,
+      });
+      if (answer.response !== 1) return { cancelled: true };
+      if (credentials !== auth || activeProfile !== profileID(auth) || !webView || !isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin) ||
+        syncCheckpoint !== checkpoint || sync.snapshot() !== "idle" || projectUploadInProgress || childMayStillRun(checkpoint)) {
+        throw new Error("账号、页面或恢复点状态已变化；恢复点已保留");
+      }
+      return discardSyncCheckpoint(true);
+    }
+    const terminal = (value: Record<string, unknown>) => ["completed", "conflict", "cancelled", "failed", "expired"].includes(String(value.state));
+    const hasHostApplication = session.host_application !== undefined && session.host_application !== null;
+    if (hasHostApplication) {
+      const application = session.host_application as Record<string, unknown>;
+      if (session.state !== "completed" || application.status !== "applied") {
+        throw new Error("目标电脑的应用回执尚未确认；旧版恢复点必须保留");
+      }
+      const verified = await readProjectHostApplication(auth, mapping, sessionID, folder.folderID);
+      if (verified.status !== "applied") throw new Error("无法确认目标电脑已应用本次内容；恢复点已保留");
+    }
+
+    const answer = await dialog.showMessageBox(mainWindow!, {
+      type: "warning", buttons: ["取消", "清除本机恢复点"], defaultId: 0, cancelId: 0,
+      title: "清除旧版项目同步恢复点",
+      message: "旧版项目同步恢复点无法自动迁移。是否清除本机恢复点？",
+      detail: `云端 session 状态：${String(session.state)}。${!terminal(session) ? "确认后会先请求取消仍在进行的上传，只有服务端确认进入终态后才清除。" : ""}\n清除只移除本机恢复点，不会删除本机或云端文件；若旧 session 已提交但没有 Host 应用回执，云端可能已包含本次上传的部分或全部内容。之后的新同步不会根据此旧恢复点推导云端删除。`,
+      noLink: true,
+    });
+    if (answer.response !== 1) return { cancelled: true };
+    if (credentials !== auth || activeProfile !== profileID(auth) || !webView || !isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin) ||
+      syncCheckpoint !== checkpoint || sync.snapshot() !== "idle" ||
+      projectUploadInProgress || childMayStillRun(checkpoint)) throw new Error("账号、页面或恢复点状态已变化；恢复点已保留");
+
+    if (!terminal(session)) {
+      const response = await fetch(`${sessionURL()}/cancel`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${auth.syncCredential}`, accept: "application/json", "Idempotency-Key": randomUUID() },
+        cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
+      });
+      if (!response.ok) throw new Error("取消云端项目 session 未确认；恢复点已保留");
+      session = await parseSessionResponse(response);
+      if (!terminal(session)) {
+        throw new Error("云端项目 session 仍未进入终态；恢复点已保留");
+      }
+      if (session.host_application !== undefined && session.host_application !== null) {
+        throw new Error("云端项目 session 存在未核实的 Host 应用回执；恢复点已保留");
+      }
+    }
+    if (credentials !== auth || activeProfile !== profileID(auth) || !webView || !isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin) ||
+      syncCheckpoint !== checkpoint || sync.snapshot() !== "idle") throw new Error("账号、页面或恢复点状态已变化；本机恢复点仍保留");
+    return discardSyncCheckpoint(true);
+  };
   portalBridgeHandler("morde:portal-legacy-discard", async (workspaceID) => {
     const id = checkedId("workspace", workspaceID);
     const auth = credentials;
     const checkpoint = syncCheckpoint;
+    if (checkpoint?.mode === "project_upload" && checkpoint.workspaceId === id && !checkpoint.sourceBindingID) {
+      return discardLegacyProjectRecovery(id);
+    }
     if (!checkpoint || checkpoint.mode === "project_upload" || checkpoint.workspaceId !== id) throw new Error("旧版同步恢复点已变化");
     const answer = await dialog.showMessageBox(mainWindow!, { type: "warning", buttons: ["保留恢复点", "放弃恢复点"], defaultId: 0, cancelId: 0,
       message: "放弃这个旧版同步恢复点？", detail: "放弃后无法从此恢复点继续。不会删除本机文件或云端文件。" });
     if (answer.response !== 1) return { cancelled: true };
     if (!auth || credentials !== auth || !webView || !isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)
-      || sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname !== "/workspaces" || syncCheckpoint !== checkpoint) throw new Error("账号、页面或同步恢复点已变化");
+    || !isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin) || syncCheckpoint !== checkpoint) throw new Error("账号、页面或同步恢复点已变化");
     discardSync();
     return { discarded: true };
   }, true);
@@ -2856,7 +3104,7 @@ function register(): void {
         detail: action === "restore" ? "目标路径必须为空；恢复后安全副本仍会保留。" : "删除后无法恢复，不影响云端文件。" });
       if (answer.response !== 1) return { cancelled: true };
       if (!auth || credentials !== auth || !webView || !isTrustedPortalBridgePage(webView.webContents.getURL(), auth.origin)
-        || sameOriginURL(webView.webContents.getURL(), auth.origin)?.pathname !== "/workspaces") throw new Error("账号或页面已变化，请重新操作");
+        || !isTrustedProjectSyncPage(webView.webContents.getURL(), auth.origin)) throw new Error("账号或页面已变化，请重新操作");
       await withPreservedMapping(id, async (mapping) => {
         const folderID = workspaceSyncProfile?.bindings[mapping.workspaceId]?.folderID;
         if (action === "restore") await sync.restorePreserved(mapping, preservedID, folderID);
@@ -2907,8 +3155,42 @@ function signOutFromMenu(): void {
   });
 }
 
+function openCodexSettings(): void {
+  if (!credentials) {
+    showWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      void dialog.showMessageBox(mainWindow, { type: "info", message: "请先登录 Morde，再配置 Codex 会话。" });
+    }
+    return;
+  }
+  if (codexWindow && !codexWindow.isDestroyed()) {
+    codexWindow.show();
+    codexWindow.focus();
+    return;
+  }
+  const window = new BrowserWindow({
+    width: 980, height: 760, minWidth: 720, minHeight: 560, title: "Morde · Codex 会话", show: false,
+    webPreferences: {
+      contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
+      preload: join(__dirname, "morde-preload.js"), additionalArguments: preloadArguments("codex"),
+    },
+  });
+  codexWindow = window;
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-navigate", (event) => event.preventDefault());
+  window.once("ready-to-show", () => { if (codexWindow === window && !window.isDestroyed()) window.show(); });
+  window.on("closed", () => { if (codexWindow === window) codexWindow = null; });
+  void window.loadFile(join(__dirname, "../resources/codex.html")).catch((error: unknown) => {
+    if (codexWindow !== window || window.isDestroyed()) return;
+    codexWindow = null;
+    window.close();
+    void dialog.showMessageBox({ type: "error", message: `Codex 设置页无法打开：${safeRendererErrorMessage(error)}` });
+  });
+}
+
 function menuSettings() {
   return [
+    { label: zh ? "Codex 会话与授权" : "Codex sessions and access", click: openCodexSettings },
     { label: zh ? "退出此电脑" : "Sign Out This PC", click: signOutFromMenu },
   ];
 }

@@ -30,12 +30,18 @@ type WorkspaceVolumeRegistry struct {
 
 type WorkspaceVolumeRegistryStore interface {
 	GetWorkspaceVolumeRegistry(context.Context, string) (WorkspaceVolumeRegistry, error)
+	ListLegacyHostWorkspaceVolumes(context.Context, string) ([]WorkspaceVolumeRegistry, error)
 	MarkWorkspaceVolumeReady(context.Context, string, string, string) error
 }
 
 type WorkspaceVolumeProvisioner interface {
 	EnsureWorkspaceVolume(context.Context, string, string, string, string) error
 	VerifyWorkspaceVolume(context.Context, string, string, string, string) error
+}
+
+type WorkspaceVolumeDeletion interface {
+	VerifyWorkspaceVolumeForDelete(context.Context, string, string, string, string) error
+	DeleteWorkspaceVolume(context.Context, string, string, string, string) error
 }
 
 type WorkspaceVolumeCopyCapacityChecker interface {
@@ -133,4 +139,74 @@ func (s *WorkspaceVolumeService) PrepareHostWorkspaceVolume(ctx context.Context,
 	return SandboxVolume{
 		Name: "workspace", MountPath: mountPath, ClaimName: name, Storage: storageSize, RequireExisting: true,
 	}, nil
+}
+
+func (s *WorkspaceVolumeService) ValidateHostWorkspaceVolume(ctx context.Context, ownerID, hostID, workspaceID string) error {
+	registered, err := s.workspaceVolumeForHost(ctx, ownerID, hostID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if registered.State == WorkspaceVolumeLegacy {
+		return nil
+	}
+	deleter, ok := s.volumes.(WorkspaceVolumeDeletion)
+	if !ok {
+		return domain.NewError(domain.CodeInvalidState, "computer storage deletion is unavailable")
+	}
+	return deleter.VerifyWorkspaceVolumeForDelete(ctx, registered.VolumeName, s.instanceID, registered.ProvisionedOwnerID, workspaceID)
+}
+
+func (s *WorkspaceVolumeService) DeleteHostWorkspaceVolume(ctx context.Context, ownerID, hostID, workspaceID string) error {
+	registered, err := s.workspaceVolumeForHost(ctx, ownerID, hostID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if registered.State == WorkspaceVolumeLegacy {
+		deleter, ok := s.volumes.(VolumeDeleter)
+		if !ok {
+			return domain.NewError(domain.CodeInvalidState, "legacy computer storage deletion is unavailable")
+		}
+		if err := deleter.DeleteVolume(ctx, domain.WorkspaceRootVolumeName(hostID)); err != nil {
+			return fmt.Errorf("delete legacy computer storage volume: %w", err)
+		}
+		return nil
+	}
+	deleter, ok := s.volumes.(WorkspaceVolumeDeletion)
+	if !ok {
+		return domain.NewError(domain.CodeInvalidState, "computer storage deletion is unavailable")
+	}
+	return deleter.DeleteWorkspaceVolume(ctx, registered.VolumeName, s.instanceID, registered.ProvisionedOwnerID, workspaceID)
+}
+
+func (s *WorkspaceVolumeService) workspaceVolumeForHost(ctx context.Context, ownerID, hostID, workspaceID string) (WorkspaceVolumeRegistry, error) {
+	if s == nil || !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) {
+		return WorkspaceVolumeRegistry{}, domain.InvalidArgument("workspace_volume", "computer storage identity is invalid")
+	}
+	registered, err := s.store.GetWorkspaceVolumeRegistry(ctx, workspaceID)
+	if err != nil {
+		return WorkspaceVolumeRegistry{}, err
+	}
+	if registered.WorkspaceID != workspaceID || registered.OwnerID != ownerID {
+		return WorkspaceVolumeRegistry{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage ownership is ambiguous")
+	}
+	switch registered.State {
+	case WorkspaceVolumeLegacy:
+		if registered.LegacyHostID != hostID || registered.VolumeName != "" {
+			return WorkspaceVolumeRegistry{}, domain.NewError(domain.CodeWorkspaceConflict, "legacy computer storage is not mapped to this computer")
+		}
+		legacyVolumes, err := s.store.ListLegacyHostWorkspaceVolumes(ctx, hostID)
+		if err != nil {
+			return WorkspaceVolumeRegistry{}, fmt.Errorf("verify legacy computer storage references: %w", err)
+		}
+		if len(legacyVolumes) != 1 || legacyVolumes[0].WorkspaceID != workspaceID || legacyVolumes[0].OwnerID != ownerID {
+			return WorkspaceVolumeRegistry{}, domain.NewError(domain.CodeWorkspaceConflict, "legacy computer storage ownership is ambiguous")
+		}
+	case WorkspaceVolumePending, WorkspaceVolumeReady:
+		if registered.VolumeName != WorkspaceNamedVolumeName(workspaceID) || !domain.ValidUserID(registered.ProvisionedOwnerID) {
+			return WorkspaceVolumeRegistry{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage volume identity is ambiguous")
+		}
+	default:
+		return WorkspaceVolumeRegistry{}, domain.NewError(domain.CodeInvalidState, "computer storage volume state is invalid")
+	}
+	return registered, nil
 }

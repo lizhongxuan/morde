@@ -167,7 +167,7 @@ export function AdminSettings() {
 
           <section className="admin-detail-section" aria-labelledby="admin-settings-quota-heading">
             <h2 id="admin-settings-quota-heading">个人数据默认额度</h2>
-            <p className="muted">以下默认值与普通聊天、工作区等其他额度分开计算；账号的实际生效额度可能由管理员单独调整。</p>
+            <p className="muted">以下默认值与普通聊天、云端电脑文件等其他额度分开计算；账号的实际生效额度可能由管理员单独调整。</p>
             <div className="admin-detail-facts">
               <article><span>每账号默认总量</span><strong>{data.default_personal_data_quota_bytes === 5 * 1024 ** 3 ? '5 GiB' : formatBytes(data.default_personal_data_quota_bytes)}</strong><small>{formatBytes(data.default_personal_data_quota_bytes)}</small></article>
               <article><span>单附件默认上限</span><strong>{data.default_personal_attachment_bytes === 300 * 1024 ** 2 ? '300 MiB' : formatBytes(data.default_personal_attachment_bytes)}</strong><small>{formatBytes(data.default_personal_attachment_bytes)}</small></article>

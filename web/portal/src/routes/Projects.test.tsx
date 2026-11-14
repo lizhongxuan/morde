@@ -8,6 +8,9 @@ import type { components } from '../api/schema';
 import { portalApi } from '../app/api';
 import { messageOutbox } from '../app/message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
+import { messageVariantOutbox } from '../app/message-variant-outbox';
+import type { PendingMessageVariantOperation } from '../app/message-variant-outbox';
+import * as messageVariantAPI from '../app/message-variants';
 import { projectApi } from '../app/project-api';
 import type { AcceptedProjectConversationMessageResponse, Project, ProjectBudget, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectWorkItem } from '../app/project-api';
 import { Projects } from './Projects';
@@ -83,6 +86,7 @@ async function openProject() {
 describe('Projects API integration', () => {
   beforeEach(() => {
     const values = new Map<string, PendingConversationMessage[]>();
+    const variantValues = new Map<string, PendingMessageVariantOperation[]>();
     const orderings = new Map<string, { heads: Record<string, string>; aliases: Record<string, string> }>();
     vi.spyOn(messageOutbox, 'read').mockImplementation(async (scope) => values.get(scope) ?? []);
     vi.spyOn(messageOutbox, 'update').mockImplementation(async (scope, change) => {
@@ -90,6 +94,12 @@ describe('Projects API integration', () => {
       const result = change(values.get(scope) ?? [], ordering);
       orderings.set(scope, ordering);
       values.set(scope, result);
+      return result;
+    });
+    vi.spyOn(messageVariantOutbox, 'read').mockImplementation(async (scope) => variantValues.get(scope) ?? []);
+    vi.spyOn(messageVariantOutbox, 'update').mockImplementation(async (scope, change) => {
+      const result = change(variantValues.get(scope) ?? []);
+      variantValues.set(scope, result);
       return result;
     });
     vi.spyOn(projectApi, 'projects').mockResolvedValue([project]);
@@ -142,6 +152,42 @@ describe('Projects API integration', () => {
     const link = await screen.findByRole('link', { name: '下载附件 1' });
     expect(link).toHaveAttribute('href', `/api/projects/${project.id}/conversations/${projectConversation.id}/messages/${projectHistoryMessage.id}/attachments-by-id/${attachmentID}/content`);
     expect(link).toHaveAttribute('download');
+  });
+
+  it('edits a project message as a new branch using the group high-water version and keeps the composer draft', async () => {
+    const source = { ...projectHistoryMessage, id: 'mproject-root', sequence: 1, content: '原项目提示' } as ProjectConversationMessage;
+    const existingVariant = { ...source, id: 'mproject-v2', sequence: 2, content: '项目提示 v2', variant_group_id: source.id,
+      variant_version: 2, variant_action: 'edit_resend' } as ProjectConversationMessage;
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([source, existingVariant]);
+    const stored = new Map<string, PendingMessageVariantOperation[]>();
+    vi.mocked(messageVariantOutbox.read).mockImplementation(async (scope) => stored.get(scope) ?? []);
+    vi.mocked(messageVariantOutbox.update).mockImplementation(async (scope, change) => {
+      const next = change(stored.get(scope) ?? []);
+      stored.set(scope, next);
+      return next;
+    });
+    vi.spyOn(messageVariantAPI, 'createMessageVariant').mockResolvedValue({
+      operation_id: 'opproject1', variant_group_id: source.id, variant_version: 3, action: 'edit_resend', state: 'accepted', user_message_id: 'mproject-v3',
+    });
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+
+    const prompt = await screen.findByLabelText('提交到共享对话的提示');
+    await user.type(prompt, '未发送项目草稿');
+    await user.click(await screen.findByRole('button', { name: '编辑并重发' }));
+    const editor = screen.getByRole('textbox', { name: '编辑项目消息并创建新版本' });
+    await user.clear(editor);
+    await user.type(editor, '从旧版分支编辑');
+    await user.click(screen.getByRole('button', { name: '创建新版本' }));
+
+    await waitFor(() => expect(messageVariantAPI.createMessageVariant).toHaveBeenCalledOnce());
+    expect(messageVariantAPI.createMessageVariant).toHaveBeenCalledWith(expect.objectContaining({
+      projectID: project.id, conversationID: projectConversation.id, messageID: existingVariant.id,
+      action: 'edit_resend', expectedVersion: 2, content: '从旧版分支编辑', actorID: owner.user_id,
+      serviceInstanceID: readyCapabilities.service_instance_id, idempotencyKey: expect.any(String),
+    }));
+    expect(prompt).toHaveValue('未发送项目草稿');
   });
 
   it('deduplicates overlapping project history pages by message ID', async () => {

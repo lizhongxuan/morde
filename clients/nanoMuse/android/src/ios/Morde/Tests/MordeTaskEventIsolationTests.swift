@@ -92,6 +92,69 @@ final class MordeTaskEventIsolationTests: XCTestCase {
         XCTAssertNil(MordeTaskResponsePolicy.stepDetailPath(taskID: "q1234567", stepID: "../secret"))
     }
 
+    func testStepRetryContractUsesSafePathRevisionAttemptAndReusableIdempotencyKey() throws {
+        XCTAssertEqual(MordeTaskResponsePolicy.stepRetryPath(taskID: "q1234567", stepID: "s1234567"),
+                       "/api/tasks/q1234567/steps/s1234567/retries")
+        XCTAssertNil(MordeTaskResponsePolicy.stepRetryPath(taskID: "../q1234567", stepID: "s1234567"))
+        XCTAssertNil(MordeTaskResponsePolicy.stepRetryPath(taskID: "q1234567", stepID: "../secret"))
+
+        let body = try XCTUnwrap(MordeTaskResponsePolicy.stepRetryBody(taskRevision: 3, attempt: 2))
+        XCTAssertEqual(Set(body.keys), ["expected_task_revision", "expected_attempt"])
+        XCTAssertEqual(body["expected_task_revision"] as? Int64, 3)
+        XCTAssertEqual(body["expected_attempt"] as? Int, 2)
+        XCTAssertEqual(MordeTaskResponsePolicy.stepRetryBody(taskRevision: 0, attempt: 2)?["expected_task_revision"] as? Int64, 0)
+        XCTAssertNil(MordeTaskResponsePolicy.stepRetryBody(taskRevision: -1, attempt: 2))
+        XCTAssertNil(MordeTaskResponsePolicy.stepRetryBody(taskRevision: 3, attempt: 0))
+        XCTAssertNil(MordeTaskResponsePolicy.stepRetryBody(taskRevision: nil, attempt: 2))
+        XCTAssertTrue(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234567",
+            attemptStepID: "s1234568", attempt: 2, status: "queued", replayed: false))
+        XCTAssertTrue(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234567",
+            attemptStepID: "s1234568", attempt: 2, status: "queued", replayed: true))
+        XCTAssertFalse(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234566",
+            attemptStepID: "s1234568", attempt: 2, status: "queued", replayed: false))
+        XCTAssertFalse(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234567",
+            attemptStepID: "../step", attempt: 2, status: "queued", replayed: false))
+        XCTAssertFalse(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234567",
+            attemptStepID: "s1234568", attempt: 1, status: "queued", replayed: false))
+        XCTAssertFalse(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234567",
+            attemptStepID: "s1234568", attempt: 2, status: "replayed", replayed: true))
+        XCTAssertFalse(MordeTaskResponsePolicy.validStepRetryReceipt(
+            sourceStepID: "s1234567", sourceAttempt: 1, responseSourceStepID: "s1234567",
+            attemptStepID: "s1234568", attempt: 2, status: "queued", replayed: nil))
+
+        let path = try XCTUnwrap(MordeTaskResponsePolicy.stepRetryPath(taskID: "q1234567", stepID: "s1234567"))
+        let fingerprint = try XCTUnwrap(MordeActionRetryAttempt.fingerprint(taskID: "q1234567", endpoint: path, body: body))
+        let first = MordeActionRetryAttempt.reusing(nil, for: fingerprint)
+        let replay = MordeActionRetryAttempt.reusing(first, for: fingerprint)
+        XCTAssertEqual(replay.idempotencyKey, first.idempotencyKey)
+    }
+
+    func testStepRetryErrorsAreIsolatedByTaskAndStep() {
+        var errors = MordeTaskStepRetryErrorStore()
+        errors.set("Retry step A failed", taskID: "q1234567", stepID: "s1234567")
+        errors.set("Retry step B failed", taskID: "q1234567", stepID: "s1234568")
+        errors.set("Same step ID in another task", taskID: "q1234568", stepID: "s1234567")
+
+        XCTAssertEqual(errors.message(taskID: "q1234567", stepID: "s1234567"), "Retry step A failed")
+        XCTAssertEqual(errors.message(taskID: "q1234567", stepID: "s1234568"), "Retry step B failed")
+        XCTAssertEqual(errors.message(taskID: "q1234568", stepID: "s1234567"), "Same step ID in another task")
+
+        errors.remove(taskID: "q1234567", stepID: "s1234567")
+        XCTAssertNil(errors.message(taskID: "q1234567", stepID: "s1234567"))
+        XCTAssertEqual(errors.message(taskID: "q1234567", stepID: "s1234568"), "Retry step B failed")
+        XCTAssertEqual(errors.message(taskID: "q1234568", stepID: "s1234567"), "Same step ID in another task")
+
+        errors.removeAll(taskID: "q1234567")
+        XCTAssertNil(errors.message(taskID: "q1234567", stepID: "s1234568"))
+        XCTAssertEqual(errors.message(taskID: "q1234568", stepID: "s1234567"), "Same step ID in another task")
+    }
+
     func testStepTimeLabelParsesFractionalAndWholeSecondTimestamps() {
         XCTAssertNotNil(MordeTaskResponsePolicy.stepTimeLabel("2026-11-13T04:44:29.123Z"))
         XCTAssertNotNil(MordeTaskResponsePolicy.stepTimeLabel("2026-11-13T04:44:29Z"))

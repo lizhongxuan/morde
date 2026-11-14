@@ -371,9 +371,11 @@ VALUES ($1::uuid,$2,$3,$4,$5,$6)`, instanceID, ownerID, conversationID, messageI
 }
 
 func loadHistoryMessageAttachmentIDs(ctx context.Context, tx pgx.Tx, instanceID, ownerID, conversationID, messageID string) ([]string, error) {
-	rows, err := tx.Query(ctx, `SELECT attachment_id FROM conversation_message_attachments
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id=$3 AND message_id=$4
-ORDER BY attachment_id`, instanceID, ownerID, conversationID, messageID)
+	rows, err := tx.Query(ctx, `SELECT link.attachment_id FROM conversation_message_attachments link
+WHERE link.service_instance_id=$1::uuid AND link.owner_id=$2 AND link.conversation_id=$3
+ AND link.message_id IN ($4,(SELECT attachment_source_message_id FROM conversation_message_variants
+   WHERE user_message_id=$4 AND actor_id=$2 AND attachment_source_message_id IS NOT NULL))
+ORDER BY link.attachment_id`, instanceID, ownerID, conversationID, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("load imported message attachments: %w", err)
 	}

@@ -32,7 +32,7 @@ func (s *taskStepRetryStoreStub) RequestTaskStepRetry(_ context.Context, record 
 	}
 	intent := task.StepRetryIntent{TaskID: request.TaskID, OwnerID: record.OwnerID, SourceStepID: request.StepID,
 		AttemptStepID: request.AttemptStepID, Attempt: request.ExpectedAttempt + 1, RetryCallID: request.RetryCallID,
-		RequestDigest: append([]byte(nil), request.ExpectedRequestDigest...), ExpiresAt: time.Now().Add(time.Hour)}
+		ExpiresAt: time.Now().Add(time.Hour)}
 	result := TaskStepRetryRecord{Intent: intent}
 	if s.records == nil {
 		s.records = make(map[string]TaskStepRetryRecord)
@@ -51,13 +51,12 @@ func TestTaskStepRetryUsesOneIdempotentAttemptIdentity(t *testing.T) {
 	}}}}
 	authorizer := &taskAuthorizerStub{}
 	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
-	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-	first, err := service.RetryStep(context.Background(), principal, "q1234567", "s1234567", 4, 1, digest, "retry-key-001")
+	first, err := service.RetryStep(context.Background(), principal, "q1234567", "s1234567", 4, 1, "retry-key-001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := service.RetryStep(context.Background(), principal, "q1234567", "s1234567", 4, 1, digest, "retry-key-001")
+	second, err := service.RetryStep(context.Background(), principal, "q1234567", "s1234567", 4, 1, "retry-key-001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +70,7 @@ func TestTaskStepRetryUsesOneIdempotentAttemptIdentity(t *testing.T) {
 	}
 
 	principal.Kind = identity.KindSession
-	third, err := service.RetryStep(context.Background(), principal, "q1234567", "s1234567", 4, 1, digest, "retry-key-002")
+	third, err := service.RetryStep(context.Background(), principal, "q1234567", "s1234567", 4, 1, "retry-key-002")
 	if err != nil || third.AttemptStepID == first.AttemptStepID || third.Replayed {
 		t.Fatalf("different key did not create a distinct idempotent attempt: result=%+v err=%v", third, err)
 	}

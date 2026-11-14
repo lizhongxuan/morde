@@ -13,6 +13,8 @@ import (
 )
 
 type CodexStore interface {
+	ConnectCodexProfile(context.Context, identity.Principal, codex.ProfileConnectionRequest) (codex.ProfileConnection, error)
+	RevokeCodexProfile(context.Context, identity.Principal, string) error
 	DiscoverCodexSession(context.Context, identity.Principal, codex.Discover) (codex.Session, error)
 	ListCodexSessions(context.Context, string, string, string, int32) (codex.SessionPage, error)
 	GetCodexEvents(context.Context, string, string, []codex.Scope, int64, int32) (codex.EventPage, error)
@@ -24,6 +26,14 @@ type CodexStore interface {
 	DeleteCodexSession(context.Context, string, string) error
 }
 
+// CodexProfileStatusStore holds profile-level discovery and history progress.
+// It is a narrow optional port so existing consumers that only mirror sessions
+// do not need to provide status reporting behavior.
+type CodexProfileStatusStore interface {
+	UpdateCodexProfileSessionDiscovery(context.Context, identity.Principal, string, codex.ProfileSessionDiscoveryUpdate) (codex.ProfileConnection, error)
+	ListCodexProfileConnections(context.Context, identity.Principal, string) ([]codex.ProfileConnection, error)
+}
+
 type CodexService struct{ store CodexStore }
 
 var codexResultCodePattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{0,128}$`)
@@ -33,6 +43,59 @@ func NewCodexService(store CodexStore) (*CodexService, error) {
 		return nil, domain.NewError(domain.CodeInvalidArgument, "Codex service store is required")
 	}
 	return &CodexService{store: store}, nil
+}
+
+func (s *CodexService) Connect(ctx context.Context, principal identity.Principal, request codex.ProfileConnectionRequest) (codex.ProfileConnection, error) {
+	if err := validateCodexClient(principal); err != nil {
+		return codex.ProfileConnection{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return codex.ProfileConnection{}, domain.InvalidArgument("connection", err.Error())
+	}
+	return s.store.ConnectCodexProfile(ctx, principal, request)
+}
+
+func (s *CodexService) Revoke(ctx context.Context, principal identity.Principal, profileKey string) error {
+	if err := validateCodexClient(principal); err != nil {
+		return err
+	}
+	if !codex.ValidProfileKey(profileKey) {
+		return domain.InvalidArgument("profile_key", "Codex profile key is invalid")
+	}
+	return s.store.RevokeCodexProfile(ctx, principal, profileKey)
+}
+
+func (s *CodexService) UpdateSessionDiscovery(ctx context.Context, principal identity.Principal, profileKey string,
+	update codex.ProfileSessionDiscoveryUpdate) (codex.ProfileConnection, error) {
+	if err := validateCodexClient(principal); err != nil {
+		return codex.ProfileConnection{}, err
+	}
+	if !codex.ValidProfileKey(profileKey) {
+		return codex.ProfileConnection{}, domain.InvalidArgument("profile_key", "Codex profile key is invalid")
+	}
+	if err := update.Validate(); err != nil {
+		return codex.ProfileConnection{}, domain.InvalidArgument("session_discovery", err.Error())
+	}
+	store, ok := s.store.(CodexProfileStatusStore)
+	if !ok {
+		return codex.ProfileConnection{}, domain.NewError(domain.CodeInternal, "Codex profile status store is unavailable")
+	}
+	return store.UpdateCodexProfileSessionDiscovery(ctx, principal, profileKey, update)
+}
+
+func (s *CodexService) ListProfileConnections(ctx context.Context, principal identity.Principal,
+	installationID string) ([]codex.ProfileConnection, error) {
+	if err := validateCodexUser(principal); err != nil {
+		return nil, err
+	}
+	if !domain.ValidClientInstallationID(installationID) {
+		return nil, domain.InvalidArgument("installation_id", "client installation id is invalid")
+	}
+	store, ok := s.store.(CodexProfileStatusStore)
+	if !ok {
+		return nil, domain.NewError(domain.CodeInternal, "Codex profile status store is unavailable")
+	}
+	return store.ListCodexProfileConnections(ctx, principal, installationID)
 }
 
 func (s *CodexService) Discover(ctx context.Context, principal identity.Principal, request codex.Discover) (codex.Session, error) {

@@ -543,7 +543,7 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			if value.SourceBindingID != "" || value.SourceBaselineSessionID != "" {
 				return domain.InvalidArgument("sync_session", "workspace root session has a project source binding")
 			}
-			if err := requireWorkspaceRootSyncTarget(ctx, tx, ownerID, value.WorkspaceID); err != nil {
+			if err := requireWorkspaceRootSyncTarget(ctx, tx, ownerID, value.WorkspaceID, hostScoped); err != nil {
 				return err
 			}
 		} else {
@@ -806,7 +806,7 @@ func (s *Store) ListDeviceWorkspaceSyncProgress(ctx context.Context, ownerID, wo
 		if currentOwner != ownerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
-		if err := requireWorkspaceRootSyncTarget(ctx, tx, ownerID, workspaceID); err != nil {
+		if err := requireWorkspaceRootSyncTarget(ctx, tx, ownerID, workspaceID, false); err != nil {
 			return err
 		}
 		rows, err := sqlcgen.New(tx).ListDeviceWorkspaceSyncProgress(ctx, sqlcgen.ListDeviceWorkspaceSyncProgressParams{ID: workspaceID, OwnerID: ownerID})
@@ -1416,7 +1416,7 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 				return domain.NewError(domain.CodeWorkspaceUnavailable, "project upload scope does not match its registered folder")
 			}
 			projectFolder = &folder
-		} else if err := requireWorkspaceRootSyncTarget(ctx, tx, workspaceOwner, workspaceID); err != nil {
+		} else if err := requireWorkspaceRootSyncTarget(ctx, tx, workspaceOwner, workspaceID, hostScoped); err != nil {
 			return err
 		}
 		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, row.OwnerID, workspaceID, row.ReplicaID, row.FolderID.String); err != nil {

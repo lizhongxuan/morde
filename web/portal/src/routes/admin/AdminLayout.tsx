@@ -14,14 +14,13 @@ const links: { to: string; label: string; icon: MordeIconName; end?: boolean }[]
   { to: '/admin/quality', label: '质量与风险', icon: 'shield' },
   { to: '/admin/controls', label: '规则与通知', icon: 'bell' },
   { to: '/admin/hosts', label: '云端电脑', icon: 'monitor' },
-  { to: '/admin/workspaces', label: '工作区', icon: 'folder' },
   { to: '/admin/audit', label: '审计', icon: 'file' },
 ];
 
 const titles: Record<string, string> = {
   '/admin': '总览', '/admin/': '总览', '/admin/users': '用户', '/admin/hosts': '云端电脑',
   '/admin/settings': '配置与预算',
-  '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/quality': '质量与风险', '/admin/controls': '规则与通知', '/admin/workspaces': '工作区', '/admin/audit': '审计',
+  '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/quality': '质量与风险', '/admin/controls': '规则与通知', '/admin/audit': '审计',
 };
 
 export function AdminLayout() {
@@ -30,7 +29,7 @@ export function AdminLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   useEffect(() => { closeNotices(); }, [closeNotices, location.pathname, location.search]);
-  const title = titles[location.pathname] ?? (location.pathname.startsWith('/admin/users/') ? '用户详情' : location.pathname.startsWith('/admin/hosts/') ? '电脑详情' : location.pathname.startsWith('/admin/workspaces/') ? '工作区详情' : '管理后台');
+  const title = titles[location.pathname] ?? (location.pathname.startsWith('/admin/users/') ? '用户详情' : location.pathname.startsWith('/admin/hosts/') ? '电脑详情' : '管理后台');
   const logout = async () => {
     try { await signOut(); navigate('/admin/login', { replace: true }); }
     catch (error) { notify(`退出登录失败：${errorDetails(error).message}`, 'error'); }

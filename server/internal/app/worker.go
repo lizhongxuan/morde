@@ -367,19 +367,7 @@ func (w *WorkerApp) reconcileDeletingHost(ctx context.Context, value host.Host) 
 		return nil
 	}
 
-	bindings, err := w.service.workspaces.GetWorkspaceBindingsByHost(ctx, value.ID)
-	if err != nil {
-		return err
-	}
-	for _, binding := range bindings {
-		if binding.State != workspace.BindingDetached {
-			return fmt.Errorf("refuse Host deletion while workspace %s is not safely detached", binding.Workspace.ID)
-		}
-	}
 	if err := w.cleanupHostSandboxes(ctx, value); err != nil {
-		return err
-	}
-	if err := w.retainLegacyHostVolumes(value.ID); err != nil {
 		return err
 	}
 	if value.SandboxID != "" {
@@ -389,6 +377,27 @@ func (w *WorkerApp) reconcileDeletingHost(ctx context.Context, value host.Host) 
 	}
 	if err := w.service.detachHostWorkspaces(ctx, value.ID); err != nil {
 		return err
+	}
+	bindings, err := w.service.workspaces.GetWorkspaceBindingsByHost(ctx, value.ID)
+	if err != nil {
+		return err
+	}
+	if len(bindings) != 1 || bindings[0].HostID != value.ID || bindings[0].OwnerID != value.OwnerID || !domain.ValidWorkspaceID(bindings[0].Workspace.ID) {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing or ambiguous")
+	}
+	if w.service.hostWorkspaceDeleter == nil {
+		return errors.New("Host workspace deletion is unavailable")
+	}
+	if err := w.service.hostWorkspaceDeleter.DeleteHostWorkspace(ctx, value.OwnerID, value.ID); err != nil {
+		return fmt.Errorf("delete Host workspace %s: %w", value.ID, err)
+	}
+	if w.service.volumes == nil {
+		return errors.New("Host persistent volume deletion is unavailable")
+	}
+	for _, volumeName := range []string{domain.ProfileVolumeName(value.ID), domain.RuntimeVolumeName(value.ID)} {
+		if err := w.service.volumes.DeleteVolume(ctx, volumeName); err != nil {
+			return fmt.Errorf("delete Host persistent volume %s: %w", volumeName, err)
+		}
 	}
 	if _, err := w.service.hosts.TransitionHost(ctx, value.ID, host.StateDeleting, host.StateDeleted, ""); err != nil {
 		current, getErr := w.service.hosts.GetHost(ctx, value.ID)

@@ -178,6 +178,17 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskPresentation.headerMood(for: nil), .idle)
     }
 
+    func testTaskArtifactListContainsOnlyCompleteVerifiedWorkspaceProofs() {
+        let confirmed = makeArtifact(id: "a1234567")
+        let unverified = makeArtifact(id: "a2345678", verified: false)
+        let incomplete = makeArtifact(id: "a3456789", sha256: nil)
+        let invalidWorkspace = makeArtifact(id: "a4567890", workspaceID: "workspace")
+
+        XCTAssertEqual(MIFTaskPresentation.confirmedArtifacts(
+            [confirmed, unverified, incomplete, invalidWorkspace]).map(\.id), ["a1234567"])
+        XCTAssertTrue(MIFTaskPresentation.confirmedArtifacts(nil).isEmpty)
+    }
+
     func testFailedTaskCanRetryOnlyFailedBatchItems() {
         let task = makeTask(id: "q1234567", status: "failed", batchItems: [
             MordeBatchItem(id: "b1234567", key: "first", status: "failed"),
@@ -202,6 +213,63 @@ final class MIFTaskViewsTests: XCTestCase {
 
         XCTAssertEqual(visible.map(\.id), ["s1234567", "s2345678"])
         XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("future_status"), AppLocalized("Status unknown"))
+    }
+
+    func testOnlyExplicitlyRetryableFailedStepsWithExpectedVersionShowRetry() throws {
+        func step(_ retryable: Bool?, attempt: Any = 1, revision: Any = 3, status: String = "failed") throws -> MordeTask.Step {
+            let value: [String: Any] = [
+                "id": "s1234567", "sequence": 1, "kind": "tool", "status": status,
+                "title": "Local tool step", "summary": "Failed safely", "created_at": "2026-11-04T00:00:01Z",
+                "attempt": attempt, "task_revision": revision,
+            ].merging(retryable.map { ["retryable": $0] } ?? [:]) { _, new in new }
+            return try JSONDecoder().decode(MordeTask.Step.self,
+                from: JSONSerialization.data(withJSONObject: value))
+        }
+
+        XCTAssertTrue(MIFTaskPresentation.canRetryStep(try step(true)))
+        XCTAssertFalse(MIFTaskPresentation.canRetryStep(try step(false)))
+        XCTAssertFalse(MIFTaskPresentation.canRetryStep(try step(nil)))
+        XCTAssertFalse(MIFTaskPresentation.canRetryStep(try step(true, attempt: 0)))
+        XCTAssertTrue(MIFTaskPresentation.canRetryStep(try step(true, revision: 0)))
+        XCTAssertFalse(MIFTaskPresentation.canRetryStep(try step(true, revision: -1)))
+        XCTAssertFalse(MIFTaskPresentation.canRetryStep(try step(true, status: "running")))
+    }
+
+    func testNonRetryableStepFailureReasonsExplainKnownStatesAndHideUnknownValues() throws {
+        let knownReasons = [
+            ("not_dispatched", "Step was not dispatched. Refresh the task and confirm its state."),
+            ("tool_failed_after_dispatch", "Step failed after dispatch. Check for partial results before retrying."),
+            ("side_effect_unknown", "This step may already have changed something. Check its result before retrying."),
+            ("authorization_changed", "Authorization changed. Refresh the task and check authorization before retrying."),
+            ("resource_changed", "The target resource changed. Refresh the task and check its state before retrying."),
+        ]
+        for (reason, explanation) in knownReasons {
+            let payload: [String: Any] = [
+                "id": "s1234567", "sequence": 1, "kind": "tool", "status": "failed",
+                "title": "Local tool step", "summary": "Failed safely", "created_at": "2026-11-04T00:00:01Z",
+                "retryable": false, "attempt": 1, "task_revision": 3, "failure_reason": reason,
+            ]
+            let step = try JSONDecoder().decode(MordeTask.Step.self,
+                from: JSONSerialization.data(withJSONObject: payload))
+            XCTAssertEqual(MIFTaskPresentation.stepFailureExplanation(step), AppLocalized(explanation), reason)
+            XCTAssertFalse(MIFTaskPresentation.canRetryStep(step), reason)
+        }
+
+        let unknownPayload: [String: Any] = [
+            "id": "s1234567", "sequence": 1, "kind": "tool", "status": "failed",
+            "title": "Local tool step", "summary": "Failed safely", "created_at": "2026-11-04T00:00:01Z",
+            "retryable": false, "attempt": 1, "task_revision": 3, "failure_reason": "future_private_code",
+        ]
+        let unknown = try JSONDecoder().decode(MordeTask.Step.self,
+            from: JSONSerialization.data(withJSONObject: unknownPayload))
+        XCTAssertNil(MIFTaskPresentation.stepFailureExplanation(unknown))
+
+        var retryablePayload = unknownPayload
+        retryablePayload["failure_reason"] = "side_effect_unknown"
+        retryablePayload["retryable"] = true
+        let retryable = try JSONDecoder().decode(MordeTask.Step.self,
+            from: JSONSerialization.data(withJSONObject: retryablePayload))
+        XCTAssertNil(MIFTaskPresentation.stepFailureExplanation(retryable))
     }
 
     func testChildJobLabelsKeepRunningFailureAndUnknownDistinct() {
@@ -352,6 +420,15 @@ final class MIFTaskViewsTests: XCTestCase {
                   step_count: stepCount, completed_step_count: completedStepCount, pending_request: nil,
                   clarification_request: nil, batch_items: batchItems, steps: steps, artifacts: nil,
                   updated_at: "2026-11-04T00:00:00Z", assistant_message: nil)
+    }
+
+    private func makeArtifact(id: String, verified: Bool = true, workspaceID: String? = "wabc1234",
+                              workspaceRevision: Int64? = 3, path: String? = "reports/output.docx",
+                              sizeBytes: Int64? = 23, sha256: String? = String(repeating: "a", count: 64)) -> MordeTask.Artifact {
+        MordeTask.Artifact(id: id, label: "Output.docx", media_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                           verified: verified, workspace_id: workspaceID, workspace_revision: workspaceRevision,
+                           path: path, size_bytes: sizeBytes, sha256: sha256,
+                           created_at: "2026-11-04T00:00:00Z")
     }
 
     private func makeEvent(sequence: Int64, type: String, payload: String) throws -> MordeTaskTimelineEvent {

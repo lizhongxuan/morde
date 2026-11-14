@@ -103,6 +103,17 @@ enum MIFTaskPresentation {
         }.sorted { $0.sequence < $1.sequence }
     }
 
+    static func confirmedArtifacts(_ artifacts: [MordeTask.Artifact]?) -> [MordeTask.Artifact] {
+        (artifacts ?? []).filter { artifact in
+            artifact.verified &&
+                artifact.workspace_id?.range(of: "^w[a-z0-9]{7}$", options: .regularExpression) != nil &&
+                artifact.workspace_revision.map { $0 >= 0 } == true && artifact.size_bytes.map { $0 >= 0 } == true &&
+                artifact.sha256?.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil &&
+                artifact.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false &&
+                !artifact.media_type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
     static func agentGroups(_ task: MordeTask, steps: [MordeTask.Step]) -> [MordeTaskAgentActivityGroup] {
         MordeTaskAgentActivityPolicy.groups(agents: task.agents ?? [], steps: steps.map {
             MordeTaskAgentActivityStep(id: $0.id, sequence: Int64($0.sequence), agentID: $0.agent_id)
@@ -163,6 +174,30 @@ enum MIFTaskPresentation {
         case "failed": return AppLocalized("Failed")
         case "unknown": return AppLocalized("Status unknown")
         default: return AppLocalized("Status unknown")
+        }
+    }
+
+    static func canRetryStep(_ step: MordeTask.Step) -> Bool {
+        step.retryable == true && step.status == "failed" &&
+            MordeTaskResponsePolicy.hasValidStepID(step.id) &&
+            MordeTaskResponsePolicy.stepRetryBody(taskRevision: step.task_revision, attempt: step.attempt) != nil
+    }
+
+    static func stepFailureExplanation(_ step: MordeTask.Step) -> String? {
+        guard step.status == "failed", step.retryable != true else { return nil }
+        switch step.failure_reason {
+        case "not_dispatched":
+            return AppLocalized("Step was not dispatched. Refresh the task and confirm its state.")
+        case "tool_failed_after_dispatch":
+            return AppLocalized("Step failed after dispatch. Check for partial results before retrying.")
+        case "side_effect_unknown":
+            return AppLocalized("This step may already have changed something. Check its result before retrying.")
+        case "authorization_changed":
+            return AppLocalized("Authorization changed. Refresh the task and check authorization before retrying.")
+        case "resource_changed":
+            return AppLocalized("The target resource changed. Refresh the task and check its state before retrying.")
+        default:
+            return nil
         }
     }
 
@@ -785,6 +820,7 @@ private struct MIFTaskStepActivityRow: View {
     @State private var attemptedRequestKey: String?
     @State private var loadError: String?
     @State private var isLoading = false
+    @State private var isRetrying = false
 
     private var visibleDetail: MordeTaskStepDetail? {
         loadedDetailRequestKey == detailRequestKey ? detail : nil
@@ -842,6 +878,36 @@ private struct MIFTaskStepActivityRow: View {
                         .foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 .accessibilityIdentifier("morde.task.step.details.\(step.id)")
+            }
+
+            if let explanation = MIFTaskPresentation.stepFailureExplanation(step) {
+                Text(verbatim: explanation)
+                    .font(.footnote)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("morde.task.step.failureReason.\(step.id)")
+            }
+
+            if MIFTaskPresentation.canRetryStep(step) {
+                Button {
+                    guard !isRetrying, !store.actionInFlight else { return }
+                    isRetrying = true
+                    Task {
+                        _ = await store.retryTaskStep(taskID: taskID, stepID: step.id)
+                        isRetrying = false
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        if isRetrying { ProgressView().controlSize(.small) }
+                        Text(AppLocalized("Retry step"))
+                    }
+                }
+                .disabled(isRetrying || store.actionInFlight)
+                .accessibilityIdentifier("morde.task.step.retry.\(step.id)")
+                if let error = store.stepRetryError(taskID: taskID, stepID: step.id) {
+                    MIFTaskInlineError(message: error)
+                        .accessibilityIdentifier("morde.task.step.retry.error.\(step.id)")
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1674,7 +1740,8 @@ struct MIFTaskDetailView: View {
     private func taskArtifacts(_ task: MordeTask) -> some View {
         MIFTaskSection(title: AppLocalized("Artifacts")) {
             if let artifacts = task.artifacts {
-                if artifacts.isEmpty {
+                let confirmed = MIFTaskPresentation.confirmedArtifacts(artifacts)
+                if confirmed.isEmpty {
                     Text(AppLocalized("No delivered artifacts"))
                         .font(.subheadline)
                         .foregroundStyle(NanoMuseTones.secondaryText)
@@ -1682,13 +1749,15 @@ struct MIFTaskDetailView: View {
                         .padding(16)
                 } else {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(artifacts.enumerated()), id: \.element.id) { index, artifact in
+                        ForEach(Array(confirmed.enumerated()), id: \.element.id) { index, artifact in
                             if index > 0 { NanoMuseRowDivider() }
+                            let size = ByteCountFormatter.string(fromByteCount: artifact.size_bytes ?? 0, countStyle: .file)
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(artifact.label)
                                     .font(.body.weight(.medium))
                                     .fixedSize(horizontal: false, vertical: true)
-                                Text(artifact.media_type)
+                                Text([artifact.path ?? "", artifact.media_type, size,
+                                      "v\(artifact.workspace_revision ?? 0)"].filter { !$0.isEmpty }.joined(separator: " · "))
                                     .font(.caption)
                                     .foregroundStyle(NanoMuseTones.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -2210,6 +2279,50 @@ struct MIFTaskErrorState: View {
         .padding(.horizontal, 16)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("morde.task.loadError")
+    }
+}
+
+struct MIFTaskPlanSection: View {
+    let task: MordeTask
+
+    var body: some View {
+        if let plan = task.plan, plan.task_revision == task.current_revision {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("\(AppLocalized("Execution plan")) · \(AppLocalized("Revision")) \(plan.revision)")
+                    .font(.caption.weight(.semibold))
+                Text(plan.goal).font(.caption).fixedSize(horizontal: false, vertical: true)
+                Text("\(AppLocalized("Cost estimate")): \(AppLocalized("Unknown"))")
+                    .font(.caption2).foregroundStyle(NanoMuseTones.secondaryText)
+                ForEach(plan.steps) { step in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(step.title).font(.caption.weight(.medium))
+                            Spacer()
+                            Text(planStepStatus(step.status)).font(.caption2).foregroundStyle(NanoMuseTones.secondaryText)
+                        }
+                        if !step.description.isEmpty { Text(step.description).font(.caption2).foregroundStyle(NanoMuseTones.secondaryText) }
+                        if !step.depends_on.isEmpty { Text("\(AppLocalized("Depends on")): \(step.depends_on.joined(separator: ", "))").font(.caption2) }
+                        if !step.outputs.isEmpty { Text("\(AppLocalized("Outputs")): \(step.outputs.joined(separator: ", "))").font(.caption2) }
+                        if !step.completion_criteria.isEmpty { Text("\(AppLocalized("Completion criteria")): \(step.completion_criteria.joined(separator: "; "))").font(.caption2) }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(NanoMuseTones.fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("morde.task.plan")
+        }
+    }
+
+    private func planStepStatus(_ status: String) -> String {
+        switch status {
+        case "in_progress": AppLocalized("Running")
+        case "completed": AppLocalized("Completed")
+        case "blocked": AppLocalized("Blocked")
+        default: AppLocalized("Queued")
+        }
     }
 }
 

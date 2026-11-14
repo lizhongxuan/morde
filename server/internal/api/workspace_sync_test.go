@@ -547,6 +547,7 @@ func TestWorkspaceSyncDeviceCredentialFenceIsExact(t *testing.T) {
 		{http.MethodGet, "/api/device/workspaces", true},
 		{http.MethodGet, "/api/workspaces/:id/changes", true},
 		{http.MethodPost, "/api/workspaces/:id/sync-sessions", true},
+		{http.MethodPost, "/api/workspaces/:id/sync-sessions/recover", true},
 		{http.MethodGet, "/api/workspaces/:id/sync-sessions/:session_id", true},
 		{http.MethodPost, "/api/workspaces/:id/sync-sessions/:session_id/commit", true},
 		{http.MethodPost, "/api/workspaces/:id/sync-sessions/:session_id/cancel", true},
@@ -568,6 +569,9 @@ func TestWorkspaceSyncDeviceCredentialFenceIsExact(t *testing.T) {
 		if got := deviceCredentialRoute(test.method, test.path); got != test.want {
 			t.Errorf("deviceCredentialRoute(%q, %q) = %t, want %t", test.method, test.path, got, test.want)
 		}
+	}
+	if hostReplicaCredentialRoute(http.MethodPost, "/api/workspaces/:id/sync-sessions/recover") {
+		t.Error("HostReplica credentials must not access owner sync checkpoint recovery")
 	}
 }
 

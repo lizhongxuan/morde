@@ -15,6 +15,10 @@ import (
 
 type codexServiceTestStore struct {
 	CodexStore
+	connectCalls        int
+	revokeCalls         int
+	lastProfileRequest  codex.ProfileConnectionRequest
+	lastRevokedProfile  string
 	listCalls           int
 	createCalls         int
 	grantScopes         map[codex.Scope]bool
@@ -35,6 +39,56 @@ type codexServiceTestStore struct {
 type codexServiceTestCommand struct {
 	hash    []byte
 	command codex.Command
+}
+
+func (s *codexServiceTestStore) ConnectCodexProfile(_ context.Context, principal identity.Principal, request codex.ProfileConnectionRequest) (codex.ProfileConnection, error) {
+	s.connectCalls++
+	s.lastProfileRequest = request
+	return codex.ProfileConnection{InstallationID: principal.ClientInstallationID, ProfileKey: request.ProfileKey,
+		Scopes: append([]codex.Scope(nil), request.Scopes...), GrantVersion: 3, Connected: true}, nil
+}
+
+func (s *codexServiceTestStore) RevokeCodexProfile(_ context.Context, _ identity.Principal, profileKey string) error {
+	s.revokeCalls++
+	s.lastRevokedProfile = profileKey
+	return nil
+}
+
+func TestCodexProfileConnectionRequiresClientAndExactReadLiveGrant(t *testing.T) {
+	store := &codexServiceTestStore{}
+	service, err := NewCodexService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := codexServiceTestClientPrincipal("i1234567")
+	request := codex.ProfileConnectionRequest{ProfileKey: "profile-1", Scopes: []codex.Scope{codex.ScopeRead, codex.ScopeLive}}
+	connection, err := service.Connect(context.Background(), client, request)
+	if err != nil || connection.ProfileKey != request.ProfileKey || connection.InstallationID != client.ClientInstallationID ||
+		connection.GrantVersion != 3 || !connection.Connected || store.connectCalls != 1 {
+		t.Fatalf("connect Codex profile = %#v, err=%v, calls=%d", connection, err, store.connectCalls)
+	}
+	if err := service.Revoke(context.Background(), client, request.ProfileKey); err != nil ||
+		store.revokeCalls != 1 || store.lastRevokedProfile != request.ProfileKey {
+		t.Fatalf("revoke Codex profile err=%v, calls=%d, key=%q", err, store.revokeCalls, store.lastRevokedProfile)
+	}
+
+	for _, invalidRequest := range []codex.ProfileConnectionRequest{
+		{ProfileKey: "profile-1", Scopes: []codex.Scope{codex.ScopeRead}},
+		{ProfileKey: "../CODEX_HOME", Scopes: []codex.Scope{codex.ScopeRead, codex.ScopeLive}},
+	} {
+		if _, err := service.Connect(context.Background(), client, invalidRequest); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Errorf("Connect(%#v) error=%v, want invalid argument", invalidRequest, err)
+		}
+	}
+	if _, err := service.Connect(context.Background(), codexServiceTestSessionPrincipal(), request); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("Portal Session connected a Codex profile: %v", err)
+	}
+	if err := service.Revoke(context.Background(), codexServiceTestSessionPrincipal(), request.ProfileKey); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("Portal Session revoked a PC Codex profile: %v", err)
+	}
+	if store.connectCalls != 1 || store.revokeCalls != 1 {
+		t.Fatalf("invalid caller reached store: connect=%d revoke=%d", store.connectCalls, store.revokeCalls)
+	}
 }
 
 func (s *codexServiceTestStore) ListCodexSessions(_ context.Context, ownerID, installationID, _ string, _ int32) (codex.SessionPage, error) {

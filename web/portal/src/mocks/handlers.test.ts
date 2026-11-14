@@ -231,7 +231,84 @@ describe("portal personal-data mock reads", () => {
   });
 });
 
+describe("local message variant mock routes", () => {
+  it("preserves personal message versions and returns 409 for a stale or reused operation key", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const identityHeaders = { "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" };
+    const created = await api("/api/conversations", {
+      ...json("POST", { title: "版本测试" }), headers: { ...identityHeaders, "Idempotency-Key": "variant-personal-create-1" },
+    });
+    const conversation = await created.json() as { id: string };
+    const messagesPath = `/api/conversations/${conversation.id}/messages`;
+    const originalKey = "variant-personal-source-1";
+    const original = await api(messagesPath, {
+      ...json("POST", { client_message_id: originalKey, content: "原始消息" }),
+      headers: { ...identityHeaders, "Idempotency-Key": originalKey },
+    });
+    const source = (await original.json() as { message: { id: string } }).message;
+    const variantPath = `${messagesPath}/${source.id}/variants`;
+    const variantKey = "variant-personal-edit-1";
+    const variantHeaders = { ...identityHeaders, "Idempotency-Key": variantKey };
+    const request = { action: "edit_resend", expected_version: 1, content: "新的消息版本" };
+    const first = await api(variantPath, { ...json("POST", request), headers: variantHeaders });
+    const accepted = await first.json() as { operation_id: string; variant_group_id: string; variant_version: number; action: string; state: string; user_message_id: string };
+    expect(first.status).toBe(202);
+    expect(accepted).toMatchObject({ variant_group_id: source.id, variant_version: 2, action: "edit_resend", state: "accepted" });
+    expect(await (await api(variantPath, { ...json("POST", request), headers: variantHeaders })).json()).toEqual(accepted);
+    expect((await api(variantPath, { ...json("POST", { ...request, content: "另一个请求" }), headers: variantHeaders })).status).toBe(409);
+    expect((await api(variantPath, { ...json("POST", request), headers: { ...identityHeaders, "Idempotency-Key": "variant-personal-stale-1" } })).status).toBe(409);
+
+    const followupKey = "variant-personal-follow-1";
+    const followup = await api(messagesPath, {
+      ...json("POST", { client_message_id: followupKey, content: "后续消息" }),
+      headers: { ...identityHeaders, "Idempotency-Key": followupKey },
+    });
+    const followupMessage = (await followup.json() as { message: { id: string; sequence: number } }).message;
+    const history = await api(messagesPath);
+    const items = (await history.json() as { items: Array<Record<string, unknown>> }).items;
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: source.id, content: "原始消息" }),
+      expect.objectContaining({ id: accepted.user_message_id, content: "新的消息版本", variant_group_id: source.id, variant_version: 2 }),
+      expect.objectContaining({ id: followupMessage.id, content: "后续消息", sequence: followupMessage.sequence }),
+    ]));
+    expect(followupMessage.sequence).toBeGreaterThan(Number(items.find((item) => item.id === accepted.user_message_id)?.sequence));
+  });
+});
+
 describe("local project mock routes", () => {
+  it("creates immutable project-message variants with version CAS and idempotent replay", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const projectID = "pdem0001";
+    const identityHeaders = { "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" };
+    const created = await api(`/api/projects/${projectID}/conversations`, {
+      ...json("POST", { title: "版本测试" }), headers: { ...identityHeaders, "Idempotency-Key": "variant-project-create-1" },
+    });
+    const conversation = await created.json() as { id: string };
+    const messagesPath = `/api/projects/${projectID}/conversations/${conversation.id}/messages`;
+    const originalKey = "variant-project-source-1";
+    const original = await api(messagesPath, {
+      ...json("POST", { client_message_id: originalKey, model_id: "pmodel01", content: "原始项目消息" }),
+      headers: { ...identityHeaders, "Idempotency-Key": originalKey },
+    });
+    const source = (await original.json() as { message: { id: string } }).message;
+    const variantPath = `${messagesPath}/${source.id}/variants`;
+    const variantKey = "variant-project-edit-1";
+    const variantHeaders = { ...identityHeaders, "Idempotency-Key": variantKey };
+    const request = { action: "edit_resend", expected_version: 1, content: "编辑后的项目消息" };
+    const first = await api(variantPath, { ...json("POST", request), headers: variantHeaders });
+    const accepted = await first.json() as { operation_id: string; variant_group_id: string; variant_version: number; action: string; state: string; user_message_id: string };
+    expect(first.status).toBe(202);
+    expect(accepted).toMatchObject({ variant_group_id: source.id, variant_version: 2, action: "edit_resend", state: "accepted" });
+    expect(await (await api(variantPath, { ...json("POST", request), headers: variantHeaders })).json()).toEqual(accepted);
+    expect((await api(variantPath, { ...json("POST", { ...request, content: "changed" }), headers: variantHeaders })).status).toBe(409);
+    expect((await api(variantPath, { ...json("POST", { ...request, expected_version: 1 }), headers: { ...identityHeaders, "Idempotency-Key": "variant-project-stale-1" } })).status).toBe(409);
+    const history = await api(messagesPath);
+    expect((await history.json() as { items: Array<Record<string, unknown>> }).items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: source.id, content: "原始项目消息" }),
+      expect.objectContaining({ id: accepted.user_message_id, content: "编辑后的项目消息", variant_group_id: source.id, variant_version: 2 }),
+    ]));
+  });
+
   it("shares project history but reconciles each sender's message only for that sender", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const projectID = "pdem0001";

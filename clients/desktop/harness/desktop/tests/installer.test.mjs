@@ -29,6 +29,9 @@ test("the installer includes only the Morde desktop runtime", () => {
     "  - resources/morde.html",
     "  - resources/morde.css",
     "  - resources/morde.js",
+    "  - resources/codex.html",
+    "  - resources/codex.css",
+    "  - resources/codex.js",
     "  - resources/morde-icon.png",
     "  - package.json",
   ]);
@@ -58,7 +61,7 @@ test("the Linux x64 package uses the Portal download manifest name", () => {
 
 test("the whitelisted Morde resources exist in the source tree", () => {
   const resources = fileURLToPath(new URL("resources/", here));
-  for (const name of ["morde.html", "morde.css", "morde.js", "morde-icon.png", "MORDE_NOTICE.txt", "THIRD_PARTY_NOTICES.morde-sync.md", "LICENSE.syncthing.txt", "THIRD_PARTY_NOTICES.syncthing.md"]) {
+  for (const name of ["morde.html", "morde.css", "morde.js", "codex.html", "codex.css", "codex.js", "morde-icon.png", "MORDE_NOTICE.txt", "THIRD_PARTY_NOTICES.morde-sync.md", "LICENSE.syncthing.txt", "THIRD_PARTY_NOTICES.syncthing.md"]) {
     assert.ok(existsSync(join(resources, name)), name);
   }
   const syncNotices = readFileSync(join(resources, "THIRD_PARTY_NOTICES.morde-sync.md"), "utf8");

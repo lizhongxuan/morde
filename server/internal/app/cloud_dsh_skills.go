@@ -29,12 +29,13 @@ const MaxCloudDSHSkillEventBytes = 8 << 10
 var cloudDSHSkillBundle embed.FS
 
 type cloudDSHSkill struct {
-	id          string
-	version     string
-	description string
-	sourceRef   string
-	resource    string
-	deprecated  bool
+	id           string
+	version      string
+	description  string
+	sourceRef    string
+	resource     string
+	deprecated   bool
+	requiresHost bool
 }
 
 var cloudDSHSkillCatalog = []cloudDSHSkill{
@@ -47,6 +48,13 @@ var cloudDSHSkillCatalog = []cloudDSHSkill{
 	{id: "knowledge-organization", version: "1", description: "Find and organize notes in the current authorized Workspace using verified files.", sourceRef: "server/internal/app/cloud_dsh_skills/knowledge-organization.md"},
 	{id: "kuaidi100", version: "1", description: "Track parcels when authorized tools are available."},
 	{id: "markdown-docs", version: "1", description: "Create and deliver verified Markdown artifacts.", sourceRef: "server/internal/app/cloud_dsh_skills/markdown-docs.md"},
+	{id: "office", version: "1", description: "Route Office file tasks to the relevant workflow; requires an authorized Host.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office/SKILL.md", requiresHost: true},
+	{id: "office-docx", version: "1", description: "Create, read, edit, and validate Word files on the authorized Host.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office-docx/SKILL.md", requiresHost: true},
+	{id: "office-export-pdf", version: "1", description: "Export an Office file to PDF with an available Host tool.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office-export-pdf/SKILL.md", requiresHost: true},
+	{id: "office-pptx", version: "1", description: "Create, read, edit, and validate PowerPoint files on the authorized Host.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office-pptx/SKILL.md", requiresHost: true},
+	{id: "office-recalculate", version: "1", description: "Recalculate spreadsheet formulas with an available Host tool.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office-recalculate/SKILL.md", requiresHost: true},
+	{id: "office-render", version: "1", description: "Render Office files for requested visual inspection with an available Host tool.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office-render/SKILL.md", requiresHost: true},
+	{id: "office-xlsx", version: "1", description: "Create, read, edit, and validate Excel workbooks on the authorized Host.", sourceRef: "project/deepseek-harness/packages/skill/skill-office/assets/office-xlsx/SKILL.md", requiresHost: true},
 	{id: "meeting-follow-up", version: "1", description: "Turn an authorized meeting record into decisions, actions, and open questions in the current Workspace.", sourceRef: "server/internal/app/cloud_dsh_skills/meeting-follow-up.md"},
 	{id: "meeting-prep", version: "1", description: "Legacy Muse meeting workflow retained for checkpoint recovery.", deprecated: true},
 	{id: "meeting-preparation", version: "1", description: "Prepare a meeting brief from user-provided information and authorized Task tools.", sourceRef: "server/internal/app/cloud_dsh_skills/meeting-preparation.md"},
@@ -104,15 +112,23 @@ type cloudDSHSkillReadOutput struct {
 	Content        string `json:"content"`
 }
 
-func cloudDSHSkillReadDefinition() AgentToolDefinition {
+func cloudDSHSkillReadDefinition(hostAvailable bool) AgentToolDefinition {
 	ids := make([]string, 0, len(cloudDSHSkillCatalog))
 	descriptions := make([]string, 0, len(cloudDSHSkillCatalog))
+	hasOfficeSkills := false
 	for _, skill := range cloudDSHSkillCatalog {
-		if skill.deprecated {
+		if skill.deprecated || skill.requiresHost && !hostAvailable {
 			continue
 		}
 		ids = append(ids, skill.id)
-		descriptions = append(descriptions, skill.id+": "+skill.description)
+		if skill.requiresHost {
+			hasOfficeSkills = true
+		} else {
+			descriptions = append(descriptions, skill.id+": "+skill.description)
+		}
+	}
+	if hasOfficeSkills {
+		descriptions = append(descriptions, "Office workflows require an authorized Host")
 	}
 	parameters, _ := json.Marshal(map[string]any{
 		"type":       "object",
@@ -121,7 +137,7 @@ func cloudDSHSkillReadDefinition() AgentToolDefinition {
 	})
 	return AgentToolDefinition{
 		ModelTool: ModelTool{Name: cloudDSHSkillReadToolName,
-			Description: "Load a reviewed Morde skill only when its purpose matches. Skills do not add permissions; use this Task's authorized tools and Workspace. Available: " + strings.Join(descriptions, "; "),
+			Description: "Load a reviewed Morde skill by ID. Skills add no permissions. Available: " + strings.Join(descriptions, "; "),
 			Parameters:  parameters},
 		RequiredScope: identity.ScopeTaskRead,
 	}
@@ -148,6 +164,12 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 		return AgentToolResult{}, err
 	}
 	current := details.Task
+	if skill.requiresHost && current.HostID == "" {
+		_, target, routed, targetErr := b.refreshDeferredTask(ctx, claimed)
+		if targetErr != nil || !routed || target.Unavailable || !domain.ValidHostID(target.HostID) {
+			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "this Morde skill requires an explicitly selected Host")
+		}
+	}
 	if current.AgentSessionID == "" || current.Authorization.Version < 1 ||
 		current.Authorization.Version != claimed.Authorization.Version ||
 		(claimed.AgentSessionID != "" && current.AgentSessionID != claimed.AgentSessionID) ||

@@ -98,6 +98,7 @@ type TaskDetails struct {
 	ClarificationRequests  []task.ClarificationRequest
 	StopRequest            *task.StopRequest
 	StopOperationIDs       []string
+	Plan                   *task.Plan
 }
 
 type TaskAgentExecution struct {
@@ -294,6 +295,18 @@ type TaskProgress struct {
 	PublishResultMessage     bool
 	CloudDSHSkillRead        *CloudDSHSkillReadCommit
 	CloudDSHPersonalMutation *CloudDSHPersonalMutationCommit
+	CloudDSHTaskPlan         *CloudDSHTaskPlanCommit
+}
+
+// CloudDSHTaskPlanCommit binds an advisory plan update to one durable DSH call.
+type CloudDSHTaskPlanCommit struct {
+	TaskID               string
+	OwnerID              string
+	AgentSessionID       string
+	AuthorizationVersion int64
+	CallID               string
+	Plan                 task.Plan
+	FingerprintSHA256    string
 }
 
 // CloudDSHSkillReadCommit binds a fixed skill response to one durable dsh call.

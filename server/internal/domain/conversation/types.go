@@ -112,6 +112,10 @@ type Message struct {
 	OutputStatus              OutputStatus
 	OutputTaskRevision        *int64
 	OutputResultEventSequence *int64
+	VariantGroupID            string
+	VariantVersion            int64
+	VariantAction             string
+	VariantOperationID        string
 	CreatedAt                 time.Time
 }
 

@@ -10,6 +10,9 @@ files:
   - resources/morde.html
   - resources/morde.css
   - resources/morde.js
+  - resources/codex.html
+  - resources/codex.css
+  - resources/codex.js
   - resources/morde-icon.png
   - package.json
 extraResources:

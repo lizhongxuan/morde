@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   codexSnapshotItemEvents,
   codexSnapshotItemFingerprint,
+  MordeCodexRuntime,
+  MordeCodexProvider,
   codexApprovalPresentation,
   codexTurnDispatch,
   codexApprovalVersion,
@@ -21,6 +23,94 @@ import {
   encodeJsonRpcFrame,
   parseJsonRpcFrame,
 } from '../out/morde-codex.js';
+
+test('Codex thread pagination visits all active pages before archived pages', async () => {
+  const provider = new MordeCodexProvider();
+  const calls = [];
+  provider.request = async (method, params) => {
+    calls.push({ method, ...params });
+    const thread = (id) => ({ id, name: id, cwd: '/tmp', status: 'completed' });
+    if (!params.archived && params.cursor === null) return { data: [thread('active-1')], nextCursor: 'active-next' };
+    if (!params.archived) return { data: [thread('active-2')], nextCursor: null };
+    if (params.cursor === null) return { data: [thread('archived-1')], nextCursor: 'archived-next' };
+    return { data: [thread('archived-2')], nextCursor: null };
+  };
+
+  const first = await provider.listThreads();
+  assert.deepEqual(first.items.map((thread) => [thread.id, thread.archived]), [['active-1', false]]);
+  assert.equal(first.nextCursor, 'active:active-next');
+  const second = await provider.listThreads(first.nextCursor);
+  assert.deepEqual(second.items.map((thread) => [thread.id, thread.archived]), [['active-2', false], ['archived-1', true]]);
+  assert.equal(second.nextCursor, 'archived:archived-next');
+  const third = await provider.listThreads(second.nextCursor);
+  assert.deepEqual(third.items.map((thread) => [thread.id, thread.archived]), [['archived-2', true]]);
+  assert.equal(third.nextCursor, null);
+  assert.deepEqual(calls.map(({ archived, cursor }) => [archived, cursor]), [
+    [false, null], [false, 'active-next'], [true, null], [true, 'archived-next'],
+  ]);
+});
+
+test('Codex profile connect and revoke preserve the last requested authorization order', async () => {
+  const saved = {
+    version: 1, serviceInstanceID: 'service', installationId: 'installation', selectedProfileKey: 'profile1', commands: {},
+    profiles: [{ profileKey: 'profile1', homeDirectory: '/tmp/codex-home', executable: '/tmp/codex', createdAt: '2026-11-14T00:00:00.000Z', connectionScopes: [] }],
+    grants: [],
+  };
+  const calls = [];
+  let markConnectStarted, releaseConnect;
+  const connectStarted = new Promise((resolve) => { markConnectStarted = resolve; });
+  const connectGate = new Promise((resolve) => { releaseConnect = resolve; });
+  const api = {
+    codexAuthorizeConnection: async (_profileKey, scopes) => {
+      calls.push('connect-start');
+      markConnectStarted();
+      await connectGate;
+      calls.push('connect-finish');
+      return { scopes, grant_version: 2 };
+    },
+    codexRevokeConnection: async () => { calls.push('revoke'); },
+  };
+  const runtime = new MordeCodexRuntime(api, { load: () => saved, save: (value) => Object.assign(saved, value) }, () => {});
+  runtime.load('service', 'installation');
+  const connecting = runtime.authorizeProfile('profile1', ['read', 'live', 'send']);
+  await connectStarted;
+  const revoking = runtime.revokeProfile('profile1');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ['connect-start'], 'a revoke must wait for an in-flight connection mutation');
+  releaseConnect();
+  await Promise.all([connecting, revoking]);
+  assert.deepEqual(calls, ['connect-start', 'connect-finish', 'revoke']);
+  assert.deepEqual(runtime.data.profiles[0].connectionScopes, []);
+});
+
+test('Codex profile status separates discovery failures and counts every pending upload event', async () => {
+  const reported = [];
+  const api = { codexReportSessionDiscoveryStatus: async (_profileKey, status) => { reported.push(status); } };
+  const runtime = new MordeCodexRuntime(api, { load: () => null, save: () => {} }, () => {});
+  runtime.load('service', 'installation');
+  runtime.data.profiles.push({
+    profileKey: 'profile1', homeDirectory: '/tmp/codex-home', executable: '/tmp/codex',
+    createdAt: '2026-11-14T00:00:00.000Z', connectionScopes: ['read', 'live'],
+  });
+  runtime.data.grants.push({
+    profileKey: 'profile1', scopes: ['read', 'live'], historyComplete: false,
+    pendingEvents: [{ source: 'snapshot' }, { source: 'live' }],
+  });
+  runtime.active = true;
+  runtime.profileSyncStates.set('profile1', { state: 'syncing', total: 1, done: 0, error: 'one thread failed' });
+  runtime.reportProfileSessionDiscovery('profile1', true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(reported[0], {
+    session_discovery: { state: 'syncing', error_code: null },
+    history_sync: { discovered_sessions: 1, history_complete_sessions: 0, pending_upload_event_count: 2 },
+  });
+
+  runtime.profileSyncStates.set('profile1', { state: 'partial', total: 1, done: 1, error: 'one thread failed' });
+  runtime.reportProfileSessionDiscovery('profile1', true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  runtime.active = false;
+  assert.deepEqual(reported[1]?.session_discovery, { state: 'partial', error_code: 'unknown' });
+});
 
 test('Codex App Server JSONL frames route versionless requests, notifications, and responses safely', () => {
   assert.deepEqual(parseJsonRpcFrame('{"id":7,"method":"thread/read","params":{"threadId":"thread-1"}}'), {
@@ -232,6 +322,11 @@ test('Codex snapshots produce stable bounded visible items with content-versione
   assert.ok(externalQuestion);
   assert.match(externalQuestion.payload.diagnostic, /不包含对应的原始 RPC handle/);
   assert.doesNotMatch(JSON.stringify(externalQuestion.payload), /question_request_id|question_version|approval_id|approval_version/);
+
+  const privateOnlyReasoning = codexSnapshotItemEvents(turn, { id: 'private-only', type: 'reasoning', summary: [], content: ['never upload'] });
+  assert.equal(privateOnlyReasoning[0].kind, 'unsupported');
+  assert.match(privateOnlyReasoning[0].payload.diagnostic, /私有推理内容不会同步/);
+  assert.doesNotMatch(JSON.stringify(privateOnlyReasoning), /never upload/);
 });
 
 test('active Codex snapshots project visible user, assistant, tool, and plan items', () => {
@@ -247,6 +342,102 @@ test('active Codex snapshots project visible user, assistant, tool, and plan ite
   assert.ok(projected.some((event) => event.item_id === tool.id && event.kind === 'tool_call'));
   assert.ok(projected.some((event) => event.item_id === tool.id && event.kind === 'tool_result' && event.payload.output === tool.aggregatedOutput));
   assert.equal(projected.find((event) => event.item_id === plan.id)?.kind, 'plan');
+});
+
+test('Codex tool inputs and outputs retain every UTF-8 chunk with stable call grouping', () => {
+  const turn = { id: 'turn-large', status: 'completed', startedAt: 100, completedAt: 101, itemsView: 'full', items: [] };
+  const item = {
+    id: 'tool-large', type: 'mcpToolCall', server: 'local', tool: 'inspect', status: 'completed',
+    arguments: { prompt: '界'.repeat(40_000) }, aggregatedOutput: 'result-'.repeat(30_000),
+  };
+  const events = codexSnapshotItemEvents(turn, item);
+  const inputs = events.filter((event) => event.kind === 'tool_call');
+  const outputs = events.filter((event) => event.kind === 'tool_result');
+
+  assert.ok(inputs.length > 1);
+  assert.ok(outputs.length > 1);
+  assert.ok(inputs.every((event, index) => event.payload.call_id === item.id && event.payload.input_part === index &&
+    event.payload.input_parts === inputs.length && Buffer.byteLength(event.payload.input) <= 24 * 1024));
+  assert.deepEqual(JSON.parse(inputs.map((event) => event.payload.input).join('')), item.arguments);
+  assert.ok(outputs.every((event, index) => event.payload.call_id === item.id && event.payload.output_part === index &&
+    event.payload.output_parts === outputs.length && Buffer.byteLength(event.payload.output) <= 24 * 1024));
+  assert.equal(outputs.map((event) => event.payload.output).join(''), item.aggregatedOutput);
+});
+
+test('Codex history resumes large items after an acknowledged local event batch and restart', async () => {
+  let saved = {
+    version: 1, serviceInstanceID: 'service', installationId: 'installation', selectedProfileKey: null, commands: {},
+    profiles: [{ profileKey: 'profile1', homeDirectory: '/tmp/codex-home', executable: '/tmp/codex', createdAt: '2026-11-14T00:00:00.000Z', connectionScopes: ['read', 'live'] }],
+    grants: [{
+      id: 'l0000001', profileKey: 'profile1', threadId: 'thread-1', title: 'Large conversation', cwdLabel: 'project', updatedAt: null,
+      status: 'completed', scopes: ['read', 'live'], grantVersion: 1, snapshotState: 'pending', historyComplete: false, historyCursor: null,
+      candidateTurns: {}, knownItems: {}, pendingEvents: [{
+        provider_event_id: 'legacy-result', kind: 'tool_result', occurred_at: '2026-11-14T00:00:00.000Z',
+        payload: { call_id: 'call-1', output: 'legacy output' }, source: 'snapshot',
+      }], approvals: {}, questions: {},
+    }],
+  };
+  const uploaded = [];
+  const api = {
+    codexEvents: async (_sessionID, events) => {
+      uploaded.push(...events);
+      return { provider_event_ids: events.map((event) => event.provider_event_id) };
+    },
+  };
+  let runtime = new MordeCodexRuntime(api, { load: () => saved, save: (value) => { saved = value; } }, () => {});
+  runtime.load('service', 'installation');
+  let grant = runtime.data.grants[0];
+  assert.equal(runtime.publicState().sessions[0].pendingEvents, 1);
+  const text = 'x'.repeat(17 * 1024 * 1024);
+  const snapshot = {
+    thread: { id: 'thread-1', name: 'Large conversation', cwd: '/tmp/project', updatedAt: '2026-11-14T00:00:00.000Z', status: 'completed', archived: false },
+    turns: [{ id: 'turn-1', status: 'completed', startedAt: 100, completedAt: 101, itemsView: 'full', items: [{ id: 'message-1', type: 'agentMessage', text }] }],
+    complete: true, anchored: true, nextCursor: null, metadataStable: true,
+  };
+
+  runtime.reconcileSnapshot(grant, snapshot);
+  assert.equal(grant.snapshotState, 'pending');
+  runtime.reconcileSnapshot(grant, snapshot);
+  assert.equal(grant.snapshotState, 'limited');
+  assert.equal(grant.historyComplete, false);
+  assert.equal(grant.historyCursor, null);
+  assert.ok(grant.pendingEvents.length > 0);
+
+  // The per-item cursor and pending batch must survive a local client restart.
+  runtime = new MordeCodexRuntime(api, { load: () => saved, save: (value) => { saved = value; } }, () => {});
+  runtime.load('service', 'installation');
+  grant = runtime.data.grants[0];
+  runtime.active = true;
+  for (let attempt = 0; attempt < 200 && (!grant.historyComplete || grant.pendingEvents.length); attempt++) {
+    if (grant.pendingEvents.length) await runtime.flushPending();
+    if (!grant.pendingEvents.length && !grant.historyComplete) runtime.reconcileSnapshot(grant, snapshot);
+  }
+  runtime.active = false;
+
+  assert.equal(grant.historyComplete, true);
+  assert.equal(grant.historyCursor, null);
+  assert.equal(grant.snapshotState, 'available');
+  assert.equal(grant.pendingEvents.length, 0);
+  const expectedEvents = codexSnapshotItemEvents(snapshot.turns[0], snapshot.turns[0].items[0]);
+  const messageEvents = uploaded.filter((event) => event.kind === 'assistant_message');
+  assert.equal(messageEvents.length, expectedEvents.length);
+  assert.equal(new Set(uploaded.map((event) => event.provider_event_id)).size, uploaded.length);
+  assert.equal(messageEvents.sort((a, b) => Number(a.payload.segment_id.split(':').at(-1)) - Number(b.payload.segment_id.split(':').at(-1)))
+    .map((event) => event.payload.text).join(''), text);
+  assert.equal(uploaded.filter((event) => event.provider_event_id === 'legacy-result').length, 1);
+  assert.equal(uploaded.filter((event) => event.kind === 'turn_completed').length, 1);
+});
+
+test('Codex image and attachment payloads report an explicit gap without uploading local data', () => {
+  const turn = { id: 'turn-media', status: 'completed', startedAt: 100, completedAt: 101, itemsView: 'full', items: [] };
+  const user = { id: 'user-media', type: 'userMessage', content: [{ type: 'image', path: '/private/photo.png', data: 'private-image-bytes' }] };
+  const tool = { id: 'tool-media', type: 'mcpToolCall', tool: 'vision', status: 'completed', result: { content: [{ type: 'image', data: 'private-tool-image' }] } };
+  const projected = [user, tool].flatMap((item) => codexSnapshotItemEvents(turn, item));
+  const gaps = projected.filter((event) => event.kind === 'unsupported');
+
+  assert.equal(gaps.length, 2);
+  assert.ok(gaps.every((event) => /未同步|未提供/.test(event.payload.diagnostic)));
+  assert.doesNotMatch(JSON.stringify(projected), /\/private\/photo|private-image-bytes|private-tool-image/);
 });
 
 test('changed active assistant snapshots replace and append without losing chunks or duplicating the final snapshot', () => {

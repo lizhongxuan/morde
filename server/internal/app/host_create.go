@@ -25,24 +25,25 @@ import (
 // HostServiceOptions are the app-layer dependencies and config values needed
 // by the shared Portal API and MCP HostService implementation.
 type HostServiceOptions struct {
-	Hosts             HostStore
-	Users             UserStore
-	Workspaces        WorkspaceStore
-	WorkspaceVolumes  HostWorkspaceVolumeResolver
-	DefaultWorkspaces HostDefaultWorkspaceProvider
-	Tokens            TokenStore
-	Sandboxes         SandboxRouter
-	Volumes           VolumeDeleter
-	DiskCapacity      DiskCapacityChecker
-	Probe             HostProbe
-	Runtime           RuntimeHandshaker
-	Audit             AuditWriter
-	CreateLocks       HostCreateLockStore
-	Sealer            *Sealer
-	Templates         map[string]template.Template
-	DefaultTemplateID string
-	Capacity          Capacity
-	Instance          string
+	Hosts                HostStore
+	Users                UserStore
+	Workspaces           WorkspaceStore
+	WorkspaceVolumes     HostWorkspaceVolumeResolver
+	DefaultWorkspaces    HostDefaultWorkspaceProvider
+	HostWorkspaceDeleter HostWorkspaceDeleter
+	Tokens               TokenStore
+	Sandboxes            SandboxRouter
+	Volumes              VolumeDeleter
+	DiskCapacity         DiskCapacityChecker
+	Probe                HostProbe
+	Runtime              RuntimeHandshaker
+	Audit                AuditWriter
+	CreateLocks          HostCreateLockStore
+	Sealer               *Sealer
+	Templates            map[string]template.Template
+	DefaultTemplateID    string
+	Capacity             Capacity
+	Instance             string
 
 	Scheme            string
 	PortalURL         string
@@ -58,40 +59,47 @@ type HostServiceOptions struct {
 }
 
 type hostService struct {
-	hosts             HostStore
-	users             UserStore
-	workspaces        WorkspaceStore
-	workspaceVolumes  HostWorkspaceVolumeResolver
-	defaultWorkspaces HostDefaultWorkspaceProvider
-	tokens            TokenStore
-	sandboxes         SandboxRouter
-	volumes           VolumeDeleter
-	diskCapacity      DiskCapacityChecker
-	probe             HostProbe
-	runtime           RuntimeHandshaker
-	audit             AuditWriter
-	createLocks       HostCreateLockStore
-	sealer            *Sealer
-	templates         map[string]template.Template
-	defaultTemplateID string
-	capacity          Capacity
-	instance          string
-	scheme            string
-	portalURL         string
-	hostSuffix        string
-	ticketTTL         time.Duration
-	readyTimeout      time.Duration
-	pollInterval      time.Duration
-	notifyCreate      func(context.Context, string) error
-	observeReady      func(string, time.Duration)
-	countAudit        func()
-	logger            *zap.Logger
+	hosts                HostStore
+	users                UserStore
+	workspaces           WorkspaceStore
+	workspaceVolumes     HostWorkspaceVolumeResolver
+	defaultWorkspaces    HostDefaultWorkspaceProvider
+	hostWorkspaceDeleter HostWorkspaceDeleter
+	tokens               TokenStore
+	sandboxes            SandboxRouter
+	volumes              VolumeDeleter
+	diskCapacity         DiskCapacityChecker
+	probe                HostProbe
+	runtime              RuntimeHandshaker
+	audit                AuditWriter
+	createLocks          HostCreateLockStore
+	sealer               *Sealer
+	templates            map[string]template.Template
+	defaultTemplateID    string
+	capacity             Capacity
+	instance             string
+	scheme               string
+	portalURL            string
+	hostSuffix           string
+	ticketTTL            time.Duration
+	readyTimeout         time.Duration
+	pollInterval         time.Duration
+	notifyCreate         func(context.Context, string) error
+	observeReady         func(string, time.Duration)
+	countAudit           func()
+	logger               *zap.Logger
 }
 
-// HostDefaultWorkspaceProvider returns the owner's reusable default Workspace
-// or creates and initializes one through WorkspaceService.
+// HostDefaultWorkspaceProvider creates server-managed persistent storage for a
+// Host and prepares the initial storage used by the account's default Host.
 type HostDefaultWorkspaceProvider interface {
 	EnsureDefaultWorkspace(context.Context, string) (workspace.Workspace, error)
+	CreateHostWorkspace(context.Context, string, string) (workspace.Workspace, error)
+}
+
+type HostWorkspaceDeleter interface {
+	ValidateHostWorkspace(context.Context, string, string, string) error
+	DeleteHostWorkspace(context.Context, string, string) error
 }
 
 type hostDefaultWorkspaceLookup interface {
@@ -150,7 +158,7 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 	}
 	return &hostService{
 		hosts: options.Hosts, users: options.Users, workspaces: options.Workspaces, workspaceVolumes: options.WorkspaceVolumes,
-		defaultWorkspaces: options.DefaultWorkspaces, tokens: options.Tokens,
+		defaultWorkspaces: options.DefaultWorkspaces, hostWorkspaceDeleter: options.HostWorkspaceDeleter, tokens: options.Tokens,
 		sandboxes: options.Sandboxes, volumes: options.Volumes, diskCapacity: options.DiskCapacity,
 		probe: options.Probe, runtime: options.Runtime, audit: options.Audit, createLocks: options.CreateLocks, sealer: options.Sealer,
 		templates: templates, defaultTemplateID: options.DefaultTemplateID, capacity: options.Capacity, instance: options.Instance,
@@ -184,11 +192,7 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 	}
 
 	sortedWorkspaceIDs := append([]string(nil), command.WorkspaceIDs...)
-	if command.WorkspaceIDs == nil {
-		if principal.Kind != identity.KindSession {
-			return host.Host{}, domain.NewError(domain.CodeForbidden, "portal session required to create a Workspace automatically")
-		}
-	} else {
+	if command.WorkspaceIDs != nil {
 		if len(sortedWorkspaceIDs) != 1 {
 			return host.Host{}, domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
 		}
@@ -229,6 +233,9 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		}
 	}
 	if command.WorkspaceIDs == nil {
+		if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
+			return host.Host{}, err
+		}
 		unlock := func() error { return nil }
 		if locker, ok := s.hosts.(hostDefaultCreationLocker); ok {
 			var lockErr error
@@ -262,13 +269,13 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		if s.defaultWorkspaces == nil {
 			return host.Host{}, domain.NewError(domain.CodeInternal, "default workspace provider is unavailable")
 		}
-		selected, err := s.defaultWorkspaces.EnsureDefaultWorkspace(ctx, principal.UserID)
+		selected, err := s.defaultWorkspaces.CreateHostWorkspace(ctx, principal.UserID, command.IdempotencyKey)
 		if err != nil {
 			return host.Host{}, err
 		}
 		if !domain.ValidWorkspaceID(selected.ID) || selected.OwnerID != principal.UserID ||
 			selected.State != workspace.StateReady || selected.DeletedAt != nil {
-			return host.Host{}, domain.NewError(domain.CodeInvalidState, "default workspace is unavailable")
+			return host.Host{}, domain.NewError(domain.CodeInvalidState, "computer storage is unavailable")
 		}
 		sortedWorkspaceIDs = []string{selected.ID}
 	}

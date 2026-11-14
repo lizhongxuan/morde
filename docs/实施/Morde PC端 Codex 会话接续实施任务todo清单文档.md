@@ -2,7 +2,16 @@
 
 需求依据：[Morde PC 端 Codex 会话接续需求文档](../Morde%20PC端%20Codex%20会话接续需求文档.md)。实现边界依据：[设计方案](../Morde%20PC端%20Codex%20会话接续设计方案.md)、根目录 AGENTS.md、server/AGENTS.md、clients/nanoMuse/AGENTS.md 与 runtime/morde-cloud-runtime/AGENTS.md。
 
-当前状态：CX-00 至 CX-06 的实现与静态复核已完成；CX-07 统一验证待后续执行。运行中外部 GUI turn 会通过有界快照回传可见项，终态仍需连续稳定快照；外部 GUI 的审批/问题若无原 RPC handle 则明确不可代答。云端保留合法问题文本并按 snapshot/live/approval scope 校验；iOS 在仅撤销 live 时保留 read 历史、撤销 read 或确认会话不存在时清理历史，并按请求 ID/version 阻止重复回答。尚未运行测试、构建或迁移，也未执行真实设备验收；Codex Desktop 外部 GUI 增量、同线程发送和审批尚未实测，完成 CX-07 前不得宣称全功能可用。
+当前状态：CX-00 至 CX-06 的实现已完成，PC 新增本地 Codex 会话管理窗口；CX-07 统一验证待后续执行。运行中外部 GUI turn 会通过有界快照回传可见项，终态仍需连续稳定快照；外部 GUI 的审批/问题若无原 RPC handle 则明确不可代答。云端保留合法问题文本并按 snapshot/live/approval scope 校验；iOS 在仅撤销 live 时保留 read 历史、撤销 read 或确认会话不存在时清理历史，并按请求 ID/version 阻止重复回答。尚未运行测试、构建或迁移，也未执行真实设备验收；Codex Desktop 外部 GUI 增量、同线程发送和审批尚未实测，完成 CX-07 前不得宣称全功能可用。
+
+## 使用方法
+
+1. 在 Morde PC 登录账号，打开应用菜单的“设置 → Codex 会话与授权”。
+2. 点击“添加 Codex 配置”，先选择已有 Codex 登录状态的 `CODEX_HOME` 文件夹，再选择本机 `codex` 可执行文件；常见配置目录为 `~/.codex`。该操作不上传 Codex 凭证。
+3. 选择一个 profile 并刷新本机 Codex 会话。每个要接续的会话单独授权；`读取历史`、`实时更新`、`发送消息`是默认勾选范围，`中断任务`和`处理审批`需要主动勾选。撤销会话授权可随时停止后续同步与操作。
+4. 在 Morde iOS 打开“Codex 会话”，选择已授权的 PC 和会话，即可查看历史与状态；按授权范围发送消息或处理审批。PC 端 Morde 需保持运行并联网以领取命令和同步授权范围内的 Codex 可见事件。
+
+本地管理窗口与 Codex App Server 的实际运行交互仍待 CX-07 在真实 Morde PC/Codex 环境验收；未通过该验收前，不承诺每种 Codex Desktop GUI 更新和审批都可接续。
 
 ## 修改边界与现状
 
@@ -10,7 +19,7 @@
 - 云端只处理身份、授权、持久命令、会话映射和可见事件；Codex Provider 在用户 PC 上调用官方 codex app-server。不得为此功能创建 DSH Task、云端 Agent 循环或第二套 Morde Agent Runtime。
 - 现有 /api/hub 是已认证的 Client 安装 WebSocket，但本功能不依赖 Hub 唤醒：PC 使用已认证 HTTPS API 每 2 秒领取持久命令，避免内存态 presence/call 语义成为交付依赖。不得把 Hub 当持久命令队列或 Codex 事件日志。
 - 现有 /api/conversations/:id/messages 进入云端 Task 路由，基础 Conversation 与云端 Host 关联，消息存储存在 Task 关联。Codex 走独立 Codex session/command/event API，不改普通 Morde Agent 对话语义。
-- 桌面发行入口为 clients/desktop/harness/desktop；Electron main 是 src/morde-main.ts，Morde 助手通过 Portal WebContentsView 加载。当前发行包没有 /api/hub client 或 Codex Provider；clients/desktop/harness/dsh-nanomuse/src/hub.ts 不在 Electron 编译/打包路径内。PC 新增 Hub/Provider 必须进入已打包的 main/IPC/preload 路径。旧 clients/desktop/nanomuse/coding/agents.py 和 runner.py 扫描私有记录并调用 codex exec resume，不得作为新 Provider。
+- 桌面发行入口为 clients/desktop/harness/desktop；Electron main 是 src/morde-main.ts，Morde 助手通过 Portal WebContentsView 加载。本次 Codex Provider、会话管理窗口和受限 IPC 入口位于 Electron 已打包的 main/preload/resources 路径；客户端通过 HTTPS 持久命令接口工作，不依赖 Hub。clients/desktop/harness/dsh-nanomuse/src/hub.ts 不在该 Electron 编译/打包路径内。旧 clients/desktop/nanomuse/coding/agents.py 和 runner.py 扫描私有记录并调用 codex exec resume，不作为本功能 Provider。
 - iOS 工程为 clients/nanoMuse/android/src/ios/Morde.xcodeproj、scheme Morde，target 使用显式 source membership；新增 Swift 源文件要登记。现有 Morde 任务 SSE 游标允许跳号，不可直接复用为 Codex 严格 gap cursor。只改 Morde iOS 所需源码、测试和 Localizable.xcstrings；Android 不在本范围。
 - 服务端遵循 server/AGENTS.md：Gin handler → app → domain/store，PostgreSQL/pgxpool、goose、sqlc，OpenAPI 唯一合同。新增或变更接口同步 server/openapi/portal.yaml、docs/实施/00-总览与公共约定.md 和相关客户端类型。
 - 仓库当前存在其他未提交工作；实现时先复核 git diff 与文件所有权，只提交本功能触及的改动，不覆盖其他工作。

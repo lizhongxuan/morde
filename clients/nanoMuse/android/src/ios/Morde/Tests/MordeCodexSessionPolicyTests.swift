@@ -19,13 +19,81 @@ final class MordeCodexSessionPolicyTests: XCTestCase {
     }
 
     func testSessionDecodesThreadIDLastSequenceAndActivityDate() throws {
-        let data = Data(#"{"id":"l0000001","installation_id":"i0000001","thread_id":"native-thread-12345678","title":"Example","cwd_label":"project","updated_at":"2026-11-14T00:00:00Z","status":"in_progress","scopes":["read","live"],"last_sequence":42}"#.utf8)
+        let data = Data(#"{"id":"l0000001","installation_id":"i0000001","profile_key":"profile-a","thread_id":"native-thread-12345678","title":"Example","cwd_label":"project","updated_at":"2026-11-14T00:00:00Z","status":"in_progress","scopes":["read","live"],"last_sequence":42}"#.utf8)
         let session = try JSONDecoder().decode(MordeCodexSession.self, from: data)
         XCTAssertEqual(session.current_sequence, 42)
+        XCTAssertEqual(session.profile_key, "profile-a")
         XCTAssertEqual(session.shortThreadID, "12345678")
         XCTAssertNotNil(session.updatedAtDate)
         XCTAssertTrue(MordeCodexEventPolicy.isValidSessionID(session.id))
         XCTAssertFalse(MordeCodexEventPolicy.isValidSessionID("cx1234567"))
+    }
+
+    func testLegacySessionWithoutProfileKeyRemainsReadable() throws {
+        let data = Data(#"{"id":"l0000001","installation_id":"i0000001","thread_id":"native-thread-12345678","title":"Example","cwd_label":"project","status":"idle","scopes":["read"],"last_sequence":0}"#.utf8)
+        let session = try JSONDecoder().decode(MordeCodexSession.self, from: data)
+        XCTAssertNil(session.profile_key)
+        XCTAssertEqual(MordeCodexSessionScopePolicy.sessions([session], profileKey: nil), [session])
+    }
+
+    func testSessionCursorRejectsEmptyImmediateAndRepeatedPageTokens() {
+        XCTAssertTrue(MordeCodexSessionScopePolicy.acceptsNextCursor("next", after: nil, seen: []))
+        XCTAssertTrue(MordeCodexSessionScopePolicy.acceptsNextCursor(nil, after: "current", seen: ["prior"]))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.acceptsNextCursor("", after: nil, seen: []))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.acceptsNextCursor("current", after: "current", seen: []))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.acceptsNextCursor("prior", after: "current", seen: ["prior"]))
+    }
+
+    func testSessionRefreshOnlyRemovesMissingSessionsAfterFinalPage() {
+        let previous: Set<String> = ["l0000001", "l0000002"]
+        let observed: Set<String> = ["l0000001"]
+        XCTAssertEqual(MordeCodexSessionScopePolicy.sessionsMissingFromCompletedRefresh(
+            previous: previous, observed: observed, finished: false), [])
+        XCTAssertEqual(MordeCodexSessionScopePolicy.sessionsMissingFromCompletedRefresh(
+            previous: previous, observed: observed, finished: true), ["l0000002"])
+    }
+
+    func testSessionProfilesCanBeFilteredWithinAnInstallation() throws {
+        func session(_ id: String, profileKey: String) throws -> MordeCodexSession {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "id": id, "installation_id": "i0000001", "profile_key": profileKey,
+                "thread_id": "thread-\(profileKey)", "title": profileKey, "cwd_label": "project",
+                "status": "idle", "scopes": ["read", "live"], "last_sequence": 0,
+            ])
+            return try JSONDecoder().decode(MordeCodexSession.self, from: data)
+        }
+        let sessions = [try session("l0000001", profileKey: "profile-a"),
+                        try session("l0000002", profileKey: "profile-b")]
+        XCTAssertEqual(MordeCodexSessionScopePolicy.profileKeys(in: sessions), ["profile-a", "profile-b"])
+        XCTAssertEqual(MordeCodexSessionScopePolicy.sessions(sessions, profileKey: "profile-b").map(\.id),
+                       ["l0000002"])
+        XCTAssertEqual(MordeCodexSessionScopePolicy.sessions(sessions, profileKey: nil), sessions)
+    }
+
+    func testProfileConnectionDecodesDiscoveryAndHistoryProgress() throws {
+        let data = Data(#"{"installation_id":"i0000001","profile_key":"profile-a","scopes":["read","live","send"],"grant_version":2,"connected":true,"updated_at":"2026-11-14T00:00:00Z","session_discovery":{"state":"partial","error_code":"connection_lost","updated_at":"2026-11-14T00:01:00Z"},"history_sync":{"discovered_sessions":4,"history_complete_sessions":2,"pending_upload_event_count":5}}"#.utf8)
+        let connection = try JSONDecoder().decode(MordeCodexProfileConnection.self, from: data)
+        XCTAssertTrue(MordeCodexProfileConnectionPolicy.isValid(connection, installationID: "i0000001"))
+        XCTAssertEqual(connection.session_discovery?.state, "partial")
+        XCTAssertEqual(connection.session_discovery?.error_code, "connection_lost")
+        XCTAssertEqual(connection.history_sync?.discovered_sessions, 4)
+        XCTAssertEqual(connection.history_sync?.history_complete_sessions, 2)
+        XCTAssertEqual(connection.history_sync?.pending_upload_event_count, 5)
+        XCTAssertFalse(MordeCodexProfileConnectionPolicy.isValid(connection, installationID: "i0000002"))
+    }
+
+    func testProfileConnectionWithoutReportedStatusIsValidFirstSyncState() throws {
+        let data = Data(#"{"installation_id":"i0000001","profile_key":"profile-a","scopes":["read","live"],"grant_version":1,"connected":true,"updated_at":"2026-11-14T00:00:00Z","session_discovery":null,"history_sync":null}"#.utf8)
+        let connection = try JSONDecoder().decode(MordeCodexProfileConnection.self, from: data)
+        XCTAssertTrue(MordeCodexProfileConnectionPolicy.isValid(connection, installationID: "i0000001"))
+        XCTAssertNil(connection.session_discovery)
+        XCTAssertNil(connection.history_sync)
+    }
+
+    func testProfileConnectionRejectsInconsistentHistoryCounts() throws {
+        let data = Data(#"{"installation_id":"i0000001","profile_key":"profile-a","scopes":["read","live"],"grant_version":1,"connected":true,"updated_at":"2026-11-14T00:00:00Z","session_discovery":{"state":"synced","error_code":null,"updated_at":"2026-11-14T00:01:00Z"},"history_sync":{"discovered_sessions":1,"history_complete_sessions":2,"pending_upload_event_count":0}}"#.utf8)
+        let connection = try JSONDecoder().decode(MordeCodexProfileConnection.self, from: data)
+        XCTAssertFalse(MordeCodexProfileConnectionPolicy.isValid(connection, installationID: "i0000001"))
     }
 
     func testCursorReportsDuplicatesAndMissingSequence() {
@@ -46,6 +114,23 @@ final class MordeCodexSessionPolicyTests: XCTestCase {
 
         let final = event(3, "three", kind: "assistant_message", itemID: "item", text: "Hello!")
         XCTAssertEqual(MordeCodexEventPolicy.timelineItems(deltas + [final]).first?.text, "Hello!")
+    }
+
+    func testReasoningSummaryIsExpandableAndPrivateReasoningIsNotExposed() {
+        let summary = MordeCodexEventPolicy.timelineItems([
+            event(1, "summary-1", kind: "reasoning_summary", text: "Public reasoning summary")
+        ]).first
+        XCTAssertEqual(summary?.kind, .reasoning)
+        XCTAssertNil(summary?.text)
+        XCTAssertEqual(summary?.details, [MordeCodexTimelineDetail(
+            field: .reasoning, text: "Public reasoning summary", state: .complete)])
+
+        let privateReasoning = MordeCodexEventPolicy.timelineItems([
+            event(2, "private-1", kind: "reasoning", text: "private model reasoning")
+        ]).first
+        XCTAssertEqual(privateReasoning?.kind, .unsupported)
+        XCTAssertNil(privateReasoning?.text)
+        XCTAssertTrue(privateReasoning?.details.isEmpty == true)
     }
 
     func testUnknownEventsDoNotExposeUnclassifiedPayloadText() {
@@ -98,6 +183,79 @@ final class MordeCodexSessionPolicyTests: XCTestCase {
         XCTAssertNil(MordeCodexEventPolicy.timelineItems([rawSnapshot]).first?.text)
         let summarized = event(2, "two", kind: "tool_result", text: "Read the page title.")
         XCTAssertEqual(MordeCodexEventPolicy.timelineItems([summarized]).first?.text, "Read the page title.")
+    }
+
+    func testToolCallGroupsInputAndOutputPartsByCallIDInPartOrder() {
+        let events = [
+            payloadEvent(1, "call-1", kind: "tool_call", payload: [
+                "call_id": .string("call-1"), "tool": .string("shell"),
+                "input": .string("second"), "input_part": .integer(1), "input_parts": .integer(2),
+            ]),
+            payloadEvent(2, "call-2", kind: "tool_call", payload: [
+                "call_id": .string("call-1"), "summary": .string("Run command"),
+                "input": .string("first"), "input_part": .integer(0), "input_parts": .integer(2),
+            ]),
+            payloadEvent(3, "result-1", kind: "tool_result", payload: [
+                "call_id": .string("call-1"), "output": .string(" world"),
+                "output_part": .integer(1), "output_parts": .integer(2),
+            ]),
+            payloadEvent(4, "result-2", kind: "tool_result", payload: [
+                "call_id": .string("call-1"), "output": .string("Hello"),
+                "output_part": .integer(0), "output_parts": .integer(2),
+            ], status: "completed"),
+        ]
+
+        let items = MordeCodexEventPolicy.timelineItems(events)
+        XCTAssertEqual(items.count, 1)
+        let item = items[0]
+        XCTAssertEqual(item.id, "tool-call-1")
+        XCTAssertEqual(item.sequence, 1)
+        XCTAssertEqual(item.text, "Run command")
+        XCTAssertEqual(item.status, "completed")
+        XCTAssertEqual(item.details.map(\.field), [.input, .output])
+        XCTAssertEqual(item.details[0].text, "firstsecond")
+        XCTAssertEqual(item.details[0].state, .complete)
+        XCTAssertEqual(item.details[1].text, "Hello world")
+        XCTAssertEqual(item.details[1].state, .complete)
+    }
+
+    func testDeclaredOutputSnapshotReplacesOverlappingStaleDeltas() {
+        let events = [
+            payloadEvent(1, "call-1", kind: "tool_call", payload: [
+                "call_id": .string("call-1"), "tool": .string("shell"),
+            ]),
+            payloadEvent(2, "delta-0", kind: "tool_output_delta", payload: [
+                "call_id": .string("call-1"), "output": .string("stale delta"), "output_part": .integer(0),
+            ]),
+            payloadEvent(3, "snapshot-0", kind: "tool_result", payload: [
+                "call_id": .string("call-1"), "output": .string("final "),
+                "output_part": .integer(0), "output_parts": .integer(2),
+            ]),
+            payloadEvent(4, "snapshot-1", kind: "tool_result", payload: [
+                "call_id": .string("call-1"), "output": .string("output"),
+                "output_part": .integer(1), "output_parts": .integer(2),
+            ]),
+        ]
+
+        let output = MordeCodexEventPolicy.timelineItems(events).first?.details
+            .first(where: { $0.field == .output })
+        XCTAssertEqual(output?.text, "final output")
+        XCTAssertEqual(output?.state, .complete)
+    }
+
+    func testIncompleteToolInputAndUnsealedOutputAreMarkedInTimeline() {
+        let call = payloadEvent(1, "call-1", kind: "tool_call", payload: [
+            "call_id": .string("call-1"), "tool": .string("mcp"),
+            "input": .string("partial"), "input_part": .integer(0), "input_parts": .integer(2),
+        ])
+        let outputDelta = payloadEvent(2, "result-1", kind: "tool_result", payload: [
+            "call_id": .string("call-1"), "output": .string("still arriving"), "output_part": .integer(0),
+        ])
+
+        let item = MordeCodexEventPolicy.timelineItems([call, outputDelta]).first
+        XCTAssertEqual(item?.details.first(where: { $0.field == .input })?.state, .incomplete)
+        XCTAssertEqual(item?.details.first(where: { $0.field == .output })?.state, .streaming)
+        XCTAssertEqual(item?.details.first(where: { $0.field == .output })?.text, "still arriving")
     }
 
     func testPendingApprovalWithoutOptionalExpiryCanBeAnsweredWithServerVersionCheck() {
@@ -224,6 +382,58 @@ final class MordeCodexSessionPolicyTests: XCTestCase {
         XCTAssertFalse(MordeCodexSessionScopePolicy.shouldClearReadHistory(afterRefreshing: nil))
     }
 
+    func testLateReadResponsesRequireCurrentSessionInstallationAndScopes() throws {
+        func session(scopes: [String]) throws -> MordeCodexSession {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "id": "l0000001", "installation_id": "i0000001", "thread_id": "thread-1",
+                "title": "Example", "cwd_label": "project", "status": "idle",
+                "scopes": scopes, "last_sequence": 1,
+            ])
+            return try JSONDecoder().decode(MordeCodexSession.self, from: data)
+        }
+        let readable = try session(scopes: ["read", "live"])
+        XCTAssertTrue(MordeCodexSessionScopePolicy.permitsReadResponse(readable,
+            selectedSessionID: readable.id, installationAuthorized: true, revoked: false))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsReadResponse(readable,
+            selectedSessionID: "l0000002", installationAuthorized: true, revoked: false))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsReadResponse(readable,
+            selectedSessionID: readable.id, installationAuthorized: false, revoked: false))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsReadResponse(readable,
+            selectedSessionID: readable.id, installationAuthorized: true, revoked: true))
+        let unreadable = try session(scopes: ["send"])
+        let readOnly = try session(scopes: ["read"])
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsReadResponse(unreadable,
+            selectedSessionID: "l0000001", installationAuthorized: true, revoked: false))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsReadResponse(readOnly,
+            selectedSessionID: "l0000001", installationAuthorized: true, revoked: false, requireLive: true))
+    }
+
+    func testLateCommandResponsesRequireCurrentReadAndActionGrants() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "id": "l0000001", "installation_id": "i0000001", "thread_id": "thread-1",
+            "title": "Example", "cwd_label": "project", "status": "idle",
+            "scopes": ["read", "send"], "last_sequence": 1,
+        ])
+        let sendable = try JSONDecoder().decode(MordeCodexSession.self, from: data)
+        XCTAssertTrue(MordeCodexSessionScopePolicy.permitsCommandResponse(sendable,
+            installationAuthorized: true, revoked: false, requiredScope: "send"))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsCommandResponse(sendable,
+            installationAuthorized: false, revoked: false, requiredScope: "send"))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsCommandResponse(sendable,
+            installationAuthorized: true, revoked: true, requiredScope: "send"))
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsCommandResponse(sendable,
+            installationAuthorized: true, revoked: false, requiredScope: "approval"))
+
+        let noReadData = try JSONSerialization.data(withJSONObject: [
+            "id": "l0000001", "installation_id": "i0000001", "thread_id": "thread-1",
+            "title": "Example", "cwd_label": "project", "status": "idle",
+            "scopes": ["send"], "last_sequence": 1,
+        ])
+        let noRead = try JSONDecoder().decode(MordeCodexSession.self, from: noReadData)
+        XCTAssertFalse(MordeCodexSessionScopePolicy.permitsCommandResponse(noRead,
+            installationAuthorized: true, revoked: false, requiredScope: "send"))
+    }
+
     func testQuestionRequestRejectsDuplicateQuestionIDs() {
         let duplicate = MordeCodexJSONValue.object(["id": .string("q1"), "header": .string("Choice"),
             "question": .string("Which option?"), "options": .array([])])
@@ -257,6 +467,14 @@ final class MordeCodexSessionPolicyTests: XCTestCase {
         MordeCodexEvent(session_id: "l0000001", sequence: sequence, provider_event_id: providerID,
                         kind: kind, occurred_at: "2026-11-14T00:00:00Z", turn_id: nil, item_id: itemID,
                         parent_item_id: nil, status: nil, payload: ["text": .string(text)],
+                        stored_at: "2026-11-14T00:00:00Z")
+    }
+
+    private func payloadEvent(_ sequence: Int64, _ providerID: String, kind: String,
+                             payload: [String: MordeCodexJSONValue], status: String? = nil) -> MordeCodexEvent {
+        MordeCodexEvent(session_id: "l0000001", sequence: sequence, provider_event_id: providerID,
+                        kind: kind, occurred_at: "2026-11-14T00:00:00Z", turn_id: "turn-1", item_id: nil,
+                        parent_item_id: nil, status: status, payload: payload,
                         stored_at: "2026-11-14T00:00:00Z")
     }
 

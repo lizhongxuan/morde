@@ -189,6 +189,10 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err != nil {
 			return err
 		}
+		plan, err := latestTaskPlan(ctx, tx, row.ID, *projected[0].CurrentRevision)
+		if err != nil {
+			return err
+		}
 		result = app.TaskDetails{
 			Task: projected[0], AssistantMessage: assistantMessage, CurrentRevisionStarted: &currentRevisionStarted,
 			Dependencies: dependencies, ChildJobs: childJobs, ResultReview: resultReview,
@@ -196,7 +200,7 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 			ScheduleObservation: scheduleObservation, Steps: steps, Agents: agents,
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
 			PendingRequest: pendingRequest, ClarificationRequests: clarifications,
-			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs,
+			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan,
 		}
 		return nil
 	})
@@ -1030,6 +1034,14 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 			return fmt.Errorf("read claimed task: %w", err)
 		}
 		claimed = rowTaskDomain(row)
+		if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET state='running',updated_at=clock_timestamp()
+WHERE task_id=$1 AND state IN ('accepted','unknown')`, claimed.ID); err != nil {
+			return fmt.Errorf("start accepted conversation variant operation: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_message_variants
+WHERE task_id=$1 AND action='regenerate_text' AND state IN ('accepted','running','unknown'))`, claimed.ID).Scan(&claimed.ToolsDisabled); err != nil {
+			return fmt.Errorf("read Task text-only variant policy: %w", err)
+		}
 		claimed.ConversationContext = conversationContext
 		claimed.DependencyResults = dependencyResults
 		stepRetry, err := loadClaimedStepRetryIntent(ctx, tx, claimed.ID, claimed.CurrentRevision)
@@ -1509,6 +1521,22 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			return task.Event{}, domain.InvalidArgument("personal_mutation", "personal mutation progress is invalid")
 		}
 	}
+	if plan := progress.CloudDSHTaskPlan; plan != nil {
+		call := progress.ToolCall
+		if progress.CloudDSHPersonalMutation != nil || progress.CloudDSHSkillRead != nil || progress.Status != task.StatusRunning ||
+			progress.Event.Type != "task.plan" || len(progress.Steps) != 1 || call == nil ||
+			!app.ValidCloudDSHTaskPlanCommit(*plan) || call.AgentSessionID != plan.AgentSessionID ||
+			call.AuthorizationVersion != plan.AuthorizationVersion || call.TaskRevision != plan.Plan.TaskRevision ||
+			call.CallKey != app.AgentOperationKey(plan.CallID) || call.ToolName != "morde_task_plan_update" ||
+			progress.Steps[0].Status != task.StepSucceeded {
+			return task.Event{}, domain.InvalidArgument("task_plan", "task plan progress fields are invalid")
+		}
+		if err := app.ValidateCloudDSHTaskPlanEvent(progress.Event.Payload, *plan); err != nil {
+			return task.Event{}, err
+		}
+	} else if progress.Event.Type == "task.plan" {
+		return task.Event{}, domain.InvalidArgument("task_plan", "task plan commit is required")
+	}
 	var result task.Event
 	var authorizationDenied bool
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
@@ -1726,6 +1754,16 @@ WHERE t.id=$1 AND t.owner_id=$2 AND ec.state='enabled' AND ec.epoch=t.execution_
 				if existing.Type != "task.step" || validateCloudDSHSkillReadEvent(existing.Payload, *skillRead) != nil {
 					return domain.NewError(domain.CodeInvalidState, "cloud dsh skill replay fingerprint changed")
 				}
+				result = existing
+				return nil
+			}
+		}
+		if plan := progress.CloudDSHTaskPlan; plan != nil {
+			existing, found, err := validateCloudDSHTaskPlanProgress(ctx, tx, currentTask, progress, *plan)
+			if err != nil {
+				return err
+			}
+			if found {
 				result = existing
 				return nil
 			}
@@ -2099,6 +2137,7 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 				return err
 			}
 		}
+		variantAssistantMessageID := ""
 		if progress.PublishResultMessage && progress.Status == task.StatusCompleted {
 			if current.ExecutionLocation != "server" {
 				return domain.NewError(domain.CodeInvalidState, "completed assistant result requires server execution")
@@ -2115,8 +2154,15 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 WHERE task_id=$1 AND sequence=$2 AND event_type='task.result'`, progress.TaskID, sequence, taskRevision, progress.Result); err != nil {
 				return fmt.Errorf("record completed Task revision: %w", err)
 			}
+			var continuationOperationID string
+			if err := tx.QueryRow(ctx, `SELECT operation_id FROM conversation_message_variants
+WHERE task_id=$1 AND action='continue_generation' AND state IN ('accepted','running','unknown')
+ORDER BY variant_version DESC LIMIT 1`, progress.TaskID).Scan(&continuationOperationID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("read continuation variant completion policy: %w", err)
+			}
+			continuingVariant := continuationOperationID != ""
 			queued := false
-			if automaticallyRouted {
+			if automaticallyRouted && !continuingVariant {
 				var err error
 				queued, err = queueConversationResultInTx(ctx, tx, progress.TaskID, taskRevision, sequence, progress.Result, maxConversationResultWindow)
 				if err != nil {
@@ -2137,7 +2183,20 @@ WHERE task_id=$1 FOR UPDATE`, progress.TaskID).Scan(&snapshotID, &snapshotTurn, 
 				messageID := ""
 				if snapshotErr == nil && sameRevision && snapshotStatus == string(app.AssistantMessageInterrupted) &&
 					snapshotTurn == progress.CurrentStep && snapshotContent != "" && strings.HasPrefix(progress.Result, snapshotContent) && domain.ValidMessageID(snapshotID) {
-					messageID = snapshotID
+					canCompleteSnapshot := !continuingVariant
+					if continuingVariant {
+						// A continuation can finish its own streamed vN+1 row, but it
+						// must never complete the interrupted assistant row it was
+						// created to continue.
+						if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_messages
+WHERE id=$1 AND task_id=$2 AND variant_operation_id=$3 AND output_task_revision=$4)`,
+							snapshotID, progress.TaskID, continuationOperationID, taskRevision).Scan(&canCompleteSnapshot); err != nil {
+							return fmt.Errorf("verify continuation assistant version lineage: %w", err)
+						}
+					}
+					if canCompleteSnapshot {
+						messageID = snapshotID
+					}
 				}
 				if alreadySaved {
 					messageID = snapshotID
@@ -2181,6 +2240,7 @@ WHERE id=$3 AND task_id=$4 AND conversation_id=$5 AND owner_id=$6 AND actor_id=$
 						return err
 					}
 				}
+				variantAssistantMessageID = messageID
 				if _, err := tx.Exec(ctx, `UPDATE task_assistant_message_snapshots SET task_revision=$2,result_event_sequence=$3
 WHERE task_id=$1 AND message_id=$4 AND status='completed'`, progress.TaskID, taskRevision, sequence, messageID); err != nil {
 					return fmt.Errorf("record completed assistant result evidence: %w", err)
@@ -2205,11 +2265,22 @@ WHERE task_id=$1 AND message_id=$4 AND status='completed'`, progress.TaskID, tas
 				return err
 			}
 		}
+		if finished {
+			variantState := "failed"
+			if progress.Status == task.StatusCompleted {
+				variantState = "completed"
+			}
+			if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET state=$2,
+assistant_message_id=COALESCE(NULLIF($3,''),assistant_message_id),updated_at=clock_timestamp()
+WHERE task_id=$1 AND state IN ('accepted','running','unknown')`, progress.TaskID, variantState, variantAssistantMessageID); err != nil {
+				return fmt.Errorf("settle conversation variant operation: %w", err)
+			}
+		}
 		result = task.Event{TaskID: progress.TaskID, Sequence: sequence, Type: progress.Event.Type, Payload: eventPayload, CreatedAt: createdAt}
 		return nil
 	})
 	if err == nil && authorizationDenied {
-		if progress.CloudDSHPersonalMutation != nil || progress.CloudDSHSkillRead != nil {
+		if progress.CloudDSHPersonalMutation != nil || progress.CloudDSHSkillRead != nil || progress.CloudDSHTaskPlan != nil {
 			return task.Event{}, domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 		}
 		return task.Event{}, taskLeaseConflict()

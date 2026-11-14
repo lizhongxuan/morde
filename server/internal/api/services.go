@@ -17,7 +17,6 @@ import (
 )
 
 type WorkspaceService interface {
-	CreateWorkspace(context.Context, identity.Principal, app.CreateWorkspaceCommand, string) (workspace.Workspace, error)
 	ListWorkspaces(context.Context, identity.Principal) ([]workspace.Workspace, error)
 	ListDeviceWorkspaces(context.Context, identity.Principal) ([]app.DeviceWorkspaceInfo, error)
 	GetWorkspace(context.Context, identity.Principal, string) (workspace.Workspace, error)
@@ -36,6 +35,11 @@ type WorkspaceSyncService interface {
 	StreamSyncBlock(context.Context, identity.Principal, string, string, string, func(int64, []byte) error) error
 	AckDownloadedBlock(context.Context, identity.Principal, string, string, string) error
 	AckDownloadAction(context.Context, identity.Principal, string, string, string, workspace.ChangeAction, string, int64) error
+}
+
+type WorkspaceSyncCheckpointRecoveryService interface {
+	RecoverSyncSession(context.Context, identity.Principal, string, string) (workspace.SyncSession, error)
+	CheckpointRecoveryEnabled() bool
 }
 
 // TaskMediaService exposes previews. GenerationReady is true only when the

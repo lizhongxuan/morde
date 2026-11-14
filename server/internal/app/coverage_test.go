@@ -349,14 +349,15 @@ func TestCoverageDeleteHostBeginsDeletionAndRejectsHostCredential(t *testing.T) 
 	value := hostServiceTestHost(host.StateRunning)
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})
-	deleted, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID})
+	deleted, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID, ConfirmWorkspaceDeletion: true})
 	if err != nil || deleted.State != host.StateDeleting {
 		t.Fatalf("Delete() = %#v, %v", deleted, err)
 	}
-	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID}); err != nil {
+	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID, ConfirmWorkspaceDeletion: true}); err != nil {
 		t.Fatalf("Delete(already deleting) = %v", err)
 	}
 	principal := hostServiceTestPrincipal()
@@ -470,36 +471,35 @@ func TestCoverageLoadSealerAndWorkerAppFacade(t *testing.T) {
 	}
 }
 
-func TestCoverageWorkerRetainsWorkspaceAndLegacyRootAfterHostDeletion(t *testing.T) {
+func TestCoverageWorkerDeletesBoundWorkspaceWithHost(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateDeleting)
 	value.SandboxID = ""
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID,
 		State: workspace.StateReady,
 	})
-	volume := service.volumes.(*hostServiceTestVolume)
-	volume.errByName = map[string]error{domain.WorkspaceRootVolumeName(value.ID): errors.New("volume is still mounted")}
 	worker := newWorkerAppTest(t, service)
 	if _, err := worker.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile() with retained legacy volume = %v", err)
+		t.Fatalf("Reconcile() deleting bound computer storage = %v", err)
 	}
 	workspaceAfterDelete, err := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if err != nil || workspaceAfterDelete.State != workspace.StateReady {
+	if err != nil || workspaceAfterDelete.State != workspace.StateDeleted || workspaceAfterDelete.DeletedAt == nil {
 		t.Fatalf("workspace after Host deletion = %#v, %v", workspaceAfterDelete, err)
 	}
 	hostAfterDelete, err := deps.hosts.GetHost(context.Background(), value.ID)
 	if err != nil || hostAfterDelete.State != host.StateDeleted {
-		t.Fatalf("Host after retaining old volume = %#v, %v", hostAfterDelete, err)
+		t.Fatalf("Host after storage cleanup = %#v, %v", hostAfterDelete, err)
 	}
 	binding, err := deps.workspaces.GetWorkspaceBinding(context.Background(), value.ID, testHostWorkspaceID(value))
 	if err != nil || binding.State != workspace.BindingDetached {
 		t.Fatalf("binding after Host deletion = %#v, %v", binding, err)
 	}
-	if len(volume.names) != 0 {
-		t.Fatalf("Host deletion removed a retained Workspace or legacy root volume: %v", volume.names)
+	if deps.defaultWorkspace.deleteCalls != 1 {
+		t.Fatalf("computer storage cleanup calls = %d, want 1", deps.defaultWorkspace.deleteCalls)
 	}
 }
 
@@ -726,6 +726,7 @@ func TestCoverageWorkerCleansMatchingSandboxFromOtherProfile(t *testing.T) {
 	value.SandboxID = ""
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})

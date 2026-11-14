@@ -571,13 +571,25 @@ COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
   AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
-) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence
+) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence,
+COALESCE(m.variant_group_id,CASE WHEN m.role='user' THEN m.id ELSE variant_input.group_id END,''),
+COALESCE(m.variant_version,CASE WHEN m.role='user' THEN 1 ELSE variant_input.variant_version END,1),
+COALESCE(m.variant_action,CASE WHEN m.role='user' THEN 'original' ELSE variant_input.variant_action END,'original')
 FROM conversation_messages m LEFT JOIN conversation_message_routes r ON r.message_id=m.id
 LEFT JOIN conversation_message_routes original_route ON original_route.service_instance_id=r.service_instance_id
  AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
  AND original_route.message_id=r.duplicate_of_message_id
 LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
-WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.source_kind<>'task_result_review'
+LEFT JOIN LATERAL (
+ SELECT COALESCE(input.variant_group_id,input.id) AS group_id,COALESCE(input.variant_version,1) AS variant_version,
+  COALESCE(input.variant_action,'original') AS variant_action
+ FROM conversation_messages input WHERE input.conversation_id=m.conversation_id AND input.owner_id=m.owner_id
+  AND input.actor_id=m.actor_id AND input.role='user' AND input.source_kind<>'conversation_variant_input'
+  AND ((m.task_id IS NOT NULL AND input.task_id=m.task_id) OR (m.task_id IS NULL AND input.sequence<m.sequence))
+ ORDER BY CASE WHEN m.task_id IS NOT NULL THEN input.sequence END ASC,
+  CASE WHEN m.task_id IS NULL THEN input.sequence END DESC LIMIT 1
+) variant_input ON true
+WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.source_kind NOT IN ('task_result_review','conversation_variant_input')
   AND ($3::bigint=0 OR m.sequence<$3::bigint)
 ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	if err != nil {
@@ -589,10 +601,12 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		var deliveryStatus, clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
+		var variantGroupID, variantAction string
+		var variantVersion int64
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
 			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
-			&outputStatus, &outputRevision, &outputEvent); err != nil {
+			&outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan conversation message: %w", err)
 		}
@@ -604,6 +618,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
+		message.VariantGroupID, message.VariantVersion, message.VariantAction = variantGroupID, variantVersion, variantAction
 		items = append(items, message)
 	}
 	if err := rows.Err(); err != nil {
@@ -654,7 +669,10 @@ COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
   AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
-) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence
+) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence,
+COALESCE(m.variant_group_id,CASE WHEN m.role='user' THEN m.id ELSE variant_input.group_id END,''),
+COALESCE(m.variant_version,CASE WHEN m.role='user' THEN 1 ELSE variant_input.variant_version END,1),
+COALESCE(m.variant_action,CASE WHEN m.role='user' THEN 'original' ELSE variant_input.variant_action END,'original')
 FROM conversation_messages m
 JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.project_id=$1
 JOIN project_members pm ON pm.project_id=c.project_id AND pm.user_id=$2
@@ -664,7 +682,16 @@ LEFT JOIN conversation_message_routes original_route ON original_route.service_i
  AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
  AND original_route.message_id=r.duplicate_of_message_id
 LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
-WHERE m.conversation_id=$3 AND m.source_kind<>'task_result_review'
+LEFT JOIN LATERAL (
+ SELECT COALESCE(input.variant_group_id,input.id) AS group_id,COALESCE(input.variant_version,1) AS variant_version,
+  COALESCE(input.variant_action,'original') AS variant_action
+ FROM conversation_messages input WHERE input.conversation_id=m.conversation_id AND input.owner_id=m.owner_id
+  AND input.actor_id=m.actor_id AND input.role='user' AND input.source_kind<>'conversation_variant_input'
+  AND ((m.task_id IS NOT NULL AND input.task_id=m.task_id) OR (m.task_id IS NULL AND input.sequence<m.sequence))
+ ORDER BY CASE WHEN m.task_id IS NOT NULL THEN input.sequence END ASC,
+  CASE WHEN m.task_id IS NULL THEN input.sequence END DESC LIMIT 1
+) variant_input ON true
+WHERE m.conversation_id=$3 AND m.source_kind NOT IN ('task_result_review','conversation_variant_input')
   AND ($4::bigint=0 OR m.sequence<$4::bigint)
 ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, limit+1)
 	if err != nil {
@@ -676,10 +703,12 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		var clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
+		var variantGroupID, variantAction string
+		var variantVersion int64
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
 			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
-			&outputStatus, &outputRevision, &outputEvent); err != nil {
+			&outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan project conversation message: %w", err)
 		}
@@ -691,6 +720,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
+		message.VariantGroupID, message.VariantVersion, message.VariantAction = variantGroupID, variantVersion, variantAction
 		items = append(items, message)
 	}
 	if err := rows.Err(); err != nil {
@@ -850,10 +880,13 @@ func (s *Store) attachConversationMessageAttachmentIDs(ctx context.Context, owne
 		messageIDs[index] = item.ID
 		byMessageID[item.ID] = index
 	}
-	rows, err := s.pool.Query(ctx, `SELECT message_id, attachment_id
-FROM conversation_message_attachments
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id=$3 AND message_id=ANY($4::text[])
-ORDER BY message_id, attachment_id`, instanceID, ownerID, conversationID, messageIDs)
+	rows, err := s.pool.Query(ctx, `SELECT requested.message_id,link.attachment_id
+FROM unnest($4::text[]) AS requested(message_id)
+JOIN conversation_message_attachments link ON link.service_instance_id=$1::uuid AND link.owner_id=$2 AND link.conversation_id=$3
+ AND link.message_id IN (requested.message_id,COALESCE((SELECT variant.attachment_source_message_id
+   FROM conversation_message_variants variant WHERE variant.user_message_id=requested.message_id AND variant.actor_id=$2
+     AND variant.attachment_source_message_id IS NOT NULL),requested.message_id))
+ORDER BY requested.message_id,link.attachment_id`, instanceID, ownerID, conversationID, messageIDs)
 	if err != nil {
 		return fmt.Errorf("list conversation message attachments: %w", err)
 	}
@@ -1394,10 +1427,27 @@ func insertMessage(ctx context.Context, tx pgx.Tx, value conversation.Message) e
 		return storeError("reserve message sequence", "conversation", err)
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO conversation_messages
-(id, conversation_id, owner_id, role, content, task_id, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence, delivery_status, actor_id)
-VALUES ($1,$2,$3,$4,$5,$6,COALESCE(NULLIF($7, ''), (SELECT model_id FROM tasks WHERE id=$6), ''),$8,$9,$10,$11,COALESCE(NULLIF($12,''),'applied'),COALESCE(NULLIF($13,''),(SELECT initiator_id FROM tasks WHERE id=$6),$3))`,
+(id, conversation_id, owner_id, role, content, task_id, model_id, source_kind, source_exchange_id, requested_conversation_id,
+ sequence, delivery_status, actor_id, variant_group_id, variant_version, variant_action, variant_operation_id)
+VALUES ($1,$2,$3,$4,$5,$6,COALESCE(NULLIF($7, ''), (SELECT model_id FROM tasks WHERE id=$6), ''),$8,$9,$10,$11,
+COALESCE(NULLIF($12,''),'applied'),COALESCE(NULLIF($13,''),(SELECT initiator_id FROM tasks WHERE id=$6),$3),
+COALESCE(NULLIF($14,''),
+ (SELECT variant_group_id FROM conversation_message_variants WHERE task_id=$6 AND state IN ('accepted','running','unknown') ORDER BY variant_version DESC LIMIT 1),
+ CASE WHEN $4='user' THEN $1 ELSE NULL END,
+ (SELECT COALESCE(input.variant_group_id,input.id) FROM conversation_messages input WHERE input.task_id=$6 AND input.role='user' ORDER BY input.sequence LIMIT 1)),
+COALESCE(NULLIF($15::bigint,0),
+ (SELECT variant_version FROM conversation_message_variants WHERE task_id=$6 AND state IN ('accepted','running','unknown') ORDER BY variant_version DESC LIMIT 1),
+ CASE WHEN $4='user' THEN 1 ELSE NULL END,
+ (SELECT COALESCE(input.variant_version,1) FROM conversation_messages input WHERE input.task_id=$6 AND input.role='user' ORDER BY input.sequence LIMIT 1)),
+COALESCE(NULLIF($16,''),
+ (SELECT action FROM conversation_message_variants WHERE task_id=$6 AND state IN ('accepted','running','unknown') ORDER BY variant_version DESC LIMIT 1),
+ CASE WHEN $4='user' THEN 'original' ELSE NULL END,
+ (SELECT COALESCE(input.variant_action,'original') FROM conversation_messages input WHERE input.task_id=$6 AND input.role='user' ORDER BY input.sequence LIMIT 1)),
+COALESCE(NULLIF($17,''),
+ (SELECT operation_id FROM conversation_message_variants WHERE task_id=$6 AND state IN ('accepted','running','unknown') ORDER BY variant_version DESC LIMIT 1)))`,
 		value.ID, value.ConversationID, value.OwnerID, string(value.Role), value.Content, nullableText(value.TaskID), value.ModelID,
-		stringOrDefault(value.SourceKind, "task"), value.SourceExchangeID, value.RequestedConversationID, sequence, string(value.DeliveryStatus), value.ActorID)
+		stringOrDefault(value.SourceKind, "task"), value.SourceExchangeID, value.RequestedConversationID, sequence, string(value.DeliveryStatus), value.ActorID,
+		value.VariantGroupID, value.VariantVersion, value.VariantAction, value.VariantOperationID)
 	if err != nil {
 		return fmt.Errorf("insert conversation message: %w", err)
 	}

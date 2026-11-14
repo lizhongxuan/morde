@@ -5,6 +5,10 @@ import type { components } from '../api/schema';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
 import { useMessageOutbox } from '../app/use-message-outbox';
+import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
+import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
+import { buildMessageVariantTimeline, createMessageVariant, maxMessageVariantScalars, messageVariantActionLabel, messageVariantContentTooLong } from '../app/message-variants';
+import type { MessageVariantAction, VersionableMessage } from '../app/message-variants';
 import { needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { MessageReceiptOrder } from '../app/message-receipt-order';
 import { deliveryStatusText, routingFailureText, routingStatusText } from '../app/message-status';
@@ -19,6 +23,7 @@ import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { projectApi } from '../app/project-api';
 import type { CreateProjectWorkItemRequest, Project, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectRole, ProjectWorkItem, ProjectWorkItemCategory } from '../app/project-api';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
+import './MessageVariants.css';
 
 type RequestKeyRecord = { fingerprint: string; key: string };
 type ActionNotice = { kind: 'success' | 'error' | 'unknown'; message: string };
@@ -26,6 +31,7 @@ type LedgerEntry = components['schemas']['ProjectBudgetLedgerEntry'];
 type ResourceKind = components['schemas']['ProjectResourceKind'];
 type ProjectMessageReceipt = { projectID: string; conversationID: string };
 type ProjectTask = Awaited<ReturnType<typeof projectApi.tasks>>[number];
+type ProjectVersionableMessage = ProjectConversationMessage & Pick<VersionableMessage, 'variant_group_id' | 'variant_version' | 'variant_action'>;
 
 function definiteProjectMessageAcceptanceFailure(error: unknown) {
   if (!(error instanceof ApiError)) return false;
@@ -126,8 +132,11 @@ function UserProjects() {
   const [projectHostID, setProjectHostID] = useState('');
   const [projectWorkspaceID, setProjectWorkspaceID] = useState('');
   const [projectMessageReceipt, setProjectMessageReceipt] = useState<ProjectMessageReceipt | null>(null);
+  const [selectedMessageVariantVersions, setSelectedMessageVariantVersions] = useState<Record<string, number>>({});
+  const [editingMessageVariant, setEditingMessageVariant] = useState<{ groupID: string; messageID: string; content: string } | null>(null);
   const pendingProjectSave = useRef<Promise<void>>(Promise.resolve());
   const sendingProjectMessages = useRef(new Set<string>());
+  const sendingVariantOperationKeys = useRef(new Set<string>());
   const projectReceiptOrder = useRef(new MessageReceiptOrder());
   const [localOutgoingInvitations, setLocalOutgoingInvitations] = useState<Record<string, ProjectInvitation[]>>({});
   const [pendingAction, setPendingAction] = useState('');
@@ -163,6 +172,7 @@ function UserProjects() {
   const taskWorkspacesQuery = useQuery({ queryKey: ['project-task-workspaces'], queryFn: portalApi.workspaces, enabled: Boolean(projectID), retry: false });
   const projectTaskCapabilitiesQuery = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities, enabled: Boolean(projectID), retry: false });
   const outbox = useMessageOutbox(user?.id, projectTaskCapabilitiesQuery.data?.service_instance_id);
+  const variantOutbox = useMessageVariantOutbox(user?.id, projectTaskCapabilitiesQuery.data?.service_instance_id);
   const activeOutboxScope = useRef(outbox.currentScope);
   useLayoutEffect(() => { activeOutboxScope.current = outbox.currentScope; }, [outbox.currentScope]);
   const projectTaskExecutionReady = projectTaskMock || projectTaskCapabilitiesQuery.data?.supported_features.includes('project_budget_execution') === true;
@@ -203,6 +213,9 @@ function UserProjects() {
   }
   const projectConversationMessages = [...projectMessagesByID.values()].sort((left, right) =>
     left.sequence - right.sequence || left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id));
+  const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
+  const projectVariantTimeline = buildMessageVariantTimeline(projectConversationMessages as ProjectVersionableMessage[], selectedVariantMap);
+  const visibleProjectConversationMessages = projectVariantTimeline.items;
   const readyTextModels = modelConnectionsQuery.data?.items.filter((model) => model.checked_at && model.capabilities.text) ?? [];
   const effectiveProjectModelID = projectModelID || (readyTextModels.length === 1 ? readyTextModels[0]?.id : '') || '';
 
@@ -416,6 +429,78 @@ function UserProjects() {
       setNotice({ kind: 'error', message: errorDetails(error).message });
     },
   });
+
+  const sendProjectVariantOperation = async (entry: MessageVariantOutboxEntry): Promise<boolean> => {
+    const key = entry.operation.input.idempotencyKey;
+    if (sendingVariantOperationKeys.current.has(key)) return false;
+    sendingVariantOperationKeys.current.add(key);
+    try {
+      if (entry.scope !== variantOutbox.currentScope || entry.operation.input.actorID !== user?.id ||
+        entry.operation.input.serviceInstanceID !== projectTaskCapabilitiesQuery.data?.service_instance_id) {
+        throw new Error('账号或服务身份已变化；此操作保留在本机，请核对后重新发起。');
+      }
+      await variantOutbox.change(entry.scope, key, (operation) => ({ ...operation, status: 'sending', error: undefined }));
+      const currentCapabilities = await portalApi.capabilities();
+      if (currentCapabilities.service_instance_id !== entry.operation.input.serviceInstanceID) {
+        throw new Error('服务身份已变化；此操作未重放，请核对后重新发起。');
+      }
+      const result = await createMessageVariant(entry.operation.input);
+      if (result.state === 'unknown') {
+        await variantOutbox.change(entry.scope, key, (operation) => ({ ...operation, status: 'unknown', error: '服务端尚未确认操作结果；重试会复用原操作编号。' }));
+        void queryClient.invalidateQueries({ queryKey: ['project-conversation-messages', entry.operation.input.projectID, entry.operation.input.conversationID] });
+        setNotice({ kind: 'unknown', message: '操作结果待核对；可以使用同一请求编号安全重试。' });
+        return false;
+      }
+      await variantOutbox.remove(entry.scope, key);
+      if (result.state !== 'failed') {
+        setSelectedMessageVariantVersions((current) => ({ ...current, [result.variant_group_id]: result.variant_version }));
+        setEditingMessageVariant((current) => current?.groupID === result.variant_group_id ? null : current);
+      }
+      void queryClient.invalidateQueries({ queryKey: ['project-conversation-messages', entry.operation.input.projectID, entry.operation.input.conversationID] });
+      void queryClient.invalidateQueries({ queryKey: ['project-task-candidates'] });
+      if (result.state === 'failed') {
+        setNotice({ kind: 'error', message: '服务端已确认项目消息版本操作失败；共享历史已刷新。' });
+        return false;
+      }
+      setNotice({ kind: 'success', message: result.state === 'completed' ? '已创建新的项目消息版本。' : '项目消息版本操作已受理，正在更新共享历史。' });
+      return true;
+    } catch (error) {
+      const staleVersion = error instanceof ApiError && error.status === 409;
+      const uncertain = !(error instanceof ApiError) || error.status >= 500 || [408, 425, 429].includes(error.status);
+      const details = errorDetails(error);
+      await variantOutbox.change(entry.scope, key, (operation) => ({ ...operation,
+        status: staleVersion ? 'failed' : uncertain ? 'unknown' : 'failed', error: staleVersion
+          ? '版本已变化，已刷新共享历史；请选中最新版本后重新操作。' : details.message }));
+      if (staleVersion) {
+        await queryClient.invalidateQueries({ queryKey: ['project-conversation-messages', entry.operation.input.projectID, entry.operation.input.conversationID] });
+        setNotice({ kind: 'error', message: '项目消息版本已变化，已刷新共享历史；请核对后再操作。' });
+      } else setNotice({ kind: uncertain ? 'unknown' : 'error', message: uncertain
+        ? '操作结果待核对；可以使用同一请求编号安全重试。' : details.message });
+      return false;
+    } finally {
+      sendingVariantOperationKeys.current.delete(key);
+    }
+  };
+
+  const startProjectVariantOperation = async (groupID: string, messageID: string, action: MessageVariantAction, contentValue?: string) => {
+    const group = projectVariantTimeline.groups.get(groupID);
+    const serviceInstanceID = projectTaskCapabilitiesQuery.data?.service_instance_id;
+    if (!project || !selectedProjectConversation || !group || !user?.id || !serviceInstanceID || !currentMember || currentMember.role === 'viewer') {
+      setNotice({ kind: 'error', message: '项目成员或服务身份尚未确认，无法执行此操作。' });
+      return false;
+    }
+    try {
+      const operation = await variantOutbox.enqueue({
+        projectID: project.id, conversationID: selectedProjectConversation.id, messageID, action,
+        expectedVersion: group.latestVersion, ...(contentValue !== undefined ? { content: contentValue } : {}),
+        serviceInstanceID, actorID: user.id,
+      });
+      return sendProjectVariantOperation(operation);
+    } catch (error) {
+      setNotice({ kind: 'error', message: errorDetails(error).message });
+      return false;
+    }
+  };
 
   const stopProjectTask = (task: ProjectTask) => {
     if (!project || task.initiator_id !== user?.id || task.conversation_id !== selectedProjectConversation?.id) return;
@@ -860,9 +945,18 @@ function UserProjects() {
                   : projectConversationMessagesQuery.isError ? <FloatingError className="error-inline" role="alert">读取共享历史失败：{errorDetails(projectConversationMessagesQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void projectConversationMessagesQuery.refetch()}>重试</button></FloatingError>
                     : !projectConversationMessages.length ? <p className="muted">该共享对话暂无消息。</p>
                       : <ScreenPagination
-                        ariaLabel="项目共享对话消息" items={projectConversationMessages} getKey={(message) => message.id}
+                        ariaLabel="项目共享对话消息" items={visibleProjectConversationMessages} getKey={(message) => message.id}
                         estimatedItemHeight={130} height={620}
                         renderItem={(message) => {
+                        const variantGroupID = projectVariantTimeline.groupByMessageID.get(message.id);
+                        const variantGroup = variantGroupID ? projectVariantTimeline.groups.get(variantGroupID) : undefined;
+                        const selectedVariantVersion = variantGroup ? selectedMessageVariantVersions[variantGroup.id] ?? variantGroup.latestVersion : 1;
+                        const selectedVariantUser = variantGroup?.versions.get(selectedVariantVersion)?.messages.find((candidate) => candidate.role === 'user') as ProjectVersionableMessage | undefined;
+                        const canOperateVariant = currentMember?.role !== 'viewer' && selectedVariantUser?.actor_id === user?.id;
+                        const groupOperations = variantGroup ? variantOutbox.entries.filter((entry) => entry.operation.input.projectID === project.id &&
+                          entry.operation.input.conversationID === message.conversation_id &&
+                          (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
+                        const editingThisMessage = editingMessageVariant?.messageID === message.id;
                         const task = taskByID.get(message.task_id ?? message.related_task_id ?? '');
                         const retryAccepted = retryAcceptedMessageIDs.has(message.id);
                         const retryAcceptedStatus = retryAccepted && ['failed', 'pending', 'processing'].includes(message.routing_status ?? '')
@@ -887,7 +981,20 @@ function UserProjects() {
                             {(message.output_status === 'streaming' || message.output_status === 'interrupted' || messageStatus) &&
                               <span className="status">{message.output_status === 'streaming' ? '生成中' : message.output_status === 'interrupted' ? '已中断' : messageStatus}</span>}
                           </div>
-                          {sourceContentMatches ? <div className="chat-message-source-list">
+                          {editingThisMessage ? <form className="message-variant-edit" onSubmit={(event) => {
+                            event.preventDefault();
+                            if (variantGroupID && editingMessageVariant) void startProjectVariantOperation(variantGroupID, message.id, 'edit_resend', editingMessageVariant.content);
+                          }}>
+                            <label className="sr-only" htmlFor={`project-message-version-edit-${encodeURIComponent(message.id)}`}>编辑项目消息并创建新版本</label>
+                            <textarea id={`project-message-version-edit-${encodeURIComponent(message.id)}`} value={editingMessageVariant.content}
+                              maxLength={maxMessageVariantScalars * 2}
+                              onChange={(event) => setEditingMessageVariant((current) => current?.messageID === message.id ? { ...current, content: event.target.value } : current)} />
+                            {messageVariantContentTooLong(editingMessageVariant.content) && <small role="alert">编辑后的消息不能超过 {maxMessageVariantScalars} 个字符。</small>}
+                            <div className="message-variant-control-actions">
+                              <button type="submit" className="button button-small button-primary" disabled={!editingMessageVariant.content.trim() || messageVariantContentTooLong(editingMessageVariant.content) || groupOperations.some((entry) => entry.operation.status === 'sending')}>创建新版本</button>
+                              <button type="button" className="button button-small button-secondary" onClick={() => setEditingMessageVariant(null)}>取消</button>
+                            </div>
+                          </form> : sourceContentMatches ? <div className="chat-message-source-list">
                             {sources.map((source) => {
                               const sourceMessage = projectConversationMessages.find((candidate) => candidate.id === source.user_message_id);
                               const prompt = sourceMessage?.content.trim().replace(/\s+/g, ' ');
@@ -921,6 +1028,32 @@ function UserProjects() {
                           </p> : null}
                           {message.output_status === 'streaming' && <small role="status">正在生成…</small>}
                           {message.output_status === 'interrupted' && <small role="status">回复已中断</small>}
+                          {variantGroup && <div className="message-variant-controls" aria-label="项目消息版本操作">
+                            {message.role === 'user' && variantGroup.versions.size > 1 && <label className="message-variant-picker">版本
+                              <select aria-label="选择项目消息版本" value={selectedVariantVersion} onChange={(event) => setSelectedMessageVariantVersions((current) => ({
+                                ...current, [variantGroup.id]: Number(event.target.value),
+                              }))}>
+                                {[...variantGroup.versions.values()].sort((left, right) => left.version - right.version).map((version) => <option key={version.version} value={version.version}>
+                                  {`v${version.version} · ${messageVariantActionLabel(version.action)}`}
+                                </option>)}
+                              </select>
+                            </label>}
+                            {message.role === 'user' && message.actor_id === user?.id && currentMember && currentMember.role !== 'viewer' && !editingThisMessage && <button type="button" className="button button-small button-secondary"
+                              disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
+                              onClick={() => setEditingMessageVariant({ groupID: variantGroup.id, messageID: message.id, content: message.content })}>编辑并重发</button>}
+                            {message.role === 'assistant' && message.content.trim() && message.output_status !== 'streaming' && canOperateVariant && <button type="button"
+                              className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
+                              onClick={() => void startProjectVariantOperation(variantGroup.id, message.id, 'regenerate_text')}>重新生成文字</button>}
+                            {message.role === 'assistant' && message.output_status === 'interrupted' && canOperateVariant && <button type="button"
+                              className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
+                              onClick={() => void startProjectVariantOperation(variantGroup.id, message.id, 'continue_generation')}>继续生成</button>}
+                          </div>}
+                          {message.role === 'user' && groupOperations.map((entry) => <div className="message-variant-operation" role="status" key={entry.operation.input.idempotencyKey}>
+                            <span>{entry.operation.status === 'sending' ? '正在创建消息版本…' : entry.operation.status === 'unknown'
+                              ? `操作结果待核对：${entry.operation.error ?? ''}` : entry.operation.error ?? '消息版本操作待发送。'}</span>
+                            {(entry.operation.status === 'unknown' || entry.operation.status === 'pending') && <button type="button" className="button button-small button-secondary"
+                              disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendProjectVariantOperation(entry)}>核对并重试</button>}
+                          </div>)}
                           {message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason === 'message_too_long' &&
                             <p role="alert" className="muted">{routingFailureText(message.routing_failure_reason)}</p>}
                           {message.task_id && <p className="muted">Task {message.task_id} · 状态 {task?.status ?? '未知'}
@@ -953,6 +1086,7 @@ function UserProjects() {
                   : modelConnectionsQuery.isError ? <FloatingError className="error-inline" role="alert">读取模型失败：{errorDetails(modelConnectionsQuery.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void modelConnectionsQuery.refetch()}>重试</button></FloatingError>
                     : !readyTextModels.length && <p className="muted">当前没有已验证的文字模型；消息可先发送，处理状态以服务端为准。</p>}
                 {outbox.storageError && <FloatingError className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</FloatingError>}
+                {variantOutbox.storageError && <FloatingError className="error-inline" role="alert">本地项目消息版本操作存储不可用：{variantOutbox.storageError}</FloatingError>}
                 <div className="inline-form">
                   <div><label htmlFor="project-task-host">目标电脑（可选）</label><select id="project-task-host" value={projectHostID} disabled={!resourcesQuery.isSuccess || taskHostsQuery.isPending} onChange={(event) => {
                     setProjectHostID(event.target.value);

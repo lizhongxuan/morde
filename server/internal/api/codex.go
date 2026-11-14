@@ -19,6 +19,8 @@ import (
 const codexEventBatchBodyLimit int64 = codex.MaxEventBatchBytes + (4 << 10)
 
 type CodexService interface {
+	Connect(context.Context, identity.Principal, codex.ProfileConnectionRequest) (codex.ProfileConnection, error)
+	Revoke(context.Context, identity.Principal, string) error
 	Discover(context.Context, identity.Principal, codex.Discover) (codex.Session, error)
 	List(context.Context, identity.Principal, string, string, int32) (codex.SessionPage, error)
 	Events(context.Context, identity.Principal, string, int64, int32) (codex.EventPage, error)
@@ -30,10 +32,91 @@ type CodexService interface {
 	Delete(context.Context, identity.Principal, string) error
 }
 
+type CodexProfileStatusService interface {
+	UpdateSessionDiscovery(context.Context, identity.Principal, string, codex.ProfileSessionDiscoveryUpdate) (codex.ProfileConnection, error)
+	ListProfileConnections(context.Context, identity.Principal, string) ([]codex.ProfileConnection, error)
+}
+
 func registerCodexRoutes(group *gin.RouterGroup, service CodexService) {
 	if service == nil {
 		return
 	}
+	group.POST("/codex/connections", func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		var request codex.ProfileConnectionRequest
+		if !decodeStrictJSON(c, &request) {
+			return
+		}
+		value, err := service.Connect(c.Request.Context(), principal, request)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, value)
+	})
+
+	group.DELETE("/codex/connections/:profile_key", func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		profileKey, ok := safeID(c, "profile_key", codex.ValidProfileKey)
+		if !ok {
+			return
+		}
+		if err := service.Revoke(c.Request.Context(), principal, profileKey); err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	if statusService, ok := service.(CodexProfileStatusService); ok {
+		group.GET("/codex/connections", func(c *gin.Context) {
+			principal, ok := principalFrom(c)
+			if !ok {
+				unauthenticated(c)
+				return
+			}
+			items, err := statusService.ListProfileConnections(c.Request.Context(), principal, c.Query("installation_id"))
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			if items == nil {
+				items = []codex.ProfileConnection{}
+			}
+			c.JSON(http.StatusOK, gin.H{"items": items})
+		})
+
+		group.PUT("/codex/connections/:profile_key/session-discovery-status", func(c *gin.Context) {
+			principal, ok := principalFrom(c)
+			if !ok {
+				unauthenticated(c)
+				return
+			}
+			profileKey, ok := safeID(c, "profile_key", codex.ValidProfileKey)
+			if !ok {
+				return
+			}
+			var request codex.ProfileSessionDiscoveryUpdate
+			if !decodeStrictJSON(c, &request) {
+				return
+			}
+			value, err := statusService.UpdateSessionDiscovery(c.Request.Context(), principal, profileKey, request)
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, value)
+		})
+	}
+
 	group.POST("/codex/sessions/discover", func(c *gin.Context) {
 		principal, ok := principalFrom(c)
 		if !ok {

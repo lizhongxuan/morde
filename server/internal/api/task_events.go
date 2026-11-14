@@ -275,6 +275,8 @@ func publicTaskEventFields(eventType string) ([]string, bool) {
 		return []string{"pending_id", "pending_version", "clarification_id", "clarification_version", "decision", "reason", "status", "idempotency_replayed", "lease_version", "file_delivery_intent"}, true
 	case "task.result":
 		return []string{"status", "reason", "task_revision"}, true
+	case "task.plan":
+		return []string{"step_id", "sequence", "task_revision", "plan_revision"}, true
 	default:
 		return nil, false
 	}

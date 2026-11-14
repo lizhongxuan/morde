@@ -40,6 +40,16 @@ describe('FloatingError', () => {
     expect((await screen.findByText('隐藏页面错误')).closest('[role="alert"]')).toBeInTheDocument();
   });
 
+  it('does not surface errors from inaccessible or visually hidden panels', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<ToastProvider><ToastNoticeCenter /><section aria-hidden="true" style={{ visibility: 'hidden' }}><FloatingError>后台标签错误</FloatingError></section></ToastProvider>);
+
+    expect(screen.queryByText('后台标签错误')).not.toBeInTheDocument();
+    rerender(<ToastProvider><ToastNoticeCenter /><section><FloatingError>后台标签错误</FloatingError></section></ToastProvider>);
+    await user.click(await screen.findByLabelText('错误提示，1 条'));
+    expect(await screen.findByText('后台标签错误')).toBeVisible();
+  });
+
   it('groups simultaneous errors with status notices outside the page layout', async () => {
     const user = userEvent.setup();
     render(<ToastProvider><ToastNoticeCenter /><main data-testid="page"><FloatingError>对话数据暂不可用</FloatingError>

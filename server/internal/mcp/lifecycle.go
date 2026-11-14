@@ -56,14 +56,8 @@ type resourceOutput struct {
 func (s *service) lifecycle(ctx context.Context, p identity.Principal, name string, args map[string]any) (any, error) {
 	switch name {
 	case "host_create":
-		workspaceIDs := make([]string, 0)
-		for _, item := range arrayArg(args, "workspace_ids") {
-			if workspaceID, ok := item.(string); ok {
-				workspaceIDs = append(workspaceIDs, workspaceID)
-			}
-		}
 		value, err := s.deps.Hosts.Create(ctx, p, app.CreateHostCommand{
-			Name: stringArg(args, "name"), WorkspaceIDs: workspaceIDs,
+			Name:           stringArg(args, "name"),
 			IdempotencyKey: stringArg(args, "idempotency_key"),
 		})
 		if err != nil {
@@ -87,7 +81,9 @@ func (s *service) lifecycle(ctx context.Context, p identity.Principal, name stri
 		}
 		return s.hostOutput(value), nil
 	case "host_delete":
-		value, err := s.deps.Hosts.Delete(ctx, p, app.DeleteHostCommand{HostID: stringArg(args, "host_id")})
+		value, err := s.deps.Hosts.Delete(ctx, p, app.DeleteHostCommand{
+			HostID: stringArg(args, "host_id"), ConfirmWorkspaceDeletion: boolArg(args, "confirm_workspace_deletion"),
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -128,6 +124,11 @@ func (s *service) hostOutput(value host.Host) hostOutput {
 
 func arrayArg(args map[string]any, name string) []any {
 	value, _ := args[name].([]any)
+	return value
+}
+
+func boolArg(args map[string]any, name string) bool {
+	value, _ := args[name].(bool)
 	return value
 }
 

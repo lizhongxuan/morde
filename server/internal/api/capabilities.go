@@ -30,6 +30,9 @@ func (h *api) capabilities(c *gin.Context) {
 	_, clientVerifier := h.deps.Verifier.(interface {
 		VerifyClient(context.Context, string) (identity.Principal, error)
 	})
+	_, deviceVerifier := h.deps.Verifier.(interface {
+		VerifyDevice(context.Context, string) (identity.Principal, error)
+	})
 	var hubVersion *string
 	if h.deps.ClientLogin != nil && clientVerifier {
 		features = append(features, "ordered_client_login", "client_installations")
@@ -50,6 +53,10 @@ func (h *api) capabilities(c *gin.Context) {
 	if syncService, ok := h.deps.WorkspaceSync.(interface{ ProjectUploadEnabled() bool }); ok &&
 		syncService.ProjectUploadEnabled() && clientVerifier {
 		features = append(features, "workspace_sync", "project_upload")
+	}
+	if recoveryService, ok := h.deps.WorkspaceSync.(WorkspaceSyncCheckpointRecoveryService); ok &&
+		recoveryService.CheckpointRecoveryEnabled() && clientVerifier && deviceVerifier {
+		features = append(features, "workspace_sync_checkpoint_recovery")
 	}
 	if h.deps.ModelGateway != nil && clientVerifier {
 		features = append(features, "model_gateway")

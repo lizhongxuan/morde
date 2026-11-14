@@ -277,7 +277,12 @@ func scanWorkspaceSyncFolder(row interface{ Scan(...any) error }) (workspace.Syn
 	return value, nil
 }
 
-func requireWorkspaceRootSyncTarget(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) error {
+// requireWorkspaceRootSyncTarget prevents user/device root synchronization from
+// treating Host-owned storage as an independent Workspace. Detached binding
+// rows are retained as ownership history and deliberately keep this fence in
+// place. This query follows the Workspace lock without taking a Host lock, so
+// it does not reverse the Host -> Workspace -> binding lifecycle lock order.
+func requireWorkspaceRootSyncTarget(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string, allowHostReplica bool) error {
 	var hasProject bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
 SELECT 1 FROM workspace_sync_folders WHERE owner_id=$1 AND workspace_id=$2 AND folder_kind='project'
@@ -286,6 +291,17 @@ SELECT 1 FROM workspace_sync_folders WHERE owner_id=$1 AND workspace_id=$2 AND f
 	}
 	if hasProject {
 		return domain.NewError(domain.CodeWorkspaceUnavailable, "project folder synchronization is not available yet")
+	}
+	if !allowHostReplica {
+		var hasHostBinding bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_bindings WHERE workspace_id=$1
+)`, workspaceID).Scan(&hasHostBinding); err != nil {
+			return fmt.Errorf("check Host ownership before root synchronization: %w", err)
+		}
+		if hasHostBinding {
+			return domain.NewError(domain.CodeWorkspaceUnavailable, "computer storage cannot use independent root synchronization")
+		}
 	}
 	return nil
 }

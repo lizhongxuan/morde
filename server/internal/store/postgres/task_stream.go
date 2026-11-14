@@ -134,6 +134,11 @@ FROM tasks t CROSS JOIN service_identity i WHERE t.id=$1 AND t.owner_id=$2 AND t
 		if currentRevision < 0 || currentRevision != desiredRevision || currentRevision != dispatchRevision || taskModelID != dispatchModelID {
 			return domain.NewError(domain.CodeInvalidState, "stream task revision changed")
 		}
+		var continuingVariant bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_message_variants
+WHERE task_id=$1 AND action='continue_generation' AND state IN ('accepted','running','unknown'))`, fence.TaskID).Scan(&continuingVariant); err != nil {
+			return fmt.Errorf("read continuation variant stream policy: %w", err)
+		}
 		if delta.PersonalProof != nil {
 			if projectID != "" || fence.InitiatorID != fence.OwnerID {
 				return domain.NewError(domain.CodeUnauthenticated, "personal stream proof is outside its scope")
@@ -154,7 +159,7 @@ WHERE task_id=$1 FOR UPDATE`, fence.TaskID).Scan(&previousID, &previousTurn, &pr
 			!previousRevision.Valid && currentRevision == 0)
 		continuation := sameRevision && previousID == delta.MessageID && previousTurn == delta.TurnID && status == string(app.AssistantMessageStreaming)
 		if hasSnapshot && !continuation {
-			if sameRevision {
+			if sameRevision && !continuingVariant {
 				return nil
 			}
 			if status != string(app.AssistantMessageCompleted) {
@@ -197,6 +202,11 @@ EXISTS (SELECT 1 FROM conversation_messages m JOIN conversation_message_routes r
 				ActorID: fence.InitiatorID, Role: conversation.RoleAssistant, Content: delta.Text, TaskID: fence.TaskID}
 			if err := insertMessage(ctx, tx, message); err != nil {
 				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET assistant_message_id=$2,updated_at=clock_timestamp()
+WHERE task_id=$1 AND state IN ('accepted','running','unknown') AND (assistant_message_id IS NULL OR assistant_message_id=$2)`,
+				fence.TaskID, delta.MessageID); err != nil {
+				return fmt.Errorf("link streamed assistant message to conversation variant: %w", err)
 			}
 			if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET output_status='streaming',output_task_revision=$2
 WHERE id=$1 AND task_id=$3`, delta.MessageID, currentRevision, fence.TaskID); err != nil {

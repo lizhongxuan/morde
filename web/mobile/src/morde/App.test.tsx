@@ -85,13 +85,15 @@ it("clears the previous account's computer list while the next account loads", a
   renderer.unmount();
 });
 
-it("keeps page-level errors in document flow instead of over the mobile header", async () => {
+it("shows page-level errors without pushing the mobile conversation", async () => {
   mockCommon();
   vi.spyOn(morde, "workspaces").mockRejectedValue(new Error("项目服务暂不可用"));
   let renderer!: ReactTestRenderer;
   await act(async () => { renderer = create(<MordeApp />); await new Promise((resolve) => setTimeout(resolve, 0)); });
   const alert = renderer.root.findByProps({ role: "alert" });
-  expect(alert.props.className).not.toMatch(/\bfixed\b/);
+  expect(alert.props.className).toMatch(/\babsolute\b/);
+  expect(alert.props.className).not.toMatch(/\bshrink-0\b/);
+  expect(renderer.root.findAllByType("main")).toHaveLength(1);
   expect(alert.findByType("span").children.join(" ")).toContain("项目服务暂不可用");
   renderer.unmount();
 });

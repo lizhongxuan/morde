@@ -35,17 +35,6 @@
 			</dict>
 		</dict>
 	</dict>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>io.morde.workspace-share</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>morde</string>
-			</array>
-		</dict>
-	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

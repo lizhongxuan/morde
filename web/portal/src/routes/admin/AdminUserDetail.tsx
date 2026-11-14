@@ -168,7 +168,7 @@ function PersonalDataQuotaForm({ ownerID, quota }: { ownerID: string; quota: Per
       <input id="user-personal-data-quota" type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" required value={quotaBytes} onChange={(event) => setQuotaBytes(event.target.value)} />
       <label htmlFor="user-personal-data-attachment-limit">单个附件上限（字节）</label>
       <input id="user-personal-data-attachment-limit" type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" required value={maxAttachmentBytes} onChange={(event) => setMaxAttachmentBytes(event.target.value)} />
-      <p className="muted">版本 v{quota.version}。额度只用于个人附件，与聊天、Workspace 和记录额度分开计算。</p>
+      <p className="muted">版本 v{quota.version}。额度只用于个人附件，与聊天、电脑文件和记录额度分开计算。</p>
       <div className="form-actions"><button className="button button-primary" disabled={save.isPending} type="submit">{save.isPending ? '保存中…' : '保存个人数据额度'}</button></div>
     </form>
   </>;
@@ -293,21 +293,14 @@ export function AdminUserDetail() {
   const { id = '' } = useParams();
   const userQuery = useQuery({ queryKey: ['admin', 'user', id], queryFn: () => portalApi.adminUser(id), enabled: !!id });
   const hosts = useQuery({ queryKey: ['admin', 'hosts'], queryFn: portalApi.adminHosts });
-  const workspaces = useInfiniteQuery({
-    queryKey: ['admin', 'workspaces', 'user', id],
-    queryFn: ({ pageParam }) => portalApi.adminWorkspaces(pageParam),
-    initialPageParam: undefined as string | undefined,
-    getNextPageParam: (page) => page.next_cursor ?? undefined,
-  });
-  if (userQuery.isPending || hosts.isPending || workspaces.isPending) return <div className="loading-card" role="status">正在读取用户信息…</div>;
-  if (userQuery.isError || hosts.isError || (workspaces.isError && !workspaces.data)) {
-    const error = userQuery.isError ? userQuery.error : hosts.isError ? hosts.error : workspaces.error;
-    return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void userQuery.refetch(); void hosts.refetch(); void workspaces.refetch(); }}>重试</button></FloatingError>;
+  if (userQuery.isPending || hosts.isPending) return <div className="loading-card" role="status">正在读取用户信息…</div>;
+  if (userQuery.isError || hosts.isError) {
+    const error = userQuery.isError ? userQuery.error : hosts.error;
+    return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void userQuery.refetch(); void hosts.refetch(); }}>重试</button></FloatingError>;
   }
   const user = userQuery.data;
   if (!user) return <div className="empty-card"><h2>找不到这个用户</h2><p>用户可能已被移除，或当前账号无权查看。</p><Link className="button button-secondary" to="/admin/users">返回用户列表</Link></div>;
   const ownedHosts = hosts.data.items.filter((host) => host.owner_id === user.id);
-  const ownedWorkspaces = workspaces.data.pages.flatMap((page) => page.items).filter((workspace) => workspace.owner_id === user.id);
 
   return <section>
     <section className="design-panel">
@@ -330,17 +323,9 @@ export function AdminUserDetail() {
     <UserEvents ownerID={user.id} />
     <section className="admin-detail-section">
       <div className="dashboard-section-heading"><div><h2>所属云端电脑</h2><p>这里显示该用户拥有的电脑及当前运行状态。</p></div><Link to="/admin/hosts">全部电脑</Link></div>
-      {!ownedHosts.length ? <div className="empty-card compact"><p>该用户还没有云端电脑。</p></div> : <div className="table-wrap"><table><thead><tr><th>电脑</th><th>运行状态</th><th>规格</th><th>绑定工作区</th><th>创建时间</th></tr></thead><tbody>
-        {ownedHosts.map((host) => <tr key={host.id}><td><Link className="admin-table-link" to={`/admin/hosts/${encodeURIComponent(host.id)}`}><strong>{host.name || host.id}</strong><small className="table-sub mono">{host.id}</small></Link></td><td><span className={`status status-${host.state}`}>{hostStateLabel[host.state] || host.state}</span></td><td>{formatCpu(host.resources.cpu_limit_milli)} / {formatMemory(host.resources.mem_limit_mib)}</td><td>{host.workspaces.length ? host.workspaces.map((binding) => binding.workspace.name || binding.workspace.id).join('、') : '未绑定'}</td><td>{formatDate(host.created_at)}</td></tr>)}
+      {!ownedHosts.length ? <div className="empty-card compact"><p>该用户还没有云端电脑。</p></div> : <div className="table-wrap"><table><thead><tr><th>电脑</th><th>运行状态</th><th>规格</th><th>专属数据目录</th><th>创建时间</th></tr></thead><tbody>
+        {ownedHosts.map((host) => <tr key={host.id}><td><Link className="admin-table-link" to={`/admin/hosts/${encodeURIComponent(host.id)}`}><strong>{host.name || host.id}</strong><small className="table-sub mono">{host.id}</small></Link></td><td><span className={`status status-${host.state}`}>{hostStateLabel[host.state] || host.state}</span></td><td>{formatCpu(host.resources.cpu_limit_milli)} / {formatMemory(host.resources.mem_limit_mib)}</td><td>{host.workspaces.length === 1 ? '已登记' : host.workspaces.length ? '需要核对' : '待核对'}</td><td>{formatDate(host.created_at)}</td></tr>)}
       </tbody></table></div>}
-    </section>
-    <section className="admin-detail-section">
-      <div className="dashboard-section-heading"><div><h2>所属工作区</h2><p>查看此用户的工作区版本、用量和绑定状态。</p></div><Link to={`/admin/workspaces?owner=${encodeURIComponent(user.id)}`}>工作区列表</Link></div>
-      {!ownedWorkspaces.length ? <div className="empty-card compact"><p>{workspaces.hasNextPage ? '已加载的记录中暂未找到该用户的工作区，可继续查找。' : '该用户还没有工作区。'}</p></div> : <div className="table-wrap"><table><thead><tr><th>工作区</th><th>状态</th><th>用量</th><th>版本</th><th>绑定电脑</th><th>最近更新</th></tr></thead><tbody>
-        {ownedWorkspaces.map((workspace) => <tr key={workspace.id}><td><Link className="admin-table-link" to={`/admin/workspaces/${encodeURIComponent(workspace.id)}`}><strong>{workspace.name || workspace.id}</strong><small className="table-sub mono">{workspace.id}</small></Link></td><td><span className={`status status-${workspace.state}`}>{workspace.state === 'ready' ? '可用' : '删除中'}</span></td><td>{formatBytes(workspace.used_bytes)} / {formatBytes(workspace.quota_bytes)}</td><td>v{workspace.revision}</td><td>{workspace.bindings.length ? workspace.bindings.map((binding) => <Link className="admin-binding-link" to={`/admin/hosts/${encodeURIComponent(binding.host_id)}`} key={binding.host_id}>{binding.host_name || binding.host_id}<small>{binding.state === 'active' && binding.applied_revision === binding.desired_revision ? '已应用' : binding.state === 'preparing' ? '正在应用' : binding.state}</small></Link>) : '未绑定'}</td><td>{formatDate(workspace.updated_at)}</td></tr>)}
-      </tbody></table></div>}
-      {workspaces.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(workspaces.error).message}<button className="button button-secondary" type="button" onClick={() => void workspaces.fetchNextPage()}>重试</button></FloatingError>}
-      {workspaces.hasNextPage && !workspaces.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={workspaces.isFetchingNextPage} onClick={() => void workspaces.fetchNextPage()}>{workspaces.isFetchingNextPage ? '正在加载…' : ownedWorkspaces.length ? '加载更多工作区' : '继续查找工作区'}</button>}
     </section>
     <p className="notice notice-info admin-detail-note">禁用登录不会自动关闭已有云端电脑。</p>
   </section>;

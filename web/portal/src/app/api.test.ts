@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { enterHostInNewTab, portalApi } from './api';
 import { projectApi } from './project-api';
+import { createMessageVariant, messageVariantContentTooLong } from './message-variants';
 
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -161,6 +162,43 @@ describe('typed Portal API client', () => {
     expect(requests.map((request) => request.headers.get('Idempotency-Key'))).toEqual(['retry-key-001', 'retry-key-002']);
     expect(requests.every((request) => request.headers.get('X-Morde-Actor-ID') === 'u1234567'
       && request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a')).toBe(true);
+  });
+
+  it('posts personal and project variants with the expected-version CAS and scoped idempotency headers', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(new URL(String(input), window.location.origin), init);
+      requests.push(request);
+      const body = await request.clone().json() as { action: string };
+      return Response.json({ operation_id: `op-${requests.length}`, variant_group_id: 'm1234567', variant_version: 2,
+        action: body.action, state: 'accepted', user_message_id: 'm7654321' }, { status: 202 });
+    }));
+
+    await createMessageVariant({ conversationID: 'c1234567', messageID: 'm1234567', action: 'edit_resend', expectedVersion: 1,
+      content: '改写消息', idempotencyKey: 'variant-personal-01', serviceInstanceID: 'instance-a', actorID: 'u1234567' });
+    await createMessageVariant({ projectID: 'j1234567', conversationID: 'c7654321', messageID: 'm7654321', action: 'regenerate_text', expectedVersion: 2,
+      idempotencyKey: 'variant-project-01', serviceInstanceID: 'instance-a', actorID: 'u1234567' });
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['POST', '/api/conversations/c1234567/messages/m1234567/variants'],
+      ['POST', '/api/projects/j1234567/conversations/c7654321/messages/m7654321/variants'],
+    ]);
+    expect(requests.map((request) => request.headers.get('Idempotency-Key'))).toEqual(['variant-personal-01', 'variant-project-01']);
+    expect(requests.every((request) => request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a'
+      && request.headers.get('X-Morde-Actor-ID') === 'u1234567')).toBe(true);
+    expect(await requests[0]!.clone().json()).toEqual({ action: 'edit_resend', expected_version: 1, content: '改写消息' });
+    expect(await requests[1]!.clone().json()).toEqual({ action: 'regenerate_text', expected_version: 2 });
+  });
+
+  it('limits edited variants by Unicode scalar count before sending', async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    expect(messageVariantContentTooLong('🙂'.repeat(32_768))).toBe(false);
+    expect(messageVariantContentTooLong('🙂'.repeat(32_769))).toBe(true);
+    await expect(createMessageVariant({ conversationID: 'c1234567', messageID: 'm1234567', action: 'edit_resend', expectedVersion: 1,
+      content: '🙂'.repeat(32_769), idempotencyKey: 'variant-too-long-01', serviceInstanceID: 'instance-a', actorID: 'u1234567' }))
+      .rejects.toThrow('编辑后的消息不能超过 32768 个字符。');
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('requests server Workspace diffs and restores selected paths with an idempotency key', async () => {
@@ -390,6 +428,22 @@ describe('typed Portal API client', () => {
     expect(await requests[0]!.json()).toEqual({ version: 4, decision: 'approve' });
     expect(await requests[1]!.json()).toEqual({ clarification_id: 'k7654321', clarification_version: 2,
       answer: 'Use the reports directory.' });
+  });
+
+  it('retries one persisted Task step with only its current revision and attempt', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ task_id: 'q1234567', source_step_id: 's1234567', attempt_step_id: 's7654321',
+        attempt: 2, status: 'queued', replayed: false }, { status: 202 });
+    }));
+
+    await portalApi.retryTaskStep('q1234567', 's1234567', { expected_task_revision: 4, expected_attempt: 1 }, 'task-step-retry-key');
+
+    expect(request?.method).toBe('POST');
+    expect(new URL(request!.url).pathname).toBe('/api/tasks/q1234567/steps/s1234567/retries');
+    expect(request?.headers.get('Idempotency-Key')).toBe('task-step-retry-key');
+    expect(await request?.json()).toEqual({ expected_task_revision: 4, expected_attempt: 1 });
   });
 
   it('sends a version-scoped cancellation action with the supplied retry key', async () => {
@@ -683,7 +737,7 @@ describe('typed Portal API client', () => {
     ]);
   });
 
-  it('creates a standalone workspace with an idempotency key and deletes hosts without legacy query flags', async () => {
+  it('creates a standalone workspace with an idempotency key and confirms workspace deletion', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -698,7 +752,7 @@ describe('typed Portal API client', () => {
     }));
 
     await portalApi.createWorkspace({ name: '项目工作区' });
-    await portalApi.deleteHost('h1234567');
+    await portalApi.deleteHost('h1234567', true);
 
     const [workspaceRequest, hostDeleteRequest] = requests;
     expect(workspaceRequest?.method).toBe('POST');
@@ -706,7 +760,7 @@ describe('typed Portal API client', () => {
     expect(await workspaceRequest?.json()).toEqual({ name: '项目工作区' });
     expect(hostDeleteRequest?.method).toBe('DELETE');
     expect(new URL(hostDeleteRequest!.url).pathname).toBe('/api/hosts/h1234567');
-    expect(new URL(hostDeleteRequest!.url).search).toBe('');
+    expect(new URL(hostDeleteRequest!.url).search).toBe('?confirm_delete_workspace=true');
   });
 
   it('replays an accepted workspace creation after the response is lost', async () => {

@@ -10,7 +10,20 @@ const listen = (channel: string, listener: (value: unknown) => void) => {
 
 const mode = process.argv.find((argument) => argument.startsWith("--morde-preload-mode="))?.slice("--morde-preload-mode=".length);
 
-if (mode === "portal") {
+if (mode === "codex") {
+  contextBridge.exposeInMainWorld("morde", {
+    state: () => call("morde:codex-state"),
+    addProfile: () => call("morde:codex-add-profile"),
+    selectProfile: (profileKey: string) => call("morde:codex-select-profile", profileKey),
+    authorizeProfile: (profileKey: string, scopes: string[]) => call("morde:codex-authorize-profile", profileKey, scopes),
+    revokeProfile: (profileKey: string) => call("morde:codex-revoke-profile", profileKey),
+    listThreads: (cursor: string | null) => call("morde:codex-list-threads", cursor),
+    authorizeThread: (threadID: string, scopes: string[]) => call("morde:codex-authorize-thread", threadID, scopes),
+    updateScopes: (sessionID: string, scopes: string[]) => call("morde:codex-update-scopes", sessionID, scopes),
+    revoke: (sessionID: string) => call("morde:codex-revoke", sessionID),
+    onState: (listener: (value: unknown) => void) => listen("morde:codex-state", listener),
+  });
+} else if (mode === "portal") {
   contextBridge.exposeInMainWorld("morde", {
     projectUploadTargets: () => call("morde:portal-project-upload-targets"),
     selectProjectDirectory: (hostId: string, workspaceId: string) => call("morde:portal-project-select-directory", hostId, workspaceId),
@@ -25,9 +38,19 @@ if (mode === "portal") {
     preserved: (workspaceId: string) => call("morde:portal-preserved-list", workspaceId),
     restorePreserved: (workspaceId: string, id: string) => call("morde:portal-preserved-restore", workspaceId, id),
     deletePreserved: (workspaceId: string, id: string) => call("morde:portal-preserved-delete", workspaceId, id),
+    codexState: () => call("morde:codex-state"),
+    codexAddProfile: () => call("morde:codex-add-profile"),
+    codexSelectProfile: (profileKey: string) => call("morde:codex-select-profile", profileKey),
+    codexListThreads: (cursor: string | null) => call("morde:codex-list-threads", cursor),
+    codexAuthorizeProfile: (profileKey: string, scopes: string[]) => call("morde:codex-authorize-profile", profileKey, scopes),
+    codexRevokeProfile: (profileKey: string) => call("morde:codex-revoke-profile", profileKey),
+    codexAuthorizeThread: (threadID: string, scopes: string[]) => call("morde:codex-authorize-thread", threadID, scopes),
+    codexUpdateScopes: (sessionID: string, scopes: string[]) => call("morde:codex-update-scopes", sessionID, scopes),
+    codexRevoke: (sessionID: string) => call("morde:codex-revoke", sessionID),
     state: () => call("morde:portal-state"),
     onState: (listener: (value: unknown) => void) => listen("morde:portal-state", listener),
     onSync: (listener: (value: unknown) => void) => listen("morde:portal-sync-state", listener),
+    onCodexState: (listener: (value: unknown) => void) => listen("morde:codex-state", listener),
   });
 } else if (mode === "host-workbench") {
   contextBridge.exposeInMainWorld("morde", {

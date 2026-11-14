@@ -391,3 +391,75 @@ func TestPostgresWorkspaceShareExpiredUnclaimedLinkCannotBeClaimed(t *testing.T)
 		t.Fatalf("expired link claim error = %v, want not found", err)
 	}
 }
+
+func TestPostgresHostBoundWorkspaceCannotBeSharedOrCopiedAsWorkspace(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	recipient := createTestUser(t, store, 3, 10_000, 20_000)
+	source := createTestWorkspace(t, ctx, store, owner.ID, "computer storage")
+	shareID, err := domain.NewPendingRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenHash := sha256.Sum256([]byte("local-only pre-host share token"))
+	share, err := store.CreateWorkspaceShare(ctx, workspace.ShareLink{
+		ID: shareID, OwnerID: owner.ID, SourceWorkspaceID: source.ID, SourceRevision: source.Revision,
+		Permission: workspace.ShareEdit, TokenHash: tokenHash[:], ExpiresAt: time.Now().Add(time.Hour), State: workspace.SharePending,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{source.ID})
+
+	if _, err := store.GetWorkspaceShareByToken(ctx, tokenHash[:]); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("preview of pre-existing Host-bound share = %v, want not found", err)
+	}
+	if _, err := store.StartWorkspaceShareClaim(ctx, tokenHash[:], recipient.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("claim of pre-existing Host-bound share = %v, want not found", err)
+	}
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_share_links WHERE id=$1`, shareID).Scan(&state); err != nil || state != string(workspace.SharePending) {
+		t.Fatalf("share state after rejected claim = %q, err=%v", state, err)
+	}
+
+	newShareID, err := domain.NewPendingRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTokenHash := sha256.Sum256([]byte("local-only post-host share token"))
+	if _, err := store.CreateWorkspaceShare(ctx, workspace.ShareLink{
+		ID: newShareID, OwnerID: owner.ID, SourceWorkspaceID: source.ID, SourceRevision: source.Revision,
+		Permission: workspace.ShareEdit, TokenHash: newTokenHash[:], ExpiresAt: time.Now().Add(time.Hour), State: workspace.SharePending,
+	}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("create share for Host-bound computer storage = %v, want forbidden", err)
+	}
+	if matches, err := store.WorkspaceShareSourceMatches(ctx, owner.ID, source.ID, source.Revision); err != nil || matches {
+		t.Fatalf("Host-bound share source matches = %t, err=%v; want false", matches, err)
+	}
+
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_share_links SET state='claiming',claimant_id=$2 WHERE id=$1`, shareID, recipient.ID); err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := domain.NewWorkspaceID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservationID, err := domain.NewPendingRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestHash := sha256.Sum256([]byte("host-bound share copy"))
+	_, _, err = store.CreateWorkspaceCopyReservation(ctx, app.WorkspaceCopyReservationRequest{
+		ID: reservationID, SourceOwnerID: owner.ID, TargetOwnerID: recipient.ID, ShareID: share.ID,
+		SourceWorkspaceID: source.ID, TargetWorkspaceID: targetID, TargetName: share.WorkspaceName,
+		ServiceInstanceID: "host-bound-share-test", SourceRevision: source.Revision, ReservedBytes: 0,
+		MaxOwnerBytes: 1 << 30, TargetQuotaBytes: 1 << 30, Idempotency: app.IdempotencyRecord{
+			OwnerID: recipient.ID, Operation: "workspace.share.copy", Key: "host-bound-share-copy-01",
+			RequestHash: requestHash[:], ResourceID: source.ID,
+		},
+	})
+	if domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("copy reservation for Host-bound computer storage = %v, want forbidden", err)
+	}
+}

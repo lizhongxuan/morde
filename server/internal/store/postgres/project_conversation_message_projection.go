@@ -12,12 +12,13 @@ import (
 	"morde/server/internal/domain/project"
 )
 
-func loadProjectMessageAttachmentIDsInTx(ctx context.Context, tx pgx.Tx, instanceID, projectID, ownerID, conversationID, messageID string) ([]string, error) {
+func loadProjectMessageAttachmentIDsInTx(ctx context.Context, tx pgx.Tx, instanceID, projectID, ownerID, actorID, conversationID, messageID string) ([]string, error) {
 	rows, err := tx.Query(ctx, `SELECT a.attachment_id FROM project_conversation_attachments a
 JOIN conversation_messages m ON m.id=a.message_id AND m.owner_id=a.owner_id AND m.conversation_id=a.conversation_id AND m.actor_id=a.actor_id
 JOIN conversation_message_routes r ON r.message_id=a.message_id AND r.service_instance_id=a.service_instance_id AND r.actor_id=a.actor_id
-WHERE a.service_instance_id=$1::uuid AND a.project_id=$2 AND a.owner_id=$3 AND a.conversation_id=$4 AND a.message_id=$5
- AND a.state='committed' ORDER BY a.attachment_id`, instanceID, projectID, ownerID, conversationID, messageID)
+WHERE a.service_instance_id=$1::uuid AND a.project_id=$2 AND a.owner_id=$3 AND a.conversation_id=$4 AND a.message_id IN
+ ($6,(SELECT attachment_source_message_id FROM conversation_message_variants WHERE user_message_id=$6 AND actor_id=$5 AND attachment_source_message_id IS NOT NULL))
+ AND a.actor_id=$5 AND a.state='committed' ORDER BY a.attachment_id`, instanceID, projectID, ownerID, actorID, conversationID, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("read project message attachments: %w", err)
 	}
@@ -64,12 +65,14 @@ func (s *Store) attachProjectConversationMessageAttachmentIDs(ctx context.Contex
 			ids = append(ids, message.ID)
 			byID[message.ID] = index
 		}
-		rows, err := tx.Query(ctx, `SELECT a.message_id,a.attachment_id FROM project_conversation_attachments a
+		rows, err := tx.Query(ctx, `SELECT COALESCE(variant.user_message_id,a.message_id),a.attachment_id FROM project_conversation_attachments a
 JOIN conversation_messages m ON m.id=a.message_id AND m.owner_id=a.owner_id AND m.conversation_id=a.conversation_id AND m.actor_id=a.actor_id
 JOIN conversation_message_routes r ON r.message_id=a.message_id AND r.service_instance_id=a.service_instance_id AND r.actor_id=a.actor_id
-WHERE a.service_instance_id=$1::uuid AND a.project_id=$2 AND a.owner_id=$3 AND a.conversation_id=$4
- AND a.message_id=ANY($5::text[]) AND a.state='committed' ORDER BY a.message_id,a.attachment_id`,
-			instanceID, projectID, value.OwnerID, conversationID, ids)
+LEFT JOIN conversation_message_variants variant ON variant.attachment_source_message_id=a.message_id AND variant.actor_id=$2
+ AND variant.project_id=$3 AND variant.conversation_id=$5 AND variant.user_message_id=ANY($6::text[])
+WHERE a.service_instance_id=$1::uuid AND a.project_id=$3 AND a.owner_id=$4 AND a.conversation_id=$5
+ AND (a.message_id=ANY($6::text[]) OR variant.user_message_id IS NOT NULL) AND a.state='committed' ORDER BY 1,a.attachment_id`,
+			instanceID, actorID, projectID, value.OwnerID, conversationID, ids)
 		if err != nil {
 			return fmt.Errorf("list project message attachments: %w", err)
 		}

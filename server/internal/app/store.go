@@ -22,6 +22,7 @@ type HostStore interface {
 	SetSandboxID(context.Context, string, host.State, *string) error
 	SetRuntimeInstanceID(context.Context, string, int64, int64, string, string) error
 	TransitionHost(context.Context, string, host.State, host.State, string) (host.Host, error)
+	BeginHostDelete(context.Context, string, host.State) (host.Host, error)
 	BeginHostRelease(context.Context, string, bool) (host.Host, bool, error)
 	CompleteHostRelease(context.Context, string, int64) (host.Host, error)
 	BeginHostRestore(context.Context, RestoreHostParams) (host.Host, bool, error)

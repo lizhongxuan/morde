@@ -24,6 +24,9 @@ func (h *api) registerWorkspaceSync(group *gin.RouterGroup, service WorkspaceSyn
 	group.GET("/workspaces/:id/manifest", h.getWorkspaceManifest(service))
 	group.GET("/workspaces/:id/changes", h.getWorkspaceChanges(service))
 	group.POST("/workspaces/:id/sync-sessions", h.createWorkspaceSyncSession(service))
+	if recoveryService, ok := service.(WorkspaceSyncCheckpointRecoveryService); ok && recoveryService.CheckpointRecoveryEnabled() {
+		group.POST("/workspaces/:id/sync-sessions/recover", h.recoverWorkspaceSyncSession(recoveryService))
+	}
 	group.GET("/workspaces/:id/sync-sessions/:session_id", h.getWorkspaceSyncSession(service))
 	group.GET("/workspaces/:id/sync-progress", h.listDeviceWorkspaceSyncProgress(service, devices))
 	group.POST("/workspaces/:id/sync-sessions/:session_id/commit", h.commitWorkspaceSyncSession(service))
@@ -32,6 +35,45 @@ func (h *api) registerWorkspaceSync(group *gin.RouterGroup, service WorkspaceSyn
 	group.GET("/workspaces/:id/sync-sessions/:session_id/blocks/:digest", h.getWorkspaceSyncBlock(service))
 	group.POST("/workspaces/:id/sync-sessions/:session_id/blocks/:digest/ack", h.ackWorkspaceSyncBlock(service))
 	group.POST("/workspaces/:id/sync-sessions/:session_id/download-actions/ack", h.ackWorkspaceSyncDownloadAction(service))
+}
+
+func (h *api) recoverWorkspaceSyncSession(service WorkspaceSyncCheckpointRecoveryService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if service == nil || !service.CheckpointRecoveryEnabled() {
+			serviceUnavailable(c)
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		workspaceID, ok := safeID(c, "id", domain.ValidWorkspaceID)
+		if !ok {
+			return
+		}
+		idempotencyKey, ok := workspaceSyncIdempotencyKey(c)
+		if !ok {
+			return
+		}
+		if c.Request.ContentLength > 0 {
+			writeError(c, domain.InvalidArgument("body", "workspace sync checkpoint recovery must not include a request body"))
+			return
+		}
+		if c.Request.ContentLength < 0 {
+			body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1))
+			if err != nil || len(body) != 0 {
+				writeError(c, domain.InvalidArgument("body", "workspace sync checkpoint recovery must not include a request body"))
+				return
+			}
+		}
+		session, err := service.RecoverSyncSession(c.Request.Context(), principal, workspaceID, idempotencyKey)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, session)
+	}
 }
 
 func (h *api) listDeviceWorkspaceSyncProgress(service WorkspaceSyncService, devices WorkspaceSyncDeviceService) gin.HandlerFunc {

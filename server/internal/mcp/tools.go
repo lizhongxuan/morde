@@ -29,13 +29,13 @@ var tools = buildTools()
 func buildTools() []toolSpec {
 	result := []toolSpec{
 		{
-			name: "host_create", description: "Create a host bound to exactly one owned Workspace using the account's current default resources. Supply a fresh idempotency_key for each new request and reuse it only when retrying that exact request.", required: []string{"workspace_ids", "idempotency_key"},
-			properties: map[string]string{"name": "string", "workspace_ids": "array", "idempotency_key": "string"},
-			schema:     `{"type":"object","properties":{"name":{"type":"string"},"workspace_ids":{"type":"array","minItems":1,"maxItems":1,"items":{"type":"string","pattern":"^w[a-z0-9]{7}$"}},"idempotency_key":{"type":"string","pattern":"^[A-Za-z0-9._~-]{8,128}$"}},"required":["workspace_ids","idempotency_key"],"additionalProperties":false}`,
+			name: "host_create", description: "Create a cloud computer with its own persistent workspace directory using the account's current default resources. Supply a fresh idempotency_key for each new request and reuse it only when retrying that exact request.", required: []string{"idempotency_key"},
+			properties: map[string]string{"name": "string", "idempotency_key": "string"},
+			schema:     `{"type":"object","properties":{"name":{"type":"string"},"idempotency_key":{"type":"string","pattern":"^[A-Za-z0-9._~-]{8,128}$"}},"required":["idempotency_key"],"additionalProperties":false}`,
 		},
 		{name: "host_list", description: "List the hosts available to the authenticated user.", properties: map[string]string{}, schema: `{"type":"object","properties":{},"additionalProperties":false}`},
 		{name: "host_get", description: "Get a host by ID, including its current state and URL.", required: []string{"host_id"}, properties: map[string]string{"host_id": "string"}, schema: `{"type":"object","properties":{"host_id":{"type":"string"}},"required":["host_id"],"additionalProperties":false}`},
-		{name: "host_delete", description: "Request host deletion. Its workspace bindings are removed; independent workspace data is retained.", required: []string{"host_id"}, properties: map[string]string{"host_id": "string"}, schema: `{"type":"object","properties":{"host_id":{"type":"string"}},"required":["host_id"],"additionalProperties":false}`},
+		{name: "host_delete", description: "Permanently delete a cloud computer and its bound workspace directory. Requires explicit confirmation after informing the user.", required: []string{"host_id", "confirm_workspace_deletion"}, properties: map[string]string{"host_id": "string", "confirm_workspace_deletion": "boolean"}, schema: `{"type":"object","properties":{"host_id":{"type":"string"},"confirm_workspace_deletion":{"const":true}},"required":["host_id","confirm_workspace_deletion"],"additionalProperties":false}`},
 		{name: "host_renew", description: "Renew a host using its configured lifetime.", required: []string{"host_id"}, properties: map[string]string{"host_id": "string"}, schema: `{"type":"object","properties":{"host_id":{"type":"string"}},"required":["host_id"],"additionalProperties":false}`},
 		{
 			name:        hostCodexStatusToolName,
@@ -134,16 +134,9 @@ func validateToolArguments(spec toolSpec, raw json.RawMessage) (map[string]any, 
 		if !app.ValidMCPIdempotencyKey(stringArg(args, "idempotency_key")) {
 			return nil, domain.InvalidArgument("idempotency_key", "a unique idempotency key of 8 to 128 safe characters is required")
 		}
-		ids, ok := args["workspace_ids"].([]any)
-		if !ok || len(ids) != 1 {
-			return nil, domain.InvalidArgument("workspace_ids", "exactly one workspace must be bound to a host")
-		}
-		for _, value := range ids {
-			id, ok := value.(string)
-			if !ok || !domain.ValidWorkspaceID(id) {
-				return nil, domain.InvalidArgument("workspace_ids", "workspace_ids must contain a valid workspace ID")
-			}
-		}
+	}
+	if spec.name == "host_delete" && args["confirm_workspace_deletion"] != true {
+		return nil, domain.InvalidArgument("confirm_workspace_deletion", "confirm deletion of this computer and its workspace directory")
 	}
 	for _, name := range []string{"timeout", "start_line", "end_line", "port"} {
 		if rawValue, ok := args[name]; ok {

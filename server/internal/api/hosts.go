@@ -264,6 +264,10 @@ func (h *api) createHost(c *gin.Context) {
 		writeError(c, domain.InvalidArgument("Idempotency-Key", "exactly one idempotency key is required"))
 		return
 	}
+	if !app.ValidMCPIdempotencyKey(keys[0]) {
+		writeError(c, domain.InvalidArgument("Idempotency-Key", "a valid idempotency key is required"))
+		return
+	}
 	var request createHostRequest
 	if !decodeStrictJSON(c, &request) {
 		return
@@ -272,21 +276,11 @@ func (h *api) createHost(c *gin.Context) {
 		writeError(c, domain.InvalidArgument("workspace", "workspace is not a supported host creation field"))
 		return
 	}
-	var workspaceIDs []string
 	if request.WorkspaceIDs != nil {
-		if err := json.Unmarshal(request.WorkspaceIDs, &workspaceIDs); err != nil || workspaceIDs == nil || len(workspaceIDs) != 1 {
-			writeError(c, domain.InvalidArgument("workspace_ids", "exactly one workspace must be bound to a host"))
-			return
-		}
-		if !domain.ValidWorkspaceID(workspaceIDs[0]) {
-			writeError(c, domain.InvalidArgument("workspace_ids", "invalid workspace id"))
-			return
-		}
-	} else if principal.Kind != identity.KindSession {
-		writeError(c, domain.NewError(domain.CodeForbidden, "portal session required to create a Workspace automatically"))
+		writeError(c, domain.InvalidArgument("workspace_ids", "computer storage is assigned by the server"))
 		return
 	}
-	command := app.CreateHostCommand{Name: request.Name, WorkspaceIDs: workspaceIDs, IdempotencyKey: keys[0]}
+	command := app.CreateHostCommand{Name: request.Name, IdempotencyKey: keys[0]}
 	created, err := h.deps.Hosts.Create(c.Request.Context(), principal, command)
 	if err != nil {
 		writeError(c, err)
@@ -491,11 +485,13 @@ func (h *api) deleteHost(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if _, exists := c.Request.URL.Query()["keepWorkspace"]; exists {
-		writeError(c, domain.InvalidArgument("keepWorkspace", "workspace retention is not a host deletion option"))
+	query := c.Request.URL.Query()
+	confirmation, exists := query["confirm_delete_workspace"]
+	if !exists || len(confirmation) != 1 || confirmation[0] != "true" || len(query) != 1 {
+		writeError(c, domain.InvalidArgument("confirm_delete_workspace", "confirm deletion of this computer and its workspace directory"))
 		return
 	}
-	item, err := h.deps.Hosts.Delete(c.Request.Context(), principal, app.DeleteHostCommand{HostID: id})
+	item, err := h.deps.Hosts.Delete(c.Request.Context(), principal, app.DeleteHostCommand{HostID: id, ConfirmWorkspaceDeletion: true})
 	if err != nil {
 		writeError(c, err)
 		return

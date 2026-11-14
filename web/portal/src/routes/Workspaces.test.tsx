@@ -38,13 +38,13 @@ const projectTarget = {
   workspaceId: workspace.id, workspaceName: workspace.name, folders: [],
 };
 
-function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace'][], initialHosts: components['schemas']['Host'][] = [], initialEntry = '/workspaces') {
+function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace'][], initialHosts: components['schemas']['Host'][] = [], initialEntry = '/workspaces', projectSyncOnly = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, ...(initialWorkspaces ? { staleTime: Infinity } : {}) }, mutations: { retry: false } } });
   if (initialWorkspaces) {
     client.setQueryData(['workspaces'], { items: initialWorkspaces });
     client.setQueryData(['hosts'], { items: initialHosts });
   }
-  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[initialEntry]}><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[initialEntry]}><Workspaces projectSyncOnly={projectSyncOnly} /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 function setProjectBridge(value: unknown) {
@@ -71,9 +71,36 @@ describe('Workspaces', () => {
     const capabilities = vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
     renderWorkspaces();
 
+    const syncPanel = screen.getByRole('region', { name: '文件同步' });
+    expect(syncPanel).toHaveClass('design-panel');
+    expect(screen.queryByRole('link', { name: '返回 Morde 对话' })).not.toBeInTheDocument();
     expect(await screen.findByText(/本机文件同步需要 Morde 桌面客户端/)).toBeInTheDocument();
     expect(capabilities).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: /上传/ })).not.toBeInTheDocument();
+  });
+
+  it('does not expose the independent cloud file inventory from the project sync entry', async () => {
+    renderWorkspaces(undefined, [], '/hosts?sync=1', true);
+
+    expect(await screen.findByRole('heading', { name: '文件同步' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '云端文件与版本' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '创建工作区' })).not.toBeInTheDocument();
+    expect(portalApi.workspaces).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back from an unavailable linked Host without explicit selection', async () => {
+    const linkedHost = { ...host, workspaces: [binding] };
+    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [linkedHost] });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null,
+      default_host_id: linkedHost.id, updated_at: null });
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn() });
+
+    renderWorkspaces(undefined, [], '/hosts?sync=1&host=h7654321', true);
+
+    expect(await screen.findByText(/无法确认链接指定的云端电脑文件访问权限/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(portalApi.workspaces).not.toHaveBeenCalled();
   });
 
   it('fails closed when the project upload gate is not advertised and does not read target metadata', async () => {
@@ -224,6 +251,8 @@ describe('Workspaces', () => {
 
   it('explains when the configured default computer is unavailable and does not silently select another target', async () => {
     const alternateTarget = { ...projectTarget, hostId: 'h7654321', hostName: '备用电脑', workspaceId: 'w7654321', workspaceName: '备用工作区' };
+    const alternateBinding = { ...binding, workspace: { ...binding.workspace, id: alternateTarget.workspaceId, name: alternateTarget.workspaceName } };
+    const alternateHost = { ...host, id: alternateTarget.hostId, name: alternateTarget.hostName, workspaces: [alternateBinding] };
     setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([alternateTarget]), selectProjectDirectory: vi.fn() });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
     const configuredHost = { ...host, workspaces: [binding] };
@@ -231,9 +260,9 @@ describe('Workspaces', () => {
     vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null,
       default_host_id: configuredHost.id, updated_at: null });
     const user = userEvent.setup();
-    renderWorkspaces([], [configuredHost]);
+    renderWorkspaces([], [configuredHost, alternateHost]);
 
-    expect(await screen.findByText(/设置中的默认电脑或其 Workspace 当前不可用于目录选择/)).toBeInTheDocument();
+    expect(await screen.findByText(/设置中的默认电脑当前不可用于目录选择/)).toBeInTheDocument();
     const alternateTargetButton = screen.getByRole('button', { name: '使用此目标' });
     expect(alternateTargetButton).toHaveAttribute('aria-pressed', 'false');
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
@@ -500,87 +529,25 @@ describe('Workspaces', () => {
     expect(localStorage.getItem('morde.pending-workspace-restore.u1234567')).toBeNull();
   });
 
-  it('unbinds, releases, restores, rebinds and restarts a running Host in order', async () => {
+  it('keeps Host file revision history read-only', async () => {
     const changes: components['schemas']['WorkspaceDiffChange'][] = [
       { path: 'notes.md', action: 'changed', before: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'a'.repeat(64), mode: 0o644 }, after: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'b'.repeat(64), mode: 0o644 }, display_status: 'metadata_only', before_text: null, after_text: null },
     ];
-    let serverWorkspace = workspace;
-    let serverHost = { ...host, workspaces: [binding] };
-    vi.mocked(portalApi.workspaces).mockImplementation(async () => ({ items: [serverWorkspace] }));
-    vi.mocked(portalApi.hosts).mockImplementation(async () => ({ items: [serverHost] }));
     vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
-    const unbind = vi.spyOn(portalApi, 'unbindWorkspaceFromHost').mockImplementation(async () => {
-      const detached = { ...binding, state: 'detached' as const, binding_version: 2 };
-      serverHost = { ...serverHost, workspaces: [detached] };
-      return detached;
-    });
-    const release = vi.spyOn(portalApi, 'releaseHost').mockImplementation(async () => {
-      serverHost = { ...serverHost, state: 'stopped' };
-      return serverHost;
-    });
-    const restore = vi.spyOn(portalApi, 'restoreWorkspacePaths').mockImplementation(async () => {
-      serverWorkspace = { ...workspace, revision: 3 };
-      return { workspace_id: workspace.id, target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false };
-    });
-    const bindWorkspace = vi.spyOn(portalApi, 'bindWorkspaceToHost').mockImplementation(async () => {
-      const preparing = { ...binding, state: 'preparing' as const, binding_version: 3, desired_revision: 3, workspace: { ...binding.workspace, revision: 3 } };
-      serverHost = { ...serverHost, workspaces: [preparing] };
-      return preparing;
-    });
-    const restoreHost = vi.spyOn(portalApi, 'restoreHost').mockImplementation(async () => {
-      const active = { ...binding, state: 'active' as const, binding_version: 3, desired_revision: 3, applied_revision: 3, workspace: { ...binding.workspace, revision: 3 } };
-      serverHost = { ...serverHost, state: 'running', workspace_runtime_online: true, workspaces: [active] };
-      return serverHost;
-    });
+    const restore = vi.spyOn(portalApi, 'restoreWorkspacePaths');
+    const unbind = vi.spyOn(portalApi, 'unbindWorkspaceFromHost');
     const user = userEvent.setup();
-    renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }]);
+    renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }], `/hosts?sync=1&host=${host.id}`, true);
 
-    await user.click(await screen.findByRole('button', { name: '比较云端文件版本 ' + workspace.name }));
+    await user.click(await screen.findByRole('button', { name: `比较云端文件版本 ${workspace.name}` }));
     await user.click(screen.getByRole('button', { name: '比较版本' }));
-    await user.click(await screen.findByRole('button', { name: '安全恢复并重启 Host' }));
-    const confirm = screen.getByRole('button', { name: '解除关联、恢复文件并重启电脑' });
-    expect(confirm).toBeDisabled();
-    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能修改这些云端文件/ }));
-    await user.click(confirm);
 
-    expect(await screen.findByText(/云端电脑与新版本应用状态均已确认/)).toBeInTheDocument();
-    expect(unbind).toHaveBeenCalledWith(host.id, workspace.id, { expected_binding_version: 1, writers_stopped: true }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
-    expect(release).toHaveBeenCalledWith(host.id, true);
-    expect(restore).toHaveBeenCalledWith(workspace.id, { target_revision: 1, expected_current_revision: 2, paths: ['notes.md'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
-    expect(bindWorkspace).toHaveBeenCalledWith(host.id, { workspace_id: workspace.id, expected_revision: 3, expected_binding_version: 2 }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
-    expect(restoreHost).toHaveBeenCalledWith(host.id);
-    expect(localStorage.getItem('morde.pending-workspace-restore.u1234567')).toBeNull();
-  });
-
-  it('pauses after an unknown unbind result and does not release the Host', async () => {
-    const changes: components['schemas']['WorkspaceDiffChange'][] = [
-      { path: 'notes.md', action: 'changed', before: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'a'.repeat(64), mode: 0o644 }, after: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'b'.repeat(64), mode: 0o644 }, display_status: 'metadata_only', before_text: null, after_text: null },
-    ];
-    vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
-    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [{ ...host, workspaces: [binding] }] });
-    vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
-    const unbind = vi.spyOn(portalApi, 'unbindWorkspaceFromHost').mockRejectedValue(new TypeError('解绑结果未知'));
-    const release = vi.spyOn(portalApi, 'releaseHost').mockResolvedValue({ ...host, state: 'stopped' });
-    const restore = vi.spyOn(portalApi, 'restoreWorkspacePaths').mockResolvedValue({
-      workspace_id: workspace.id, target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false,
-    });
-    const user = userEvent.setup();
-    renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }]);
-
-    await user.click(await screen.findByRole('button', { name: '比较云端文件版本 ' + workspace.name }));
-    await user.click(screen.getByRole('button', { name: '比较版本' }));
-    await user.click(await screen.findByRole('button', { name: '安全恢复并重启 Host' }));
-    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能修改这些云端文件/ }));
-    await user.click(screen.getByRole('button', { name: '解除关联、恢复文件并重启电脑' }));
-
-    expect(await screen.findByText('解绑结果未知')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '核对状态并继续恢复' })).toBeInTheDocument();
-    const saved = JSON.parse(localStorage.getItem('morde.pending-workspace-restore.u1234567') ?? 'null') as PendingWorkspaceRestore;
-    expect(saved.phase).toBe('unbind');
-    expect(saved.unbindKey).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    expect(release).not.toHaveBeenCalled();
+    expect(await screen.findByText(/共 1 个路径差异/)).toBeInTheDocument();
+    expect(screen.getByText('电脑专属目录的历史版本仅供查看，不能使用通用工作区恢复流程。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '安全恢复并重启 Host' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /恢复 1 个路径/ })).not.toBeInTheDocument();
     expect(restore).not.toHaveBeenCalled();
-    expect(unbind).toHaveBeenCalledTimes(1);
+    expect(unbind).not.toHaveBeenCalled();
   });
 
   it('keeps restore disabled when the compared target is not the current revision', async () => {
@@ -686,7 +653,7 @@ describe('Workspaces', () => {
     expect(await screen.findByText('服务端已保存')).toBeInTheDocument();
     expect(await screen.findByText('应用：已应用')).toBeInTheDocument();
     expect(screen.getByText('同步：已同步 v2')).toBeInTheDocument();
-    expect(screen.getByText('项目：文件已就绪')).toBeInTheDocument();
+    expect(screen.getByText('电脑文件：已就绪')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: '打开云端电脑 开发电脑' }));
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${host.id}`, '_blank');
@@ -864,7 +831,7 @@ describe('Workspaces', () => {
 
     expect(await screen.findByText('服务端已保存')).toBeInTheDocument();
     expect(screen.getByText('应用：正在应用')).toBeInTheDocument();
-    expect(screen.getByText('项目：等待电脑应用文件')).toBeInTheDocument();
+    expect(screen.getByText('电脑文件：等待电脑应用文件')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '打开云端电脑 开发电脑' })).toBeDisabled();
   });
 
@@ -875,7 +842,7 @@ describe('Workspaces', () => {
     renderWorkspaces();
 
     expect(await screen.findByText('同步：待应用：电脑 v2 / 文件 v3')).toBeInTheDocument();
-    expect(screen.getByText('项目：等待电脑应用文件')).toBeInTheDocument();
+    expect(screen.getByText('电脑文件：等待电脑应用文件')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '打开云端电脑 开发电脑' })).toBeDisabled();
   });
 

@@ -186,7 +186,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     const appActions = applicationMenu[0].submenu;
     assert.deepEqual(appActions.map((item) => item.label), ['Open Morde', 'Settings', undefined, 'Quit Morde']);
     const settings = appActions.find((item) => item.label === 'Settings').submenu;
-    assert.deepEqual(settings.map((item) => item.label), ['Sign Out This PC']);
+    assert.deepEqual(settings.map((item) => item.label), ['Codex sessions and access', 'Sign Out This PC']);
     await handlers.get('morde:open-assistant')({ sender: mainWindow.webContents });
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
     assert.equal(contents.getURL(), assistantURL);

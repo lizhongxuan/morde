@@ -3,14 +3,20 @@ package app
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/workspace"
 )
+
+func hostPersistentVolumesDeleted(volume *hostServiceTestVolume, hostID string) bool {
+	return slices.Equal(volume.names, []string{domain.ProfileVolumeName(hostID), domain.RuntimeVolumeName(hostID)})
+}
 
 func TestWorkerAppDoesNotRetryUnknownRestoreCreate(t *testing.T) {
 	service, deps := newHostServiceTest(t)
@@ -261,6 +267,7 @@ func TestWorkerAppReconcileDeletesHostAfterVerifiedWorkspaceDetach(t *testing.T)
 	value.SandboxID = ""
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID,
 		State: workspace.StateReady,
@@ -281,7 +288,7 @@ func TestWorkerAppReconcileDeletesHostAfterVerifiedWorkspaceDetach(t *testing.T)
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
 	binding, _ := deps.workspaces.GetWorkspaceBinding(context.Background(), value.ID, testHostWorkspaceID(value))
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || binding.State != workspace.BindingDetached || len(volume.names) != 0 {
+	if got.State != host.StateDeleted || ws.State != workspace.StateDeleted || ws.DeletedAt == nil || binding.State != workspace.BindingDetached || !hostPersistentVolumesDeleted(volume, value.ID) {
 		t.Fatalf("host/workspace/binding/volume = %#v / %#v / %#v / %v", got, ws, binding, volume.names)
 	}
 }
@@ -292,6 +299,7 @@ func TestWorkerAppWaitsForHostActivityLeasesBeforeDeletingHost(t *testing.T) {
 	value.CreateAttemptedAt = ptrTime(time.Now())
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})
@@ -315,8 +323,9 @@ func TestWorkerAppWaitsForHostActivityLeasesBeforeDeletingHost(t *testing.T) {
 		t.Fatalf("Reconcile() after the Host activity lease drained: %v", err)
 	}
 	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
-	if got.State != host.StateDeleted || deps.sandbox.values[value.SandboxID].State != SandboxTerminated ||
-		len(deps.sandbox.deleteCalls) != 1 || len(volume.names) != 0 {
+	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
+	if got.State != host.StateDeleted || ws.State != workspace.StateDeleted || deps.sandbox.values[value.SandboxID].State != SandboxTerminated ||
+		len(deps.sandbox.deleteCalls) != 1 || !hostPersistentVolumesDeleted(volume, value.ID) {
 		t.Fatalf("Host after activity lease drain = %#v, sandbox=%#v, deletes=%v, volumes=%v",
 			got, deps.sandbox.values[value.SandboxID], deps.sandbox.deleteCalls, volume.names)
 	}
@@ -327,6 +336,7 @@ func TestWorkerAppFailsClosedWhenHostActivityLeaseCheckFailsBeforeDeletion(t *te
 	value := hostServiceTestHost(host.StateDeleting)
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})
@@ -346,34 +356,37 @@ func TestWorkerAppFailsClosedWhenHostActivityLeaseCheckFailsBeforeDeletion(t *te
 	}
 }
 
-func TestWorkerAppRefusesToDeleteHostWithAttachedWorkspaceBeforeCleanup(t *testing.T) {
+func TestWorkerAppDeletesBoundWorkspaceAfterAttachedHostCleanup(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateDeleting)
+	value.CreateAttemptedAt = ptrTime(time.Now().Add(-time.Minute))
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})
 	deps.sandbox.add(Sandbox{ID: value.SandboxID, State: SandboxRunning, Metadata: hostServiceMetadata(value.ID)})
 	worker := newWorkerAppTest(t, service)
 
-	if _, err := worker.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "not safely detached") {
-		t.Fatalf("Reconcile() error = %v, want attached-workspace preservation error", err)
+	if _, err := worker.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() deleting attached Host storage = %v", err)
 	}
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
 	volume := service.volumes.(*hostServiceTestVolume)
-	if got.State != host.StateDeleting || ws.State != workspace.StateReady ||
-		deps.sandbox.values[value.SandboxID].State != SandboxRunning || len(deps.sandbox.deleteCalls) != 0 || len(volume.names) != 0 {
-		t.Fatalf("host/workspace/sandbox/volumes after refused deletion = %#v / %#v / %#v / %v", got, ws, deps.sandbox.values[value.SandboxID], volume.names)
+	if got.State != host.StateDeleted || ws.State != workspace.StateDeleted ||
+		deps.sandbox.values[value.SandboxID].State != SandboxTerminated || len(deps.sandbox.deleteCalls) != 1 || !hostPersistentVolumesDeleted(volume, value.ID) {
+		t.Fatalf("host/workspace/sandbox/volumes after deletion = %#v / %#v / %#v / %v", got, ws, deps.sandbox.values[value.SandboxID], volume.names)
 	}
 }
 
-func TestWorkerAppReconcilePreservesWorkspaceForAlreadyDetachedBinding(t *testing.T) {
+func TestWorkerAppReconcileDeletesWorkspaceForAlreadyDetachedBinding(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateDeleting)
 	value.SandboxID = ""
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID,
 		State: workspace.StateReady,
@@ -386,30 +399,81 @@ func TestWorkerAppReconcilePreservesWorkspaceForAlreadyDetachedBinding(t *testin
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
 	volume := service.volumes.(*hostServiceTestVolume)
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 0 {
-		t.Fatalf("host/detached workspace/volume = %#v / %#v / %v", got, ws, volume.names)
+	if got.State != host.StateDeleted || ws.State != workspace.StateDeleted || ws.DeletedAt == nil || !hostPersistentVolumesDeleted(volume, value.ID) {
+		t.Fatalf("host/deleted storage/volume = %#v / %#v / %v", got, ws, volume.names)
 	}
 }
 
-func TestWorkerAppRetainsLegacyVolumesAfterHostDeletion(t *testing.T) {
+func TestWorkerAppKeepsHostDeletingUntilStorageCleanupSucceeds(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateDeleting)
 	value.SandboxID = ""
 	value.Workspaces[0].State = workspace.BindingDetached
 	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID,
 		State: workspace.StateReady,
 	})
 	worker := newWorkerAppTest(t, service)
 	volume := service.volumes.(*hostServiceTestVolume)
-	if _, err := worker.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
+	deps.defaultWorkspace.deleteErr = errors.New("storage volume is still mounted")
+	if _, err := worker.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "storage volume is still mounted") {
+		t.Fatalf("Reconcile() error = %v, want storage cleanup failure", err)
 	}
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 0 {
-		t.Fatalf("host/workspace/retained volumes = %#v / %#v / %v", got, ws, volume.names)
+	if got.State != host.StateDeleting || ws.State != workspace.StateReady || len(volume.names) != 0 {
+		t.Fatalf("host/workspace/volume after failed cleanup = %#v / %#v / %v", got, ws, volume.names)
+	}
+	deps.defaultWorkspace.deleteErr = nil
+	if _, err := worker.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() after storage cleanup retry = %v", err)
+	}
+	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
+	ws, _ = deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
+	if got.State != host.StateDeleted || ws.State != workspace.StateDeleted || !slices.Equal(volume.names, []string{
+		domain.ProfileVolumeName(value.ID), domain.ProfileVolumeName(value.ID), domain.RuntimeVolumeName(value.ID),
+	}) {
+		t.Fatalf("host/workspace after storage cleanup retry = %#v / %#v / %v", got, ws, volume.names)
+	}
+}
+
+func TestWorkerAppKeepsHostDeletingUntilPersistentVolumeCleanupSucceeds(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateDeleting)
+	value.SandboxID = ""
+	value.Workspaces[0].State = workspace.BindingDetached
+	deps.hosts.addHost(value)
+	deps.workspaces.addBinding(value.Workspaces[0])
+	deps.workspaces.add(workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady})
+	worker := newWorkerAppTest(t, service)
+	volume := service.volumes.(*hostServiceTestVolume)
+	profileVolume := domain.ProfileVolumeName(value.ID)
+	failOnce := true
+	volume.beforeDelete = func(name string) error {
+		if name == profileVolume && failOnce {
+			failOnce = false
+			return errors.New("profile volume is still mounted")
+		}
+		return nil
+	}
+	if _, err := worker.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "profile volume is still mounted") {
+		t.Fatalf("Reconcile() error = %v, want Host volume cleanup failure", err)
+	}
+	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
+	if got.State != host.StateDeleting || ws.State != workspace.StateDeleted || !slices.Equal(volume.names, []string{profileVolume}) {
+		t.Fatalf("Host/workspace/volume after failed Host volume cleanup = %#v / %#v / %v", got, ws, volume.names)
+	}
+	if _, err := worker.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() after Host volume cleanup retry = %v", err)
+	}
+	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
+	if got.State != host.StateDeleted || !slices.Equal(volume.names, []string{
+		profileVolume, profileVolume, domain.RuntimeVolumeName(value.ID),
+	}) {
+		t.Fatalf("Host/volume after Host volume cleanup retry = %#v / %v", got, volume.names)
 	}
 }
 

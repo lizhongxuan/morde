@@ -144,12 +144,12 @@ export function LocalWorkspaceRecovery({ bridge, workspaceNames }: { bridge: Bri
   if (!bridge?.legacySyncState || !state && !error || state && !state.mappings.length && !state.checkpoint && !error) return null;
 
   return <details className="local-workspace-recovery">
-    <summary>已有 Workspace 本机同步与安全副本</summary>
-    <p className="muted">这里保留旧版同步的停止、恢复点和本机安全副本操作。</p>
+    <summary>旧版目录同步与安全副本</summary>
+    <p className="muted">这里保留旧版目录同步的停止、恢复点和本机安全副本操作。</p>
     {error && <p role="alert">{error} <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => void refresh()}>重试</button></p>}
     {message && <p role="status">{message}</p>}
     {state?.checkpoint && <div>
-      <p>旧版同步恢复点：{workspaceNames[state.checkpoint.workspaceId] ?? state.checkpoint.workspaceId} · {state.checkpoint.mode}</p>
+      <p>旧版目录同步恢复点：{workspaceNames[state.checkpoint.workspaceId] ?? state.checkpoint.workspaceId} · {state.checkpoint.mode}</p>
       <p className="muted">同步范围：{state.checkpoint.scope.length ? state.checkpoint.scope.join('、') : '整个目录'}</p>
       <div className="inline-actions">
         {state.syncState === 'running' && <button type="button" className="button button-secondary button-small" disabled={stopping || !bridge.legacyStopSync}

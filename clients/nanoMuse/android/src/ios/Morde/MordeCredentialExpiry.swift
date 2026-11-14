@@ -618,11 +618,65 @@ enum MordeTaskResponsePolicy {
         return "/api/tasks/\(taskID)/steps/\(stepID)"
     }
 
+    static func stepRetryPath(taskID: String, stepID: String) -> String? {
+        guard hasValidTaskID(taskID), hasValidStepID(stepID) else { return nil }
+        return "/api/tasks/\(taskID)/steps/\(stepID)/retries"
+    }
+
+    static func stepRetryBody(taskRevision: Int64?, attempt: Int?) -> [String: Any]? {
+        guard let taskRevision, taskRevision >= 0, let attempt, attempt > 0 else { return nil }
+        return ["expected_task_revision": taskRevision, "expected_attempt": attempt]
+    }
+
+    static func validStepRetryReceipt(sourceStepID: String, sourceAttempt: Int,
+                                      responseSourceStepID: String?, attemptStepID: String?,
+                                      attempt: Int?, status: String?, replayed: Bool?) -> Bool {
+        guard hasValidStepID(sourceStepID), sourceAttempt > 0,
+              responseSourceStepID == sourceStepID,
+              let attemptStepID, hasValidStepID(attemptStepID), attemptStepID != sourceStepID,
+              let attempt, attempt > sourceAttempt,
+              status == "queued", replayed != nil else { return false }
+        return true
+    }
+
     static func stepTimeLabel(_ value: String) -> String? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let date = fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
         return date?.formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+struct MordeTaskStepRetryErrorStore {
+    private struct Key: Hashable {
+        let taskID: String
+        let stepID: String
+    }
+
+    private var messages: [Key: String] = [:]
+
+    mutating func set(_ message: String, taskID: String, stepID: String) {
+        guard MordeTaskResponsePolicy.hasValidTaskID(taskID),
+              MordeTaskResponsePolicy.hasValidStepID(stepID) else { return }
+        messages[Key(taskID: taskID, stepID: stepID)] = message
+    }
+
+    func message(taskID: String, stepID: String) -> String? {
+        messages[Key(taskID: taskID, stepID: stepID)]
+    }
+
+    mutating func remove(taskID: String, stepID: String) {
+        messages.removeValue(forKey: Key(taskID: taskID, stepID: stepID))
+    }
+
+    mutating func removeAll(taskID: String) {
+        for key in messages.keys.filter({ $0.taskID == taskID }) {
+            messages.removeValue(forKey: key)
+        }
+    }
+
+    mutating func removeAll() {
+        messages.removeAll()
     }
 }
 
@@ -1389,7 +1443,7 @@ struct MordeTaskEventCursor: Equatable, Sendable {
 enum MordeTaskEventSnapshotPolicy {
     static func requiresRefresh(type: String) -> Bool {
         ["task.status", "task.step", "task.operation", "task.message", "task.batch_item",
-         "task.artifact", "task.waiting_user", "task.response", "task.result"].contains(type)
+         "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan"].contains(type)
     }
 }
 
@@ -1551,6 +1605,9 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     let output_status: String?
     let output_task_revision: Int64?
     let output_result_event_sequence: Int64?
+    let variant_group_id: String?
+    let variant_version: Int64?
+    let variant_action: String?
 
     var displayStatus: String? { output_status ?? status }
     var displayTaskRevision: Int64? { output_task_revision ?? task_revision }
@@ -1563,7 +1620,8 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
          local_send_status: String? = nil, owner_id: String? = nil, actor_id: String? = nil,
          task_revision: Int64? = nil, result_event_sequence: Int64? = nil,
          sources: [MordeClientMessageSource]? = nil, output_status: String? = nil,
-         output_task_revision: Int64? = nil, output_result_event_sequence: Int64? = nil) {
+         output_task_revision: Int64? = nil, output_result_event_sequence: Int64? = nil,
+         variant_group_id: String? = nil, variant_version: Int64? = nil, variant_action: String? = nil) {
         self.id = id
         self.conversation_id = conversation_id
         self.sequence = sequence
@@ -1588,6 +1646,9 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
         self.output_status = output_status
         self.output_task_revision = output_task_revision
         self.output_result_event_sequence = output_result_event_sequence
+        self.variant_group_id = variant_group_id
+        self.variant_version = variant_version
+        self.variant_action = variant_action
     }
 }
 
@@ -1627,6 +1688,138 @@ struct MordeConversationMessageReceipt: Decodable {
     let replayed: Bool?
 }
 
+enum MordeConversationVariantAction: String, Codable, CaseIterable {
+    case editResend = "edit_resend"
+    case regenerateText = "regenerate_text"
+    case continueGeneration = "continue_generation"
+}
+
+struct MordeConversationVariantOperationResponse: Decodable, Equatable {
+    let operation_id: String
+    let variant_group_id: String
+    let variant_version: Int64
+    let action: MordeConversationVariantAction
+    let state: String
+    let task_id: String?
+    let user_message_id: String?
+    let assistant_message_id: String?
+
+    var hasKnownOutcome: Bool { state != "unknown" }
+
+    var isValid: Bool {
+        operation_id.range(of: #"^[A-Za-z0-9._~-]{1,128}$"#, options: .regularExpression) != nil &&
+            variant_group_id.range(of: #"^m[a-z0-9]{7}$"#, options: .regularExpression) != nil &&
+            variant_version >= 1 && ["accepted", "running", "completed", "failed", "unknown"].contains(state) &&
+            (task_id.map { $0.range(of: #"^q[a-z0-9]{7}$"#, options: .regularExpression) != nil } ?? true) &&
+            (user_message_id.map { $0.range(of: #"^m[a-z0-9]{7}$"#, options: .regularExpression) != nil } ?? true) &&
+            (assistant_message_id.map { $0.range(of: #"^m[a-z0-9]{7}$"#, options: .regularExpression) != nil } ?? true)
+    }
+}
+
+struct MordeConversationVariantOperationRequest: Encodable, Equatable {
+    static let maximumContentScalars = 32_768
+
+    let action: MordeConversationVariantAction
+    let expected_version: Int64
+    let content: String?
+
+    init(action: MordeConversationVariantAction, expectedVersion: Int64, content: String? = nil) {
+        self.action = action
+        self.expected_version = expectedVersion
+        self.content = content
+    }
+
+    var fields: [String: Any] {
+        var result: [String: Any] = ["action": action.rawValue, "expected_version": expected_version]
+        if let content { result["content"] = content }
+        return result
+    }
+
+    var isValid: Bool {
+        expected_version >= 1 && (action == .editResend
+            ? content.map {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                    $0.unicodeScalars.count <= Self.maximumContentScalars
+            } == true
+            : content == nil)
+    }
+}
+
+struct MordeConversationVariantOperationAttempt: Codable, Equatable {
+    let idempotencyKey: String
+    let action: MordeConversationVariantAction
+    let expectedVersion: Int64
+    let projectID: String?
+    let conversationID: String
+    let messageID: String
+    let groupID: String
+    let content: String?
+}
+
+enum MordeConversationVariantPresentation {
+    static func version(_ message: MordeClientMessage) -> Int64 {
+        max(1, message.variant_version ?? 1)
+    }
+
+    static func groupID(_ message: MordeClientMessage) -> String? {
+        guard let value = message.variant_group_id,
+              value.range(of: #"^m[a-z0-9]{7}$"#, options: .regularExpression) != nil else { return nil }
+        return value
+    }
+
+    static func hasValidProjection(_ message: MordeClientMessage) -> Bool {
+        if message.variant_group_id == nil {
+            return message.variant_version == nil && message.variant_action == nil
+        }
+        return groupID(message) != nil && (message.variant_version.map { $0 >= 1 } ?? true) &&
+            (message.variant_action.map { $0.utf8.count <= 64 } ?? true)
+    }
+
+    static func versions(in messages: [MordeClientMessage], groupID: String) -> [Int64] {
+        Array(Set(messages.filter { self.groupID($0) == groupID }.map(version))).sorted()
+    }
+
+    static func selectedVersion(in messages: [MordeClientMessage], groupID: String,
+                                preferred: Int64?) -> Int64? {
+        let available = versions(in: messages, groupID: groupID)
+        if let preferred, available.contains(preferred) { return preferred }
+        return available.last
+    }
+
+    static func latestVersion(in messages: [MordeClientMessage], groupID: String) -> Int64? {
+        versions(in: messages, groupID: groupID).last
+    }
+
+    static func visibleMessages(_ messages: [MordeClientMessage], selectedVersions: [String: Int64]) -> [MordeClientMessage] {
+        messages.filter { message in
+            guard let groupID = groupID(message),
+                  let selected = selectedVersion(in: messages, groupID: groupID,
+                                                 preferred: selectedVersions[groupID]) else { return true }
+            return version(message) == selected
+        }
+    }
+
+    static func allows(_ action: MordeConversationVariantAction, for message: MordeClientMessage) -> Bool {
+        guard groupID(message) != nil, version(message) >= 1 else { return false }
+        switch action {
+        case .editResend:
+            return message.role == "user"
+        case .regenerateText:
+            return message.role == "assistant" && message.displayStatus == "completed"
+        case .continueGeneration:
+            return message.role == "assistant" && message.displayStatus == "interrupted" && message.task_id != nil
+        }
+    }
+
+    static func attemptStorageKey(scope: MordeClientDataScope, projectID: String?, conversationID: String,
+                                  groupID: String, action: MordeConversationVariantAction) -> String {
+        let parts = [scope.serviceOrigin, scope.serviceInstanceID, scope.accountID, projectID ?? "personal",
+                     conversationID, groupID, action.rawValue]
+        return SHA256.hash(data: Data(parts.joined(separator: "\u{0}").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 enum MordeConversationMessageReceiptPolicy {
     static func matches(_ message: MordeClientMessage, clientMessageID: String,
                         conversationID: String, content: String) -> Bool {
@@ -1637,7 +1830,9 @@ enum MordeConversationMessageReceiptPolicy {
 
 enum MordeConversationMessagePagePolicy {
     static func matches(_ messages: [MordeClientMessage], conversationID: String) -> Bool {
-        messages.allSatisfy { $0.conversation_id == conversationID }
+        messages.allSatisfy {
+            $0.conversation_id == conversationID && MordeConversationVariantPresentation.hasValidProjection($0)
+        }
     }
 }
 
@@ -1715,7 +1910,9 @@ enum MordeTaskSnapshotMessageMerge {
             owner_id: snapshot.owner_id, actor_id: snapshot.actor_id, task_revision: snapshot.task_revision,
             result_event_sequence: snapshot.result_event_sequence, sources: snapshot.sources,
             output_status: nil, output_task_revision: snapshot.output_task_revision,
-            output_result_event_sequence: snapshot.output_result_event_sequence)
+            output_result_event_sequence: snapshot.output_result_event_sequence,
+            variant_group_id: snapshot.variant_group_id, variant_version: snapshot.variant_version,
+            variant_action: snapshot.variant_action)
     }
 
     static func shouldIncludeSnapshot(resultMessagePending: Bool?, resultMessagePublished: Bool?, status: String?) -> Bool {
@@ -1812,7 +2009,9 @@ enum MordeTaskSnapshotMessageMerge {
                     owner_id: existing.owner_id, actor_id: existing.actor_id, task_revision: existing.task_revision,
                     result_event_sequence: existing.result_event_sequence, sources: existing.sources,
                     output_status: existing.output_status, output_task_revision: existing.output_task_revision,
-                    output_result_event_sequence: existing.output_result_event_sequence)
+                    output_result_event_sequence: existing.output_result_event_sequence,
+                    variant_group_id: existing.variant_group_id, variant_version: existing.variant_version,
+                    variant_action: existing.variant_action)
             } else {
                 merged[index] = MordeClientMessage(
                     id: snapshot.id, conversation_id: snapshot.conversation_id ?? existing.conversation_id,
@@ -1833,7 +2032,10 @@ enum MordeTaskSnapshotMessageMerge {
                     sources: snapshot.sources ?? existing.sources,
                     output_status: existing.output_status == nil ? snapshot.output_status : snapshot.displayStatus,
                     output_task_revision: snapshot.output_task_revision ?? existing.output_task_revision,
-                    output_result_event_sequence: snapshot.output_result_event_sequence ?? existing.output_result_event_sequence)
+                    output_result_event_sequence: snapshot.output_result_event_sequence ?? existing.output_result_event_sequence,
+                    variant_group_id: snapshot.variant_group_id ?? existing.variant_group_id,
+                    variant_version: snapshot.variant_version ?? existing.variant_version,
+                    variant_action: snapshot.variant_action ?? existing.variant_action)
             }
         } else {
             merged.append(snapshot)
@@ -2632,6 +2834,8 @@ private struct MordeOutboxSnapshot: Codable {
     var lastMessageIDs: [String: String] = [:]
     var resolvedConversations: [String: String]? = nil
     var routingRetryAttempts: [String: String]? = nil
+    var variantOperationAttempts: [String: MordeConversationVariantOperationAttempt]? = nil
+    var variantSelections: [String: Int64]? = nil
 }
 
 /// Each account's messages are written atomically before the composer is cleared.
@@ -2692,6 +2896,54 @@ final class MordeMessageOutbox {
         var snapshot = try read(scope: scope)
         guard snapshot.routingRetryAttempts?[storageKey] == attempt else { return }
         snapshot.routingRetryAttempts?.removeValue(forKey: storageKey)
+        try write(snapshot, scope: scope)
+    }
+
+    func pendingVariantOperation(storageKey: String, scope: MordeClientDataScope) throws -> MordeConversationVariantOperationAttempt? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return try read(scope: scope).variantOperationAttempts?[storageKey]
+    }
+
+    func beginVariantOperation(storageKey: String, proposed: MordeConversationVariantOperationAttempt,
+                               scope: MordeClientDataScope) throws -> MordeConversationVariantOperationAttempt {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        var snapshot = try read(scope: scope)
+        if let existing = snapshot.variantOperationAttempts?[storageKey] { return existing }
+        var attempts = snapshot.variantOperationAttempts ?? [:]
+        attempts[storageKey] = proposed
+        snapshot.variantOperationAttempts = attempts
+        try write(snapshot, scope: scope)
+        return proposed
+    }
+
+    func finishVariantOperation(storageKey: String, attempt: MordeConversationVariantOperationAttempt,
+                                scope: MordeClientDataScope) throws {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        var snapshot = try read(scope: scope)
+        guard snapshot.variantOperationAttempts?[storageKey]?.idempotencyKey == attempt.idempotencyKey else { return }
+        snapshot.variantOperationAttempts?.removeValue(forKey: storageKey)
+        try write(snapshot, scope: scope)
+    }
+
+    func variantSelections(scope: MordeClientDataScope) throws -> [String: Int64] {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return try read(scope: scope).variantSelections ?? [:]
+    }
+
+    func setVariantSelection(storageKey: String, version: Int64, scope: MordeClientDataScope) throws {
+        guard version >= 1, !storageKey.isEmpty, storageKey.utf8.count <= 512 else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        var snapshot = try read(scope: scope)
+        var selections = snapshot.variantSelections ?? [:]
+        selections[storageKey] = version
+        snapshot.variantSelections = selections
         try write(snapshot, scope: scope)
     }
 

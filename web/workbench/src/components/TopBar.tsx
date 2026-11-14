@@ -102,7 +102,8 @@ export default function TopBar({
             ? `操作租约${control.control_lease_held_by_me ? '由你持有' : '有效'} · ${formatRemaining(control.control_lease_expires_at, now)}`
             : '当前没有有效操作租约'}
         </span>}
-        {notice && <span className="workbench-status" data-kind={noticeKind} role={noticeKind === 'error' ? 'alert' : 'status'}>{notice}</span>}
+        {notice && noticeKind === 'success' && <FloatingError role="status" className="workbench-floating-success">{notice}</FloatingError>}
+        {notice && noticeKind === 'error' && <FloatingError>{notice}</FloatingError>}
       </div>
       <div className="top-actions">
         {!embedded && <button className="button button-secondary host-return-button" type="button" onClick={returnToPreviousPage}>返回云端电脑</button>}

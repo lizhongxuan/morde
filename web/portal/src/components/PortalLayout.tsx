@@ -9,6 +9,7 @@ import { MordeIcon, type MordeIconName } from './MordeIcon';
 const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
   { to: '/hosts', label: '云端电脑', icon: 'monitor' },
   { to: '/assistant', label: '对话', icon: 'spark' },
+  { to: '/codex', label: 'Codex 会话', icon: 'spark' },
   { to: '/projects', label: '项目', icon: 'folder' },
   { to: '/personal', label: '个人数据', icon: 'user' },
   { to: '/goals', label: '目标与计划', icon: 'target' },
@@ -70,11 +71,11 @@ const personalSections: Array<[string, string, MordeIconName]> = [
 ];
 
 const pageNavigationFor = (pathname: string): PageNavigation | null => {
-  if (pathname === '/workspaces' || pathname === '/hosts' || pathname.startsWith('/hosts/')) return {
-    title: '云端电脑',
+  if (pathname === '/hosts' || pathname.startsWith('/hosts/')) return {
+    title: '云端电脑', queryDefault: ['sync', '0'],
     items: [
-      { label: '云端电脑', icon: 'monitor', to: '/hosts' },
-      { label: '文件同步', icon: 'folder', to: '/workspaces' },
+      { label: '云端电脑', icon: 'monitor', to: '/hosts', query: ['sync', '0'] },
+      { label: '文件同步', icon: 'folder', to: '/hosts?sync=1', query: ['sync', '1'] },
     ],
   };
   if (pathname === '/personal') return {
@@ -135,7 +136,7 @@ export function PortalLayout() {
       <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={goForward}><MordeIcon name="forward" /></button>
       <span className="morde-top-divider" aria-hidden="true" />
       {hasCollapsibleSidebar && <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>}
-    </div><ToastNoticeCenter /><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><MordeIcon name="monitor" /></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>
+    </div><ToastNoticeCenter /><div className="morde-top-actions"><Link className="morde-notification-link" to="/clients" aria-label="查看客户端与设备"><MordeIcon name="monitor" /></Link><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">

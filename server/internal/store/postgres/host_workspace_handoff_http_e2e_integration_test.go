@@ -30,12 +30,13 @@ import (
 
 	"morde/server/internal/api"
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
 )
 
-func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
+func TestHostWorkspaceStorageCannotMoveToAnotherComputer(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
@@ -198,44 +199,17 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 		t.Fatalf("stale Host A advanced revision to %d: %v", afterStaleA.Revision, err)
 	}
 
-	hostB, rootCredentialB := createHostHandoffTestHost(t, ctx, store, sealer, owner.ID, capacity, []string{workspaceValue.ID})
-	workspaceValue, err = store.GetWorkspace(ctx, workspaceValue.ID)
-	if err != nil {
-		t.Fatal(err)
+	secondHost := testCreateHostParams(t, store, owner.ID, capacity, []string{workspaceValue.ID})
+	if _, _, err := store.CreateHost(ctx, secondHost); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("another computer reused the first computer's persistent directory: %v", err)
 	}
-	preparingB, err := store.GetWorkspaceBinding(ctx, hostB.ID, workspaceValue.ID)
-	if err != nil || preparingB.DesiredRevision != checkpointRevision {
-		t.Fatalf("bind Workspace to Host B at checkpoint = %#v, %v", preparingB, err)
+	bindings, err := store.GetWorkspaceBindingsByWorkspace(ctx, workspaceValue.ID)
+	if err != nil || len(bindings) != 1 || bindings[0].HostID != hostA.ID || bindings[0].State != workspace.BindingDetached {
+		t.Fatalf("storage binding after rejected move = %#v, %v", bindings, err)
 	}
-	credentialB, bindingB := hostHandoffBindingCredential(t, httpClient, httpServer.URL, hostB, rootCredentialB, workspaceValue.ID)
-	directoryB := t.TempDir()
-	clientB, err := client.New(httpServer.URL, credentialB, httpClient)
-	if err != nil {
-		t.Fatal(err)
-	}
-	initialB, err := clientB.Sync(ctx, client.SyncOptions{
-		WorkspaceID: workspaceValue.ID, Directory: directoryB, Direction: "download", Policy: "fill_missing", BaseRevision: &zeroRevision,
-	})
-	if err != nil || initialB.Session.State != "completed" || initialB.Session.TargetRevision != checkpointRevision {
-		t.Fatalf("Host B restore download = %#v, %v", initialB.Session, err)
-	}
-	if data, err := os.ReadFile(filepath.Join(directoryB, "before-leaving.txt")); err != nil || string(data) != "checkpointed on Host A\n" {
-		t.Fatalf("Host B restored checkpoint data = %q, %v", data, err)
-	}
-	if err := clientB.ConfirmDownloadedLiveBaseline(ctx, workspaceValue.ID, directoryB, checkpointRevision); err != nil {
-		t.Fatalf("Host B did not establish a live baseline from its download: %v", err)
-	}
-	if err := clientB.ValidateLiveBaseline(ctx, workspaceValue.ID, directoryB, nil); err != nil {
-		t.Fatalf("Host B cannot resume its downloaded baseline: %v", err)
-	}
-	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostB, bindingB.BindingVersion, workspaceValue.ID,
-		rootCredentialB, initialB.Session.ID, checkpointRevision)
-	hostHandoffActivate(t, httpClient, httpServer.URL, hostB, bindingB.BindingVersion, workspaceValue.ID, rootCredentialB)
-
-	activeB, err := store.GetWorkspaceBinding(ctx, hostB.ID, workspaceValue.ID)
-	if err != nil || activeB.State != workspace.BindingActive || activeB.AppliedRevision != checkpointRevision ||
-		activeB.DesiredRevision != checkpointRevision || activeB.Workspace.Revision != checkpointRevision {
-		t.Fatalf("Host B binding after verified restore = %#v, %v", activeB, err)
+	ownerWorkspace, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil || ownerWorkspace.OwnerID != owner.ID || ownerWorkspace.Revision != checkpointRevision {
+		t.Fatalf("computer directory changed after rejected move = %#v, %v", ownerWorkspace, err)
 	}
 }
 

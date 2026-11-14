@@ -141,6 +141,7 @@ type taskResponse struct {
 	StopRequest            *taskStopRequestResponse          `json:"stop_request"`
 	AssistantMessage       *taskAssistantMessageResponse     `json:"assistant_message"`
 	FinishedAt             *time.Time                        `json:"finished_at"`
+	Plan                   *task.Plan                        `json:"plan,omitempty"`
 }
 
 type taskFileFetchResponse struct {
@@ -1109,12 +1110,15 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	if value.Task.EventSequence < 0 || (value.CurrentRevisionStarted != nil && value.Task.CurrentRevision == nil) {
 		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
+	if value.Plan != nil && (value.Plan.Validate() != nil || value.Task.CurrentRevision == nil || value.Plan.TaskRevision != *value.Task.CurrentRevision) {
+		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
 	response := taskResponse{
 		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
 		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
-		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt,
+		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan,
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
 		message := assistant.Message
@@ -1209,6 +1213,12 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			UnsettledOperationIDs: unsettled,
 		}
 	}
+	retriedStepIDs := make(map[string]struct{}, len(value.Steps))
+	for _, step := range value.Steps {
+		if step.RetryOfStepID != "" {
+			retriedStepIDs[step.RetryOfStepID] = struct{}{}
+		}
+	}
 	for _, step := range value.Steps {
 		if !domain.ValidStepID(step.ID) || step.TaskID != value.Task.ID || step.Sequence < 1 || !validStepStatus(step.Status) ||
 			!validStepKind(step.Kind) || utf8.RuneCountInString(step.Summary) > 2000 || step.CreatedAt.IsZero() {
@@ -1230,9 +1240,13 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			(step.Phase != "" && !validTaskText(step.Phase, 64)) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
+		retryable := step.Retryable
+		if _, retried := retriedStepIDs[step.ID]; retried {
+			retryable = false
+		}
 		response.Steps = append(response.Steps, taskStepResponse{
 			ID: step.ID, Sequence: step.Sequence, Attempt: attempt, RetryOfStepID: optionalTaskText(step.RetryOfStepID),
-			Kind: step.Kind, Status: step.Status, Title: step.Title, FailureReason: optionalTaskText(step.FailureReason), Retryable: step.Retryable,
+			Kind: step.Kind, Status: step.Status, Title: step.Title, FailureReason: optionalTaskText(step.FailureReason), Retryable: retryable,
 			Summary: step.Summary, CreatedAt: step.CreatedAt, AgentID: optionalTaskText(step.AgentSessionID), TaskRevision: step.TaskRevision,
 			ToolName: optionalTaskText(step.ToolName), Phase: optionalTaskText(step.Phase), DetailState: detailState,
 		})

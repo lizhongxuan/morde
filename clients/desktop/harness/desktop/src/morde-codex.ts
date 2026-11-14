@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, isAbsolute, resolve } from "node:path";
-import type { CodexDiscoverInput, CodexQueuedCommand, CodexScope, MordeAPI } from "./morde-core";
+import type { CodexDiscoverInput, CodexProfileSyncStatus, CodexQueuedCommand, CodexScope, MordeAPI } from "./morde-core";
 
 // Dependency-free protocol handling adapted from MIT-licensed T3code sources:
 // project/T3code/packages/effect-codex-app-server/src/protocol.ts and client.ts.
@@ -14,6 +14,7 @@ export type CodexThread = {
   cwd: string;
   updatedAt: string | null;
   status: string;
+  archived: boolean;
 };
 export type CodexTurn = {
   id: string;
@@ -111,7 +112,7 @@ function stableID(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-function threadFrom(value: unknown): CodexThread | null {
+function threadFrom(value: unknown, archived = false): CodexThread | null {
   const row = object(value);
   if (!row || !stableID(row.id)) return null;
   const updated = typeof row.updatedAt === "number" ? unixSecondsISO(row.updatedAt) :
@@ -123,6 +124,7 @@ function threadFrom(value: unknown): CodexThread | null {
     cwd,
     updatedAt: updated,
     status: boundedString(object(row.status)?.type, 128) ?? boundedString(row.status, 128) ?? "unknown",
+    archived,
   };
 }
 
@@ -303,19 +305,34 @@ export class MordeCodexProvider {
     this.write({ id, error: { code, message } });
   }
 
-  async listThreads(cursor: string | null = null): Promise<{ items: CodexThread[]; nextCursor: string | null }> {
-    if (!(cursor === null || typeof cursor === "string" && cursor.length <= 4096 && !cursor.includes("\u0000"))) throw new Error("Invalid Codex thread cursor");
+  private async listThreadPage(cursor: string | null, archived: boolean): Promise<{ items: CodexThread[]; nextCursor: string | null }> {
     const result = object(await this.request("thread/list", {
-      cursor, limit: 100, sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true,
+      cursor, limit: 100, sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: false, archived,
     }));
     if (!result || !Array.isArray(result.data)) throw new Error("Codex thread list is unavailable");
-    const threads = result.data.map(threadFrom).filter((thread): thread is CodexThread => thread !== null);
+    const threads = result.data.map((thread) => threadFrom(thread, archived)).filter((thread): thread is CodexThread => thread !== null);
     const rawNext = result.nextCursor;
     if (rawNext !== undefined && rawNext !== null && (typeof rawNext !== "string" || rawNext.length > 4096 || rawNext.includes("\u0000") || rawNext === cursor)) {
       throw new Error("Codex thread pagination is invalid");
     }
     const next = typeof rawNext === "string" ? rawNext : null;
     return { items: threads, nextCursor: next };
+  }
+
+  async listThreads(cursor: string | null = null): Promise<{ items: CodexThread[]; nextCursor: string | null }> {
+    if (!(cursor === null || typeof cursor === "string" && cursor.length <= 8192 && !cursor.includes("\u0000"))) throw new Error("Invalid Codex thread cursor");
+    const phase = cursor?.startsWith("archived:") ? "archived" : "active";
+    if (cursor !== null && !cursor.startsWith("active:") && !cursor.startsWith("archived:")) throw new Error("Invalid Codex thread cursor");
+    const prefix = `${phase}:`;
+    const serverCursor = cursor === null ? null : cursor.slice(prefix.length) || null;
+    const page = await this.listThreadPage(serverCursor, phase === "archived");
+    if (page.nextCursor) return { items: page.items, nextCursor: `${phase}:${page.nextCursor}` };
+    if (phase === "archived") return page;
+    const archivedPage = await this.listThreadPage(null, true);
+    return {
+      items: [...page.items, ...archivedPage.items],
+      nextCursor: archivedPage.nextCursor ? `archived:${archivedPage.nextCursor}` : null,
+    };
   }
 
   async readSnapshot(threadID: string, knownTurnIDs: ReadonlySet<string> = new Set(), startCursor: string | null = null): Promise<CodexSnapshot> {
@@ -429,7 +446,7 @@ export function codexSnapshotItemFingerprint(item: JsonObject): string {
   return hash(JSON.stringify(item));
 }
 
-export type CodexLocalProfile = { profileKey: string; homeDirectory: string; executable: string; createdAt: string };
+export type CodexLocalProfile = { profileKey: string; homeDirectory: string; executable: string; createdAt: string; connectionScopes?: CodexScope[] };
 export type CodexEventInput = {
   provider_event_id: string;
   kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "file_change" | "child_agent" | "question" | "approval_request" | "approval_status" | "unsupported";
@@ -506,23 +523,24 @@ export type CodexPersistentState = {
 };
 
 export type CodexRuntimeState = {
-  profiles: { profileKey: string; label: string; executableLabel: string; selected: boolean; state: string; error: string | null }[];
+  profiles: { profileKey: string; label: string; executableLabel: string; selected: boolean; state: string; error: string | null; connectionAuthorized: boolean; scopes: CodexScope[]; syncState: "idle" | "syncing" | "synced" | "partial"; syncTotal: number; syncDone: number; syncError: string | null }[];
   selectedProfileKey: string | null;
-  sessions: { id: string; profileKey: string; threadId: string; title: string; cwdLabel: string; updatedAt: string | null; status: string; scopes: CodexScope[]; snapshotState: string; snapshotMessage?: string; pendingEvents: number; blockedEvents: number }[];
+  sessions: { id: string; profileKey: string; threadId: string; title: string; cwdLabel: string; updatedAt: string | null; status: string; scopes: CodexScope[]; snapshotState: string; snapshotMessage?: string; historyComplete: boolean; pendingEvents: number; blockedEvents: number }[];
   realtimeCapability: "available" | "unverified";
   running: boolean;
   error: string | null;
 };
 
-type CodexAPI = Pick<MordeAPI, "codexDiscover" | "codexClaim" | "codexCommandResult" | "codexEvents">;
+type CodexAPI = Pick<MordeAPI, "codexDiscover" | "codexClaim" | "codexCommandResult" | "codexEvents" | "codexAuthorizeConnection" | "codexRevokeConnection" | "codexReportSessionDiscoveryStatus">;
 type RuntimePersistence = { load: () => unknown | null; save: (value: CodexPersistentState) => void };
+type ProfileSyncProgress = { state: "idle" | "syncing" | "synced" | "partial"; total: number; done: number; error: string | null };
 
 const SCOPES = new Set<CodexScope>(["read", "live", "send", "interrupt", "approval"]);
 const FINAL_COMMAND_STATUSES = new Set(["forwarded", "running", "waiting_approval", "completed", "failed", "unknown"]);
 const PROFILE_EXIT_COMMAND_STATUSES = new Set(["dispatching", "claimed", "forwarded", "running", "waiting_approval"]);
 const MAX_LOCAL_EVENTS = 3000;
-const MAX_LOCAL_STATE_BYTES = 8 * 1024 * 1024;
-const MAX_VISIBLE_MESSAGE_BYTES = 2 * 1024 * 1024;
+const MAX_LOCAL_STATE_BYTES = 64 * 1024 * 1024;
+const MAX_VISIBLE_MESSAGE_BYTES = 16 * 1024 * 1024;
 
 function isCodexScope(value: unknown): value is CodexScope { return typeof value === "string" && SCOPES.has(value as CodexScope); }
 
@@ -681,8 +699,8 @@ function eventInputValid(value: unknown): value is CodexEventInput {
   const allowedKeys: Record<string, Set<string>> = {
     user_message: new Set(["text", "segment_id"]), assistant_message: new Set(["text", "segment_id"]),
     assistant_delta: new Set(["text", "segment_id", "delta_index"]), reasoning_summary: new Set(["text"]),
-    plan: new Set(["summary", "items"]), tool_call: new Set(["tool", "summary", "call_id", "status"]),
-    tool_result: new Set(["tool", "summary", "output", "exit_code", "status"]),
+    plan: new Set(["summary", "items"]), tool_call: new Set(["tool", "summary", "call_id", "status", "input", "input_part", "input_parts"]),
+    tool_result: new Set(["tool", "summary", "output", "call_id", "output_part", "output_parts", "exit_code", "status"]),
     file_change: new Set(["path_label", "change", "summary"]), child_agent: new Set(["agent_label", "status", "summary"]),
     unsupported: new Set(["provider_type", "diagnostic"]), turn_started: new Set(["status"]),
     turn_completed: new Set(["status", "summary"]), turn_failed: new Set(["status", "error_code", "summary"]),
@@ -699,7 +717,16 @@ function eventInputValid(value: unknown): value is CodexEventInput {
     (row.status !== undefined && (typeof row.status !== "string" || row.status.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(row.status))) ||
     (row.source !== "snapshot" && row.source !== "live" && row.source !== "approval") ||
     (row.turn_id !== undefined && !stableID(row.turn_id)) || (row.item_id !== undefined && !stableID(row.item_id)) ||
-    row.kind === "question" && (row.source !== "live" || !codexQuestionEventPayloadValid(payload))) return false;
+    row.kind === "question" && (row.source !== "live" || !codexQuestionEventPayloadValid(payload)) ||
+    row.kind === "tool_call" && (payload.input !== undefined || payload.input_part !== undefined || payload.input_parts !== undefined) &&
+      (typeof payload.input !== "string" || Buffer.byteLength(payload.input) > 24 * 1024 || !stableID(payload.call_id) ||
+        !Number.isSafeInteger(payload.input_part) || !Number.isSafeInteger(payload.input_parts) ||
+        (payload.input_part as number) < 0 || (payload.input_parts as number) < 1 || (payload.input_part as number) >= (payload.input_parts as number)) ||
+    row.kind === "tool_result" && payload.call_id !== undefined && !stableID(payload.call_id) ||
+    row.kind === "tool_result" && (payload.output_part !== undefined || payload.output_parts !== undefined) &&
+      (typeof payload.output !== "string" || Buffer.byteLength(payload.output) > 24 * 1024 || !stableID(payload.call_id) ||
+        !Number.isSafeInteger(payload.output_part) || (payload.output_part as number) < 0 ||
+        payload.output_parts !== undefined && (!Number.isSafeInteger(payload.output_parts) || (payload.output_parts as number) <= (payload.output_part as number)))) return false;
   return true;
 }
 
@@ -707,7 +734,7 @@ function validPersistentState(value: unknown, serviceInstanceID: string, install
   const state = object(value);
   const commands = object(state?.commands);
   if (!state || state.version !== 1 || state.serviceInstanceID !== serviceInstanceID || state.installationId !== installationId ||
-    !Array.isArray(state.profiles) || state.profiles.length > 20 || !Array.isArray(state.grants) || state.grants.length > 500 ||
+    !Array.isArray(state.profiles) || state.profiles.length > 20 || !Array.isArray(state.grants) ||
     !commands || Object.keys(commands).length > 10000 ||
     !(state.selectedProfileKey === null || typeof state.selectedProfileKey === "string")) return false;
   const keys = new Set<string>();
@@ -716,7 +743,8 @@ function validPersistentState(value: unknown, serviceInstanceID: string, install
     if (!profile || typeof profile.profileKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(profile.profileKey) || keys.has(profile.profileKey) ||
       typeof profile.homeDirectory !== "string" || !(isAbsolute(profile.homeDirectory) || /^[A-Za-z]:[\\/]/.test(profile.homeDirectory)) ||
       typeof profile.executable !== "string" || !(isAbsolute(profile.executable) || /^[A-Za-z]:[\\/]/.test(profile.executable)) ||
-      typeof profile.createdAt !== "string" || !Number.isFinite(Date.parse(profile.createdAt))) return false;
+      typeof profile.createdAt !== "string" || !Number.isFinite(Date.parse(profile.createdAt)) ||
+      profile.connectionScopes !== undefined && (!Array.isArray(profile.connectionScopes) || !profile.connectionScopes.every(isCodexScope) || new Set(profile.connectionScopes).size !== profile.connectionScopes.length)) return false;
     keys.add(profile.profileKey);
   }
   if (state.selectedProfileKey !== null && !keys.has(state.selectedProfileKey)) return false;
@@ -902,7 +930,7 @@ function itemOutput(item: JsonObject): string {
   });
   if (typeof object(item.result)?.error === "string") texts.push(String(object(item.result)!.error));
   if (Array.isArray(item.results)) {
-    for (const value of item.results.slice(0, 128)) {
+    for (const value of item.results) {
       const row = object(value);
       if (!row) continue;
       const summary = [row.title, row.url, row.snippet, row.description].filter((part): part is string => typeof part === "string").join("\n");
@@ -912,15 +940,26 @@ function itemOutput(item: JsonObject): string {
   return texts.join("\n");
 }
 
+function hasUnprojectedMedia(item: JsonObject): boolean {
+  const result = object(item.result);
+  const arrays = [item.content, item.contentItems, Array.isArray(item.output) ? item.output : undefined, result?.content]
+    .filter(Array.isArray) as unknown[][];
+  return arrays.some((items) => items.some((value) => {
+    if (typeof value === "string") return false;
+    const row = object(value);
+    return !row || typeof row.text !== "string" && typeof row.title !== "string";
+  }));
+}
+
 function itemEvent(
   kind: CodexEventInput["kind"], turn: CodexTurn, item: JsonObject, suffix: string,
-  payload: Record<string, unknown>, status?: string,
+  payload: Record<string, unknown>, status?: string, fingerprint = codexSnapshotItemFingerprint(item),
 ): CodexEventInput {
   const event: CodexEventInput = {
     // Including the source item fingerprint gives each visible version a stable ID.
     // Cloud dedupe can then collapse identical live/snapshot/final projections without
     // dropping a changed active snapshot.
-    provider_event_id: codexItemEventID(kind, turn.id, `${item.id}:${suffix}:${codexSnapshotItemFingerprint(item)}`), kind,
+    provider_event_id: codexItemEventID(kind, turn.id, `${item.id}:${suffix}:${fingerprint}`), kind,
     occurred_at: turnCompletedAt(turn), turn_id: turn.id, item_id: String(item.id), payload, source: "snapshot",
   };
   if (status !== undefined) event.status = nativeStatus(status);
@@ -932,13 +971,17 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
   const id = stableID(item.id) ? item.id : "unknown-item";
   const at = turn.completedAt ?? turn.startedAt ?? Date.now() / 1000;
   const itemTurn = { ...turn, id: turn.id, completedAt: at };
+  const normalizedItem = { ...item, id };
+  const fingerprint = codexSnapshotItemFingerprint(normalizedItem);
+  const snapshotEvent = (kind: CodexEventInput["kind"], suffix: string, payload: Record<string, unknown>, status?: string) =>
+    itemEvent(kind, itemTurn, normalizedItem, suffix, payload, status, fingerprint);
   const events: CodexEventInput[] = [];
   const pushText = (kind: "user_message" | "assistant_message", text: string) => {
     const chunks = boundedMessageChunks(text);
     chunks.forEach((chunk, index) => {
       // Snapshot chunks stay in the assistant_message family. iOS groups each stable
       // segment_id and keeps the newest version of that segment before joining chunks.
-      events.push(itemEvent(kind, itemTurn, { ...item, id }, `message:${index}`, {
+      events.push(snapshotEvent(kind, `message:${index}`, {
         text: chunk,
         ...(chunks.length > 1 || kind === "assistant_message" ? { segment_id: `${id}:${index}` } : {}),
       }));
@@ -946,32 +989,49 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
   };
   const pushOutput = (tool: string, summary: string, output: string, status: string, exitCode?: number) => {
     const chunks = boundedMessageChunks(output);
-    chunks.forEach((chunk, index) => events.push(itemEvent("tool_result", itemTurn, { ...item, id }, `result:${index}`, {
+    chunks.forEach((chunk, index) => events.push(snapshotEvent("tool_result", `result:${index}`, {
       tool: eventText(tool, 128) || "codex_tool", summary: eventText(summary, 12 * 1024), output: chunk,
+      call_id: id, output_part: index, output_parts: chunks.length,
       ...(typeof exitCode === "number" && Number.isFinite(exitCode) ? { exit_code: exitCode } : {}),
       status: nativeStatus(status),
     }, status)));
   };
-  const pushTool = (tool: string, summary: string, status: string) => events.push(itemEvent("tool_call", itemTurn, { ...item, id }, "call", {
-    tool: eventText(tool, 128) || "codex_tool", summary: eventText(summary), call_id: id, status: nativeStatus(status),
-  }, status));
+  const pushTool = (tool: string, summary: string, status: string, input: unknown = {}) => {
+    const encodedInput = typeof input === "string" ? JSON.stringify({ input }) : JSON.stringify(input);
+    const chunks = boundedMessageChunks(encodedInput);
+    chunks.forEach((chunk, index) => events.push(snapshotEvent("tool_call", `call:${index}`, {
+      tool: eventText(tool, 128) || "codex_tool", summary: eventText(summary), call_id: id, status: nativeStatus(status),
+      input: chunk, input_part: index, input_parts: chunks.length,
+    }, status)));
+  };
 
   const text = visibleText(item);
   if (item.type === "userMessage" && text !== null) pushText("user_message", text);
   else if (item.type === "agentMessage" && text !== null) pushText("assistant_message", text);
+  if (item.type === "userMessage" && hasUnprojectedMedia(item)) {
+    events.push(snapshotEvent("unsupported", "attachment", {
+      provider_type: "attachment", diagnostic: "此 Codex 用户消息包含未同步的图片或附件；当前 App Server 历史接口未提供可读取的附件内容。",
+    }));
+  }
 
   if (item.type === "reasoning") {
     // Codex exposes both `summary` and private `content`; only its user-visible summary is projected.
     const summary = Array.isArray(item.summary) ? item.summary.filter((part): part is string => typeof part === "string").join("\n") : "";
-    if (summary) events.push(itemEvent("reasoning_summary", itemTurn, { ...item, id }, "summary", { text: eventText(summary) }));
+    boundedMessageChunks(summary).forEach((chunk, index) => {
+      if (summary) events.push(snapshotEvent("reasoning_summary", `summary:${index}`, { text: chunk }));
+    });
+    if (!summary && Array.isArray(item.content) && item.content.length > 0) events.push(snapshotEvent("unsupported", "reasoning_summary_unavailable", {
+      provider_type: "reasoning_summary", diagnostic: "Codex 未提供可展示的推理摘要；私有推理内容不会同步。",
+    }));
   } else if (item.type === "plan") {
     const summary = typeof item.text === "string" ? item.text : "";
-    const steps = summary.split(/\r?\n/).map((line) => eventText(line, 4096)).filter(Boolean).slice(0, 256);
-    events.push(itemEvent("plan", itemTurn, { ...item, id }, "plan", { summary: eventText(summary), items: steps }));
+    boundedMessageChunks(summary).forEach((chunk, index) => {
+      events.push(snapshotEvent("plan", `plan:${index}`, { summary: chunk, items: [] }));
+    });
   } else if (item.type === "commandExecution") {
     const status = nativeStatus(item.status);
     const command = eventText(item.command, 24 * 1024);
-    pushTool("command", command, status);
+    pushTool("command", command, status, { command: item.command ?? "", cwd: item.cwd ?? "" });
     pushOutput("command", command, typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "", status,
       typeof item.exitCode === "number" ? item.exitCode : undefined);
   } else if (item.type === "fileChange") {
@@ -983,18 +1043,21 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
       const pathParts = change.path.split(/[\\/]+/).filter(Boolean);
       const pathLabel = eventText(pathParts.slice(-2).join("/"), 256) || "文件";
       const action = ["add", "update", "delete"].includes(kind.type) ? kind.type : "change";
-      events.push(itemEvent("file_change", itemTurn, { ...item, id }, `file:${index}`, {
+      events.push(snapshotEvent("file_change", `file:${index}`, {
         path_label: pathLabel, change: action, summary: `Codex ${action}`,
       }, nativeStatus(item.status)));
     }
   } else if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") {
     const status = nativeStatus(item.status);
     const tool = item.type === "mcpToolCall" ? `${String(item.server ?? "mcp")}/${String(item.tool ?? "tool")}` : String(item.tool ?? "tool");
-    pushTool(tool, tool, status);
+    pushTool(tool, tool, status, item.arguments ?? item.input ?? item.params ?? {});
     pushOutput(tool, tool, itemOutput(item), status);
+    if (hasUnprojectedMedia(item)) events.push(snapshotEvent("unsupported", "tool_media", {
+      provider_type: "tool_media", diagnostic: "此 Codex 工具结果包含未同步的图片或附件；当前 App Server 历史接口未提供可读取的附件内容。",
+    }));
   } else if (item.type === "webSearch") {
     const query = eventText(item.query, 12 * 1024);
-    pushTool("web_search", query, "completed");
+    pushTool("web_search", query, "completed", { query: item.query ?? "" });
     pushOutput("web_search", query, itemOutput(item), "completed");
   } else if (item.type === "collabAgentToolCall") {
     const states = object(item.agentsStates) ?? {};
@@ -1003,21 +1066,21 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
       for (const [index, [label, value]] of entries.entries()) {
         const state = object(value);
         const status = nativeStatus(state?.status);
-        events.push(itemEvent("child_agent", itemTurn, { ...item, id }, `agent:${hash(label).slice(0, 12)}`, {
+        events.push(snapshotEvent("child_agent", `agent:${hash(label).slice(0, 12)}`, {
           agent_label: `agent-${hash(label).slice(0, 8)}`, status,
           summary: eventText(state?.message ?? `${String(item.tool ?? "subagent")} ${status}`, 12 * 1024),
         }, status));
       }
     } else {
       const status = nativeStatus(item.status);
-      events.push(itemEvent("child_agent", itemTurn, { ...item, id }, "agent", {
+      events.push(snapshotEvent("child_agent", "agent", {
         agent_label: `agent-${hash(String(item.receiverThreadIds ?? item.id)).slice(0, 8)}`, status,
         summary: eventText(`${String(item.tool ?? "subagent")} ${status}`, 12 * 1024),
       }, status));
     }
   } else if (item.type === "subAgentActivity") {
     const status = nativeStatus(item.kind);
-    events.push(itemEvent("child_agent", itemTurn, { ...item, id }, "activity", {
+    events.push(snapshotEvent("child_agent", "activity", {
       agent_label: `agent-${hash(String(item.agentThreadId ?? item.agentPath ?? item.id)).slice(0, 8)}`, status,
       summary: eventText(`Subagent ${status}`, 12 * 1024),
     }, status));
@@ -1034,17 +1097,21 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
         }) : []),
         "thread/read 快照只包含问题内容，不包含对应的原始 RPC handle；若问题由其他 Codex App Server 发起，Morde 无法通过此快照回答，请在原 Codex 客户端处理。",
       ].filter(Boolean).join("\n");
-      events.push(itemEvent("unsupported", itemTurn, { ...item, id }, `question:${index}`, {
+      events.push(snapshotEvent("unsupported", `question:${index}`, {
         provider_type: "user_question", diagnostic: eventText(diagnostic),
       }));
     }
-  } else if (["imageView", "imageGeneration", "functionCallOutput", "sleep"].includes(String(item.type))) {
+  } else if (item.type === "imageView" || item.type === "imageGeneration") {
+    events.push(snapshotEvent("unsupported", "image", {
+      provider_type: "image", diagnostic: "Codex 会话包含图片内容，但当前 App Server 历史接口未提供可读取的图片数据。",
+    }));
+  } else if (["functionCallOutput", "sleep"].includes(String(item.type))) {
     const label = String(item.type);
     const details = item.type === "functionCallOutput" ? itemOutput(item) : `${label} item recorded by Codex.`;
-    pushTool(label, label, nativeStatus(item.status ?? "completed"));
+    pushTool(label, label, nativeStatus(item.status ?? "completed"), item.arguments ?? item.input ?? {});
     pushOutput(label, label, details, nativeStatus(item.status ?? "completed"));
   } else if (item.type === "hookPrompt" || item.type === "contextCompaction") {
-    events.push(itemEvent("unsupported", itemTurn, { ...item, id }, String(item.type), {
+    events.push(snapshotEvent("unsupported", String(item.type), {
       provider_type: String(item.type), diagnostic: `Codex history contains a ${String(item.type)} item; no readable text projection is available.`,
     }));
   }
@@ -1121,6 +1188,15 @@ export class MordeCodexRuntime {
   private claimTimer: NodeJS.Timeout | null = null;
   private snapshotTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
+  private discoveryTimer: NodeJS.Timeout | null = null;
+  private readonly profileSyncStates = new Map<string, ProfileSyncProgress>();
+  private readonly profilesSyncing = new Set<string>();
+  private readonly profileSyncEpochs = new Map<string, number>();
+  private readonly profileMutationTails = new Map<string, Promise<void>>();
+  private readonly profileStatusTimers = new Map<string, NodeJS.Timeout>();
+  private readonly profileStatusLatest = new Map<string, CodexProfileSyncStatus>();
+  private readonly profileStatusInFlight = new Map<string, number>();
+  private readonly profileStatusReported = new Map<string, string>();
   private claimInProgress = false;
   private snapshotInProgress = false;
   private flushInProgress = false;
@@ -1143,7 +1219,16 @@ export class MordeCodexRuntime {
     if (this.claimTimer) clearInterval(this.claimTimer);
     if (this.flushTimer) clearInterval(this.flushTimer);
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
-    this.claimTimer = this.flushTimer = this.snapshotTimer = null;
+    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
+    this.claimTimer = this.flushTimer = this.snapshotTimer = this.discoveryTimer = null;
+    for (const timer of this.profileStatusTimers.values()) clearTimeout(timer);
+    this.profileStatusTimers.clear();
+    this.profileStatusLatest.clear();
+    this.profileStatusInFlight.clear();
+    this.profileStatusReported.clear();
+    this.profileSyncStates.clear();
+    this.profilesSyncing.clear();
+    this.profileSyncEpochs.clear();
     const oldProviders = new Map(this.providers);
     this.activeCommandProfiles.clear();
     for (const grant of this.data?.grants ?? []) {
@@ -1189,7 +1274,9 @@ export class MordeCodexRuntime {
     }
     this.claimTimer = setInterval(() => { void this.claimCommands(); }, 2000);
     this.flushTimer = setInterval(() => { void this.flushPending(); }, 1500);
-    this.snapshotTimer = setInterval(() => { void this.snapshotOne(); }, 2_500);
+    this.snapshotTimer = setInterval(() => { void this.snapshotOne(); }, 500);
+    this.discoveryTimer = setInterval(() => { void this.discoverConnectedProfiles(); }, 30_000);
+    void this.discoverConnectedProfiles();
     await this.recoverUnknownCommands();
     this.onChange();
   }
@@ -1203,7 +1290,12 @@ export class MordeCodexRuntime {
     if (this.claimTimer) clearInterval(this.claimTimer);
     if (this.flushTimer) clearInterval(this.flushTimer);
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
-    this.claimTimer = this.flushTimer = this.snapshotTimer = null;
+    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
+    this.claimTimer = this.flushTimer = this.snapshotTimer = this.discoveryTimer = null;
+    for (const timer of this.profileStatusTimers.values()) clearTimeout(timer);
+    this.profileStatusTimers.clear();
+    this.profileStatusLatest.clear();
+    this.profilesSyncing.clear();
     const providers = new Map(this.providers);
     for (const grant of this.data?.grants ?? []) {
       this.invalidateGrantApprovals(grant, providers.get(grant.profileKey), true);
@@ -1229,16 +1321,20 @@ export class MordeCodexRuntime {
     return {
       profiles: (state?.profiles ?? []).map((profile) => {
         const provider = this.providerStates.get(profile.profileKey);
+        const sync = this.profileSyncStates.get(profile.profileKey);
         return {
           profileKey: profile.profileKey, label: basename(profile.homeDirectory), executableLabel: basename(profile.executable),
           selected: profile.profileKey === state?.selectedProfileKey,
           state: provider?.state ?? "stopped", error: provider?.error ?? null,
+          connectionAuthorized: Boolean(profile.connectionScopes?.length), scopes: profile.connectionScopes ?? [],
+          syncState: sync?.state ?? "idle", syncTotal: sync?.total ?? 0, syncDone: sync?.done ?? 0, syncError: sync?.error ?? null,
         };
       }),
       selectedProfileKey: state?.selectedProfileKey ?? null,
       sessions: (state?.grants ?? []).map((grant) => ({
         id: grant.id, profileKey: grant.profileKey, threadId: grant.threadId, title: grant.title, cwdLabel: grant.cwdLabel,
         updatedAt: grant.updatedAt, status: grant.status, scopes: grant.scopes, snapshotState: grant.snapshotState,
+        historyComplete: grant.historyComplete,
         pendingEvents: grant.pendingEvents.length,
         blockedEvents: grant.pendingEvents.filter((event) => event.source === "snapshot" ? !grant.scopes.includes("read") : event.source === "approval" ? !grant.scopes.includes("approval") : !grant.scopes.includes("live")).length,
         ...(grant.snapshotMessage ? { snapshotMessage: grant.snapshotMessage } : {}),
@@ -1249,7 +1345,7 @@ export class MordeCodexRuntime {
     };
   }
 
-  listThreads(cursor: string | null = null): Promise<{ items: { id: string; title: string; cwdLabel: string; updatedAt: string | null; status: string; authorized: boolean }[]; nextCursor: string | null }> {
+  listThreads(cursor: string | null = null): Promise<{ items: { id: string; title: string; cwdLabel: string; updatedAt: string | null; status: string; authorized: boolean; archived: boolean }[]; nextCursor: string | null }> {
     const selected = this.data?.profiles.find((profile) => profile.profileKey === this.data?.selectedProfileKey);
     if (!selected) throw new Error("请先选择 CODEX_HOME profile");
     return this.ensureProvider(selected).then(async (provider) => {
@@ -1257,6 +1353,7 @@ export class MordeCodexRuntime {
       return { items: result.items.map((thread) => ({
         id: thread.id, title: thread.name, cwdLabel: safeCwdLabel(thread.cwd), updatedAt: thread.updatedAt,
         status: thread.status, authorized: Boolean(this.data?.grants.some((grant) => grant.profileKey === selected.profileKey && grant.threadId === thread.id)),
+        archived: thread.archived,
       })), nextCursor: result.nextCursor };
     });
   }
@@ -1292,24 +1389,111 @@ export class MordeCodexRuntime {
     const state = this.requireState();
     const profile = state.profiles.find((item) => item.profileKey === state.selectedProfileKey);
     if (!profile) throw new Error("请先选择 CODEX_HOME profile");
-    const old = state.grants.find((grant) => grant.profileKey === profile.profileKey && grant.threadId === threadID);
     const provider = await this.ensureProvider(profile);
-    const listed = await provider.listThreads();
-    if (!listed.items.some((thread) => thread.id === threadID)) throw new Error("线程不在当前 Codex profile 的可授权列表中");
+    let cursor: string | null = null;
+    let thread: CodexThread | undefined;
+    do {
+      const page = await provider.listThreads(cursor);
+      thread = page.items.find((item) => item.id === threadID);
+      cursor = thread ? null : page.nextCursor;
+    } while (!thread && cursor);
+    if (!thread) throw new Error("线程不在当前 Codex profile 的可授权列表中");
+    const authorized = await this.authorizeListedThread(profile, thread, scopesValue as CodexScope[]);
+    if (!authorized) throw new Error("Codex profile authorization changed before the session was added");
+    return authorized;
+  }
+
+  async authorizeProfile(profileKey: string, scopesValue: unknown): Promise<void> {
+    return this.serializeProfileMutation(profileKey, async () => {
+      if (!Array.isArray(scopesValue) || !scopesValue.every(isCodexScope) || new Set(scopesValue).size !== scopesValue.length ||
+        !scopesValue.includes("read") || !scopesValue.includes("live")) throw new Error("连接 Codex 需要授权读取历史和同步新事件");
+      const profile = this.requireProfile(profileKey);
+      const generation = this.generation;
+      const epoch = this.bumpProfileSyncEpoch(profileKey);
+      const connection = await this.api.codexAuthorizeConnection(profileKey, scopesValue as CodexScope[]);
+      if (generation !== this.generation) return;
+      if (this.profileSyncEpochs.get(profileKey) !== epoch) {
+        await this.api.codexRevokeConnection(profileKey).catch(() => undefined);
+        throw new Error("Codex 配置授权已被后续操作取代");
+      }
+      const previousScopes = profile.connectionScopes;
+      profile.connectionScopes = connection.scopes;
+      this.profileSyncStates.set(profileKey, { state: "syncing", total: 0, done: 0, error: null });
+      try { this.persist(); }
+      catch (error) {
+        profile.connectionScopes = previousScopes;
+        await this.api.codexRevokeConnection(profileKey).catch(() => undefined);
+        throw error;
+      }
+      this.onChange();
+      this.reportProfileSessionDiscovery(profileKey, true);
+      void this.syncProfileThreads(profile, true);
+    });
+  }
+
+  async revokeProfile(profileKey: string): Promise<void> {
+    return this.serializeProfileMutation(profileKey, async () => {
+      const profile = this.requireProfile(profileKey);
+      const generation = this.generation;
+      const epoch = this.bumpProfileSyncEpoch(profileKey);
+      await this.api.codexRevokeConnection(profileKey);
+      if (generation !== this.generation) return;
+      if (this.profileSyncEpochs.get(profileKey) !== epoch) return;
+      profile.connectionScopes = [];
+      this.profileSyncStates.set(profileKey, { state: "idle", total: 0, done: 0, error: null });
+      const statusTimer = this.profileStatusTimers.get(profileKey);
+      if (statusTimer) clearTimeout(statusTimer);
+      this.profileStatusTimers.delete(profileKey);
+      this.profileStatusLatest.delete(profileKey);
+      this.profileStatusReported.delete(profileKey);
+      for (const grant of this.requireState().grants.filter((item) => item.profileKey === profileKey)) {
+        this.invalidateGrantApprovals(grant, this.providers.get(profileKey), true);
+        this.invalidateGrantQuestions(grant, this.providers.get(profileKey), true);
+        grant.scopes = [];
+        grant.snapshotState = "disabled";
+        grant.snapshotMessage = "Codex 配置授权已撤销；本机未确认事件保留且暂停上传。";
+      }
+      this.persist();
+      this.onChange();
+    });
+  }
+
+  private async serializeProfileMutation<T>(profileKey: string, mutation: () => Promise<T>): Promise<T> {
+    const previous = this.profileMutationTails.get(profileKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.profileMutationTails.set(profileKey, current);
+    await previous;
+    try { return await mutation(); }
+    finally {
+      release();
+      if (this.profileMutationTails.get(profileKey) === current) this.profileMutationTails.delete(profileKey);
+    }
+  }
+
+  private async authorizeListedThread(profile: CodexLocalProfile, thread: CodexThread, scopes: CodexScope[], syncFence?: { epoch: number; scopesKey: string }): Promise<{ id: string; grantVersion: number } | null> {
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return null;
+    const state = this.requireState();
+    const old = state.grants.find((grant) => grant.profileKey === profile.profileKey && grant.threadId === thread.id);
     if (old) {
-      await this.updateScopes(old.id, scopesValue);
+      if (scopes.length !== old.scopes.length || scopes.some((scope) => !old.scopes.includes(scope))) await this.updateScopes(old.id, scopes, syncFence);
+      if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return null;
       return { id: old.id, grantVersion: old.grantVersion };
     }
-    const snapshot = await provider.readSnapshot(threadID);
+    const provider = await this.ensureProvider(profile);
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return null;
+    const snapshot = await provider.readSnapshot(thread.id);
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return null;
     const cwdLabel = safeCwdLabel(snapshot.thread.cwd);
     const discover: CodexDiscoverInput = {
       profile_key: profile.profileKey, thread_id: snapshot.thread.id, title: snapshot.thread.name.slice(0, 512),
       cwd_label: cwdLabel.slice(0, 256), updated_at: snapshot.thread.updatedAt,
-      status: normalizeSessionStatus(snapshot.thread.status), scopes: scopesValue as CodexScope[],
+      status: normalizeSessionStatus(snapshot.thread.status), scopes,
     };
     const response = await this.api.codexDiscover(discover);
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return null;
     const grant: CodexGrant = old ?? {
-      id: response.id, profileKey: profile.profileKey, threadId: threadID, title: discover.title, cwdLabel, updatedAt: discover.updated_at,
+      id: response.id, profileKey: profile.profileKey, threadId: thread.id, title: discover.title, cwdLabel, updatedAt: discover.updated_at,
       status: discover.status, scopes: response.scopes, grantVersion: response.grant_version,
       snapshotState: "pending", historyComplete: false, historyCursor: null, candidateTurns: {}, knownItems: {}, pendingEvents: [], approvals: {}, questions: {},
     };
@@ -1334,10 +1518,145 @@ export class MordeCodexRuntime {
     return { id: grant.id, grantVersion: grant.grantVersion };
   }
 
-  async updateScopes(sessionID: string, scopesValue: unknown): Promise<void> {
+  private async discoverConnectedProfiles(): Promise<void> {
+    if (!this.active || !this.data) return;
+    for (const profile of this.data.profiles) {
+      if (profile.connectionScopes?.length) void this.syncProfileThreads(profile, false);
+    }
+  }
+
+  private async syncProfileThreads(profile: CodexLocalProfile, updateExisting: boolean): Promise<void> {
+    if (!this.active || !profile.connectionScopes?.length || this.profilesSyncing.has(profile.profileKey)) return;
+    const generation = this.generation;
+    const scopes = [...profile.connectionScopes];
+    const scopesKey = JSON.stringify(scopes);
+    const epoch = this.profileSyncEpochs.get(profile.profileKey) ?? 0;
+    const fence = { epoch, scopesKey };
+    const progress: ProfileSyncProgress = { state: "syncing", total: 0, done: 0, error: null };
+    this.profileSyncStates.set(profile.profileKey, progress);
+    this.profilesSyncing.add(profile.profileKey);
+    this.onChange();
+    this.reportProfileSessionDiscovery(profile.profileKey, true);
+    try {
+      const provider = await this.ensureProvider(profile);
+      let cursor: string | null = null;
+      const seen = new Set<string>();
+      let failures = 0;
+      do {
+        if (!this.profileSyncCurrent(profile, epoch, scopesKey, generation)) return;
+        const page = await provider.listThreads(cursor);
+        if (!this.profileSyncCurrent(profile, epoch, scopesKey, generation)) return;
+        for (const thread of page.items) {
+          if (seen.has(thread.id)) continue;
+          seen.add(thread.id);
+          progress.total++;
+          const old = this.data?.grants.find((grant) => grant.profileKey === profile.profileKey && grant.threadId === thread.id);
+          try {
+            if (!old || updateExisting && (old.scopes.length !== scopes.length || scopes.some((scope) => !old.scopes.includes(scope)))) {
+              await this.authorizeListedThread(profile, thread, scopes, fence);
+            }
+          } catch (error) {
+            if (!this.profileSyncCurrent(profile, epoch, scopesKey, generation)) return;
+            failures++;
+            progress.error = `${thread.id}: ${safeError(error)}`;
+          }
+          if (!this.profileSyncCurrent(profile, epoch, scopesKey, generation)) return;
+          progress.done++;
+          if (progress.done % 10 === 0) {
+            this.onChange();
+            this.reportProfileSessionDiscovery(profile.profileKey);
+          }
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+      progress.state = failures ? "partial" : "synced";
+    } catch (error) {
+      if (this.profileSyncCurrent(profile, epoch, scopesKey, generation)) {
+        progress.state = "partial";
+        progress.error = safeError(error);
+        this.lastError = progress.error;
+      }
+    } finally {
+      if (generation === this.generation) {
+        this.profilesSyncing.delete(profile.profileKey);
+        const current = this.profileSyncEpochs.get(profile.profileKey) ?? 0;
+        const connected = Boolean(profile.connectionScopes?.length);
+        const superseded = current !== epoch || JSON.stringify(profile.connectionScopes ?? []) !== scopesKey;
+        if (current === epoch) {
+          this.profileSyncStates.set(profile.profileKey, progress);
+          if (connected) this.reportProfileSessionDiscovery(profile.profileKey, true);
+        }
+        this.onChange();
+        if (this.active && connected && superseded) {
+          void this.syncProfileThreads(profile, true);
+        }
+      }
+    }
+  }
+
+  private bumpProfileSyncEpoch(profileKey: string): number {
+    const epoch = (this.profileSyncEpochs.get(profileKey) ?? 0) + 1;
+    this.profileSyncEpochs.set(profileKey, epoch);
+    return epoch;
+  }
+
+  private reportProfileSessionDiscovery(profileKey: string, immediate = false): void {
+    if (typeof this.api.codexReportSessionDiscoveryStatus !== "function") return;
+    const state = this.data;
+    const profile = state?.profiles.find((item) => item.profileKey === profileKey);
+    if (!this.active || !state || !profile?.connectionScopes?.length) return;
+    const grants = state.grants.filter((item) => item.profileKey === profileKey && item.scopes.includes("read"));
+    const progress = this.profileSyncStates.get(profileKey);
+    const status: CodexProfileSyncStatus = {
+      session_discovery: {
+        state: progress?.state === "partial" ? "partial" : progress?.state === "synced" ? "synced" : "syncing",
+        error_code: progress?.state === "partial" && progress.error ? "unknown" : null,
+      },
+      history_sync: {
+        discovered_sessions: Math.max(progress?.total ?? 0, grants.length),
+        history_complete_sessions: grants.filter((item) => item.historyComplete).length,
+        pending_upload_event_count: grants.reduce((count, item) => count + item.pendingEvents.length, 0),
+      },
+    };
+    const signature = JSON.stringify(status);
+    if (this.profileStatusReported.get(profileKey) === signature) return;
+    this.profileStatusLatest.set(profileKey, status);
+    if (this.profileStatusInFlight.has(profileKey)) return;
+    const existing = this.profileStatusTimers.get(profileKey);
+    if (existing && !immediate) return;
+    if (existing) clearTimeout(existing);
+    const reportGeneration = this.generation;
+    const reportState = state;
+    const timer = setTimeout(() => {
+      this.profileStatusTimers.delete(profileKey);
+      const latest = this.profileStatusLatest.get(profileKey);
+      if (!latest || !this.active || this.generation !== reportGeneration || this.data !== reportState || !profile.connectionScopes?.length) return;
+      const sentSignature = JSON.stringify(latest);
+      this.profileStatusInFlight.set(profileKey, reportGeneration);
+      void this.api.codexReportSessionDiscoveryStatus(profileKey, latest).then(() => {
+        if (this.generation === reportGeneration && this.data === reportState) this.profileStatusReported.set(profileKey, sentSignature);
+      }).catch(() => undefined).finally(() => {
+        if (this.profileStatusInFlight.get(profileKey) !== reportGeneration) return;
+        this.profileStatusInFlight.delete(profileKey);
+        if (this.generation !== reportGeneration || this.data !== reportState || !this.active) return;
+        const next = this.profileStatusLatest.get(profileKey);
+        if (next && JSON.stringify(next) !== sentSignature) this.reportProfileSessionDiscovery(profileKey);
+        else if (this.profileStatusReported.get(profileKey) !== sentSignature) this.profileStatusLatest.delete(profileKey);
+      });
+    }, immediate ? 0 : 5000);
+    this.profileStatusTimers.set(profileKey, timer);
+  }
+
+  private profileSyncCurrent(profile: CodexLocalProfile, epoch: number, scopesKey: string, generation = this.generation): boolean {
+    return this.active && generation === this.generation && this.profileSyncEpochs.get(profile.profileKey) === epoch &&
+      JSON.stringify(profile.connectionScopes ?? []) === scopesKey && Boolean(profile.connectionScopes?.length);
+  }
+
+  async updateScopes(sessionID: string, scopesValue: unknown, syncFence?: { epoch: number; scopesKey: string }): Promise<void> {
     if (!Array.isArray(scopesValue) || !scopesValue.every(isCodexScope) || new Set(scopesValue).size !== scopesValue.length) throw new Error("Invalid Codex scope selection");
     const grant = this.requireGrant(sessionID);
     const profile = this.requireProfile(grant.profileKey);
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return;
     const requested = scopesValue as CodexScope[];
     grant.scopes = grant.scopes.filter((scope) => requested.includes(scope));
     this.invalidateGrantQuestions(grant, this.providers.get(profile.profileKey), true);
@@ -1364,7 +1683,9 @@ export class MordeCodexRuntime {
     let input: CodexDiscoverInput;
     if (requested.includes("read")) {
       const provider = await this.ensureProvider(profile);
+      if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return;
       snapshot = await provider.readSnapshot(grant.threadId, new Set(Object.keys(grant.candidateTurns)));
+      if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return;
       input = {
         profile_key: profile.profileKey, thread_id: grant.threadId, title: snapshot.thread.name.slice(0, 512),
         cwd_label: safeCwdLabel(snapshot.thread.cwd),
@@ -1376,9 +1697,11 @@ export class MordeCodexRuntime {
         updated_at: grant.updatedAt, status: normalizeSessionStatus(grant.status), scopes: requested,
       };
     }
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return;
     let response: Awaited<ReturnType<MordeAPI["codexDiscover"]>>;
     try { response = await this.api.codexDiscover(input); }
     catch (error) { this.onChange(); throw error; }
+    if (syncFence && !this.profileSyncCurrent(profile, syncFence.epoch, syncFence.scopesKey)) return;
     grant.scopes = response.scopes;
     grant.grantVersion = response.grant_version;
     grant.title = input.title;
@@ -1555,7 +1878,7 @@ export class MordeCodexRuntime {
       this.deltaIndices.set(key, index + 1);
       const kind = method === "item/reasoning/summaryTextDelta" ? "reasoning_summary" : method === "item/plan/delta" ? "plan" : "tool_result";
       const payload = kind === "reasoning_summary" ? { text: delta } : kind === "plan" ? { summary: delta, items: [] } : {
-        tool: "command", summary: "Codex command output", output: delta, status: "inProgress",
+        tool: "command", summary: "Codex command output", output: delta, call_id: itemID, output_part: index, status: "inProgress",
       };
       event = {
         provider_event_id: codexProviderEventID(kind, turnID, `${itemID}:${method}:${index}`), kind,
@@ -2000,7 +2323,13 @@ export class MordeCodexRuntime {
         changed = true;
       }
     } catch (error) { this.lastError = safeError(error); changed = true; }
-    finally { this.flushInProgress = false; if (changed) this.onChange(); }
+    finally {
+      this.flushInProgress = false;
+      if (changed) {
+        this.onChange();
+        for (const profile of this.data?.profiles ?? []) this.reportProfileSessionDiscovery(profile.profileKey);
+      }
+    }
   }
 
   private async snapshotOne(): Promise<void> {
@@ -2012,14 +2341,23 @@ export class MordeCodexRuntime {
     const recentGrants = grants.filter((grant) => grant.updatedAt && now - Date.parse(grant.updatedAt) < 60_000);
     const priority = [...new Set([...activeGrants, ...recentGrants])];
     const pool = priority.length ? priority : grants;
-    const grant = pool[this.selectedGrantIndex % pool.length]!;
-    this.selectedGrantIndex = (this.selectedGrantIndex + 1) % pool.length;
-    const profile = this.data.profiles.find((item) => item.profileKey === grant.profileKey);
-    if (!profile) return;
-    // Drain the previous bounded page before expanding the durable local event buffer.
-    if (grant.pendingEvents.length >= 256) return;
+    const count = Math.min(16, pool.length);
+    const selected = Array.from({ length: count }, (_, offset) => pool[(this.selectedGrantIndex + offset) % pool.length]!);
+    this.selectedGrantIndex = (this.selectedGrantIndex + count) % pool.length;
     this.snapshotInProgress = true;
     const generation = this.generation;
+    try { await Promise.all(selected.map((grant) => this.snapshotGrant(grant, generation))); }
+    finally {
+      this.snapshotInProgress = false;
+      for (const profile of this.data?.profiles ?? []) this.reportProfileSessionDiscovery(profile.profileKey);
+      this.onChange();
+    }
+  }
+
+  private async snapshotGrant(grant: CodexGrant, generation: number): Promise<void> {
+    if (!this.active || generation !== this.generation || grant.pendingEvents.length >= 256 || !this.data) return;
+    const profile = this.data.profiles.find((item) => item.profileKey === grant.profileKey);
+    if (!profile) return;
     try {
       const provider = await this.ensureProvider(profile);
       const cursor = grant.historyComplete ? null : grant.historyCursor;
@@ -2039,7 +2377,7 @@ export class MordeCodexRuntime {
       grant.snapshotMessage = "thread/read 快照不可用；外部 Codex 更新和终态可能尚未同步。";
       this.lastError = safeError(error);
       try { this.persist(); } catch { this.lastError = "thread/read 状态未知，且本机安全存储无法保存该状态。"; }
-    } finally { this.snapshotInProgress = false; this.onChange(); }
+    }
   }
 
   private reconcileSnapshot(grant: CodexGrant, snapshot: CodexSnapshot, advanceHistory = true): void {
@@ -2048,8 +2386,10 @@ export class MordeCodexRuntime {
     const nextKnownItems = { ...grant.knownItems };
     const sorted = [...turns].reverse();
     const appended: CodexEventInput[] = [];
+    const queuedIDs = new Set(grant.pendingEvents.map((event) => event.provider_event_id));
     let bytes = 0;
     let unstable = false;
+    let bufferLimited = false;
     let awaitingStable = false;
     let externalWrite = snapshot.metadataStable === false;
     for (const turn of sorted) {
@@ -2084,16 +2424,24 @@ export class MordeCodexRuntime {
         if (!mapped.length) mapped.push(itemEvent("unsupported", turn, item, "unsupported", {
           provider_type: eventText(item.type, 128) || "unknown_item",
           diagnostic: `Codex history item type ${eventText(item.type, 128) || "unknown"} has no projection.`,
-        }));
-        for (const event of mapped) {
+        }, undefined, fingerprint));
+        const progressPrefix = `${fingerprint}:partial:`;
+        const savedProgress = existingFingerprint?.startsWith(progressPrefix) ? Number(existingFingerprint.slice(progressPrefix.length)) : 0;
+        const startAt = Number.isSafeInteger(savedProgress) && savedProgress > 0 && savedProgress <= mapped.length ? savedProgress : 0;
+        let projectedThrough = startAt;
+        for (let index = startAt; index < mapped.length; index++) {
+          const event = mapped[index]!;
+          if (queuedIDs.has(event.provider_event_id)) { projectedThrough = index + 1; continue; }
           bytes += Buffer.byteLength(JSON.stringify(event));
-          if (bytes > MAX_VISIBLE_MESSAGE_BYTES || grant.pendingEvents.length + appended.length >= MAX_LOCAL_EVENTS) { unstable = true; break; }
+          if (bytes > MAX_VISIBLE_MESSAGE_BYTES || grant.pendingEvents.length + appended.length >= MAX_LOCAL_EVENTS) { bufferLimited = true; break; }
           appended.push(event);
+          queuedIDs.add(event.provider_event_id);
+          projectedThrough = index + 1;
         }
-        if (unstable) break;
-        nextKnownItems[key] = fingerprint;
+        nextKnownItems[key] = bufferLimited ? `${progressPrefix}${projectedThrough}` : fingerprint;
+        if (bufferLimited) break;
       }
-      if (unstable) break;
+      if (unstable || bufferLimited) break;
       if (!isTerminal) continue;
       const turnEvent = snapshotTurnEvent(turn.status);
       if (turnEvent) {
@@ -2106,12 +2454,16 @@ export class MordeCodexRuntime {
             provider_event_id: turnEventID(turnEvent.kind, turn.id), kind: turnEvent.kind,
             occurred_at: turnCompletedAt(turn), turn_id: turn.id, status: turn.status, payload: { status: turn.status }, source: "snapshot",
           };
-          bytes += Buffer.byteLength(JSON.stringify(event));
-          if (bytes > MAX_VISIBLE_MESSAGE_BYTES || grant.pendingEvents.length + appended.length >= MAX_LOCAL_EVENTS) { unstable = true; break; }
-          appended.push(event);
+          if (!queuedIDs.has(event.provider_event_id)) {
+            bytes += Buffer.byteLength(JSON.stringify(event));
+            if (bytes > MAX_VISIBLE_MESSAGE_BYTES || grant.pendingEvents.length + appended.length >= MAX_LOCAL_EVENTS) { bufferLimited = true; break; }
+            appended.push(event);
+            queuedIDs.add(event.provider_event_id);
+          }
         }
         nextKnownItems[key] = fingerprint;
       }
+      if (bufferLimited) break;
     }
     if (unstable) {
       grant.snapshotState = "unknown";
@@ -2127,14 +2479,14 @@ export class MordeCodexRuntime {
     // Keep recheck fingerprints bounded; stable provider IDs plus server ACK handle older duplicates.
     const knownEntries = Object.entries(nextKnownItems);
     grant.knownItems = Object.fromEntries(knownEntries.slice(-10_000));
-    if (advanceHistory && !awaitingStable && !externalWrite) {
+    if (advanceHistory && !awaitingStable && !externalWrite && !bufferLimited) {
       grant.historyCursor = snapshot.nextCursor;
       if (snapshot.complete) grant.historyComplete = true;
     }
     grant.updatedAt = snapshot.thread.updatedAt;
     grant.status = normalizeSessionStatus(snapshot.thread.status);
-    grant.snapshotState = externalWrite ? "unknown" : awaitingStable ? "pending" : grant.historyComplete ? "available" : "limited";
-    grant.snapshotMessage = externalWrite ? "活动 turn 的可见项已同步；thread/read 不含外部审批或问题 RPC handle，无法通过此快照回答；等待稳定终态快照。" : awaitingStable ? "等待相邻 thread/read 快照一致。" : grant.historyComplete ? undefined : `历史回填进行中：每批最多 ${snapshot.turns.length} 轮；更早历史尚未同步。`;
+    grant.snapshotState = bufferLimited ? "limited" : externalWrite ? "unknown" : awaitingStable ? "pending" : grant.historyComplete ? "available" : "limited";
+    grant.snapshotMessage = bufferLimited ? "本机事件缓冲达到单批上限；已保存的部分会先上传，确认后继续回填。" : externalWrite ? "活动 turn 的可见项已同步；thread/read 不含外部审批或问题 RPC handle，无法通过此快照回答；等待稳定终态快照。" : awaitingStable ? "等待相邻 thread/read 快照一致。" : grant.historyComplete ? undefined : `历史回填进行中：每批最多 ${snapshot.turns.length} 轮；更早历史尚未同步。`;
     try { this.persist(); }
     catch {
       grant.candidateTurns = previous.candidateTurns;

@@ -32,6 +32,7 @@ const (
 	personalAttachmentJSONLimit  = 16 << 10
 	personalAttachmentChunkLimit = 4 << 20
 	personalHistoryImportLimit   = 8 << 20
+	codexConnectionBodyLimit     = 16 << 10
 	codexDiscoverBodyLimit       = 16 << 10
 	codexCommandBodyLimit        = 72 << 10
 	codexCommandResultBodyLimit  = 1 << 10
@@ -277,6 +278,10 @@ func (h *api) limitBody(c *gin.Context) {
 		limit = personalHistoryImportLimit
 	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/codex/sessions/discover":
 		limit = codexDiscoverBodyLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/codex/connections":
+		limit = codexConnectionBodyLimit
+	case c.Request.Method == http.MethodPut && c.FullPath() == "/api/codex/connections/:profile_key/session-discovery-status":
+		limit = codexConnectionBodyLimit
 	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/codex/sessions/:id/commands":
 		limit = codexCommandBodyLimit
 	case c.Request.Method == http.MethodPost && (c.FullPath() == "/api/codex/commands/claim" ||
@@ -559,7 +564,8 @@ func validCredentialMetricKind(kind string) bool {
 }
 
 func hostReplicaCredentialRoute(method, path string) bool {
-	if deviceCredentialRoute(method, path) && path != "/api/workspaces/:id/sync-progress" {
+	if deviceCredentialRoute(method, path) && path != "/api/workspaces/:id/sync-progress" &&
+		path != "/api/workspaces/:id/sync-sessions/recover" {
 		return true
 	}
 	return (method == http.MethodGet && path == "/api/host-replicas/:host_id/generations/:generation/task-workspace-view-deletions") ||
@@ -574,6 +580,7 @@ func deviceCredentialRoute(method, path string) bool {
 		path == "/api/workspaces/:id/sync-sessions/:session_id") && method == http.MethodGet:
 		return true
 	case (path == "/api/workspaces/:id/sync-sessions" ||
+		path == "/api/workspaces/:id/sync-sessions/recover" ||
 		path == "/api/workspaces/:id/sync-sessions/:session_id/commit" ||
 		path == "/api/workspaces/:id/sync-sessions/:session_id/cancel") && method == http.MethodPost:
 		return true
@@ -594,7 +601,7 @@ func clientCredentialRoute(method, path string) bool {
 		switch path {
 		case "/api/me", "/api/me/record-captures", "/api/me/main-conversation", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
 			"/api/hosts/:id/control",
-			"/api/codex/sessions", "/api/codex/sessions/:id/events", "/api/codex/sessions/:id/events/stream",
+			"/api/codex/connections", "/api/codex/sessions", "/api/codex/sessions/:id/events", "/api/codex/sessions/:id/events/stream",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
 			"/api/conversations/:id/messages", "/api/conversations/:id/tasks", "/api/conversations/:id/message-uploads/:client_message_id",
 			"/api/projects", "/api/projects/:id", "/api/projects/:id/members", "/api/projects/:id/resources",
@@ -623,9 +630,10 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
 			"/api/tasks/:id/steps/:step_id/retries",
 			"/api/conversations/:id/message-uploads/:client_message_id/commit",
-			"/api/conversations/:id/messages/:message_id/retry-processing",
+			"/api/conversations/:id/messages/:message_id/retry-processing", "/api/conversations/:id/messages/:message_id/variants",
 			"/api/projects/:id/conversations", "/api/projects/:id/conversations/:conversation_id/messages",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/retry-processing",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/variants",
 			"/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id/commit",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/commit",
 			"/api/tasks/:id/workspace-view-deletions",
@@ -649,11 +657,12 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/me/main-conversation/ensure":
 			return true
 		case "/api/codex/sessions/discover", "/api/codex/sessions/:id/commands",
-			"/api/codex/commands/claim", "/api/codex/commands/:id/result", "/api/codex/sessions/:id/events":
+			"/api/codex/connections", "/api/codex/commands/claim", "/api/codex/commands/:id/result", "/api/codex/sessions/:id/events":
 			return true
 		}
 	case http.MethodPut:
 		return path == "/api/personal-data/:type/:id" || path == "/api/personal-data/uploads/:upload_id/chunks/:sequence" ||
+			path == "/api/codex/connections/:profile_key/session-discovery-status" ||
 			path == "/api/conversations/:id/message-uploads/:client_message_id" ||
 			path == "/api/conversations/:id/message-uploads/:client_message_id/chunks/:sequence" ||
 			path == "/api/conversations/:id/messages/:message_id/attachments/:client_attachment_id" ||
@@ -668,6 +677,7 @@ func clientCredentialRoute(method, path string) bool {
 	case http.MethodDelete:
 		return path == "/api/clients/:id" || path == "/api/devices/:id" || path == "/api/personal-data/:type/:id" ||
 			path == "/api/goals/:id" || path == "/api/auth/client-schedule-grant" ||
+			path == "/api/codex/connections/:profile_key" ||
 			path == "/api/personal-data/uploads/:upload_id" || path == "/api/model-connections/:id"
 	}
 	return false

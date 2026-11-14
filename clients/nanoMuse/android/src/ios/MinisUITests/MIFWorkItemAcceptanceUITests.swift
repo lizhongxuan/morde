@@ -2,6 +2,48 @@ import XCTest
 
 @MainActor
 final class MIFWorkItemAcceptanceUITests: XCTestCase {
+    func testRetryableTaskStepSubmitsOnceAndRefreshesSameRevisionTaskAndEvents() {
+        // The local endpoint accepts only expected revision 1 and serves revision 1 before and after retry.
+        let app = openRetryableTaskStepFixture(extraArguments: ["-morde.localTaskStepRetryFixture"])
+        let retry = app.buttons["morde.task.step.retry.s0000007"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 10))
+        XCTAssertTrue(retry.isHittable)
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(identifier: "morde.task.step.failureReason.s0000011").firstMatch.waitForExistence(timeout: 5),
+            "A non-retryable step with an uncertain side effect must explain why retry is unavailable.")
+        XCTAssertFalse(app.buttons["morde.task.step.retry.s0000011"].exists)
+
+        retry.tap()
+        XCTAssertFalse(retry.isEnabled, "Retry must stay disabled while the accepted request is in flight.")
+
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(identifier: "morde.task.step.s0000008").firstMatch.waitForExistence(timeout: 15),
+            "The accepted response must be followed by a refreshed second attempt.")
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(identifier: "morde.task.event.1").firstMatch.waitForExistence(timeout: 15),
+            "The task event stream must refresh after retry acceptance.")
+        XCTAssertFalse(app.buttons["morde.task.step.retry.s0000007"].exists,
+                       "The failed attempt must lose its retry entry after the task refresh.")
+        app.terminate()
+    }
+
+    func testTaskStepRetryFailureIsShownAndRetryCanBeAttemptedAgain() {
+        let app = openRetryableTaskStepFixture(extraArguments: [
+            "-morde.localTaskStepRetryFixture", "-morde.localTaskStepRetryFailureFixture",
+        ])
+        let retry = app.buttons["morde.task.step.retry.s0000007"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 10))
+        retry.tap()
+
+        let error = app.descendants(matching: .any)
+            .matching(identifier: "morde.task.step.retry.error.s0000007").firstMatch
+        XCTAssertTrue(error.waitForExistence(timeout: 10),
+                      "A rejected or uncertain retry result must remain visible on the failed step.")
+        XCTAssertTrue(retry.waitForExistence(timeout: 5))
+        XCTAssertTrue(retry.isEnabled)
+        app.terminate()
+    }
+
     func testTaskNavigationPreservesChatDraftAndSelectedTabAccessibility() {
         let app = launchFixture()
         let chatTab = app.buttons["morde.shell.tab.chat"]
@@ -499,6 +541,27 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         if !extraArguments.contains("-morde.localConversationFailureFixture") {
             XCTAssertTrue(app.buttons["morde.shell.tab.tasks"].waitForExistence(timeout: 15))
         }
+        return app
+    }
+
+    private func openRetryableTaskStepFixture(extraArguments: [String]) -> XCUIApplication {
+        let app = launchFixture(extraArguments: ["-morde.localTaskPagesStatusFixture"] + extraArguments)
+        let tasksTab = app.buttons["morde.shell.tab.tasks"]
+        XCTAssertTrue(tasksTab.waitForExistence(timeout: 10))
+        tasksTab.tap()
+
+        let taskRow = app.buttons["morde.tasks.row.q0000006"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 15))
+        let taskList = app.scrollViews["morde.tasks.list"]
+        for _ in 0..<8 where !taskRow.isHittable { taskList.swipeUp() }
+        XCTAssertTrue(taskRow.isHittable)
+        taskRow.tap()
+
+        XCTAssertTrue(app.buttons["morde.task.step.retry.s0000007"].waitForExistence(timeout: 15))
+        let detail = app.scrollViews["morde.task.detailScroll"]
+        let retry = app.buttons["morde.task.step.retry.s0000007"]
+        for _ in 0..<8 where !retry.isHittable { detail.swipeUp() }
+        XCTAssertTrue(retry.isHittable)
         return app
     }
 

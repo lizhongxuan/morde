@@ -13,14 +13,16 @@ describe('PortalLayout', () => {
   it('exposes work and settings pages from the primary navigation', () => {
     render(<ToastProvider><MemoryRouter initialEntries={['/assistant']}><PortalLayout /></MemoryRouter></ToastProvider>);
 
-    expect(screen.getByRole('link', { name: '打开手机端' })).toHaveAttribute('href', '/app/');
+    expect(screen.getByRole('link', { name: '查看客户端与设备' })).toHaveAttribute('href', '/clients');
+    expect(screen.queryByRole('link', { name: '打开手机端' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '返回上一页' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '前进' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '折叠侧边栏' })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '工作台' })).not.toBeInTheDocument();
     const workNavigation = screen.getByRole('navigation', { name: '工作导航' });
     expect(within(workNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
-    expect(within(workNavigation).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
+    expect(within(workNavigation).queryByRole('link', { name: '本机项目' })).not.toBeInTheDocument();
+    expect(within(workNavigation).getByRole('link', { name: 'Codex 会话' })).toHaveAttribute('href', '/codex');
     expect(within(workNavigation).getByRole('link', { name: '对话' })).toHaveAttribute('href', '/assistant');
     expect(within(workNavigation).getByRole('link', { name: '项目' })).toHaveAttribute('href', '/projects');
     expect(within(workNavigation).getByRole('link', { name: '个人数据' })).toHaveAttribute('href', '/personal');
@@ -37,11 +39,14 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 
-  it('places file sync under the cloud-computer page navigation', () => {
-    const { container } = render(<ToastProvider><MemoryRouter initialEntries={['/workspaces']}><PortalLayout /></MemoryRouter></ToastProvider>);
+  it('places project sync under the cloud-computer page navigation', () => {
+    const { container } = render(<ToastProvider><MemoryRouter initialEntries={['/hosts?sync=1']}><PortalLayout /></MemoryRouter></ToastProvider>);
     const contextNavigation = screen.getByRole('complementary', { name: '云端电脑子菜单' });
     expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('aria-current', 'page');
+    expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/hosts?sync=1');
     expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).not.toHaveAttribute('aria-current', 'page');
+    expect(within(screen.getByRole('navigation', { name: '工作导航' })).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
     expect(container.querySelector('.morde-topbar > .notice-center')).toBeInTheDocument();
   });
 

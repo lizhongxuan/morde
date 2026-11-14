@@ -141,7 +141,7 @@ export default function App() {
           </div>
         )}
         {!state.lite && <DesktopRemoteHint />}
-        {state.toast && <p role="status" className="mx-auto w-full max-w-[900px] shrink-0 px-4 py-2 text-center text-[13.5px] text-muted">{state.toast}</p>}
+        {state.toast && <p role="status" className="pointer-events-none absolute left-4 right-4 top-3 z-50 mx-auto w-fit max-w-[900px] rounded-xl border border-border bg-surface/95 px-4 py-2 text-center text-[13.5px] text-muted shadow-lg backdrop-blur-sm">{state.toast}</p>}
         {/* `tabbar-room` keeps the screens, the chat's composer included, above the floating bar;
             a wide window has the sidebar instead and gives the room back. */}
         <main className={cx("tabbar-room mx-auto min-h-0 w-full flex-1 wide:max-w-[900px]", !state.lite && "wide:pb-0")}>

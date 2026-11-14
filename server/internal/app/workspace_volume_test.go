@@ -78,6 +78,24 @@ func TestWorkspaceVolumeServiceUsesOnlyExactLegacyHostVolume(t *testing.T) {
 	}
 }
 
+func TestWorkspaceVolumeServiceRejectsSharedLegacyHostRootForDeletion(t *testing.T) {
+	store := &workspaceVolumeTestStore{
+		registry: WorkspaceVolumeRegistry{
+			WorkspaceID: "w1234567", OwnerID: "u1234567", State: WorkspaceVolumeLegacy, LegacyHostID: "h1234567",
+		},
+		legacyVolumes: []WorkspaceVolumeRegistry{{
+			WorkspaceID: "w7654321", OwnerID: "u1234567", State: WorkspaceVolumeLegacy, LegacyHostID: "h1234567",
+		}},
+	}
+	service, err := NewWorkspaceVolumeService(store, &workspaceVolumeTestProvisioner{}, "instance-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ValidateHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("ValidateHostWorkspaceVolume(shared legacy root) error = %v, want workspace conflict", err)
+	}
+}
+
 func TestWorkspaceVolumeServiceRejectsIdentityAndProvisionFailures(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -138,13 +156,22 @@ func TestWorkspaceVolumeServiceRejectsIdentityAndProvisionFailures(t *testing.T)
 }
 
 type workspaceVolumeTestStore struct {
-	registry   WorkspaceVolumeRegistry
-	readyCalls int
-	readyErr   error
+	registry      WorkspaceVolumeRegistry
+	legacyVolumes []WorkspaceVolumeRegistry
+	readyCalls    int
+	readyErr      error
 }
 
 func (s *workspaceVolumeTestStore) GetWorkspaceVolumeRegistry(context.Context, string) (WorkspaceVolumeRegistry, error) {
 	return s.registry, nil
+}
+
+func (s *workspaceVolumeTestStore) ListLegacyHostWorkspaceVolumes(_ context.Context, hostID string) ([]WorkspaceVolumeRegistry, error) {
+	values := append([]WorkspaceVolumeRegistry(nil), s.legacyVolumes...)
+	if s.registry.State == WorkspaceVolumeLegacy && s.registry.LegacyHostID == hostID {
+		values = append(values, s.registry)
+	}
+	return values, nil
 }
 
 func (s *workspaceVolumeTestStore) MarkWorkspaceVolumeReady(_ context.Context, ownerID, workspaceID, volumeName string) error {
@@ -162,8 +189,10 @@ func (s *workspaceVolumeTestStore) MarkWorkspaceVolumeReady(_ context.Context, o
 type workspaceVolumeTestProvisioner struct {
 	ensureCalls int
 	verifyCalls int
+	deleteCalls int
 	ensureErr   error
 	verifyErr   error
+	deleteErr   error
 	lastOwnerID string
 }
 
@@ -177,4 +206,13 @@ func (p *workspaceVolumeTestProvisioner) VerifyWorkspaceVolume(_ context.Context
 	p.verifyCalls++
 	p.lastOwnerID = ownerID
 	return p.verifyErr
+}
+
+func (p *workspaceVolumeTestProvisioner) VerifyWorkspaceVolumeForDelete(context.Context, string, string, string, string) error {
+	return p.verifyErr
+}
+
+func (p *workspaceVolumeTestProvisioner) DeleteWorkspaceVolume(context.Context, string, string, string, string) error {
+	p.deleteCalls++
+	return p.deleteErr
 }

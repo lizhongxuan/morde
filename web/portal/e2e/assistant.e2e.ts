@@ -20,20 +20,26 @@ test.describe("Assistant durable tasks", () => {
   });
 
   test("keeps portal pages within the viewport at desktop and narrow widths", async ({ page }) => {
+    test.setTimeout(90_000);
     await page.goto("/");
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
 
-    const routes = ["/assistant", "/personal", "/goals", "/hosts", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/projects", "/workspaces"];
-    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals", "/hosts", "/workspaces"]);
+    const routes = ["/assistant", "/personal", "/goals", "/hosts", "/hosts?sync=1", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/projects", "/workspaces", "/local-projects"];
+    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals", "/hosts", "/workspaces", "/local-projects"]);
     for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }, { width: 480, height: 720 }]) {
       await page.setViewportSize(viewport);
       for (const route of routes) {
         await page.goto(route);
-        await expect(page.locator(".morde-shell")).toBeVisible();
+        const routePath = new URL(route, "http://morde.test").pathname;
+        if (routePath === "/workspaces" || routePath === "/local-projects") await expect(page).toHaveURL(/\/hosts\?sync=1/);
+        await expect(page.locator(".morde-shell"), `Portal shell for ${route} at ${viewport.width}px`).toBeVisible();
+        if (route === "/hosts?sync=1" || routePath === "/workspaces" || routePath === "/local-projects") {
+          await expect(page.getByRole("heading", { name: "文件同步" })).toBeVisible();
+        }
         const sidebarToggle = page.getByRole("button", { name: /折叠侧边栏|展开侧边栏/ });
-        if (routesWithContextSidebar.has(route)) {
+        if (routesWithContextSidebar.has(routePath)) {
           await expect(sidebarToggle).toBeVisible();
           const expanded = await sidebarToggle.getAttribute("aria-expanded");
           await sidebarToggle.click();
@@ -266,7 +272,14 @@ test.describe("Assistant durable tasks", () => {
           title: stepTitle, summary: "", created_at: timestamp }],
         batch_items: [], artifacts: [],
         pending_request: status === "waiting_user" ? { id: "kdem0001", version: 1, kind: "approval", title: "写入文件",
-          object: "报告.md", content: "准备创建报告。", impact: "会新增一个文件。" } : null,
+          object: "报告.md", content: "准备创建报告。", impact: "会新增一个文件。", expires_at: "2099-12-31T23:59:59Z",
+          disclosures: {
+            risk: { state: "known", summary: "需要核对写入范围。" },
+            this_cost: { state: "known", basis: "estimate", amount_micros: 1_250_000, currency: "USD" },
+            cumulative_cost: { state: "unknown", basis: null, amount_micros: null, currency: null },
+            alternatives: { state: "known", options: ["只预览", "延迟执行"] },
+            revocation: { state: "not_applicable", summary: null },
+          } } : null,
         clarification_request: null, stop_request: null,
         assistant_message: { id: replyID, conversation_id: conversationID, sequence, task_id: id, task_revision: 1,
           role: "assistant", content: replyText, status: replyStatus, created_at: timestamp },
@@ -306,7 +319,14 @@ test.describe("Assistant durable tasks", () => {
     await firstCard.getByRole("button", { name: /查看并处理/ }).click();
     const firstPanel = page.locator(`.task-panel-detail .task-activity[data-task-id="${taskIDs[0]}"]`);
     await expect(firstPanel).toContainText("写入文件");
-    await expect(firstPanel.getByRole("region", { name: "需要批准的操作" })).toContainText("准备创建报告。");
+    const approval = firstPanel.getByRole("region", { name: "需要批准的操作" });
+    await expect(approval).toContainText("准备创建报告。");
+    await expect(approval).toContainText("审批到期：");
+    await expect(approval).toContainText("风险需要核对写入范围。");
+    await expect(approval).toContainText("本次费用估算 USD 1.25");
+    await expect(approval).toContainText("累计费用未知");
+    await expect(approval).toContainText("替代方案只预览；延迟执行");
+    await expect(approval).toContainText("撤销方式不适用");
     await expect(page.getByText("第一项任务已完成首轮建议。")).toBeVisible();
     await expect(page.getByText("第二项任务正在读取网页。")).toBeVisible();
     await expect(page.locator(".message-list article").first()).toHaveClass(/chat-message-user/);
@@ -529,6 +549,13 @@ test.describe("Assistant durable tasks", () => {
     await expect(connect).toBeEnabled();
     await connect.click();
     const alert = page.getByRole("alert").filter({ hasText: "本地演示模式无法连接真实云端电脑" });
+    const noticeCenter = page.locator(".morde-topbar > .notice-center");
+    const openNotices = async () => {
+      await expect(noticeCenter).toBeVisible();
+      const details = noticeCenter.locator("details");
+      if (await details.getAttribute("open") === null) await noticeCenter.locator("summary").click();
+    };
+    await openNotices();
     await expect(alert).toBeVisible();
     await expect(page.getByRole("textbox", { name: "消息内容" })).toBeVisible();
     await expect(page).toHaveURL(/\/assistant$/);
@@ -536,6 +563,7 @@ test.describe("Assistant durable tasks", () => {
     await expect(connect).toBeEnabled();
     await alert.getByRole("button", { name: "关闭错误提示" }).click();
     await connect.click();
+    await openNotices();
     await expect(alert).toBeVisible();
   });
 

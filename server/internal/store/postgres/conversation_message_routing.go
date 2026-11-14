@@ -165,7 +165,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorI
 	value.RoutingStatus = conversation.RoutingStatus(routing)
 	value.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 	if projectID != "" {
-		value.AttachmentIDs, err = loadProjectMessageAttachmentIDsInTx(ctx, tx, instanceID, projectID, value.OwnerID, value.ConversationID, value.ID)
+		value.AttachmentIDs, err = loadProjectMessageAttachmentIDsInTx(ctx, tx, instanceID, projectID, value.OwnerID, value.ActorID, value.ConversationID, value.ID)
 	} else {
 		value.AttachmentIDs, err = loadHistoryMessageAttachmentIDs(ctx, tx, instanceID, value.OwnerID, value.ConversationID, value.ID)
 	}
@@ -217,7 +217,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.ar
 			return fmt.Errorf("find conversation receipt: %w", err)
 		}
 		if projectID != "" {
-			value.AttachmentIDs, err = loadProjectMessageAttachmentIDsInTx(ctx, tx, instanceID, projectID, value.OwnerID, value.ConversationID, value.ID)
+			value.AttachmentIDs, err = loadProjectMessageAttachmentIDsInTx(ctx, tx, instanceID, projectID, value.OwnerID, value.ActorID, value.ConversationID, value.ID)
 		} else {
 			value.AttachmentIDs, err = loadHistoryMessageAttachmentIDs(ctx, tx, instanceID, value.OwnerID, value.ConversationID, value.ID)
 		}

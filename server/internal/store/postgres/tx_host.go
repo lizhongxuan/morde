@@ -370,6 +370,15 @@ ORDER BY id FOR UPDATE`, ids)
 		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	for _, id := range lockedIDs {
+		var alreadyBound bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_bindings WHERE workspace_id=$1
+)`, id).Scan(&alreadyBound); err != nil {
+			return nil, fmt.Errorf("check computer storage uniqueness before binding: %w", err)
+		}
+		if alreadyBound {
+			return nil, domain.NewError(domain.CodeWorkspaceConflict, "computer storage cannot be assigned to another computer")
+		}
 		if copyReservationID == "" {
 			if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, id); err != nil {
 				return nil, err

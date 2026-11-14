@@ -27,6 +27,13 @@ function savedWorkspaceSyncProfile(value, enabled) {
 
 function harness(initialAuth = null, existingRoot = null) {
   const root = existingRoot ?? mkdtempSync(join(tmpdir(), 'morde-desktop-auth-'));
+  const intervals = new Set();
+  const originalSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (...args) => {
+    const interval = originalSetInterval(...args);
+    intervals.add(interval);
+    return interval;
+  };
   const userData = join(root, 'Morde Client');
   const fs = require('node:fs');
   fs.mkdirSync(userData, { recursive: true });
@@ -108,7 +115,12 @@ function harness(initialAuth = null, existingRoot = null) {
     root, userData, handlers, windows, views, partitions, appEvents, shellURLs, dialog,
     async ready() { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)); },
     invoke(channel, ...args) { return handlers.get(channel)({ sender: windows.at(-1).webContents }, ...args); },
-    cleanup(removeRoot = true) { delete require.cache[entry]; if (removeRoot) rmSync(root, { recursive: true, force: true }); },
+    cleanup(removeRoot = true) {
+      globalThis.setInterval = originalSetInterval;
+      for (const interval of intervals) clearInterval(interval);
+      delete require.cache[entry];
+      if (removeRoot) rmSync(root, { recursive: true, force: true });
+    },
   };
 }
 
@@ -990,6 +1002,7 @@ test('closing and reopening the macOS window restores the authenticated Web view
 test('completed server session with a file conflict keeps the desktop recovery point', async () => {
   const originalFetch = globalThis.fetch;
   const Sync = require('../out/morde-sync.js').MordeSync;
+  const SyncRunError = require('../out/morde-sync.js').SyncRunError;
   const originalRun = Sync.prototype.run;
   globalThis.fetch = async (url) => new Response(JSON.stringify(String(url).endsWith('/api/capabilities')
     ? capabilitiesWithWorkspaceSync
@@ -1611,10 +1624,19 @@ test('project upload registers only folder metadata and reports a stopped Host a
     throw new Error('unexpected metadata request ' + path);
   };
   const syncCalls = [];
+  let holdNextSyncRun = true, syncRunEntered, releaseSyncRun;
+  const syncRunStarted = new Promise((resolve) => { syncRunEntered = resolve; });
+  const syncRunGate = new Promise((resolve) => { releaseSyncRun = resolve; });
   Sync.prototype.run = async function (_auth, mapping, mode, scope, checkpoint, _authorized, confirmMapping) {
     await confirmMapping?.();
     syncCalls.push({ workspaceId: mapping.workspaceId, mode, scope, folderId: checkpoint.folderId, hostId: checkpoint.hostId, sourceBindingID: checkpoint.sourceBindingID,
       idempotencyKey: checkpoint.idempotencyKey, sessionId: checkpoint.sessionId });
+    if (holdNextSyncRun) {
+      holdNextSyncRun = false;
+      this.update('running', { session_id: 'p1234567', stage: 'compare' });
+      syncRunEntered();
+      await syncRunGate;
+    }
     if (syncCalls.length === 1) {
       this.update('running', { session_id: 'p1234567', stage: 'compare' });
       return { session: { id: 'p1234567', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'conflict' },
@@ -1638,7 +1660,11 @@ test('project upload registers only folder metadata and reports a stopped Host a
     });
     const sameDirectory = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
     assert.equal(sameDirectory.selectionID, selection.selectionID, 'reselecting the same local directory keeps its private source identity');
-    const conflict = await h.invoke('morde:project-upload', selection.selectionID, 'demo');
+    const pendingConflict = h.invoke('morde:project-upload', selection.selectionID, 'demo');
+    await syncRunStarted;
+    await assert.rejects(h.invoke('morde:login', 'https://other.example', 'other', 'password'), /local Workspace operations before changing accounts/);
+    releaseSyncRun();
+    const conflict = await pendingConflict;
     assert.match(confirmation.message, /offline computer/);
     assert.match(confirmation.detail, /目标电脑：offline computer（h1234567）/);
     assert.match(confirmation.detail, /完整扫描所选本机根目录/);
@@ -1733,7 +1759,7 @@ test('legacy project mappings receive a private source binding before reuse', as
 
 test('project upload resumes the same confirmed session after desktop restart', async () => {
   const originalFetch = globalThis.fetch;
-  const Sync = require('../out/morde-sync.js').MordeSync;
+  const { MordeSync: Sync, SyncRunError } = require('../out/morde-sync.js');
   const originalRun = Sync.prototype.run;
   const appRoot = mkdtempSync(join(tmpdir(), 'morde-project-recovery-profile-'));
   const projectRoot = mkdtempSync(join(homedir(), 'morde-project-recovery-empty-'));
@@ -1780,7 +1806,7 @@ test('project upload resumes the same confirmed session after desktop restart', 
       selectionID: checkpoint.projectSelectionID, projectName: checkpoint.projectName, idempotencyKey: checkpoint.idempotencyKey,
       sessionId: checkpoint.sessionId, mode, scope });
     this.update('running', { session_id: 'p1234567', stage: 'transfer' });
-    if (runs.length === 1) throw new Error('connection lost');
+    if (runs.length === 1) throw new SyncRunError('unknown', 'connection lost');
     return { session: { id: 'p1234567', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'completed' }, conflicts: [] };
   };
   let first, second;
@@ -1792,8 +1818,11 @@ test('project upload resumes the same confirmed session after desktop restart', 
     await assert.rejects(first.invoke('morde:project-upload', selection.selectionID, 'demo'), /connection lost/);
     const saved = JSON.parse(readFileSync(profileFile(first, auth, 'sync-checkpoint'), 'utf8'));
     assert.equal(saved.mode, 'project_upload');
+    assert.equal(saved.syncOutcome, 'unknown');
+    assert.equal(saved.syncMessage, 'connection lost');
     assert.equal(saved.folderId, folderID);
     assert.match(saved.sourceBindingID, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const previousSourceBindingID = saved.sourceBindingID;
     assert.equal(saved.sessionId, 'p1234567');
     assert.equal(saved.projectSelectionID, selection.selectionID);
     first.cleanup(false);
@@ -1803,6 +1832,11 @@ test('project upload resumes the same confirmed session after desktop restart', 
     await second.ready();
     const recovered = await second.invoke('morde:state');
     assert.equal(recovered.syncCheckpoint.mode, 'project_upload');
+    assert.equal(recovered.syncRecovery.state, 'unknown');
+    assert.equal(recovered.syncRecovery.message, 'connection lost');
+    const expectedSourceBindingID = JSON.parse(readFileSync(profileFile(second, auth, 'project-mappings'), 'utf8'))[0].sourceBindingID;
+    assert.match(expectedSourceBindingID, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.equal(expectedSourceBindingID, previousSourceBindingID);
     const result = await second.invoke('morde:project-upload', selection.selectionID, 'demo');
     assert.equal(result.cloudStatus, 'confirmed');
     assert.equal(result.hostStatus, 'pending_apply');
@@ -1812,6 +1846,8 @@ test('project upload resumes the same confirmed session after desktop restart', 
     assert.equal(runs[1].idempotencyKey, runs[0].idempotencyKey);
     assert.equal(runs[1].folderId, runs[0].folderId);
     assert.equal(runs[1].sourceBindingID, runs[0].sourceBindingID);
+    assert.equal(runs[1].sourceBindingID, expectedSourceBindingID);
+    assert.equal(JSON.parse(readFileSync(profileFile(second, auth, 'sync-checkpoint'), 'utf8')).sourceBindingID, expectedSourceBindingID);
     assert.equal(runs[1].selectionID, runs[0].selectionID);
     assert.equal((await second.invoke('morde:state')).syncCheckpoint.hostApplicationStatus, 'pending_apply');
     receiptStatus = 'applied';
@@ -1827,6 +1863,54 @@ test('project upload resumes the same confirmed session after desktop restart', 
     second?.cleanup(false);
     rmSync(appRoot, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy project upload recovery stays blocked even when local identity matches without a server source ID', async () => {
+  const originalFetch = globalThis.fetch;
+  const { MordeSync: Sync } = require('../out/morde-sync.js');
+  const originalRun = Sync.prototype.run;
+  const appRoot = mkdtempSync(join(tmpdir(), 'morde-project-legacy-no-source-id-'));
+  const h = harness(auth, appRoot);
+  const selectionID = '11111111-1111-4111-8111-111111111111';
+  const directory = join(appRoot, 'selected-project');
+  mkdirSync(directory);
+  const info = statSync(directory, { bigint: true });
+  const mapping = {
+    selectionID, sourceBindingID: '22222222-2222-4222-8222-222222222222',
+    hostId: 'h1234567', workspaceId: 'w1234567', projectName: 'demo', directory, dev: String(info.dev), ino: String(info.ino),
+    folderId: `morde-${'a'.repeat(32)}`, registrationKey: '33333333-3333-4333-8333-333333333333',
+  };
+  const checkpoint = {
+    serviceInstanceID: auth.serviceInstanceID, installationId: auth.installationId,
+    workspaceId: mapping.workspaceId, directory, dev: mapping.dev, ino: mapping.ino,
+    mode: 'project_upload', scope: [], projectSelectionID: selectionID, hostId: mapping.hostId,
+    folderId: mapping.folderId, projectName: 'demo', idempotencyKey: 'legacy-upload-1',
+  };
+  writeFileSync(profileFile(h, auth, 'project-mappings'), JSON.stringify([mapping]));
+  writeFileSync(profileFile(h, auth, 'sync-checkpoint'), JSON.stringify(checkpoint));
+  const requests = [];
+  let syncRuns = 0;
+  Sync.prototype.run = async () => { syncRuns++; throw new Error('old server session must not be resumed without reconciliation'); };
+  globalThis.fetch = async (url) => {
+    requests.push(String(url));
+    return json(String(url).endsWith('/api/capabilities') ? capabilitiesResponse : {});
+  };
+  try {
+    await h.ready();
+    await assert.rejects(h.invoke('morde:project-upload', selectionID, 'demo'), /缺少服务端来源身份/);
+    const saved = JSON.parse(readFileSync(profileFile(h, auth, 'sync-checkpoint'), 'utf8'));
+    assert.equal('sourceBindingID' in saved, false);
+    assert.equal(saved.directory, directory);
+    assert.equal(syncRuns, 0);
+    assert.equal(requests.some((url) => new URL(url).pathname.includes('/sync-sessions')), false,
+      'a checkpoint without the server source ID must not query or resume its upload session');
+    assert.equal((await h.invoke('morde:state')).syncCheckpoint.mode, 'project_upload');
+  } finally {
+    Sync.prototype.run = originalRun;
+    globalThis.fetch = originalFetch;
+    h.cleanup(false);
+    rmSync(appRoot, { recursive: true, force: true });
   }
 });
 

@@ -31,6 +31,13 @@ FROM workspaces WHERE id=$1 FOR UPDATE`, value.SourceWorkspaceID).Scan(&ownerID,
 		if ownerID != value.OwnerID || deleted {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
+		bound, err := workspaceHasHostBindingTx(ctx, tx, value.SourceWorkspaceID)
+		if err != nil {
+			return err
+		}
+		if bound {
+			return domain.NewError(domain.CodeForbidden, "computer storage cannot be shared as an independent Workspace")
+		}
 		if readOnly {
 			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
@@ -73,6 +80,15 @@ FROM workspace_share_links WHERE token_hash=$1 FOR UPDATE`, tokenHash)
 				return fmt.Errorf("expire Workspace share link: %w", err)
 			}
 			return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
+		}
+		if result.State == workspace.SharePending {
+			bound, err := workspaceHasHostBindingTx(ctx, tx, result.SourceWorkspaceID)
+			if err != nil {
+				return err
+			}
+			if bound {
+				return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
+			}
 		}
 		if err := result.Validate(); err != nil {
 			return domain.NewError(domain.CodeInternal, "stored Workspace share link is invalid")
@@ -120,6 +136,20 @@ WHERE id=$1 AND state='pending'`, result.ID, claimantID); err != nil {
 				return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
 			}
 		default:
+			return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
+		}
+		var lockedWorkspaceID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, result.SourceWorkspaceID).Scan(&lockedWorkspaceID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
+			}
+			return fmt.Errorf("lock Workspace share source before claim: %w", err)
+		}
+		bound, err := workspaceHasHostBindingTx(ctx, tx, result.SourceWorkspaceID)
+		if err != nil {
+			return err
+		}
+		if bound {
 			return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
 		}
 		if err := result.Validate(); err != nil {
@@ -198,11 +228,23 @@ func (s *Store) WorkspaceShareSourceMatches(ctx context.Context, ownerID, worksp
 	var matches bool
 	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
 SELECT 1 FROM workspaces WHERE id=$1 AND owner_id=$2 AND state='ready' AND revision=$3 AND
-deleted_at IS NULL AND is_read_only=false)`, workspaceID, ownerID, revision).Scan(&matches)
+deleted_at IS NULL AND is_read_only=false AND NOT EXISTS (
+  SELECT 1 FROM workspace_bindings WHERE workspace_id=$1
+))`, workspaceID, ownerID, revision).Scan(&matches)
 	if err != nil {
 		return false, fmt.Errorf("verify Workspace share source: %w", err)
 	}
 	return matches, nil
+}
+
+func workspaceHasHostBindingTx(ctx context.Context, tx pgx.Tx, workspaceID string) (bool, error) {
+	var bound bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_bindings WHERE workspace_id=$1
+)`, workspaceID).Scan(&bound); err != nil {
+		return false, fmt.Errorf("check Host binding for Workspace: %w", err)
+	}
+	return bound, nil
 }
 
 type workspaceShareRow interface {

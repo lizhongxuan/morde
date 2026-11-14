@@ -574,7 +574,7 @@ func requireApprovedWorkspaceTransferTarget(ctx context.Context, tx pgx.Tx, owne
 func validateWorkspaceTransferable(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64) error {
 	var blocked bool
 	if err := tx.QueryRow(ctx, `SELECT
-EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1 AND state <> 'detached') OR
+EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1) OR
 EXISTS (SELECT 1 FROM workspace_sync_sessions WHERE workspace_id=$1 AND state IN ('planned','transferring','verifying','applying')) OR
 EXISTS (SELECT 1 FROM workspace_sync_receive_reservations WHERE workspace_id=$1 AND state IN ('reserved','aborting')) OR
 EXISTS (SELECT 1 FROM tasks WHERE workspace_id=$1 AND status NOT IN ('completed','failed','cancelled')) OR
@@ -586,7 +586,7 @@ EXISTS (SELECT 1 FROM workspace_copy_reservations WHERE source_workspace_id=$1 A
 		return fmt.Errorf("check active Workspace references before transfer: %w", err)
 	}
 	if blocked {
-		return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an active binding, Task, synchronization session, or publish")
+		return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has a computer binding, Task, synchronization session, or publish")
 	}
 
 	var unsupported bool

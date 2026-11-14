@@ -72,7 +72,7 @@ FROM workspaces WHERE id=$1`, workspaceID).Scan(&storedOwner, &state, &currentRe
 		}
 		var blocked bool
 		if err := tx.QueryRow(ctx, `SELECT
-EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1 AND state <> 'detached') OR
+EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1) OR
 EXISTS (SELECT 1 FROM workspace_sync_sessions WHERE workspace_id=$1 AND state IN ('planned','transferring','verifying','applying')) OR
 EXISTS (SELECT 1 FROM tasks WHERE workspace_id=$1 AND status IN ('queued','running','waiting_user','pausing','cancelling')) OR
 EXISTS (SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')) OR
@@ -84,7 +84,7 @@ EXISTS (SELECT 1 FROM task_hub_operations o WHERE o.workspace_id=$1 AND o.action
 			return fmt.Errorf("check Workspace writers before file operation: %w", err)
 		}
 		if blocked {
-			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an active Host binding or in-flight write; stop and settle it before editing")
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace belongs to a cloud computer or has an in-flight write; edit through the authorized project path")
 		}
 		if err := ensureNoWorkspaceSyncReceive(ctx, tx, workspaceID, ""); err != nil {
 			return err

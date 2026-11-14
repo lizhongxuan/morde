@@ -223,7 +223,7 @@ func validateInitialTaskEvent(eventType string, payload []byte) ([]byte, error) 
 
 func validTaskEventType(value string) bool {
 	switch value {
-	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result":
+	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan":
 		return true
 	default:
 		return false

@@ -39,8 +39,9 @@ test('Portal preload exposes project and restricted local recovery operations', 
   const bridge = loadBridge('portal');
   assert.equal(bridge.exposed.name, 'morde');
   assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
+    'codexAddProfile', 'codexAuthorizeProfile', 'codexAuthorizeThread', 'codexListThreads', 'codexRevoke', 'codexRevokeProfile', 'codexSelectProfile', 'codexState', 'codexUpdateScopes',
     'deletePreserved', 'legacyDiscardSync', 'legacyPauseSync', 'legacyResumeSync', 'legacyStopLiveSync', 'legacyStopSync', 'legacySyncState',
-    'onState', 'onSync', 'preserved', 'projectUploadTargets', 'restorePreserved', 'selectProjectDirectory', 'state', 'stopProjectSync', 'uploadProject',
+    'onCodexState', 'onState', 'onSync', 'preserved', 'projectUploadTargets', 'restorePreserved', 'selectProjectDirectory', 'state', 'stopProjectSync', 'uploadProject',
   ]);
   await bridge.exposed.value.projectUploadTargets();
   await bridge.exposed.value.selectProjectDirectory('h1234567', 'w1234567');
@@ -49,6 +50,8 @@ test('Portal preload exposes project and restricted local recovery operations', 
   await bridge.exposed.value.state();
   await bridge.exposed.value.legacySyncState();
   await bridge.exposed.value.restorePreserved('w1234567', 'a'.repeat(32));
+  await bridge.exposed.value.codexAuthorizeProfile('profile-a', ['read', 'live']);
+  await bridge.exposed.value.codexRevokeProfile('profile-a');
   assert.deepEqual(bridge.calls, [
     ['morde:portal-project-upload-targets'],
     ['morde:portal-project-select-directory', 'h1234567', 'w1234567'],
@@ -57,6 +60,8 @@ test('Portal preload exposes project and restricted local recovery operations', 
     ['morde:portal-state'],
     ['morde:portal-legacy-state'],
     ['morde:portal-preserved-restore', 'w1234567', 'a'.repeat(32)],
+    ['morde:codex-authorize-profile', 'profile-a', ['read', 'live']],
+    ['morde:codex-revoke-profile', 'profile-a'],
   ]);
 
   const received = [];
@@ -69,6 +74,19 @@ test('Portal preload exposes project and restricted local recovery operations', 
   }
   unsubscribe();
   assert.equal(bridge.removed[0][0], 'morde:portal-state');
+});
+
+test('Codex settings preload exposes profile connection consent and revocation', async () => {
+  const bridge = loadBridge('codex');
+  assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
+    'addProfile', 'authorizeProfile', 'authorizeThread', 'listThreads', 'onState', 'revoke', 'revokeProfile', 'selectProfile', 'state', 'updateScopes',
+  ]);
+  await bridge.exposed.value.authorizeProfile('profile-a', ['read', 'live']);
+  await bridge.exposed.value.revokeProfile('profile-a');
+  assert.deepEqual(bridge.calls, [
+    ['morde:codex-authorize-profile', 'profile-a', ['read', 'live']],
+    ['morde:codex-revoke-profile', 'profile-a'],
+  ]);
 });
 
 test('Host Workbench preload exposes only the validated return action', async () => {

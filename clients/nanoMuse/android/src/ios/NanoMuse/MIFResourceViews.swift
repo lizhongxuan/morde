@@ -70,40 +70,11 @@ struct MIFResourcePageState: Equatable {
         let error: String?
     }
 
-    struct Workspace: Equatable, Identifiable {
-        enum Status: Equatable {
-            case ready
-            case syncing
-            case unbound
-            case unavailable
-            case unknown
-        }
-
-        let id: String
-        let name: String
-        let status: Status
-        let hostName: String?
-        let usedBytes: Int64
-        let quotaBytes: Int64
-        let isReadOnly: Bool
-        let canOpen: Bool
-
-        var capacitySummary: String? {
-            guard usedBytes >= 0, quotaBytes > 0 else { return nil }
-            let percentage = Int(min(100, max(0, (Double(usedBytes) * 100 / Double(quotaBytes)).rounded())))
-            let formatter = ByteCountFormatter()
-            formatter.countStyle = .memory
-            return "\(formatter.string(fromByteCount: quotaBytes)) · \(AppLocalized("Used")) \(percentage)%"
-        }
-    }
-
     let isLoading: Bool
     let loadError: String?
     let hostsState: ListState
-    let workspacesState: ListState
     let defaultTarget: DefaultTarget
     let hosts: [Host]
-    let workspaces: [Workspace]
 }
 
 extension MIFHostRuntimeStatus {
@@ -136,14 +107,12 @@ enum MIFResourceControlAction: String, Hashable {
 enum MIFResourcePageSection: CaseIterable, Hashable {
     case cloudComputers
     case cloudPhones
-    case workspaces
     case aiTools
 
     var title: String {
         switch self {
         case .cloudComputers: return AppLocalized("Cloud computers")
         case .cloudPhones: return AppLocalized("Cloud phones")
-        case .workspaces: return AppLocalized("电脑文件")
         case .aiTools: return AppLocalized("AI tools")
         }
     }
@@ -152,7 +121,6 @@ enum MIFResourcePageSection: CaseIterable, Hashable {
         switch self {
         case .cloudComputers: return AppLocalized("No cloud computers are available in this account scope.")
         case .cloudPhones: return AppLocalized("Execution status unavailable")
-        case .workspaces: return AppLocalized("此账号范围内没有可用的电脑文件。")
         case .aiTools: return AppLocalized("No AI tool runtime status is available in this account scope.")
         }
     }
@@ -161,7 +129,6 @@ enum MIFResourcePageSection: CaseIterable, Hashable {
         switch self {
         case .cloudComputers: return "desktopcomputer"
         case .cloudPhones: return "iphone"
-        case .workspaces: return "externaldrive"
         case .aiTools: return "wrench.and.screwdriver"
         }
     }
@@ -170,7 +137,6 @@ enum MIFResourcePageSection: CaseIterable, Hashable {
         switch self {
         case .cloudComputers: return "morde.resources.empty.cloudComputers"
         case .cloudPhones: return "morde.resources.empty.cloudPhones"
-        case .workspaces: return "morde.resources.empty.workspaces"
         case .aiTools: return "morde.resources.empty.aiTools"
         }
     }
@@ -182,8 +148,6 @@ enum MIFResourcePageRules {
         switch section {
         case .cloudComputers:
             return state.hosts.isEmpty && !state.hostsState.isLoading && state.hostsState.loadError == nil
-        case .workspaces:
-            return state.workspaces.isEmpty && !state.workspacesState.isLoading && state.workspacesState.loadError == nil
         case .cloudPhones, .aiTools:
             return true
         }
@@ -208,7 +172,6 @@ struct MIFResourcePageActions {
     let shareHost: (String) -> Void
     let refreshControl: (String) -> Void
     let control: (String, MIFResourceControlAction) -> Void
-    let openWorkspaceFiles: (String) -> Void
 }
 
 private struct MIFResourceHostGlyph: Shape {
@@ -229,35 +192,6 @@ private struct MIFResourceHostGlyph: Shape {
         path.move(to: CGPoint(x: rect.minX + 12 * scaleX, y: rect.minY + 16.5 * scaleY))
         path.addLine(to: CGPoint(x: rect.minX + 12 * scaleX, y: rect.minY + 20.5 * scaleY))
         return path
-    }
-}
-
-private struct MIFResourceWorkspaceGlyph: View {
-    let color: Color
-
-    var body: some View {
-        GeometryReader { geometry in
-            let scale = min(geometry.size.width, geometry.size.height) / 24
-            ZStack(alignment: .topLeading) {
-                Path { path in
-                    path.addRoundedRect(
-                        in: CGRect(x: 3 * scale, y: 7 * scale,
-                                   width: 18 * scale, height: 10.5 * scale),
-                        cornerSize: CGSize(width: 2.5 * scale, height: 2.5 * scale)
-                    )
-                    path.move(to: CGPoint(x: 6.8 * scale, y: 12.2 * scale))
-                    path.addLine(to: CGPoint(x: 10.8 * scale, y: 12.2 * scale))
-                }
-                .stroke(color, style: StrokeStyle(lineWidth: 1.8 * scale,
-                                                  lineCap: .round, lineJoin: .round))
-                Circle()
-                    .fill(color)
-                    .frame(width: 2.2 * scale, height: 2.2 * scale)
-                    .position(x: 16.8 * scale, y: 12.2 * scale)
-            }
-        }
-        .frame(width: 21, height: 21)
-        .accessibilityHidden(true)
     }
 }
 
@@ -318,7 +252,7 @@ struct MIFResourceRoom: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    if state.isLoading && state.hosts.isEmpty && state.workspaces.isEmpty {
+                    if state.isLoading && state.hosts.isEmpty {
                         ProgressView(AppLocalized("Loading resources…"))
                             .frame(maxWidth: .infinity, minHeight: 80)
                     }
@@ -445,17 +379,6 @@ struct MIFResourceRoom: View {
         case .cloudPhones, .aiTools:
             resourceEmptyStateRow(section.emptyMessage, symbol: section.emptySymbol)
                 .accessibilityIdentifier(section.emptyStateIdentifier)
-        case .workspaces:
-            if state.workspaces.isEmpty, MIFResourcePageRules.showsEmptyState(for: section, state: state) {
-                resourceEmptyStateRow(section.emptyMessage, symbol: section.emptySymbol)
-                    .accessibilityIdentifier(section.emptyStateIdentifier)
-            } else if state.workspaces.isEmpty {
-                EmptyView()
-            } else {
-                ForEach(state.workspaces) { workspace in
-                    workspaceRow(workspace)
-                }
-            }
         }
     }
 
@@ -614,58 +537,6 @@ struct MIFResourceRoom: View {
         }
     }
 
-    private func workspaceRow(_ workspace: MIFResourcePageState.Workspace) -> some View {
-        let hostName = workspace.hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isReadyOnComputer = workspace.status == .ready && hostName?.isEmpty == false
-        return Button {
-            actions.openWorkspaceFiles(workspace.id)
-        } label: {
-            HStack(alignment: .top, spacing: 13) {
-                MIFResourceWorkspaceGlyph(color: rowIconStrokeColor)
-                    .frame(width: 44, height: 44)
-                    .background(rowIconFill, in: Circle())
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(hostName.flatMap { $0.isEmpty ? nil : $0 } ?? AppLocalized("电脑文件"))
-                        .font(.system(size: 16, weight: .semibold))
-                        .tracking(-0.16)
-                        .lineSpacing(1.5)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if let capacitySummary = workspace.capacitySummary {
-                        Text(capacitySummary)
-                            .font(.system(size: 14))
-                            .lineSpacing(3.5)
-                            .foregroundStyle(rowSummaryColor)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    HStack(spacing: 6) {
-                        Text(isReadyOnComputer ? AppLocalized("Ready") : workspace.status.localizedTitle)
-                        if let hostName, !hostName.isEmpty {
-                            Text("·")
-                            Text(hostName)
-                        }
-                        if workspace.isReadOnly {
-                            Text("·")
-                            Text(AppLocalized("Read-only"))
-                        }
-                    }
-                    .font(.footnote)
-                    .foregroundStyle(rowStatusColor)
-                    .padding(.top, 1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 1)
-                if workspace.canOpen {
-                    resourceDisclosureChevron
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(!workspace.canOpen)
-        .accessibilityIdentifier("morde.resources.workspace.open.\(workspace.id)")
-        .padding(.vertical, 13)
-    }
-
     private var resourceDisclosureChevron: some View {
         Text("›")
             .font(.system(size: 20, weight: .light))
@@ -750,18 +621,6 @@ private extension MIFResourcePageState.Control.Lease {
         case .active: return AppLocalized("Control lease active")
         case .expired: return AppLocalized("Control lease expired")
         case .unknown: return AppLocalized("Lease status unknown")
-        }
-    }
-}
-
-private extension MIFResourcePageState.Workspace.Status {
-    var localizedTitle: String {
-        switch self {
-        case .ready: return AppLocalized("Ready")
-        case .syncing: return AppLocalized("Syncing")
-        case .unbound: return AppLocalized("Not mounted")
-        case .unavailable: return AppLocalized("Unavailable")
-        case .unknown: return AppLocalized("Status unknown")
         }
     }
 }

@@ -13,5 +13,6 @@ it('only shows the retained administration navigation', () => {
   for (const name of ['邀请', '站点与提示', '活动']) {
     expect(screen.queryByRole('link', { name })).not.toBeInTheDocument();
   }
+  expect(screen.queryByRole('link', { name: /工作区/ })).not.toBeInTheDocument();
   expect(screen.queryByText('管理控制台')).not.toBeInTheDocument();
 });

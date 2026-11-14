@@ -58,6 +58,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskPagesStepCountsFixtureLaunchArgument = "-morde.localTaskPagesStepCountsFixture"
     static let taskPagesDesignRowsFixtureLaunchArgument = "-morde.localTaskPagesDesignRowsFixture"
     static let taskPagesStatusFixtureLaunchArgument = "-morde.localTaskPagesStatusFixture"
+    static let taskStepRetryFixtureLaunchArgument = "-morde.localTaskStepRetryFixture"
+    static let taskStepRetryFailureFixtureLaunchArgument = "-morde.localTaskStepRetryFailureFixture"
     static let taskPagesLongListFixtureLaunchArgument = "-morde.localTaskPagesLongListFixture"
     static let taskPagesTransitionStatusFixtureLaunchArgument = "-morde.localTaskPagesTransitionStatusFixture"
     static let taskPagesEmptyFixtureLaunchArgument = "-morde.localTaskPagesEmptyFixture"
@@ -137,13 +139,6 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let workspaceDesignVisualFixtureLaunchArgument = "-morde.localWorkspaceDesignVisualFixture"
     static let workspaceLateManifestPageFixtureLaunchArgument = "-morde.localWorkspaceLateManifestPageFixture"
     static let workspaceReadOnlyFixtureLaunchArgument = "-morde.localWorkspaceReadOnlyFixture"
-    static let workspaceShareFixtureLaunchArgument = "-morde.localWorkspaceShareFixture"
-    static let workspaceShareDeepLinkFixtureLaunchArgument = "-morde.localWorkspaceShareDeepLinkFixture"
-    static let workspaceShareEditFixtureLaunchArgument = "-morde.localWorkspaceShareEditFixture"
-    static let workspaceSharePreviewNotFoundFixtureLaunchArgument = "-morde.localWorkspaceSharePreviewNotFoundFixture"
-    static let workspaceShareAcceptNotFoundFixtureLaunchArgument = "-morde.localWorkspaceShareAcceptNotFoundFixture"
-    static let workspaceSharePreviewNetworkFailureFixtureLaunchArgument = "-morde.localWorkspaceSharePreviewNetworkFailureFixture"
-    static let workspaceShareAcceptNetworkFailureFixtureLaunchArgument = "-morde.localWorkspaceShareAcceptNetworkFailureFixture"
     static let resourceConfirmedEmptyFixtureLaunchArgument = "-morde.localResourceConfirmedEmptyFixture"
     static let resourceDefaultHostPreferenceFailureFixtureLaunchArgument = "-morde.localResourceDefaultHostPreferenceFailureFixture"
     static let resourceRefreshRecoveryFixtureLaunchArgument = "-morde.localResourceRefreshRecoveryFixture"
@@ -195,6 +190,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var taskPagesTaskActionStatus = "running"
     private static var taskPagesTaskActionIdempotencyKey: String?
     private static var taskPagesTaskActionRequestCount = 0
+    private static var taskStepRetryAccepted = false
+    private static var taskStepRetryIdempotencyKey: String?
     private static var taskPagesTaskActionServiceInstanceChanged = false
     private static var taskPagesTaskActionSecondInstanceAccepted = false
     private static var taskFileFetchCancellationStatus = "waiting_device"
@@ -210,7 +207,6 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var mainChatFixtureEnsured = false
     private static var resourceRefreshListRequestCount = 0
     private static var workspaceManifestFailureRequestCount = 0
-    private static var resourceFixtureWorkspaceShareClaimed = false
     private static var resourceFixtureHostMembers: [[String: Any]] = [[
         "user_id": "u7654321", "permissions": ["desktop:view", "desktop:control"],
         "created_at": "2026-01-01T00:00:00Z",
@@ -853,6 +849,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
         taskPagesTaskActionStatus = "running"
         taskPagesTaskActionIdempotencyKey = nil
         taskPagesTaskActionRequestCount = 0
+        taskStepRetryAccepted = false
+        taskStepRetryIdempotencyKey = nil
         taskPagesTaskActionServiceInstanceChanged = false
         taskPagesTaskActionSecondInstanceAccepted = false
         taskK2StoppedTaskID = nil
@@ -1444,6 +1442,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
         if ["q0000005", "q0000006", "q0000007"].contains(id) {
             let isCompleted = id == "q0000005"
             let isFailed = id == "q0000006"
+            let isStepRetryFixture = isFailed && ProcessInfo.processInfo.arguments.contains(Self.taskStepRetryFixtureLaunchArgument)
+            let stepRetryAccepted = isStepRetryFixture && taskStepRetryAcceptedSnapshot
             let status = isCompleted ? "completed" : (isFailed ? "failed" : "cancelled")
             let objective = isCompleted ? "Completed task fixture" :
                 (isFailed ? "Failed task fixture" : "Cancelled task fixture")
@@ -1451,10 +1451,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 id: id,
                 status: status,
                 objective: objective)
-            task["event_sequence"] = 0
+            task["event_sequence"] = stepRetryAccepted ? 1 : 0
+            if isStepRetryFixture {
+                task["current_revision"] = 1
+                task["desired_revision"] = 1
+                task["current_revision_started"] = true
+                if stepRetryAccepted { task["status"] = "running" }
+            }
             task["result"] = isFailed ? NSNull() :
                 (isCompleted ? "Local completed result" : "Local cancelled result")
-            task["current_step"] = isFailed ? "Review failed output" : NSNull()
+            task["current_step"] = isFailed ? (stepRetryAccepted ? "Retrying failed operation" : "Review failed output") : NSNull()
             task["waiting_reason"] = NSNull()
             task["stop_request"] = NSNull()
             task["pending_request"] = NSNull()
@@ -1468,20 +1474,41 @@ private final class MordeAuthURLProtocol: URLProtocol {
                                 "title": "Finish local task", "summary": "The local task completed successfully.",
                                 "created_at": "2026-11-04T00:00:01Z"]
             } else if isFailed {
-                terminalStep = ["id": "s0000007", "sequence": 1, "kind": "tool", "status": "failed",
-                                "title": "Review failed output", "summary": "A local synthetic failure.",
-                                "created_at": "2026-11-04T00:00:01Z"]
+                var failedStep: [String: Any] = ["id": "s0000007", "sequence": 1, "kind": "tool", "status": "failed",
+                    "title": "Review failed output", "summary": "A local synthetic failure.",
+                    "created_at": "2026-11-04T00:00:01Z"]
+                if isStepRetryFixture {
+                    failedStep["retryable"] = !stepRetryAccepted
+                    failedStep["attempt"] = 1
+                    failedStep["task_revision"] = 1
+                    failedStep["failure_reason"] = "synthetic_failure"
+                    failedStep["retry_of_step_id"] = NSNull()
+                }
+                terminalStep = failedStep
             } else {
                 terminalStep = ["id": "s0000009", "sequence": 1, "kind": "agent", "status": "cancelled",
                                 "title": "Task stopped", "summary": "The local task was cancelled.",
                                 "created_at": "2026-11-04T00:00:01Z"]
             }
-            task["steps"] = [
+            var steps: [[String: Any]] = [
                 terminalStep,
-                ["id": "s0000010", "sequence": 2, "kind": "budget", "status": "succeeded",
+                ["id": "s0000010", "sequence": stepRetryAccepted ? 3 : 2, "kind": "budget", "status": "succeeded",
                  "title": "Private budget field", "summary": "This must never be shown.",
                  "created_at": "2026-11-04T00:00:02Z"],
             ]
+            if isStepRetryFixture {
+                steps.append(["id": "s0000011", "sequence": stepRetryAccepted ? 4 : 3, "kind": "tool", "status": "failed",
+                    "title": "Operation result uncertain", "summary": "The operation outcome could not be confirmed.",
+                    "created_at": "2026-11-04T00:00:04Z", "retryable": false, "attempt": 1,
+                    "task_revision": 1, "failure_reason": "side_effect_unknown", "retry_of_step_id": NSNull()])
+            }
+            if isStepRetryFixture && stepRetryAccepted {
+                steps.insert(["id": "s0000008", "sequence": 2, "kind": "tool", "status": "queued",
+                    "title": "Retry failed operation", "summary": "Attempt 2 has been accepted.",
+                    "created_at": "2026-11-04T00:00:03Z", "retryable": false, "attempt": 2,
+                    "task_revision": 1, "failure_reason": NSNull(), "retry_of_step_id": "s0000007"], at: 1)
+            }
+            task["steps"] = steps
             task["artifacts"] = []
             return task
         }
@@ -1646,6 +1673,40 @@ private final class MordeAuthURLProtocol: URLProtocol {
         taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
         taskFixtureEventCount += 1
         return taskFixtureEventCount
+    }
+
+    private static var taskStepRetryAcceptedSnapshot: Bool {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        return taskStepRetryAccepted
+    }
+
+    private static func taskStepRetryResponse(key: String?, payload: [String: Any]?, fail: Bool)
+        -> (status: Int, body: Data, shouldDelayResponse: Bool) {
+        guard let key, !key.isEmpty, let payload,
+              Set(payload.keys) == Set(["expected_task_revision", "expected_attempt"]),
+              payload["expected_task_revision"] as? Int == 1,
+              payload["expected_attempt"] as? Int == 1 else {
+            return (409, Data(#"{"error":{"code":"conflict","message":"Invalid step retry contract"}}"#.utf8), false)
+        }
+        if fail {
+            return (503, Data(#"{"error":{"code":"unavailable","message":"Synthetic step retry failure"}}"#.utf8), false)
+        }
+
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        let replayed: Bool
+        if let originalKey = taskStepRetryIdempotencyKey {
+            guard originalKey == key else {
+                return (409, Data(#"{"error":{"code":"conflict","message":"Step retry must reuse its idempotency key"}}"#.utf8), false)
+            }
+            replayed = true
+        } else {
+            taskStepRetryIdempotencyKey = key
+            taskStepRetryAccepted = true
+            replayed = false
+        }
+        let replayedJSON = replayed ? "true" : "false"
+        let body = #"{"task_id":"q0000006","source_step_id":"s0000007","attempt_step_id":"s0000008","attempt":2,"status":"queued","replayed":\#(replayedJSON)}"#
+        return (202, Data(body.utf8), !replayed)
     }
 
     private static var didTaskFixtureSeeEvent: Bool {
@@ -1891,22 +1952,17 @@ private final class MordeAuthURLProtocol: URLProtocol {
         let usesResourceListFailureFixture = ProcessInfo.processInfo.arguments.contains(resourceListFailureFixtureLaunchArgument)
         let usesConfirmedEmptyFixture = ProcessInfo.processInfo.arguments.contains(resourceConfirmedEmptyFixtureLaunchArgument)
         let usesRefreshRecoveryFixture = ProcessInfo.processInfo.arguments.contains(resourceRefreshRecoveryFixtureLaunchArgument)
-        let usesWorkspaceShareEditFixture = ProcessInfo.processInfo.arguments.contains(workspaceShareEditFixtureLaunchArgument)
-        let usesWorkspaceShareFixture = ProcessInfo.processInfo.arguments.contains(workspaceShareFixtureLaunchArgument) ||
-            usesWorkspaceShareEditFixture
         let usesWorkspaceManifestFailureFixture = ProcessInfo.processInfo.arguments.contains(workspaceManifestFailureFixtureLaunchArgument)
         let usesWorkspaceLateManifestPageFixture = ProcessInfo.processInfo.arguments.contains(workspaceLateManifestPageFixtureLaunchArgument)
         let usesWorkspaceLongListFixture = ProcessInfo.processInfo.arguments.contains(workspaceLongListFixtureLaunchArgument)
         let usesWorkspaceDesignVisualFixture = ProcessInfo.processInfo.arguments.contains(workspaceDesignVisualFixtureLaunchArgument) ||
             ProcessInfo.processInfo.arguments.contains(resourceDesignVisualFixtureLaunchArgument)
-        guard usesResourceAcceptanceFixture || usesResourceListFailureFixture || usesConfirmedEmptyFixture || usesRefreshRecoveryFixture || usesWorkspaceShareFixture || usesWorkspaceManifestFailureFixture || usesWorkspaceLateManifestPageFixture || usesWorkspaceLongListFixture || usesWorkspaceDesignVisualFixture || ProcessInfo.processInfo.arguments.contains(workspaceCapabilityDisabledFixtureLaunchArgument),
+        guard usesResourceAcceptanceFixture || usesResourceListFailureFixture || usesConfirmedEmptyFixture || usesRefreshRecoveryFixture || usesWorkspaceManifestFailureFixture || usesWorkspaceLateManifestPageFixture || usesWorkspaceLongListFixture || usesWorkspaceDesignVisualFixture || ProcessInfo.processInfo.arguments.contains(workspaceCapabilityDisabledFixtureLaunchArgument),
               request.url?.host == "127.0.0.1" else { return nil }
         let path = request.url?.path ?? ""
         let method = request.httpMethod ?? "GET"
         func json(_ value: Any) -> Data { (try? JSONSerialization.data(withJSONObject: value)) ?? Data() }
         func page(_ items: [[String: Any]]) -> [String: Any] { ["items": items, "next_cursor": NSNull()] }
-        let workspaceShareFixtureExpiry = ISO8601DateFormatter().string(from: Date().addingTimeInterval(6 * 24 * 60 * 60))
-        let workspaceShareFixturePermission = usesWorkspaceShareEditFixture ? "edit" : "view"
         func binding(_ workspaceID: String, name: String, syncState: String = "healthy") -> [String: Any] {
             ["workspace": ["id": workspaceID, "name": name, "revision": 7, "state": "ready"],
              "state": "active", "desired_revision": 7, "applied_revision": 7, "sync_state": syncState]
@@ -2011,78 +2067,22 @@ private final class MordeAuthURLProtocol: URLProtocol {
             }
             var workspaces: [[String: Any]] = [
                 ["id": "w0000001", "name": readyWorkspaceName, "revision": 7, "state": "ready",
-                 "used_bytes": 63_221_918_597, "quota_bytes": 137_438_953_472, "is_read_only": false],
+                 "used_bytes": 63_221_918_597, "quota_bytes": 137_438_953_472,
+                 "is_read_only": ProcessInfo.processInfo.arguments.contains(workspaceReadOnlyFixtureLaunchArgument)],
                 ["id": "w0000002", "name": "Syncing Workspace", "revision": 7, "state": "ready",
                  "used_bytes": 0, "quota_bytes": 68_719_476_736, "is_read_only": false],
-                ["id": "w0000003", "name": "Unbound Workspace", "revision": 1, "state": "syncing",
-                 "used_bytes": 0, "quota_bytes": 34_359_738_368, "is_read_only": false],
             ]
             if usesResourceDesignVisualFixture { workspaces = Array(workspaces.prefix(1)) }
-            resourceFixtureLock.lock()
-            let shareClaimed = resourceFixtureWorkspaceShareClaimed
-            resourceFixtureLock.unlock()
-            if shareClaimed {
-                workspaces.append(["id": "w0000004", "name": "Ready Workspace copy", "revision": 7, "state": "ready",
-                                   "used_bytes": 63_221_918_597, "quota_bytes": 137_438_953_472,
-                                   "is_read_only": workspaceShareFixturePermission == "view"])
-            }
-            if ProcessInfo.processInfo.arguments.contains(workspaceReadOnlyFixtureLaunchArgument) {
-                workspaces.append(["id": "w0000005", "name": "Read-only Workspace", "revision": 7,
-                                   "state": "ready", "used_bytes": 63_221_918_597,
-                                   "quota_bytes": 137_438_953_472, "is_read_only": true])
-            }
             return (200, json(page(workspaces)))
         }
-        if path == "/api/workspace-shares/preview", method == "POST", usesWorkspaceShareFixture {
-            guard let payload = jsonPayload(request),
-                  payload["token"] as? String == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" else {
-                return (400, Data(#"{"error":{"code":"invalid_argument","message":"Invalid local Workspace share token"}}"#.utf8))
-            }
-            if ProcessInfo.processInfo.arguments.contains(workspaceSharePreviewNotFoundFixtureLaunchArgument) {
-                return (404, Data(#"{"error":{"code":"not_found","message":"Workspace share link not found"}}"#.utf8))
-            }
-            resourceFixtureLock.lock(); defer { resourceFixtureLock.unlock() }
-            guard !resourceFixtureWorkspaceShareClaimed else {
-                return (404, Data(#"{"error":{"code":"not_found","message":"Workspace share link not found"}}"#.utf8))
-            }
-            return (200, json(["workspace_name": "Ready Workspace", "permission": workspaceShareFixturePermission,
-                               "expires_at": workspaceShareFixtureExpiry]))
-        }
-        if path == "/api/workspace-shares/accept", method == "POST", usesWorkspaceShareFixture {
-            guard let payload = jsonPayload(request),
-                  payload["token"] as? String == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" else {
-                return (400, Data(#"{"error":{"code":"invalid_argument","message":"Invalid local Workspace share token"}}"#.utf8))
-            }
-            if ProcessInfo.processInfo.arguments.contains(workspaceShareAcceptNotFoundFixtureLaunchArgument) {
-                return (404, Data(#"{"error":{"code":"not_found","message":"Workspace share link not found"}}"#.utf8))
-            }
-            resourceFixtureLock.lock(); defer { resourceFixtureLock.unlock() }
-            guard !resourceFixtureWorkspaceShareClaimed else {
-                return (404, Data(#"{"error":{"code":"not_found","message":"Workspace share link not found"}}"#.utf8))
-            }
-            resourceFixtureWorkspaceShareClaimed = true
-            return (200, json(["workspace_id": "w0000004", "workspace_name": "Ready Workspace copy",
-                               "permission": workspaceShareFixturePermission]))
-        }
-        if path == "/api/workspaces/w0000001/shares", method == "POST", usesWorkspaceShareFixture {
-            guard let payload = jsonPayload(request), payload["expected_current_revision"] as? Int == 7,
-                  let permission = payload["permission"] as? String, ["view", "edit"].contains(permission) else {
-                return (400, Data(#"{"error":{"code":"invalid_argument","message":"Invalid local Workspace share request"}}"#.utf8))
-            }
-            return (201, json(["workspace_name": "Ready Workspace", "permission": permission,
-                               "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                               "expires_at": workspaceShareFixtureExpiry]))
-        }
-        if ["/api/workspaces/w0000001/manifest", "/api/workspaces/w0000004/manifest",
-            "/api/workspaces/w0000005/manifest"].contains(path), method == "GET" {
+        if path == "/api/workspaces/w0000001/manifest", method == "GET" {
             if ProcessInfo.processInfo.arguments.contains(workspaceManifestForbiddenFixtureLaunchArgument) {
                 return (403, Data(#"{"error":{"code":"forbidden","message":"Synthetic Workspace permission denied"}}"#.utf8))
             }
             if usesWorkspaceManifestFailureFixture && Self.shouldFailWorkspaceManifestRequest() {
                 return (503, Data(#"{"error":{"code":"unavailable","message":"Synthetic Workspace manifest failure"}}"#.utf8))
             }
-            let workspaceID = path.contains("w0000004") ? "w0000004" :
-                (path.contains("w0000005") ? "w0000005" : "w0000001")
+            let workspaceID = "w0000001"
             let query = request.url.flatMap {
                 URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems
             } ?? []
@@ -2450,19 +2450,6 @@ private final class MordeAuthURLProtocol: URLProtocol {
 
     override func startLoading() {
         Self.initializeWorkItemFixtureIfNeeded()
-        let workspaceShareNetworkFailure = request.url?.host == "127.0.0.1" &&
-            request.httpMethod == "POST" &&
-            ((request.url?.path == "/api/workspace-shares/preview" &&
-              ProcessInfo.processInfo.arguments.contains(Self.workspaceSharePreviewNetworkFailureFixtureLaunchArgument)) ||
-             (request.url?.path == "/api/workspace-shares/accept" &&
-              ProcessInfo.processInfo.arguments.contains(Self.workspaceShareAcceptNetworkFailureFixtureLaunchArgument)))
-        if workspaceShareNetworkFailure {
-            let phase = request.url?.path == "/api/workspace-shares/preview" ? "preview" : "accept"
-            let error = NSError(domain: NSURLErrorDomain, code: URLError.networkConnectionLost.rawValue,
-                                userInfo: [NSLocalizedDescriptionKey: "Synthetic Workspace share \(phase) network failure"])
-            client?.urlProtocol(self, didFailWithError: error)
-            return
-        }
         if ProcessInfo.processInfo.arguments.contains(Self.chatSendOfflineFixtureLaunchArgument),
            request.url?.host == "127.0.0.1", request.url?.path.hasPrefix("/api/conversations/") == true,
            request.url?.path.hasSuffix("/messages") == true, request.httpMethod == "POST" {
@@ -2947,6 +2934,18 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 200
                 body = Data("id: 8\nevent: task.snapshot_required\ndata: {\"sequence\":8}\n\n".utf8)
             }
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000006/events", request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskStepRetryFixtureLaunchArgument) {
+            let after = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems?
+                .first(where: { $0.name == "after" })?.value.flatMap(Int64.init) ?? 0
+            if Self.taskStepRetryAcceptedSnapshot && after < 1 {
+                statusCode = 200
+                let event = #"{"task_id":"q0000006","sequence":1,"type":"task.step","created_at":"2026-11-14T00:00:01Z","payload":{"kind":"tool","status":"queued","title":"Retry accepted","summary":"A new attempt was accepted by the local fixture."}}"#
+                body = Data("id: 1\nevent: task.step\ndata: \(event)\n\n".utf8)
+            } else {
+                statusCode = 204
+                body = Data()
+            }
         } else if isFixtureOrigin, request.url?.path.hasPrefix("/api/tasks/") == true,
                   request.url?.path.hasSuffix("/events") == true, request.httpMethod == "GET",
                   ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) {
@@ -3038,6 +3037,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 403
                 body = Data(#"{"error":{"code":"forbidden","message":"Task belongs to another local fixture account"}}"#.utf8)
             }
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000006/steps/s0000007/retries",
+                  request.httpMethod == "POST",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskStepRetryFixtureLaunchArgument) {
+            let response = Self.taskStepRetryResponse(
+                key: request.value(forHTTPHeaderField: "Idempotency-Key"),
+                payload: Self.jsonPayload(request),
+                fail: ProcessInfo.processInfo.arguments.contains(Self.taskStepRetryFailureFixtureLaunchArgument))
+            statusCode = response.status
+            body = response.body
+            shouldDelayTaskPagesActionResponse = response.shouldDelayResponse
         } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000001/actions",
                   request.httpMethod == "POST",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskPagesTaskActionDelayFixtureLaunchArgument) ||
@@ -3975,7 +3984,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
             statusCode = 200
             body = Data(#"{"items":[{"id":"p1234567","name":"Local Test Tool","capabilities":{"text":true,"tools":true}}],"default_model_configured":true,"default_model_id":"p1234567"}"#.utf8)
         } else if isFixtureOrigin, request.httpMethod == "GET",
-                  ["/api/hosts", "/api/shared-hosts", "/api/workspaces", "/api/available-models",
+                  ["/api/hosts", "/api/shared-hosts", "/api/workspaces", "/api/clients", "/api/available-models",
                    "/api/conversations", "/api/tasks", "/api/notifications"].contains(request.url?.path ?? "") {
             statusCode = 200
             body = request.url?.path == "/api/available-models"
@@ -4400,22 +4409,6 @@ private struct MordeWorkspace: Decodable, Identifiable {
         return "\(formatter.string(fromByteCount: quota_bytes)) · \(AppLocalized("Used")) \(percentage)%"
     }
 }
-private struct MordeWorkspaceShareCreated: Decodable {
-    let workspace_name: String
-    let permission: String
-    let token: String
-    let expires_at: String
-}
-private struct MordeWorkspaceSharePreview: Decodable {
-    let workspace_name: String
-    let permission: String
-    let expires_at: String
-}
-private struct MordeWorkspaceShareAccepted: Decodable {
-    let workspace_id: String
-    let workspace_name: String
-    let permission: String
-}
 private struct MordeClientInstallation: Decodable, Identifiable {
     let id: String
     let display_name: String
@@ -4551,6 +4544,9 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
     let output_result_event_sequence: Int64?
     let local_send_status: String?
     let sources: [MordeClientMessageSource]?
+    let variant_group_id: String?
+    let variant_version: Int64?
+    let variant_action: String?
 
     var clientMessage: MordeClientMessage {
         MordeClientMessage(id: id, conversation_id: conversation_id, sequence: sequence, task_id: task_id,
@@ -4559,7 +4555,8 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
             routing_failure_reason: routing_failure_reason, duplicate_of_message_id: duplicate_of_message_id,
             related_task_id: related_task_id, local_send_status: local_send_status,
             owner_id: owner_id, actor_id: actor_id, sources: sources, output_status: output_status,
-            output_task_revision: output_task_revision, output_result_event_sequence: output_result_event_sequence)
+            output_task_revision: output_task_revision, output_result_event_sequence: output_result_event_sequence,
+            variant_group_id: variant_group_id, variant_version: variant_version, variant_action: variant_action)
     }
 }
 private struct MordeProjectConversationTask: Decodable {
@@ -4757,6 +4754,7 @@ struct MordeTask: Decodable, Identifiable {
         let title: String; let summary: String; let created_at: String
         let agent_id: String?; let task_revision: Int64?; let tool_name: String?
         let phase: String?; let detail_state: String?; let truncated: Bool?
+        let retryable: Bool?; let attempt: Int?; let failure_reason: String?; let retry_of_step_id: String?
     }
     struct Artifact: Decodable, Identifiable {
         let id: String; let label: String; let media_type: String; let verified: Bool
@@ -4780,6 +4778,14 @@ struct MordeTask: Decodable, Identifiable {
         let state: String; let source_task_id: String; let source_task_revision: Int64
         let source_event_sequence: Int64; let reply_message_id: String?
     }
+    struct Plan: Decodable, Equatable {
+        struct Step: Decodable, Equatable, Identifiable {
+            let id: String; let title: String; let description: String; let depends_on: [String]
+            let outputs: [String]; let completion_criteria: [String]; let status: String
+        }
+        let task_revision: Int64; let revision: Int64; let goal: String
+        let cost_estimate_state: String; let steps: [Step]
+    }
     let owner_id: String?; let initiator_id: String?
     let id: String; let conversation_id: String; let host_id: String?; let execution_location: String?
     let model_id: String?
@@ -4793,6 +4799,7 @@ struct MordeTask: Decodable, Identifiable {
     let pending_request: Pending?
     let clarification_request: Clarification?; let batch_items: [MordeBatchItem]?
     let dependencies: [Dependency]?; let child_jobs: [ChildJob]?; let result_review: ResultReview?
+    let plan: Plan?
     let steps: [Step]?; let agents: [MordeTaskAgentExecution]?; let artifacts: [Artifact]?; let updated_at: String
     let assistant_message: MordeClientMessage?
 
@@ -6195,7 +6202,6 @@ private struct MordeIndependentSendTarget {
     @Published private(set) var hostRuntimeDataAvailable = false
     @Published var sharedHosts: [MordeSharedHost] = []
     @Published var workspaces: [MordeWorkspace] = []
-    @Published var pendingWorkspaceShareToken: String?
     @Published private(set) var defaultHostID: String?
     @Published private(set) var defaultHostPreferenceState: MordeResourceLoadState = .loading
     @Published var hostOpenErrors: [String: String] = [:]
@@ -6236,6 +6242,7 @@ private struct MordeIndependentSendTarget {
     @Published private(set) var taskTimelineLoading: Set<String> = []
     @Published private(set) var taskTimelineNoHistory: Set<String> = []
     @Published private(set) var taskPageActionErrors: [String: String] = [:]
+    @Published private(set) var taskStepRetryErrors = MordeTaskStepRetryErrorStore()
     @Published var notifications: [MordeNotification] = []
     @Published var notificationNextCursor: String?
     @Published var loadingMoreNotifications = false
@@ -6317,6 +6324,9 @@ private struct MordeIndependentSendTarget {
     @Published private(set) var draftConversationAliases: [String: String] = [:]
     @Published private(set) var routingRetryInFlight: Set<String> = []
     @Published private(set) var routingRetryErrors: [String: String] = [:]
+    @Published private(set) var variantOperationsInFlight: Set<String> = []
+    @Published private(set) var variantOperationErrors: [String: String] = [:]
+    @Published private(set) var selectedVariantVersions: [String: Int64] = [:]
     private var outboxInFlight: Set<String> = []
     private var outboxRetryScheduled: Set<String> = []
     private var outboxRetryAttempts: [String: Int] = [:]
@@ -6664,6 +6674,32 @@ private struct MordeIndependentSendTarget {
             throw CancellationError()
         }
         return value
+    }
+
+    @discardableResult
+    func retryTaskStep(taskID: String, stepID: String) async -> Bool {
+        guard MordeTaskResponsePolicy.hasValidTaskID(taskID),
+              MordeTaskResponsePolicy.hasValidStepID(stepID),
+              let task = taskPageDetails[taskID], task.id == taskID,
+              let step = task.steps?.first(where: { $0.id == stepID }),
+              step.retryable == true, step.status == "failed",
+              let attempt = step.attempt,
+              let path = MordeTaskResponsePolicy.stepRetryPath(taskID: taskID, stepID: stepID),
+              let body = MordeTaskResponsePolicy.stepRetryBody(taskRevision: step.task_revision,
+                                                               attempt: step.attempt) else {
+            taskStepRetryErrors.set(
+                AppLocalized("Step retry details are unavailable or stale. Refresh the task before retrying."),
+                taskID: taskID, stepID: stepID)
+            return false
+        }
+        taskStepRetryErrors.remove(taskID: taskID, stepID: stepID)
+        let accepted = await submitTaskAction(taskID: taskID, path: path, body: body,
+                                              updateCurrentTask: currentTask?.id == taskID,
+                                              expectedStepRetry: (sourceStepID: step.id, sourceAttempt: attempt))
+        if accepted, taskID != currentTask?.id, !taskTimelineLoading.contains(taskID) {
+            Task { await self.watchTaskTimeline(taskID: taskID) }
+        }
+        return accepted
     }
 
     func loadTaskFileFetches(taskID: String, expectedScope: MordeClientDataScope? = nil) async throws {
@@ -7202,7 +7238,10 @@ private struct MordeIndependentSendTarget {
                                attachment_ids: $0.attachments.compactMap(\.attachmentID), created_at: $0.createdAt,
                                client_message_id: $0.id, local_send_status: $0.state.rawValue)
         }
-        return orderedConversationMessages(messages) + pending
+        let visible = MordeConversationVariantPresentation.visibleMessages(
+            orderedConversationMessages(messages),
+            selectedVersions: selectedVariantVersions(scope: scope, projectID: nil, conversationID: conversationID))
+        return visible + pending
     }
 
     var offlineProjectMessages: [MordeOutboxMessage] {
@@ -7236,7 +7275,9 @@ private struct MordeIndependentSendTarget {
                 attachment_ids: original?.attachment_ids,
                 output_status: message.displayStatus, output_task_revision: message.displayTaskRevision,
                 output_result_event_sequence: message.displayResultEventSequence,
-                local_send_status: message.local_send_status, sources: message.sources)
+                local_send_status: message.local_send_status, sources: message.sources,
+                variant_group_id: message.variant_group_id, variant_version: message.variant_version,
+                variant_action: message.variant_action)
         }
         let receivedIDs = Set(displayed.compactMap(\.client_message_id))
         let pending = pendingMessages.filter {
@@ -7250,9 +7291,113 @@ private struct MordeIndependentSendTarget {
                 duplicate_of_message_id: nil, related_task_id: nil,
                 attachment_ids: $0.attachments.filter(\.linked).compactMap(\.attachmentID),
                 output_status: nil, output_task_revision: nil, output_result_event_sequence: nil,
-                local_send_status: $0.state.rawValue, sources: nil)
+                local_send_status: $0.state.rawValue, sources: nil,
+                variant_group_id: nil, variant_version: nil, variant_action: nil)
         }
-        return orderedProjectConversationMessages(displayed) + pending
+        let ordered = orderedProjectConversationMessages(displayed)
+        let visibleIDs = Set(MordeConversationVariantPresentation.visibleMessages(
+            ordered.map(\.clientMessage),
+            selectedVersions: selectedVariantVersions(scope: scope, projectID: projectID,
+                                                       conversationID: conversationID)).map(\.id))
+        return ordered.filter { visibleIDs.contains($0.id) } + pending
+    }
+
+    private func selectedVariantVersions(scope: MordeClientDataScope, projectID: String?,
+                                         conversationID: String) -> [String: Int64] {
+        let prefix = "\(projectID ?? "personal"):\(conversationID):"
+        var result: [String: Int64] = (try? messageOutbox.variantSelections(scope: scope))?.reduce(into: [:]) { values, entry in
+            guard entry.key.hasPrefix(prefix) else { return }
+            values[String(entry.key.dropFirst(prefix.count))] = entry.value
+        } ?? [:]
+        let memoryPrefix = "\(scope.messageOutboxKey):\(prefix)"
+        selectedVariantVersions.forEach { key, version in
+            guard key.hasPrefix(memoryPrefix) else { return }
+            result[String(key.dropFirst(memoryPrefix.count))] = version
+        }
+        return result
+    }
+
+    func variantVersions(for message: MordeClientMessage, projectID: String? = nil) -> [Int64] {
+        guard currentDataScope != nil, let conversationID = message.conversation_id,
+              let groupID = MordeConversationVariantPresentation.groupID(message) else { return [] }
+        let source: [MordeClientMessage]
+        if let projectID {
+            guard selectedProjectID == projectID, selectedProjectConversationID == conversationID else { return [] }
+            source = (projectConversationMessages.map(\.clientMessage) + projectAssistantSnapshots)
+                .filter { $0.conversation_id == conversationID }
+        } else {
+            guard currentConversation == conversationID else { return [] }
+            source = messages.filter { $0.conversation_id == conversationID }
+        }
+        return MordeConversationVariantPresentation.versions(in: source, groupID: groupID)
+    }
+
+    func selectedVariantVersion(for message: MordeClientMessage, projectID: String? = nil) -> Int64? {
+        guard let scope = currentDataScope, let conversationID = message.conversation_id,
+              let groupID = MordeConversationVariantPresentation.groupID(message) else { return nil }
+        let all = variantVersions(for: message, projectID: projectID)
+        let key = variantSelectionKey(scope: scope, projectID: projectID,
+                                      conversationID: conversationID, groupID: groupID)
+        if let selected = selectedVariantVersions[key], all.contains(selected) { return selected }
+        return all.last
+    }
+
+    func selectVariantVersion(_ version: Int64, for message: MordeClientMessage, projectID: String? = nil) {
+        guard let scope = currentDataScope, let conversationID = message.conversation_id,
+              let groupID = MordeConversationVariantPresentation.groupID(message),
+              variantVersions(for: message, projectID: projectID).contains(version) else { return }
+        let selectionKey = variantSelectionKey(scope: scope, projectID: projectID,
+                                               conversationID: conversationID, groupID: groupID)
+        let storageKey = variantSelectionStorageKey(projectID: projectID,
+            conversationID: conversationID, groupID: groupID)
+        try? messageOutbox.setVariantSelection(storageKey: storageKey, version: version, scope: scope)
+        selectedVariantVersions[selectionKey] = version
+    }
+
+    private func variantSelectionStorageKey(projectID: String?, conversationID: String, groupID: String) -> String {
+        "\(projectID ?? "personal"):\(conversationID):\(groupID)"
+    }
+
+    private func variantSelectionKey(scope: MordeClientDataScope, projectID: String?,
+                                     conversationID: String, groupID: String) -> String {
+        "\(scope.messageOutboxKey):\(projectID ?? "personal"):\(conversationID):\(groupID)"
+    }
+
+    private func variantOperationUIKey(scope: MordeClientDataScope, projectID: String?,
+                                       conversationID: String, groupID: String,
+                                       action: MordeConversationVariantAction) -> String {
+        "\(scope.messageOutboxKey):\(projectID ?? "personal"):\(conversationID):\(groupID):\(action.rawValue)"
+    }
+
+    func variantOperationIsInFlight(for message: MordeClientMessage, action: MordeConversationVariantAction,
+                                    projectID: String? = nil) -> Bool {
+        guard let scope = currentDataScope, let conversationID = message.conversation_id,
+              let groupID = MordeConversationVariantPresentation.groupID(message) else { return false }
+        return variantOperationsInFlight.contains(variantOperationUIKey(scope: scope, projectID: projectID,
+            conversationID: conversationID, groupID: groupID, action: action))
+    }
+
+    func variantOperationError(for message: MordeClientMessage, action: MordeConversationVariantAction,
+                               projectID: String? = nil) -> String? {
+        guard let scope = currentDataScope, let conversationID = message.conversation_id,
+              let groupID = MordeConversationVariantPresentation.groupID(message) else { return nil }
+        return variantOperationErrors[variantOperationUIKey(scope: scope, projectID: projectID,
+            conversationID: conversationID, groupID: groupID, action: action)]
+    }
+
+    func variantOperationIsPending(for message: MordeClientMessage, action: MordeConversationVariantAction,
+                                   projectID: String? = nil) -> Bool {
+        guard let scope = currentDataScope, let conversationID = message.conversation_id,
+              let groupID = MordeConversationVariantPresentation.groupID(message) else { return false }
+        let key = MordeConversationVariantPresentation.attemptStorageKey(scope: scope, projectID: projectID,
+            conversationID: conversationID, groupID: groupID, action: action)
+        return (try? messageOutbox.pendingVariantOperation(storageKey: key, scope: scope)) != nil
+    }
+
+    func anyVariantOperationIsPending(for message: MordeClientMessage, projectID: String? = nil) -> Bool {
+        MordeConversationVariantAction.allCases.contains {
+            variantOperationIsPending(for: message, action: $0, projectID: projectID)
+        }
     }
 
     private func refreshPendingMessages(scope: MordeClientDataScope) {
@@ -7420,6 +7565,142 @@ private struct MordeIndependentSendTarget {
         } catch {
             guard currentDataScope?.hasSameAccount(as: scope) == true else { return }
             routingRetryErrors[messageID] = error.localizedDescription
+        }
+    }
+
+    func performConversationVariantAction(_ action: MordeConversationVariantAction,
+                                         message: MordeClientMessage,
+                                         content: String? = nil,
+                                         retryPending: Bool = false,
+                                         projectID: String? = nil) async {
+        guard signedIn, let scope = currentDataScope,
+              let conversationID = message.conversation_id,
+              MordeProjectPolicy.hasValidConversationID(conversationID),
+              message.id.range(of: #"^m[a-z0-9]{7}$"#, options: .regularExpression) != nil,
+              let groupID = MordeConversationVariantPresentation.groupID(message) else { return }
+
+        let source: [MordeClientMessage]
+        if let projectID {
+            guard MordeProjectPolicy.hasValidID(projectID), selectedProjectID == projectID,
+                  selectedProjectConversationID == conversationID,
+                  projectConversations.contains(where: { $0.id == conversationID && $0.project_id == projectID }),
+                  let stored = projectConversationMessages.first(where: { $0.id == message.id }),
+                  stored.conversation_id == conversationID else { return }
+            if action == .editResend && stored.actor_id != scope.accountID { return }
+            source = projectConversationMessages.map(\.clientMessage)
+        } else {
+            guard currentConversation == conversationID,
+                  let stored = messages.first(where: { $0.id == message.id }),
+                  stored.conversation_id == conversationID else { return }
+            if action == .editResend && stored.actor_id != scope.accountID { return }
+            source = messages
+        }
+        guard source.contains(where: { $0.id == message.id && $0.conversation_id == conversationID &&
+            MordeConversationVariantPresentation.groupID($0) == groupID }) else { return }
+
+        let uiKey = variantOperationUIKey(scope: scope, projectID: projectID,
+            conversationID: conversationID, groupID: groupID, action: action)
+        let storageKey = MordeConversationVariantPresentation.attemptStorageKey(scope: scope,
+            projectID: projectID, conversationID: conversationID, groupID: groupID, action: action)
+        let pendingAttempt = try? messageOutbox.pendingVariantOperation(storageKey: storageKey, scope: scope)
+        let attempt: MordeConversationVariantOperationAttempt
+        if retryPending {
+            guard let pendingAttempt else { return }
+            attempt = pendingAttempt
+        } else {
+            guard MordeConversationVariantPresentation.allows(action, for: message), pendingAttempt == nil,
+                  MordeConversationVariantOperationRequest(action: action, expectedVersion: 1,
+                      content: action == .editResend ? content : nil).isValid,
+                  let expectedVersion = MordeConversationVariantPresentation.latestVersion(in: source,
+                                                                                            groupID: groupID),
+                  expectedVersion < Int64.max else { return }
+            for pendingAction in MordeConversationVariantAction.allCases {
+                let pendingKey = MordeConversationVariantPresentation.attemptStorageKey(scope: scope,
+                    projectID: projectID, conversationID: conversationID, groupID: groupID, action: pendingAction)
+                if (try? messageOutbox.pendingVariantOperation(storageKey: pendingKey, scope: scope)) != nil {
+                    variantOperationErrors[uiKey] = AppLocalized("Retry the pending version action before starting another.")
+                    return
+                }
+            }
+            if action == .editResend, source.first(where: { $0.id == message.id })?.actor_id != scope.accountID { return }
+            let candidate = MordeConversationVariantOperationAttempt(
+                idempotencyKey: UUID().uuidString.lowercased(), action: action, expectedVersion: expectedVersion,
+                projectID: projectID, conversationID: conversationID, messageID: message.id,
+                groupID: groupID, content: action == .editResend ? content : nil)
+            let request = MordeConversationVariantOperationRequest(action: candidate.action,
+                expectedVersion: candidate.expectedVersion, content: candidate.content)
+            guard request.isValid else { return }
+            do {
+                let stored = try messageOutbox.beginVariantOperation(storageKey: storageKey,
+                    proposed: candidate, scope: scope)
+                guard stored == candidate else {
+                    variantOperationErrors[uiKey] = AppLocalized("Retry the pending version action before starting another.")
+                    return
+                }
+                attempt = stored
+            } catch {
+                variantOperationErrors[uiKey] = error.localizedDescription
+                return
+            }
+        }
+        guard attempt.action == action, attempt.projectID == projectID,
+              attempt.conversationID == conversationID, attempt.groupID == groupID,
+              attempt.expectedVersion >= 1, attempt.expectedVersion < Int64.max,
+              attempt.messageID.range(of: #"^m[a-z0-9]{7}$"#, options: .regularExpression) != nil,
+              attempt.content.map({
+                  $0.unicodeScalars.count <= MordeConversationVariantOperationRequest.maximumContentScalars
+              }) ?? true else { return }
+        if !retryPending {
+            guard let target = source.first(where: { $0.id == attempt.messageID && $0.conversation_id == conversationID &&
+                      MordeConversationVariantPresentation.groupID($0) == groupID }),
+                  (action != .editResend || target.actor_id == scope.accountID),
+                  MordeConversationVariantPresentation.allows(action, for: target) else { return }
+        }
+        let requestBody = MordeConversationVariantOperationRequest(action: attempt.action,
+            expectedVersion: attempt.expectedVersion, content: attempt.content)
+        guard requestBody.isValid else { return }
+        variantOperationsInFlight.insert(uiKey)
+        variantOperationErrors.removeValue(forKey: uiKey)
+        defer { variantOperationsInFlight.remove(uiKey) }
+
+        do {
+            let base = projectID.map { "/api/projects/\($0)/conversations/\(conversationID)" }
+                ?? "/api/conversations/\(conversationID)"
+            let (data, response) = try await responseData("\(base)/messages/\(attempt.messageID)/variants",
+                method: "POST", body: requestBody.fields, key: attempt.idempotencyKey, authorized: true,
+                handleUnauthorized: true, scheduleAuthorized: false,
+                headers: ["X-Morde-Service-Instance-ID": scope.serviceInstanceID,
+                          "X-Morde-Actor-ID": scope.accountID])
+            let receipt = try JSONDecoder().decode(MordeConversationVariantOperationResponse.self, from: data)
+            guard (200..<300).contains(response.statusCode), receipt.isValid,
+                  receipt.variant_group_id == groupID, receipt.action == action,
+                  receipt.variant_version == attempt.expectedVersion + 1,
+                  currentDataScope?.hasSameAccount(as: scope) == true else {
+                throw URLError(.cannotParseResponse)
+            }
+            if receipt.hasKnownOutcome {
+                try messageOutbox.finishVariantOperation(storageKey: storageKey, attempt: attempt, scope: scope)
+            } else {
+                variantOperationErrors[uiKey] = AppLocalized("The request result is unknown; retrying uses the same request ID.")
+            }
+            if let projectID, selectedProjectID == projectID, selectedProjectConversationID == conversationID {
+                await loadProjectConversationMessages(projectID: projectID, conversationID: conversationID)
+            } else if projectID == nil, currentConversation == conversationID {
+                await retryCurrentConversationMessages()
+            }
+        } catch {
+            guard currentDataScope?.hasSameAccount(as: scope) == true else { return }
+            variantOperationErrors[uiKey] = error.localizedDescription
+            let failure = error as NSError
+            if failure.domain == "Morde", failure.code == 409 {
+                try? messageOutbox.finishVariantOperation(storageKey: storageKey,
+                                                           attempt: attempt, scope: scope)
+            }
+            if let projectID, selectedProjectID == projectID, selectedProjectConversationID == conversationID {
+                await loadProjectConversationMessages(projectID: projectID, conversationID: conversationID)
+            } else if projectID == nil, currentConversation == conversationID {
+                await retryCurrentConversationMessages()
+            }
         }
     }
 
@@ -8059,7 +8340,9 @@ private struct MordeIndependentSendTarget {
                         attachment_ids: received.attachment_ids,
                         output_status: received.output_status, output_task_revision: received.output_task_revision,
                         output_result_event_sequence: received.output_result_event_sequence,
-                        local_send_status: nil, sources: received.sources)
+                        local_send_status: nil, sources: received.sources,
+                        variant_group_id: received.variant_group_id, variant_version: received.variant_version,
+                        variant_action: received.variant_action)
                     projectConversationMessages.removeAll { $0.id == received.id || $0.client_message_id == id }
                     projectConversationMessages.append(projectMessage)
                     projectConversationMessages = orderedProjectConversationMessages(projectConversationMessages)
@@ -8399,6 +8682,7 @@ private struct MordeIndependentSendTarget {
         taskFileFetchErrors = [:]
         taskTimelineHistoryExpired = []; taskTimelineLoading = []; taskTimelineNoHistory = []
         taskPageActionErrors = [:]
+        taskStepRetryErrors.removeAll()
         loadingMoreNotifications = false
         clientInstallations = []
         hostControlStatuses = [:]; hostControlErrors = [:]; hostControlActionInFlightFor = nil
@@ -9805,6 +10089,7 @@ private struct MordeIndependentSendTarget {
             (value.output_status.map { ["streaming", "interrupted", "completed"].contains($0) && value.role == "assistant" } ?? true) &&
             (value.output_task_revision.map { $0 >= 0 } ?? true) &&
             (value.output_result_event_sequence.map { $0 > 0 && value.output_status == "completed" } ?? true) &&
+            MordeConversationVariantPresentation.hasValidProjection(value.clientMessage) &&
             MordeProjectPolicy.hasValidUserID(value.owner_id) && MordeProjectPolicy.hasValidUserID(value.actor_id) &&
             value.task_id.map { $0.range(of: #"^q[a-z0-9]{7}$"#, options: .regularExpression) != nil } ?? true
     }
@@ -10994,57 +11279,6 @@ private struct MordeIndependentSendTarget {
         }
     }
 
-    func openWorkspaceShareURL(_ url: URL) {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "morde", components.host?.lowercased() == "workspace-share",
-              components.path.isEmpty, components.user == nil, components.password == nil,
-              components.port == nil, components.fragment == nil,
-              let items = components.queryItems, items.count == 1, items[0].name == "token",
-              let token = items[0].value, Self.validWorkspaceShareToken(token) else { return }
-        pendingWorkspaceShareToken = token
-    }
-
-    func createWorkspaceShare(workspaceID: String, revision: Int, permission: String) async throws -> MordeWorkspaceShareCreated {
-        guard let scope = currentDataScope, Self.validWorkspaceID(workspaceID), revision >= 0,
-              ["view", "edit"].contains(permission) else { throw URLError(.badURL) }
-        let result: MordeWorkspaceShareCreated = try await portalCall(
-            "/api/workspaces/\(workspaceID)/shares", method: "POST",
-            body: ["expected_current_revision": revision, "permission": permission], expectedScope: scope)
-        guard scope == currentDataScope, result.permission == permission, Self.validWorkspaceShareToken(result.token),
-              !result.workspace_name.isEmpty, result.workspace_name.unicodeScalars.count <= 120,
-              let expiresAt = Self.parseISO8601(result.expires_at), expiresAt > Date(),
-              expiresAt.timeIntervalSinceNow <= 7 * 24 * 60 * 60 + 60 else { throw URLError(.cannotParseResponse) }
-        return result
-    }
-
-    func previewWorkspaceShare(token: String) async throws -> MordeWorkspaceSharePreview {
-        guard let scope = currentDataScope, Self.validWorkspaceShareToken(token) else { throw URLError(.badURL) }
-        let result: MordeWorkspaceSharePreview = try await portalCall(
-            "/api/workspace-shares/preview", method: "POST", body: ["token": token], expectedScope: scope)
-        guard scope == currentDataScope, ["view", "edit"].contains(result.permission),
-              !result.workspace_name.isEmpty, result.workspace_name.unicodeScalars.count <= 120,
-              let expiresAt = Self.parseISO8601(result.expires_at), expiresAt > Date() else {
-            throw URLError(.cannotParseResponse)
-        }
-        return result
-    }
-
-    func acceptWorkspaceShare(token: String) async throws -> MordeWorkspaceShareAccepted {
-        guard let scope = currentDataScope, Self.validWorkspaceShareToken(token) else { throw URLError(.badURL) }
-        let result: MordeWorkspaceShareAccepted = try await portalCall(
-            "/api/workspace-shares/accept", method: "POST", body: ["token": token], expectedScope: scope)
-        guard scope == currentDataScope, Self.validWorkspaceID(result.workspace_id),
-              ["view", "edit"].contains(result.permission), !result.workspace_name.isEmpty else {
-            throw URLError(.cannotParseResponse)
-        }
-        await refreshWorkspaces()
-        return result
-    }
-
-    private static func validWorkspaceShareToken(_ value: String) -> Bool {
-        value.range(of: "^[A-Za-z0-9_-]{43}$", options: .regularExpression) != nil
-    }
-
     func localWorkspaceFileURL(workspaceID: String, path: String) -> URL? {
         try? Self.workspaceDownloadURL(workspaceID: workspaceID, path: path)
     }
@@ -11592,6 +11826,24 @@ private struct MordeIndependentSendTarget {
             throw URLError(.cannotParseResponse)
         }
         return page
+    }
+
+    func codexProfileConnections(installationID: String) async throws -> [MordeCodexProfileConnection] {
+        guard MordeClientInstallationPolicy.isValidID(installationID),
+              clientInstallations.contains(where: { $0.id == installationID && $0.platform == "desktop" && !$0.revoked }) else {
+            throw NSError(domain: "Morde.Codex", code: 403)
+        }
+        var components = URLComponents()
+        components.path = "/api/codex/connections"
+        components.queryItems = [URLQueryItem(name: "installation_id", value: installationID)]
+        guard let path = components.string else { throw URLError(.badURL) }
+        let response: MordeCodexProfileConnectionList = try await call(path)
+        let profileKeys = response.items.map(\.profile_key)
+        guard Set(profileKeys).count == profileKeys.count,
+              response.items.allSatisfy({ MordeCodexProfileConnectionPolicy.isValid($0, installationID: installationID) }) else {
+            throw URLError(.cannotParseResponse)
+        }
+        return response.items
     }
 
     func codexEventPage(sessionID: String, afterSequence: Int64, limit: Int = 100) async throws -> MordeCodexEventPage {
@@ -12676,17 +12928,26 @@ private struct MordeIndependentSendTarget {
         else { taskPageActionErrors[taskID] = message }
     }
 
+    private func reportTaskStepRetryError(_ message: String, taskID: String, stepID: String) {
+        taskStepRetryErrors.set(message, taskID: taskID, stepID: stepID)
+    }
+
     @discardableResult private func submitTaskAction(taskID: String, path: String,
                                                       body: [String: Any],
-                                                      updateCurrentTask: Bool = true) async -> Bool {
+                                                      updateCurrentTask: Bool = true,
+                                                      expectedStepRetry: (sourceStepID: String, sourceAttempt: Int)? = nil) async -> Bool {
         let selectedConversationID = updateCurrentTask ? currentConversation : nil
         func selectedTaskIsCurrent() -> Bool {
             guard updateCurrentTask, let selectedConversationID else { return false }
             return currentConversation == selectedConversationID && currentTask?.id == taskID
         }
         func report(_ message: String) {
-            reportTaskPageActionError(message, taskID: taskID,
-                                      updateCurrentTask: selectedTaskIsCurrent())
+            if let expectedStepRetry {
+                reportTaskStepRetryError(message, taskID: taskID, stepID: expectedStepRetry.sourceStepID)
+            } else {
+                reportTaskPageActionError(message, taskID: taskID,
+                                          updateCurrentTask: selectedTaskIsCurrent())
+            }
         }
         let isLoadedTarget = updateCurrentTask ? currentTask?.id == taskID : taskPageDetails[taskID] != nil
         guard canStartMordeAction(busy: busy), isLoadedTarget,
@@ -12709,11 +12970,27 @@ private struct MordeIndependentSendTarget {
         retryActionScopeKey = actionScope.storageKey
         busy = true; defer { busy = false }
         do {
-            struct Response: Decodable { let task_id: String }
+            struct Response: Decodable {
+                let task_id: String
+                let source_step_id: String?
+                let attempt_step_id: String?
+                let attempt: Int?
+                let status: String?
+                let replayed: Bool?
+            }
             let response: Response = try await call(path, method: "POST", body: body,
                                                     key: retryAction?.idempotencyKey)
             guard actionScope == currentDataScope else { return false }
             guard response.task_id == taskID else { throw URLError(.cannotParseResponse) }
+            if let expectedStepRetry,
+               !MordeTaskResponsePolicy.validStepRetryReceipt(
+                    sourceStepID: expectedStepRetry.sourceStepID,
+                    sourceAttempt: expectedStepRetry.sourceAttempt,
+                    responseSourceStepID: response.source_step_id,
+                    attemptStepID: response.attempt_step_id,
+                    attempt: response.attempt, status: response.status, replayed: response.replayed) {
+                throw URLError(.cannotParseResponse)
+            }
             do {
                 let refreshed = try await task(id: taskID)
                 guard actionScope == currentDataScope else { return false }
@@ -12724,8 +13001,13 @@ private struct MordeIndependentSendTarget {
                 }
                 retryAction = nil
                 retryActionScopeKey = nil
-                if selectedTaskIsCurrent() { error = nil }
-                else { taskPageActionErrors.removeValue(forKey: taskID) }
+                if let expectedStepRetry {
+                    taskStepRetryErrors.remove(taskID: taskID, stepID: expectedStepRetry.sourceStepID)
+                } else if selectedTaskIsCurrent() {
+                    error = nil
+                } else {
+                    taskPageActionErrors.removeValue(forKey: taskID)
+                }
             } catch {
                 guard actionScope == currentDataScope else { return false }
                 if selectedTaskIsCurrent() { setResourceState(.failed(error.localizedDescription), for: .taskDetail) }
@@ -12935,6 +13217,7 @@ private struct MordeIndependentSendTarget {
         taskFileFetchLoadGenerations.removeValue(forKey: taskID)
         taskPageDetails.removeValue(forKey: taskID)
         taskPageActionErrors.removeValue(forKey: taskID)
+        taskStepRetryErrors.removeAll(taskID: taskID)
         taskFileFetches.removeValue(forKey: taskID)
         taskFileFetchErrors.removeValue(forKey: taskID)
         tasks.removeAll { $0.id == taskID }
@@ -13339,6 +13622,9 @@ private struct MordeIndependentSendTarget {
     var loadingTimelines: Set<String> { client.taskTimelineLoading }
     var emptyTimelines: Set<String> { client.taskTimelineNoHistory }
     var actionErrors: [String: String] { client.taskPageActionErrors }
+    func stepRetryError(taskID: String, stepID: String) -> String? {
+        client.taskStepRetryErrors.message(taskID: taskID, stepID: stepID)
+    }
 
     func taskPage(status: String? = nil, cursor: String? = nil) async throws -> MordePage<MordeTask> {
         try await client.taskPage(status: status, cursor: cursor)
@@ -13348,6 +13634,9 @@ private struct MordeIndependentSendTarget {
                         expectedScopeKey: String) async throws -> MordeTaskStepDetail {
         try await client.taskStepDetail(taskID: taskID, stepID: stepID,
             minimumEventSequence: minimumEventSequence, expectedScopeKey: expectedScopeKey)
+    }
+    func retryTaskStep(taskID: String, stepID: String) async -> Bool {
+        await client.retryTaskStep(taskID: taskID, stepID: stepID)
     }
     func refreshFileFetches(taskID: String) async throws {
         try await client.loadTaskFileFetches(taskID: taskID)
@@ -13510,13 +13799,18 @@ private enum MIFCodexSessionRefreshResult {
 
     @Published private(set) var installations: [MIFCodexInstallation] = []
     @Published private(set) var selectedInstallationID: String?
+    @Published private(set) var selectedProfileKey: String?
     @Published private(set) var selectedSessionID: String?
     @Published private(set) var sessionsByInstallation: [String: [MordeCodexSession]] = [:]
+    @Published private(set) var profileConnectionsByInstallation: [String: [MordeCodexProfileConnection]] = [:]
+    @Published private(set) var profileConnectionErrors: [String: String] = [:]
+    @Published private(set) var loadingProfileConnections: Set<String> = []
     @Published private(set) var nextSessionCursorByInstallation: [String: String] = [:]
     @Published private(set) var installationErrors: [String: String] = [:]
     @Published private(set) var revokedInstallations: Set<String> = []
     @Published private(set) var eventPagesBySession: [String: [MordeCodexEvent]] = [:]
     @Published private(set) var eventCursorBySession: [String: Int64] = [:]
+    @Published private(set) var eventServerSequenceBySession: [String: Int64] = [:]
     @Published private(set) var eventErrors: [String: String] = [:]
     @Published private(set) var revokedSessions: Set<String> = []
     @Published private(set) var commandStatusBySession: [String: String] = [:]
@@ -13536,6 +13830,10 @@ private enum MIFCodexSessionRefreshResult {
     private var observation: AnyCancellable?
     private var scopeKey: String?
     private var isSignedInScope: Bool
+    private var sessionCursorsByInstallation: [String: Set<String>] = [:]
+    private var profileConnectionLoadGenerations: [String: UUID] = [:]
+    private var sessionIDsBeforeRefreshByInstallation: [String: Set<String>] = [:]
+    private var sessionIDsObservedDuringRefreshByInstallation: [String: Set<String>] = [:]
     private var replyIdentityByCommandID: [String: MordeCodexReplyIdentity] = [:]
 
     private init() {
@@ -13549,12 +13847,34 @@ private enum MIFCodexSessionRefreshResult {
     var isSignedIn: Bool { client.signedIn }
     var cacheScopeIdentity: String? { client.signedIn ? client.taskPageScopeKey : nil }
     var sessions: [MordeCodexSession] { selectedInstallationID.flatMap { sessionsByInstallation[$0] } ?? [] }
+    var selectedProfileConnections: [MordeCodexProfileConnection] {
+        selectedInstallationID.flatMap { profileConnectionsByInstallation[$0] } ?? []
+    }
+    var selectedProfileConnectionError: String? {
+        selectedInstallationID.flatMap { profileConnectionErrors[$0] }
+    }
+    var selectedProfileConnectionsLoading: Bool {
+        selectedInstallationID.map { loadingProfileConnections.contains($0) } ?? false
+    }
+    var profileKeys: [String] {
+        Array(Set(MordeCodexSessionScopePolicy.profileKeys(in: sessions) +
+                  selectedProfileConnections.map(\.profile_key))).sorted()
+    }
+    var visibleSessions: [MordeCodexSession] {
+        MordeCodexSessionScopePolicy.sessions(sessions, profileKey: selectedProfileKey)
+    }
     var selectedSession: MordeCodexSession? {
         guard let selectedSessionID, let selectedInstallationID else { return nil }
         return sessionsByInstallation[selectedInstallationID]?.first { $0.id == selectedSessionID }
     }
     var events: [MordeCodexEvent] { selectedSessionID.flatMap { eventPagesBySession[$0] } ?? [] }
     var timeline: [MordeCodexTimelineItem] { MordeCodexEventPolicy.timelineItems(events) }
+    func serverCurrentSequence(for session: MordeCodexSession) -> Int64 {
+        max(session.current_sequence, eventServerSequenceBySession[session.id] ?? 0)
+    }
+    func installationOnline(_ installationID: String) -> Bool? {
+        client.devices.first(where: { $0.id == installationID })?.online
+    }
     var selectedInstallation: MIFCodexInstallation? {
         installations.first { $0.id == selectedInstallationID }
     }
@@ -13617,6 +13937,7 @@ private enum MIFCodexSessionRefreshResult {
         defer { loadingInstallations = false }
         if client.user == nil { await client.load() }
         await client.loadClientInstallations()
+        await client.loadDevices()
         synchronizeScope()
         guard client.signedIn else {
             installations = []
@@ -13629,7 +13950,10 @@ private enum MIFCodexSessionRefreshResult {
         }
         let desktopInstallations = client.clientInstallations.filter { $0.platform == "desktop" }
         let authorizedInstallationIDs = Set(desktopInstallations.filter { !$0.revoked }.map(\.id))
-        for installationID in Array(sessionsByInstallation.keys) where !authorizedInstallationIDs.contains(installationID) {
+        let cachedInstallationIDs = Set(sessionsByInstallation.keys)
+            .union(profileConnectionsByInstallation.keys)
+            .union(profileConnectionLoadGenerations.keys)
+        for installationID in cachedInstallationIDs where !authorizedInstallationIDs.contains(installationID) {
             clearSessions(installationID: installationID)
         }
         revokedInstallations = Set(desktopInstallations.filter(\.revoked).map(\.id))
@@ -13645,6 +13969,7 @@ private enum MIFCodexSessionRefreshResult {
             selectedInstallationID = installations.first(where: { !$0.revoked })?.id ?? installations.first?.id
         }
         if let id = selectedInstallationID, installations.first(where: { $0.id == id })?.revoked != true {
+            await loadProfileConnections(installationID: id)
             await loadSessions(installationID: id)
         }
     }
@@ -13660,20 +13985,60 @@ private enum MIFCodexSessionRefreshResult {
     func selectInstallation(_ id: String) async {
         guard installations.contains(where: { $0.id == id }) else { return }
         selectedInstallationID = id
+        selectedProfileKey = nil
         selectedSessionID = nil
         if installations.first(where: { $0.id == id })?.revoked != true {
+            await loadProfileConnections(installationID: id)
             await loadSessions(installationID: id)
         }
+    }
+
+    func selectProfile(_ profileKey: String?) {
+        if let profileKey, !profileKeys.contains(profileKey) { return }
+        selectedProfileKey = profileKey
+        selectedSessionID = nil
     }
 
     func selectSession(_ id: String) {
         guard sessions.contains(where: { $0.id == id }) else { return }
         selectedSessionID = id
         eventErrors[id] = nil
-        if revokedSessions.contains(id) { eventPagesBySession[id] = nil; eventCursorBySession[id] = nil }
+        if revokedSessions.contains(id) {
+            eventPagesBySession[id] = nil
+            eventCursorBySession[id] = nil
+            eventServerSequenceBySession[id] = nil
+        }
     }
 
     func closeSession() { selectedSessionID = nil }
+
+    func loadProfileConnections(installationID: String) async {
+        synchronizeScope()
+        guard client.signedIn, let scope = scopeKey, scope == client.taskPageScopeKey,
+              isAuthorizedInstallation(installationID) else { return }
+        let generation = UUID()
+        profileConnectionLoadGenerations[installationID] = generation
+        profileConnectionsByInstallation[installationID] = nil
+        profileConnectionErrors[installationID] = nil
+        loadingProfileConnections.insert(installationID)
+        defer {
+            if profileConnectionLoadGenerations[installationID] == generation {
+                loadingProfileConnections.remove(installationID)
+            }
+        }
+        do {
+            let connections = try await client.codexProfileConnections(installationID: installationID)
+            guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                  profileConnectionLoadGenerations[installationID] == generation,
+                  isAuthorizedInstallation(installationID) else { return }
+            profileConnectionsByInstallation[installationID] = connections
+        } catch {
+            guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                  profileConnectionLoadGenerations[installationID] == generation,
+                  isAuthorizedInstallation(installationID) else { return }
+            profileConnectionErrors[installationID] = error.localizedDescription
+        }
+    }
 
     func loadSessions(installationID: String, cursor: String? = nil) async {
         guard client.signedIn, let scope = scopeKey, scope == client.taskPageScopeKey,
@@ -13682,11 +14047,23 @@ private enum MIFCodexSessionRefreshResult {
         installationErrors[installationID] = nil
         defer { loadingSessions.remove(installationID) }
         do {
+            let seenCursors = cursor == nil ? Set<String>() : (sessionCursorsByInstallation[installationID] ?? [])
             let page = try await client.codexSessionPage(installationID: installationID, cursor: cursor)
-            guard client.signedIn, scope == client.taskPageScopeKey else { return }
+            guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                  isAuthorizedInstallation(installationID) else { return }
+            guard MordeCodexSessionScopePolicy.acceptsNextCursor(page.next_cursor, after: cursor, seen: seenCursors) else {
+                nextSessionCursorByInstallation[installationID] = nil
+                throw URLError(.cannotParseResponse)
+            }
+            if cursor == nil {
+                sessionCursorsByInstallation[installationID] = []
+                sessionIDsBeforeRefreshByInstallation[installationID] = Set(
+                    (sessionsByInstallation[installationID] ?? []).map(\.id))
+                sessionIDsObservedDuringRefreshByInstallation[installationID] = []
+            }
+            if let next = page.next_cursor { sessionCursorsByInstallation[installationID, default: []].insert(next) }
             let current = sessionsByInstallation[installationID] ?? []
             if let cursor {
-                guard page.next_cursor.map({ !$0.isEmpty && $0 != cursor }) ?? true else { throw URLError(.cannotParseResponse) }
                 var merged = current
                 var indexes = Dictionary(uniqueKeysWithValues: merged.enumerated().map { ($0.element.id, $0.offset) })
                 for session in page.items {
@@ -13697,6 +14074,8 @@ private enum MIFCodexSessionRefreshResult {
             } else {
                 sessionsByInstallation[installationID] = page.items
             }
+            sessionIDsObservedDuringRefreshByInstallation[installationID, default: []]
+                .formUnion(page.items.map(\.id))
             for session in page.items {
                 if MordeCodexSessionScopePolicy.shouldClearReadHistory(afterRefreshing: session.scopes) {
                     revokedSessions.insert(session.id)
@@ -13706,6 +14085,23 @@ private enum MIFCodexSessionRefreshResult {
                 }
             }
             nextSessionCursorByInstallation[installationID] = page.next_cursor
+            if page.next_cursor == nil {
+                let missing = MordeCodexSessionScopePolicy.sessionsMissingFromCompletedRefresh(
+                    previous: sessionIDsBeforeRefreshByInstallation[installationID] ?? [],
+                    observed: sessionIDsObservedDuringRefreshByInstallation[installationID] ?? [],
+                    finished: true)
+                for sessionID in missing {
+                    removeConfirmedMissingSession(installationID: installationID, sessionID: sessionID)
+                }
+                sessionIDsBeforeRefreshByInstallation[installationID] = nil
+                sessionIDsObservedDuringRefreshByInstallation[installationID] = nil
+                if selectedInstallationID == installationID,
+                   let selectedProfileKey,
+                   !sessions.contains(where: { $0.profile_key == selectedProfileKey }) &&
+                   !selectedProfileConnections.contains(where: { $0.profile_key == selectedProfileKey }) {
+                    self.selectedProfileKey = nil
+                }
+            }
             revokedInstallations.remove(installationID)
         } catch {
             guard client.signedIn, scope == client.taskPageScopeKey else { return }
@@ -13724,6 +14120,33 @@ private enum MIFCodexSessionRefreshResult {
         await loadSessions(installationID: installationID, cursor: cursor)
     }
 
+    private func isAuthorizedInstallation(_ installationID: String) -> Bool {
+        !revokedInstallations.contains(installationID) &&
+            installations.contains(where: { $0.id == installationID && !$0.revoked }) &&
+            client.clientInstallations.contains(where: {
+                $0.id == installationID && $0.platform == "desktop" && !$0.revoked
+            })
+    }
+
+    private func hasCurrentReadGrant(sessionID: String, installationID: String,
+                                     requireLive: Bool = false) -> Bool {
+        MordeCodexSessionScopePolicy.permitsReadResponse(
+            sessionsByInstallation[installationID]?.first(where: { $0.id == sessionID }),
+            selectedSessionID: selectedSessionID,
+            installationAuthorized: isAuthorizedInstallation(installationID),
+            revoked: revokedSessions.contains(sessionID), requireLive: requireLive)
+    }
+
+    private func hasCurrentCommandGrant(_ command: MIFCodexPendingCommand) -> Bool {
+        guard let session = sessionsByInstallation[command.installationID]?.first(where: { $0.id == command.sessionID }),
+              session.installation_id == command.installationID else { return false }
+        return MordeCodexSessionScopePolicy.permitsCommandResponse(
+            session,
+            installationAuthorized: isAuthorizedInstallation(command.installationID),
+            revoked: revokedSessions.contains(command.sessionID),
+            requiredScope: command.action.requiredScope)
+    }
+
     private func refreshSessionScopes(installationID: String, sessionID: String,
                                      scope: String) async -> MIFCodexSessionRefreshResult {
         var cursor: String?
@@ -13731,7 +14154,8 @@ private enum MIFCodexSessionRefreshResult {
         while client.signedIn, scope == client.taskPageScopeKey {
             do {
                 let page = try await client.codexSessionPage(installationID: installationID, cursor: cursor)
-                guard client.signedIn, scope == client.taskPageScopeKey else { return .failed }
+                guard client.signedIn, scope == client.taskPageScopeKey,
+                      isAuthorizedInstallation(installationID) else { return .failed }
                 if let refreshed = page.items.first(where: { $0.id == sessionID }) {
                     var sessions = sessionsByInstallation[installationID] ?? []
                     if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
@@ -13779,14 +14203,29 @@ private enum MIFCodexSessionRefreshResult {
               let scope = scopeKey, scope == client.taskPageScopeKey else { return }
         loadingEvents.insert(session.id)
         eventErrors[session.id] = nil
-        if reset { eventPagesBySession[session.id] = nil; eventCursorBySession[session.id] = nil }
+        if reset {
+            eventPagesBySession[session.id] = nil
+            eventCursorBySession[session.id] = nil
+            eventServerSequenceBySession[session.id] = max(
+                eventServerSequenceBySession[session.id] ?? 0, session.current_sequence)
+        }
         defer { loadingEvents.remove(session.id) }
         do {
             var target: Int64? = session.current_sequence
             var firstPage: MordeCodexEventPage?
             if target == nil {
                 firstPage = try await client.codexEventPage(sessionID: session.id, afterSequence: 0)
+                guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                      selectedSessionID == session.id else { return }
+                guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+                    clearReadHistory(sessionID: session.id)
+                    return
+                }
                 target = firstPage?.current_sequence ?? firstPage?.items.last?.sequence
+                if let firstPage {
+                    eventServerSequenceBySession[session.id] = max(
+                        eventServerSequenceBySession[session.id] ?? 0, firstPage.current_sequence)
+                }
             }
             let targetSequence = max(target ?? 0, 0)
             let after = max(0, targetSequence - 100)
@@ -13797,22 +14236,44 @@ private enum MIFCodexSessionRefreshResult {
             } else {
                 page = try await client.codexEventPage(sessionID: session.id, afterSequence: after)
             }
-            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                  selectedSessionID == session.id else { return }
+            guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+                clearReadHistory(sessionID: session.id)
+                return
+            }
+            eventServerSequenceBySession[session.id] = max(
+                eventServerSequenceBySession[session.id] ?? 0, page.current_sequence)
             var events = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
                                                          afterSequence: after)
             var last = events.last?.sequence ?? after
             let latest = max(targetSequence, page.current_sequence)
             while last < latest {
                 page = try await client.codexEventPage(sessionID: session.id, afterSequence: last)
+                guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                      selectedSessionID == session.id else { return }
+                guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+                    clearReadHistory(sessionID: session.id)
+                    return
+                }
+                eventServerSequenceBySession[session.id] = max(
+                    eventServerSequenceBySession[session.id] ?? 0, page.current_sequence)
                 let next = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
                                                            afterSequence: last)
                 guard let nextLast = next.last?.sequence, nextLast > last else { throw URLError(.cannotParseResponse) }
                 events = try MordeCodexEventPolicy.merge(events, incoming: next, sessionID: session.id)
                 last = nextLast
             }
-            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                  selectedSessionID == session.id else { return }
+            guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+                clearReadHistory(sessionID: session.id)
+                return
+            }
             eventPagesBySession[session.id] = events
             eventCursorBySession[session.id] = last
+            eventServerSequenceBySession[session.id] = max(
+                max(eventServerSequenceBySession[session.id] ?? 0, targetSequence), page.current_sequence)
             if let event = events.last(where: { $0.visibleStatus != nil && $0.isSessionStatus }),
                let status = event.visibleStatus {
                 commandStatusBySession[session.id] = eventStatus(event, status: status)
@@ -13826,8 +14287,7 @@ private enum MIFCodexSessionRefreshResult {
             let failure = error as NSError
             if [403, 404].contains(failure.code) {
                 revokedSessions.insert(session.id)
-                eventPagesBySession[session.id] = nil
-                eventCursorBySession[session.id] = nil
+                clearReadHistory(sessionID: session.id)
             }
             eventErrors[session.id] = eventErrorValue(error)
         }
@@ -13842,9 +14302,16 @@ private enum MIFCodexSessionRefreshResult {
         let after = max(0, first.sequence - 101)
         do {
             let page = try await client.codexEventPage(sessionID: session.id, afterSequence: after)
-            guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                  selectedSessionID == session.id else { return }
+            guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+                clearReadHistory(sessionID: session.id)
+                return
+            }
             let incoming = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
                                                            afterSequence: after)
+            eventServerSequenceBySession[session.id] = max(
+                eventServerSequenceBySession[session.id] ?? 0, page.current_sequence)
             let earlier = incoming.filter { $0.sequence < first.sequence }
             guard !earlier.isEmpty else { return }
             eventPagesBySession[session.id] = try MordeCodexEventPolicy.merge(
@@ -13863,10 +14330,13 @@ private enum MIFCodexSessionRefreshResult {
     func followSelectedSession() async {
         guard let session = selectedSession, let installationID = selectedInstallationID,
               session.installation_id == installationID,
-              let scope = scopeKey else { return }
+              let scope = scopeKey,
+              hasCurrentReadGrant(sessionID: session.id, installationID: installationID) else { return }
         if session.hasScope("read"), eventPagesBySession[session.id] == nil { await loadTimeline() }
-        guard session.hasScope("read"), session.hasScope("live"), !revokedSessions.contains(session.id) else { return }
-        while !Task.isCancelled, client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id {
+        guard hasCurrentReadGrant(sessionID: session.id, installationID: installationID, requireLive: true) else { return }
+        while !Task.isCancelled, client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+              selectedSessionID == session.id,
+              hasCurrentReadGrant(sessionID: session.id, installationID: installationID, requireLive: true) {
             do {
                 try await client.codexEventStream(installationID: installationID, sessionID: session.id,
                     afterSequence: eventCursorBySession[session.id] ?? session.current_sequence) { [weak self] event in
@@ -13986,16 +14456,16 @@ private enum MIFCodexSessionRefreshResult {
     private func submit(_ command: MIFCodexPendingCommand) async -> Bool {
         guard client.signedIn, let scope = scopeKey, scope == client.taskPageScopeKey,
               let session = sessionsByInstallation[command.installationID]?.first(where: { $0.id == command.sessionID }),
-              session.hasScope("read"), session.hasScope(command.action.requiredScope),
-              !revokedSessions.contains(session.id),
-              submittingSessions.insert(session.id).inserted else { return false }
+              hasCurrentCommandGrant(command),
+              submittingSessions.insert(command.sessionID).inserted else { return false }
         commandErrors[session.id] = nil
-        defer { submittingSessions.remove(session.id) }
+        defer { submittingSessions.remove(command.sessionID) }
         do {
             let receipt = try await client.codexCommand(session: session, installationID: command.installationID,
                 requiredScope: command.action.requiredScope, body: command.action.body,
                 idempotencyKey: command.idempotencyKey)
-            guard client.signedIn, scope == client.taskPageScopeKey else { return false }
+            guard client.signedIn, scope == client.taskPageScopeKey,
+                  hasCurrentCommandGrant(command) else { return false }
             commandStatusBySession[session.id] = normalizedStatus(receipt.status)
             commandErrors[session.id] = nil
             pendingCommands[session.id] = nil
@@ -14015,6 +14485,8 @@ private enum MIFCodexSessionRefreshResult {
                     confirmedMissingSession = true
                 }
             }
+            guard client.signedIn, scope == client.taskPageScopeKey,
+                  hasCurrentCommandGrant(command) else { return false }
             if failure.domain == NSURLErrorDomain || (500...599).contains(failure.code) {
                 commandStatusBySession[session.id] = "unknown"
                 commandErrors[session.id] = error.localizedDescription
@@ -14034,7 +14506,15 @@ private enum MIFCodexSessionRefreshResult {
     }
 
     private func receive(_ event: MordeCodexEvent, session: MordeCodexSession, scope: String) async throws {
-        guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { throw CancellationError() }
+        guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+              selectedSessionID == session.id else { throw CancellationError() }
+        guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+            clearReadHistory(sessionID: session.id)
+            throw CancellationError()
+        }
+        guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id, requireLive: true) else {
+            throw CancellationError()
+        }
         var cursor = MordeCodexEventCursor(afterSequence: eventCursorBySession[session.id] ?? 0)
         switch cursor.accept(event, sessionID: session.id) {
         case .duplicate:
@@ -14051,6 +14531,17 @@ private enum MIFCodexSessionRefreshResult {
             var last = cursor.sequence
             while last < event.sequence {
                 let page = try await client.codexEventPage(sessionID: session.id, afterSequence: last)
+                guard client.signedIn, scope == scopeKey, scope == client.taskPageScopeKey,
+                      selectedSessionID == session.id else { throw CancellationError() }
+                guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id) else {
+                    clearReadHistory(sessionID: session.id)
+                    throw CancellationError()
+                }
+                guard hasCurrentReadGrant(sessionID: session.id, installationID: session.installation_id, requireLive: true) else {
+                    throw CancellationError()
+                }
+                eventServerSequenceBySession[session.id] = max(
+                    eventServerSequenceBySession[session.id] ?? 0, page.current_sequence)
                 let missing = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
                                                               afterSequence: last)
                 let throughEvent = missing.filter { $0.sequence <= event.sequence }
@@ -14126,6 +14617,12 @@ private enum MIFCodexSessionRefreshResult {
     private func clearReadHistory(sessionID: String) {
         eventPagesBySession[sessionID] = nil
         eventCursorBySession[sessionID] = nil
+        eventServerSequenceBySession[sessionID] = nil
+        eventErrors[sessionID] = nil
+        commandStatusBySession[sessionID] = nil
+        commandErrors[sessionID] = nil
+        pendingCommands[sessionID] = nil
+        clearReplyState(sessionID: sessionID)
     }
 
     private func clearReplyState(sessionID: String) {
@@ -14168,9 +14665,13 @@ private enum MIFCodexSessionRefreshResult {
         let ids = Set((sessionsByInstallation[installationID] ?? []).map(\.id))
         sessionsByInstallation[installationID] = nil
         nextSessionCursorByInstallation[installationID] = nil
+        sessionCursorsByInstallation[installationID] = nil
+        sessionIDsBeforeRefreshByInstallation[installationID] = nil
+        sessionIDsObservedDuringRefreshByInstallation[installationID] = nil
         for id in ids {
             eventPagesBySession[id] = nil
             eventCursorBySession[id] = nil
+            eventServerSequenceBySession[id] = nil
             eventErrors[id] = nil
             revokedSessions.remove(id)
             commandStatusBySession[id] = nil
@@ -14181,7 +14682,12 @@ private enum MIFCodexSessionRefreshResult {
             deletingSessions.remove(id)
             submittingSessions.remove(id)
         }
+        profileConnectionsByInstallation[installationID] = nil
+        profileConnectionErrors[installationID] = nil
+        profileConnectionLoadGenerations[installationID] = nil
+        loadingProfileConnections.remove(installationID)
         if selectedSessionID.map(ids.contains) == true { selectedSessionID = nil }
+        if selectedInstallationID == installationID { selectedProfileKey = nil }
     }
 
     private func synchronizeScope() {
@@ -14192,13 +14698,22 @@ private enum MIFCodexSessionRefreshResult {
         scopeKey = current
         installations = []
         selectedInstallationID = nil
+        selectedProfileKey = nil
         selectedSessionID = nil
         sessionsByInstallation = [:]
+        profileConnectionsByInstallation = [:]
+        profileConnectionErrors = [:]
+        profileConnectionLoadGenerations = [:]
+        loadingProfileConnections = []
         nextSessionCursorByInstallation = [:]
+        sessionCursorsByInstallation = [:]
+        sessionIDsBeforeRefreshByInstallation = [:]
+        sessionIDsObservedDuringRefreshByInstallation = [:]
         installationErrors = [:]
         revokedInstallations = []
         eventPagesBySession = [:]
         eventCursorBySession = [:]
+        eventServerSequenceBySession = [:]
         eventErrors = [:]
         revokedSessions = []
         commandStatusBySession = [:]
@@ -14277,30 +14792,7 @@ private enum MIFCodexSessionRefreshResult {
                 workspaceSummary: nil, canOpen: host.state == "running" && hasView,
                 control: nil, error: client.hostOpenErrors[host.id])
         }
-        let workspaces = client.workspaces.map { workspace in
-            let binding = client.hosts.compactMap { host in
-                host.workspaces?.first(where: { $0.workspace.id == workspace.id }).map { (host, $0) }
-            }.first
-            let status: MIFResourcePageState.Workspace.Status
-            if workspace.state != "ready" {
-                status = .unavailable
-            } else if let binding {
-                if binding.1.sync_state == "syncing" || binding.1.sync_state == "pending" {
-                    status = .syncing
-                } else {
-                    status = client.isReady(binding.1) ? .ready : .unavailable
-                }
-            } else {
-                status = .unbound
-            }
-            return MIFResourcePageState.Workspace(
-                id: workspace.id, name: workspace.name, status: status,
-                hostName: binding?.0.name, usedBytes: workspace.used_bytes, quotaBytes: workspace.quota_bytes,
-                isReadOnly: workspace.is_read_only,
-                canOpen: workspace.state == "ready")
-        }
         let hostResourceStates = [client.resourceState(.hosts), client.resourceState(.sharedHosts)]
-        let workspaceResourceState = client.resourceState(.workspaces)
         let hostErrors = hostResourceStates.compactMap(\.failureMessage)
         let hostsState = MIFResourcePageState.ListState(
             isLoading: hostResourceStates.contains { state in
@@ -14308,11 +14800,8 @@ private enum MIFCodexSessionRefreshResult {
                 return false
             },
             loadError: hostErrors.isEmpty ? nil : hostErrors.joined(separator: " · "))
-        let workspacesState = MIFResourcePageState.ListState(
-            isLoading: workspaceResourceState == .loading,
-            loadError: workspaceResourceState.failureMessage)
-        let errors = [hostsState.loadError, workspacesState.loadError].compactMap { $0 }
-        let loading = hostsState.isLoading || workspacesState.isLoading
+        let errors = [hostsState.loadError].compactMap { $0 }
+        let loading = hostsState.isLoading
         let target: MIFResourcePageState.DefaultTarget
         switch client.defaultHostPreferenceState {
         case .loading, .failed:
@@ -14328,8 +14817,7 @@ private enum MIFCodexSessionRefreshResult {
         }
         return MIFResourcePageState(
             isLoading: loading, loadError: errors.isEmpty ? nil : errors.joined(separator: " · "),
-            hostsState: hostsState, workspacesState: workspacesState,
-            defaultTarget: target, hosts: ownedHostViews + sharedHosts, workspaces: workspaces)
+            hostsState: hostsState, defaultTarget: target, hosts: ownedHostViews + sharedHosts)
     }
 
     private var isResourceListLoading: Bool {
@@ -14900,7 +15388,7 @@ private struct MordeWorkspacePreviewItem: Identifiable {
     var id: String { url.absoluteString }
 }
 
-private struct MordeWorkspaceFilesView: View {
+private struct MordeComputerFilesView: View {
     private enum WorkspaceTool: String, Identifiable {
         case upload
         case history
@@ -14960,14 +15448,8 @@ private struct MordeWorkspaceFilesView: View {
     @StateObject private var client = MordeClient.shared
     @Environment(\.dismiss) private var dismiss
     private let onBack: (() -> Void)?
-    @State private var selectedWorkspaceID = ""
+    private let hostID: String
     @State private var workspaceTool: WorkspaceTool?
-    @State private var shareSheetPresented = false
-    @State private var sharePermission = "view"
-    @State private var shareWorking = false
-    @State private var shareError: String?
-    @State private var showShareError = false
-    @State private var shareNotice: String?
     @State private var files: [MordeWorkspaceFile] = []
     @State private var directories: [String] = []
     @State private var currentDirectoryPath = ""
@@ -15004,23 +15486,25 @@ private struct MordeWorkspaceFilesView: View {
     @State private var errorMessage: String?
     @State private var previewItem: MordeWorkspacePreviewItem?
 
-    init(initialWorkspaceID: String? = nil, onBack: (() -> Void)? = nil) {
-        _selectedWorkspaceID = State(initialValue: initialWorkspaceID ?? "")
+    init(hostID: String, onBack: (() -> Void)? = nil) {
+        self.hostID = hostID
         self.onBack = onBack
     }
 
+    private var selectedWorkspaceID: String { selectedWorkspace?.id ?? "" }
+
     private var selectedWorkspace: MordeWorkspace? {
-        client.workspaces.first { $0.id == selectedWorkspaceID }
+        guard let workspaceID = client.hosts.first(where: { $0.id == hostID })?.workspaces?.first?.workspace.id else { return nil }
+        return client.workspaces.first { $0.id == workspaceID }
     }
 
     private var workspaceMountSummary: String? {
         guard let workspace = selectedWorkspace,
               client.resourceState(.hosts).isLoaded,
               client.resourceState(.workspaces).isLoaded else { return nil }
-        guard let host = client.hosts.first(where: { host in
-            host.workspaces?.contains(where: { $0.workspace.id == workspace.id }) == true
-        }), let binding = host.workspaces?.first(where: { $0.workspace.id == workspace.id }) else {
-            return workspaceSummary(base: workspace.state == "ready" ? "未挂载" : "不可用", workspace: workspace)
+        guard let host = client.hosts.first(where: { $0.id == hostID }),
+              let binding = host.workspaces?.first(where: { $0.workspace.id == workspace.id }) else {
+            return workspaceSummary(base: "电脑文件不可用", workspace: workspace)
         }
         let status: String
         if binding.sync_state == "syncing" || binding.sync_state == "pending" {
@@ -15371,102 +15855,14 @@ private struct MordeWorkspaceFilesView: View {
         }
     }
 
-    private var workspaceShareSheet: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("分享电脑文件")
-                .font(.system(size: 17.5, weight: .bold))
-                .tracking(-0.175)
-                .accessibilityIdentifier("morde.workspace.share.title")
-            workspaceSharePermission("view", title: "可查看", detail: "只能看文件")
-                .padding(.vertical, 13)
-            workspaceSharePermission("edit", title: "可编辑", detail: "能改文件")
-                .padding(.vertical, 13)
-            Button {
-                Task { await copyWorkspaceShareLink() }
-            } label: {
-                Text(shareWorking ? "正在创建链接…" : "复制分享链接")
-                    .font(.system(size: 15.5, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 13)
-                    .background(Color(red: 0.067, green: 0.067, blue: 0.067), in: Capsule())
-            }
-            .buttonStyle(.plain)
-            .padding(.top, 16)
-            .disabled(shareWorking || selectedWorkspace == nil)
-            .accessibilityIdentifier("morde.workspace.share.copy")
-        }
-        .padding(.horizontal, 22)
-        .padding(.top, 22)
-        .padding(.bottom, 30)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .presentationDetents([.height(221)])
-    }
-
-    private func workspaceSharePermission(_ value: String, title: String, detail: String) -> some View {
-        Button { sharePermission = value } label: {
-            HStack(spacing: 10) {
-                ZStack {
-                    Circle()
-                        .fill(sharePermission == value ? Color(red: 0.067, green: 0.067, blue: 0.067) : .clear)
-                Circle()
-                    .strokeBorder(sharePermission == value
-                                  ? Color(red: 0.067, green: 0.067, blue: 0.067)
-                                  : Color(red: 0.851, green: 0.851, blue: 0.871), lineWidth: 2)
-                    if sharePermission == value {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 10, weight: .heavy))
-                            .foregroundStyle(.white)
-                    }
-                }
-                .frame(width: 20, height: 20)
-                Text(title).font(.system(size: 15.5, weight: .semibold))
-                Spacer()
-                Text(detail)
-                    .font(.system(size: 13.5, weight: .medium))
-                    .foregroundStyle(Color(red: 0.639, green: 0.639, blue: 0.659))
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityValue(sharePermission == value ? "selected" : "")
-        .accessibilityIdentifier("morde.workspace.share.permission.\(value)")
-    }
-
-    @MainActor
-    private func copyWorkspaceShareLink() async {
-        guard !shareWorking, let selectedWorkspace else { return }
-        shareWorking = true
-        defer { shareWorking = false }
-        do {
-            let created = try await client.createWorkspaceShare(workspaceID: selectedWorkspace.id,
-                revision: selectedWorkspace.revision, permission: sharePermission)
-            var components = URLComponents()
-            components.scheme = "morde"
-            components.host = "workspace-share"
-            components.queryItems = [URLQueryItem(name: "token", value: created.token)]
-            guard let url = components.url else { throw URLError(.badURL) }
-            UIPasteboard.general.string = url.absoluteString
-            shareSheetPresented = false
-            shareNotice = "分享链接已复制"
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if shareNotice == "分享链接已复制" { shareNotice = nil }
-            }
-        } catch {
-            shareError = error.localizedDescription
-            showShareError = true
-        }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                NanoMuseRoundButton(symbol: "chevron.left", label: "返回资源", size: 38) {
+                NanoMuseRoundButton(symbol: "chevron.left", label: AppLocalized("Back"), size: 38) {
                     if let onBack { onBack() } else { dismiss() }
                 }
                 .accessibilityIdentifier("morde.workspace.back")
-                Text("电脑文件")
+                Text(AppLocalized("电脑文件"))
                     .font(.headline.weight(.semibold))
                     .tracking(-0.17)
                     .lineLimit(1)
@@ -15488,13 +15884,6 @@ private struct MordeWorkspaceFilesView: View {
                     }
                     .padding(.leading, 10)
                 Spacer(minLength: 8)
-                NanoMuseRoundButton(symbol: "square.and.arrow.up", label: "分享电脑文件", size: 38) {
-                    sharePermission = "view"
-                    shareError = nil
-                    shareSheetPresented = true
-                }
-                .disabled(selectedWorkspace == nil || selectedWorkspace?.is_read_only == true)
-                .accessibilityIdentifier("morde.workspace.share")
             }
             .padding(.horizontal, 22)
             .padding(.top, 10)
@@ -15547,25 +15936,6 @@ private struct MordeWorkspaceFilesView: View {
                     }
                 }
             }
-        }
-        .sheet(isPresented: $shareSheetPresented) { workspaceShareSheet }
-        .alert("无法创建分享链接", isPresented: $showShareError) {
-            Button("确定", role: .cancel) { shareError = nil }
-        } message: {
-            Text(shareError ?? "")
-        }
-        .overlay(alignment: .bottom) {
-            if let shareNotice {
-                Text(shareNotice)
-                    .font(.footnote.weight(.medium))
-                    .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(.regularMaterial, in: Capsule())
-                    .accessibilityIdentifier("morde.workspace.share.copied")
-                    .padding(.bottom, 18)
-            }
-        }
-        .onChange(of: client.workspaces.map(\.id)) { ids in
-            if !ids.contains(selectedWorkspaceID) { selectedWorkspaceID = ids.first ?? "" }
         }
         .onChange(of: selectedWorkspaceID) { _ in
             manifestGeneration += 1
@@ -16033,88 +16403,6 @@ private struct MordeWorkspaceFilesView: View {
     }
 }
 
-private struct MordeWorkspaceShareAcceptanceView: View {
-    let token: String
-    @StateObject private var client = MordeClient.shared
-    @Environment(\.dismiss) private var dismiss
-    @State private var preview: MordeWorkspaceSharePreview?
-    @State private var loadError: String?
-    @State private var isLoading = true
-    @State private var isAccepting = false
-
-    var body: some View {
-        NavigationStack {
-            VStack(alignment: .leading, spacing: 16) {
-                if isLoading {
-                    ProgressView("正在读取分享信息…")
-                } else if let preview {
-                    Text(preview.workspace_name).font(.title3.weight(.semibold))
-                    Text(preview.permission == "view" ? "可查看 · 只能看文件" : "可编辑 · 能改文件")
-                        .foregroundStyle(.secondary)
-                    Text("领取后会创建归你所有的独立副本，之后与原文件目录无关。")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button {
-                        Task { await accept() }
-                    } label: {
-                        Text(isAccepting ? "正在领取…" : "领取独立副本")
-                            .font(.body.weight(.semibold))
-                            .frame(maxWidth: .infinity, minHeight: 48)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isAccepting)
-                    .accessibilityIdentifier("morde.workspace.share.accept")
-                } else if let loadError {
-                    Text(loadError).foregroundStyle(.secondary)
-                    Button("重新加载") { Task { await loadPreview() } }
-                        .disabled(isLoading)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .navigationTitle("领取文件副本")
-            .navigationBarTitleDisplayMode(.inline)
-        }
-        .presentationDetents([.medium])
-        .task(id: token) { await loadPreview() }
-        .onChange(of: client.user?.id) { _ in dismiss() }
-    }
-
-    @MainActor
-    private func loadPreview() async {
-        guard !isLoading || preview == nil else { return }
-        isLoading = true
-        loadError = nil
-        defer { isLoading = false }
-        do {
-            preview = try await client.previewWorkspaceShare(token: token)
-        } catch {
-            preview = nil
-            let failure = error as NSError
-            loadError = failure.domain == "Morde" && failure.code == 404
-                ? "此链接已失效或已被领取，请向分享者索取新链接。"
-                : error.localizedDescription
-        }
-    }
-
-    @MainActor
-    private func accept() async {
-        guard !isAccepting else { return }
-        isAccepting = true
-        defer { isAccepting = false }
-        do {
-            _ = try await client.acceptWorkspaceShare(token: token)
-            dismiss()
-        } catch {
-            let failure = error as NSError
-            loadError = failure.domain == "Morde" && failure.code == 404
-                ? "此链接已失效或已被领取，请向分享者索取新链接。"
-                : error.localizedDescription
-            preview = nil
-        }
-    }
-}
-
 struct MordeWorkspaceQuickLook: UIViewControllerRepresentable {
     let url: URL
 
@@ -16536,7 +16824,6 @@ struct MIFResourcesRoot: View {
     private let onMenu: (() -> Void)?
     private let onOpenHost: ((MIFResourcePageState.Host) -> Void)?
     @StateObject private var store = MIFResourcePageStore.shared
-    @State private var workspaceFilesID: String?
     @State private var hostSharingID: String?
     @State private var libraryPresented = false
     @State private var isVisible = false
@@ -16548,17 +16835,13 @@ struct MIFResourcesRoot: View {
         self.onOpenHost = onOpenHost
     }
 
-    private var workspaceNavigationPresented: Binding<Bool> {
-        Binding(get: { workspaceFilesID != nil }, set: { if !$0 { workspaceFilesID = nil } })
-    }
-
     private var shouldRefreshHostRuntime: Bool {
         isVisible && scenePhase == .active && store.scopeKey != nil && store.hostURL == nil &&
-            workspaceFilesID == nil && hostSharingID == nil && !libraryPresented
+            hostSharingID == nil && !libraryPresented
     }
 
     private var hostRuntimeRefreshTaskID: String {
-        "\(store.scopeKey ?? "signed-out"):\(scenePhase == .active):\(isVisible):\(store.hostURL == nil):\(workspaceFilesID == nil):\(hostSharingID == nil):\(!libraryPresented)"
+        "\(store.scopeKey ?? "signed-out"):\(scenePhase == .active):\(isVisible):\(store.hostURL == nil):\(hostSharingID == nil):\(!libraryPresented)"
     }
 
     private var sheetDestination: Binding<MIFResourceSheetDestination?> {
@@ -16571,7 +16854,6 @@ struct MIFResourcesRoot: View {
             set: { value in
                 guard value == nil else { return }
                 store.dismissHost()
-                workspaceFilesID = nil
                 hostSharingID = nil
                 libraryPresented = false
             })
@@ -16587,8 +16869,7 @@ struct MIFResourcesRoot: View {
             },
             shareHost: { hostSharingID = $0 },
             refreshControl: { id in Task { await store.refreshControl(id) } },
-            control: { id, action in Task { await store.control(id, action: action) } },
-            openWorkspaceFiles: { workspaceFilesID = $0 }))
+            control: { id, action in Task { await store.control(id, action: action) } }))
             .task(id: store.scopeKey) { await store.loadIfNeeded() }
             .task(id: hostRuntimeRefreshTaskID) {
                 guard shouldRefreshHostRuntime else { return }
@@ -16601,11 +16882,6 @@ struct MIFResourcesRoot: View {
             }
             .onAppear { isVisible = true }
             .onDisappear { isVisible = false }
-            .navigationDestination(isPresented: workspaceNavigationPresented) {
-                if let id = workspaceFilesID {
-                    MordeWorkspaceFilesView(initialWorkspaceID: id)
-                }
-            }
             .sheet(item: sheetDestination) { destination in
                 switch destination {
                 case .host(let url):
@@ -16645,17 +16921,10 @@ private struct MordeClientContainer: View {
 
     var body: some View {
         MordeRoot(client: client, layout: layout, bottomOverlay: bottomOverlay)
-            .onOpenURL { client.openWorkspaceShareURL($0) }
             .task {
                 guard ownsLifecycle else { return }
                 client.refreshExpiredAuthorization()
                 await client.load()
-#if DEBUG
-                if ProcessInfo.processInfo.arguments.contains(MordeAuthURLProtocol.workspaceShareDeepLinkFixtureLaunchArgument),
-                   let url = URL(string: "morde://workspace-share?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") {
-                    client.openWorkspaceShareURL(url)
-                }
-#endif
             }
             .task {
                 guard ownsLifecycle else { return }
@@ -16680,14 +16949,6 @@ private struct MordeClientContainer: View {
                         client.refreshExpiredAuthorization()
                         await client.load()
                     }
-                }
-            }
-            .sheet(isPresented: Binding(
-                get: { client.signedIn && client.user != nil && client.pendingWorkspaceShareToken != nil },
-                set: { if !$0 { client.pendingWorkspaceShareToken = nil } }
-            )) {
-                if let token = client.pendingWorkspaceShareToken {
-                    MordeWorkspaceShareAcceptanceView(token: token)
                 }
             }
     }
@@ -17663,6 +17924,20 @@ private struct MordeRoot: View {
                                 .id(message.id)
                                 .onAppear { if isLatestMessage { latestMessageVisible = true } }
                                 .onDisappear { if isLatestMessage { latestMessageVisible = false } }
+                            MordeConversationVariantControls(message: message,
+                                versions: client.variantVersions(for: message),
+                                selectedVersion: client.selectedVariantVersion(for: message),
+                                isOwnUserMessage: message.role == "user" && message.actor_id == client.user?.id,
+                                isBusy: { client.variantOperationIsInFlight(for: message, action: $0) },
+                                isPending: { client.variantOperationIsPending(for: message, action: $0) },
+                                hasAnyPending: client.anyVariantOperationIsPending(for: message),
+                                error: { client.variantOperationError(for: message, action: $0) },
+                                onSelectVersion: { client.selectVariantVersion($0, for: message) },
+                                onAction: { action, content, retryPending in
+                                    Task { await client.performConversationVariantAction(action, message: message,
+                                                                                       content: content,
+                                                                                       retryPending: retryPending) }
+                                })
                         }
                         ForEach(client.conversationTasks.filter { $0.conversation_id == client.currentConversation }) { task in
                             conversationTaskCard(task)
@@ -17919,6 +18194,7 @@ private struct MordeRoot: View {
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
                 Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
             }
+            MIFTaskPlanSection(task: task)
             conversationTaskRelations(task)
             NavigationLink {
                 MIFTaskDetailView(taskID: task.id)
@@ -18302,13 +18578,13 @@ private struct MordeRoot: View {
             }
         case .task(let id):
             MIFTaskDetailView(taskID: id)
-        case .workspace(let id):
-            MordeWorkspaceFilesView(initialWorkspaceID: id, onBack: { selectDesignRoute(.resources) })
+        case .computerFiles(let id, let shared):
+            MordeComputerFilesView(hostID: id, onBack: { selectDesignRoute(.computer(id, shared: shared)) })
         case .computer(let id, let shared):
             MordeComputerDesignRoom(client: client, hostID: id, shared: shared,
                                     onClose: { selectDesignRoute(.resources) },
-                                    onOpenWorkspace: { workspaceID in
-                                        selectDesignRoute(.workspace(workspaceID))
+                                    onOpenWorkspace: {
+                                        selectDesignRoute(.computerFiles(id, shared: shared))
                                     })
         case .file:
             unavailableRoute("文件预览不可用", symbol: "doc")
@@ -19172,6 +19448,152 @@ private struct MIFMordeMessageBubble: View {
         .padding(.vertical, 8)
         .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(NanoMuseTones.hairline))
+    }
+}
+
+private struct MordeConversationVariantControls: View {
+    let message: MordeClientMessage
+    let versions: [Int64]
+    let selectedVersion: Int64?
+    let isOwnUserMessage: Bool
+    let isBusy: (MordeConversationVariantAction) -> Bool
+    let isPending: (MordeConversationVariantAction) -> Bool
+    let hasAnyPending: Bool
+    let error: (MordeConversationVariantAction) -> String?
+    let onSelectVersion: (Int64) -> Void
+    let onAction: (MordeConversationVariantAction, String?, Bool) -> Void
+
+    @State private var editing = false
+    @State private var draft = ""
+
+    var body: some View {
+        Group {
+            if MordeConversationVariantPresentation.groupID(message) != nil, !versions.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 12) {
+                        if message.role == "user", versions.count > 1, let selectedVersion {
+                            Menu {
+                                ForEach(versions, id: \.self) { version in
+                                    Button {
+                                        onSelectVersion(version)
+                                    } label: {
+                                        if selectedVersion == version {
+                                            Label(AppLocalized("Version") + " \(version)", systemImage: "checkmark")
+                                        } else {
+                                            Text(AppLocalized("Version") + " \(version)")
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Label(AppLocalized("Version") + " \(selectedVersion)/\(versions.count)",
+                                      systemImage: "clock.arrow.circlepath").font(.caption)
+                            }
+                            .accessibilityIdentifier("morde.message.variants.select.\(message.id)")
+                        }
+                        if isOwnUserMessage && MordeConversationVariantPresentation.allows(.editResend, for: message) {
+                            if isPending(.editResend) {
+                                Button(AppLocalized("Retry pending action")) {
+                                    onAction(.editResend, nil, true)
+                                }
+                                .font(.caption.weight(.medium))
+                                .disabled(isBusy(.editResend))
+                                if let error = error(.editResend) {
+                                    Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                }
+                            } else {
+                                Button(editing ? AppLocalized("Cancel") : AppLocalized("Edit and resend")) {
+                                    draft = message.content
+                                    editing.toggle()
+                                }
+                                .font(.caption.weight(.medium))
+                                .disabled(isBusy(.editResend) || hasAnyPending)
+                                .accessibilityIdentifier("morde.message.variants.edit.\(message.id)")
+                            }
+                        } else if isPending(.editResend) {
+                            Button(AppLocalized("Retry pending action")) {
+                                onAction(.editResend, nil, true)
+                            }
+                            .font(.caption.weight(.medium))
+                            .disabled(isBusy(.editResend))
+                            if let error = error(.editResend) {
+                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                            }
+                        } else if message.role == "assistant",
+                                  isPending(.regenerateText) {
+                            Button(AppLocalized("Retry pending action")) {
+                                onAction(.regenerateText, nil, true)
+                            }
+                            .font(.caption.weight(.medium))
+                            .disabled(isBusy(.regenerateText))
+                            if let error = error(.regenerateText) {
+                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                            }
+                        } else if message.role == "assistant",
+                                  MordeConversationVariantPresentation.allows(.regenerateText, for: message) {
+                            Button(AppLocalized("Regenerate answer")) {
+                                onAction(.regenerateText, nil, false)
+                            }
+                            .font(.caption.weight(.medium))
+                            .disabled(isBusy(.regenerateText) || hasAnyPending)
+                            .accessibilityIdentifier("morde.message.variants.regenerate.\(message.id)")
+                            if let error = error(.regenerateText) {
+                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                            }
+                        } else if message.role == "assistant",
+                                  isPending(.continueGeneration) {
+                            Button(AppLocalized("Retry pending action")) {
+                                onAction(.continueGeneration, nil, true)
+                            }
+                            .font(.caption.weight(.medium))
+                            .disabled(isBusy(.continueGeneration))
+                            if let error = error(.continueGeneration) {
+                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                            }
+                        } else if message.role == "assistant",
+                                  MordeConversationVariantPresentation.allows(.continueGeneration, for: message) {
+                            Button(AppLocalized("Continue generation")) {
+                                onAction(.continueGeneration, nil, false)
+                            }
+                            .font(.caption.weight(.medium))
+                            .disabled(isBusy(.continueGeneration) || hasAnyPending)
+                            .accessibilityIdentifier("morde.message.variants.continue.\(message.id)")
+                            if let error = error(.continueGeneration) {
+                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                            }
+                        }
+                        if isBusy(.editResend) || isBusy(.regenerateText) || isBusy(.continueGeneration) {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    if editing {
+                        TextEditor(text: $draft)
+                            .frame(minHeight: 92, maxHeight: 180)
+                            .padding(6)
+                            .background(Color(uiColor: .secondarySystemBackground),
+                                        in: RoundedRectangle(cornerRadius: 10))
+                            .accessibilityIdentifier("morde.message.variants.edit.content.\(message.id)")
+                        HStack {
+                            Spacer()
+                            Button(AppLocalized("Send new version")) {
+                                onAction(.editResend, draft, false)
+                                editing = false
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isBusy(.editResend) || hasAnyPending ||
+                                      draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .accessibilityIdentifier("morde.message.variants.edit.submit.\(message.id)")
+                        }
+                        if let error = error(.editResend) {
+                            Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                        }
+                    } else if let error = error(.editResend), isOwnUserMessage {
+                        Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                    }
+                }
+                .padding(.leading, message.role == "assistant" ? 4 : 0)
+                .frame(maxWidth: .infinity, alignment: message.role == "user" ? .trailing : .leading)
+            }
+        }
     }
 }
 
@@ -20132,7 +20554,8 @@ private struct MordeProjectsRoom: View {
             message.duplicate_of_message_id == nil &&
             (pending == nil || pending?.state == .accepted) &&
             MordeRoutingPresentation.canRetryProcessing(message.routing_failure_reason)
-        return HStack(alignment: .bottom, spacing: 8) {
+        return VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
+          HStack(alignment: .bottom, spacing: 8) {
             if isUser { Spacer(minLength: 40) }
             if canRetryProcessing {
                 Button {
@@ -20260,6 +20683,28 @@ private struct MordeProjectsRoom: View {
             }
             }
             if !isUser { Spacer(minLength: 0) }
+          }
+          let clientMessage = message.clientMessage
+          MordeConversationVariantControls(message: clientMessage,
+              versions: client.variantVersions(for: clientMessage, projectID: client.selectedProjectID),
+              selectedVersion: client.selectedVariantVersion(for: clientMessage, projectID: client.selectedProjectID),
+              isOwnUserMessage: isUser && message.actor_id == client.user?.id,
+              isBusy: { client.variantOperationIsInFlight(for: clientMessage, action: $0,
+                                                          projectID: client.selectedProjectID) },
+              isPending: { client.variantOperationIsPending(for: clientMessage, action: $0,
+                                                            projectID: client.selectedProjectID) },
+              hasAnyPending: client.anyVariantOperationIsPending(for: clientMessage,
+                                                                projectID: client.selectedProjectID),
+              error: { client.variantOperationError(for: clientMessage, action: $0,
+                                                    projectID: client.selectedProjectID) },
+              onSelectVersion: { client.selectVariantVersion($0, for: clientMessage,
+                                                            projectID: client.selectedProjectID) },
+              onAction: { action, content, retryPending in
+                  guard let projectID = client.selectedProjectID else { return }
+                  Task { await client.performConversationVariantAction(action, message: clientMessage,
+                                                                      content: content, retryPending: retryPending,
+                                                                      projectID: projectID) }
+              })
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     }
@@ -20277,6 +20722,7 @@ private struct MordeProjectsRoom: View {
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
                 Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
             }
+            MIFTaskPlanSection(task: task)
             if let pending = task.pending_request { projectConversationApprovalControls(task, pending: pending) }
             if let clarification = task.clarification_request {
                 projectConversationClarificationControls(task, clarification: clarification)
@@ -20540,7 +20986,7 @@ private struct MordeComputerDesignRoom: View {
     let hostID: String
     let shared: Bool
     let onClose: () -> Void
-    let onOpenWorkspace: (String) -> Void
+    let onOpenWorkspace: () -> Void
     @State private var pageLoadState: MordeHostPageLoadState = .loading
     @State private var desktopConnectionStatus: MIFDesktopConnectionStatus = .unknown
     @State private var hostWebView: WKWebView?
@@ -20560,8 +21006,8 @@ private struct MordeComputerDesignRoom: View {
     }
 
     private var openBoundWorkspace: (() -> Void)? {
-        guard let workspaceID = boundWorkspace?.workspace.id else { return nil }
-        return { onOpenWorkspace(workspaceID) }
+        guard boundWorkspace != nil else { return nil }
+        return onOpenWorkspace
     }
 
     private var computerTitle: String {

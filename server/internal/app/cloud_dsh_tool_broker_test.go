@@ -68,6 +68,28 @@ func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) 
 	}
 }
 
+func TestTextRegenerationExposesNoDSHToolDefinitions(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run",
+		result: `{"exit_code":0,"stdout":"should not run","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	claimed.ToolsDisabled = true
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil {
+		t.Fatalf("text-only Definitions() error = %v", err)
+	}
+	if len(definitions) != 0 {
+		t.Fatalf("text-only DSH definitions = %#v, want no tools including built-ins", definitions)
+	}
+}
+
 type cloudDSHRecordCaptureStore struct {
 	taskStore       *cloudDSHBrokerTaskStore
 	calls           int
@@ -533,6 +555,13 @@ func TestCloudDSHToolBrokerLoadsFixedSkillForHostlessServerTask(t *testing.T) {
 				store.details.Task.Usage, len(store.events))
 		}
 	}
+	if result, err = broker.Execute(context.Background(), claimed, ModelToolCall{
+		CallID: "call_hostless_office_skill", Name: cloudDSHSkillReadToolName, Arguments: `{"skill_id":"office"}`,
+	}); domain.CodeOf(err) != domain.CodeForbidden || result.Status == AgentToolSucceeded ||
+		store.details.Task.Usage.ToolCalls != 5 || len(store.events) != 5 {
+		t.Fatalf("hostless task loaded an Office skill: %#v, err=%v, usage=%+v events=%d", result, err,
+			store.details.Task.Usage, len(store.events))
+	}
 }
 
 func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T) {
@@ -563,16 +592,16 @@ func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T)
 }
 
 func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
-	definition := cloudDSHSkillReadDefinition()
-	if len(cloudDSHSkillCatalog) != 22 || len(definition.Description) > 2048 || !strings.Contains(definition.Description, "weekly-review-planning") ||
-		strings.Contains(definition.Description, "Legacy Muse") ||
-		!strings.Contains(definition.Description, "amap") || !strings.Contains(definition.Description, "Morde skill") ||
-		!strings.Contains(definition.Description, "markdown-docs") || !strings.Contains(definition.Description, "wide-research") ||
-		!strings.Contains(definition.Description, "translation") || !strings.Contains(definition.Description, "meeting-follow-up") ||
-		!strings.Contains(definition.Description, "app-creation") || !strings.Contains(definition.Description, "email-management") ||
-		!strings.Contains(definition.Description, "scheduling") ||
-		strings.Contains(definition.Description, "nanoMuse skill") {
+	definition := cloudDSHSkillReadDefinition(true)
+	if len(cloudDSHSkillCatalog) != 29 || len(definition.Description) > 2048 ||
+		!strings.Contains(definition.Description, "Morde skill by ID") ||
+		strings.Contains(definition.Description, "Legacy Muse") || strings.Contains(definition.Description, "nanoMuse skill") {
 		t.Fatalf("skill catalog does not expose all built-ins: %d, %s", len(cloudDSHSkillCatalog), definition.Description)
+	}
+	for _, id := range []string{"weekly-review-planning", "markdown-docs", "translation"} {
+		if !strings.Contains(definition.Description, id) {
+			t.Errorf("skill overview omits %q", id)
+		}
 	}
 	var schema struct {
 		Properties map[string]struct {
@@ -609,6 +638,19 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 		if schema.Properties["skill_id"].Enum[index] != id {
 			t.Fatalf("skill tool allowlist differs from the embedded catalog: %#v", schema.Properties)
 		}
+	}
+	for _, id := range []string{"office", "office-docx", "office-pptx", "office-xlsx", "office-render", "office-recalculate", "office-export-pdf"} {
+		found := false
+		for _, allowedID := range schema.Properties["skill_id"].Enum {
+			found = found || allowedID == id
+		}
+		if !found {
+			t.Errorf("Host skill ID %q is absent from the skill enum", id)
+		}
+	}
+	hostless := cloudDSHSkillReadDefinition(false)
+	if strings.Contains(string(hostless.Parameters), `"office"`) || strings.Contains(string(hostless.Parameters), `"office-xlsx"`) {
+		t.Fatalf("hostless skill tool exposes Office skills: %s", hostless.Parameters)
 	}
 }
 

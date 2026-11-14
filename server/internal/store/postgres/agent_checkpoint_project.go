@@ -17,6 +17,19 @@ import (
 // Each declared slot must belong to this Task's actual initiator and be fully
 // committed before it can enter a pending message or a root checkpoint.
 func loadProjectCheckpointAttachmentIDs(ctx context.Context, tx pgx.Tx, instanceID, projectID, ownerID, actorID, conversationID, messageID string) ([]string, error) {
+	var attachmentSourceMessageID string
+	err := tx.QueryRow(ctx, `SELECT attachment_source_message_id FROM conversation_message_variants
+WHERE user_message_id=$1 AND actor_id=$2 AND project_id=$3 AND conversation_id=$4
+ AND attachment_source_message_id IS NOT NULL`, messageID, actorID, projectID, conversationID).Scan(&attachmentSourceMessageID)
+	if err == nil {
+		if !domain.ValidMessageID(attachmentSourceMessageID) || attachmentSourceMessageID == messageID {
+			return nil, domain.NewError(domain.CodeInvalidState, "variant attachment source is invalid")
+		}
+		return loadProjectCheckpointAttachmentIDs(ctx, tx, instanceID, projectID, ownerID, actorID, conversationID, attachmentSourceMessageID)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("read project variant attachment source: %w", err)
+	}
 	var personalLinks bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_message_attachments WHERE message_id=$1)`, messageID).Scan(&personalLinks); err != nil {
 		return nil, fmt.Errorf("check project message attachment scope: %w", err)
@@ -25,7 +38,7 @@ func loadProjectCheckpointAttachmentIDs(ctx context.Context, tx pgx.Tx, instance
 		return nil, domain.NewError(domain.CodeInvalidState, "project message has an attachment outside its project")
 	}
 	var metadata []byte
-	err := tx.QueryRow(ctx, `SELECT request_metadata FROM conversation_message_routes
+	err = tx.QueryRow(ctx, `SELECT request_metadata FROM conversation_message_routes
 WHERE message_id=$1 AND service_instance_id=$2::uuid AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5`,
 		messageID, instanceID, ownerID, actorID, conversationID).Scan(&metadata)
 	if errors.Is(err, pgx.ErrNoRows) {

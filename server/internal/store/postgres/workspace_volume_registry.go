@@ -32,6 +32,43 @@ FROM workspace_volumes WHERE workspace_id=$1`, workspaceID).Scan(
 	return value, nil
 }
 
+func (s *Store) ListLegacyHostWorkspaceVolumes(ctx context.Context, hostID string) ([]app.WorkspaceVolumeRegistry, error) {
+	if !domain.ValidHostID(hostID) {
+		return nil, domain.InvalidArgument("host_id", "host id is invalid")
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT workspace_id, owner_id, provisioned_owner_id, state, volume_name, legacy_host_id
+FROM workspace_volumes
+WHERE state='legacy' AND legacy_host_id=$1
+ORDER BY workspace_id`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("list legacy Host workspace volume references: %w", err)
+	}
+	defer rows.Close()
+	values := make([]app.WorkspaceVolumeRegistry, 0)
+	for rows.Next() {
+		var value app.WorkspaceVolumeRegistry
+		var provisionedOwnerID, volumeName, legacyHostID *string
+		if err := rows.Scan(&value.WorkspaceID, &value.OwnerID, &provisionedOwnerID, &value.State, &volumeName, &legacyHostID); err != nil {
+			return nil, fmt.Errorf("read legacy Host workspace volume reference: %w", err)
+		}
+		if provisionedOwnerID != nil {
+			value.ProvisionedOwnerID = *provisionedOwnerID
+		}
+		if volumeName != nil {
+			value.VolumeName = *volumeName
+		}
+		if legacyHostID != nil {
+			value.LegacyHostID = *legacyHostID
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate legacy Host workspace volume references: %w", err)
+	}
+	return values, nil
+}
+
 func (s *Store) MarkWorkspaceVolumeReady(ctx context.Context, ownerID, workspaceID, volumeName string) error {
 	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) || volumeName != app.WorkspaceNamedVolumeName(workspaceID) {
 		return domain.InvalidArgument("workspace_volume", "workspace volume registration is invalid")

@@ -51,10 +51,6 @@ type workspaceResponse struct {
 	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
-type createWorkspaceRequest struct {
-	Name string `json:"name"`
-}
-
 type tokenListResponse struct {
 	Items []tokenResponse `json:"items"`
 }
@@ -77,7 +73,6 @@ func (h *api) registerResources(group *gin.RouterGroup) {
 	group.GET("/templates", h.listTemplates)
 	group.GET("/device/workspaces", h.listDeviceWorkspaces)
 	group.GET("/workspaces", h.listWorkspaces)
-	group.POST("/workspaces", h.createWorkspace)
 	group.GET("/workspaces/:id", h.getWorkspace)
 	group.DELETE("/workspaces/:id", h.deleteWorkspace)
 	group.GET("/apikeys", h.listAPIKeys)
@@ -156,38 +151,6 @@ func (h *api) listWorkspaces(c *gin.Context) {
 		response.Items = append(response.Items, view)
 	}
 	c.JSON(http.StatusOK, response)
-}
-
-func (h *api) createWorkspace(c *gin.Context) {
-	principal, _ := principalFrom(c)
-	if h.deps.WorkspaceOps == nil {
-		serviceUnavailable(c)
-		return
-	}
-	var request createWorkspaceRequest
-	if !decodeJSON(c, &request) {
-		return
-	}
-	if strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > 120 {
-		writeError(c, domain.InvalidArgument("name", "name must be between 1 and 120 characters"))
-		return
-	}
-	keys := c.Request.Header.Values("Idempotency-Key")
-	if len(keys) > 1 {
-		writeError(c, domain.InvalidArgument("Idempotency-Key", "only one idempotency key may be supplied"))
-		return
-	}
-	item, err := h.deps.WorkspaceOps.CreateWorkspace(c.Request.Context(), principal, app.CreateWorkspaceCommand{Name: request.Name}, c.GetHeader("Idempotency-Key"))
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-	view, err := toWorkspaceResponse(item)
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-	c.JSON(http.StatusCreated, view)
 }
 
 func (h *api) getWorkspace(c *gin.Context) {

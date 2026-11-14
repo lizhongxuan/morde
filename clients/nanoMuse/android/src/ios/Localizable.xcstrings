@@ -155,6 +155,174 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 工作階段" } }
       }
     },
+    "Codex profiles" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Profile" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex profiles" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Perfiles de Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Profils Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex プロファイル" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 프로필" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Профили Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 配置" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 設定檔" } }
+      }
+    },
+    "Codex profile unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Profil nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex profile unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Perfil de Codex no disponible" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Profil Codex indisponible" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex プロファイルを利用できません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 프로필을 사용할 수 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Профиль Codex недоступен" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 配置不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 設定檔無法使用" } }
+      }
+    },
+    "Codex session list failed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Sitzungsliste fehlgeschlagen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex session list failed" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Falló la lista de sesiones de Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Échec de la liste des sessions Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex セッション一覧の取得に失敗しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 세션 목록을 불러오지 못함" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не удалось получить список сеансов Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 会话列表获取失败" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 工作階段清單載入失敗" } }
+      }
+    },
+    "Codex connection lost" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex-Verbindung unterbrochen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex connection lost" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Se perdió la conexión con Codex" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Connexion Codex perdue" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex 接続が失われました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 연결이 끊어짐" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Соединение с Codex потеряно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 连接已断开" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 連線已中斷" } }
+      }
+    },
+    "Discovering sessions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Sitzungen werden erkannt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Discovering sessions" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Buscando sesiones" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Recherche des sessions" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "セッションを検出中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세션 검색 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Обнаружение сеансов" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在发现会话" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "正在探索工作階段" } }
+      }
+    },
+    "Sessions discovered" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Sitzungen erkannt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sessions discovered" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Sesiones detectadas" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Sessions détectées" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "セッションを検出しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세션을 찾았습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сеансы обнаружены" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已发现会话" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已找到工作階段" } }
+      }
+    },
+    "Session discovery incomplete" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Sitzungserkennung unvollständig" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Session discovery incomplete" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Detección de sesiones incompleta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Détection des sessions incomplète" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "セッションの検出が不完全です" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "세션 검색이 완료되지 않았습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Обнаружение сеансов выполнено не полностью" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "会话发现不完整" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "工作階段探索未完成" } }
+      }
+    },
+    "No connected Codex profiles" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine Codex-Profile verbunden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No connected Codex profiles" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No hay perfiles de Codex conectados" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucun profil Codex connecté" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "接続された Codex プロファイルはありません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "연결된 Codex 프로필이 없습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Нет подключенных профилей Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "没有已连接的 Codex 配置" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "沒有已連線的 Codex 設定檔" } }
+      }
+    },
+    "Pending first sync" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Erste Synchronisierung ausstehend" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Pending first sync" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Primera sincronización pendiente" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Première synchronisation en attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "初回同期を待っています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "첫 동기화 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидается первая синхронизация" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待首次同步" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待首次同步" } }
+      }
+    },
+    "Sessions with complete history: %1$lld of %2$lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Sitzungen mit vollständigem Verlauf: %1$lld von %2$lld" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sessions with complete history: %1$lld of %2$lld" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Sesiones con historial completo: %1$lld de %2$lld" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Sessions avec historique complet : %1$lld sur %2$lld" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "履歴が揃ったセッション: %1$lld/%2$lld" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "기록이 모두 동기화된 세션: %1$lld/%2$lld" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сеансы с полной историей: %1$lld из %2$lld" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "历史记录完整的会话：%1$lld/%2$lld" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "歷史記錄完整的工作階段：%1$lld/%2$lld" } }
+      }
+    },
+    "Pending upload events: %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ausstehende Upload-Ereignisse: %lld" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Pending upload events: %lld" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Eventos pendientes de subir: %lld" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Événements en attente d’envoi : %lld" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "アップロード待ちイベント: %lld" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "업로드 대기 중인 이벤트: %lld" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидающие загрузки события: %lld" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "待上传事件：%lld" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "待上傳事件：%lld" } }
+      }
+    },
+    "Loaded events: %1$lld / server current sequence: %2$lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Geladene Ereignisse: %1$lld / Aktuelle Serversequenz: %2$lld" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Loaded events: %1$lld / server current sequence: %2$lld" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Eventos cargados: %1$lld / secuencia actual del servidor: %2$lld" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Événements chargés : %1$lld / séquence actuelle du serveur : %2$lld" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "読み込み済みイベント: %1$lld / サーバーの現在のシーケンス: %2$lld" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "로드된 이벤트: %1$lld / 서버 현재 시퀀스: %2$lld" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загружено событий: %1$lld / текущая последовательность сервера: %2$lld" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已载入事件：%1$lld / 服务端当前序号：%2$lld" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已載入事件：%1$lld / 伺服器目前序號：%2$lld" } }
+      }
+    },
     "Delete Codex session" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -24822,6 +24990,34 @@
             "value" : "無法取得交付物詳細資料"
           }
         }
+      }
+    },
+    "Artifact is not verified or its proof is incomplete; metadata only" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Artifact is not verified or its proof is incomplete; metadata only" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "产物尚未核验或证明信息不完整；当前仅显示元数据" } }
+      }
+    },
+    "Media preview is unavailable for this task; metadata only" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Media preview is unavailable for this task; metadata only" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此任务暂不支持媒体预览；当前仅显示元数据" } }
+      }
+    },
+    "The matching Workspace file could not be verified; retry or sync the exact version" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The matching Workspace file could not be verified; retry or sync the exact version" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法在本机核验对应的 Workspace 文件；请重试或同步准确版本" } }
+      }
+    },
+    "Workspace sync is unavailable; metadata only" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Workspace sync is unavailable; metadata only" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Workspace 同步不可用；当前仅显示元数据" } }
       }
     },
     "Artifacts" : {
@@ -128594,6 +128790,20 @@
         }
       }
     },
+    "Retry step" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Schritt erneut versuchen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Retry step" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Reintentar el paso" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réessayer l’étape" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ステップを再試行" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "단계 재시도" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторить шаг" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重试步骤" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重試步驟" } }
+      }
+    },
     "Retry batch item: %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -146255,6 +146465,90 @@
             "value" : "一句話就能調整"
           }
         }
+      }
+    },
+    "Step retry details are unavailable or stale. Refresh the task before retrying." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Schrittinformationen sind nicht verfügbar oder veraltet. Aktualisieren Sie die Aufgabe vor einem erneuten Versuch." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Step retry details are unavailable or stale. Refresh the task before retrying." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Los datos para reintentar el paso no están disponibles o están desactualizados. Actualiza la tarea antes de volver a intentarlo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Les informations de relance de l’étape sont indisponibles ou obsolètes. Actualisez la tâche avant de réessayer." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ステップの再試行情報が利用できないか古くなっています。再試行する前にタスクを更新してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "단계 재시도 정보가 없거나 오래되었습니다. 다시 시도하기 전에 작업을 새로 고치세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Данные для повтора шага недоступны или устарели. Обновите задачу перед повторной попыткой." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "步骤重试信息不可用或已过期。请先刷新任务再重试。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "步驟重試資訊不可用或已過期。請先重新整理任務再重試。" } }
+      }
+    },
+    "Step was not dispatched. Refresh the task and confirm its state." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Der Schritt wurde nicht ausgelöst. Aktualisieren Sie die Aufgabe und prüfen Sie ihren Status." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Step was not dispatched. Refresh the task and confirm its state." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se envió el paso. Actualiza la tarea y confirma su estado." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’étape n’a pas été envoyée. Actualisez la tâche et vérifiez son état." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ステップは送信されていません。タスクを更新して状態を確認してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "단계가 전송되지 않았습니다. 작업을 새로 고치고 상태를 확인하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Шаг не был отправлен. Обновите задачу и проверьте её состояние." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "步骤未发出；请刷新任务并确认状态。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "步驟未送出；請重新整理任務並確認狀態。" } }
+      }
+    },
+    "Step failed after dispatch. Check for partial results before retrying." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Der Schritt ist nach dem Start fehlgeschlagen. Prüfen Sie vor einem erneuten Versuch auf Teilergebnisse." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Step failed after dispatch. Check for partial results before retrying." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El paso falló después de enviarse. Comprueba si hubo resultados parciales antes de reintentarlo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’étape a échoué après son envoi. Vérifiez les résultats partiels avant de réessayer." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ステップは送信後に失敗しました。再試行する前に部分的な結果を確認してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "단계가 전송된 후 실패했습니다. 다시 시도하기 전에 부분 결과가 있는지 확인하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Шаг завершился ошибкой после отправки. Перед повтором проверьте частичные результаты." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "步骤发出后失败；请先核对是否产生了部分结果。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "步驟送出後失敗；請先確認是否產生部分結果。" } }
+      }
+    },
+    "This step may already have changed something. Check its result before retrying." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dieser Schritt hat möglicherweise bereits Änderungen vorgenommen. Prüfen Sie das Ergebnis vor einem erneuten Versuch." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This step may already have changed something. Check its result before retrying." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Es posible que este paso ya haya realizado cambios. Comprueba el resultado antes de reintentarlo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Cette étape a peut-être déjà apporté des modifications. Vérifiez son résultat avant de réessayer." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "このステップですでに変更が行われた可能性があります。再試行する前に結果を確認してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 단계에서 이미 변경이 발생했을 수 있습니다. 다시 시도하기 전에 결과를 확인하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Этот шаг мог уже внести изменения. Перед повтором проверьте результат." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此步骤可能已经产生更改；重试前请先核对结果。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "此步驟可能已造成變更；重試前請先確認結果。" } }
+      }
+    },
+    "Authorization changed. Refresh the task and check authorization before retrying." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Berechtigung hat sich geändert. Aktualisieren Sie die Aufgabe und prüfen Sie die Berechtigung vor einem erneuten Versuch." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Authorization changed. Refresh the task and check authorization before retrying." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La autorización cambió. Actualiza la tarea y comprueba la autorización antes de reintentarlo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’autorisation a changé. Actualisez la tâche et vérifiez l’autorisation avant de réessayer." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "認証状態が変わりました。タスクを更新し、再試行する前に認証を確認してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "권한이 변경되었습니다. 작업을 새로 고치고 다시 시도하기 전에 권한을 확인하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Авторизация изменилась. Обновите задачу и проверьте права перед повтором." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "授权状态已变化；请刷新任务并重新核对授权。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "授權狀態已變更；請重新整理任務並再次確認授權。" } }
+      }
+    },
+    "The target resource changed. Refresh the task and check its state before retrying." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die Zielressource hat sich geändert. Aktualisieren Sie die Aufgabe und prüfen Sie ihren Status vor einem erneuten Versuch." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The target resource changed. Refresh the task and check its state before retrying." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El recurso de destino cambió. Actualiza la tarea y comprueba su estado antes de reintentarlo." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La ressource cible a changé. Actualisez la tâche et vérifiez son état avant de réessayer." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "対象リソースが変更されました。タスクを更新し、再試行する前に状態を確認してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "대상 리소스가 변경되었습니다. 작업을 새로 고치고 다시 시도하기 전에 상태를 확인하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Целевой ресурс изменился. Обновите задачу и проверьте его состояние перед повтором." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "目标资源已变化；请刷新任务并核对资源状态。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目標資源已變更；請重新整理任務並確認資源狀態。" } }
       }
     },
     "Step details unavailable" : {
@@ -190002,6 +190296,118 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сведения о задаче недоступны" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务详情不可用" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務詳細資料無法使用" } }
+      }
+    },
+    "Continue generation" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Generierung fortsetzen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Continue generation" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Continuar generación" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Continuer la génération" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "生成を続ける" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "생성 계속하기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Продолжить генерацию" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "继续生成" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "繼續生成" } }
+      }
+    },
+    "Edit and resend" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Bearbeiten und erneut senden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Edit and resend" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Editar y reenviar" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Modifier et renvoyer" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "編集して再送信" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "수정 후 다시 보내기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Изменить и отправить повторно" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "编辑并重新发送" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "編輯並重新傳送" } }
+      }
+    },
+    "Regenerate answer" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Antwort neu generieren" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Regenerate answer" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Regenerar respuesta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Régénérer la réponse" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "回答を再生成" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "답변 다시 생성" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сгенерировать ответ заново" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重新生成回答" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重新產生回答" } }
+      }
+    },
+    "Send new version" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Neue Version senden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Send new version" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Enviar nueva versión" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Envoyer une nouvelle version" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "新しいバージョンを送信" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "새 버전 보내기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отправить новую версию" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "发送新版本" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "傳送新版本" } }
+      }
+    },
+    "Retry pending action" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ausstehende Aktion wiederholen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Retry pending action" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Reintentar acción pendiente" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réessayer l’action en attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "保留中の操作を再試行" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "대기 중인 작업 다시 시도" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторить ожидающее действие" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重试待确认操作" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "重試待確認操作" } }
+      }
+    },
+    "Retry the pending version action before starting another." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wiederhole die ausstehende Versionsaktion, bevor du eine neue startest." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Retry the pending version action before starting another." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Reintenta la acción de versión pendiente antes de iniciar otra." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réessayez l’action de version en attente avant d’en lancer une autre." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "次の操作を始める前に、保留中のバージョン操作を再試行してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "새 작업을 시작하기 전에 대기 중인 버전 작업을 다시 시도하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторите ожидающее действие с версией, прежде чем начинать новое." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "请先重试待确认的版本操作，再开始新操作。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "請先重試待確認的版本操作，再開始新操作。" } }
+      }
+    },
+    "Incomplete" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Unvollständig" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Incomplete" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Incompleto" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Incomplet" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "不完全" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "불완전" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Неполный" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "未完整" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "未完整" } }
+      }
+    },
+    "Streaming" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wird übertragen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Streaming" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "En curso" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En cours" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ストリーミング中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "스트리밍 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Передача" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "流式输出中" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "串流輸出中" } }
       }
     }
   },

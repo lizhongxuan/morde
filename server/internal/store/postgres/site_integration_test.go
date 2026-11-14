@@ -708,7 +708,7 @@ func TestHostDeletionDrainPersistsUntilDeletedTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deleting, err := store.TransitionHost(ctx, hostID, host.StateRunning, host.StateDeleting, "")
+	deleting, err := store.BeginHostDelete(ctx, hostID, host.StateRunning)
 	if err != nil || deleting.State != host.StateDeleting {
 		t.Fatalf("TransitionHost(running, deleting) = %#v, %v", deleting, err)
 	}
@@ -738,8 +738,23 @@ func TestHostDeletionDrainPersistsUntilDeletedTransition(t *testing.T) {
 		t.Fatalf("Host occupancy during delete retry = %#v, %v", occupancy, err)
 	}
 
+	if _, err := store.TransitionHost(ctx, hostID, host.StateDeleting, host.StateDeleted, ""); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("complete Host deletion before storage cleanup error = %v, want workspace busy", err)
+	}
+	workspaceValue, err := store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimedWorkspace, err := store.ClaimWorkspaceForDelete(ctx, workspaceID, workspaceValue.Revision)
+	if err != nil {
+		t.Fatalf("claim computer storage after physical cleanup: %v", err)
+	}
+	if _, err := store.CompleteWorkspaceDelete(ctx, workspaceID, claimedWorkspace.Revision); err != nil {
+		t.Fatalf("record completed computer storage cleanup: %v", err)
+	}
+
 	// This state transition is the database completion boundary. The production
-	// worker calls it only after sandbox and volume cleanup has succeeded.
+	// worker calls it only after physical storage and sandbox cleanup have succeeded.
 	deleted, err := store.TransitionHost(ctx, hostID, host.StateDeleting, host.StateDeleted, "")
 	if err != nil || deleted.State != host.StateDeleted {
 		t.Fatalf("TransitionHost(deleting, deleted) after cleanup = %#v, %v", deleted, err)

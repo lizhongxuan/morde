@@ -22,7 +22,7 @@ import (
 	"morde/server/internal/storage/workspacecurrent"
 )
 
-func TestPostgresWorkspaceOwnershipTransferPreservesTaskHistoryAndRevokesFormerOwner(t *testing.T) {
+func TestPostgresWorkspaceOwnershipTransferRefusesComputerStorageAndPreservesTaskHistory(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	oldOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
@@ -82,27 +82,17 @@ VALUES ($1,$2,$3,$4,'download','fill_missing','completed','complete',$5,$5,$5,0,
 	seedWorkspaceOwnerPhysicalUsage(t, ctx, store, oldOwner.ID, workspaceValue.ID, 9)
 
 	service := newTestWorkspaceOwnershipTransferService(t, store, 100)
-	created, replayed, err := service.RequestWorkspaceTransfer(ctx, oldPrincipal, workspaceValue.ID, newOwner.ID, workspaceValue.Revision, "transfer-request-01")
-	if err != nil || replayed || created.State != workspace.OwnershipTransferPending {
-		t.Fatalf("request ownership transfer = %#v replayed=%t err=%v", created, replayed, err)
+	if _, _, err := service.RequestWorkspaceTransfer(ctx, oldPrincipal, workspaceValue.ID, newOwner.ID,
+		workspaceValue.Revision, "transfer-request-01"); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("request computer storage ownership transfer = %v, want workspace busy", err)
 	}
-	replayedTransfer, replayed, err := service.RequestWorkspaceTransfer(ctx, oldPrincipal, workspaceValue.ID, newOwner.ID, workspaceValue.Revision, "transfer-request-01")
-	if err != nil || !replayed || replayedTransfer.ID != created.ID {
-		t.Fatalf("replay ownership transfer request = %#v replayed=%t err=%v", replayedTransfer, replayed, err)
-	}
-
-	accepted, err := service.AcceptWorkspaceTransfer(ctx, newPrincipal, workspaceValue.ID, created.ID, "transfer-accept-01")
-	if err != nil || accepted.State != workspace.OwnershipTransferAccepted || accepted.OperationID == "" {
-		t.Fatalf("accept Workspace transfer = %#v, %v", accepted, err)
-	}
-	repeated, err := service.AcceptWorkspaceTransfer(ctx, newPrincipal, workspaceValue.ID, created.ID, "transfer-accept-01")
-	if err != nil || repeated.State != workspace.OwnershipTransferAccepted || repeated.OperationID != accepted.OperationID {
-		t.Fatalf("replay Workspace acceptance = %#v, %v", repeated, err)
-	}
-
 	current, err := store.GetWorkspace(ctx, workspaceValue.ID)
-	if err != nil || current.OwnerID != newOwner.ID || current.ID != workspaceValue.ID || current.Revision != workspaceValue.Revision || current.UsedBytes != 5 {
-		t.Fatalf("Workspace identity or tree changed during transfer: %#v, %v", current, err)
+	if err != nil || current.OwnerID != oldOwner.ID || current.ID != workspaceValue.ID || current.Revision != workspaceValue.Revision || current.UsedBytes != 5 {
+		t.Fatalf("computer storage identity or tree changed after rejected transfer: %#v, %v", current, err)
+	}
+	var transferRows int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_ownership_transfers WHERE workspace_id=$1`, workspaceValue.ID).Scan(&transferRows); err != nil || transferRows != 0 {
+		t.Fatalf("computer storage ownership transfer rows = %d, want none: %v", transferRows, err)
 	}
 	var oldAllocated, newAllocated int64
 	if err := store.pool.QueryRow(ctx, `SELECT allocated_bytes FROM workspace_owner_block_usage WHERE owner_id=$1`, oldOwner.ID).Scan(&oldAllocated); err != nil {
@@ -111,25 +101,8 @@ VALUES ($1,$2,$3,$4,'download','fill_missing','completed','complete',$5,$5,$5,0,
 	if err := store.pool.QueryRow(ctx, `SELECT allocated_bytes FROM workspace_owner_block_usage WHERE owner_id=$1`, newOwner.ID).Scan(&newAllocated); err != nil {
 		t.Fatal(err)
 	}
-	if oldAllocated != 0 || newAllocated != 9 {
-		t.Fatalf("owner physical quota after transfer = old:%d new:%d, want old:0 new:9", oldAllocated, newAllocated)
-	}
-	var endedOwnerRows, currentOwnerRows int
-	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_ownership_history
-WHERE workspace_id=$1 AND owner_id=$2 AND ended_at IS NOT NULL`, workspaceValue.ID, oldOwner.ID).Scan(&endedOwnerRows); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_ownership_history
-WHERE workspace_id=$1 AND owner_id=$2 AND ended_at IS NULL AND transfer_id=$3`, workspaceValue.ID, newOwner.ID, created.ID).Scan(&currentOwnerRows); err != nil {
-		t.Fatal(err)
-	}
-	if endedOwnerRows != 1 || currentOwnerRows != 1 {
-		t.Fatalf("Workspace ownership history = ended old rows %d, current new rows %d", endedOwnerRows, currentOwnerRows)
-	}
-	var volumeOwner, provisionedOwner string
-	if err := store.pool.QueryRow(ctx, `SELECT owner_id, provisioned_owner_id FROM workspace_volumes WHERE workspace_id=$1`, workspaceValue.ID).
-		Scan(&volumeOwner, &provisionedOwner); err != nil || volumeOwner != newOwner.ID || provisionedOwner != oldOwner.ID {
-		t.Fatalf("Workspace volume ownership after transfer = %q/%q, %v", volumeOwner, provisionedOwner, err)
+	if oldAllocated != 9 || newAllocated != 0 {
+		t.Fatalf("owner physical quota after rejected transfer = old:%d new:%d, want old:9 new:0", oldAllocated, newAllocated)
 	}
 	var historicalTaskOwner, historicalTaskInitiator string
 	if err := store.pool.QueryRow(ctx, `SELECT owner_id,initiator_id FROM tasks WHERE id=$1`, createdTask.Task.ID).
@@ -140,22 +113,22 @@ WHERE workspace_id=$1 AND owner_id=$2 AND ended_at IS NULL AND transfer_id=$3`, 
 		t.Fatalf("former Task owner lost access through Task authorization: %v", err)
 	}
 	if _, err := store.GetTask(ctx, createdTask.Task.ID, newOwner.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("new Workspace owner read old Task history through Task authorization: %v", err)
+		t.Fatalf("another account read computer Task history through Task authorization: %v", err)
 	}
 
 	syncService := testWorkspaceSyncService(t, store)
-	if _, err := syncService.GetManifest(ctx, oldPrincipal, workspaceValue.ID, workspaceValue.Revision, "", "", 100); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("former owner read transferred Workspace file metadata: %v", err)
+	manifest, err := syncService.GetManifest(ctx, oldPrincipal, workspaceValue.ID, workspaceValue.Revision, "", "", 100)
+	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Path != "README.md" {
+		t.Fatalf("computer owner lost storage file metadata after rejected transfer: %#v, %v", manifest, err)
 	}
-	if _, err := syncService.GetSyncSession(ctx, oldPrincipal, workspaceValue.ID, syncSessionID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("former owner read historical Workspace sync session after transfer: %v", err)
+	if _, err := syncService.GetSyncSession(ctx, oldPrincipal, workspaceValue.ID, syncSessionID); err != nil {
+		t.Fatalf("computer owner lost storage sync history after rejected transfer: %v", err)
 	}
-	newManifest, err := syncService.GetManifest(ctx, newPrincipal, workspaceValue.ID, workspaceValue.Revision, "", "", 100)
-	if err != nil || len(newManifest.Files) != 1 || newManifest.Files[0].Path != "README.md" {
-		t.Fatalf("new owner could not read preserved Workspace file metadata: %#v, %v", newManifest, err)
+	if _, err := syncService.GetManifest(ctx, newPrincipal, workspaceValue.ID, workspaceValue.Revision, "", "", 100); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("another account read computer storage file metadata: %v", err)
 	}
 	if _, err := syncService.GetSyncSession(ctx, newPrincipal, workspaceValue.ID, syncSessionID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("new owner read an old owner's session-scoped history: %v", err)
+		t.Fatalf("another account read computer storage sync history: %v", err)
 	}
 }
 

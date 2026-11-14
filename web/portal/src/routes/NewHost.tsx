@@ -8,14 +8,14 @@ import { useAuth } from '../app/auth';
 import { useToast } from '../app/toast';
 import { FloatingError } from '../components/FloatingError';
 
-type HostCreateInput = { name?: string; workspace_mode: 'new' | 'existing' | 'automatic'; workspace_ids: string[] };
 type PendingHostCreate = {
-  version: 1;
-  fingerprint: string;
-  input: HostCreateInput;
+  name?: string;
   hostIdempotencyKey: string;
-  workspaceIdempotencyKey?: string;
-  workspaceID?: string;
+};
+
+type PendingHostCreateRead = {
+  pending: PendingHostCreate | null;
+  issue: 'legacy' | 'invalid' | null;
 };
 
 function pendingCreateKey(userID: string) {
@@ -25,26 +25,25 @@ function pendingCreateKey(userID: string) {
 function isPendingHostCreate(value: unknown): value is PendingHostCreate {
   if (!value || typeof value !== 'object') return false;
   const pending = value as Partial<PendingHostCreate>;
-  const input = pending.input;
   const validKey = (key: unknown) => typeof key === 'string' && /^[A-Za-z0-9._~-]{8,128}$/.test(key);
-  return pending.version === 1 && !!input && typeof input === 'object' &&
-    (input.name === undefined || typeof input.name === 'string') &&
-    (input.workspace_mode === 'new' || input.workspace_mode === 'existing' || input.workspace_mode === 'automatic') &&
-    Array.isArray(input.workspace_ids) && input.workspace_ids.every((id) => typeof id === 'string') &&
-    pending.fingerprint === JSON.stringify(input) && validKey(pending.hostIdempotencyKey) &&
-    (input.workspace_mode !== 'new' || validKey(pending.workspaceIdempotencyKey)) &&
-    (pending.workspaceID === undefined || typeof pending.workspaceID === 'string');
+  return Object.keys(value).every((key) => key === 'name' || key === 'hostIdempotencyKey') &&
+    (pending.name === undefined || typeof pending.name === 'string') &&
+    validKey(pending.hostIdempotencyKey);
 }
 
-function readPendingHostCreate(userID?: string): { pending: PendingHostCreate | null; invalid: boolean } {
-  if (!userID) return { pending: null, invalid: false };
+function readPendingHostCreate(userID?: string): PendingHostCreateRead {
+  if (!userID) return { pending: null, issue: null };
   try {
     const raw = localStorage.getItem(pendingCreateKey(userID));
-    if (!raw) return { pending: null, invalid: false };
+    if (!raw) return { pending: null, issue: null };
     const value: unknown = JSON.parse(raw);
-    return isPendingHostCreate(value) ? { pending: value, invalid: false } : { pending: null, invalid: true };
+    if (isPendingHostCreate(value)) return { pending: value, issue: null };
+    if (value && typeof value === 'object' && (value as { version?: unknown }).version === 1) {
+      return { pending: null, issue: 'legacy' };
+    }
+    return { pending: null, issue: 'invalid' };
   } catch {
-    return { pending: null, invalid: true };
+    return { pending: null, issue: 'invalid' };
   }
 }
 
@@ -54,63 +53,41 @@ export function NewHost() {
   const { user } = useAuth();
   const { notify } = useToast();
   const hosts = useQuery({ queryKey: ['hosts'], queryFn: portalApi.hosts });
+  const ownedHostCount = hosts.data?.items.filter((host) => host.owner_id === user?.id).length ?? 0;
   const [restored] = useState(() => readPendingHostCreate(user?.id));
-  const [name, setName] = useState(restored.pending?.input.name ?? '');
+  const [name, setName] = useState(restored.pending?.name ?? '');
   const pendingCreate = useRef<PendingHostCreate | null>(restored.pending);
   const [recoveryPending, setRecoveryPending] = useState(!!restored.pending);
-  const [recoveryError, setRecoveryError] = useState(restored.invalid);
+  const [recoveryIssue, setRecoveryIssue] = useState(restored.issue);
 
   const create = useMutation({
-    mutationFn: async (pending: PendingHostCreate) => {
-      const input = pending.input;
-      if (input.workspace_mode === 'automatic') {
-        return portalApi.createHost({ ...(input.name ? { name: input.name } : {}) }, pending.hostIdempotencyKey);
-      }
-      let workspaceIDs = input.workspace_ids;
-      if (input.workspace_mode === 'new') {
-        let workspaceID = pending.workspaceID;
-        if (!workspaceID) {
-          const workspace = await portalApi.createWorkspace(
-            { name: `${input.name || '项目'}工作区`.slice(0, 100) }, pending.workspaceIdempotencyKey,
-          );
-          workspaceID = workspace.id;
-          pending.workspaceID = workspaceID;
-          localStorage.setItem(pendingCreateKey(user!.id), JSON.stringify(pending));
-        }
-        workspaceIDs = [workspaceID];
-      }
-      return portalApi.createHost({ ...(input.name ? { name: input.name } : {}), workspace_ids: workspaceIDs }, pending.hostIdempotencyKey);
-    },
+    mutationFn: (pending: PendingHostCreate) =>
+      portalApi.createHost({ ...(pending.name ? { name: pending.name } : {}) }, pending.hostIdempotencyKey),
     onSuccess: () => {
       try { localStorage.removeItem(pendingCreateKey(user!.id)); } catch { /* A stale record only replays this same idempotent request. */ }
       pendingCreate.current = null;
       setRecoveryPending(false);
       void client.invalidateQueries({ queryKey: ['hosts'] });
-      void client.invalidateQueries({ queryKey: ['workspaces'] });
       notify('云端电脑创建已提交，正在等待启动。', 'success');
       navigate('/hosts', { replace: true });
     },
     onError: (error) => {
       const knownRejection = error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 401;
       setRecoveryPending(!knownRejection);
-      void client.invalidateQueries({ queryKey: ['workspaces'] });
       notify(errorDetails(error).message, 'error');
     },
   });
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (create.isPending || recoveryError || !user) return;
+    if (create.isPending || recoveryIssue || !user) return;
     if (recoveryPending && pendingCreate.current) {
       create.mutate(pendingCreate.current);
       return;
     }
-    const input = { ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: 'automatic' as const, workspace_ids: [] as string[] };
-    const fingerprint = JSON.stringify(input);
-    if (!pendingCreate.current || pendingCreate.current.fingerprint !== fingerprint) {
+    const normalizedName = name.trim();
+    if (!pendingCreate.current || pendingCreate.current.name !== (normalizedName || undefined)) {
       pendingCreate.current = {
-        version: 1,
-        fingerprint,
-        input,
+        ...(normalizedName ? { name: normalizedName } : {}),
         hostIdempotencyKey: newIdempotencyKey(),
       };
     }
@@ -129,7 +106,7 @@ export function NewHost() {
       localStorage.removeItem(pendingCreateKey(user.id));
       pendingCreate.current = null;
       setRecoveryPending(false);
-      setRecoveryError(false);
+      setRecoveryIssue(null);
     } catch {
       notify('无法清除本机的创建恢复记录。', 'error');
     }
@@ -137,17 +114,23 @@ export function NewHost() {
 
   if (hosts.isPending) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
   if (hosts.isError) return <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>;
-  if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <FloatingError>已达到云端电脑数量上限</FloatingError>;
+  if (ownedHostCount >= (user?.quota.hosts ?? 0) && !recoveryIssue) return <FloatingError>已达到云端电脑数量上限</FloatingError>;
   return <section>
-    {recoveryError && <FloatingError>无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></FloatingError>}
+    {recoveryIssue && <FloatingError>
+      {recoveryIssue === 'legacy'
+        ? '发现旧版电脑创建恢复记录，不能安全重放。请先检查云端电脑列表，确认上次创建结果，再清除本机记录。'
+        : '无法读取本机上次创建记录。为避免重复创建，请先检查云端电脑列表并核实结果，再清除本机记录。'}
+      {' '}<Link to="/hosts">检查云端电脑列表</Link>{' '}
+      <button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button>
+    </FloatingError>}
     <form className="form-card form-stack" onSubmit={submit}>
       <div className="design-panel-header"><div><h2>基本配置</h2><p>使用管理员为你设置的规格。</p></div><Link className="button button-secondary" to="/hosts">← 返回云端电脑</Link></div>
       {recoveryPending && !create.isPending && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会用相同请求编号核对结果；若已在主机列表确认，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}
-      <p className="notice notice-info">默认工作和下载目录位于 <code>/home/gem/workspace</code>。建议将需要保留的文件保存到此目录。</p>
+      <p className="notice notice-info">电脑文件保存在专属的 <code>~/workspace/</code> 目录中。这里的数据随电脑持久保存；项目同步会写入 <code>~/workspace/project/项目名/</code>。</p>
       <label htmlFor="host-name">云端电脑名称 <span className="muted">（可选）</span></label>
-      <input id="host-name" value={name} maxLength={100} disabled={recoveryPending || recoveryError} onChange={(event) => setName(event.target.value)} placeholder="例如：数据分析" />
-      <p className="muted">电脑会自动准备文件空间；你不需要单独选择工作区。</p>
-      <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryError}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建云端电脑'}</button></div>
+      <input id="host-name" value={name} maxLength={100} disabled={recoveryPending || recoveryIssue !== null} onChange={(event) => setName(event.target.value)} placeholder="例如：数据分析" />
+      <p className="muted">创建电脑时会自动准备其专属文件目录，无需另外配置。</p>
+      <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryIssue !== null}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建云端电脑'}</button></div>
     </form>
   </section>;
 }

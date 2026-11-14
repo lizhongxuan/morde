@@ -107,8 +107,8 @@ test.describe("default computer and Workspace continuity", () => {
     await defaultComputer.selectOption(secondHostID);
     await expect(defaultComputer).toHaveValue(secondHostID);
     await expect(page.locator(".host-default-workspace strong")).toHaveText("默认电脑二 Workspace");
-    await expect(page.getByRole("link", { name: "管理 Workspace" }))
-      .toHaveAttribute("href", `/workspaces?host=${secondHostID}`);
+    await expect(page.getByLabel("默认云端电脑设置").getByRole("link", { name: "文件同步" }))
+      .toHaveAttribute("href", `/hosts?sync=1&host=${secondHostID}`);
 
     await page.reload();
     await expect(page.getByRole("combobox", { name: "默认云端电脑" })).toHaveValue(secondHostID);

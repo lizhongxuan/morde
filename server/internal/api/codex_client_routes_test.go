@@ -5,12 +5,14 @@ import (
 	"testing"
 )
 
-func TestCodexClientCredentialReadAllowlist(t *testing.T) {
+func TestCodexClientCredentialRouteAllowlist(t *testing.T) {
 	for _, route := range []struct{ method, path string }{
+		{http.MethodPost, "/api/codex/connections"},
 		{http.MethodGet, "/api/codex/sessions"},
 		{http.MethodGet, "/api/codex/sessions/:id/events"},
 		{http.MethodGet, "/api/codex/sessions/:id/events/stream"},
 		{http.MethodPost, "/api/codex/sessions/:id/commands"},
+		{http.MethodDelete, "/api/codex/connections/:profile_key"},
 	} {
 		if !clientCredentialRoute(route.method, route.path) {
 			t.Errorf("clientCredentialRoute(%q, %q) = false", route.method, route.path)

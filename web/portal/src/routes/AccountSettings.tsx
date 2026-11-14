@@ -190,7 +190,7 @@ function PersonalSyncSettings() {
       {status.error && <FloatingError className="error-inline" role="alert">无法读取本机同步队列：{status.error}</FloatingError>}
       {status.conflictCount !== null && status.conflictCount > 0 && <p className="notice notice-warning">存在未解决冲突；本地草稿已保留，请到<Link to="/personal">个人数据</Link>查看并处理。</p>}
     </div>
-    <div className="connection-section-heading"><div><h3>个人数据额度</h3><p className="muted">包括个人对象、计划和个人附件，不包括聊天、工作区和完整记录。</p></div></div>
+    <div className="connection-section-heading"><div><h3>个人数据额度</h3><p className="muted">包括个人对象、计划和个人附件，不包括聊天、云端电脑文件和完整记录。</p></div></div>
     {quota.isPending ? <div className="loading-card" role="status">正在读取个人数据额度…</div>
       : quota.isError ? <FloatingError className="error-card" role="alert">{errorDetails(quota.error).message}<button type="button" className="button button-secondary" onClick={() => void quota.refetch()}>重试</button></FloatingError>
         : <p className="notice notice-info" role="status">已用 {formatBytes(quota.data.used_bytes)}，待上传预留 {formatBytes(quota.data.reserved_bytes)}，总额度 {formatBytes(quota.data.quota_bytes)}，可用 {formatBytes(quota.data.remaining_bytes)}；单附件上限 {formatBytes(quota.data.max_attachment_bytes)}。</p>}

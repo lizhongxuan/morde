@@ -31,7 +31,19 @@ private func ios03HTTPResponseMatchesOrigin(_ response: HTTPURLResponse, origin:
 }
 
 final class IOS03SimulatorAcceptanceUITests: XCTestCase {
-    func testLoginAndReadWorkspaceResources() throws {
+    private func openComputerFiles(_ app: XCUIApplication, hostID: String) {
+        let host = app.buttons["morde.resources.host.open.\(hostID)"]
+        XCTAssertTrue(host.waitForExistence(timeout: 10))
+        host.tap()
+        let workbench = app.descendants(matching: .any)["morde.computer.webview"]
+        XCTAssertTrue(workbench.waitForExistence(timeout: 10))
+        let files = workbench.buttons["文件"]
+        XCTAssertTrue(files.waitForExistence(timeout: 20))
+        files.tap()
+        XCTAssertTrue(app.scrollViews["morde.workspace.files"].waitForExistence(timeout: 10))
+    }
+
+    func testLoginAndReadComputerResources() throws {
         guard let account = ProcessInfo.processInfo.environment["MORDE_IOS03_TEST_USER"],
               let password = ProcessInfo.processInfo.environment["MORDE_IOS03_TEST_PASSWORD"],
               let serverAddress = ProcessInfo.processInfo.environment["MORDE_IOS03_TEST_SERVER"] else {
@@ -1606,14 +1618,15 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                        "Friend actions stay hidden until the feature is implemented.")
         attachScreen(app, named: "MDA-09-friends-placeholder")
         menu.tap()
-        app.buttons["morde.nav.drawer.toolChats"].tap()
-        XCTAssertTrue(app.descendants(matching: .any)["morde.placeholder.toolChats"].waitForExistence(timeout: 10))
+        app.buttons["morde.nav.drawer.codexSessions"].tap()
+        XCTAssertTrue(app.buttons["morde.codex.refresh"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["没有可用的已授权 PC 安装。"].waitForExistence(timeout: 10),
+                      "The empty Codex sessions state must render after installations load.")
         for tab in ["chat", "tasks", "approvals", "resources"] {
             XCTAssertFalse(app.buttons["morde.nav.tab.\(tab)"].isSelected,
-                           "The AI tool chat placeholder does not select a primary tab.")
+                           "The Codex sessions page does not select a primary tab.")
         }
-        attachScreen(app, named: "MDA-10-tool-chats-placeholder")
-        app.buttons["morde.toolChats.back"].tap()
+        attachScreen(app, named: "MDA-10-codex-sessions")
         XCTAssertTrue(menu.waitForExistence(timeout: 5))
 
         menu.tap()
@@ -3346,39 +3359,19 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [enabledAgain], timeout: 10), .completed)
     }
 
-    func testMordeResourceWorkspaceRouteBrowsesSyntheticManifest() {
+    func testMordeResourceHostRouteBrowsesSyntheticManifest() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
-                                                   "-morde.localWorkspaceReadOnlyFixture",
+                                                   "-morde.localHostWorkbenchFixture",
                                                    "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"],
                         resetExistingAccount: true)
         app.buttons["morde.nav.tab.resources"].tap()
 
-        let workspace = app.buttons["morde.resources.workspace.open.w0000001"]
-        XCTAssertTrue(workspace.waitForExistence(timeout: 10))
-        XCTAssertTrue(waitForAccessibilityLabel(workspace, containing: "就绪", timeout: 10),
-                      "A computer's files show ready only when the server confirms the binding. Actual: \(workspace.label)")
-        XCTAssertTrue(workspace.label.contains("Running host"), "The file state names its actual bound computer.")
-        let syncingWorkspace = app.buttons["morde.resources.workspace.open.w0000002"]
-        XCTAssertTrue(syncingWorkspace.waitForExistence(timeout: 5))
-        XCTAssertTrue(waitForAccessibilityLabel(syncingWorkspace, containing: "同步中", timeout: 10),
-                      "An active but syncing binding keeps its real status. Actual: \(syncingWorkspace.label)")
-        XCTAssertTrue(syncingWorkspace.label.contains("Unready binding host"), "The syncing row keeps its actual Host name.")
-        XCTAssertFalse(syncingWorkspace.label.contains("已就绪"))
-        let unavailableWorkspace = app.buttons["morde.resources.workspace.open.w0000003"]
-        XCTAssertTrue(unavailableWorkspace.exists)
-        XCTAssertTrue(unavailableWorkspace.label.contains("不可用"), "A Workspace the API reports as syncing stays unavailable.")
-        XCTAssertFalse(unavailableWorkspace.label.contains("已就绪"))
-        XCTAssertFalse(unavailableWorkspace.label.contains("Unready binding host"), "No Host name is shown without a binding.")
-        let unboundWorkspace = app.buttons["morde.resources.workspace.open.w0000005"]
-        XCTAssertTrue(unboundWorkspace.exists)
-        XCTAssertTrue(unboundWorkspace.label.contains("未关联云端电脑"), "An unlinked computer-file resource is identified accurately.")
-        XCTAssertFalse(unboundWorkspace.label.contains("已就绪"))
-        XCTAssertFalse(unboundWorkspace.label.contains("Running host"), "An unbound Workspace does not invent a Host.")
         let host = app.buttons["morde.resources.host.open.h0000001"]
-        XCTAssertTrue(host.exists)
+        XCTAssertTrue(host.waitForExistence(timeout: 10))
         XCTAssertTrue(host.label.contains("电脑文件已就绪"), "Show the binding's confirmed file readiness on its computer.")
         let syncingHost = app.buttons["morde.resources.host.open.h0000003"]
+        XCTAssertTrue(syncingHost.waitForExistence(timeout: 5))
         XCTAssertTrue(syncingHost.label.contains("电脑文件同步中"), "Show the server's pending sync state on its computer.")
         XCTAssertTrue(app.staticTexts["云端电脑"].exists)
         XCTAssertFalse(app.staticTexts["云端主机"].exists)
@@ -3388,20 +3381,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["云手机"].exists)
         XCTAssertFalse(app.staticTexts["Cloud phones"].exists)
         XCTAssertLessThan(host.frame.minY, cloudPhoneStatus.frame.minY)
-        XCTAssertLessThan(cloudPhoneStatus.frame.minY, workspace.frame.minY,
-                          "The unavailable status stays between Host and Workspace content without an extra heading.")
         XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.aiTools"].exists,
                       "Connector metadata must not be presented as live AI tool status.")
         let resourceScroll = app.scrollViews["morde.resources.scroll"]
         XCTAssertTrue(resourceScroll.waitForExistence(timeout: 5))
         attachScreen(app, named: "MDA-07 resources initial viewport")
-        for _ in 0..<10 {
-            guard !workspace.isHittable || !syncingWorkspace.isHittable else { break }
-            resourceScroll.swipeUp()
-        }
-        XCTAssertTrue(workspace.isHittable && syncingWorkspace.isHittable,
-                      "The screenshot should show the mounted and syncing Workspace rows.")
-        attachScreen(app, named: "MDA-07 mounted and syncing Workspace status rows")
         let aiToolsEmpty = app.descendants(matching: .any)["morde.resources.empty.aiTools"]
         for _ in 0..<12 { resourceScroll.swipeUp() }
         XCTAssertTrue(aiToolsEmpty.isHittable, "The last resource section should be visible at the content end.")
@@ -3409,8 +3393,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(tabBarButton.frame.minY - 5 - aiToolsEmpty.frame.maxY, 30, accuracy: 3,
                        "The final resource row should sit 30 pt above the floating tab bar capsule.")
         attachScreen(app, named: "MDA-07 resources at final-row tail gap")
-        for _ in 0..<12 where !workspace.isHittable { resourceScroll.swipeDown() }
-        XCTAssertTrue(workspace.isHittable, "The Workspace row should return to view when scrolling back up.")
+        for _ in 0..<12 where !host.isHittable { resourceScroll.swipeDown() }
+        XCTAssertTrue(host.isHittable, "The computer row should return to view when scrolling back up.")
         let addResource = app.buttons["morde.resources.add"]
         XCTAssertTrue(addResource.exists)
         XCTAssertTrue(addResource.isEnabled)
@@ -3424,8 +3408,12 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         attachScreen(app, named: "MDA-07 resource add transient top toast")
         XCTAssertFalse(app.alerts.firstMatch.exists,
                        "The prototype add action is transient feedback and must not add a dismissal button.")
-        workspace.tap()
-
+        host.tap()
+        let workbench = app.descendants(matching: .any)["morde.computer.webview"]
+        XCTAssertTrue(workbench.waitForExistence(timeout: 10))
+        let filesButton = workbench.buttons["文件"]
+        XCTAssertTrue(filesButton.waitForExistence(timeout: 20))
+        filesButton.tap()
         let workspaceFiles = app.scrollViews["morde.workspace.files"]
         XCTAssertTrue(workspaceFiles.waitForExistence(timeout: 10))
         let workspaceTitle = app.descendants(matching: .any)["morde.workspace.title"]
@@ -3462,15 +3450,18 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["guide.md"].waitForExistence(timeout: 10))
         app.buttons["morde.workspace.breadcrumb.parent"].tap()
         XCTAssertTrue(app.staticTexts["README.md"].waitForExistence(timeout: 10))
-        app.buttons["返回资源"].tap()
+        app.buttons["morde.workspace.back"].tap()
+        XCTAssertTrue(app.buttons["morde.computer.close"].waitForExistence(timeout: 5))
+        app.buttons["morde.computer.close"].tap()
         XCTAssertTrue(app.buttons["morde.nav.tab.resources"].waitForExistence(timeout: 5))
     }
 
     func testMordeWorkspaceFileActionsStayInRowMenu() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture"])
+        launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
+                                                   "-morde.localHostWorkbenchFixture"])
         app.buttons["morde.nav.tab.resources"].tap()
-        app.buttons["morde.resources.workspace.open.w0000001"].tap()
+        openComputerFiles(app, hostID: "h0000001")
 
         let fileActions = app.buttons["README.md 的操作"]
         XCTAssertTrue(fileActions.waitForExistence(timeout: 10))
@@ -3520,9 +3511,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     func testMordeWorkspaceRejectsUnsafeManifestPaths() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
+                                                   "-morde.localHostWorkbenchFixture",
                                                    "-morde.localWorkspaceInvalidManifestFixture"])
         app.buttons["morde.nav.tab.resources"].tap()
-        app.buttons["morde.resources.workspace.open.w0000001"].tap()
+        openComputerFiles(app, hostID: "h0000001")
 
         let manifestError = app.staticTexts.matching(
             NSPredicate(format: "label BEGINSWITH %@", "文件清单暂不可用：")
@@ -3532,15 +3524,16 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                        "An unsafe manifest path must not be rendered as a file row.")
         XCTAssertFalse(app.buttons["README.md 的操作"].exists)
         XCTAssertFalse(app.buttons["Retry"].exists)
-        XCTAssertTrue(app.buttons["返回资源"].exists)
+        XCTAssertTrue(app.buttons["morde.workspace.back"].exists)
     }
 
     func testMordeWorkspaceRejectsFileDirectoryPathConflicts() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
+                                                   "-morde.localHostWorkbenchFixture",
                                                    "-morde.localWorkspacePathConflictFixture"])
         app.buttons["morde.nav.tab.resources"].tap()
-        app.buttons["morde.resources.workspace.open.w0000001"].tap()
+        openComputerFiles(app, hostID: "h0000001")
 
         let manifestError = app.staticTexts.matching(
             NSPredicate(format: "label BEGINSWITH %@", "文件清单暂不可用：")
@@ -3549,15 +3542,16 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["docs"].exists,
                        "A file path cannot also be the parent of a manifest directory.")
         XCTAssertFalse(app.buttons["morde.workspace.directory.docs"].exists)
-        XCTAssertTrue(app.buttons["返回资源"].exists)
+        XCTAssertTrue(app.buttons["morde.workspace.back"].exists)
     }
 
     func testMordeWorkspaceStopsRepeatedManifestCursor() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
+                                                   "-morde.localHostWorkbenchFixture",
                                                    "-morde.localWorkspaceManifestCursorLoopFixture"])
         app.buttons["morde.nav.tab.resources"].tap()
-        app.buttons["morde.resources.workspace.open.w0000001"].tap()
+        openComputerFiles(app, hostID: "h0000001")
 
         XCTAssertTrue(app.staticTexts["README.md"].waitForExistence(timeout: 10))
         let manifestError = app.staticTexts.matching(
@@ -3566,182 +3560,16 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(manifestError.waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["second-page.md"].exists,
                        "A repeated cursor page must not be appended or retried forever.")
-        XCTAssertTrue(app.buttons["返回资源"].exists)
-    }
-
-    func testMordeWorkspaceShareCreatesLinkWithSelectedPermission() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
-                                                   "-morde.localWorkspaceShareFixture"])
-        app.buttons["morde.nav.tab.resources"].tap()
-        app.buttons["morde.resources.workspace.open.w0000001"].tap()
-        app.buttons["morde.workspace.share"].tap()
-
-        XCTAssertTrue(app.staticTexts["分享电脑文件"].waitForExistence(timeout: 5))
-        let editPermission = app.buttons["morde.workspace.share.permission.edit"]
-        XCTAssertTrue(editPermission.waitForExistence(timeout: 5))
-        editPermission.tap()
-        XCTAssertEqual(editPermission.value as? String, "selected")
-        app.buttons["morde.workspace.share.copy"].tap()
-        XCTAssertTrue(app.staticTexts["morde.workspace.share.copied"].waitForExistence(timeout: 10))
-    }
-
-    func testMordeWorkspaceShareDeepLinkClaimsPermanentIndependentCopy() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let stalePrompt = springboard.alerts.firstMatch
-        if stalePrompt.waitForExistence(timeout: 1) {
-            stalePrompt.buttons["取消"].tap()
-        }
-        launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
-                                                   "-morde.localWorkspaceShareFixture",
-                                                   "-morde.localWorkspaceShareDeepLinkFixture"])
-
-        let acceptCopy = app.buttons["morde.workspace.share.accept"]
-        XCTAssertTrue(acceptCopy.waitForExistence(timeout: 20), "The share deep link should present the recipient claim flow.")
-        XCTAssertTrue(app.staticTexts["Ready Workspace"].exists)
-        XCTAssertTrue(app.staticTexts["可查看 · 只能看文件"].exists)
-        XCTAssertTrue(app.staticTexts["领取后会创建归你所有的独立副本，之后与原文件目录无关。"].exists)
-        acceptCopy.tap()
-
-        let resources = app.buttons["morde.nav.tab.resources"]
-        XCTAssertTrue(resources.waitForExistence(timeout: 10))
-        resources.tap()
-        let acceptedCopy = app.buttons["morde.resources.workspace.open.w0000004"]
-        XCTAssertTrue(acceptedCopy.waitForExistence(timeout: 20),
-                      "Accepting a link should add the independent copy to the recipient's Workspace list.")
-    }
-
-    func testMordeWorkspaceEditShareDeepLinkClaimsEditableIndependentCopy() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let stalePrompt = springboard.alerts.firstMatch
-        if stalePrompt.waitForExistence(timeout: 1) {
-            stalePrompt.buttons["取消"].tap()
-        }
-        launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
-                                                   "-morde.localWorkspaceShareFixture",
-                                                   "-morde.localWorkspaceShareEditFixture",
-                                                   "-morde.localWorkspaceShareDeepLinkFixture"])
-
-        let acceptCopy = app.buttons["morde.workspace.share.accept"]
-        XCTAssertTrue(acceptCopy.waitForExistence(timeout: 20), "The edit-share deep link should present the recipient claim flow.")
-        XCTAssertTrue(app.staticTexts["Ready Workspace"].exists)
-        XCTAssertTrue(app.staticTexts["可编辑 · 能改文件"].exists)
-        XCTAssertTrue(app.staticTexts["领取后会创建归你所有的独立副本，之后与原文件目录无关。"].exists)
-        acceptCopy.tap()
-
-        let resources = app.buttons["morde.nav.tab.resources"]
-        XCTAssertTrue(resources.waitForExistence(timeout: 10))
-        resources.tap()
-        let original = app.buttons["morde.resources.workspace.open.w0000001"]
-        let acceptedCopy = app.buttons["morde.resources.workspace.open.w0000004"]
-        XCTAssertTrue(original.waitForExistence(timeout: 20), "The original Workspace remains distinct from the claimed copy.")
-        XCTAssertTrue(acceptedCopy.waitForExistence(timeout: 20),
-                      "Accepting an edit link should add a separate Workspace copy to the recipient's list.")
-        XCTAssertTrue(acceptedCopy.label.contains("Ready Workspace copy"))
-        XCTAssertFalse(acceptedCopy.label.contains("只读"), "An edit-permission copy must not be marked read-only.")
-        XCTAssertNotEqual(original.identifier, acceptedCopy.identifier,
-                          "The accepted copy must have its own Workspace identity.")
-
-        acceptedCopy.tap()
-        XCTAssertTrue(app.staticTexts["Ready Workspace copy"].waitForExistence(timeout: 10))
-        let fileActions = app.buttons["README.md 的操作"]
-        XCTAssertTrue(fileActions.waitForExistence(timeout: 10))
-        fileActions.tap()
-        XCTAssertTrue(app.buttons["重命名"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["重命名"].isEnabled)
-        XCTAssertTrue(app.buttons["移动"].isEnabled)
-        XCTAssertTrue(app.buttons["删除电脑文件"].isEnabled,
-                      "The accepted edit copy should allow Workspace file mutations.")
-    }
-
-    func testMordeWorkspaceSharePreviewNotFoundShowsInvalidLinkError() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: [
-            "-morde.localResourceAcceptanceFixture",
-            "-morde.localWorkspaceShareFixture",
-            "-morde.localWorkspaceShareDeepLinkFixture",
-            "-morde.localWorkspaceSharePreviewNotFoundFixture",
-        ])
-
-        let invalidLink = app.staticTexts["此链接已失效或已被领取，请向分享者索取新链接。"]
-        XCTAssertTrue(invalidLink.waitForExistence(timeout: 20))
-        XCTAssertFalse(app.buttons["morde.workspace.share.accept"].exists,
-                       "A not-found preview must not leave a claim action available.")
-        XCTAssertFalse(app.staticTexts["Ready Workspace copy"].exists,
-                       "A missing share link must not be shown as an accepted copy.")
-        attachScreen(app, named: "MDA-14-share-preview-not-found-error")
-    }
-
-    func testMordeWorkspaceShareAcceptNotFoundDoesNotReportSuccess() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: [
-            "-morde.localResourceAcceptanceFixture",
-            "-morde.localWorkspaceShareFixture",
-            "-morde.localWorkspaceShareDeepLinkFixture",
-            "-morde.localWorkspaceShareAcceptNotFoundFixture",
-        ])
-
-        let accept = app.buttons["morde.workspace.share.accept"]
-        XCTAssertTrue(accept.waitForExistence(timeout: 20))
-        accept.tap()
-
-        let invalidLink = app.staticTexts["此链接已失效或已被领取，请向分享者索取新链接。"]
-        XCTAssertTrue(invalidLink.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.buttons["morde.workspace.share.accept"].exists,
-                       "A not-found acceptance must not leave a claim action available.")
-        XCTAssertFalse(app.staticTexts["Ready Workspace copy"].exists,
-                       "A rejected claim must not be shown as an accepted copy.")
-        attachScreen(app, named: "MDA-14-share-accept-not-found-error")
-    }
-
-    func testMordeWorkspaceSharePreviewNetworkFailureShowsError() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: [
-            "-morde.localResourceAcceptanceFixture",
-            "-morde.localWorkspaceShareFixture",
-            "-morde.localWorkspaceShareDeepLinkFixture",
-            "-morde.localWorkspaceSharePreviewNetworkFailureFixture",
-        ])
-
-        let error = app.staticTexts["Synthetic Workspace share preview network failure"]
-        XCTAssertTrue(error.waitForExistence(timeout: 20))
-        XCTAssertFalse(app.buttons["morde.workspace.share.accept"].exists,
-                       "A failed preview request must not offer a claim action.")
-        XCTAssertFalse(app.staticTexts["Ready Workspace copy"].exists,
-                       "A failed preview request must not be shown as an accepted copy.")
-        attachScreen(app, named: "MDA-14-share-preview-network-error")
-    }
-
-    func testMordeWorkspaceShareAcceptNetworkFailureShowsErrorWithoutSuccess() {
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: [
-            "-morde.localResourceAcceptanceFixture",
-            "-morde.localWorkspaceShareFixture",
-            "-morde.localWorkspaceShareDeepLinkFixture",
-            "-morde.localWorkspaceShareAcceptNetworkFailureFixture",
-        ])
-
-        let accept = app.buttons["morde.workspace.share.accept"]
-        XCTAssertTrue(accept.waitForExistence(timeout: 20))
-        accept.tap()
-
-        let error = app.staticTexts["Synthetic Workspace share accept network failure"]
-        XCTAssertTrue(error.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.buttons["morde.workspace.share.accept"].exists,
-                       "A failed claim response must not leave an active claim action.")
-        XCTAssertFalse(app.staticTexts["Ready Workspace copy"].exists,
-                       "A failed claim response must not be shown as an accepted copy.")
-        attachScreen(app, named: "MDA-14-share-accept-network-error")
+        XCTAssertTrue(app.buttons["morde.workspace.back"].exists)
     }
 
     func testMordeReadOnlyWorkspaceDisablesCloudMutations() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localResourceAcceptanceFixture",
+                                                   "-morde.localHostWorkbenchFixture",
                                                    "-morde.localWorkspaceReadOnlyFixture"])
         app.buttons["morde.nav.tab.resources"].tap()
-        app.buttons["morde.resources.workspace.open.w0000005"].tap()
+        openComputerFiles(app, hostID: "h0000001")
 
         let fileActions = app.buttons["README.md 的操作"]
         XCTAssertTrue(fileActions.waitForExistence(timeout: 10))
@@ -3825,7 +3653,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(app.staticTexts["morde.resources.host.status.h0000001"].label, "运行中")
         XCTAssertFalse(app.buttons["morde.resources.host.open.h0000002"].exists,
                        "This visual fixture intentionally shows one ordinary Host state.")
-        XCTAssertTrue(app.buttons["morde.resources.workspace.open.w0000001"].exists)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "morde.resources.workspace.open.")).firstMatch.exists,
+                       "Computer files are reached through the owning computer, not a separate Workspace list.")
         XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.cloudPhones"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.aiTools"].exists)
         XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "剩余")).count, 0,
@@ -3857,14 +3686,14 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
         let refreshError = app.descendants(matching: .any)["morde.resources.loadError"]
         XCTAssertTrue(refreshError.waitForExistence(timeout: 15))
-        let workspace = app.buttons["morde.resources.workspace.open.w0000001"]
-        XCTAssertFalse(workspace.exists)
+        let host = app.buttons["morde.resources.host.open.h0000001"]
+        XCTAssertFalse(host.exists)
         let resourceList = app.scrollViews["morde.resources.scroll"]
         XCTAssertTrue(resourceList.exists)
         let pullStart = resourceList.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08))
         let pullEnd = resourceList.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85))
         pullStart.press(forDuration: 0.1, thenDragTo: pullEnd)
-        XCTAssertTrue(workspace.waitForExistence(timeout: 20))
+        XCTAssertTrue(host.waitForExistence(timeout: 20))
         XCTAssertFalse(refreshError.exists)
     }
 
@@ -3878,7 +3707,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
         XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.cloudComputers"]
             .waitForExistence(timeout: 15))
-        XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.workspaces"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["morde.resources.empty.workspaces"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.cloudPhones"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["morde.resources.empty.aiTools"].exists)
         XCTAssertFalse(app.alerts["请求失败"].exists)

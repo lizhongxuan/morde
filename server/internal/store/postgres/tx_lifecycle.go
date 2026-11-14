@@ -92,6 +92,14 @@ WHERE id = $1 AND state = 'creating' AND create_attempted_at IS NULL`, hostID, r
 // TransitionHost performs a compare-and-swap update. A stale expected state
 // never overwrites a concurrent transition.
 func (s *Store) TransitionHost(ctx context.Context, hostID string, from, to host.State, reason string) (host.Host, error) {
+	return s.transitionHost(ctx, hostID, from, to, reason, false)
+}
+
+func (s *Store) BeginHostDelete(ctx context.Context, hostID string, from host.State) (host.Host, error) {
+	return s.transitionHost(ctx, hostID, from, host.StateDeleting, "", true)
+}
+
+func (s *Store) transitionHost(ctx context.Context, hostID string, from, to host.State, reason string, deleteComputerStorage bool) (host.Host, error) {
 	var updated host.Host
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockHost(ctx, tx, hostID); err != nil {
@@ -112,6 +120,23 @@ func (s *Store) TransitionHost(ctx context.Context, hostID string, from, to host
 		if to == host.StateDeleted && from != host.StateDeleting {
 			return domain.NewError(domain.CodeInvalidState, "Host can only be marked deleted after sandbox cleanup from deleting state")
 		}
+		if to == host.StateDeleted {
+			var workspaceCount int64
+			var workspacePendingDeletion bool
+			if err := tx.QueryRow(ctx, `SELECT count(DISTINCT wb.workspace_id),
+COALESCE(bool_or(w.state <> 'deleted' OR w.deleted_at IS NULL), false)
+FROM workspace_bindings wb
+JOIN workspaces w ON w.id=wb.workspace_id
+WHERE wb.host_id=$1`, hostID).Scan(&workspaceCount, &workspacePendingDeletion); err != nil {
+				return fmt.Errorf("verify Host storage deletion before completion: %w", err)
+			}
+			if workspaceCount != 1 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing or ambiguous")
+			}
+			if workspacePendingDeletion {
+				return domain.NewError(domain.CodeWorkspaceBusy, "computer storage cleanup is incomplete")
+			}
+		}
 		if to == host.StateDeleting {
 			if currentRow.ControlState == string(host.ControlTakingOver) || currentRow.ControlState == string(host.ControlReturning) {
 				return domain.NewError(domain.CodeConflict, "host control transition is in progress; retry deletion after it completes")
@@ -129,8 +154,29 @@ func (s *Store) TransitionHost(ctx context.Context, hostID string, from, to host
 )`, hostID).Scan(&hasAttachedWorkspace); err != nil {
 				return fmt.Errorf("check workspace bindings before host deletion: %w", err)
 			}
-			if hasAttachedWorkspace {
+			if hasAttachedWorkspace && !deleteComputerStorage {
 				return domain.NewError(domain.CodeWorkspaceBusy, "unbind and verify all workspaces before deleting this host")
+			}
+			if deleteComputerStorage {
+				var workspaceCount int64
+				if err := tx.QueryRow(ctx, `SELECT count(DISTINCT workspace_id)
+FROM workspace_bindings WHERE host_id=$1`, hostID).Scan(&workspaceCount); err != nil {
+					return fmt.Errorf("check Host storage identity before deletion: %w", err)
+				}
+				if workspaceCount != 1 {
+					return domain.NewError(domain.CodeWorkspaceConflict, "computer storage identity is missing or ambiguous")
+				}
+				var shared bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM workspace_bindings own
+  JOIN workspace_bindings other ON other.workspace_id=own.workspace_id AND other.host_id<>own.host_id
+  WHERE own.host_id=$1
+)`, hostID).Scan(&shared); err != nil {
+					return fmt.Errorf("check shared Host storage before deletion: %w", err)
+				}
+				if shared {
+					return domain.NewError(domain.CodeWorkspaceConflict, "computer storage is shared with another computer")
+				}
 			}
 			if err := beginHostSiteDrain(ctx, tx, hostID); err != nil {
 				return err

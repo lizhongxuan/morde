@@ -39,6 +39,7 @@ type Docker struct {
 
 var _ app.VolumeDeleter = (*Docker)(nil)
 var _ app.WorkspaceVolumeProvisioner = (*Docker)(nil)
+var _ app.WorkspaceVolumeDeletion = (*Docker)(nil)
 var _ app.LegacyWorkspaceVolumeSource = (*Docker)(nil)
 
 // NewDocker constructs a Docker volume deleter for a unix:// socket URL, such as
@@ -243,6 +244,25 @@ func (d *Docker) VerifyWorkspaceVolume(ctx context.Context, name, instanceID, ow
 		return errors.New("registered Workspace volume is missing")
 	}
 	return verifyWorkspaceVolume(volume, name, labels)
+}
+
+func (d *Docker) VerifyWorkspaceVolumeForDelete(ctx context.Context, name, instanceID, ownerID, workspaceID string) error {
+	labels, err := workspaceVolumeLabels(name, instanceID, ownerID, workspaceID)
+	if err != nil {
+		return err
+	}
+	volume, exists, err := d.inspectWorkspaceVolume(ctx, name)
+	if err != nil || !exists {
+		return err
+	}
+	return verifyWorkspaceVolume(volume, name, labels)
+}
+
+func (d *Docker) DeleteWorkspaceVolume(ctx context.Context, name, instanceID, ownerID, workspaceID string) error {
+	if err := d.VerifyWorkspaceVolumeForDelete(ctx, name, instanceID, ownerID, workspaceID); err != nil {
+		return err
+	}
+	return d.DeleteVolume(ctx, name)
 }
 
 type dockerVolumeIdentity struct {

@@ -2,9 +2,10 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -40,13 +41,14 @@ type WorkspaceCapacityChecker interface {
 }
 
 type WorkspaceService struct {
-	store             WorkspaceStore
-	content           WorkspaceContentDeleter
-	current           WorkspaceCurrentDeleter
-	initializeCurrent WorkspaceCurrentInitializer
-	capacity          WorkspaceCapacityChecker
-	audit             AuditWriter
-	maxWorkspaceBytes int64
+	store                WorkspaceStore
+	content              WorkspaceContentDeleter
+	current              WorkspaceCurrentDeleter
+	initializeCurrent    WorkspaceCurrentInitializer
+	capacity             WorkspaceCapacityChecker
+	audit                AuditWriter
+	maxWorkspaceBytes    int64
+	hostWorkspaceVolumes *WorkspaceVolumeService
 }
 
 func NewWorkspaceService(store WorkspaceStore, content WorkspaceContentDeleter, current WorkspaceCurrentDeleter, capacity WorkspaceCapacityChecker, writer AuditWriter, maxWorkspaceBytes int64) (*WorkspaceService, error) {
@@ -64,6 +66,14 @@ func (s *WorkspaceService) SetWorkspaceCurrentInitializer(initializer WorkspaceC
 		return errors.New("workspace current initializer is required")
 	}
 	s.initializeCurrent = initializer
+	return nil
+}
+
+func (s *WorkspaceService) SetHostWorkspaceVolumes(volumes *WorkspaceVolumeService) error {
+	if s == nil || volumes == nil {
+		return errors.New("Host workspace volume service is required")
+	}
+	s.hostWorkspaceVolumes = volumes
 	return nil
 }
 
@@ -108,6 +118,18 @@ func (s *WorkspaceService) CreateWorkspace(ctx context.Context, principal identi
 	return created, nil
 }
 
+func (s *WorkspaceService) CreateHostWorkspace(ctx context.Context, ownerID, idempotencyKey string) (workspace.Workspace, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.Workspace{}, domain.InvalidArgument("owner_id", "computer owner is invalid")
+	}
+	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+		return workspace.Workspace{}, err
+	}
+	digest := sha256.Sum256([]byte(ownerID + "\x00" + idempotencyKey))
+	return s.CreateWorkspace(ctx, identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession},
+		CreateWorkspaceCommand{Name: "Computer storage"}, "host-workspace-"+hex.EncodeToString(digest[:]))
+}
+
 func (s *WorkspaceService) ListWorkspaces(ctx context.Context, principal identity.Principal) ([]workspace.Workspace, error) {
 	if principal.Kind != identity.KindSession && principal.Kind != identity.KindClient {
 		return nil, domain.NewError(domain.CodeForbidden, "portal session required")
@@ -132,56 +154,69 @@ func (s *WorkspaceService) EnsureDefaultWorkspace(ctx context.Context, ownerID s
 	if !domain.ValidUserID(ownerID) {
 		return workspace.Workspace{}, domain.InvalidArgument("user_id", "user id is invalid")
 	}
-	values, err := s.store.ListWorkspacesByOwner(ctx, ownerID)
-	if err != nil {
-		return workspace.Workspace{}, err
-	}
-	sort.Slice(values, func(i, j int) bool {
-		if values[i].CreatedAt.Equal(values[j].CreatedAt) {
-			return values[i].ID < values[j].ID
-		}
-		return values[i].CreatedAt.Before(values[j].CreatedAt)
-	})
-	for _, value := range values {
-		if value.OwnerID != ownerID || value.State != workspace.StateReady || value.DeletedAt != nil {
-			continue
-		}
-		if registryStore, ok := s.store.(WorkspaceVolumeRegistryStore); ok {
-			registered, err := registryStore.GetWorkspaceVolumeRegistry(ctx, value.ID)
-			if domain.CodeOf(err) == domain.CodeNotFound {
-				continue
-			}
-			if err != nil {
-				return workspace.Workspace{}, err
-			}
-			if registered.WorkspaceID != value.ID || registered.OwnerID != ownerID {
-				return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Workspace volume registration is inconsistent")
-			}
-			if registered.State != WorkspaceVolumePending && registered.State != WorkspaceVolumeReady {
-				continue
-			}
-		}
-		bindings, err := s.store.GetWorkspaceBindingsByWorkspace(ctx, value.ID)
-		if err != nil {
-			return workspace.Workspace{}, err
-		}
-		available := true
-		for _, binding := range bindings {
-			if binding.State != workspace.BindingDetached {
-				available = false
-				break
-			}
-		}
-		if available {
-			return value, nil
-		}
-	}
 	key, err := domain.NewWorkspaceID()
 	if err != nil {
 		return workspace.Workspace{}, fmt.Errorf("generate default Workspace idempotency key: %w", err)
 	}
 	return s.CreateWorkspace(ctx, identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession},
-		CreateWorkspaceCommand{Name: "Default Workspace"}, "default-host-workspace-"+key)
+		CreateWorkspaceCommand{Name: "Computer storage"}, "default-host-workspace-"+key)
+}
+
+func (s *WorkspaceService) ValidateHostWorkspace(ctx context.Context, ownerID, hostID, workspaceID string) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) {
+		return domain.InvalidArgument("host_workspace", "computer storage identity is invalid")
+	}
+	bindings, err := s.store.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return fmt.Errorf("read computer storage binding before deletion: %w", err)
+	}
+	if len(bindings) != 1 || bindings[0].HostID != hostID || bindings[0].OwnerID != ownerID || bindings[0].Workspace.ID != workspaceID {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage ownership is ambiguous")
+	}
+	allBindings, err := s.store.GetWorkspaceBindingsByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("read computer storage references before deletion: %w", err)
+	}
+	if len(allBindings) != 1 || allBindings[0].HostID != hostID || allBindings[0].OwnerID != ownerID {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage is shared or has ambiguous references")
+	}
+	value, err := s.store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if value.OwnerID != ownerID {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage owner changed")
+	}
+	if value.State != workspace.StateReady && value.State != workspace.StateDeleting && value.State != workspace.StateDeleted {
+		return domain.NewError(domain.CodeWorkspaceBusy, "computer storage is not ready for deletion")
+	}
+	if s.hostWorkspaceVolumes == nil {
+		return domain.NewError(domain.CodeInvalidState, "computer storage cleanup is unavailable")
+	}
+	return s.hostWorkspaceVolumes.ValidateHostWorkspaceVolume(ctx, ownerID, hostID, workspaceID)
+}
+
+func (s *WorkspaceService) DeleteHostWorkspace(ctx context.Context, ownerID, hostID string) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) {
+		return domain.InvalidArgument("host_workspace", "computer storage identity is invalid")
+	}
+	bindings, err := s.store.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return fmt.Errorf("read computer storage binding before deletion: %w", err)
+	}
+	if len(bindings) != 1 || bindings[0].HostID != hostID || bindings[0].OwnerID != ownerID || !domain.ValidWorkspaceID(bindings[0].Workspace.ID) {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing or ambiguous")
+	}
+	workspaceID := bindings[0].Workspace.ID
+	if err := s.ValidateHostWorkspace(ctx, ownerID, hostID, workspaceID); err != nil {
+		return err
+	}
+	if bindings[0].State != workspace.BindingDetached {
+		return domain.NewError(domain.CodeWorkspaceBusy, "computer storage is still attached")
+	}
+	principal := identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	_, err = s.deleteWorkspace(ctx, principal, workspaceID, hostID)
+	return err
 }
 
 func (s *WorkspaceService) ListDeviceWorkspaces(ctx context.Context, principal identity.Principal) ([]DeviceWorkspaceInfo, error) {
@@ -229,6 +264,10 @@ func (s *WorkspaceService) GetWorkspace(ctx context.Context, principal identity.
 }
 
 func (s *WorkspaceService) DeleteWorkspace(ctx context.Context, principal identity.Principal, id string) (workspace.Workspace, error) {
+	return s.deleteWorkspace(ctx, principal, id, "")
+}
+
+func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identity.Principal, id, allowedHostID string) (workspace.Workspace, error) {
 	if principal.Kind != identity.KindSession {
 		return workspace.Workspace{}, domain.NewError(domain.CodeForbidden, "portal session required")
 	}
@@ -244,6 +283,15 @@ func (s *WorkspaceService) DeleteWorkspace(ctx context.Context, principal identi
 	}
 	if value.OwnerID != principal.UserID {
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	bindings, err := s.store.GetWorkspaceBindingsByWorkspace(ctx, id)
+	if err != nil {
+		return workspace.Workspace{}, fmt.Errorf("read computer storage bindings before deletion: %w", err)
+	}
+	for _, binding := range bindings {
+		if allowedHostID == "" || binding.HostID != allowedHostID || binding.State != workspace.BindingDetached {
+			return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "computer storage is assigned to a cloud computer")
+		}
 	}
 	lock, acquired, err := s.store.TryWorkspaceBlockStoreLock(ctx, id)
 	if err != nil {
@@ -263,7 +311,21 @@ func (s *WorkspaceService) DeleteWorkspace(ctx context.Context, principal identi
 	if value.OwnerID != principal.UserID {
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
+	bindings, err = s.store.GetWorkspaceBindingsByWorkspace(ctx, id)
+	if err != nil {
+		return workspace.Workspace{}, fmt.Errorf("recheck computer storage bindings before deletion: %w", err)
+	}
+	for _, binding := range bindings {
+		if allowedHostID == "" || binding.HostID != allowedHostID || binding.State != workspace.BindingDetached {
+			return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "computer storage is assigned to a cloud computer")
+		}
+	}
 	if value.State == workspace.StateDeleted || value.DeletedAt != nil {
+		if allowedHostID != "" {
+			if err := s.hostWorkspaceVolumes.DeleteHostWorkspaceVolume(ctx, principal.UserID, allowedHostID, id); err != nil {
+				return workspace.Workspace{}, err
+			}
+		}
 		return value, nil
 	}
 	wasReady := value.State == workspace.StateReady
@@ -288,6 +350,11 @@ func (s *WorkspaceService) DeleteWorkspace(ctx context.Context, principal identi
 	}
 	if err := s.current.Delete(ctx, value.OwnerID, id); err != nil {
 		return workspace.Workspace{}, fmt.Errorf("delete workspace current directory: %w", err)
+	}
+	if allowedHostID != "" {
+		if err := s.hostWorkspaceVolumes.DeleteHostWorkspaceVolume(ctx, principal.UserID, allowedHostID, id); err != nil {
+			return workspace.Workspace{}, err
+		}
 	}
 	deleted, err := s.store.CompleteWorkspaceDelete(ctx, id, value.Revision)
 	if err != nil {

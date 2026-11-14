@@ -67,6 +67,7 @@ test('offline fallback retries the PC page instead of opening a standalone sync 
   const elements = await mount(api);
   assert.equal(elements.get('offline-page').hidden, false);
   assert.equal(elements.get('login').hidden, true);
+  assert.match(elements.get('offline-message').textContent, /本机项目/);
   elements.get('retry-assistant').onclick();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(calls[0], 'open-assistant');
@@ -85,7 +86,7 @@ test('desktop fallback contains no separate sync page or fixed notification over
   const html = await readFile(new URL('../resources/morde.html', import.meta.url), 'utf8');
   const css = await readFile(new URL('../resources/morde.css', import.meta.url), 'utf8');
   assert.match(html, /id="offline-page"/);
-  assert.match(html, /云端电脑.*文件同步/);
+  assert.match(html, /本机项目/);
   assert.doesNotMatch(html, /sync-page|project-upload|workspace-sync|local-sync/);
   assert.doesNotMatch(css, /position\s*:\s*fixed/);
 });

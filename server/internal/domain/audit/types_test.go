@@ -8,6 +8,7 @@ func TestActionValid(t *testing.T) {
 		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter,
 		ActionHostApplicationInstall,
 		ActionHostApplicationLaunch, ActionHostApplicationStop,
+		ActionCodexProfileConnection,
 		ActionModelBudgetUpdate, ActionModelDefaultUpdate,
 		ActionAPIKeyCreate, ActionAPIKeyDelete,
 		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionMCPCall,

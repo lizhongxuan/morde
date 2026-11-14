@@ -58,6 +58,8 @@ struct MordeCodexSessionsRoom: View {
     private var sessionList: some View {
         VStack(spacing: 0) {
             installationPicker
+            profileConnectionPanel
+            profilePicker
             if let installation = store.selectedInstallation {
                 if installation.revoked || store.revokedInstallations.contains(installation.id) {
                     emptyState(AppLocalized("This PC installation has been revoked."))
@@ -70,7 +72,7 @@ struct MordeCodexSessionsRoom: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 10) {
-                            ForEach(store.sessions) { session in sessionRow(session) }
+                            ForEach(store.visibleSessions) { session in sessionRow(session) }
                             if store.canLoadMoreSessions {
                                 Button {
                                     Task { await store.loadMoreSessions() }
@@ -98,6 +100,146 @@ struct MordeCodexSessionsRoom: View {
         }
     }
 
+    @ViewBuilder
+    private var profilePicker: some View {
+        if !store.profileKeys.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    profileChip(AppLocalized("All"), profileKey: nil)
+                    ForEach(store.profileKeys, id: \.self) { profileKey in
+                        profileChip(profileLabel(profileKey), profileKey: profileKey)
+                    }
+                }
+                .padding(.horizontal, 18).padding(.vertical, 6)
+            }
+            .accessibilityIdentifier("morde.codex.profiles")
+        }
+    }
+
+    @ViewBuilder
+    private var profileConnectionPanel: some View {
+        if store.selectedInstallation?.revoked == false {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(AppLocalized("Codex profiles"))
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                if let error = store.installationLoadError {
+                    HStack(spacing: 8) {
+                        Text(error).font(.caption).foregroundStyle(.orange)
+                        Spacer(minLength: 4)
+                        Button(AppLocalized("Retry")) { Task { await store.loadInstallations() } }
+                            .font(.caption)
+                            .accessibilityIdentifier("morde.codex.profiles.retryInstallations")
+                    }
+                } else if store.selectedProfileConnectionsLoading && store.selectedProfileConnections.isEmpty {
+                    ProgressView().controlSize(.small)
+                } else if let error = store.selectedProfileConnectionError {
+                    HStack(spacing: 8) {
+                        Text(error).font(.caption).foregroundStyle(.orange)
+                        Spacer(minLength: 4)
+                        Button(AppLocalized("Retry")) {
+                            guard let id = store.selectedInstallationID else { return }
+                            Task { await store.loadProfileConnections(installationID: id) }
+                        }
+                        .font(.caption)
+                        .accessibilityIdentifier("morde.codex.profiles.retry")
+                    }
+                } else if store.selectedProfileConnections.isEmpty {
+                    Text(AppLocalized("No connected Codex profiles"))
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.selectedProfileConnections) { connection in
+                        profileConnectionRow(connection)
+                    }
+                }
+            }
+            .padding(.horizontal, 18).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("morde.codex.profileConnections")
+        }
+    }
+
+    private func profileConnectionRow(_ connection: MordeCodexProfileConnection) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(profileLabel(connection.profile_key)).font(.subheadline.weight(.medium))
+                Text(AppLocalized("Authorized")).font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                if store.selectedProfileConnectionsLoading { ProgressView().controlSize(.small) }
+            }
+            Text(connection.scopes.sorted().joined(separator: ", "))
+                .font(.caption2).foregroundStyle(.secondary)
+            if let discovery = connection.session_discovery {
+                HStack(spacing: 8) {
+                    Text(discoveryStateLabel(discovery.state))
+                    if let date = discovery.updatedAtDate {
+                        Text("\(AppLocalized("Updated")) · \(date.formatted(date: .abbreviated, time: .shortened))")
+                    }
+                    if let errorCode = discovery.error_code {
+                        Text(discoveryErrorLabel(errorCode)).foregroundStyle(.orange)
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                if let history = connection.history_sync {
+                    Text(String(format: AppLocalized("Sessions with complete history: %1$lld of %2$lld"),
+                                history.history_complete_sessions, history.discovered_sessions))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(String(format: AppLocalized("Pending upload events: %lld"),
+                                history.pending_upload_event_count))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text(AppLocalized("Pending first sync"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(NanoMuseTones.hairline))
+        .accessibilityIdentifier("morde.codex.profileConnection.\(connection.profile_key)")
+    }
+
+    private func discoveryStateLabel(_ state: String) -> String {
+        switch state {
+        case "syncing": AppLocalized("Discovering sessions")
+        case "synced": AppLocalized("Sessions discovered")
+        case "partial": AppLocalized("Session discovery incomplete")
+        default: AppLocalized("Unknown")
+        }
+    }
+
+    private func discoveryErrorLabel(_ code: String) -> String {
+        switch code {
+        case "profile_unavailable": AppLocalized("Codex profile unavailable")
+        case "session_list_failed": AppLocalized("Codex session list failed")
+        case "connection_lost": AppLocalized("Codex connection lost")
+        default: AppLocalized("Unknown")
+        }
+    }
+
+    private func presenceLabel(for online: Bool) -> String {
+        online ? AppLocalized("Hub presence online") : AppLocalized("Offline")
+    }
+
+    private func profileChip(_ title: String, profileKey: String?) -> some View {
+        Button { store.selectProfile(profileKey) } label: {
+            Text(title)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(store.selectedProfileKey == profileKey ? NanoMuseTones.surface : .clear,
+                            in: Capsule())
+                .overlay(Capsule().strokeBorder(NanoMuseTones.hairline))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(profileKey ?? AppLocalized("All"))
+        .accessibilityIdentifier(profileKey.map { "morde.codex.profile.\($0)" } ?? "morde.codex.profile.all")
+    }
+
+    private func profileLabel(_ profileKey: String) -> String {
+        let suffix = String(profileKey.suffix(8))
+        return store.profileKeys.filter { $0.hasSuffix(suffix) }.count == 1 ? suffix : profileKey
+    }
+
     private var installationPicker: some View {
         Group {
             if !store.installations.isEmpty {
@@ -109,9 +251,14 @@ struct MordeCodexSessionsRoom: View {
                             } label: {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(installation.displayName).lineLimit(1).font(.subheadline.weight(.medium))
-                                    Text(installation.revoked ? AppLocalized("Installation revoked.") :
-                                         AppLocalized("Authorized PC installation"))
+                                    let presence = store.installationOnline(installation.id)
+                                    let onlineLabel = presence.map { presenceLabel(for: $0) } ?? AppLocalized("Unknown")
+                                    Text(installation.revoked ? AppLocalized("Installation revoked.") : onlineLabel)
                                         .font(.caption).foregroundStyle(.secondary)
+                                    if !installation.revoked {
+                                        Text(AppLocalized("Authorized PC installation"))
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
                                 }
                                 .padding(.horizontal, 14).padding(.vertical, 9)
                                 .background(store.selectedInstallationID == installation.id ? NanoMuseTones.surface : .clear,
@@ -134,6 +281,9 @@ struct MordeCodexSessionsRoom: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(session.title.isEmpty ? AppLocalized("Untitled chat") : session.title)
                         .font(.headline).foregroundStyle(.primary).lineLimit(1)
+                    if let profileKey = session.profile_key {
+                        Text(profileLabel(profileKey)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
                     if !session.cwd_label.isEmpty {
                         let cwd = session.cwd_label
                         Text(cwd).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -194,6 +344,9 @@ struct MordeCodexSessionsRoom: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.title.isEmpty ? AppLocalized("Untitled chat") : session.title)
                         .font(.headline).lineLimit(1)
+                    if let profileKey = session.profile_key {
+                        Text(profileLabel(profileKey)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
                     Text(statusLabel(store.selectedSessionStatus)).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -215,6 +368,14 @@ struct MordeCodexSessionsRoom: View {
                     Text(AppLocalized("Read history permission is unavailable."))
                         .font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 18).padding(.vertical, 8)
+                }
+                if session.hasScope("read") {
+                    Text(String(format: AppLocalized("Loaded events: %1$lld / server current sequence: %2$lld"),
+                                Int64(store.events.count), store.serverCurrentSequence(for: session)))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 18).padding(.top, 4)
+                        .accessibilityIdentifier("morde.codex.historyProgress")
                 }
                 if let error = store.eventErrors[session.id] {
                     Text(eventErrorText(error)).font(.footnote).foregroundStyle(.orange)
@@ -268,6 +429,37 @@ struct MordeCodexSessionsRoom: View {
                 }
                 if let text = item.text, !text.isEmpty {
                     Text(text).font(.body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !item.details.isEmpty {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(Array(item.details.enumerated()), id: \.offset) { entry in
+                                let detail = entry.element
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 8) {
+                                        Text(verbatim: NSLocalizedString(detail.field.localizationKey, comment: "Codex event detail field"))
+                                            .font(.caption.weight(.semibold))
+                                        Spacer(minLength: 4)
+                                        if let stateKey = detail.state.localizationKey {
+                                            Text(verbatim: NSLocalizedString(stateKey, comment: "Codex event detail state"))
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    if let value = detail.text, !value.isEmpty {
+                                        Text(value)
+                                            .font(.system(.footnote, design: .monospaced))
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        Text(AppLocalized("Details"))
+                    }
+                    .font(.footnote)
+                    .accessibilityIdentifier("morde.codex.tool.details.\(item.id)")
                 }
             }
             .padding(12)

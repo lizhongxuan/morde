@@ -38,7 +38,7 @@ function HostRecovery({ id, generation, failed }: { id: string; generation: numb
   const recover = useMutation({
     mutationFn: () => portalApi.adminRecoverHost(id, { runtime_generation: generation, confirm_retry: confirmed }),
     onSuccess: (result) => {
-      notify(result.action === 'adopt_existing' ? `已找到 ${result.sandbox_count} 个沙箱，正在接管恢复。` : '已确认并重新创建电脑，工作区数据卷已保留。', 'success');
+      notify(result.action === 'adopt_existing' ? `已找到 ${result.sandbox_count} 个沙箱，正在接管恢复。` : '已确认并重新创建电脑，电脑数据目录已保留。', 'success');
       setConfirmed(false);
       void client.invalidateQueries({ queryKey: ['admin', 'hosts'] });
     },
@@ -46,8 +46,8 @@ function HostRecovery({ id, generation, failed }: { id: string; generation: numb
   });
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>异常恢复</h2><p>修复镜像、网络或沙箱服务等外部问题后，可在这里安全恢复。</p></div></div>
-    <div className="notice notice-warning">{failed ? '该电脑的恢复已失败。系统会核对当前代沙箱：运行中的沙箱可接管；失败的沙箱会在确认后移除并创建新代。个人配置与 Workspace 数据卷会保留。' : '上次恢复结果不确定，系统已暂停自动重试。系统会核对远端沙箱：找到可用沙箱就接管；没有可用沙箱时，仅在确认问题已修复后重新创建。Workspace 数据卷会保留。'}</div>
-    <label className="checkbox-row"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />我已修复外部问题，并确认必要时可以删除失败沙箱并重建这台电脑；数据卷需要保留。</label>
+    <div className="notice notice-warning">{failed ? '该电脑的恢复已失败。系统会核对当前代沙箱：运行中的沙箱可接管；失败的沙箱会在确认后移除并创建新代。个人配置与电脑数据目录会保留。' : '上次恢复结果不确定，系统已暂停自动重试。系统会核对远端沙箱：找到可用沙箱就接管；没有可用沙箱时，仅在确认问题已修复后重新创建。电脑数据目录会保留。'}</div>
+    <label className="checkbox-row"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />我已修复外部问题，并确认必要时可以删除失败沙箱并重建这台电脑；数据目录需要保留。</label>
     <div className="form-actions"><button className="button button-primary" type="button" disabled={!confirmed || recover.isPending} onClick={() => recover.mutate()}>{recover.isPending ? '正在检查并恢复…' : '检查并恢复'}</button></div>
   </section>;
 }
@@ -78,11 +78,11 @@ export function AdminHostDetail() {
     <HostResourceEditor id={host.id} />
     {((host.state === 'creating' && host.state_reason === 'restore_unknown') || (host.state === 'failed' && host.runtime_generation > 1)) && <HostRecovery id={host.id} generation={host.runtime_generation} failed={host.state === 'failed'} />}
     <section className="admin-detail-section">
-      <div className="dashboard-section-heading"><div><h2>绑定工作区</h2><p>服务端保存和电脑应用状态分别核对。</p></div></div>
-      {!host.workspaces.length ? <div className="empty-card compact"><p>这台电脑当前没有绑定工作区。</p></div> : <div className="table-wrap"><table><thead><tr><th>工作区</th><th>应用状态</th><th>服务端版本</th><th>电脑已应用版本</th><th>同步状态</th></tr></thead><tbody>
-        {host.workspaces.map((binding) => <tr key={binding.workspace.id}><td><Link className="admin-table-link" to={`/admin/workspaces/${encodeURIComponent(binding.workspace.id)}`}><strong>{binding.workspace.name || binding.workspace.id}</strong><small className="table-sub mono">{binding.workspace.id}</small></Link></td><td>{binding.state}</td><td>v{binding.desired_revision}</td><td>{binding.applied_revision > 0 ? `v${binding.applied_revision}` : '尚未应用'}</td><td>{binding.sync_state || '未提供'}</td></tr>)}
+      <div className="dashboard-section-heading"><div><h2>电脑专属数据目录</h2><p>数据目录随这台电脑持久保存；管理员只核对目录和应用状态。</p></div></div>
+      {!host.workspaces.length ? <div className="empty-card compact"><p>当前接口未返回电脑数据目录状态，需要进一步核对。</p></div> : <div className="table-wrap"><table><thead><tr><th>目录</th><th>应用状态</th><th>目标版本</th><th>电脑已应用版本</th><th>同步状态</th></tr></thead><tbody>
+        {host.workspaces.map((binding) => <tr key={binding.workspace.id}><td>电脑专属目录</td><td>{binding.state}</td><td>v{binding.desired_revision}</td><td>{binding.applied_revision > 0 ? `v${binding.applied_revision}` : '尚未应用'}</td><td>{binding.sync_state || '未提供'}</td></tr>)}
       </tbody></table></div>}
     </section>
-    <p className="notice notice-info admin-detail-note">此页面只查看电脑、所有者和工作区绑定元数据。当前管理接口不提供停止、冻结或隔离能力。</p>
+    <p className="notice notice-info admin-detail-note">此页面只查看电脑、所有者和专属数据目录元数据。当前管理接口不提供停止、冻结或隔离能力。</p>
   </section>;
 }

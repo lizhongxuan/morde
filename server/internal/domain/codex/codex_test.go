@@ -24,6 +24,34 @@ func TestDiscoverValidateAllowsColonButRejectsPathSeparatorsInCWDLabel(t *testin
 			}
 		})
 	}
+	invalidProfile := valid
+	invalidProfile.ProfileKey = "local_CODEX_HOME_profile"
+	if err := invalidProfile.Validate(); err == nil {
+		t.Fatal("Codex profile metadata accepted an environment variable name")
+	}
+}
+
+func TestProfileConnectionRequiresOpaqueKeyAndReadLiveScopes(t *testing.T) {
+	valid := ProfileConnectionRequest{ProfileKey: "profile_1", Scopes: []Scope{ScopeRead, ScopeLive, ScopeSend}}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid profile connection was rejected: %v", err)
+	}
+
+	for _, invalid := range []ProfileConnectionRequest{
+		{ProfileKey: "", Scopes: []Scope{ScopeRead, ScopeLive}},
+		{ProfileKey: "../secret", Scopes: []Scope{ScopeRead, ScopeLive}},
+		{ProfileKey: "local_CODEX_HOME_profile", Scopes: []Scope{ScopeRead, ScopeLive}},
+		{ProfileKey: "profile", Scopes: nil},
+		{ProfileKey: "profile", Scopes: []Scope{}},
+		{ProfileKey: "profile", Scopes: []Scope{ScopeRead}},
+		{ProfileKey: "profile", Scopes: []Scope{ScopeLive}},
+		{ProfileKey: "profile", Scopes: []Scope{ScopeRead, ScopeLive, ScopeLive}},
+		{ProfileKey: "profile", Scopes: []Scope{ScopeRead, ScopeLive, Scope("admin")}},
+	} {
+		if err := invalid.Validate(); err == nil {
+			t.Errorf("invalid profile connection was accepted: %#v", invalid)
+		}
+	}
 }
 
 func TestEventInputValidationEnforcesKindPayloadAndByteLimit(t *testing.T) {
@@ -49,6 +77,64 @@ func TestEventInputValidationEnforcesKindPayloadAndByteLimit(t *testing.T) {
 	})
 	if err := oversized.Validate(); err == nil {
 		t.Fatalf("event larger than %d bytes was accepted", MaxEventBytes)
+	}
+}
+
+func TestCodexToolEventChunksValidateAndPreserveLegacyEvents(t *testing.T) {
+	call := codexTestEvent("tool-input-0001", EventToolCall, map[string]any{
+		"tool": "command", "call_id": "call-1", "input": strings.Repeat("界", 8*1024), "input_part": 0, "input_parts": 2,
+	})
+	if err := call.Validate(); err != nil {
+		t.Fatalf("valid tool input chunk was rejected: %v", err)
+	}
+	result := codexTestEvent("tool-output-0001", EventToolResult, map[string]any{
+		"tool": "command", "call_id": "call-1", "output": strings.Repeat("界", 8*1024), "output_part": 1, "output_parts": 2,
+	})
+	if err := result.Validate(); err != nil {
+		t.Fatalf("valid tool output chunk was rejected: %v", err)
+	}
+	liveDelta := codexTestEvent("tool-output-delta", EventToolResult, map[string]any{
+		"tool": "command", "call_id": "call-1", "output": "partial output", "output_part": 0,
+	})
+	if err := liveDelta.Validate(); err != nil {
+		t.Fatalf("live output delta without a known parts count was rejected: %v", err)
+	}
+
+	legacy := codexTestEvent("tool-output-legacy", EventToolResult, map[string]any{
+		"tool": "command", "output": strings.Repeat("x", 30*1024),
+	})
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("legacy event without chunk metadata was rejected: %v", err)
+	}
+	legacyWithCallID := codexTestEvent("tool-output-legacy-call", EventToolResult, map[string]any{
+		"tool": "command", "call_id": "legacy/provider-call", "output": strings.Repeat("x", 30*1024),
+	})
+	if err := legacyWithCallID.Validate(); err != nil {
+		t.Fatalf("legacy result with call ID and no chunk metadata was rejected: %v", err)
+	}
+
+	invalid := []struct {
+		name    string
+		kind    EventKind
+		payload map[string]any
+	}{
+		{"input missing part", EventToolCall, map[string]any{"call_id": "call-1", "input": "args", "input_parts": 1}},
+		{"input missing count", EventToolCall, map[string]any{"call_id": "call-1", "input": "args", "input_part": 0}},
+		{"input part outside count", EventToolCall, map[string]any{"call_id": "call-1", "input": "args", "input_part": 1, "input_parts": 1}},
+		{"fractional input part", EventToolCall, map[string]any{"call_id": "call-1", "input": "args", "input_part": 0.5, "input_parts": 1}},
+		{"oversized input chunk", EventToolCall, map[string]any{"call_id": "call-1", "input": strings.Repeat("x", MaxToolPayloadChunkBytes+1), "input_part": 0, "input_parts": 1}},
+		{"output missing call ID", EventToolResult, map[string]any{"output": "partial", "output_part": 0}},
+		{"output missing text", EventToolResult, map[string]any{"call_id": "call-1", "output_part": 0}},
+		{"output count before part", EventToolResult, map[string]any{"call_id": "call-1", "output": "partial", "output_part": 1, "output_parts": 1}},
+		{"oversized output chunk", EventToolResult, map[string]any{"call_id": "call-1", "output": strings.Repeat("x", MaxToolPayloadChunkBytes+1), "output_part": 0}},
+	}
+	for index, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			event := codexTestEvent(fmt.Sprintf("tool-invalid-%04d", index), test.kind, test.payload)
+			if err := event.Validate(); err == nil {
+				t.Fatal("invalid tool event payload was accepted")
+			}
+		})
 	}
 }
 
@@ -353,6 +439,7 @@ func TestCommandStatusEventsAreValidatedAndServerManaged(t *testing.T) {
 	statusEvent := codexTestEvent("morde:command:g0000001:1:waiting_pc", EventCommandStatus, map[string]any{
 		"command_id": "g0000001", "type": "send", "status": "waiting_pc", "result_code": "",
 	})
+	statusEvent.Source = ""
 	statusEvent.Status = "waiting_pc"
 	if err := statusEvent.Validate(); err != nil {
 		t.Fatalf("valid command status event: %v", err)

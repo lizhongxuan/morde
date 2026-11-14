@@ -27,30 +27,18 @@ func (s *Store) RequestTaskStepRetry(ctx context.Context, record app.Idempotency
 	}
 	if !domain.ValidTaskID(request.TaskID) || !domain.ValidStepID(request.StepID) ||
 		!domain.ValidStepID(request.AttemptStepID) || record.RelatedID != request.StepID ||
-		request.ExpectedTaskRevision < 0 || request.ExpectedAttempt < 1 || len(request.ExpectedRequestDigest) != 32 ||
+		request.ExpectedTaskRevision < 0 || request.ExpectedAttempt < 1 ||
 		request.RetryCallID != "morde_step_retry_"+request.AttemptStepID {
 		return app.TaskStepRetryRecord{}, domain.InvalidArgument("retry", "task step retry identity is invalid")
 	}
 	var result app.TaskStepRetryRecord
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		stored, replayed, err := findIdempotency(ctx, tx, record)
+		replay, replayed, err := replayTaskStepRetry(ctx, tx, record, request)
 		if err != nil {
 			return err
 		}
 		if replayed {
-			intent, err := readTaskStepRetryIntent(ctx, tx, stored.ResourceID)
-			if err != nil {
-				return err
-			}
-			if intent.TaskID != request.TaskID || intent.SourceStepID != request.StepID ||
-				intent.TaskRevision != request.ExpectedTaskRevision || intent.Attempt != request.ExpectedAttempt+1 ||
-				!bytes.Equal(intent.RequestDigest, request.ExpectedRequestDigest) {
-				return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different step retry")
-			}
-			if !intent.Consumed && !intent.ExpiresAt.After(time.Now()) {
-				return domain.NewError(domain.CodeConflict, "step retry authorization expired")
-			}
-			result = app.TaskStepRetryRecord{Intent: intent, Replayed: true}
+			result = replay
 			return nil
 		}
 
@@ -79,6 +67,17 @@ func (s *Store) RequestTaskStepRetry(ctx context.Context, record app.Idempotency
 		var locked string
 		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, request.TaskID, initial.OwnerID).Scan(&locked); err != nil {
 			return storeError("lock task for safe step retry", "task", err)
+		}
+		// A competing retry with this key can commit while this transaction waits
+		// on the task row above. Recheck after acquiring that row lock so the
+		// waiter returns the reserved attempt instead of rejecting its queued task.
+		replay, replayed, err = replayTaskStepRetry(ctx, tx, record, request)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			result = replay
+			return nil
 		}
 		current, err := queries.GetTask(ctx, sqlcgen.GetTaskParams{ID: request.TaskID, OwnerID: initial.OwnerID})
 		if err != nil {
@@ -140,7 +139,7 @@ FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, request.TaskID, request.
 		if source.Status != task.StepFailed || !source.Retryable || source.FailureReason != "not_dispatched" || source.Phase != "prepare" ||
 			source.Kind != "tool" || source.Attempt != request.ExpectedAttempt || source.TaskRevision == nil ||
 			*source.TaskRevision != request.ExpectedTaskRevision || source.AgentSessionID != current.AgentSessionID ||
-			!bytes.Equal(source.RequestDigest, request.ExpectedRequestDigest) || source.ToolCallKey == "" || source.ToolName == "" {
+			len(source.RequestDigest) != 32 || source.ToolCallKey == "" || source.ToolName == "" {
 			return domain.NewError(domain.CodeConflict, "step failure is not safe to retry")
 		}
 		if !app.SupportsSafeTaskStepRetryTool(source.ToolName) {
@@ -217,7 +216,7 @@ WHERE wb.host_id=$1 AND wb.workspace_id=$2`, current.HostID.String, current.Work
 			WorkspaceRevision: workspaceRevision, CheckpointThroughSequence: current.CheckpointThroughSeq,
 			CheckpointDigest: append([]byte(nil), current.CheckpointDigest...),
 			ExpiresAt:        time.Now().UTC().Truncate(time.Microsecond).Add(taskStepRetryIntentLifetime)}
-		stored, replayed, err = reserveIdempotency(ctx, tx, record, request.AttemptStepID, request.StepID)
+		stored, replayed, err := reserveIdempotency(ctx, tx, record, request.AttemptStepID, request.StepID)
 		if err != nil {
 			return err
 		}
@@ -225,6 +224,12 @@ WHERE wb.host_id=$1 AND wb.workspace_id=$2`, current.HostID.String, current.Work
 			intent, err := readTaskStepRetryIntent(ctx, tx, stored.ResourceID)
 			if err != nil {
 				return err
+			}
+			if !matchesTaskStepRetryReplay(intent, record.OwnerID, request, source.RequestDigest) {
+				return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different step retry")
+			}
+			if !intent.Consumed && !intent.ExpiresAt.After(time.Now()) {
+				return domain.NewError(domain.CodeConflict, "step retry authorization expired")
 			}
 			result = app.TaskStepRetryRecord{Intent: intent, Replayed: true}
 			return nil
@@ -493,6 +498,50 @@ RETURNING event_seq`, taskID, stepID).Scan(&sequence)
 		return err
 	}
 	return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.step", Payload: stepPayload})
+}
+
+func readTaskStepRetrySourceDigest(ctx context.Context, tx pgx.Tx, taskID, stepID string) ([]byte, error) {
+	var digest []byte
+	if err := tx.QueryRow(ctx, `SELECT request_digest FROM task_steps WHERE task_id=$1 AND id=$2`, taskID, stepID).Scan(&digest); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.NewError(domain.CodeConflict, "step retry source is unavailable")
+		}
+		return nil, fmt.Errorf("read task step retry source digest: %w", err)
+	}
+	if len(digest) != 32 {
+		return nil, domain.NewError(domain.CodeConflict, "step retry source digest is unavailable")
+	}
+	return digest, nil
+}
+
+func replayTaskStepRetry(ctx context.Context, tx pgx.Tx, record app.IdempotencyRecord,
+	request app.TaskStepRetryRequest) (app.TaskStepRetryRecord, bool, error) {
+	stored, replayed, err := findIdempotency(ctx, tx, record)
+	if err != nil || !replayed {
+		return app.TaskStepRetryRecord{}, replayed, err
+	}
+	intent, err := readTaskStepRetryIntent(ctx, tx, stored.ResourceID)
+	if err != nil {
+		return app.TaskStepRetryRecord{}, true, err
+	}
+	sourceDigest, err := readTaskStepRetrySourceDigest(ctx, tx, request.TaskID, request.StepID)
+	if err != nil {
+		return app.TaskStepRetryRecord{}, true, err
+	}
+	if !matchesTaskStepRetryReplay(intent, record.OwnerID, request, sourceDigest) {
+		return app.TaskStepRetryRecord{}, true, domain.NewError(domain.CodeIdempotencyConflict,
+			"idempotency key was used for a different step retry")
+	}
+	if !intent.Consumed && !intent.ExpiresAt.After(time.Now()) {
+		return app.TaskStepRetryRecord{}, true, domain.NewError(domain.CodeConflict, "step retry authorization expired")
+	}
+	return app.TaskStepRetryRecord{Intent: intent, Replayed: true}, true, nil
+}
+
+func matchesTaskStepRetryReplay(intent task.StepRetryIntent, ownerID string, request app.TaskStepRetryRequest, sourceDigest []byte) bool {
+	return intent.OwnerID == ownerID && intent.TaskID == request.TaskID && intent.SourceStepID == request.StepID &&
+		intent.TaskRevision == request.ExpectedTaskRevision && intent.Attempt == request.ExpectedAttempt+1 &&
+		bytes.Equal(intent.RequestDigest, sourceDigest)
 }
 
 func readTaskStepRetryIntent(ctx context.Context, tx pgx.Tx, attemptStepID string) (task.StepRetryIntent, error) {

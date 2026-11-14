@@ -257,6 +257,13 @@ func (s *Store) CreateWorkspaceCopyReservation(ctx context.Context, request app.
 			if err := lockWorkspaceForSyncMutation(ctx, tx, request.SourceWorkspaceID); err != nil {
 				return err
 			}
+			bound, err := workspaceHasHostBindingTx(ctx, tx, request.SourceWorkspaceID)
+			if err != nil {
+				return err
+			}
+			if bound {
+				return domain.NewError(domain.CodeForbidden, "computer storage cannot be copied as an independent Workspace")
+			}
 		}
 		var currentOwner, state string
 		var readOnly bool

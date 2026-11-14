@@ -91,15 +91,15 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 		t.Fatal("host_create schema is missing")
 	}
 
-	created, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "host_create", Arguments: map[string]any{"workspace_ids": []string{"w1234567"}, "idempotency_key": "host-create-key-001"}})
+	created, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "host_create", Arguments: map[string]any{"idempotency_key": "host-create-key-001"}})
 	if err != nil || created.IsError {
 		t.Fatalf("host_create result=%+v err=%v", created, err)
 	}
 	if hosts.createCalls.Load() != 1 {
 		t.Fatalf("Create called %d times, want 1", hosts.createCalls.Load())
 	}
-	if len(hosts.lastCreate.WorkspaceIDs) != 1 || hosts.lastCreate.WorkspaceIDs[0] != "w1234567" {
-		t.Fatalf("workspace IDs = %v, want [w1234567]", hosts.lastCreate.WorkspaceIDs)
+	if hosts.lastCreate.WorkspaceIDs != nil {
+		t.Fatalf("host_create selected server storage: %v", hosts.lastCreate.WorkspaceIDs)
 	}
 	if _, exists := created.StructuredContent.(map[string]any)["workspaces"]; !exists {
 		t.Fatalf("host_create response omitted bindings: %#v", created.StructuredContent)
@@ -215,9 +215,8 @@ func TestValidateToolArguments(t *testing.T) {
 		{name: "runtime idempotency key required", spec: toolByName("window_list"), json: `{"host_id":"h1234567"}`, wantErr: true},
 		{name: "runtime idempotency key invalid", spec: toolByName("window_list"), json: `{"host_id":"h1234567","idempotency_key":"short"}`, wantErr: true},
 		{name: "invalid port", spec: toolByName("preview_url"), json: `{"host_id":"host_test","port":65536}`, wantErr: true},
-		{name: "valid workspace IDs", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567"],"idempotency_key":"host-create-key-001"}`},
-		{name: "host create workspace required", spec: toolByName("host_create"), json: `{"idempotency_key":"host-create-key-001"}`, wantErr: true},
-		{name: "host create one workspace only", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567","w7654321"],"idempotency_key":"host-create-key-001"}`, wantErr: true},
+		{name: "host create assigns storage on server", spec: toolByName("host_create"), json: `{"idempotency_key":"host-create-key-001"}`},
+		{name: "host create rejects caller selected storage", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567"],"idempotency_key":"host-create-key-001"}`, wantErr: true},
 		{name: "host create idempotency key required", spec: toolByName("host_create"), json: `{}`, wantErr: true},
 		{name: "host create idempotency key invalid", spec: toolByName("host_create"), json: `{"idempotency_key":"short"}`, wantErr: true},
 		{name: "legacy template rejected", spec: toolByName("host_create"), json: `{"template_id":"python","idempotency_key":"host-create-key-001"}`, wantErr: true},
@@ -226,6 +225,8 @@ func TestValidateToolArguments(t *testing.T) {
 		{name: "duplicate workspace IDs", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567","w1234567"],"idempotency_key":"host-create-key-001"}`, wantErr: true},
 		{name: "workspace IDs must be strings", spec: toolByName("host_create"), json: `{"workspace_ids":[1],"idempotency_key":"host-create-key-001"}`, wantErr: true},
 		{name: "legacy host delete option rejected", spec: toolByName("host_delete"), json: `{"host_id":"h1234567","keep_workspace":true}`, wantErr: true},
+		{name: "host delete requires confirmation", spec: toolByName("host_delete"), json: `{"host_id":"h1234567","confirm_workspace_deletion":false}`, wantErr: true},
+		{name: "host delete accepts explicit confirmation", spec: toolByName("host_delete"), json: `{"host_id":"h1234567","confirm_workspace_deletion":true}`},
 		{name: "trailing JSON", spec: toolByName("host_get"), json: `{"host_id":"host_test"}{}`, wantErr: true},
 		{name: "mutually exclusive type selectors", spec: toolByName("browser_type"), json: `{"host_id":"host_test","text":"x","index":1,"selector":"#x"}`, wantErr: true},
 	}

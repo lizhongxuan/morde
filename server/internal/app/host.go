@@ -106,100 +106,7 @@ func (s *hostService) BindWorkspace(ctx context.Context, principal identity.Prin
 	if err := authorizeHostScope(principal, hostID, identity.ScopeHostManage); err != nil {
 		return workspace.Binding{}, err
 	}
-	if !domain.ValidWorkspaceID(workspaceID) || expectedBindingVersion < 0 {
-		return workspace.Binding{}, domain.InvalidArgument("workspace_id", "workspace binding request is invalid")
-	}
-	if err := validateIdempotencyKey(idempotencyKey); err != nil {
-		return workspace.Binding{}, err
-	}
-	hostValue, err := s.getAuthorizedHost(ctx, principal, hostID)
-	if err != nil {
-		return workspace.Binding{}, err
-	}
-	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
-	if err != nil {
-		return workspace.Binding{}, err
-	}
-	for _, binding := range bindings {
-		if binding.Workspace.ID != workspaceID {
-			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host Workspace identity cannot be changed")
-		}
-	}
-	var currentBindings []workspace.Binding
-	for _, binding := range bindings {
-		if binding.State != workspace.BindingDetached {
-			currentBindings = append(currentBindings, binding)
-		}
-	}
-	if len(currentBindings) > 1 {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host has multiple active workspace bindings")
-	}
-	if hostValue.State != host.StateRunning && hostValue.State != host.StateStopped {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "host must be running or stopped to bind a workspace")
-	}
-	if len(currentBindings) == 1 && currentBindings[0].Workspace.ID != workspaceID {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host already has a workspace binding")
-	}
-	value, err := s.workspaces.GetWorkspace(ctx, workspaceID)
-	if err != nil {
-		return workspace.Binding{}, err
-	}
-	if value.OwnerID != principal.UserID || value.State != workspace.StateReady || value.DeletedAt != nil {
-		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace not found")
-	}
-	if expectedRevision != nil && (*expectedRevision < 0 || *expectedRevision != value.Revision) {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace changed before binding")
-	}
-	current, err := s.workspaces.GetWorkspaceBinding(ctx, hostID, workspaceID)
-	if err == nil {
-		if current.OwnerID != principal.UserID {
-			return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
-		}
-		if current.BindingVersion < expectedBindingVersion {
-			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-		}
-		delta := current.BindingVersion - expectedBindingVersion
-		switch current.State {
-		case workspace.BindingActive, workspace.BindingPreparing:
-			if delta > 2 || (current.State == workspace.BindingPreparing && delta > 1) {
-				return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-			}
-			if current.DesiredRevision == value.Revision {
-				return current, nil
-			}
-			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding is still catching up")
-		case workspace.BindingUnbinding:
-			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace unbinding is still in progress")
-		case workspace.BindingDetached, workspace.BindingFailed:
-			if delta != 0 {
-				return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-			}
-			return s.workspaces.TransitionWorkspaceBinding(ctx, hostID, workspaceID, current.BindingVersion,
-				current.State, workspace.BindingPreparing, current.DesiredRevision, current.AppliedRevision)
-		default:
-			return workspace.Binding{}, domain.NewError(domain.CodeInvalidState, "workspace binding state is invalid")
-		}
-	}
-	if domain.CodeOf(err) != domain.CodeNotFound {
-		return workspace.Binding{}, err
-	}
-	if expectedBindingVersion != 0 {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-	}
-	created, err := s.workspaces.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: principal.UserID, HostID: hostID, Workspace: value, Directory: workspaceID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: value.Revision,
-	})
-	if domain.CodeOf(err) == domain.CodeWorkspaceBusy {
-		current, lookupErr := s.workspaces.GetWorkspaceBinding(ctx, hostID, workspaceID)
-		if lookupErr == nil && current.OwnerID == principal.UserID && current.DesiredRevision == value.Revision {
-			delta := current.BindingVersion
-			if current.State == workspace.BindingPreparing && delta == 1 || current.State == workspace.BindingActive && delta <= 2 {
-				return current, nil
-			}
-		}
-	}
-	return created, err
+	return workspace.Binding{}, domain.NewError(domain.CodeForbidden, "computer storage cannot be rebound")
 }
 
 func (s *hostService) UnbindWorkspace(ctx context.Context, principal identity.Principal, hostID, workspaceID string, expectedBindingVersion int64, writersStopped bool, idempotencyKey string) (workspace.Binding, error) {
@@ -209,48 +116,7 @@ func (s *hostService) UnbindWorkspace(ctx context.Context, principal identity.Pr
 	if err := authorizeHostScope(principal, hostID, identity.ScopeHostManage); err != nil {
 		return workspace.Binding{}, err
 	}
-	if !domain.ValidWorkspaceID(workspaceID) || expectedBindingVersion < 1 {
-		return workspace.Binding{}, domain.InvalidArgument("workspace_id", "workspace binding request is invalid")
-	}
-	if err := validateIdempotencyKey(idempotencyKey); err != nil {
-		return workspace.Binding{}, err
-	}
-	if !writersStopped {
-		return workspace.Binding{}, domain.InvalidArgument("writers_stopped", "stop AI tools, IDEs, and other workspace writers before confirming unbinding")
-	}
-	hostValue, err := s.getAuthorizedHost(ctx, principal, hostID)
-	if err != nil {
-		return workspace.Binding{}, err
-	}
-	if hostValue.State != host.StateRunning {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "host must be running to safely unbind a workspace")
-	}
-	current, err := s.workspaces.GetWorkspaceBinding(ctx, hostID, workspaceID)
-	if err != nil {
-		return workspace.Binding{}, err
-	}
-	if current.OwnerID != principal.UserID {
-		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
-	}
-	if current.BindingVersion < expectedBindingVersion {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-	}
-	delta := current.BindingVersion - expectedBindingVersion
-	switch current.State {
-	case workspace.BindingDetached, workspace.BindingUnbinding:
-		if delta > 2 {
-			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-		}
-		return current, nil
-	case workspace.BindingPreparing, workspace.BindingActive, workspace.BindingFailed:
-		if delta != 0 {
-			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace binding version changed; refresh and retry")
-		}
-		return s.workspaces.TransitionWorkspaceBinding(ctx, hostID, workspaceID, current.BindingVersion,
-			current.State, workspace.BindingUnbinding, current.DesiredRevision, current.AppliedRevision)
-	default:
-		return workspace.Binding{}, domain.NewError(domain.CodeInvalidState, "workspace binding state is invalid")
-	}
+	return workspace.Binding{}, domain.NewError(domain.CodeForbidden, "computer storage cannot be unbound")
 }
 
 func (s *hostService) RetryWorkspaceSync(ctx context.Context, principal identity.Principal, hostID, workspaceID string, expectedBindingVersion int64) (workspace.Binding, error) {
@@ -383,6 +249,9 @@ func (s *hostService) Delete(ctx context.Context, principal identity.Principal, 
 	if err := rejectHostCredential(principal); err != nil {
 		return host.Host{}, err
 	}
+	if !command.ConfirmWorkspaceDeletion {
+		return host.Host{}, domain.InvalidArgument("confirm_delete_workspace", "confirm deletion of this computer and its workspace directory")
+	}
 	if value.RuntimeGeneration > 1 && (value.StateReason == "restore_unknown" ||
 		(value.State == host.StateCreating && value.CreateAttemptedAt != nil)) {
 		return host.Host{}, domain.NewError(domain.CodeConflict, "restore create outcome is uncertain; contact an operator before deleting this host")
@@ -391,9 +260,31 @@ func (s *hostService) Delete(ctx context.Context, principal identity.Principal, 
 	if err != nil {
 		return host.Host{}, err
 	}
+	boundWorkspaceIDs := make(map[string]struct{}, len(bindings))
 	for _, binding := range bindings {
-		if binding.State != workspace.BindingDetached {
-			return host.Host{}, domain.NewError(domain.CodeWorkspaceBusy, "unbind and verify all workspaces before deleting this host")
+		if binding.HostID != value.ID || binding.OwnerID != value.OwnerID || !domain.ValidWorkspaceID(binding.Workspace.ID) {
+			return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage ownership is ambiguous")
+		}
+		boundWorkspaceIDs[binding.Workspace.ID] = struct{}{}
+	}
+	if len(boundWorkspaceIDs) != 1 {
+		return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing or ambiguous")
+	}
+	for workspaceID := range boundWorkspaceIDs {
+		otherBindings, err := s.workspaces.GetWorkspaceBindingsByWorkspace(ctx, workspaceID)
+		if err != nil {
+			return host.Host{}, err
+		}
+		for _, binding := range otherBindings {
+			if binding.HostID != value.ID {
+				return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage is shared with another computer")
+			}
+		}
+		if s.hostWorkspaceDeleter == nil {
+			return host.Host{}, domain.NewError(domain.CodeInvalidState, "computer storage cleanup is unavailable")
+		}
+		if err := s.hostWorkspaceDeleter.ValidateHostWorkspace(ctx, value.OwnerID, value.ID, workspaceID); err != nil {
+			return host.Host{}, err
 		}
 	}
 	if value.State == host.StateDeleting {
@@ -402,7 +293,7 @@ func (s *hostService) Delete(ctx context.Context, principal identity.Principal, 
 	if err := host.ValidateTransition(value.State, host.StateDeleting); err != nil {
 		return host.Host{}, err
 	}
-	updated, err := s.hosts.TransitionHost(ctx, value.ID, value.State, host.StateDeleting, "")
+	updated, err := s.hosts.BeginHostDelete(ctx, value.ID, value.State)
 	if err != nil {
 		return host.Host{}, err
 	}

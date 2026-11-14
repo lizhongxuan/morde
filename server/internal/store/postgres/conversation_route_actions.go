@@ -395,8 +395,16 @@ SELECT COALESCE(bool_or(cycle OR (depth=128 AND previous_id IS NOT NULL)),false)
 	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,COALESCE(m.task_id,''),COALESCE(m.output_task_revision,0),
 COALESCE(m.output_result_event_sequence,0),m.role,m.content FROM conversation_messages m
 LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
-WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind<>'task_result_review'
+WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind NOT IN ('task_result_review','conversation_variant_input')
  AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
+ AND ($8::text='' OR COALESCE(m.variant_group_id,CASE WHEN m.role='user' THEN m.id ELSE (
+   SELECT COALESCE(origin.variant_group_id,origin.id) FROM conversation_messages origin
+   WHERE origin.owner_id=m.owner_id AND origin.conversation_id=m.conversation_id AND origin.actor_id=m.actor_id
+    AND origin.role='user' AND origin.source_kind<>'conversation_variant_input'
+    AND ((m.task_id IS NOT NULL AND origin.task_id=m.task_id) OR (m.task_id IS NULL AND origin.sequence<m.sequence))
+   ORDER BY CASE WHEN m.task_id IS NOT NULL THEN origin.sequence END ASC,
+    CASE WHEN m.task_id IS NULL THEN origin.sequence END DESC LIMIT 1
+ ) END,'')<>$8)
  AND (
    (m.actor_id=$4 AND (m.task_id IS NULL OR t.initiator_id=$4)
     AND (m.role='user' OR (m.role='assistant' AND (
@@ -420,7 +428,7 @@ WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind
     AND (`+projectSharedHistoryEvidenceSQL+`))
  )
 ORDER BY m.sequence DESC LIMIT 8`, claim.Message.OwnerID, claim.Message.ConversationID, claim.Message.Sequence, claim.Message.ActorID,
-		claim.ServiceInstanceID, claim.Input.ProjectID, descendants)
+		claim.ServiceInstanceID, claim.Input.ProjectID, descendants, claim.Input.VariantGroupID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read route history: %w", err)
 	}
@@ -448,6 +456,14 @@ COALESCE(m.output_result_event_sequence,0),m.role,m.content FROM conversation_me
 WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.role='assistant'
  AND m.source_kind NOT IN ('history_import','legacy_instant') AND m.delivery_status='applied'
  AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
+ AND ($8::text='' OR COALESCE(m.variant_group_id,(
+   SELECT COALESCE(origin.variant_group_id,origin.id) FROM conversation_messages origin
+   WHERE origin.owner_id=m.owner_id AND origin.conversation_id=m.conversation_id AND origin.actor_id=m.actor_id
+    AND origin.role='user' AND origin.source_kind<>'conversation_variant_input'
+    AND ((m.task_id IS NOT NULL AND origin.task_id=m.task_id) OR (m.task_id IS NULL AND origin.sequence<m.sequence))
+   ORDER BY CASE WHEN m.task_id IS NOT NULL THEN origin.sequence END ASC,
+    CASE WHEN m.task_id IS NULL THEN origin.sequence END DESC LIMIT 1
+ ),'')<>$8)
  AND EXISTS (SELECT 1 FROM conversation_result_batches batch JOIN conversation_result_sources source
    ON source.batch_message_id=batch.message_id AND source.owner_id=batch.owner_id
     AND source.actor_id=batch.actor_id AND source.conversation_id=batch.conversation_id AND source.state='published'
@@ -461,7 +477,7 @@ WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.role='assis
     WHERE project_scope.id=m.conversation_id AND project_scope.owner_id=m.owner_id AND project_scope.project_id=$6)
     AND (`+projectSharedHistoryEvidenceSQL+`)))
 ORDER BY m.sequence DESC LIMIT 4`, claim.Message.OwnerID, claim.Message.ConversationID, claim.Message.Sequence,
-		claim.Message.ActorID, claim.ServiceInstanceID, claim.Input.ProjectID, descendants)
+		claim.Message.ActorID, claim.ServiceInstanceID, claim.Input.ProjectID, descendants, claim.Input.VariantGroupID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read recent published Task results: %w", err)
 	}
@@ -505,6 +521,7 @@ WHERE source.batch_message_id=ANY($1::text[]) AND source.owner_id=$2 AND source.
  AND batch.state='published' AND batch.published_message_id=source.batch_message_id
  AND batch.service_instance_id=$5::uuid
  AND origin.delivery_status='applied' AND origin.source_kind NOT IN ('history_import','legacy_instant')
+ AND ($7::text='' OR COALESCE(origin.variant_group_id,origin.id)<>$7)
  AND octet_length(origin.content)<=4096 AND origin.id<>ALL($6::text[])
  AND (origin.id=source.user_message_id OR origin.sequence=(
    SELECT min(initial.sequence) FROM conversation_messages initial
@@ -513,7 +530,7 @@ WHERE source.batch_message_id=ANY($1::text[]) AND source.owner_id=$2 AND source.
     AND initial.role='user' AND initial.delivery_status='applied'
     AND initial.source_kind NOT IN ('history_import','legacy_instant')))
 ORDER BY origin.sequence`, publishedResultIDs, claim.Message.OwnerID, claim.Message.ActorID,
-			claim.Message.ConversationID, claim.ServiceInstanceID, descendants)
+			claim.Message.ConversationID, claim.ServiceInstanceID, descendants, claim.Input.VariantGroupID)
 		if err != nil {
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("read published Task source requests: %w", err)
 		}
@@ -558,6 +575,10 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 WHERE owner_id=$1 AND conversation_id=$2 AND initiator_id=$3
  AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')
  AND waiting_reason<>'project_recovery_unavailable'
+ AND ($8::text='' OR NOT EXISTS (SELECT 1 FROM conversation_messages origin
+   WHERE origin.task_id=tasks.id AND origin.owner_id=tasks.owner_id AND origin.conversation_id=tasks.conversation_id
+    AND origin.actor_id=tasks.initiator_id AND origin.role='user'
+    AND COALESCE(origin.variant_group_id,origin.id)=$8))
  AND NOT EXISTS (SELECT 1 FROM conversation_messages future WHERE future.task_id=tasks.id AND future.id=ANY($7::text[]))
  AND (created_at<=$4 OR EXISTS (SELECT 1 FROM conversation_messages origin
    WHERE origin.task_id=tasks.id AND origin.owner_id=tasks.owner_id AND origin.conversation_id=tasks.conversation_id
@@ -567,7 +588,7 @@ ORDER BY id LIMIT 65`
 		query += ` FOR UPDATE`
 	}
 	rows, err = tx.Query(ctx, query, claim.Message.OwnerID, claim.Message.ConversationID, claim.Message.ActorID,
-		claim.Message.CreatedAt, claim.Message.Sequence, value.PreviousMessageID, descendants)
+		claim.Message.CreatedAt, claim.Message.Sequence, value.PreviousMessageID, descendants, claim.Input.VariantGroupID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read route task candidates: %w", err)
 	}
@@ -615,6 +636,7 @@ JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND 
 LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
 WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
  AND r.message_id<>$5 AND r.duplicate_of_message_id IS NULL
+ AND ($11::text='' OR COALESCE(m.variant_group_id,m.id)<>$11)
  AND (m.sequence<$6 OR r.client_message_id=$7 OR r.message_id=(
    SELECT prior.duplicate_of_message_id FROM conversation_message_routes prior
    WHERE prior.service_instance_id=$1::uuid AND prior.owner_id=$2 AND prior.actor_id=$3
@@ -627,7 +649,7 @@ ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_ad
  OR t.status IN ('queued','running','waiting_user','pausing','paused','cancelling') THEN 0 ELSE 1 END,
 		m.sequence DESC LIMIT 101`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
 		claim.Message.ConversationID, claim.Message.ID, claim.Message.Sequence, claim.Input.PreviousClientMessageID,
-		claim.Message.CreatedAt, claim.Input.ResultReviewID, claim.AggregationStartedAt)
+		claim.Message.CreatedAt, claim.Input.ResultReviewID, claim.AggregationStartedAt, claim.Input.VariantGroupID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read prior conversation route candidates: %w", err)
 	}
@@ -1806,12 +1828,16 @@ func validateInitialRouteAttachments(ctx context.Context, tx pgx.Tx, claim app.C
 		return nil
 	}
 	var total, matching, distinctAttachments int
+	messageID := claim.Message.ID
+	if domain.ValidMessageID(claim.Input.VariantSourceMessageID) {
+		messageID = claim.Input.VariantSourceMessageID
+	}
 	if claim.Input.ProjectID != "" {
 		err := tx.QueryRow(ctx, `SELECT count(*),
  count(*) FILTER (WHERE client_attachment_id=ANY($7::text[]) AND state='committed'),count(DISTINCT attachment_id)
 FROM project_conversation_attachments
 WHERE message_id=$1 AND service_instance_id=$2::uuid AND owner_id=$3 AND actor_id=$4
- AND conversation_id=$5 AND project_id=$6`, claim.Message.ID, claim.ServiceInstanceID,
+ AND conversation_id=$5 AND project_id=$6`, messageID, claim.ServiceInstanceID,
 			claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID, claim.Input.ProjectID,
 			claim.Input.ClientAttachmentIDs).Scan(&total, &matching, &distinctAttachments)
 		if err != nil {
@@ -1829,7 +1855,7 @@ JOIN conversation_message_attachments link ON link.service_instance_id=slot.serv
 JOIN personal_attachment_uploads upload ON upload.service_instance_id=link.service_instance_id AND upload.owner_id=link.owner_id
  AND upload.upload_id=link.upload_id AND upload.attachment_id=link.attachment_id
 WHERE slot.message_id=$1 AND slot.service_instance_id=$2::uuid AND slot.owner_id=$3`,
-		claim.Message.ID, claim.ServiceInstanceID, claim.Message.ActorID, claim.Input.ClientAttachmentIDs).Scan(&total, &matching, &distinctAttachments)
+		messageID, claim.ServiceInstanceID, claim.Message.ActorID, claim.Input.ClientAttachmentIDs).Scan(&total, &matching, &distinctAttachments)
 	if err != nil {
 		return fmt.Errorf("check initial conversation attachments: %w", err)
 	}
@@ -1917,6 +1943,16 @@ func finishConversationRoute(ctx context.Context, tx pgx.Tx, claim app.Conversat
 		if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET task_id=$2,delivery_status=$3 WHERE id=$1`, claim.Message.ID, taskID, status); err != nil {
 			return fmt.Errorf("associate routed message with task: %w", err)
 		}
+		if claim.Input.VariantOperationID != "" {
+			updated, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET task_id=$2,state='running',updated_at=clock_timestamp()
+WHERE operation_id=$1 AND actor_id=$3 AND state='accepted'`, claim.Input.VariantOperationID, taskID, claim.Message.ActorID)
+			if err != nil {
+				return fmt.Errorf("associate variant operation with Task: %w", err)
+			}
+			if updated.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "conversation variant operation changed during routing")
+			}
+		}
 	} else if applied {
 		result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied'
 WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user' AND task_id IS NULL AND delivery_status IN ('pending','applied')`,
@@ -1933,10 +1969,21 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 		if err != nil {
 			return err
 		}
+		variantGroupID, variantVersion, variantAction, operationID := claim.Input.VariantGroupID, claim.Input.VariantVersion, claim.Input.VariantAction, claim.Input.VariantOperationID
+		if variantGroupID == "" {
+			variantGroupID, variantVersion, variantAction = claim.Message.ID, 1, "original"
+		}
 		if err := insertMessage(ctx, tx, conversation.Message{ID: messageID, OwnerID: claim.Message.OwnerID,
 			ActorID: claim.Message.ActorID, ConversationID: claim.Message.ConversationID, Role: conversation.RoleAssistant,
-			Content: reply, SourceKind: "conversation", DeliveryStatus: conversation.DeliveryApplied}); err != nil {
+			Content: reply, SourceKind: "conversation", DeliveryStatus: conversation.DeliveryApplied,
+			VariantGroupID: variantGroupID, VariantVersion: variantVersion, VariantAction: variantAction, VariantOperationID: operationID}); err != nil {
 			return err
+		}
+		if operationID != "" {
+			if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET state='completed',assistant_message_id=$2,updated_at=clock_timestamp()
+WHERE operation_id=$1 AND actor_id=$3 AND state='accepted'`, operationID, messageID, claim.Message.ActorID); err != nil {
+				return fmt.Errorf("complete direct conversation variant: %w", err)
+			}
 		}
 		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
 			ObjectType: "message", ObjectID: messageID, Operation: "upsert", MutationID: claim.Message.ClientMessageID}); err != nil {
@@ -2059,6 +2106,12 @@ WHERE message_id=$1 AND trigger_message_id=$2 AND state='processing'`, claim.Inp
 				return fmt.Errorf("finish failed task result review trigger: %w", err)
 			}
 			return recordTaskResultReviewChanges(ctx, tx, claim, taskIDs)
+		}
+		if claim.Input.VariantOperationID != "" {
+			if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET state='failed',updated_at=clock_timestamp()
+WHERE operation_id=$1 AND actor_id=$2 AND state IN ('accepted','running')`, claim.Input.VariantOperationID, claim.Message.ActorID); err != nil {
+				return fmt.Errorf("fail conversation variant route: %w", err)
+			}
 		}
 		return recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
 			ObjectType: "message", ObjectID: claim.Message.ID, Operation: "upsert", MutationID: claim.Message.ClientMessageID})

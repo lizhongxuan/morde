@@ -74,6 +74,7 @@ indirect enum MordeCodexJSONValue: Codable, Equatable, Sendable {
 struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
     let id: String
     let installation_id: String
+    let profile_key: String?
     let thread_id: String
     let title: String
     let cwd_label: String
@@ -84,7 +85,7 @@ struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
     let turn_id: String?
 
     private enum CodingKeys: String, CodingKey {
-        case id, session_id, installation_id, thread_id, title, cwd_label, updated_at, status, scopes
+        case id, session_id, installation_id, profile_key, thread_id, title, cwd_label, updated_at, status, scopes
         case last_sequence, turn_id, current_turn_id
     }
 
@@ -93,6 +94,7 @@ struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
         id = try values.decodeIfPresent(String.self, forKey: .id)
             ?? values.decode(String.self, forKey: .session_id)
         installation_id = try values.decode(String.self, forKey: .installation_id)
+        profile_key = try values.decodeIfPresent(String.self, forKey: .profile_key)
         thread_id = try values.decode(String.self, forKey: .thread_id)
         title = try values.decode(String.self, forKey: .title)
         cwd_label = try values.decode(String.self, forKey: .cwd_label)
@@ -116,10 +118,122 @@ struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
     func hasScope(_ scope: String) -> Bool { scopes.contains(scope) }
 }
 
+struct MordeCodexSessionDiscoveryStatus: Decodable, Equatable, Sendable {
+    let state: String
+    let error_code: String?
+    let updated_at: String
+
+    var updatedAtDate: Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: updated_at) ?? ISO8601DateFormatter().date(from: updated_at)
+    }
+}
+
+struct MordeCodexHistorySyncProgress: Decodable, Equatable, Sendable {
+    let discovered_sessions: Int64
+    let history_complete_sessions: Int64
+    let pending_upload_event_count: Int64
+}
+
+struct MordeCodexProfileConnection: Decodable, Equatable, Identifiable, Sendable {
+    let installation_id: String
+    let profile_key: String
+    let scopes: [String]
+    let grant_version: Int64
+    let connected: Bool
+    let updated_at: String
+    let session_discovery: MordeCodexSessionDiscoveryStatus?
+    let history_sync: MordeCodexHistorySyncProgress?
+
+    var id: String { profile_key }
+
+    var updatedAtDate: Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: updated_at) ?? ISO8601DateFormatter().date(from: updated_at)
+    }
+}
+
+struct MordeCodexProfileConnectionList: Decodable, Sendable {
+    let items: [MordeCodexProfileConnection]
+}
+
+enum MordeCodexProfileConnectionPolicy {
+    static func isValid(_ connection: MordeCodexProfileConnection,
+                        installationID: String) -> Bool {
+        let allowedScopes: Set<String> = ["read", "live", "send", "interrupt", "approval"]
+        let profileKeyIsSafe = !connection.profile_key.isEmpty && connection.profile_key.utf8.count <= 128 &&
+            connection.profile_key.unicodeScalars.allSatisfy { scalar in
+                (scalar.value >= 48 && scalar.value <= 57) ||
+                    (scalar.value >= 65 && scalar.value <= 90) ||
+                    (scalar.value >= 97 && scalar.value <= 122) || scalar.value == 95 || scalar.value == 45
+            } && !connection.profile_key.uppercased().contains("CODEX_HOME")
+        guard connection.installation_id == installationID, profileKeyIsSafe,
+              connection.connected, connection.grant_version > 0,
+              connection.scopes.count >= 2,
+              Set(connection.scopes).count == connection.scopes.count,
+              Set(connection.scopes).isSubset(of: allowedScopes),
+              connection.scopes.contains("read"), connection.scopes.contains("live"),
+              connection.updatedAtDate != nil,
+              (connection.session_discovery == nil) == (connection.history_sync == nil) else { return false }
+        if let status = connection.session_discovery {
+            guard ["syncing", "synced", "partial"].contains(status.state),
+                  status.updatedAtDate != nil,
+                  status.error_code.map({
+                      ["profile_unavailable", "session_list_failed", "connection_lost", "unknown"].contains($0)
+                  }) ?? true,
+                  (status.state == "partial") == (status.error_code != nil) else { return false }
+        }
+        if let progress = connection.history_sync {
+            guard progress.discovered_sessions >= 0,
+                  progress.history_complete_sessions >= 0,
+                  progress.history_complete_sessions <= progress.discovered_sessions,
+                  progress.pending_upload_event_count >= 0 else { return false }
+        }
+        return true
+    }
+}
+
 enum MordeCodexSessionScopePolicy {
+    static func profileKeys(in sessions: [MordeCodexSession]) -> [String] {
+        Array(Set(sessions.compactMap(\.profile_key))).sorted()
+    }
+
+    static func sessions(_ sessions: [MordeCodexSession], profileKey: String?) -> [MordeCodexSession] {
+        guard let profileKey else { return sessions }
+        return sessions.filter { $0.profile_key == profileKey }
+    }
+
+    static func acceptsNextCursor(_ next: String?, after current: String?, seen: Set<String>) -> Bool {
+        guard let next else { return true }
+        return !next.isEmpty && next != current && !seen.contains(next)
+    }
+
+    static func sessionsMissingFromCompletedRefresh(previous: Set<String>, observed: Set<String>,
+                                                     finished: Bool) -> Set<String> {
+        finished ? previous.subtracting(observed) : []
+    }
+
     static func shouldClearReadHistory(afterRefreshing scopes: [String]?) -> Bool {
         guard let scopes else { return false }
         return !scopes.contains("read")
+    }
+
+    static func permitsReadResponse(_ session: MordeCodexSession?, selectedSessionID: String?,
+                                    installationAuthorized: Bool, revoked: Bool,
+                                    requireLive: Bool = false) -> Bool {
+        guard let session, installationAuthorized, !revoked, session.id == selectedSessionID,
+              session.hasScope("read") else { return false }
+        return !requireLive || session.hasScope("live")
+    }
+
+    static func permitsCommandResponse(_ session: MordeCodexSession?,
+                                       installationAuthorized: Bool, revoked: Bool,
+                                       requiredScope: String) -> Bool {
+        guard let session, installationAuthorized, !revoked,
+              session.hasScope("read"), !requiredScope.isEmpty else { return false }
+        return session.hasScope(requiredScope)
     }
 }
 
@@ -244,6 +358,16 @@ struct MordeCodexEvent: Decodable, Equatable, Identifiable, Sendable {
                                            requestID: question.id, version: question.version)
         }
         return nil
+    }
+
+    var codexToolCallID: String? {
+        guard ["tool_call", "tool_result", "tool_output_delta", "tool_call_summary", "tool_result_summary"]
+                .contains(normalizedKind),
+              let callID = values["call_id"]?.stringValue,
+              !callID.isEmpty, callID.utf8.count <= 512,
+              callID == callID.trimmingCharacters(in: .whitespacesAndNewlines),
+              !callID.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
+        return callID
     }
 }
 
@@ -443,6 +567,10 @@ private struct MordeCodexTextItemKey: Hashable {
     let itemID: String
 }
 
+private struct MordeCodexToolCallKey: Hashable {
+    let callID: String
+}
+
 enum MordeCodexEventPolicy {
     enum MergeError: Error, Equatable {
         case invalidEvent
@@ -498,15 +626,20 @@ enum MordeCodexEventPolicy {
         var output: [MordeCodexTimelineItem] = []
         let ordered = events.sorted(by: { $0.sequence < $1.sequence })
         var messageEvents: [MordeCodexTextItemKey: [MordeCodexEvent]] = [:]
+        var toolCallEvents: [MordeCodexToolCallKey: [MordeCodexEvent]] = [:]
         for event in ordered {
             let kind: MordeCodexTimelineKind?
             if event.isUserMessage { kind = .user }
             else if event.isAssistantDelta || event.isAssistantMessage { kind = .assistant }
             else { kind = nil }
-            guard let kind else { continue }
-            let key = MordeCodexTextItemKey(kind: kind, turnID: event.turn_id,
-                                            itemID: event.item_id ?? "sequence-\(event.sequence)")
-            messageEvents[key, default: []].append(event)
+            if let kind {
+                let key = MordeCodexTextItemKey(kind: kind, turnID: event.turn_id,
+                                                itemID: event.item_id ?? "sequence-\(event.sequence)")
+                messageEvents[key, default: []].append(event)
+            }
+            if let callID = event.codexToolCallID {
+                toolCallEvents[MordeCodexToolCallKey(callID: callID), default: []].append(event)
+            }
         }
         var questions: [String: MordeCodexUserQuestionRequest] = [:]
         var questionStatuses: [String: String] = [:]
@@ -518,6 +651,7 @@ enum MordeCodexEventPolicy {
         }
         var emittedQuestions = Set<String>()
         var emittedMessages = Set<MordeCodexTextItemKey>()
+        var emittedToolCalls = Set<MordeCodexToolCallKey>()
         for event in ordered {
             let textKind: MordeCodexTimelineKind?
             if event.isUserMessage { textKind = .user }
@@ -534,7 +668,7 @@ enum MordeCodexEventPolicy {
                 output.append(MordeCodexTimelineItem(
                     id: "\(textKind == .user ? "user" : "assistant")-\(key.turnID ?? "")-\(key.itemID)",
                     sequence: latest.sequence, kind: textKind, text: text, status: latest.visibleStatus,
-                    approval: nil, question: nil))
+                    approval: nil, question: nil, details: []))
                 continue
             }
             if let request = event.questionRequest {
@@ -544,7 +678,14 @@ enum MordeCodexEventPolicy {
                 let latestStatus = questionStatuses[key] ?? request.status
                 output.append(MordeCodexTimelineItem(id: "question-\(request.id)-\(request.version)",
                     sequence: event.sequence, kind: .question, text: nil, status: latestStatus,
-                    approval: nil, question: original.withStatus(latestStatus)))
+                    approval: nil, question: original.withStatus(latestStatus), details: []))
+                continue
+            }
+            if let callID = event.codexToolCallID {
+                let key = MordeCodexToolCallKey(callID: callID)
+                guard emittedToolCalls.insert(key).inserted,
+                      let group = toolCallEvents[key], let first = group.first else { continue }
+                output.append(toolTimelineItem(callID: callID, events: group, sequence: first.sequence))
                 continue
             }
             let kind: MordeCodexTimelineKind
@@ -552,7 +693,7 @@ enum MordeCodexEventPolicy {
             else if event.isApproval { kind = .approval }
             else if ["reasoning_summary", "reasoning_summary_part"].contains(event.normalizedKind) { kind = .reasoning }
             else if ["plan", "plan_update", "plan_summary"].contains(event.normalizedKind) { kind = .plan }
-            else if ["tool_activity", "tool_call", "tool_call_summary", "tool_result", "tool_result_summary",
+            else if ["tool_activity", "tool_call", "tool_call_summary", "tool_result", "tool_output_delta", "tool_result_summary",
                      "command", "command_summary", "command_output", "command_result"].contains(event.normalizedKind) { kind = .tool }
             else if ["file_change", "file_change_summary", "file_summary"].contains(event.normalizedKind) { kind = .file }
             else if ["child_agent", "subagent_activity", "subagent_summary", "agent_activity", "agent_summary"].contains(event.normalizedKind) { kind = .agent }
@@ -566,11 +707,148 @@ enum MordeCodexEventPolicy {
             } else {
                 visibleText = kind != .user && kind != .assistant && isRawJSON(event.text) ? nil : event.text
             }
+            let reasoningDetails = kind == .reasoning && visibleText != nil
+                ? [MordeCodexTimelineDetail(field: .reasoning, text: visibleText, state: .complete)]
+                : []
             output.append(MordeCodexTimelineItem(id: "event-\(event.sequence)", sequence: event.sequence,
-                kind: kind, text: visibleText, status: event.visibleStatus,
-                approval: kind == .approval ? event.approval : nil, question: nil))
+                kind: kind, text: kind == .reasoning ? nil : visibleText, status: event.visibleStatus,
+                approval: kind == .approval ? event.approval : nil, question: nil, details: reasoningDetails))
         }
         return output
+    }
+
+    private static func toolTimelineItem(callID: String, events: [MordeCodexEvent],
+                                         sequence: Int64) -> MordeCodexTimelineItem {
+        let ordered = events.sorted { $0.sequence < $1.sequence }
+        let callEvents = ordered.filter { $0.normalizedKind == "tool_call" }
+        let resultEvents = ordered.filter { ["tool_result", "tool_output_delta"].contains($0.normalizedKind) }
+        let summaryEvents = ordered.filter {
+            ["tool_call", "tool_call_summary", "tool_result_summary", "tool_result", "tool_output_delta"]
+                .contains($0.normalizedKind)
+        }
+        let summary = ["summary", "text", "tool"].lazy
+            .flatMap { key in summaryEvents.compactMap { $0.values[key]?.stringValue } }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isRawJSON($0) }
+        let input = assembleToolDetail(callEvents, field: "input", isOutput: false)
+        let result = assembleToolDetail(resultEvents, field: "output", isOutput: true)
+        let details = [input, result].compactMap { $0 }
+        return MordeCodexTimelineItem(
+            id: "tool-\(callID)", sequence: sequence, kind: .tool, text: summary,
+            status: ordered.reversed().compactMap(\.visibleStatus).first,
+            approval: nil, question: nil, details: details)
+    }
+
+    private static func assembleToolDetail(_ events: [MordeCodexEvent], field: String,
+                                           isOutput: Bool) -> MordeCodexTimelineDetail? {
+        guard !events.isEmpty else { return nil }
+        let partKey = "\(field)_part"
+        let countKey = "\(field)_parts"
+        let hasField = events.contains { $0.values[field] != nil || $0.values[partKey] != nil || $0.values[countKey] != nil }
+        guard hasField else { return nil }
+
+        struct Chunk {
+            let sequence: Int64
+            let index: Int?
+            let count: Int?
+            let hasIndex: Bool
+            let hasCount: Bool
+            let hasText: Bool
+            let text: String?
+        }
+        let receivedChunks = events.map { event in
+            Chunk(sequence: event.sequence,
+                  index: integerValue(event.values[partKey]),
+                  count: integerValue(event.values[countKey]),
+                  hasIndex: event.values[partKey] != nil,
+                  hasCount: event.values[countKey] != nil,
+                  hasText: event.values[field] != nil,
+                  text: event.values[field]?.stringValue)
+        }
+        let hasDeclaredOutputSnapshot = isOutput && receivedChunks.contains(where: \.hasCount)
+        let chunks = hasDeclaredOutputSnapshot
+            ? receivedChunks.filter(\.hasCount)
+            : receivedChunks
+        var invalid = chunks.contains { chunk in
+            if let text = chunk.text, text.utf8.count > 24 * 1024 { return true }
+            if chunk.hasText && chunk.text == nil { return true }
+            if chunk.hasIndex && chunk.index == nil { return true }
+            if chunk.hasCount && chunk.count == nil { return true }
+            if let index = chunk.index, index < 0 { return true }
+            if let count = chunk.count, count <= 0 || count > 4096 { return true }
+            if let index = chunk.index, let count = chunk.count, index >= count { return true }
+            return false
+        }
+        let declaredCounts = Set(chunks.compactMap(\.count))
+        if declaredCounts.count > 1 { invalid = true }
+        let expectedCount = chunks.sorted { $0.sequence < $1.sequence }.compactMap(\.count).first
+        let indexed = chunks.filter { $0.text != nil }
+        let allIndexed = indexed.allSatisfy { $0.index != nil }
+        var assembled: String
+        var missing = false
+        if allIndexed, !indexed.isEmpty, expectedCount == nil, isOutput {
+            let sorted = indexed.sorted {
+                guard let left = $0.index, let right = $1.index else { return $0.sequence < $1.sequence }
+                return left == right ? $0.sequence < $1.sequence : left < right
+            }
+            var seenByIndex: [Int: String] = [:]
+            var pieces: [String] = []
+            var seenIndexes = Set<Int>()
+            for chunk in sorted {
+                guard let index = chunk.index, let text = chunk.text else { continue }
+                if let previous = seenByIndex[index], previous == text { continue }
+                if seenByIndex[index] != nil { invalid = true }
+                seenByIndex[index] = text
+                pieces.append(text)
+                seenIndexes.insert(index)
+            }
+            let indexes = seenIndexes.sorted()
+            missing = indexes != Array(0..<indexes.count)
+            assembled = pieces.joined()
+        } else if allIndexed, !indexed.isEmpty {
+            var latestByIndex: [Int: String] = [:]
+            for chunk in indexed {
+                guard let index = chunk.index, let text = chunk.text else { continue }
+                if let previous = latestByIndex[index], previous != text { invalid = true }
+                latestByIndex[index] = text
+            }
+            if let expectedCount {
+                let expected = Set(0..<expectedCount)
+                missing = Set(latestByIndex.keys) != expected
+            } else {
+                let indexes = latestByIndex.keys.sorted()
+                missing = indexes != Array(0..<indexes.count)
+            }
+            assembled = latestByIndex.keys.sorted().compactMap { latestByIndex[$0] }.joined()
+        } else {
+            let ordered = chunks.sorted { $0.sequence < $1.sequence }
+            assembled = ordered.compactMap(\.text).joined()
+            if expectedCount != nil || chunks.count > 1 || chunks.contains(where: \.hasIndex) {
+                missing = true
+            }
+        }
+        var state: MordeCodexTimelineDetailState
+        if invalid || missing {
+            state = .incomplete
+        } else if expectedCount == nil && (chunks.contains(where: \.hasIndex) || chunks.count > 1) {
+            state = isOutput ? .streaming : .incomplete
+        } else {
+            state = .complete
+        }
+        if !invalid, expectedCount == nil, chunks.count == 1,
+           chunks.first?.hasIndex == false, chunks.first?.hasCount == false {
+            state = .complete
+        }
+        return MordeCodexTimelineDetail(field: isOutput ? .output : .input,
+                                        text: assembled.isEmpty ? nil : assembled, state: state)
+    }
+
+    private static func integerValue(_ value: MordeCodexJSONValue?) -> Int? {
+        guard let value else { return nil }
+        switch value {
+        case .integer(let number): return Int(exactly: number)
+        case .number(let number): return number.isFinite ? Int(exactly: number) : nil
+        default: return nil
+        }
     }
 
     private static func joinedMessageText(_ events: [MordeCodexEvent], kind: MordeCodexTimelineKind) -> String {
@@ -622,6 +900,36 @@ enum MordeCodexTimelineKind: Hashable, Sendable {
     case user, assistant, reasoning, plan, tool, file, agent, approval, question, status, commandStatus, unsupported
 }
 
+enum MordeCodexTimelineDetailField: Hashable, Sendable {
+    case input, output, reasoning
+
+    var localizationKey: String {
+        switch self {
+        case .input: "Input"
+        case .output: "Output"
+        case .reasoning: "Reasoning summary"
+        }
+    }
+}
+
+enum MordeCodexTimelineDetailState: Hashable, Sendable {
+    case complete, incomplete, streaming
+
+    var localizationKey: String? {
+        switch self {
+        case .complete: nil
+        case .incomplete: "Incomplete"
+        case .streaming: "Streaming"
+        }
+    }
+}
+
+struct MordeCodexTimelineDetail: Equatable, Sendable {
+    let field: MordeCodexTimelineDetailField
+    let text: String?
+    let state: MordeCodexTimelineDetailState
+}
+
 struct MordeCodexTimelineItem: Identifiable, Equatable, Sendable {
     let id: String
     let sequence: Int64
@@ -630,6 +938,7 @@ struct MordeCodexTimelineItem: Identifiable, Equatable, Sendable {
     let status: String?
     let approval: MordeCodexApproval?
     let question: MordeCodexUserQuestionRequest?
+    let details: [MordeCodexTimelineDetail]
 }
 
 enum MordeCodexSSEParserError: Error {

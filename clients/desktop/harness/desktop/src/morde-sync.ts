@@ -12,7 +12,14 @@ type Progress = { state: string; stage?: string; confirmed_bytes?: number; plann
 export type HandoffTarget = "desktop" | "cloud_workspace";
 export type HandoffRecord = { id: string; workspaceId: string; scope: string[]; source: HandoffTarget; target: HandoffTarget; phase: "checking" | "needs_review" | "verified"; revision?: number };
 export type ProjectHostApplicationStatus = "pending_apply" | "applied" | "conflict" | "unknown";
-export type SyncCheckpoint = { serviceInstanceID: string; installationId: string; workspaceId: string; directory: string; dev: string; ino: string; mode: "upload" | "download" | "bidirectional" | "live_sync" | "handoff_checkpoint" | "project_upload"; scope: string[]; handoffTarget?: HandoffTarget; projectSelectionID?: string; sourceBindingID?: string; hostId?: string; folderId?: string; projectName?: string; idempotencyKey: string; sessionId?: string; sessionState?: "running" | "completed" | "conflict" | "cancelled" | "failed" | "expired"; hostApplicationStatus?: ProjectHostApplicationStatus; childPid?: number };
+export type SyncCheckpoint = { serviceInstanceID: string; installationId: string; workspaceId: string; directory: string; dev: string; ino: string; mode: "upload" | "download" | "bidirectional" | "live_sync" | "handoff_checkpoint" | "project_upload"; scope: string[]; handoffTarget?: HandoffTarget; projectSelectionID?: string; sourceBindingID?: string; hostId?: string; folderId?: string; projectName?: string; idempotencyKey: string; sessionId?: string; sessionState?: "running" | "completed" | "conflict" | "cancelled" | "failed" | "expired"; hostApplicationStatus?: ProjectHostApplicationStatus; syncOutcome?: "failed" | "unknown"; syncMessage?: string; childPid?: number };
+
+export class SyncRunError extends Error {
+  constructor(readonly outcome: "failed" | "unknown", message: string) {
+    super(message);
+    this.name = "SyncRunError";
+  }
+}
 
 export function validateSyncScope(value: unknown): string[] {
   if (!Array.isArray(value) || value.length > 1000 || value.some((part) => typeof part !== "string" || !part || isAbsolute(part) || /^[A-Za-z]:/.test(part) || part.split(/[\\/]/).some((segment) => segment === ".." || segment === "." || !segment))) throw new Error("Invalid sync scope");
@@ -269,13 +276,13 @@ export class MordeSync {
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
         buffer += chunk;
-        if (buffer.length > 1_000_000) { failure = new Error("Sync response too large"); child.kill(); return; }
+        if (buffer.length > 1_000_000) { failure = new SyncRunError("unknown", "Sync response too large"); child.kill(); return; }
         for (;;) {
           const end = buffer.indexOf("\n");
           if (end < 0) break;
           const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
           let message: Record<string, unknown>;
-          try { message = JSON.parse(line) as Record<string, unknown>; } catch { failure = new Error("Invalid sync response"); child.kill(); return; }
+          try { message = JSON.parse(line) as Record<string, unknown>; } catch { failure = new SyncRunError("unknown", "Invalid sync response"); child.kill(); return; }
           if (message.method === "progress") {
             const progress = message.params as Progress;
             this.update("running", progress);
@@ -285,14 +292,21 @@ export class MordeSync {
             if (message.error) {
               const detail = (message.error as { message?: unknown }).message;
               lockRejected = detail === "another Morde sync operation is active for this directory";
-              endOperation(new Error(lockRejected ? "This folder is already syncing in another Morde process" : "Sync failed; check workspace status"));
+              const knownRejection = lockRejected || (message.error as { code?: unknown }).code === -32602 ||
+                typeof detail === "string" && /\breturned HTTP 4\d{2}(?:\b|\s*\()/.test(detail);
+              endOperation(new SyncRunError(knownRejection ? "failed" : "unknown",
+                lockRejected ? "This folder is already syncing in another Morde process" : "Sync failed; check workspace status"));
             } else if (!Object.prototype.hasOwnProperty.call(message, "result") || !message.result || typeof message.result !== "object" || Array.isArray(message.result)) {
-              endOperation(new Error("Invalid sync response"));
+              endOperation(new SyncRunError("unknown", "Invalid sync response"));
             } else { this.operationConfirmed = true; endOperation(undefined, message.result); }
           }
         }
       });
-      child.on("error", () => { failure = new Error("Could not start morde-sync"); });
+      child.on("error", () => {
+        if (received || failure) return;
+        failure = new SyncRunError(child.pid ? "unknown" : "failed",
+          child.pid ? "Sync process failed before a verified result" : "Could not start morde-sync");
+      });
       child.on("close", () => {
         this.child = null;
         if (this.stopping && !(this.cancelAcknowledged || this.operationConfirmed)) {
@@ -300,13 +314,13 @@ export class MordeSync {
           this.shutdownPid = child.pid ?? null;
           this.update(this.state);
         }
-        settle(failure ?? (received ? undefined : new Error("Sync exited without a verified result")), result);
+        settle(failure ?? (received ? undefined : new SyncRunError("unknown", "Sync exited without a verified result")), result);
       });
       try {
         if (child.pid) this.started?.(child.pid);
         child.stdin.write(`${JSON.stringify(request)}\n`);
       } catch (error) {
-        failure = error instanceof Error ? error : new Error("Could not save sync recovery point");
+        failure = new SyncRunError("failed", error instanceof Error ? error.message : "Could not save sync recovery point");
         child.kill();
       }
     });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
-import { checkedDirectory, MordeSync, verifyMapping } from '../out/morde-sync.js';
+import { checkedDirectory, MordeSync, SyncRunError, verifyMapping } from '../out/morde-sync.js';
 
 test('sync directory identity and overlap reject nested and aliased roots', async () => {
   const root = await mkdtemp(join(tmpdir(), 'morde-desktop-'));
@@ -41,6 +41,28 @@ process.stdin.once('data', chunk => { const req = JSON.parse(String(chunk).trim(
     assert.ok(Number.isSafeInteger(childPid) && childPid > 0);
     assert.equal(sync.snapshot(), 'idle');
     assert.throws(() => process.kill(childPid, 0), { code: 'ESRCH' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('sync errors distinguish a confirmed failure from an unverified result', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'morde-sync-outcome-'));
+  try {
+    const directory = join(root, 'project'), failedBinary = join(root, 'failed-sync'), unknownBinary = join(root, 'unknown-sync');
+    await mkdir(directory);
+    await writeFile(failedBinary, `#!/usr/bin/env node
+process.stdin.once('data', chunk => { const req = JSON.parse(String(chunk).trim()); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:req.id,error:{code:-32010,message:'Morde API POST returned HTTP 403 (forbidden)'}})+'\\n'); });
+`);
+    await writeFile(unknownBinary, `#!/usr/bin/env node
+process.stdin.once('data', () => process.exit(0));
+`);
+    await Promise.all([chmod(failedBinary, 0o700), chmod(unknownBinary, 0o700)]);
+    const mapping = { ...await checkedDirectory(directory, []), workspaceId: 'w1234567' };
+    const auth = { origin: 'https://portal.example', installationId: 'inst', clientCredential: 'client-secret',
+      clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z' };
+    const failed = new MordeSync(() => failedBinary, () => {});
+    await assert.rejects(failed.run(auth, mapping, 'upload'), (error) => error instanceof SyncRunError && error.outcome === 'failed');
+    const unknown = new MordeSync(() => unknownBinary, () => {});
+    await assert.rejects(unknown.run(auth, mapping, 'upload'), (error) => error instanceof SyncRunError && error.outcome === 'unknown');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

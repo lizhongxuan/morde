@@ -82,12 +82,152 @@ type Discover struct {
 	Scopes     []Scope       `json:"scopes"`
 }
 
+// ProfileConnectionRequest declares the exact scopes granted to one Codex
+// profile on the authenticated desktop installation.
+type ProfileConnectionRequest struct {
+	ProfileKey string  `json:"profile_key"`
+	Scopes     []Scope `json:"scopes"`
+}
+
+func (value ProfileConnectionRequest) Validate() error {
+	if !ValidProfileKey(value.ProfileKey) || value.Scopes == nil || len(value.Scopes) < 2 || len(value.Scopes) > len(allScopes) {
+		return errors.New("Codex profile connection is invalid")
+	}
+	seen := make(map[Scope]struct{}, len(value.Scopes))
+	for _, scope := range value.Scopes {
+		if !ValidScope(scope) {
+			return errors.New("Codex profile connection scopes are invalid")
+		}
+		if _, duplicate := seen[scope]; duplicate {
+			return errors.New("Codex profile connection scopes are invalid")
+		}
+		seen[scope] = struct{}{}
+	}
+	if _, ok := seen[ScopeRead]; !ok {
+		return errors.New("Codex profile connection must include the read scope")
+	}
+	if _, ok := seen[ScopeLive]; !ok {
+		return errors.New("Codex profile connection must include the live scope")
+	}
+	return nil
+}
+
+type ProfileConnection struct {
+	InstallationID   string                  `json:"installation_id"`
+	ProfileKey       string                  `json:"profile_key"`
+	Scopes           []Scope                 `json:"scopes"`
+	GrantVersion     int64                   `json:"grant_version"`
+	Connected        bool                    `json:"connected"`
+	UpdatedAt        time.Time               `json:"updated_at"`
+	SessionDiscovery *SessionDiscoveryStatus `json:"session_discovery"`
+	HistorySync      *HistorySyncProgress    `json:"history_sync"`
+}
+
+type DiscoveryState string
+
+const (
+	DiscoverySyncing DiscoveryState = "syncing"
+	DiscoverySynced  DiscoveryState = "synced"
+	DiscoveryPartial DiscoveryState = "partial"
+)
+
+func (state DiscoveryState) Valid() bool {
+	switch state {
+	case DiscoverySyncing, DiscoverySynced, DiscoveryPartial:
+		return true
+	default:
+		return false
+	}
+}
+
+type DiscoveryErrorCode string
+
+const (
+	DiscoveryErrorProfileUnavailable DiscoveryErrorCode = "profile_unavailable"
+	DiscoveryErrorSessionListFailed  DiscoveryErrorCode = "session_list_failed"
+	DiscoveryErrorConnectionLost     DiscoveryErrorCode = "connection_lost"
+	DiscoveryErrorUnknown            DiscoveryErrorCode = "unknown"
+)
+
+func (code DiscoveryErrorCode) Valid() bool {
+	switch code {
+	case DiscoveryErrorProfileUnavailable, DiscoveryErrorSessionListFailed, DiscoveryErrorConnectionLost, DiscoveryErrorUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProfileSessionDiscoveryUpdate contains the client-reported profile-level
+// discovery state. It does not claim that all historical events were uploaded.
+type ProfileSessionDiscoveryUpdate struct {
+	SessionDiscovery *SessionDiscoveryUpdate    `json:"session_discovery"`
+	HistorySync      *HistorySyncProgressUpdate `json:"history_sync"`
+}
+
+type SessionDiscoveryUpdate struct {
+	State     DiscoveryState      `json:"state"`
+	ErrorCode *DiscoveryErrorCode `json:"error_code"`
+}
+
+type SessionDiscoveryStatus struct {
+	State     DiscoveryState      `json:"state"`
+	ErrorCode *DiscoveryErrorCode `json:"error_code"`
+	UpdatedAt time.Time           `json:"updated_at"`
+}
+
+// HistorySyncProgress is a count summary reported by the PC. It is separate
+// from discovery state and does not assert that every event is present remotely.
+type HistorySyncProgress struct {
+	DiscoveredSessions      int64 `json:"discovered_sessions"`
+	HistoryCompleteSessions int64 `json:"history_complete_sessions"`
+	PendingUploadEventCount int64 `json:"pending_upload_event_count"`
+}
+
+type HistorySyncProgressUpdate struct {
+	DiscoveredSessions      *int64 `json:"discovered_sessions"`
+	HistoryCompleteSessions *int64 `json:"history_complete_sessions"`
+	PendingUploadEventCount *int64 `json:"pending_upload_event_count"`
+}
+
+func (value ProfileSessionDiscoveryUpdate) Validate() error {
+	if value.SessionDiscovery == nil || value.HistorySync == nil || value.HistorySync.DiscoveredSessions == nil ||
+		value.HistorySync.HistoryCompleteSessions == nil || value.HistorySync.PendingUploadEventCount == nil {
+		return errors.New("Codex profile session discovery and history sync fields are required")
+	}
+	if !value.SessionDiscovery.State.Valid() {
+		return errors.New("Codex session discovery state is invalid")
+	}
+	if value.SessionDiscovery.ErrorCode != nil && !value.SessionDiscovery.ErrorCode.Valid() {
+		return errors.New("Codex session discovery error code is invalid")
+	}
+	if value.SessionDiscovery.State == DiscoverySynced && value.SessionDiscovery.ErrorCode != nil {
+		return errors.New("successful Codex session discovery cannot include an error code")
+	}
+	if value.SessionDiscovery.State == DiscoverySyncing && value.SessionDiscovery.ErrorCode != nil {
+		return errors.New("running Codex session discovery cannot include an error code")
+	}
+	if value.SessionDiscovery.State == DiscoveryPartial && value.SessionDiscovery.ErrorCode == nil {
+		return errors.New("partial Codex session discovery requires an error code")
+	}
+	if *value.HistorySync.DiscoveredSessions < 0 || *value.HistorySync.HistoryCompleteSessions < 0 ||
+		*value.HistorySync.PendingUploadEventCount < 0 ||
+		*value.HistorySync.HistoryCompleteSessions > *value.HistorySync.DiscoveredSessions {
+		return errors.New("Codex history sync counts are invalid")
+	}
+	return nil
+}
+
 var profileKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 var nativeIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,512}$`)
 var questionVersionPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
+func ValidProfileKey(value string) bool {
+	return profileKeyPattern.MatchString(value) && !strings.Contains(strings.ToUpper(value), "CODEX_HOME")
+}
+
 func (value Discover) Validate() error {
-	if !profileKeyPattern.MatchString(value.ProfileKey) || !nativeIDPattern.MatchString(value.ThreadID) ||
+	if !ValidProfileKey(value.ProfileKey) || !nativeIDPattern.MatchString(value.ThreadID) ||
 		!validVisibleString(value.Title, 0, 512) || !validVisibleString(value.CWDLabel, 0, 256) ||
 		strings.ContainsAny(value.CWDLabel, "/\\") || !value.Status.Valid() {
 		return errors.New("Codex thread metadata is invalid")
@@ -149,8 +289,8 @@ var eventPayloadKeys = map[EventKind]map[string]struct{}{
 	EventTurnCompleted:     keys("status", "summary"),
 	EventTurnFailed:        keys("status", "error_code", "summary"),
 	EventTurnCancelled:     keys("status", "summary"),
-	EventToolCall:          keys("tool", "summary", "call_id", "status"),
-	EventToolResult:        keys("tool", "summary", "output", "exit_code", "status"),
+	EventToolCall:          keys("tool", "summary", "call_id", "status", "input", "input_part", "input_parts"),
+	EventToolResult:        keys("tool", "summary", "output", "call_id", "output_part", "output_parts", "exit_code", "status"),
 	EventToolCallSummary:   keys("tool", "summary", "call_id", "status"),
 	EventToolResultSummary: keys("tool", "summary", "output", "exit_code", "status"),
 	EventCommandSummary:    keys("summary", "output_summary", "exit_code", "status"),
@@ -268,6 +408,9 @@ func (value EventInput) Validate() error {
 	if value.Kind == EventQuestion && !validQuestionEvent(value.Payload) {
 		return errors.New("Codex question event is invalid")
 	}
+	if !validToolEventPayload(value.Kind, value.Payload) {
+		return errors.New("Codex tool event payload is invalid")
+	}
 	for key, item := range value.Payload {
 		if _, ok := allowed[key]; !ok || !validEventPayloadValue(value.Kind, key, item) {
 			return errors.New("Codex event payload contains unsupported fields")
@@ -278,6 +421,95 @@ func (value EventInput) Validate() error {
 		return errors.New("Codex event exceeds the maximum size")
 	}
 	return nil
+}
+
+const (
+	MaxToolPayloadChunkBytes = 24 << 10
+	maxToolPayloadParts      = 4096
+)
+
+// Tool input/output is transported in UTF-8-safe chunks. The chunk metadata is
+// optional for historical events, but new chunked events must be self-contained
+// so consumers can reconstruct one call without guessing.
+func validToolEventPayload(kind EventKind, payload map[string]any) bool {
+	switch kind {
+	case EventToolCall:
+		input, hasInput := payload["input"]
+		partValue, hasPart := payload["input_part"]
+		partsValue, hasParts := payload["input_parts"]
+		if !hasInput && !hasPart && !hasParts {
+			return true // Older events may contain only a summary and call ID.
+		}
+		text, textOK := input.(string)
+		part, partOK := nonNegativePayloadInt(partValue)
+		parts, partsOK := positivePayloadInt(partsValue)
+		return textOK && validToolPayloadChunk(text) && validToolCallID(payload["call_id"]) &&
+			hasPart && partOK && hasParts && partsOK && parts <= maxToolPayloadParts && part < parts
+	case EventToolResult:
+		callID, hasCallID := payload["call_id"]
+		partValue, hasPart := payload["output_part"]
+		partsValue, hasParts := payload["output_parts"]
+		if !hasPart && !hasParts {
+			return true // Legacy results may have a call ID but no chunk metadata.
+		}
+		output, textOK := payload["output"].(string)
+		part, partOK := nonNegativePayloadInt(partValue)
+		if !hasCallID || !hasPart || !textOK || !validToolPayloadChunk(output) || !validToolCallID(callID) || !partOK {
+			return false
+		}
+		if hasParts {
+			parts, partsOK := positivePayloadInt(partsValue)
+			if !partsOK || parts > maxToolPayloadParts || part >= parts {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func validToolCallID(value any) bool {
+	text, ok := value.(string)
+	return ok && nativeIDPattern.MatchString(text)
+}
+
+func validToolPayloadChunk(value string) bool {
+	return utf8.ValidString(value) && len(value) <= MaxToolPayloadChunkBytes && !strings.ContainsRune(value, '\x00')
+}
+
+func nonNegativePayloadInt(value any) (int64, bool) {
+	integer, ok := payloadInt64(value)
+	return integer, ok && integer >= 0 && integer < maxToolPayloadParts
+}
+
+func positivePayloadInt(value any) (int64, bool) {
+	integer, ok := payloadInt64(value)
+	return integer, ok && integer > 0
+}
+
+func payloadInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int32:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case float64:
+		if typed < 0 || typed > maxToolPayloadParts || typed != float64(int64(typed)) {
+			return 0, false
+		}
+		return int64(typed), true
+	case json.Number:
+		integer, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return integer, true
+	default:
+		return 0, false
+	}
 }
 
 func (value EventInput) validSourceForKind() bool {
@@ -638,6 +870,9 @@ func validCommandText(value string) bool {
 }
 
 func (command CommandInput) RequiredScope() Scope {
+	if command.Validate() != nil {
+		return ""
+	}
 	switch command.Type {
 	case CommandSend:
 		return ScopeSend

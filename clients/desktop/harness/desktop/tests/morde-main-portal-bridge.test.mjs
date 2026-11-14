@@ -52,6 +52,13 @@ function mockFetch(calls) {
 
 function harness({ checkpoint } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'morde-p11-portal-'));
+  const intervals = new Set();
+  const originalSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (...args) => {
+    const interval = originalSetInterval(...args);
+    intervals.add(interval);
+    return interval;
+  };
   const userData = join(root, 'Morde Client');
   mkdirSync(userData, { recursive: true });
   writeFileSync(join(userData, 'credentials.bin'), JSON.stringify({ version: 2, credentials: auth }));
@@ -158,13 +165,54 @@ function harness({ checkpoint } = {}) {
 
   return {
     root, userData, handlers, windows, views, partitions, appEvents, dialog,
-    async ready() { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)); },
+    async ready() {
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      globalThis.setInterval = originalSetInterval;
+    },
     invoke(channel, sender, args = [], senderFrame = sender.mainFrame) {
       return handlers.get(channel)({ sender, senderFrame }, ...args);
     },
-    cleanup() { delete require.cache[entry]; rmSync(root, { recursive: true, force: true }); },
+    cleanup() {
+      globalThis.setInterval = originalSetInterval;
+      for (const interval of intervals) clearInterval(interval);
+      delete require.cache[entry];
+      rmSync(root, { recursive: true, force: true });
+    },
   };
 }
+
+test('Codex dialogs use the correct overload with or without a parent window', async () => {
+  const originalFetch = globalThis.fetch;
+  mockFetch([]);
+  const h = harness();
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = 'https://portal.example/codex';
+    for (const withParent of [true, false]) {
+      h.windows[0].destroyed = !withParent;
+      const opened = [], confirmations = [];
+      h.dialog.showOpenDialog = async (...args) => {
+        opened.push(args);
+        return opened.length === 1 ? { canceled: false, filePaths: [h.root] } : { canceled: true, filePaths: [] };
+      };
+      h.dialog.showMessageBox = async (...args) => { confirmations.push(args); return { response: 0 }; };
+      await h.invoke('morde:codex-add-profile', portal);
+      await h.invoke('morde:codex-authorize-profile', portal, ['profile-a', ['read', 'live']]);
+      await h.invoke('morde:codex-revoke-profile', portal, ['profile-a']);
+      assert.deepEqual(opened.map((args) => args.at(-1).properties), [['openDirectory'], ['openFile']]);
+      for (const args of [...opened, ...confirmations]) {
+        assert.equal(args.length, withParent ? 2 : 1);
+        if (withParent) assert.equal(args[0], h.windows[0]);
+      }
+      assert.equal(confirmations.length, 2);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
 
 test('Portal bridge requires the current trusted top-level route and returns only empty-folder metadata', async () => {
   const originalFetch = globalThis.fetch;
@@ -184,6 +232,12 @@ test('Portal bridge requires the current trusted top-level route and returns onl
 
     portal.webContents.url = 'https://portal.example/hosts#host-h1234567';
     await assert.rejects(h.invoke('morde:portal-legacy-state', portal.webContents), /Invalid Portal window or route/);
+    await assert.rejects(h.invoke('morde:portal-state', portal.webContents), /Invalid Portal window or route/);
+    portal.webContents.url = 'https://portal.example/hosts';
+    await assert.rejects(h.invoke('morde:portal-project-upload-targets', portal.webContents), /Invalid Portal window or route/);
+    portal.webContents.url = 'https://portal.example/hosts?sync=1&next=/assistant';
+    await assert.rejects(h.invoke('morde:portal-state', portal.webContents), /Invalid Portal window or route/);
+    portal.webContents.url = 'https://portal.example/hosts?sync=1&host=h1234567';
     const state = await h.invoke('morde:portal-state', portal.webContents);
     assertPortalProjectState(state);
     assert.deepEqual(state, { projectMappings: [], syncState: 'idle', syncCheckpoint: null, syncRecovery: null });
@@ -196,6 +250,8 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     portal.webContents.url = 'https://portal.example/assistant';
     await assert.rejects(h.invoke('morde:portal-state', portal.webContents), /Invalid Portal window or route/);
     portal.webContents.url = 'https://portal.example/workspaces?host=h1234567';
+    await assert.rejects(h.invoke('morde:portal-legacy-state', portal.webContents), /Invalid Portal window or route/);
+    portal.webContents.url = 'https://portal.example/hosts?sync=1&host=h1234567';
 
     const legacy = await h.invoke('morde:portal-legacy-state', portal.webContents);
     assert.deepEqual(legacy, { mappings: [], syncState: 'idle', checkpoint: null, nodeState: 'stopped', safetyCopiesAvailable: true });
@@ -210,7 +266,7 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     assert.equal(calls.every((call) => new URL(call.url).origin === auth.origin), true, 'all network calls are replaced with this test’s local fetch stub');
 
     h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] });
-    portal.webContents.url = 'https://portal.example/hosts#host-h1234567';
+    portal.webContents.url = 'https://portal.example/hosts?sync=1&host=h1234567';
     const selection = await h.invoke('morde:portal-project-select-directory', portal.webContents, ['h1234567', 'w1234567']);
     assert.deepEqual(selection, {
       selectionID: selection.selectionID, hostId: 'h1234567', workspaceId: 'w1234567',
@@ -249,7 +305,7 @@ test('legacy checkpoint recovery requires confirmation and the same trusted page
   try {
     await h.ready();
     const portal = h.views[0].webContents;
-    portal.url = 'https://portal.example/workspaces';
+    portal.url = 'https://portal.example/hosts?sync=1';
     assert.deepEqual((await h.invoke('morde:portal-legacy-state', portal)).checkpoint,
       { workspaceId: 'w1234567', mode: 'upload', scope: ['notes'] });
     h.dialog.showMessageBox = async () => ({ response: 0 });
@@ -275,7 +331,7 @@ test('Portal project upload rejects a replaced empty directory before registerin
   try {
     await h.ready();
     const portal = h.views[0];
-    portal.webContents.url = 'https://portal.example/hosts#host-h1234567';
+    portal.webContents.url = 'https://portal.example/hosts?sync=1&host=h1234567';
     h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] });
     const selection = await h.invoke('morde:portal-project-select-directory', portal.webContents, ['h1234567', 'w1234567']);
     assert.equal(selection.projectName, 'empty-project');

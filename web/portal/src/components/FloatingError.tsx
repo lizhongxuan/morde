@@ -13,12 +13,16 @@ function FloatingOverlay({ children, className = '', role, region, dismissible, 
     const ancestors: HTMLElement[] = [];
     for (let ancestor = anchor.current?.parentElement ?? null; ancestor; ancestor = ancestor.parentElement) ancestors.push(ancestor);
     const updateVisibility = () => {
-      const visible = !ancestors.some((ancestor) => ancestor.hidden || getComputedStyle(ancestor).display === 'none');
+      const visible = !ancestors.some((ancestor) => {
+        const style = getComputedStyle(ancestor);
+        return ancestor.hidden || ancestor.inert || ancestor.getAttribute('aria-hidden') === 'true'
+          || style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility);
+      });
       setSourceVisible((current) => current === visible ? current : visible);
     };
     updateVisibility();
     const observer = new MutationObserver(updateVisibility);
-    ancestors.forEach((ancestor) => observer.observe(ancestor, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] }));
+    ancestors.forEach((ancestor) => observer.observe(ancestor, { attributes: true, attributeFilter: ['aria-hidden', 'class', 'hidden', 'inert', 'style'] }));
     return () => observer.disconnect();
   }, [region]);
   if (dismissed) return null;

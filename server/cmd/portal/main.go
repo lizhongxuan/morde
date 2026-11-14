@@ -437,8 +437,12 @@ func serve(ctx context.Context, configPath string) error {
 	if err := workspaces.SetWorkspaceCurrentInitializer(workspaceSync.InitializeWorkspaceCurrent); err != nil {
 		return fmt.Errorf("configure Workspace current initializer: %w", err)
 	}
+	if err := workspaces.SetHostWorkspaceVolumes(workspaceVolumes); err != nil {
+		return fmt.Errorf("configure Host workspace deletion: %w", err)
+	}
 	hosts, err := app.NewHostService(app.HostServiceOptions{
-		Hosts: store, Users: store, Workspaces: store, DefaultWorkspaces: workspaces, WorkspaceVolumes: workspaceVolumes, Tokens: store,
+		Hosts: store, Users: store, Workspaces: store, DefaultWorkspaces: workspaces,
+		HostWorkspaceDeleter: workspaces, WorkspaceVolumes: workspaceVolumes, Tokens: store,
 		Sandboxes: router, Probe: aioClient, Runtime: runtimeControl, Audit: auditService, CreateLocks: store, Sealer: sealer, Volumes: volumes, DiskCapacity: volumes,
 		Templates: templates, DefaultTemplateID: cfg.Templates.Default, Capacity: app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB},
 		Instance: cfg.Instance, Scheme: cfg.Domains.Scheme, PortalURL: cfg.Domains.Scheme + "://" + cfg.Domains.Portal,

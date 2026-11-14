@@ -359,7 +359,9 @@ FROM conversation_message_attachments AS link
 LEFT JOIN personal_attachment_uploads AS upload
   ON upload.service_instance_id=link.service_instance_id AND upload.owner_id=link.owner_id
  AND upload.upload_id=link.upload_id AND upload.attachment_id=link.attachment_id
-WHERE link.service_instance_id=$1::uuid AND link.owner_id=$2 AND link.conversation_id=$3 AND link.message_id=$4
+WHERE link.service_instance_id=$1::uuid AND link.owner_id=$2 AND link.conversation_id=$3
+ AND (link.message_id=$4 OR link.message_id=(SELECT attachment_source_message_id
+      FROM conversation_message_variants WHERE user_message_id=$4 AND attachment_source_message_id IS NOT NULL))
 ORDER BY link.attachment_id`, serviceInstanceID, ownerID, conversationID, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("query conversation message attachments: %w", err)

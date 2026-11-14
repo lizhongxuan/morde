@@ -30,7 +30,7 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 		"Google Drive", "Dropbox", "Readwise", "Studocu",
 	}
 
-	definition := cloudDSHSkillReadDefinition()
+	definition := cloudDSHSkillReadDefinition(true)
 	var schema struct {
 		Properties map[string]struct {
 			Enum []string `json:"enum"`
@@ -143,5 +143,27 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 		if _, ok := allowedSkillIDs[id]; ok {
 			t.Errorf("legacy Muse skill %q remains available to new Tasks", id)
 		}
+	}
+}
+
+func TestOfficeSkillsUseAuthorizedHostToolsAndFailClosedWithoutHost(t *testing.T) {
+	for _, id := range []string{"office", "office-docx", "office-pptx", "office-xlsx", "office-render", "office-recalculate", "office-export-pdf"} {
+		skill, ok := cloudDSHSkillForID(id)
+		if !ok || !skill.requiresHost {
+			t.Fatalf("Office skill %q is absent or not Host-scoped: %#v", id, skill)
+		}
+		content, err := cloudDSHSkillBundle.ReadFile(skill.resource)
+		if err != nil {
+			t.Fatalf("read Office skill %q: %v", id, err)
+		}
+		text := string(content)
+		if !strings.Contains(text, runtimeToolShellExec) || !strings.Contains(text, "Task Workspace") ||
+			!strings.Contains(text, "Do not install") || strings.Contains(text, "present(") ||
+			strings.Contains(text, "load_workspace_dependencies") || strings.Contains(text, "/opt/muse/") {
+			t.Errorf("Office skill %q does not follow Morde Host and artifact boundaries", id)
+		}
+	}
+	if strings.Contains(string(cloudDSHSkillReadDefinition(false).Parameters), `"office"`) {
+		t.Fatal("Office skills are exposed without an available Host")
 	}
 }

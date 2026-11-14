@@ -1,6 +1,6 @@
 const api = window.morde;
 const $ = (id) => document.getElementById(id);
-const offlineText = 'Morde 云端页面暂时无法连接。网络恢复后，可从 PC 端「云端电脑」下的「文件同步」入口继续操作。';
+const offlineText = 'Morde 云端页面暂时无法连接。网络恢复后，可从 PC 端「本机项目」入口继续同步。';
 let state = null;
 
 function showMessage(target, value, error = false) {

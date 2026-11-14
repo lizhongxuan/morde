@@ -8,12 +8,17 @@ import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview, K2TaskDependency } from '../app/k2-task-projection';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import { useMessageOutbox } from '../app/use-message-outbox';
+import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
+import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
+import { buildMessageVariantTimeline, createMessageVariant, maxMessageVariantScalars, messageVariantActionLabel, messageVariantContentTooLong } from '../app/message-variants';
+import type { MessageVariantAction, VersionableMessage } from '../app/message-variants';
 import { deliveryStatusText, userVisibleRoutingStatusText } from '../app/message-status';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { outboxReceiptRequest } from '../app/message-outbox';
 import { MessageReceiptOrder } from '../app/message-receipt-order';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
+import type { components } from '../api/schema';
 import { ApiError } from '../api/client';
 import { useAuth } from '../app/auth';
 import { formatBytes, formatDate, hostStateLabel } from '../app/format';
@@ -27,6 +32,7 @@ import { extractAssistantPDFText } from './assistant-pdf';
 import { assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
 import type { AssistantComposerDraft } from './assistant-drafts';
 import './AssistantSidebar.css';
+import './MessageVariants.css';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items'][number];
@@ -59,7 +65,7 @@ type ComputerEmbedSession = {
 };
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
   snapshotStatus?: 'streaming' | 'completed' | 'interrupted';
-};
+} & Pick<VersionableMessage, 'variant_group_id' | 'variant_version' | 'variant_action'>;
 type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string; needsPreparation?: boolean; preparationCancelled?: boolean };
 type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string };
 
@@ -137,6 +143,27 @@ function hasCompleteVerifiedArtifactProof(artifact: TaskArtifact): boolean {
     && (artifact.workspace_revision ?? -1) >= 0 && Number.isSafeInteger(artifact.size_bytes)
     && (artifact.size_bytes ?? -1) >= 0 && /^[a-f0-9]{64}$/iu.test(artifact.sha256 ?? '')
     && Boolean(artifact.path.trim()) && Boolean(artifact.media_type.trim());
+}
+
+function taskStepRetryRequest(task: Task, step: TaskStep): components['schemas']['TaskStepRetryRequest'] | null {
+  const revision = task.current_revision;
+  if (step.retryable !== true || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0 ||
+    !Number.isSafeInteger(step.attempt) || step.attempt < 1 ||
+    (task.desired_revision !== undefined && task.desired_revision !== revision) ||
+    (step.task_revision !== undefined && step.task_revision !== revision)) return null;
+  return { expected_task_revision: revision, expected_attempt: step.attempt };
+}
+
+function taskStepRetryBlockedReason(step: TaskStep): string | null {
+  if (step.retryable === true || typeof step.failure_reason !== 'string') return null;
+  const labels: Record<string, string> = {
+    not_dispatched: 'Host 确认调用未派发，但当前状态不允许重试。',
+    tool_failed_after_dispatch: '工具调用已派发并失败，不能自动重试。',
+    side_effect_unknown: '因操作副作用状态未知，不能安全重试。',
+    authorization_changed: '授权状态已变化，需重新授权后才能重试。',
+    resource_changed: '任务资源已变化，不能按原步骤重试。',
+  };
+  return Object.hasOwn(labels, step.failure_reason) ? labels[step.failure_reason] ?? null : null;
 }
 
 function AssistantOutboxRetryButton({ entry, sendMessage, label }: {
@@ -504,7 +531,7 @@ function isResourceNoLongerAccessible(error: unknown): boolean {
 
 const taskEventTypes = [
   'task.status', 'task.step', 'task.operation', 'task.message', 'task.batch_item',
-  'task.artifact', 'task.waiting_user', 'task.response', 'task.result', 'task.snapshot_required',
+  'task.artifact', 'task.waiting_user', 'task.response', 'task.result', 'task.plan', 'task.snapshot_required',
 ] as const;
 
 function stepTitle(step: Task['steps'][number]): string {
@@ -540,6 +567,9 @@ function stepDetailObject(step: TaskStep, object: string | null): string | null 
 
 const stepStatus: Record<Task['steps'][number]['status'], string> = {
   queued: '等待中', running: '进行中', waiting_user: '等待确认', succeeded: '已完成', failed: '失败', unknown: '结果待确认',
+};
+const planStepStatus: Record<NonNullable<Task['plan']>['steps'][number]['status'], string> = {
+  pending: '待处理', in_progress: '进行中', completed: '已完成', blocked: '受阻',
 };
 
 function stepStatusText(step: TaskStep): string {
@@ -855,6 +885,8 @@ export function Assistant() {
   const [sideConversationsOpen, setSideConversationsOpen] = useState(false);
   const [conversationSearch, setConversationSearch] = useState('');
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [selectedMessageVariantVersions, setSelectedMessageVariantVersions] = useState<Record<string, number>>({});
+  const [editingMessageVariant, setEditingMessageVariant] = useState<{ groupID: string; messageID: string; content: string } | null>(null);
   const [historyPageLoadVersion, setHistoryPageLoadVersion] = useState(0);
   const [openingTaskID, setOpeningTaskID] = useState('');
   const [taskObservationError, setTaskObservationError] = useState<{ taskID: string; message: string } | null>(null);
@@ -871,10 +903,15 @@ export function Assistant() {
   const receiptOrder = useRef(new MessageReceiptOrder());
   const newConversationKey = useRef<string | null>(null);
   const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
+  const [taskStepRetryErrors, setTaskStepRetryErrors] = useState<Record<string, string>>({});
+  const [pendingTaskStepRetries, setPendingTaskStepRetries] = useState<Set<string>>(() => new Set());
+  const pendingTaskStepRetriesRef = useRef(new Set<string>());
   const ensureMainKey = useRef<{ userID: string; key: string } | null>(null);
   const ensureAttemptedUserID = useRef<string | null>(null);
   const conversationView = useRef<HTMLDivElement>(null);
   const olderMessagesAnchor = useRef<{ height: number; top: number } | null>(null);
+  const variantScrollAnchor = useRef<number | null>(null);
+  const sendingVariantOperationKeys = useRef(new Set<string>());
   const activeComposerDraftIdentity = useRef<string | null>(null);
   const composerDraftWrite = useRef<Promise<void>>(Promise.resolve());
   const composerEditRevision = useRef(0);
@@ -894,6 +931,7 @@ export function Assistant() {
   }, []);
   const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
   const outbox = useMessageOutbox(user?.id, capabilities.data?.service_instance_id);
+  const variantOutbox = useMessageVariantOutbox(user?.id, capabilities.data?.service_instance_id);
   const activeOutboxScope = useRef(outbox.currentScope);
   useLayoutEffect(() => { activeOutboxScope.current = outbox.currentScope; }, [outbox.currentScope]);
   const conversations = useInfiniteQuery({
@@ -1438,7 +1476,11 @@ export function Assistant() {
       setOpeningTaskID('');
     }
   }
-  const displayMessages = mergeTaskAssistantMessages(conversationMessageItems, tasks);
+  const mergedDisplayMessages = mergeTaskAssistantMessages(conversationMessageItems, tasks);
+  const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
+  const variantTimeline = buildMessageVariantTimeline(mergedDisplayMessages, selectedVariantMap);
+  const displayMessages = variantTimeline.items;
+  const variantSelectionSignature = JSON.stringify(Object.entries(selectedMessageVariantVersions).sort(([left], [right]) => left.localeCompare(right)));
   const startedTaskMessageIDs = new Set<string>();
   const markedStartedTasks = new Set<string>();
   for (const message of [...displayMessages].reverse()) {
@@ -1460,6 +1502,11 @@ export function Assistant() {
     const result = await messages.fetchNextPage();
     if (result.isFetchNextPageError) olderMessagesAnchor.current = null;
     else setHistoryPageLoadVersion((version) => version + 1);
+  };
+  const selectMessageVariantVersion = (groupID: string, version: number) => {
+    variantScrollAnchor.current = conversationView.current?.scrollTop ?? 0;
+    followConversation.current = false;
+    setSelectedMessageVariantVersions((current) => ({ ...current, [groupID]: version }));
   };
   const submissionModelID = readyModels.some((item) => item.id === effectiveModelID) ? effectiveModelID : '';
   const taskActionKey = (scope: string, fingerprint: string) => {
@@ -1485,6 +1532,77 @@ export function Assistant() {
       return;
     }
     notify(details.message, 'error');
+  };
+
+  const sendVariantOperation = async (entry: MessageVariantOutboxEntry): Promise<boolean> => {
+    const key = entry.operation.input.idempotencyKey;
+    if (sendingVariantOperationKeys.current.has(key)) return false;
+    sendingVariantOperationKeys.current.add(key);
+    try {
+      if (entry.scope !== variantOutbox.currentScope || entry.operation.input.actorID !== user?.id ||
+        entry.operation.input.serviceInstanceID !== capabilities.data?.service_instance_id) {
+        throw new Error('账号或服务身份已变化；此操作保留在本机，请核对后重新发起。');
+      }
+      await variantOutbox.change(entry.scope, key, (operation) => ({ ...operation, status: 'sending', error: undefined }));
+      const currentCapabilities = await portalApi.capabilities();
+      if (currentCapabilities.service_instance_id !== entry.operation.input.serviceInstanceID) {
+        throw new Error('服务身份已变化；此操作未重放，请核对后重新发起。');
+      }
+      const result = await createMessageVariant(entry.operation.input);
+      if (result.state === 'unknown') {
+        await variantOutbox.change(entry.scope, key, (operation) => ({ ...operation, status: 'unknown', error: '服务端尚未确认操作结果；重试会复用原操作编号。' }));
+        void client.invalidateQueries({ queryKey: ['conversation-messages', entry.operation.input.conversationID] });
+        notify('操作结果待核对；可以使用同一请求编号安全重试。', 'error');
+        return false;
+      }
+      await variantOutbox.remove(entry.scope, key);
+      if (result.state !== 'failed') {
+        setSelectedMessageVariantVersions((current) => ({ ...current, [result.variant_group_id]: result.variant_version }));
+        setEditingMessageVariant((current) => current?.groupID === result.variant_group_id ? null : current);
+      }
+      void client.invalidateQueries({ queryKey: ['conversation-messages', entry.operation.input.conversationID] });
+      void client.invalidateQueries({ queryKey: ['conversation-tasks', entry.operation.input.conversationID] });
+      if (result.state === 'failed') {
+        notify('服务端已确认消息版本操作失败；对话已刷新。', 'error');
+        return false;
+      }
+      notify(result.state === 'completed' ? '已创建新的消息版本。' : '消息版本操作已受理，正在更新对话。', 'success');
+      return true;
+    } catch (error) {
+      const staleVersion = error instanceof ApiError && error.status === 409;
+      const uncertain = !(error instanceof ApiError) || error.status >= 500 || [408, 425, 429].includes(error.status);
+      const details = errorDetails(error);
+      await variantOutbox.change(entry.scope, key, (operation) => ({ ...operation,
+        status: staleVersion ? 'failed' : uncertain ? 'unknown' : 'failed', error: staleVersion
+          ? '版本已变化，已刷新消息；请选中最新版本后重新操作。' : details.message }));
+      if (staleVersion) {
+        await client.invalidateQueries({ queryKey: ['conversation-messages', entry.operation.input.conversationID] });
+        notify('消息版本已变化，已刷新对话；请核对后再操作。', 'error');
+      } else if (uncertain) notify('操作结果待核对；可以用同一请求编号安全重试。', 'error');
+      else notify(details.message, 'error');
+      return false;
+    } finally {
+      sendingVariantOperationKeys.current.delete(key);
+    }
+  };
+
+  const startVariantOperation = async (groupID: string, messageID: string, action: MessageVariantAction, contentValue?: string) => {
+    const group = variantTimeline.groups.get(groupID);
+    const serviceInstanceID = capabilities.data?.service_instance_id;
+    if (!group || !user?.id || !serviceInstanceID) {
+      notify('账号、服务或消息版本尚未确认，无法执行此操作。', 'error');
+      return false;
+    }
+    try {
+      const operation = await variantOutbox.enqueue({
+        conversationID: conversationID!, messageID, action, expectedVersion: group.latestVersion,
+        ...(contentValue !== undefined ? { content: contentValue } : {}), serviceInstanceID, actorID: user.id,
+      });
+      return sendVariantOperation(operation);
+    } catch (error) {
+      notify(errorDetails(error).message, 'error');
+      return false;
+    }
   };
 
   const sendMessage = async (entry: MessageOutboxEntry, reconcile: boolean) => {
@@ -1705,6 +1823,39 @@ export function Assistant() {
       notify('补充信息已提交，任务正在恢复。', 'success');
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
+  });
+  const retryTaskStep = useMutation({
+    mutationFn: (request: { taskID: string; stepID: string; body: components['schemas']['TaskStepRetryRequest'];
+      actionScope: string; errorKey: string; key: string }) =>
+      portalApi.retryTaskStep(request.taskID, request.stepID, request.body, request.key),
+    onSuccess: async (_response, request) => {
+      clearTaskActionKey(request.actionScope, request.key);
+      setTaskStepRetryErrors((current) => {
+        if (!(request.errorKey in current)) return current;
+        const next = { ...current };
+        delete next[request.errorKey];
+        return next;
+      });
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ['task', request.taskID] }),
+        client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
+        client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+        client.invalidateQueries({ queryKey: ['task-step-detail'], predicate: (query) => query.queryKey[4] === request.taskID }),
+      ]);
+    },
+    onError: async (error, request) => {
+      setTaskStepRetryErrors((current) => ({ ...current, [request.errorKey]: errorDetails(error).message }));
+      if (errorDetails(error).code === 'conflict') await client.invalidateQueries({ queryKey: ['task', request.taskID] });
+    },
+    onSettled: (_response, _error, request) => {
+      pendingTaskStepRetriesRef.current.delete(request.errorKey);
+      setPendingTaskStepRetries((current) => {
+        if (!current.has(request.errorKey)) return current;
+        const next = new Set(current);
+        next.delete(request.errorKey);
+        return next;
+      });
+    },
   });
   const taskControl = useMutation({
     mutationFn: async (request: { taskID: string; action: 'pause' | 'resume' | 'cancel'; expectedStatus: Task['status'];
@@ -2172,6 +2323,19 @@ export function Assistant() {
       key: taskActionKey(actionScope, fingerprint) });
   };
 
+  const submitTaskStepRetry = (task: Task, step: TaskStep) => {
+    const body = taskStepRetryRequest(task, step);
+    if (!body) return;
+    const errorKey = `${task.id}:${step.id}`;
+    if (pendingTaskStepRetriesRef.current.has(errorKey)) return;
+    pendingTaskStepRetriesRef.current.add(errorKey);
+    setPendingTaskStepRetries((current) => new Set(current).add(errorKey));
+    const actionScope = `step-retry:${task.id}:${step.id}`;
+    const fingerprint = JSON.stringify(body);
+    retryTaskStep.mutate({ taskID: task.id, stepID: step.id, body, actionScope, errorKey,
+      key: taskActionKey(actionScope, fingerprint) });
+  };
+
   const showMoreSideConversations = async () => {
     const targetCount = Math.min(Math.max(sideConversations.length, localComposerDrafts.length), visibleSideConversationCount) + 5;
     let result = conversations;
@@ -2305,11 +2469,19 @@ export function Assistant() {
       setShowJumpToLatest(true);
       return;
     }
+    if (view && variantScrollAnchor.current !== null) {
+      view.scrollTop = variantScrollAnchor.current;
+      variantScrollAnchor.current = null;
+      const atLatest = view.scrollHeight - view.scrollTop - view.clientHeight < 80;
+      followConversation.current = atLatest;
+      setShowJumpToLatest(!atLatest);
+      return;
+    }
     if (view && followConversation.current) {
       view.scrollTop = view.scrollHeight;
       setShowJumpToLatest(false);
     }
-  }, [conversationID, displayMessages.length, latestDisplayMessageContent, outbox.entries.length, historyPageLoadVersion]);
+  }, [conversationID, displayMessages.length, latestDisplayMessageContent, outbox.entries.length, historyPageLoadVersion, variantSelectionSignature]);
 
   useEffect(() => {
     if (conversationID && finishedTaskIDs) {
@@ -2437,6 +2609,18 @@ export function Assistant() {
         {recoveryMessage && <p role="status">{recoveryMessage}</p>}
         {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
       </section>
+      {task.plan && task.plan.task_revision === task.current_revision && <section className="task-activity-k2 task-activity-plan" aria-label="执行计划">
+        <h3>执行计划 · 修订 {task.plan.revision}</h3>
+        <p>{task.plan.goal}</p>
+        <small>费用估算：未知</small>
+        <ol>{task.plan.steps.map((step) => <li key={step.id}>
+          <span><strong>{step.title}</strong><small>{planStepStatus[step.status]}</small></span>
+          {step.description && <small>{step.description}</small>}
+          {step.depends_on.length > 0 && <small>依赖：{step.depends_on.join('、')}</small>}
+          {step.outputs.length > 0 && <small>产出：{step.outputs.join('、')}</small>}
+          {step.completion_criteria.length > 0 && <small>完成条件：{step.completion_criteria.join('；')}</small>}
+        </li>)}</ol>
+      </section>}
       {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
         <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
         <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
@@ -2506,12 +2690,25 @@ export function Assistant() {
           <h4>{group.title}{group.status && <small>{group.status}</small>}</h4>
           <ol className="task-activity-steps">{group.steps.slice(0, visibleCount).map((step) => {
             const expanded = taskStepSelection?.taskID === task.id && taskStepSelection.stepID === step.id;
+            const retryBody = taskStepRetryRequest(task, step);
+            const retryBlockedReason = taskStepRetryBlockedReason(step);
+            const retryKey = `${task.id}:${step.id}`;
             return <li key={step.id}><span className={`task-step-icon status-${step.status}`} aria-hidden="true">●</span><div>
               <button type="button" className="task-activity-step-button" aria-expanded={expanded} aria-controls={`task-step-detail-${step.id}`}
                 onClick={() => setTaskStepSelection(expanded ? null : { taskID: task.id, stepID: step.id })}>
                 <strong>{stepTitle(step)}</strong><small>{stepStatusText(step)}</small>
+                {step.attempt > 1 && <small className="task-step-attempt-label">第 {step.attempt} 次尝试</small>}
                 {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
               </button>
+              {retryBody && <button type="button" className="button button-small button-secondary"
+                aria-label={`重试步骤 ${stepTitle(step)}`} disabled={pendingTaskStepRetries.has(retryKey)}
+                onClick={() => submitTaskStepRetry(task, step)}>
+                {pendingTaskStepRetries.has(retryKey) ? '正在重试…' : '重试步骤'}
+              </button>}
+              {retryBlockedReason && <small className="task-step-retry-blocked-reason">{retryBlockedReason}</small>}
+              {taskStepRetryErrors[retryKey] && <p className="error-inline task-step-retry-error" role="alert">
+                步骤重试失败：{taskStepRetryErrors[retryKey]}
+              </p>}
               {expanded && <section id={`task-step-detail-${step.id}`} aria-label={`动作详情：${stepTitle(step)}`}>
                 <TaskStepDetails key={`${user?.id ?? ''}:${capabilities.data?.service_instance_id ?? ''}:${task.conversation_id}:${task.id}:${step.id}`}
                   task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
@@ -2705,6 +2902,12 @@ export function Assistant() {
                 </div>}
                 {displayMessages.map((message, index) => {
                   const messageTask = tasksByID.get(message.task_id ?? message.related_task_id ?? '');
+                  const variantGroupID = variantTimeline.groupByMessageID.get(message.id);
+                  const variantGroup = variantGroupID ? variantTimeline.groups.get(variantGroupID) : undefined;
+                  const selectedVariantVersion = variantGroup ? selectedMessageVariantVersions[variantGroup.id] ?? variantGroup.latestVersion : 1;
+                  const groupOperations = variantGroup ? variantOutbox.entries.filter((entry) => entry.operation.input.conversationID === conversationID &&
+                    (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
+                  const editingThisMessage = editingMessageVariant?.messageID === message.id;
                   const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
                     ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
                   const routingStatus = message.role === 'user' ? acceptedRetryStatus ?? conversationMessageStatus(message, messageTask) : null;
@@ -2723,7 +2926,19 @@ export function Assistant() {
                     {message.role === 'assistant' && <strong className="chat-message-author">Morde</strong>}
                     <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}${startedTaskMessageIDs.has(message.id) ? ' chat-message-user-started' : ''}`}
                       aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
-                      {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
+                      {editingThisMessage ? <form className="message-variant-edit" onSubmit={(event) => {
+                        event.preventDefault();
+                        if (variantGroupID && editingMessageVariant) void startVariantOperation(variantGroupID, message.id, 'edit_resend', editingMessageVariant.content);
+                      }}>
+                        <label className="sr-only" htmlFor={`message-version-edit-${encodeURIComponent(message.id)}`}>编辑消息并创建新版本</label>
+                        <textarea id={`message-version-edit-${encodeURIComponent(message.id)}`} value={editingMessageVariant.content} maxLength={maxMessageVariantScalars * 2}
+                          onChange={(event) => setEditingMessageVariant((current) => current?.messageID === message.id ? { ...current, content: event.target.value } : current)} />
+                        {messageVariantContentTooLong(editingMessageVariant.content) && <small role="alert">编辑后的消息不能超过 {maxMessageVariantScalars} 个字符。</small>}
+                        <div className="message-variant-control-actions">
+                          <button type="submit" className="button button-small button-primary" disabled={!editingMessageVariant.content.trim() || messageVariantContentTooLong(editingMessageVariant.content) || groupOperations.some((entry) => entry.operation.status === 'sending')}>创建新版本</button>
+                          <button type="button" className="button button-small button-secondary" onClick={() => setEditingMessageVariant(null)}>取消</button>
+                        </div>
+                      </form> : message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
                         {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
                           href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {index + 1}</a></span>)}
@@ -2731,6 +2946,30 @@ export function Assistant() {
                       {message.snapshotStatus === 'streaming' && <small role="status">正在生成…</small>}
                       {message.snapshotStatus === 'interrupted' && <small role="status">回复已中断</small>}
                       {startedTaskMessageIDs.has(message.id) && <span className="chat-task-started" role="img" aria-label="任务已开始处理" title="任务已开始处理">👌🏻</span>}
+                      {variantGroup && <div className="message-variant-controls" aria-label="消息版本操作">
+                        {message.role === 'user' && variantGroup.versions.size > 1 && <label className="message-variant-picker">版本
+                          <select aria-label="选择消息版本" value={selectedVariantVersion} onChange={(event) => selectMessageVariantVersion(variantGroup.id, Number(event.target.value))}>
+                            {[...variantGroup.versions.values()].sort((left, right) => left.version - right.version).map((version) => <option key={version.version} value={version.version}>
+                              {`v${version.version} · ${messageVariantActionLabel(version.action)}`}
+                            </option>)}
+                          </select>
+                        </label>}
+                        {message.role === 'user' && !editingThisMessage && <button type="button" className="button button-small button-secondary"
+                          disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
+                          onClick={() => setEditingMessageVariant({ groupID: variantGroup.id, messageID: message.id, content: message.content })}>编辑并重发</button>}
+                        {message.role === 'assistant' && message.content.trim() && message.snapshotStatus !== 'streaming' && message.output_status !== 'streaming' && <button type="button"
+                          className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
+                          onClick={() => void startVariantOperation(variantGroup.id, message.id, 'regenerate_text')}>重新生成文字</button>}
+                        {message.role === 'assistant' && message.output_status === 'interrupted' && <button type="button"
+                          className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
+                          onClick={() => void startVariantOperation(variantGroup.id, message.id, 'continue_generation')}>继续生成</button>}
+                      </div>}
+                      {message.role === 'user' && groupOperations.map((entry) => <div className="message-variant-operation" role="status" key={entry.operation.input.idempotencyKey}>
+                        <span>{entry.operation.status === 'sending' ? '正在创建消息版本…' : entry.operation.status === 'unknown'
+                          ? `操作结果待核对：${entry.operation.error ?? ''}` : entry.operation.error ?? '消息版本操作待发送。'}</span>
+                        {(entry.operation.status === 'unknown' || entry.operation.status === 'pending') && <button type="button" className="button button-small button-secondary"
+                          disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
+                      </div>)}
                     </article>
                     {message.role === 'user' && routingStatus && <div className="chat-message-status" role="status">
                         {routingStatus}
@@ -2751,6 +2990,7 @@ export function Assistant() {
           {modelConfigurationKnown && models.data?.configuration_status === 'not_configured' && <FloatingNotice className="notice-warning">还没有配置云端模型。<Link to="/connections">配置模型</Link></FloatingNotice>}
           {modelConfigurationKnown && models.data?.configuration_status === 'configured' && !readyModels.length && <FloatingNotice className="notice-warning">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></FloatingNotice>}
           {outbox.storageError && <FloatingError className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</FloatingError>}
+          {variantOutbox.storageError && <FloatingError className="error-inline" role="alert">本地消息版本操作存储不可用：{variantOutbox.storageError}</FloatingError>}
           {execution.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></FloatingError>}
           {execution.data?.state === 'stopping' && <FloatingNotice className="notice-warning">AI 服务正在停止；消息仍可先发送。</FloatingNotice>}
           {hosts.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取目标电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
@@ -2947,7 +3187,7 @@ export function Assistant() {
             </div>} />}
         </div>}
         {!conversationContentAccessRevoked && taskPanelTab === 'files' && <div className="task-panel-list task-panel-files">
-          <Link className="button button-secondary button-small" to="/workspaces">管理文件同步</Link>
+          <Link className="button button-secondary button-small" to="/hosts?sync=1">管理本机项目</Link>
           {messages.hasNextPage && <button type="button" className="button button-small button-secondary" disabled={messages.isFetchingNextPage}
             onClick={() => void loadOlderMessages()}>{messages.isFetchingNextPage ? '正在加载更早消息…' : '加载更早消息中的附件'}</button>}
           {!conversationFiles.length ? <p className="muted">此会话还没有附件或任务成果。</p> : <ScreenPagination items={conversationFiles}

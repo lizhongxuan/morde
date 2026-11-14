@@ -204,14 +204,15 @@ func TestHostServiceCreateAllowsSessionDefaultAndRequiresExplicitAuthorizedWorks
 		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey,
 		TokenID: "t1234567", HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeHostCreate},
 	}
-	if _, err := service.Create(context.Background(), apiKey, CreateHostCommand{}); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("Create() with API key and omitted Workspace error = %v, want forbidden", err)
+	if _, err := service.Create(context.Background(), apiKey, CreateHostCommand{}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Create() without idempotency key error = %v, want invalid argument", err)
 	}
 	if _, err := service.Create(context.Background(), apiKey, command); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("Create() with API key without Workspace authorization error = %v, want forbidden", err)
 	}
-	if deps.hosts.createCalls != 1 {
-		t.Fatalf("invalid creates reached HostStore unexpectedly: %d calls", deps.hosts.createCalls)
+	apiCreated, err := service.Create(context.Background(), apiKey, CreateHostCommand{IdempotencyKey: "api-host-create-01"})
+	if err != nil || len(apiCreated.Workspaces) != 1 || deps.hosts.createCalls != 2 {
+		t.Fatalf("API key private-storage Host create = %#v, calls=%d, err=%v", apiCreated, deps.hosts.createCalls, err)
 	}
 }
 
@@ -497,7 +498,7 @@ func TestHostServiceAdminListAndOwnershipHideForeignHosts(t *testing.T) {
 	}
 }
 
-func TestHostServiceDeleteNeverDeletesIndependentWorkspace(t *testing.T) {
+func TestHostServiceDeleteDefersPrivateStorageCleanupToWorker(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateFailed)
 	value.SandboxID = ""
@@ -509,7 +510,7 @@ func TestHostServiceDeleteNeverDeletesIndependentWorkspace(t *testing.T) {
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})
-	updated, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID})
+	updated, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID, ConfirmWorkspaceDeletion: true})
 	if err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
@@ -520,6 +521,7 @@ func TestHostServiceDeleteNeverDeletesIndependentWorkspace(t *testing.T) {
 
 	old := hostServiceTestHost(host.StateFailed)
 	old.ID = "h8765432"
+	old.Workspaces[0].HostID = old.ID
 	old.Workspaces[0].Workspace.ID = "w7654321"
 	deps.hosts.addHost(old)
 	oldBinding := old.Workspaces[0]
@@ -528,7 +530,7 @@ func TestHostServiceDeleteNeverDeletesIndependentWorkspace(t *testing.T) {
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(old), OwnerID: old.OwnerID, State: workspace.StateReady,
 	})
-	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: old.ID}); err != nil {
+	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: old.ID, ConfirmWorkspaceDeletion: true}); err != nil {
 		t.Fatalf("Delete(reused workspace) error = %v", err)
 	}
 	newer, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(old))
@@ -537,18 +539,31 @@ func TestHostServiceDeleteNeverDeletesIndependentWorkspace(t *testing.T) {
 	}
 }
 
-func TestHostServiceRequiresVerifiedUnbindBeforeHostDeletion(t *testing.T) {
+func TestHostServiceHostDeletionRequiresConfirmationAndValidatedStorage(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateRunning)
 	deps.hosts.addHost(value)
 	deps.workspaces.addBinding(value.Workspaces[0])
 
-	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
-		t.Fatalf("Delete(active workspace) error = %v, want workspace busy", err)
+	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Delete(without confirmation) error = %v, want invalid argument", err)
 	}
 	current, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	if current.State != host.StateRunning {
-		t.Fatalf("Host transitioned before workspace detach: %#v", current)
+		t.Fatalf("Host transitioned without confirmation: %#v", current)
+	}
+	deps.defaultWorkspace.validateErr = domain.NewError(domain.CodeWorkspaceConflict, "storage ownership is ambiguous")
+	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID, ConfirmWorkspaceDeletion: true}); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("Delete(with ambiguous storage) error = %v", err)
+	}
+	current, _ = deps.hosts.GetHost(context.Background(), value.ID)
+	if current.State != host.StateRunning {
+		t.Fatalf("Host transitioned with ambiguous storage: %#v", current)
+	}
+	deps.defaultWorkspace.validateErr = nil
+	deleted, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID, ConfirmWorkspaceDeletion: true})
+	if err != nil || deleted.State != host.StateDeleting {
+		t.Fatalf("Delete(confirmed) = %#v, %v", deleted, err)
 	}
 }
 
@@ -580,78 +595,37 @@ func TestHostServiceRetryWorkspaceSyncResetsConflictIdempotently(t *testing.T) {
 	}
 }
 
-func TestHostServiceBindAndUnbindWorkspaceAreIdempotent(t *testing.T) {
+func TestHostServiceCannotRebindOrUnbindHostStorage(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateRunning)
-	value.Workspaces = nil
 	deps.hosts.addHost(value)
-	ws := workspace.Workspace{ID: "w7654321", OwnerID: value.OwnerID, Name: "code", State: workspace.StateReady, Revision: 5}
-	other := workspace.Workspace{ID: "w8765432", OwnerID: value.OwnerID, Name: "other", State: workspace.StateReady, Revision: 0}
-	deps.workspaces.add(ws)
+	binding := value.Workspaces[0]
+	deps.workspaces.addBinding(binding)
+	other := workspace.Workspace{ID: "w8765432", OwnerID: value.OwnerID, Name: "other", State: workspace.StateReady}
 	deps.workspaces.add(other)
 	revision := int64(5)
-
-	bound, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, &revision, 0, "bind-workspace-01")
-	if err != nil || bound.State != workspace.BindingPreparing || bound.DesiredRevision != 5 || bound.AppliedRevision != 0 {
-		t.Fatalf("BindWorkspace() = %#v, %v", bound, err)
+	if _, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, other.ID, &revision, 0, "bind-workspace-01"); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("BindWorkspace() error = %v, want forbidden", err)
 	}
-	repeated, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, &revision, 0, "bind-workspace-01")
-	if err != nil || repeated.BindingVersion != bound.BindingVersion {
-		t.Fatalf("repeated BindWorkspace() = %#v, %v", repeated, err)
+	if _, err := service.UnbindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, binding.Workspace.ID, binding.BindingVersion, true, "unbind-workspace-01"); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("UnbindWorkspace() error = %v, want forbidden", err)
 	}
-
-	active := bound
-	active.State = workspace.BindingActive
-	active.BindingVersion++
-	active.AppliedRevision = active.DesiredRevision
-	deps.workspaces.addBinding(active)
-	if _, err := service.UnbindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, active.BindingVersion, false, "unbind-workspace-00"); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("UnbindWorkspace without writer-stop confirmation error = %v", err)
-	}
-	unbound, err := service.UnbindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, active.BindingVersion, true, "unbind-workspace-01")
-	if err != nil || unbound.State != workspace.BindingUnbinding {
-		t.Fatalf("UnbindWorkspace() = %#v, %v", unbound, err)
-	}
-	repeated, err = service.UnbindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, active.BindingVersion, true, "unbind-workspace-01")
-	if err != nil || repeated.BindingVersion != unbound.BindingVersion {
-		t.Fatalf("repeated UnbindWorkspace() = %#v, %v", repeated, err)
-	}
-	detached, err := deps.workspaces.TransitionWorkspaceBinding(context.Background(), value.ID, ws.ID, unbound.BindingVersion,
-		workspace.BindingUnbinding, workspace.BindingDetached, unbound.DesiredRevision, unbound.AppliedRevision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rebound, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, &revision, detached.BindingVersion, "bind-workspace-02")
-	if err != nil || rebound.State != workspace.BindingPreparing {
-		t.Fatalf("rebind after verified detach = %#v, %v", rebound, err)
-	}
-	if _, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, other.ID, nil, 0, "bind-workspace-03"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
-		t.Fatalf("rebinding Host to a different Workspace error = %v, want workspace conflict", err)
-	}
-	if _, err := service.UnbindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, active.BindingVersion, true, "unbind-workspace-01"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
-		t.Fatalf("replay stale unbind after rebind error = %v", err)
-	}
-	if _, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, ws.ID, &revision, 0, "bind-workspace-01"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
-		t.Fatalf("replay stale bind after rebind error = %v", err)
+	current, err := deps.workspaces.GetWorkspaceBinding(context.Background(), value.ID, binding.Workspace.ID)
+	if err != nil || current.State != binding.State || current.BindingVersion != binding.BindingVersion {
+		t.Fatalf("storage binding changed after rejected mutation = %#v, %v", current, err)
 	}
 }
 
-func TestHostServiceCanBindUnboundStoppedLegacyHostExactlyOnce(t *testing.T) {
+func TestHostServiceCannotBindUnboundStoppedHost(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateStopped)
 	value.Workspaces = nil
 	deps.hosts.addHost(value)
 	first := workspace.Workspace{ID: "w7654321", OwnerID: value.OwnerID, Name: "first", State: workspace.StateReady}
-	second := workspace.Workspace{ID: "w8765432", OwnerID: value.OwnerID, Name: "second", State: workspace.StateReady}
 	deps.workspaces.add(first)
-	deps.workspaces.add(second)
 	revision := int64(0)
-	bound, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, first.ID, &revision, 0, "bind-stopped-01")
-	if err != nil || bound.State != workspace.BindingPreparing || bound.Workspace.ID != first.ID {
-		t.Fatalf("BindWorkspace(stopped Host) = %#v, %v", bound, err)
-	}
-	if _, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, second.ID, &revision, 0, "bind-stopped-02"); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
-		t.Fatalf("BindWorkspace(stopped Host, second workspace) error = %v, want workspace conflict", err)
+	if _, err := service.BindWorkspace(context.Background(), hostServiceTestPrincipal(), value.ID, first.ID, &revision, 0, "bind-stopped-01"); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("BindWorkspace(stopped Host) error = %v, want forbidden", err)
 	}
 }
 
@@ -846,7 +820,7 @@ func TestHostServiceRestoreUnknownCreateIsFailClosed(t *testing.T) {
 	if stored.State != host.StateCreating || stored.StateReason != "restore_unknown" || stored.RuntimeGeneration != 2 || deps.sandbox.createCalls != 0 {
 		t.Fatalf("Host/create after unknown restore = %#v / %d", stored, deps.sandbox.createCalls)
 	}
-	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID}); domain.CodeOf(err) != domain.CodeConflict {
+	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: value.ID, ConfirmWorkspaceDeletion: true}); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("Delete(unknown restore) error = %v", err)
 	}
 	volume := service.volumes.(*hostServiceTestVolume)
@@ -865,7 +839,7 @@ func TestHostServiceRestoreUnknownCreateIsFailClosed(t *testing.T) {
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(markerOnly), OwnerID: markerOnly.OwnerID, State: workspace.StateReady,
 	})
-	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: markerOnly.ID}); domain.CodeOf(err) != domain.CodeConflict {
+	if _, err := service.Delete(context.Background(), hostServiceTestPrincipal(), DeleteHostCommand{HostID: markerOnly.ID, ConfirmWorkspaceDeletion: true}); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("Delete(restore_unknown marker without create timestamp) error = %v", err)
 	}
 	markerWorkspace, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(markerOnly))
@@ -1179,7 +1153,8 @@ func newHostServiceTest(t *testing.T) (*hostService, hostServiceTestDeps) {
 	workspaceVolumes := &hostServiceTestWorkspaceVolumes{}
 	service, err := NewHostService(HostServiceOptions{
 		Hosts: hosts, Users: users, Workspaces: workspaces,
-		WorkspaceVolumes: workspaceVolumes, DefaultWorkspaces: defaultWorkspace, Tokens: tokens,
+		WorkspaceVolumes: workspaceVolumes, DefaultWorkspaces: defaultWorkspace,
+		HostWorkspaceDeleter: defaultWorkspace, Tokens: tokens,
 		Sandboxes: &hostServiceTestRouter{client: sandbox}, Volumes: &hostServiceTestVolume{}, DiskCapacity: diskCapacity, Probe: ready, Runtime: runtimeReady, Audit: auditWriter, CreateLocks: createLocks,
 		Sealer: sealer, Templates: map[string]template.Template{"small": hostServiceTestTemplate()}, DefaultTemplateID: "small",
 		Capacity: Capacity{CPUMilli: 8000, MemMiB: 16384}, Instance: "test",
@@ -1207,9 +1182,14 @@ func hostServiceTestCreateCommand(deps hostServiceTestDeps, name string) CreateH
 }
 
 type hostServiceTestDefaultWorkspaceProvider struct {
-	workspaces *hostServiceTestWorkspaceStore
-	calls      int
-	err        error
+	workspaces    *hostServiceTestWorkspaceStore
+	byRequest     map[string]workspace.Workspace
+	calls         int
+	validateCalls int
+	deleteCalls   int
+	err           error
+	validateErr   error
+	deleteErr     error
 }
 
 type hostServiceTestWorkspaceVolumes struct {
@@ -1232,37 +1212,71 @@ func (r *hostServiceTestWorkspaceVolumes) PrepareHostWorkspaceVolume(_ context.C
 	}, nil
 }
 
-func (p *hostServiceTestDefaultWorkspaceProvider) EnsureDefaultWorkspace(_ context.Context, ownerID string) (workspace.Workspace, error) {
+func (p *hostServiceTestDefaultWorkspaceProvider) EnsureDefaultWorkspace(ctx context.Context, ownerID string) (workspace.Workspace, error) {
+	key, err := domain.NewWorkspaceID()
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	return p.CreateHostWorkspace(ctx, ownerID, "default-host-"+key)
+}
+
+func (p *hostServiceTestDefaultWorkspaceProvider) CreateHostWorkspace(_ context.Context, ownerID, requestKey string) (workspace.Workspace, error) {
 	p.calls++
 	if p.err != nil {
 		return workspace.Workspace{}, p.err
 	}
-	values, err := p.workspaces.ListWorkspacesByOwner(context.Background(), ownerID)
+	if p.byRequest == nil {
+		p.byRequest = make(map[string]workspace.Workspace)
+	}
+	if value, ok := p.byRequest[requestKey]; ok {
+		return value, nil
+	}
+	id, err := domain.NewWorkspaceID()
 	if err != nil {
 		return workspace.Workspace{}, err
 	}
-	for _, value := range values {
-		if value.State != workspace.StateReady || value.DeletedAt != nil {
-			continue
-		}
-		bindings, err := p.workspaces.GetWorkspaceBindingsByWorkspace(context.Background(), value.ID)
-		if err != nil {
-			return workspace.Workspace{}, err
-		}
-		available := true
-		for _, binding := range bindings {
-			if binding.State != workspace.BindingDetached {
-				available = false
-				break
-			}
-		}
-		if available {
-			return value, nil
-		}
-	}
-	value := workspace.Workspace{ID: "w1234567", OwnerID: ownerID, Name: "default", State: workspace.StateReady, QuotaBytes: 2_048 << 20}
+	value := workspace.Workspace{ID: id, OwnerID: ownerID, Name: "Computer storage", State: workspace.StateReady, QuotaBytes: 2_048 << 20}
 	p.workspaces.add(value)
+	p.byRequest[requestKey] = value
 	return value, nil
+}
+
+func (p *hostServiceTestDefaultWorkspaceProvider) ValidateHostWorkspace(ctx context.Context, ownerID, hostID, workspaceID string) error {
+	p.validateCalls++
+	if p.validateErr != nil {
+		return p.validateErr
+	}
+	bindings, err := p.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return err
+	}
+	if len(bindings) != 1 || bindings[0].OwnerID != ownerID || bindings[0].Workspace.ID != workspaceID {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is ambiguous")
+	}
+	return nil
+}
+
+func (p *hostServiceTestDefaultWorkspaceProvider) DeleteHostWorkspace(ctx context.Context, ownerID, hostID string) error {
+	p.deleteCalls++
+	if p.deleteErr != nil {
+		return p.deleteErr
+	}
+	bindings, err := p.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return err
+	}
+	if len(bindings) != 1 || bindings[0].OwnerID != ownerID || bindings[0].State != workspace.BindingDetached {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing, ambiguous or attached")
+	}
+	value, err := p.workspaces.GetWorkspace(ctx, bindings[0].Workspace.ID)
+	if err != nil {
+		return err
+	}
+	value.State = workspace.StateDeleted
+	now := time.Now()
+	value.DeletedAt = &now
+	p.workspaces.add(value)
+	return nil
 }
 
 type hostServiceTestDiskCapacity struct {
@@ -1732,6 +1746,10 @@ func (s *hostServiceTestHostStore) TransitionHost(_ context.Context, id string, 
 	value.UpdatedAt = time.Now()
 	s.values[id] = value
 	return cloneHostServiceHost(value), nil
+}
+
+func (s *hostServiceTestHostStore) BeginHostDelete(ctx context.Context, id string, from host.State) (host.Host, error) {
+	return s.TransitionHost(ctx, id, from, host.StateDeleting, "")
 }
 
 func (s *hostServiceTestHostStore) BeginHostRelease(_ context.Context, id string, confirmProcessTermination bool) (host.Host, bool, error) {

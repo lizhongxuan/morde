@@ -20,7 +20,23 @@ type AdminModelDefault = components["schemas"]["AdminModelDefault"];
 type Conversation = components["schemas"]["Conversation"];
 type ConversationMessage = components["schemas"]["ConversationMessage"];
 type MockConversationMessage = ConversationMessage & { delivery_status?: ConversationDeliveryStatus };
+type MockVariantAction = 'edit_resend' | 'regenerate_text' | 'continue_generation';
+type MockVariantMessage = {
+  id: string; conversation_id: string; sequence: number; role: 'user' | 'assistant'; content: string;
+  task_id?: string; related_task_id?: string; routing_status?: string; output_status?: string;
+  actor_id?: string; owner_id?: string; delivery_status?: string; created_at: string;
+  client_message_id?: string;
+  variant_group_id?: string; variant_version?: number; variant_action?: 'original' | MockVariantAction;
+  sources?: { user_message_id: string }[];
+};
+type MockVariantResponse = {
+  operation_id: string; variant_group_id: string; variant_version: number; action: MockVariantAction; state: 'accepted';
+  user_message_id?: string; assistant_message_id?: string; task_id?: string;
+};
 type Task = components["schemas"]["Task"];
+type TaskStep = components["schemas"]["TaskStep"];
+type TaskStepRetryRequest = components["schemas"]["TaskStepRetryRequest"];
+type TaskStepRetryResult = components["schemas"]["TaskStepRetryResult"];
 type Project = components["schemas"]["Project"];
 type ProjectMember = components["schemas"]["ProjectMember"];
 type ProjectInvitation = components["schemas"]["ProjectInvitation"];
@@ -131,13 +147,93 @@ function nextConversationMessageSequence(conversationID: string): number {
   const project = projectConversationMessages.filter((message) => message.conversation_id === conversationID);
   return Math.max(0, ...personal.map((message) => message.sequence), ...project.map((message) => message.sequence)) + 1;
 }
+
+function mockVariantRoot(target: MockVariantMessage, messages: readonly MockVariantMessage[]): string | null {
+  if (target.variant_group_id) return target.variant_group_id;
+  if (target.role === 'user') return target.id;
+  const sources = [...new Set((target.sources ?? []).map((source) => source.user_message_id))];
+  if (sources.length === 1) return sources[0] ?? null;
+  if (target.task_id) {
+    const users = [...new Set(messages.filter((message) => message.role === 'user' &&
+      (message.task_id === target.task_id || message.related_task_id === target.task_id)).map((message) => message.variant_group_id ?? message.id))];
+    if (users.length === 1) return users[0] ?? null;
+  }
+  return null;
+}
+
+function createMockMessageVariant(input: {
+  user: User; request: Request; projectID?: string; conversationID: string; targetID: string;
+  messages: Array<MockConversationMessage | ProjectConversationMessage>;
+  projectConversation?: ProjectConversation;
+}) {
+  const { user, request, projectID, conversationID, targetID, messages, projectConversation } = input;
+  const identityError = request.headers.get('X-Morde-Service-Instance-ID') !== mockServiceInstanceID
+    ? failure('conflict', '服务身份不匹配', 409)
+    : request.headers.get('X-Morde-Actor-ID') !== user.id ? failure('conflict', '账号身份不匹配', 409) : null;
+  if (identityError) return identityError;
+  const idempotencyKey = request.headers.get('Idempotency-Key')?.trim() ?? '';
+  if (!/^[A-Za-z0-9._~-]{8,128}$/.test(idempotencyKey)) return failure('invalid_argument', 'Idempotency-Key 无效', 400);
+  return request.json().catch(() => null).then((raw: unknown) => {
+    const body = raw as { action?: unknown; expected_version?: unknown; content?: unknown } | null;
+    const action = body?.action;
+    if (!body || Object.keys(body).some((key) => !['action', 'expected_version', 'content'].includes(key)) ||
+      !['edit_resend', 'regenerate_text', 'continue_generation'].includes(String(action)) ||
+      !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 1 ||
+      (action === 'edit_resend' ? typeof body.content !== 'string' || !body.content.trim() || Array.from(body.content).length > 32768 : body.content !== undefined)) {
+      return failure('invalid_argument', '消息版本操作请求无效', 400);
+    }
+    const target = messages.find((candidate) => candidate.id === targetID && candidate.conversation_id === conversationID) as MockVariantMessage | undefined;
+    if (!target) return failure('not_found', '消息不存在', 404);
+    if (projectID && (!projectConversation || target.owner_id !== projectConversation.owner_id)) return failure('not_found', '项目共享对话消息不存在', 404);
+    if (projectID && target.actor_id !== user.id) return failure('forbidden', '只有消息发起人可以操作该版本', 403);
+    const rootID = mockVariantRoot(target, messages as MockVariantMessage[]);
+    if (!rootID) return failure('invalid_state', '无法确认消息的原始版本组', 409);
+    if ((action === 'edit_resend' && target.role !== 'user') || (action !== 'edit_resend' && target.role !== 'assistant')) {
+      return failure('invalid_state', '消息角色不支持此版本操作', 409);
+    }
+    if (action === 'continue_generation' && target.output_status !== 'interrupted') return failure('invalid_state', '当前回复没有可继续的检查点', 409);
+    const scopedKey = `${user.id}:${projectID ?? 'personal'}:${conversationID}:${idempotencyKey}`;
+    const requestText = canonicalJSON({ conversationID, targetID, ...(projectID ? { projectID } : {}), ...body });
+    const replay = messageVariantReplays.get(scopedKey);
+    if (replay) return replay.request === requestText ? json(replay.response, 202) : failure('idempotency_conflict', '幂等键已用于其他消息版本操作', 409);
+    const groupRows = (messages as MockVariantMessage[]).filter((candidate) => candidate.variant_group_id === rootID || candidate.id === rootID);
+    const latestVersion = Math.max(1, ...groupRows.map((candidate) => candidate.variant_version ?? 1));
+    if (body.expected_version !== latestVersion) return failure('conflict', '消息版本已变化，请刷新后重试', 409);
+    const version = latestVersion + 1;
+    const timestamp = now();
+    const role = action === 'edit_resend' ? 'user' : 'assistant';
+    const nextID = id('m');
+    const nextContent = action === 'edit_resend' ? String(body.content) : action === 'continue_generation'
+      ? `${target.content}\n\n（本机演示：续写结果）` : `${target.content}\n\n（本机演示：重新生成的文字版本）`;
+    const next: MockVariantMessage = {
+      id: nextID, conversation_id: conversationID, sequence: nextConversationMessageSequence(conversationID), role, content: nextContent,
+      ...(target.task_id ? { task_id: target.task_id } : {}), ...(target.related_task_id ? { related_task_id: target.related_task_id } : {}),
+      ...(role === 'user' ? { routing_status: 'pending', delivery_status: 'pending', client_message_id: nextID } : { output_status: 'completed', delivery_status: 'applied' }),
+      created_at: timestamp, variant_group_id: rootID, variant_version: version, variant_action: action as MockVariantAction,
+      ...(projectID ? { actor_id: user.id, owner_id: projectConversation!.owner_id } : {}),
+    };
+    messages.push(next as MockConversationMessage & ProjectConversationMessage);
+    if (projectConversation) projectConversation.updated_at = timestamp;
+    const response: MockVariantResponse = {
+      operation_id: id('op'), variant_group_id: rootID, variant_version: version, action: action as MockVariantAction, state: 'accepted',
+      ...(role === 'user' ? { user_message_id: nextID } : { assistant_message_id: nextID }),
+      ...(target.task_id ? { task_id: target.task_id } : {}),
+    };
+    messageVariantReplays.set(scopedKey, { request: requestText, response });
+    if (!projectID) persistAssistantState();
+    return json(response, 202);
+  });
+}
+
 const projectConversationCreates = new Map<string, { request: string; response: ProjectConversation }>();
 const projectConversationAcceptances = new Map<string, { request: string; response: AcceptedProjectConversationMessageResponse }>();
+const messageVariantReplays = new Map<string, { request: string; response: MockVariantResponse }>();
 const conversationCreates = new Map<string, { request: string; response: Conversation }>();
 const projectWorkItemClaimReplays = new Map<string, { request: string; response: ProjectWorkItem }>();
 const taskSubmitReplays = new Map<string, { request: string; response: Task }>();
 const conversationAcceptances = new Map<string, { request: string; response: components["schemas"]["AcceptedConversationMessageResponse"] }>();
 const taskActionReplays = new Map<string, { request: string; response: components["schemas"]["TaskActionResponse"] }>();
+const taskStepRetryReplays = new Map<string, { request: string; response: TaskStepRetryResult }>();
 const mainConversationReplays = new Map<string, { request: string; response: MainConversation }>();
 let userPreferences = new Map<string, UserPreferences>();
 let notifications: Notification[] = [];
@@ -428,11 +524,13 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   projectConversationMessages = [];
   projectConversationCreates.clear();
   projectConversationAcceptances.clear();
+  messageVariantReplays.clear();
   conversationCreates.clear();
   projectWorkItemClaimReplays.clear();
   taskSubmitReplays.clear();
   conversationAcceptances.clear();
   taskActionReplays.clear();
+  taskStepRetryReplays.clear();
   mainConversationReplays.clear();
   userPreferences = new Map();
   notifications = [];
@@ -1187,6 +1285,15 @@ export const handlers = [
         && (!clientMessageID || (item.client_message_id === clientMessageID && item.actor_id === user.id))),
       next_cursor: null,
     });
+  }),
+  http.post("/api/projects/:projectID/conversations/:conversationID/messages/:messageID/variants", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    const projectConversation = projectConversations.find((item) => item.project_id === projectID && item.id === conversationID);
+    if (!readableProject(projectID, user) || !projectConversation) return failure("not_found", "项目共享对话不存在", 404);
+    return createMockMessageVariant({ user, request, projectID, conversationID, targetID: String(params.messageID),
+      messages: projectConversationMessages as unknown as Array<MockConversationMessage | ProjectConversationMessage>, projectConversation });
   }),
   http.get("/api/projects/:projectID/conversations/:conversationID/tasks", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2572,6 +2679,13 @@ export const handlers = [
     return json({ items: conversationMessages.filter((item) => item.conversation_id === conversationID
       && (!clientMessageID || item.client_message_id === clientMessageID)), next_cursor: null });
   }),
+  http.post("/api/conversations/:conversationID/messages/:messageID/variants", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
+    return createMockMessageVariant({ user, request, conversationID, targetID: String(params.messageID),
+      messages: conversationMessages as unknown as Array<MockConversationMessage | ProjectConversationMessage> });
+  }),
   http.get("/api/conversations/:conversationID/tasks", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
     const conversationID = String(params.conversationID);
@@ -2707,6 +2821,65 @@ export const handlers = [
     const task = tasks.get(String(params.taskID));
     if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
     return json(task);
+  }),
+  http.post("/api/tasks/:taskID/steps/:stepID/retries", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const taskID = String(params.taskID);
+    const stepID = String(params.stepID);
+    const task = tasks.get(taskID);
+    if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
+    const body = await request.json().catch(() => null) as TaskStepRetryRequest | null;
+    if (!body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((field) => !["expected_task_revision", "expected_attempt"].includes(field)) ||
+      !Number.isSafeInteger(body.expected_task_revision) || body.expected_task_revision < 0 ||
+      !Number.isSafeInteger(body.expected_attempt) || body.expected_attempt < 1) {
+      return failure("invalid_argument", "步骤重试条件无效", 400);
+    }
+    const replayKey = `${user.id}:${key}`;
+    const requestText = JSON.stringify({ taskID, stepID, ...body });
+    const replay = taskStepRetryReplays.get(replayKey);
+    if (replay) return replay.request === requestText
+      ? json({ ...replay.response, replayed: true }, 202)
+      : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    const source = task.steps.find((step) => step.id === stepID);
+    if (!source || task.status !== "failed" || source.status !== "failed" || source.retryable !== true) {
+      return failure("invalid_state", "步骤当前不可安全重试", 409);
+    }
+    if (task.current_revision !== body.expected_task_revision || task.desired_revision !== body.expected_task_revision ||
+      source.task_revision !== body.expected_task_revision || source.attempt !== body.expected_attempt) {
+      return failure("conflict", "任务修订或步骤尝试已变化", 409);
+    }
+    const timestamp = now();
+    const attemptStep: TaskStep = {
+      ...source,
+      id: id("s"),
+      sequence: Math.max(0, ...task.steps.map((step) => step.sequence)) + 1,
+      attempt: source.attempt + 1,
+      retry_of_step_id: source.id,
+      status: "queued",
+      summary: "重试已受理，等待执行。",
+      failure_reason: null,
+      retryable: false,
+      task_revision: body.expected_task_revision,
+      created_at: timestamp,
+    };
+    source.retryable = false;
+    task.steps.push(attemptStep);
+    task.status = "queued";
+    task.current_step = attemptStep.id;
+    task.step_count += 1;
+    task.event_sequence += 1;
+    task.updated_at = timestamp;
+    task.result = null;
+    task.finished_at = null;
+    task.waiting_reason = null;
+    const response: TaskStepRetryResult = { task_id: taskID, source_step_id: stepID, attempt_step_id: attemptStep.id,
+      attempt: attemptStep.attempt, status: "queued", replayed: false };
+    taskStepRetryReplays.set(replayKey, { request: requestText, response });
+    persistAssistantState();
+    return json(response, 202);
   }),
   http.get("/api/tasks/:taskID/events", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
