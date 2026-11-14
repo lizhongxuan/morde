@@ -103,6 +103,40 @@ enum MIFTaskPresentation {
         }.sorted { $0.sequence < $1.sequence }
     }
 
+    static func currentPlan(_ task: MordeTask) -> MordeTask.Plan? {
+        guard let plan = task.plan, plan.task_revision == task.current_revision else { return nil }
+        return plan
+    }
+
+    static func currentBilling(_ task: MordeTask) -> MordeTask.Billing? {
+        guard let billing = task.billing, billing.model_calls >= 0 else { return nil }
+        var calls: Int64 = 0
+        for cost in billing.costs {
+            guard cost.calls > 0, cost.reserved_micros >= 0,
+                  cost.rate_versions.allSatisfy({ $0 > 0 }),
+                  cost.rate_versions == cost.rate_versions.sorted(),
+                  Set(cost.rate_versions).count == cost.rate_versions.count else { return nil }
+            let (nextCalls, overflow) = calls.addingReportingOverflow(cost.calls)
+            guard !overflow else { return nil }
+            calls = nextCalls
+            let validCurrency = cost.currency?.range(of: "^[A-Z]{3}$", options: .regularExpression) != nil
+            switch cost.state {
+            case "settled":
+                guard validCurrency, !cost.rate_versions.isEmpty, let actual = cost.actual_micros, actual >= 0 else { return nil }
+            case "estimated":
+                guard validCurrency, !cost.rate_versions.isEmpty, cost.reserved_micros > 0, cost.actual_micros == nil else { return nil }
+            case "unknown":
+                guard cost.actual_micros == nil,
+                      cost.currency == nil ? cost.rate_versions.isEmpty && cost.reserved_micros == 0 : validCurrency && !cost.rate_versions.isEmpty && cost.reserved_micros > 0 else { return nil }
+            case "byok":
+                guard cost.currency == nil, cost.rate_versions.isEmpty, cost.reserved_micros == 0, cost.actual_micros == nil else { return nil }
+            default:
+                return nil
+            }
+        }
+        return calls == billing.model_calls ? billing : nil
+    }
+
     static func confirmedArtifacts(_ artifacts: [MordeTask.Artifact]?) -> [MordeTask.Artifact] {
         (artifacts ?? []).filter { artifact in
             artifact.verified &&
@@ -1248,6 +1282,8 @@ struct MIFTaskDetailView: View {
                 MIFTaskInlineError(message: detailError)
             }
             taskSummary(task)
+            MIFTaskBillingSection(task: task)
+            MIFTaskPlanSection(task: task)
             taskSteps(task)
             taskRelationships(task)
             taskPendingRequest(task)
@@ -2282,11 +2318,76 @@ struct MIFTaskErrorState: View {
     }
 }
 
+struct MIFTaskBillingSection: View {
+    let task: MordeTask
+
+    var body: some View {
+        if let billing = MIFTaskPresentation.currentBilling(task) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AppLocalized("Usage and cost")).font(.caption.weight(.semibold))
+                Text("\(AppLocalized("Model calls")): \(billing.model_calls)").font(.caption)
+                if let usage = task.usage, let budget = task.budget {
+                    Text("\(AppLocalized("Tokens")): \(usage.model_tokens.map { String($0) } ?? AppLocalized("Unknown")) / \(budget.model_tokens)")
+                        .font(.caption)
+                    Text("\(AppLocalized("Tool calls")): \(usage.tool_calls) / \(budget.tool_calls) · \(AppLocalized("Active time")): \(usage.active_seconds) / \(budget.active_seconds) s")
+                        .font(.caption)
+                }
+                ForEach(billing.costs) { cost in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(costLabel(cost)).font(.caption.weight(.medium))
+                            Spacer()
+                            Text("\(cost.calls) \(AppLocalized("calls"))").font(.caption2).foregroundStyle(NanoMuseTones.secondaryText)
+                        }
+                        if !cost.rate_versions.isEmpty {
+                            Text("\(AppLocalized("Rate snapshots")): \(cost.rate_versions.map { "v\($0)" }.joined(separator: ", "))")
+                                .font(.caption2).foregroundStyle(NanoMuseTones.secondaryText)
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                if billing.costs.isEmpty { Text(AppLocalized("No model calls yet")).font(.caption).foregroundStyle(NanoMuseTones.secondaryText) }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(NanoMuseTones.fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("morde.task.billing")
+        }
+    }
+
+    private func costLabel(_ cost: MordeTask.Billing.Cost) -> String {
+        switch cost.state {
+        case "settled":
+            guard let currency = cost.currency, let amount = cost.actual_micros else { return AppLocalized("Unknown") }
+            return "\(AppLocalized("Settled")): \(money(amount, currency: currency))"
+        case "estimated":
+            guard let currency = cost.currency else { return AppLocalized("Unknown") }
+            return "\(AppLocalized("Estimated reservation (not actual cost)")): \(money(cost.reserved_micros, currency: currency))"
+        case "unknown":
+            if let currency = cost.currency {
+                return "\(AppLocalized("Cost unknown")) · \(AppLocalized("Reserved amount")): \(money(cost.reserved_micros, currency: currency))"
+            }
+            return AppLocalized("Cost unknown")
+        case "byok": return AppLocalized("BYOK · no Morde charge")
+        default: return AppLocalized("Unknown")
+        }
+    }
+
+    private func money(_ micros: Int64, currency: String) -> String {
+        let whole = micros / 1_000_000
+        let rawFraction = String(micros % 1_000_000)
+        var fraction = String(repeating: "0", count: 6 - rawFraction.count) + rawFraction
+        while fraction.last == "0" { fraction.removeLast() }
+        return "\(currency) \(whole)\(fraction.isEmpty ? "" : ".\(fraction)")"
+    }
+}
+
 struct MIFTaskPlanSection: View {
     let task: MordeTask
 
     var body: some View {
-        if let plan = task.plan, plan.task_revision == task.current_revision {
+        if let plan = MIFTaskPresentation.currentPlan(task) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("\(AppLocalized("Execution plan")) · \(AppLocalized("Revision")) \(plan.revision)")
                     .font(.caption.weight(.semibold))

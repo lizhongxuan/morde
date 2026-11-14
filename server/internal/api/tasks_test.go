@@ -1725,6 +1725,7 @@ func TestTaskEventPayloadsExposeOnlyTypeAllowlistedFields(t *testing.T) {
 		{"waiting user", "task.waiting_user", `{"status":"waiting_user","reason":"approval_required","detail":{"content":"private approval"}}`, []string{"status", "reason"}, []string{"detail"}},
 		{"response", "task.response", `{"decision":"approve","status":"queued","pending_id":"r1234567","answer":"private answer"}`, []string{"decision", "status", "pending_id"}, []string{"answer"}},
 		{"result", "task.result", `{"status":"completed","reason":"done","result":"unreviewed result","error":"private error"}`, []string{"status", "reason"}, []string{"result", "error"}},
+		{"plan", "task.plan", `{"step_id":"s1234567","sequence":4,"task_revision":2,"plan_revision":3,"plan":{"goal":"private plan"},"detail":{"call_id":"private call"}}`, []string{"step_id", "sequence", "task_revision", "plan_revision"}, []string{"goal", "call_id"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1868,5 +1869,23 @@ func apiTestTask() task.Task {
 		ModelID: "model-a", Objective: "summarize files", Status: task.StatusQueued,
 		Budget:    task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func TestTaskBillingProjectionPreservesCostStatesAndRejectsInconsistentTotals(t *testing.T) {
+	actual := int64(75)
+	value := &app.TaskBilling{ModelCalls: 4, Costs: []app.TaskCostSummary{
+		{State: "settled", Currency: "USD", Calls: 1, RateVersions: []int64{2}, ReservedMicros: 100, ActualMicros: &actual},
+		{State: "estimated", Currency: "USD", Calls: 1, RateVersions: []int64{3}, ReservedMicros: 25},
+		{State: "unknown", Currency: "USD", Calls: 1, RateVersions: []int64{3}, ReservedMicros: 40},
+		{State: "byok", Calls: 1},
+	}}
+	response, err := toTaskBillingResponse(value)
+	if err != nil || response.ModelCalls != 4 || len(response.Costs) != 4 || response.Costs[0].ActualMicros == nil || *response.Costs[0].ActualMicros != actual {
+		t.Fatalf("valid Task billing projection = %#v, %v", response, err)
+	}
+	value.ModelCalls++
+	if _, err := toTaskBillingResponse(value); err == nil {
+		t.Fatal("billing call count that does not match its buckets was accepted")
 	}
 }

@@ -42,7 +42,7 @@ type CloudDSHTaskPlanReceiptReader interface {
 
 func cloudDSHTaskPlanDefinition() AgentToolDefinition {
 	return AgentToolDefinition{ModelTool: ModelTool{Name: cloudDSHTaskPlanToolName,
-		Description: "For complex multi-step tasks, save or revise an advisory plan with dependencies, deliverables, and completion criteria. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application.",
+		Description: "When a complex task has multiple dependent steps, the main Agent should save a plan before doing the work and revise it when the approach changes. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
 }
 
@@ -59,6 +59,15 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 		if input.Steps[index].Status == "" {
 			input.Steps[index].Status = task.PlanStepPending
 		}
+		if input.Steps[index].DependsOn == nil {
+			input.Steps[index].DependsOn = []string{}
+		}
+		if input.Steps[index].Outputs == nil {
+			input.Steps[index].Outputs = []string{}
+		}
+		if input.Steps[index].CompletionCriteria == nil {
+			input.Steps[index].CompletionCriteria = []string{}
+		}
 	}
 	details, err := b.currentServerTask(ctx, claimed)
 	if err != nil {
@@ -66,6 +75,7 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	}
 	current := details.Task
 	if current.CurrentRevision == nil || current.AgentSessionID == "" || current.Authorization.Version < 1 ||
+		call.TaskFence == nil || call.TaskFence.AgentSessionID != current.AgentSessionID ||
 		current.Authorization.Version != claimed.Authorization.Version ||
 		(claimed.AgentSessionID != "" && current.AgentSessionID != claimed.AgentSessionID) ||
 		!sameCloudDSHAuthorization(current.Authorization, claimed.Authorization) {
@@ -106,19 +116,21 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "task plan replay receipt is unavailable")
 		}
 		stored, err := reader.GetCloudDSHTaskPlanReceipt(ctx, current.ID, current.OwnerID, current.AgentSessionID, call.CallID)
-		if err != nil {
+		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
 			return AgentToolResult{}, err
 		}
-		if stored.Validate() != nil {
+		if err == nil && (stored.Validate() != nil || stored.TaskRevision != plan.TaskRevision || stored.Goal != input.Goal || !reflect.DeepEqual(stored.Steps, input.Steps)) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "stored task plan replay receipt is invalid")
 		}
-		plan = stored
-		output, err = json.Marshal(plan)
-		if err != nil {
-			return AgentToolResult{}, err
+		if err == nil {
+			plan = stored
+			output, err = json.Marshal(plan)
+			if err != nil {
+				return AgentToolResult{}, err
+			}
+			commit.Plan = plan
+			commit.FingerprintSHA256 = cloudDSHTaskPlanFingerprint(commit)
 		}
-		commit.Plan = plan
-		commit.FingerprintSHA256 = cloudDSHTaskPlanFingerprint(commit)
 	}
 	usage := cloneTaskUsage(current.Usage)
 	if usage.ToolCalls == int64(^uint64(0)>>1) {
@@ -188,6 +200,17 @@ func validateCloudDSHTaskPlanEvent(payload []byte, expected CloudDSHTaskPlanComm
 
 func ValidateCloudDSHTaskPlanEvent(payload []byte, expected CloudDSHTaskPlanCommit) error {
 	return validateCloudDSHTaskPlanEvent(payload, expected)
+}
+
+func ValidateCloudDSHTaskPlanEventForStep(payload []byte, expected CloudDSHTaskPlanCommit, stepID string, sequence int64) error {
+	if err := validateCloudDSHTaskPlanEvent(payload, expected); err != nil {
+		return err
+	}
+	var event cloudDSHTaskPlanEvent
+	if decodeStrictRuntimeResult(payload, &event) != nil || event.StepID != stepID || event.Sequence != sequence {
+		return domain.NewError(domain.CodeInvalidState, "task plan event step identity changed")
+	}
+	return nil
 }
 
 func ReadCloudDSHTaskPlanReceipt(payload []byte, taskID, ownerID, sessionID, callID string) (task.Plan, error) {

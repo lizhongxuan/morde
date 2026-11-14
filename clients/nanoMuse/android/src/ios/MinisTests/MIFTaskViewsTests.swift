@@ -15,6 +15,26 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(MordeTask.self, from: Data(missingCounts.utf8)))
     }
 
+    func testCurrentTaskPlanIsRevisionFenced() throws {
+        let currentJSON = #"{"id":"q1234567","conversation_id":"c1234567","objective":"demo","status":"running","current_revision":2,"step_count":0,"completed_step_count":0,"updated_at":"2026-11-04T00:00:00Z","plan":{"task_revision":2,"revision":3,"goal":"Prepare report","cost_estimate_state":"unknown","steps":[{"id":"collect","title":"Collect sources","description":"","depends_on":[],"outputs":["notes"],"completion_criteria":["sources cited"],"status":"in_progress"}]}}"#
+        let staleJSON = currentJSON.replacingOccurrences(of: "\"task_revision\":2", with: "\"task_revision\":1")
+        let current = try JSONDecoder().decode(MordeTask.self, from: Data(currentJSON.utf8))
+        let stale = try JSONDecoder().decode(MordeTask.self, from: Data(staleJSON.utf8))
+        XCTAssertEqual(MIFTaskPresentation.currentPlan(current)?.revision, 3)
+        XCTAssertNil(MIFTaskPresentation.currentPlan(stale))
+    }
+
+    func testTaskBillingSeparatesSettledEstimateUnknownAndBYOK() throws {
+        let json = #"{"id":"q1234567","conversation_id":"c1234567","objective":"demo","status":"completed","step_count":0,"completed_step_count":0,"updated_at":"2026-11-04T00:00:00Z","budget":{"active_seconds":600,"tool_calls":10,"model_tokens":1000},"usage":{"active_seconds":30,"tool_calls":2,"model_tokens":120},"billing":{"model_calls":4,"costs":[{"state":"settled","currency":"USD","calls":1,"rate_versions":[2],"reserved_micros":1000000,"actual_micros":750000},{"state":"estimated","currency":"USD","calls":1,"rate_versions":[3],"reserved_micros":250000,"actual_micros":null},{"state":"unknown","calls":1,"rate_versions":[],"reserved_micros":0,"actual_micros":null},{"state":"byok","calls":1,"rate_versions":[],"reserved_micros":0,"actual_micros":null}]}}"#
+        let task = try JSONDecoder().decode(MordeTask.self, from: Data(json.utf8))
+        let billing = try XCTUnwrap(MIFTaskPresentation.currentBilling(task))
+        XCTAssertEqual(billing.model_calls, 4)
+        XCTAssertEqual(billing.costs.map(\.state), ["settled", "estimated", "unknown", "byok"])
+
+        let mismatch = try JSONDecoder().decode(MordeTask.self, from: Data(json.replacingOccurrences(of: "\"model_calls\":4", with: "\"model_calls\":5").utf8))
+        XCTAssertNil(MIFTaskPresentation.currentBilling(mismatch))
+    }
+
     func testTaskFileFetchPresentationSeparatesOfflineWaitFromContentAndCancellation() throws {
         let offline = try makeFileFetch([
             "status": "waiting_device", "waiting_reason": "device_offline",

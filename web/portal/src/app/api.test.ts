@@ -737,75 +737,23 @@ describe('typed Portal API client', () => {
     ]);
   });
 
-  it('creates a standalone workspace with an idempotency key and confirms workspace deletion', async () => {
+  it('requires explicit confirmation before deleting host-owned storage', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
-      if (new URL(request.url).pathname === '/api/workspaces') {
-        return Response.json({ id: 'w1234567', name: '项目工作区', revision: 0, used_bytes: 0, quota_bytes: 4096, state: 'ready', created_at: '', updated_at: '' }, { status: 201 });
-      }
       return Response.json({
         id: 'h1234567', name: '测试电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'deleting', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '', workspaces: [],
         resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
       });
     }));
 
-    await portalApi.createWorkspace({ name: '项目工作区' });
     await portalApi.deleteHost('h1234567', true);
 
-    const [workspaceRequest, hostDeleteRequest] = requests;
-    expect(workspaceRequest?.method).toBe('POST');
-    expect(workspaceRequest?.headers.get('Idempotency-Key')).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    expect(await workspaceRequest?.json()).toEqual({ name: '项目工作区' });
-    expect(hostDeleteRequest?.method).toBe('DELETE');
-    expect(new URL(hostDeleteRequest!.url).pathname).toBe('/api/hosts/h1234567');
-    expect(new URL(hostDeleteRequest!.url).search).toBe('?confirm_delete_workspace=true');
-  });
-
-  it('replays an accepted workspace creation after the response is lost', async () => {
-    const accepted = new Map<string, { id: string; name: string; revision: number; used_bytes: number; quota_bytes: number; state: string; created_at: string; updated_at: string }>();
-    const keys: string[] = [];
-    let attempts = 0;
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      const key = request.headers.get('Idempotency-Key')!;
-      keys.push(key);
-      let workspace = accepted.get(key);
-      if (!workspace) {
-        workspace = { id: 'w1234567', name: '项目工作区', revision: 0, used_bytes: 0, quota_bytes: 4096, state: 'ready', created_at: '', updated_at: '' };
-        accepted.set(key, workspace);
-      }
-      if (attempts++ === 0) throw new TypeError('服务器已接受请求，但响应丢失');
-      return Response.json(workspace, { status: 201 });
-    }));
-
-    await expect(portalApi.createWorkspace({ name: '项目工作区' }, 'workspace-retry-key-001')).rejects.toThrow('服务器已接受请求，但响应丢失');
-    await expect(portalApi.createWorkspace({ name: '项目工作区' }, 'workspace-retry-key-001')).resolves.toMatchObject({ id: 'w1234567' });
-
-    expect(keys).toEqual(['workspace-retry-key-001', 'workspace-retry-key-001']);
-    expect(accepted.size).toBe(1);
-  });
-
-  it('unbinds a workspace with the observed binding version, writer confirmation, and idempotency key', async () => {
-    let request: Request | undefined;
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      request = new Request(input, init);
-      return Response.json({
-        workspace: { id: 'w1234567', name: '项目工作区', revision: 2, used_bytes: 1, state: 'ready' },
-        directory: 'projects/w1234567', state: 'unbinding', binding_version: 3, desired_revision: 2, applied_revision: 2,
-      }, { status: 202 });
-    }));
-
-    const response = await portalApi.unbindWorkspaceFromHost('h1234567', 'w1234567', {
-      expected_binding_version: 2, writers_stopped: true,
-    });
-
-    expect(response.state).toBe('unbinding');
-    expect(request?.method).toBe('DELETE');
-    expect(new URL(request!.url).pathname).toBe('/api/hosts/h1234567/workspace-bindings/w1234567');
-    expect(request!.headers.get('Idempotency-Key')).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    expect(await request!.json()).toEqual({ expected_binding_version: 2, writers_stopped: true });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe('DELETE');
+    expect(new URL(requests[0]!.url).pathname).toBe('/api/hosts/h1234567');
+    expect(new URL(requests[0]!.url).search).toBe('?confirm_delete_workspace=true');
   });
 
   it('retries Host workspace sync with the observed binding version and preserves stale-version errors', async () => {

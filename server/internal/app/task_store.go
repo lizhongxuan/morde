@@ -99,6 +99,21 @@ type TaskDetails struct {
 	StopRequest            *task.StopRequest
 	StopOperationIDs       []string
 	Plan                   *task.Plan
+	Billing                *TaskBilling
+}
+
+type TaskBilling struct {
+	ModelCalls int64
+	Costs      []TaskCostSummary
+}
+
+type TaskCostSummary struct {
+	State          string
+	Currency       string
+	Calls          int64
+	RateVersions   []int64
+	ReservedMicros int64
+	ActualMicros   *int64
 }
 
 type TaskAgentExecution struct {

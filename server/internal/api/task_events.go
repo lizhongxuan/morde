@@ -318,7 +318,7 @@ func validPublicTaskEventField(field string, raw json.RawMessage) bool {
 	case "done", "requires_reconciliation", "usage_known", "redacted", "idempotency_replayed":
 		var value bool
 		return json.Unmarshal(raw, &value) == nil
-	case "batch_attempt", "task_revision", "revision", "size_bytes", "required_revision", "applied_revision",
+	case "batch_attempt", "task_revision", "revision", "plan_revision", "sequence", "size_bytes", "required_revision", "applied_revision",
 		"pending_version", "clarification_version", "lease_version", "attempt":
 		var value int64
 		return json.Unmarshal(raw, &value) == nil && value >= 0

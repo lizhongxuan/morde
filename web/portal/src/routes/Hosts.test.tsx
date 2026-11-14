@@ -332,11 +332,10 @@ describe('Hosts', () => {
     expect(within(card).getByText('桌面连接').parentElement).toHaveTextContent('由 noVNC 工作台单独检测');
   });
 
-  it('does not allow binding independent cloud files to a stopped computer', async () => {
+  it('keeps assigned storage immutable on a stopped computer', async () => {
     const stoppedHost = { ...ownedHost, state: 'stopped' as const, workspaces: [] };
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [stoppedHost] });
     const restore = vi.spyOn(portalApi, 'restoreHost').mockResolvedValue({ ...stoppedHost, state: 'creating' });
-    const bind = vi.spyOn(portalApi, 'bindWorkspaceToHost');
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
@@ -349,7 +348,6 @@ describe('Hosts', () => {
     expect(screen.queryByLabelText(/关联已有云端文件/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /关联所选文件|绑定/ })).not.toBeInTheDocument();
     expect(restore).not.toHaveBeenCalled();
-    expect(bind).not.toHaveBeenCalled();
   });
 
   it('confirms compute release and calls the release endpoint', async () => {

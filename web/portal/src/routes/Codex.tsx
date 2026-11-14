@@ -175,9 +175,9 @@ function toolEventDetails(kind: string, payload: unknown, eventStatus?: string):
 }
 
 export function Codex() {
-  const codexBridge = useMemo(getBridge, []);
+  const codexBridge = useMemo(() => getBridge(), []);
   const [state, setState] = useState<CodexState | null>(null);
-  const [stateError, setStateError] = useState('');
+  const [stateError, setStateError] = useState(() => codexBridge?.codexState ? '' : '当前 PC 客户端未提供 Codex 会话桥接。');
   const [message, setMessage] = useState('');
   const [scopes, setScopes] = useState<CodexScope[]>(defaultScopes);
   const [threads, setThreads] = useState<CodexThread[]>([]);
@@ -234,7 +234,6 @@ export function Codex() {
     };
     const stop = codexBridge?.onCodexState?.(apply);
     if (codexBridge?.codexState) void codexBridge.codexState().then(apply).catch((error: unknown) => { if (active) setStateError(errorDetails(error).message); });
-    else setStateError('当前 PC 客户端未提供 Codex 会话桥接。');
     return () => { active = false; stop?.(); };
   }, [codexBridge]);
 
@@ -243,6 +242,7 @@ export function Codex() {
     if (!profileKey) {
       threadRequestSequenceRef.current += 1;
       loadingProfileRef.current = '';
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Drop the loading state for the profile that was just deselected.
       setThreadLoading(false);
       setThreads([]); setNextCursor(null); setSelectedThreadID(''); return;
     }
@@ -251,7 +251,7 @@ export function Codex() {
     setScopes(scopeList(selected?.scopes).length ? scopeList(selected?.scopes) : defaultScopes);
     void loadThreads(null);
     // Load only when the selected profile changes, not on every state push.
-    // eslint-disable-next-line react-hooks/exhaustive-deps, react-hooks/set-state-in-effect
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profileKey]);
 
   const selectedEvents = useInfiniteQuery({

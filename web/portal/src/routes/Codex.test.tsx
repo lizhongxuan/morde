@@ -26,6 +26,11 @@ function renderPage() {
 describe('Codex', () => {
   afterEach(() => { cleanup(); delete (window as Window & { morde?: unknown }).morde; vi.restoreAllMocks(); });
 
+  it('reports that the Codex bridge is unavailable outside the PC client', () => {
+    renderPage();
+    expect(screen.getByRole('status')).toHaveTextContent('Codex 会话同步需要 Morde PC 客户端');
+  });
+
   it('lists local conversations and displays synced reasoning and tool events from the server', async () => {
     Object.defineProperty(window, 'morde', { configurable: true, value: {
       codexState: vi.fn().mockResolvedValue(state),

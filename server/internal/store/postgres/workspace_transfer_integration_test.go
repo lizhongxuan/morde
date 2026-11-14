@@ -112,12 +112,13 @@ VALUES ($1,$2,$3,$4,'download','fill_missing','completed','complete',$5,$5,$5,0,
 	if _, err := store.GetTask(ctx, createdTask.Task.ID, oldOwner.ID); err != nil {
 		t.Fatalf("former Task owner lost access through Task authorization: %v", err)
 	}
-	if _, err := store.GetTask(ctx, createdTask.Task.ID, newOwner.ID); domain.CodeOf(err) != domain.CodeNotFound {
+	_, err = store.GetTask(ctx, createdTask.Task.ID, newOwner.ID)
+	if domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("another account read computer Task history through Task authorization: %v", err)
 	}
 
 	syncService := testWorkspaceSyncService(t, store)
-	manifest, err := syncService.GetManifest(ctx, oldPrincipal, workspaceValue.ID, workspaceValue.Revision, "", "", 100)
+	manifest, err = syncService.GetManifest(ctx, oldPrincipal, workspaceValue.ID, workspaceValue.Revision, "", "", 100)
 	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Path != "README.md" {
 		t.Fatalf("computer owner lost storage file metadata after rejected transfer: %#v, %v", manifest, err)
 	}

@@ -1285,6 +1285,8 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-activity-plan { margin-top: 10px; }
 .assistant-page .task-activity-plan > p { margin: 0 0 5px; line-height: 1.5; overflow-wrap: anywhere; }
 .assistant-page .task-activity-plan > small { color: var(--muted); }
+.assistant-page .task-activity-billing { margin-top: 10px; }
+.assistant-page .task-activity-billing > p { margin: 0; color: #75839a; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .assistant-page .task-activity-plan ol { margin: 8px 0 0; padding-left: 22px; display: grid; gap: 8px; }
 .assistant-page .task-activity-plan li { display: grid; gap: 3px; line-height: 1.4; overflow-wrap: anywhere; }
 .assistant-page .task-activity-plan li > span { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }

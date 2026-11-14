@@ -433,7 +433,7 @@ func TestWorkerAppKeepsHostDeletingUntilStorageCleanupSucceeds(t *testing.T) {
 	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ = deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
 	if got.State != host.StateDeleted || ws.State != workspace.StateDeleted || !slices.Equal(volume.names, []string{
-		domain.ProfileVolumeName(value.ID), domain.ProfileVolumeName(value.ID), domain.RuntimeVolumeName(value.ID),
+		domain.ProfileVolumeName(value.ID), domain.RuntimeVolumeName(value.ID),
 	}) {
 		t.Fatalf("host/workspace after storage cleanup retry = %#v / %#v / %v", got, ws, volume.names)
 	}

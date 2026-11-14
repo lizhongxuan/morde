@@ -193,6 +193,10 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err != nil {
 			return err
 		}
+		billing, err := s.taskBilling(ctx, tx, row.ID, projected[0].InitiatorID, projected[0].ProjectID)
+		if err != nil {
+			return err
+		}
 		result = app.TaskDetails{
 			Task: projected[0], AssistantMessage: assistantMessage, CurrentRevisionStarted: &currentRevisionStarted,
 			Dependencies: dependencies, ChildJobs: childJobs, ResultReview: resultReview,
@@ -200,7 +204,7 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 			ScheduleObservation: scheduleObservation, Steps: steps, Agents: agents,
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
 			PendingRequest: pendingRequest, ClarificationRequests: clarifications,
-			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan,
+			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan, Billing: &billing,
 		}
 		return nil
 	})
@@ -1527,11 +1531,11 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			progress.Event.Type != "task.plan" || len(progress.Steps) != 1 || call == nil ||
 			!app.ValidCloudDSHTaskPlanCommit(*plan) || call.AgentSessionID != plan.AgentSessionID ||
 			call.AuthorizationVersion != plan.AuthorizationVersion || call.TaskRevision != plan.Plan.TaskRevision ||
-			call.CallKey != app.AgentOperationKey(plan.CallID) || call.ToolName != "morde_task_plan_update" ||
+			call.CallKey != plan.CallID || call.ToolName != "morde_task_plan_update" ||
 			progress.Steps[0].Status != task.StepSucceeded {
 			return task.Event{}, domain.InvalidArgument("task_plan", "task plan progress fields are invalid")
 		}
-		if err := app.ValidateCloudDSHTaskPlanEvent(progress.Event.Payload, *plan); err != nil {
+		if err := app.ValidateCloudDSHTaskPlanEventForStep(progress.Event.Payload, *plan, progress.Steps[0].ID, progress.Steps[0].Sequence); err != nil {
 			return task.Event{}, err
 		}
 	} else if progress.Event.Type == "task.plan" {

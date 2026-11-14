@@ -58,7 +58,7 @@ final class MordeTaskEventIsolationTests: XCTestCase {
 
     func testKnownEventsRefreshSnapshotAndUnknownEventsCanAdvance() throws {
         for type in ["task.status", "task.step", "task.operation", "task.message", "task.batch_item",
-                     "task.artifact", "task.waiting_user", "task.response", "task.result"] {
+                     "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan"] {
             XCTAssertTrue(MordeTaskEventSnapshotPolicy.requiresRefresh(type: type), type)
         }
         XCTAssertFalse(MordeTaskEventSnapshotPolicy.requiresRefresh(type: "task.future_safe_event"))

@@ -12283,6 +12283,22 @@ components:
         active_seconds: { type: integer, minimum: 0 }
         tool_calls: { type: integer, minimum: 0 }
         model_tokens: { type: [integer, 'null'], minimum: 0 }
+    TaskCostSummary:
+      type: object
+      required: [state, calls, rate_versions, reserved_micros, actual_micros]
+      properties:
+        state: { type: string, enum: [settled, estimated, unknown, byok], description: settled uses the saved actual amount; estimated is a reservation and not a charge; unknown means reconciliation is unavailable; byok means a user-supplied model connection with no Morde charge. }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        calls: { type: integer, format: int64, minimum: 1 }
+        rate_versions: { type: array, items: { type: integer, format: int64, minimum: 1 }, uniqueItems: true, description: Rate snapshot versions used by these calls. Empty when no Morde rate applies. }
+        reserved_micros: { type: integer, format: int64, minimum: 0, description: Saved reservation total; for settled calls the actual amount is authoritative. }
+        actual_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Exact settled total; null unless state is settled. }
+    TaskBilling:
+      type: object
+      required: [model_calls, costs]
+      properties:
+        model_calls: { type: integer, format: int64, minimum: 0 }
+        costs: { type: array, items: { $ref: '#/components/schemas/TaskCostSummary' }, description: Per-currency and per-state totals; groups preserve rate snapshot versions. }
     TaskDependency:
       type: object
       required: [task_id, required_revision, task_status, satisfied]
@@ -12674,6 +12690,7 @@ components:
             waiting_reason: { type: [string, 'null'], description: 'Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available.' }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
             plan: { oneOf: [{ $ref: '#/components/schemas/TaskPlan' }, { type: 'null' }], description: Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. }
+            billing: { $ref: '#/components/schemas/TaskBilling', description: Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown, estimates and BYOK remain distinct. }
             agents: { type: array, items: { $ref: '#/components/schemas/TaskAgentExecution' } }
             batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
             artifacts: { type: array, items: { $ref: '#/components/schemas/TaskArtifact' } }
@@ -12787,12 +12804,12 @@ components:
     TaskEvent:
       type: object
       description: >-
-        Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication.
+        Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision; task.plan exposes step_id, sequence, task_revision, and plan_revision only, with the authorized Task snapshot carrying plan content. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication.
       required: [task_id, sequence, type, created_at, payload]
       properties:
         task_id: { $ref: '#/components/schemas/TaskId' }
         sequence: { type: integer, minimum: 1 }
-        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result] }
+        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan] }
         created_at: { type: string, format: date-time }
         payload: {}
     Notification:
@@ -13024,7 +13041,7 @@ components:
       type: object
       required: [type, count]
       properties:
-        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result] }
+        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan] }
         count: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
     AdminAuditEventCount:

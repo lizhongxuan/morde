@@ -2624,6 +2624,49 @@ describe('Assistant durable tasks', () => {
       .not.toEqual(expect.arrayContaining([expect.stringContaining('尚未整理的 Task 原始结果')]));
   });
 
+  it('shows the revisioned plan in task details with unknown cost and hides stale plans', async () => {
+    const plannedTask = {
+      ...task, current_revision: 2, desired_revision: 2,
+      billing: { model_calls: 4, costs: [
+        { state: 'settled' as const, currency: 'USD', calls: 1, rate_versions: [2], reserved_micros: 1_000_000, actual_micros: 750_000 },
+        { state: 'estimated' as const, currency: 'USD', calls: 1, rate_versions: [3], reserved_micros: 250_000, actual_micros: null },
+        { state: 'unknown' as const, calls: 1, rate_versions: [], reserved_micros: 0, actual_micros: null },
+        { state: 'byok' as const, calls: 1, rate_versions: [], reserved_micros: 0, actual_micros: null },
+      ] },
+      plan: { task_revision: 2, revision: 3, goal: '准备交付报告', cost_estimate_state: 'unknown' as const, steps: [
+        { id: 'sources', title: '整理来源', description: '核对可用资料', depends_on: [], outputs: ['来源清单'],
+          completion_criteria: ['来源可核查'], status: 'completed' as const },
+        { id: 'report', title: '撰写报告', description: '', depends_on: ['sources'], outputs: ['报告'],
+          completion_criteria: ['报告经过核对'], status: 'in_progress' as const },
+      ] },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.mocked(portalApi.task).mockResolvedValue(plannedTask);
+    const rendered = renderPage();
+    const activity = await findTaskActivity(task.id);
+    const billing = within(activity).getByRole('region', { name: '用量与费用' });
+    expect(billing).toHaveTextContent('模型调用 4 次');
+    expect(billing).toHaveTextContent('Token 12 / 1000');
+    expect(billing).toHaveTextContent('已结算 USD 0.75');
+    expect(billing).toHaveTextContent('预留估算 USD 0.25（非实际费用）');
+    expect(billing).toHaveTextContent('费用未知');
+    expect(billing).toHaveTextContent('自带模型 · Morde 未计费');
+    expect(billing).toHaveTextContent('费率快照：v2');
+    const plan = within(activity).getByRole('region', { name: '执行计划' });
+    expect(plan).toHaveTextContent('执行计划 · 修订 3');
+    expect(plan).toHaveTextContent('费用估算：未知');
+    expect(plan).toHaveTextContent('整理来源');
+    expect(plan).toHaveTextContent('撰写报告');
+    expect(plan).toHaveTextContent('依赖：sources');
+
+    rendered.unmount();
+    const staleTask = { ...plannedTask, current_revision: 3 };
+    vi.mocked(portalApi.task).mockResolvedValue(staleTask);
+    renderPage();
+    const staleActivity = await findTaskActivity(task.id);
+    expect(within(staleActivity).queryByRole('region', { name: '执行计划' })).not.toBeInTheDocument();
+  });
+
   it('shows a failed task snapshot as interrupted instead of still generating', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const failedTask = asLegacyTask({

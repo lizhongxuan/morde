@@ -128,18 +128,20 @@
   - 实施边界：不可变版本以原始 user message 为 group，当前最高版本由 server 在事务中锁定并校验；每个新版本记录 action、user/assistant message、Task 和幂等状态，原文不改不删。版本请求为 `{action, expected_version, content?}`，编辑重发需提交新正文，且复用来源消息的附件授权；重生成不重新调用工具；续写仅在同一 Task revision 与 DSH checkpoint 可验证时受理。消息列表按原 sequence 返回全部版本行和 `variant_group_id`/`variant_version`/`variant_action`，PC 与 iOS 共享同一投影并本地切换版本。
   - 当前证据与缺口：服务端已实现个人/项目会话变体 API、账号与服务实例幂等、不可变历史行、附件沿用来源授权，以及流式/非流式继续生成投影；操作结果未知时持久返回 `202`，不覆盖旧回复。Portal 已支持历史版本切换、编辑并重发、仅对完成回复重新生成文字、仅对中断回复继续生成；版本操作先持久化到 IndexedDB，刷新不自动重放，重试复用同一幂等键。iOS 已同步版本字段、切换和操作 outbox。当前复跑 Portal 类型检查通过，Assistant/Projects/outbox 定向 Vitest 209 项通过，Playwright 编辑、版本切换与草稿保留 1/1 通过；此前 Portal 321 项、iOS SwiftPM 61 项和本机隔离 PostgreSQL 3 项测试也有通过记录。当前全量 `go test ./internal/app` 通过；本轮环境没有 `CH_TEST_DATABASE_URL`，未重跑 PostgreSQL 集成测试。实际 PC/iOS 客户端、真实模型重生成及断线恢复验收仍待完成。
 
-- [ ] **T19（进行中，依赖 T04、T16）复杂任务计划与修订**
-  - 修改：`runtime/morde-cloud-runtime/`、`server/internal/app/cloud_dsh_*`、Task 存储/API/OpenAPI 及 PC/iOS 任务视图。由 DSH 主 Agent 按需生成目标、步骤、产出、依赖和完成条件，有依据时展示费用量级及所需审批，否则标为未知；持久化版本及实际进度，步骤计划与工具步骤、任务间 `task_dependencies` 分别表达；沿用步数、时间和模型预算，超限时显示原因。
-  - 验收：本地替身检查计划、无循环依赖和实际结果；修订保留已完成产物和旧记录，旧结果不覆盖新计划，简单任务不被强制确认；内置浏览器、实际 PC 和可运行 iOS 检查展示。
+- [ ] **T19（待验证，依赖 T04、T16）复杂任务计划与修订**
+  - 修改：复用 DSH 主 Agent 与现有授权/任务租约，增加 `morde_task_plan_update` 工具；计划用有界 DAG 校验并写入 append-only `task.plan` 事件，按 Task revision 加计划 revision，不新增数据库迁移。计划不授予权限、不要求用户确认；成本没有可信数据时固定显示未知。Task GET 只返回当前修订计划，SSE 仅发送步骤 ID、序号和修订号；PC Portal 任务详情与 iOS 任务详情显示目标、步骤、状态、依赖、产出和完成条件，过期 Task revision 不展示。
+  - 本地证据：计划 DAG 校验、DSH 工具定义/事件指纹、SSE 内容隔离及 Postgres 包编译通过；Portal 类型检查和计划视图定向测试通过；iOS 相关 Swift 文件解析及本地化 JSON 解析通过。修复了一个已有清理重试测试中错误期待重复删除卷的断言，清理顺序仍是先成功删除 Workspace，再各删除一次 Profile/Runtime 卷。
+  - 尚缺验收：当前未设置 `CH_TEST_DATABASE_URL`，未运行计划回执幂等/并发的真实 PostgreSQL 集成测试；实际 PC 和可运行 iOS 客户端 UI 尚未验收。修正已有清理重试测试的错误断言后，完整 `go test ./internal/app` 通过；本轮只运行了 API 事件脱敏定向测试，未重跑全量 API 测试。此前全量 API 测试发现的 Codex route allowlist 失败仍待单独核实。故此项保持待验证。
 
 - [ ] **T20（待验证，依赖 T05）审批上下文与到期状态**
   - 修改：Task 审批 domain、服务、存储/API、OpenAPI、`Assistant.tsx`、iOS 任务/审批视图和本地化。展示有依据的对象、影响、风险、本次预计与累计费用、替代方案、撤销方式及期限；未知或不适用如实标示，计划确认不扩大具体操作授权或硬限额。
   - 验收：本地 PostgreSQL 和工具替身覆盖批准/拒绝、到期与并发响应、重复提交、版本过期、权限失效和未知费用；内置浏览器、实际 PC 及可运行 iOS 检查卡片和恢复。
   - 当前证据与缺口：服务端审批响应增加风险、本次/累计费用、替代方案与撤销方式的结构化披露；缺少可信来源时统一返回 `unknown`，不会编造信息。审批决定写入本身再校验数据库期限，覆盖“响应等待事务锁时到期”的竞态，并在同一事务中过期、拒绝和重排任务。API/OpenAPI、披露状态验证、YAML 解析及本地 PostgreSQL `-race` 8 项审批集成回归通过，含离线、执行槽占满、多扫描器、并发响应和到期等待场景；未增加数据库迁移。Portal 已生成 API 类型并在审批卡显示五项字段、未知/不适用状态及安全校验后的费用金额；Assistant 定向 161 项测试、TypeScript 和 ESLint 通过。iOS 现已同步同一组披露字段、未知态与到期/状态未知时禁用决定的规则；审批视图测试覆盖已知、不适用、缺字段、损坏/过期时间，SwiftPM 审批/项目会话测试 52 项通过，独立 Simulator arm64 构建退出码 0。2026-11-14 将现有 Assistant Portal E2E 审批场景扩展为真实卡片交互，使用本地 MSW 检查已知风险、估算费用、未知累计费用、已知替代方案、不适用撤销及期限，Playwright 定向 1/1 通过。内置浏览器此前检查过 PC 对话和任务侧栏，但当前演示数据没有审批卡；本轮本地内置浏览器打开 `/assistant` 后 CUA 超时，不能复验卡片交互。连接中的远端 PC 是旧版且没有可用模型，iOS Xcode UI 构建仍缺 `ProviderCustomization.xcconfig` 与 FFmpeg/Rclone XCFrameworks。实现已到待验证状态，完整 PC/iOS UI 与真实设备验收尚未完成。
 
-- [ ] **T21（未开始，依赖 T05）任务用量、费用与预算**
-  - 修改：`server/internal/app/model_gateway*`、`project_budget*.go`、`server/internal/store/postgres/project_budget.go`、Task 投影/OpenAPI 和 PC/iOS 视图。复用现有 Token 账本及项目金额、币种和费率快照，展示调用次数、用量、时长及可获得的预算/费用，区分已结算、估算、未知和自带模型；任务结束后仍可查看汇总。
-  - 验收：隔离账本覆盖个人/项目任务、无价格、未知使用、调价后的历史快照、跨账号访问和多实例汇总；内置浏览器、实际 PC 和可运行 iOS 核对相同状态，不把估算当实际扣费。
+- [ ] **T21（待验证，依赖 T05）任务用量、费用与预算**
+  - 修改：复用 Task 用量与既有 `model_call_ledger` / `project_budget_ledger`，Task 详情按同一数据库快照计算调用次数和费用分组，不新增账本、价格来源或迁移。项目费用保留货币与费率版本；显示已结算实际金额、尚未结算的预留估算、未知费用及 BYOK。个人任务没有可信货币费率时只报告未知或自带模型，不由 Token 数推算费用。PC/iOS 同时显示调用、Token、工具调用、活跃时间及任务预算。
+  - 本地证据：新增 Task 账单投影、API/OpenAPI 类型、Portal/iOS 任务详情显示和字段校验；新增项目 Task 结算集成断言，检查实际费用与费率版本来自已存快照。`go test ./internal/app -count=1`、Task billing API 定向测试、PostgreSQL 聚合单测及包编译通过；Portal 类型检查与 Assistant 计划/费用 UI 定向测试通过；iOS 源文件解析及本地化 JSON 解析通过。
+  - 尚缺验收：当前未设置 `CH_TEST_DATABASE_URL`，PostgreSQL 项目 Task 账单集成用例未运行；个人平台模型未知费率、BYOK、未结算与多费率版本组合尚未在数据库集成环境实测。实际 PC/iOS 客户端 UI 未验收，iOS Xcode UI 测试仍缺 `ProviderCustomization.xcconfig` 与 FFmpeg/Rclone XCFrameworks。故此项保持待验证。
 
 - [ ] **T22（未开始，依赖 T04）任务排队、公平与能力匹配**
   - 修改：`server/internal/store/postgres/task_execution.go`、Task 服务/API、必要迁移、DSH 上下文及 PC/iOS 任务视图。在现有领取、租约和资源围栏上支持用户置顶、普通和后台优先级，以及防饥饿；子 Agent 只匹配实际可用且获授权的工具/资源，队列位置仅在可计算时显示。

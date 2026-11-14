@@ -532,6 +532,14 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, principal.UserID, callID).
 			projectActor, projectTask, projectState, actualMicros, accountTask, accountState, accountInput, accountOutput,
 			taskProject, taskInitiator, taskUsage)
 	}
+	details, err := store.GetTask(ctx, taskID, principal.UserID)
+	if err != nil || details.Billing == nil || details.Billing.ModelCalls != 1 || len(details.Billing.Costs) != 1 ||
+		details.Billing.Costs[0].State != "settled" || details.Billing.Costs[0].Currency != "USD" ||
+		details.Billing.Costs[0].Calls != 1 || details.Billing.Costs[0].ActualMicros == nil || *details.Billing.Costs[0].ActualMicros != 48 ||
+		len(details.Billing.Costs[0].RateVersions) != 1 || details.Billing.Costs[0].RateVersions[0] != 7 ||
+		details.Task.Usage.ModelTokens == nil || *details.Task.Usage.ModelTokens != 48 {
+		t.Fatalf("Task billing detail = %#v, %v", details.Billing, err)
+	}
 
 	stopReceipt := []byte("verified guardian stop")
 	stopDigest := sha256.Sum256(stopReceipt)

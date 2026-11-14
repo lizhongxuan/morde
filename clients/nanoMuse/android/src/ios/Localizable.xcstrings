@@ -152382,6 +152382,139 @@
     "Task result updated" : {
 
     },
+    "Execution plan" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Execution plan" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行计划" } }
+      }
+    },
+    "Execution plan updated" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Execution plan updated" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行计划已更新" } }
+      }
+    },
+    "Revision" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Revision" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "修订" } }
+      }
+    },
+    "Cost estimate" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cost estimate" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费用估算" } }
+      }
+    },
+    "Usage and cost" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Usage and cost" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "用量与费用" } }
+      }
+    },
+    "Model calls" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Model calls" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "模型调用" } }
+      }
+    },
+    "Tool calls" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Tool calls" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "工具调用" } }
+      }
+    },
+    "Active time" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Active time" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "活跃时间" } }
+      }
+    },
+    "Tokens" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Tokens" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Token" } }
+      }
+    },
+    "Estimated reservation (not actual cost)" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Estimated reservation (not actual cost)" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "预留估算（非实际费用）" } }
+      }
+    },
+    "Cost unknown" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cost unknown" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费用未知" } }
+      }
+    },
+    "Reserved amount" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Reserved amount" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "预留金额" } }
+      }
+    },
+    "BYOK · no Morde charge" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "BYOK · no Morde charge" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "自带模型 · Morde 未计费" } }
+      }
+    },
+    "Rate snapshots" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Rate snapshots" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费率快照" } }
+      }
+    },
+    "calls" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "calls" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "次调用" } }
+      }
+    },
+    "No model calls yet" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No model calls yet" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "尚无模型调用" } }
+      }
+    },
+    "Depends on" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Depends on" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "依赖" } }
+      }
+    },
+    "Outputs" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Outputs" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "产出" } }
+      }
+    },
+    "Completion criteria" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Completion criteria" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "完成条件" } }
+      }
+    },
     "Task Running" : {
       "extractionState" : "stale",
       "localizations" : {

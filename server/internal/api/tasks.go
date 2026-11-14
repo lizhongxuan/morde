@@ -142,6 +142,7 @@ type taskResponse struct {
 	AssistantMessage       *taskAssistantMessageResponse     `json:"assistant_message"`
 	FinishedAt             *time.Time                        `json:"finished_at"`
 	Plan                   *task.Plan                        `json:"plan,omitempty"`
+	Billing                *taskBillingResponse              `json:"billing,omitempty"`
 }
 
 type taskFileFetchResponse struct {
@@ -384,6 +385,20 @@ type taskUsageResponse struct {
 	ActiveSeconds int64  `json:"active_seconds"`
 	ToolCalls     int64  `json:"tool_calls"`
 	ModelTokens   *int64 `json:"model_tokens"`
+}
+
+type taskBillingResponse struct {
+	ModelCalls int64                     `json:"model_calls"`
+	Costs      []taskCostSummaryResponse `json:"costs"`
+}
+
+type taskCostSummaryResponse struct {
+	State          string  `json:"state"`
+	Currency       string  `json:"currency,omitempty"`
+	Calls          int64   `json:"calls"`
+	RateVersions   []int64 `json:"rate_versions"`
+	ReservedMicros int64   `json:"reserved_micros"`
+	ActualMicros   *int64  `json:"actual_micros"`
 }
 
 type taskStepResponse struct {
@@ -1098,6 +1113,62 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 	return response, nil
 }
 
+func toTaskBillingResponse(value *app.TaskBilling) (*taskBillingResponse, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if value.ModelCalls < 0 {
+		return nil, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	result := &taskBillingResponse{ModelCalls: value.ModelCalls, Costs: make([]taskCostSummaryResponse, 0, len(value.Costs))}
+	var calls int64
+	for _, cost := range value.Costs {
+		if cost.Calls < 1 || cost.Calls > value.ModelCalls-calls || cost.ReservedMicros < 0 {
+			return nil, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		validCurrency := len(cost.Currency) == 3 && cost.Currency[0] >= 'A' && cost.Currency[0] <= 'Z' &&
+			cost.Currency[1] >= 'A' && cost.Currency[1] <= 'Z' && cost.Currency[2] >= 'A' && cost.Currency[2] <= 'Z'
+		seenVersions := make(map[int64]struct{}, len(cost.RateVersions))
+		lastVersion := int64(0)
+		for _, version := range cost.RateVersions {
+			if version <= lastVersion {
+				return nil, domain.NewError(domain.CodeInternal, "internal error")
+			}
+			seenVersions[version] = struct{}{}
+			lastVersion = version
+		}
+		switch cost.State {
+		case "settled":
+			if !validCurrency || len(seenVersions) == 0 || cost.ActualMicros == nil || *cost.ActualMicros < 0 {
+				return nil, domain.NewError(domain.CodeInternal, "internal error")
+			}
+		case "estimated":
+			if !validCurrency || len(seenVersions) == 0 || cost.ReservedMicros < 1 || cost.ActualMicros != nil {
+				return nil, domain.NewError(domain.CodeInternal, "internal error")
+			}
+		case "unknown":
+			if cost.ActualMicros != nil || (cost.Currency != "" && (!validCurrency || len(seenVersions) == 0 || cost.ReservedMicros < 1)) ||
+				(cost.Currency == "" && (len(seenVersions) != 0 || cost.ReservedMicros != 0)) {
+				return nil, domain.NewError(domain.CodeInternal, "internal error")
+			}
+		case "byok":
+			if cost.Currency != "" || len(seenVersions) != 0 || cost.ReservedMicros != 0 || cost.ActualMicros != nil {
+				return nil, domain.NewError(domain.CodeInternal, "internal error")
+			}
+		default:
+			return nil, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		calls += cost.Calls
+		versions := append([]int64{}, cost.RateVersions...)
+		result.Costs = append(result.Costs, taskCostSummaryResponse{State: cost.State, Currency: cost.Currency, Calls: cost.Calls,
+			RateVersions: versions, ReservedMicros: cost.ReservedMicros, ActualMicros: cost.ActualMicros})
+	}
+	if calls != value.ModelCalls {
+		return nil, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	return result, nil
+}
+
 func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	taskSummary := value.Task
 	taskSummary.StepCount, taskSummary.CompletedStepCount = task.StepCounts(value.Steps)
@@ -1113,12 +1184,16 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	if value.Plan != nil && (value.Plan.Validate() != nil || value.Task.CurrentRevision == nil || value.Plan.TaskRevision != *value.Task.CurrentRevision) {
 		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
+	billing, err := toTaskBillingResponse(value.Billing)
+	if err != nil {
+		return taskResponse{}, err
+	}
 	response := taskResponse{
 		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
 		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
-		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan,
+		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan, Billing: billing,
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
 		message := assistant.Message

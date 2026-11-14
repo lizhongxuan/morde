@@ -31,7 +31,6 @@ describe('NewHost', () => {
       { ...createdHost, id: 'h7654321', owner_id: 'u7654321' },
     ] });
     const createHost = vi.spyOn(portalApi, 'createHost').mockResolvedValue(createdHost);
-    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace');
     const user = userEvent.setup();
     renderPage();
 
@@ -41,7 +40,6 @@ describe('NewHost', () => {
     await user.click(screen.getByRole('button', { name: '创建云端电脑' }));
 
     await waitFor(() => expect(createHost).toHaveBeenCalledWith({ name: '研究电脑' }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/)));
-    expect(createWorkspace).not.toHaveBeenCalled();
   });
 
   it('retries an uncertain automatic creation with the same request key', async () => {
@@ -74,7 +72,6 @@ describe('NewHost', () => {
       version: 1, fingerprint: JSON.stringify(input), input, hostIdempotencyKey: key('host'),
       workspaceIdempotencyKey: key('workspace'),
     }));
-    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace');
     const createHost = vi.spyOn(portalApi, 'createHost').mockResolvedValue(createdHost);
     const user = userEvent.setup();
     renderPage();
@@ -84,7 +81,6 @@ describe('NewHost', () => {
     expect(warning).toHaveTextContent('请先检查云端电脑列表，确认上次创建结果');
     expect(within(warning).getByRole('link', { name: '检查云端电脑列表' })).toHaveAttribute('href', '/hosts');
     expect(screen.queryByRole('button', { name: '继续上次创建' })).not.toBeInTheDocument();
-    expect(createWorkspace).not.toHaveBeenCalled();
     expect(createHost).not.toHaveBeenCalled();
 
     await user.click(within(warning).getByRole('button', { name: '我已核实，清除记录' }));

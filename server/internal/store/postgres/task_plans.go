@@ -82,7 +82,7 @@ AND payload #>> '{detail,call_id}'=$2 ORDER BY sequence LIMIT 1`, taskID, callID
 func validateCloudDSHTaskPlanProgress(ctx context.Context, tx pgx.Tx, current task.Task, progress app.TaskProgress, commit app.CloudDSHTaskPlanCommit) (task.Event, bool, error) {
 	if current.ID != commit.TaskID || current.OwnerID != commit.OwnerID || current.ExecutionLocation != "server" ||
 		current.AgentSessionID != commit.AgentSessionID || current.Authorization.Version != commit.AuthorizationVersion ||
-		current.CurrentRevision == nil || *current.CurrentRevision != commit.Plan.TaskRevision {
+		progress.ToolCall == nil || progress.ToolCall.TaskRevision != commit.Plan.TaskRevision {
 		return task.Event{}, false, domain.NewError(domain.CodeInvalidState, "task plan revision or authorization changed")
 	}
 	var authorizationValid bool
@@ -92,8 +92,9 @@ func validateCloudDSHTaskPlanProgress(ctx context.Context, tx pgx.Tx, current ta
 	if !authorizationValid {
 		return task.Event{}, false, domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 	}
-	if err := app.ValidateCloudDSHTaskPlanEvent(progress.Event.Payload, commit); err != nil {
-		return task.Event{}, false, err
+	if len(progress.Steps) != 1 || app.ValidateCloudDSHTaskPlanEventForStep(progress.Event.Payload, commit,
+		progress.Steps[0].ID, progress.Steps[0].Sequence) != nil {
+		return task.Event{}, false, domain.NewError(domain.CodeInvalidState, "task plan event step identity changed")
 	}
 	if priorPayload, found, err := findCloudDSHTaskPlanEvent(ctx, tx, current.ID, commit.CallID); err != nil {
 		return task.Event{}, false, err

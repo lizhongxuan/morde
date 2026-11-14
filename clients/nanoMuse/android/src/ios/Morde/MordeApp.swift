@@ -4786,6 +4786,16 @@ struct MordeTask: Decodable, Identifiable {
         let task_revision: Int64; let revision: Int64; let goal: String
         let cost_estimate_state: String; let steps: [Step]
     }
+    struct Budget: Decodable { let active_seconds: Int64; let tool_calls: Int64; let model_tokens: Int64 }
+    struct Usage: Decodable { let active_seconds: Int64; let tool_calls: Int64; let model_tokens: Int64? }
+    struct Billing: Decodable {
+        struct Cost: Decodable, Identifiable {
+            let state: String; let currency: String?; let calls: Int64; let rate_versions: [Int64]
+            let reserved_micros: Int64; let actual_micros: Int64?
+            var id: String { "\(state):\(currency ?? ""):\(rate_versions.map { String($0) }.joined(separator: ","))" }
+        }
+        let model_calls: Int64; let costs: [Cost]
+    }
     let owner_id: String?; let initiator_id: String?
     let id: String; let conversation_id: String; let host_id: String?; let execution_location: String?
     let model_id: String?
@@ -4796,6 +4806,7 @@ struct MordeTask: Decodable, Identifiable {
     let result: String?; let result_message_pending: Bool?; let result_message_published: Bool?
     let current_step: String?; let waiting_reason: String?; let stop_request: StopRequest?
     let step_count: Int64; let completed_step_count: Int64
+    let budget: Budget?; let usage: Usage?; let billing: Billing?
     let pending_request: Pending?
     let clarification_request: Clarification?; let batch_items: [MordeBatchItem]?
     let dependencies: [Dependency]?; let child_jobs: [ChildJob]?; let result_review: ResultReview?
@@ -4981,6 +4992,7 @@ struct MordeTaskTimelineEvent: Decodable, Identifiable, Equatable {
         case "task.waiting_user": return AppLocalized("Waiting for your action")
         case "task.response": return AppLocalized("Task response updated")
         case "task.result": return AppLocalized("Task result updated")
+        case "task.plan": return AppLocalized("Execution plan updated")
         default: return AppLocalized("Task activity")
         }
     }
@@ -18194,7 +18206,6 @@ private struct MordeRoot: View {
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
                 Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
             }
-            MIFTaskPlanSection(task: task)
             conversationTaskRelations(task)
             NavigationLink {
                 MIFTaskDetailView(taskID: task.id)
@@ -20722,7 +20733,6 @@ private struct MordeProjectsRoom: View {
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
                 Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
             }
-            MIFTaskPlanSection(task: task)
             if let pending = task.pending_request { projectConversationApprovalControls(task, pending: pending) }
             if let clarification = task.clarification_request {
                 projectConversationClarificationControls(task, clarification: clarification)

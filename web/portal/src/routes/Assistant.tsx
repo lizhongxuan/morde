@@ -48,6 +48,7 @@ type TaskApprovalTextDisclosure = TaskApproval['disclosures']['risk'];
 type TaskApprovalCostDisclosure = TaskApproval['disclosures']['this_cost'];
 type TaskApprovalAlternativesDisclosure = TaskApproval['disclosures']['alternatives'];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
+type TaskCostSummary = NonNullable<Task['billing']>['costs'][number];
 type TaskArtifact = Task['artifacts'][number];
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
@@ -90,6 +91,25 @@ function taskApprovalAlternativesDisclosure(value?: TaskApprovalAlternativesDisc
   if (!value) return '未知';
   if (value.state !== 'known') return value.state === 'not_applicable' ? '不适用' : '未知';
   return value.options.length ? value.options.join('；') : '服务端标记为已知，但未提供方案';
+}
+
+function taskMoney(micros: number, currency: string): string {
+  if (!Number.isSafeInteger(micros) || micros < 0 || !/^[A-Z]{3}$/.test(currency)) return '未知';
+  const amount = BigInt(micros);
+  const whole = amount / 1_000_000n;
+  const fraction = (amount % 1_000_000n).toString().padStart(6, '0').replace(/0+$/u, '');
+  return `${currency} ${whole.toLocaleString('zh-CN')}${fraction ? `.${fraction}` : ''}`;
+}
+
+function taskCostText(cost: TaskCostSummary): string {
+  switch (cost.state) {
+    case 'settled': return `已结算 ${cost.currency ? taskMoney(cost.actual_micros ?? -1, cost.currency) : '未知'}`;
+    case 'estimated': return `预留估算 ${cost.currency ? taskMoney(cost.reserved_micros, cost.currency) : '未知'}（非实际费用）`;
+    case 'unknown': return cost.currency
+      ? `费用未知 · 预留 ${taskMoney(cost.reserved_micros, cost.currency)}` : '费用未知';
+    case 'byok': return '自带模型 · Morde 未计费';
+    default: return '费用未知';
+  }
 }
 
 function conversationTitleFromText(content?: string): string | null {
@@ -2609,6 +2629,15 @@ export function Assistant() {
         {recoveryMessage && <p role="status">{recoveryMessage}</p>}
         {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
       </section>
+      {task.billing && <section className="task-activity-k2 task-activity-billing" aria-label="用量与费用">
+        <h3>用量与费用</h3>
+        <p>模型调用 {task.billing.model_calls} 次 · Token {task.usage.model_tokens === null ? '未知' : `${task.usage.model_tokens} / ${task.budget.model_tokens}`}</p>
+        <p>工具调用 {task.usage.tool_calls} / {task.budget.tool_calls} · 活跃时间 {task.usage.active_seconds} / {task.budget.active_seconds} 秒</p>
+        {task.billing.costs.length > 0 ? <ul>{task.billing.costs.map((cost, index) => <li key={`${cost.state}:${cost.currency ?? ''}:${index}`}>
+          <span><strong>{taskCostText(cost)}</strong><small>{cost.calls} 次调用{cost.currency ? ` · ${cost.currency}` : ''}</small></span>
+          {cost.rate_versions.length > 0 && <small>费率快照：{cost.rate_versions.map((version) => `v${version}`).join('、')}</small>}
+        </li>)}</ul> : <p>暂无模型调用记录。</p>}
+      </section>}
       {task.plan && task.plan.task_revision === task.current_revision && <section className="task-activity-k2 task-activity-plan" aria-label="执行计划">
         <h3>执行计划 · 修订 {task.plan.revision}</h3>
         <p>{task.plan.goal}</p>

@@ -9043,6 +9043,34 @@ export interface components {
             tool_calls: number;
             model_tokens: number | null;
         };
+        TaskCostSummary: {
+            /**
+             * @description settled uses the saved actual amount; estimated is a reservation and not a charge; unknown means reconciliation is unavailable; byok means a user-supplied model connection with no Morde charge.
+             * @enum {string}
+             */
+            state: "settled" | "estimated" | "unknown" | "byok";
+            currency?: string;
+            /** Format: int64 */
+            calls: number;
+            /** @description Rate snapshot versions used by these calls. Empty when no Morde rate applies. */
+            rate_versions: number[];
+            /**
+             * Format: int64
+             * @description Saved reservation total; for settled calls the actual amount is authoritative.
+             */
+            reserved_micros: number;
+            /**
+             * Format: int64
+             * @description Exact settled total; null unless state is settled.
+             */
+            actual_micros: number | null;
+        };
+        TaskBilling: {
+            /** Format: int64 */
+            model_calls: number;
+            /** @description Per-currency and per-state totals; groups preserve rate snapshot versions. */
+            costs: components["schemas"]["TaskCostSummary"][];
+        };
         TaskDependency: {
             task_id: components["schemas"]["TaskId"];
             /** Format: int64 */
@@ -9484,6 +9512,8 @@ export interface components {
             steps: components["schemas"]["TaskStep"][];
             /** @description Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. */
             plan?: components["schemas"]["TaskPlan"] | null;
+            /** @description Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown */
+            billing?: components["schemas"]["TaskBilling"];
             agents?: components["schemas"]["TaskAgentExecution"][];
             batch_items: components["schemas"]["TaskBatchItem"][];
             artifacts: components["schemas"]["TaskArtifact"][];
@@ -9565,12 +9595,12 @@ export interface components {
             status: components["schemas"]["TaskStatus"];
             unsettled_operation_ids: components["schemas"]["OperationId"][];
         };
-        /** @description Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
+        /** @description Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision; task.plan exposes step_id, sequence, task_revision, and plan_revision only, with the authorized Task snapshot carrying plan content. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
         TaskEvent: {
             task_id: components["schemas"]["TaskId"];
             sequence: number;
             /** @enum {string} */
-            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result";
+            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result" | "task.plan";
             /** Format: date-time */
             created_at: string;
             payload: unknown;
@@ -9822,7 +9852,7 @@ export interface components {
         };
         AdminTaskEventCount: {
             /** @enum {string} */
-            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result";
+            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result" | "task.plan";
             /** Format: int64 */
             count: number;
         };
