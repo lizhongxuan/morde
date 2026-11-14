@@ -311,3 +311,35 @@ test('login refuses unsupported services and minimum client versions before send
     assert.equal(calls[1].url, 'https://portal.example/api/auth/client-login');
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('Codex claim preserves exact structured-question IDs and rejects malformed answer payloads', async () => {
+  const originalFetch = globalThis.fetch;
+  const command = {
+    id: 'g1234567', session_id: 'l1234567', profile_key: 'profile-1', thread_id: 'native-thread', grant_version: 1,
+    type: 'answer_question', input: {
+      question_request_id: '100', question_version: 'a'.repeat(64), answers: { ' choice ': ['A'] },
+    },
+  };
+  try {
+    globalThis.fetch = async () => json({ items: [command] });
+    const [parsed] = await new MordeAPI(() => credentials).codexClaim();
+    assert.deepEqual(parsed, {
+      id: 'g1234567', session_id: 'l1234567', profile_key: 'profile-1', thread_id: 'native-thread', grant_version: 1,
+      type: 'answer_question', input: {
+        question_request_id: '100', question_version: 'a'.repeat(64), answers: { ' choice ': ['A'] },
+      },
+    });
+
+    for (const invalidInput of [
+      { question_request_id: '100', answers: { choice: ['A'] } },
+      { question_request_id: '100', question_version: 'v1', answers: { choice: ['A'] } },
+      { question_request_id: '100', question_version: 'a'.repeat(64), answers: { '   ': ['A'] } },
+      { question_request_id: '100', question_version: 'a'.repeat(64), answers: { choice: [] } },
+      { question_request_id: '100', question_version: 'a'.repeat(64), answers: { choice: [''] } },
+      { question_request_id: '100', question_version: 'a'.repeat(64), answers: { choice: ['   '] } },
+    ]) {
+      globalThis.fetch = async () => json({ items: [{ ...command, input: invalidInput }] });
+      await assert.rejects(() => new MordeAPI(() => credentials).codexClaim(), /(Invalid|Incomplete) Morde Codex/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});

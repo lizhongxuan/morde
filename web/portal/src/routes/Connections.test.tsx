@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
 import { ApiError } from '../api/client';
 import { portalApi } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Connections } from './Connections';
 
 const timestamp = '2026-10-22T08:00:00.000Z';
@@ -23,7 +23,7 @@ const mcpConnector: MCPConnector = {
 function renderPage() {
   if (!vi.isMockFunction(portalApi.mcpConnectors)) vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Connections /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Connections /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 async function selectArea(user: ReturnType<typeof userEvent.setup>, name: '个人模型' | '团队模型' | 'MCP 工具') {

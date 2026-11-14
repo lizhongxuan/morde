@@ -671,6 +671,68 @@ func cloudDSHWriteTool() app.AgentToolDefinition {
 	}}
 }
 
+func TestCloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure(t *testing.T) {
+	const arguments = `{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}`
+	const canonicalArguments = `{"content":"saved","path":"notes.txt","workspace_id":"w1234567"}`
+	digest := sha256.Sum256([]byte(`{"name":"file_write","arguments":` + canonicalArguments + `}`))
+	checkpointDigest := bytes.Repeat([]byte{0x5a}, sha256.Size)
+	revision, workspaceRevision := int64(4), int64(9)
+	now := time.Now().UTC()
+	intent := task.StepRetryIntent{TaskID: "q1234567", OwnerID: "u1234567", SourceStepID: "s1234567", AttemptStepID: "s7654321",
+		Attempt: 2, SourceCallID: "call_retry_source_1", RetryCallID: "morde_step_retry_s7654321", AgentSessionID: "session_456",
+		TaskRevision: revision, ToolName: "file_write", RequestDigest: digest[:], AuthorizationVersion: 1,
+		HostID: "h1234567", HostRuntimeGeneration: 3, CheckpointThroughSequence: 15, CheckpointDigest: checkpointDigest,
+		ExpiresAt: now.Add(time.Minute)}
+	value := task.Task{ID: intent.TaskID, OwnerID: intent.OwnerID, HostID: intent.HostID, Authorization: task.Authorization{Version: 1},
+		AgentSessionID: intent.AgentSessionID, CurrentRevision: &revision, DesiredRevision: &revision,
+		CheckpointThroughSequence: intent.CheckpointThroughSequence, CheckpointDigest: checkpointDigest,
+		WorkspaceID: "w1234567", InputRevision: &workspaceRevision, WorkspaceCheckpointRevision: &workspaceRevision}
+	intent.WorkspaceID, intent.InputRevision, intent.WorkspaceCheckpointRevision = value.WorkspaceID, value.InputRevision, value.WorkspaceCheckpointRevision
+	intent.WorkspaceBindingVersion, intent.WorkspaceRevision = 2, &workspaceRevision
+	value.StepRetry = &intent
+	if !validCloudDSHStepRetryForTask(value, now) {
+		t.Fatal("current immutable retry fence was rejected")
+	}
+	for name, mutate := range map[string]func(*task.Task){
+		"consumed":         func(v *task.Task) { copied := *v.StepRetry; copied.Consumed = true; v.StepRetry = &copied },
+		"authorization":    func(v *task.Task) { v.Authorization.Version++ },
+		"revision":         func(v *task.Task) { changed := revision + 1; v.CurrentRevision = &changed },
+		"workspace":        func(v *task.Task) { changed := workspaceRevision + 1; v.WorkspaceCheckpointRevision = &changed },
+		"checkpoint":       func(v *task.Task) { v.CheckpointDigest = bytes.Repeat([]byte{0x6b}, sha256.Size) },
+		"unsupported tool": func(v *task.Task) { copied := *v.StepRetry; copied.ToolName = "dsh_delegate"; v.StepRetry = &copied },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := value
+			copied := *value.StepRetry
+			changed.StepRetry = &copied
+			mutate(&changed)
+			if validCloudDSHStepRetryForTask(changed, now) {
+				t.Fatal("changed retry fence was admitted")
+			}
+		})
+	}
+
+	history := newCloudDSHCheckpointHistory(intent.AgentSessionID)
+	history.calls[intent.SourceCallID] = &cloudDSHToolCall{name: intent.ToolName, arguments: []byte(arguments), historical: true,
+		callSeen: true, resultSeen: true, resultText: "Tool failed: confirmed not dispatched"}
+	if err := markCloudDSHRetrySourceReconciled(history, intent); err != nil {
+		t.Fatalf("verified source failure was rejected: %v", err)
+	}
+	if !history.calls[intent.SourceCallID].reconciled || history.calls[intent.SourceCallID].status != app.AgentToolFailed {
+		t.Fatal("source failure was not marked reconciled")
+	}
+	for name, result := range map[string]string{"succeeded": "success", "unknown": "Tool failed: ", "empty failure": "Tool failed:"} {
+		t.Run(name, func(t *testing.T) {
+			bad := newCloudDSHCheckpointHistory(intent.AgentSessionID)
+			bad.calls[intent.SourceCallID] = &cloudDSHToolCall{name: intent.ToolName, arguments: []byte(arguments), historical: true,
+				callSeen: true, resultSeen: true, resultText: result}
+			if err := markCloudDSHRetrySourceReconciled(bad, intent); err == nil {
+				t.Fatal("non-confirmed source result was accepted for retry")
+			}
+		})
+	}
+}
+
 func cloudDSHUseTestTaskScript(t *testing.T, supervisor *cloudDSHTestSupervisor, taskScript string) {
 	t.Helper()
 	root := t.TempDir()

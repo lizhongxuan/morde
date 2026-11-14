@@ -41,7 +41,7 @@
 - [ ] **T01（进行中）PC 对话工作界面**
   - 修改：`web/portal/src/routes/Assistant.tsx`、`AssistantSidebar.css`、`components/PortalLayout.tsx` 及 `clients/desktop/harness/desktop/`。参考 DS-Bot：左侧放导航、主会话和旁聊，中间放当前对话，右侧放任务动态、电脑和文件；接入真实数据并保留个人数据、目标与计划、模型与工具及设置入口，以及各会话草稿、侧栏切换、键盘操作和阅读锚点。
   - 验收：内置浏览器和实际 PC 分别检查常规/窄窗口、主会话与旁聊、两个会话的草稿和任务归属、滚动及任务动态；从文件同步页可返回对话，加载失败显示真实原因。
-  - 当前证据与缺口：内置浏览器复现并复测了快速切换文字草稿；离线打包客户端在本地替身下验证了同步页返回对话和两会话草稿。另用仅调整初始窗口宽度的临时 Electron 源码副本检查了 720 px 布局与草稿；合成附件的切换竞态也已验证。当前旧包未更新，截图中的 HTTP 404 来源与真实数据验收待补。任务停止时，本地旁聊向服务端会话迁移的草稿修复尚未完成，附件迟到写回和保存失败分支待处理，相关两个回归用例最后一次修改后未重跑；不得视为已验收。
+  - 当前证据与缺口：内置浏览器此前复测了快速切换草稿、窄窗口（720 px）和合成附件切换；Portal 本地定向测试覆盖附件迟到写回、迁移删除和保存回滚竞态。Portal 的 `FloatingError`、`FloatingNotice` 和普通 toast 已统一进入顶栏折叠提示中心，展开内容会撑开顶栏并下移页面，不覆盖对话或组件；登录、注册、改密和下载等无 Portal 顶栏的错误保持在表单或页面内容流中。文件同步入口从会话右侧“文件”面板进入，同一 `/workspaces` 路由保留 PC 用户端外壳，并在展开后列于“云端电脑 > 文件同步”；不再出现在一级工作导航或桌面客户端菜单中。桌面离线恢复状态留在应用内联顶栏；Morde 手机页面的网络错误也已改为正常文档流。内置浏览器此前以本地 mock 在 1280×720 检查提示展开和文件同步入口/同壳布局；Portal 全量 722 项测试与 2 项 Node 测试通过，TypeScript 通过，三项通知/导航 E2E 通过；Morde 手机页面定向测试 4 项、类型检查及 ESLint 通过；桌面渲染器/路径专项测试在临时副本中 30 项通过。本轮 Desktop 生产 `npm run build` 通过，Codex/Core 定向测试 26 项通过；隔离 Electron 使用本地合成 Mock 启动成功，确认 Assistant WebView 已认证、同步恢复页未覆盖主界面且没有单独的同步页控件。全量 Desktop `npm test` 未完成：一轮重叠执行后被中止，报告 278 项通过、2 项因 pending promise 被取消，故不能视为全量通过。实际安装包、真实网络错误与完整任务动态仍待验收；云端不可用时本机恢复界面仅在本地应用内使用。
 
 - [ ] **T02（待验证）跨端会话与长上下文**
   - 修改：按缺口调整 `server/internal/app/conversation_*`、`server/internal/store/postgres/conversation_*`、`runtime/morde-cloud-runtime/src/engine.mjs`、Portal outbox 和 iOS 会话投影。复用摘要、原文分页、授权历史和检查点；历史不可取得时说明，同步目录不自动授予项目记忆权限。
@@ -56,7 +56,7 @@
 - [ ] **T04（待验证，依赖 T02）主 Agent 委派与结果恢复**
   - 修改：`runtime/morde-cloud-runtime/src/engine.mjs`、`server/internal/app/agent_sessions.go`、`server/internal/worker/cloud_dsh_session_tree.go` 和结果汇总。复用 DSH 子会话、授权子集、租约和检查点；独立任务按资源条件并行，有依赖的任务等前置结果，主 Agent 汇总实际成功、失败或未知状态。
   - 验收：本地 DSH/模型替身派发至少两个无冲突子任务，检查并行、依赖、失败回传、重启和取消隔离；真实模型协作另行验收。
-  - 当前证据与缺口：本轮使用本地模型替身运行 9 项 DSH Runtime 测试，覆盖双子任务并行、依赖任务在前一结果结算后启动、主 Agent 汇总、失败/未知结果、子任务取消及检查点恢复、独立任务取消隔离；iOS 子任务状态及父子归属投影通过实际方法提取后的本地替身断言。原始 iOS UI 和真实模型协作仍需验收。
+  - 当前证据与缺口：本轮使用本地模型替身运行 9 项 DSH Runtime 定向测试，覆盖双子任务并行、依赖任务在前一结果结算后启动、主 Agent 汇总、失败/未知结果、子任务取消及检查点恢复、独立任务取消隔离；另完整运行 `runtime/morde-cloud-runtime` 的 107 项测试，全部通过。iOS 子任务状态及父子归属投影通过实际方法提取后的本地替身断言。原始 iOS UI 和真实模型协作仍需验收。
 
 - [ ] **T05（待验证，依赖 T01、T03、T04）任务进度、审批和控制**
   - 修改：`Assistant.tsx`、任务快照/事件投影及 iOS `MIFTaskViews.swift`；展示当前会话的任务、子任务、审批、澄清和控制状态，断线按游标续读，失效时重新取快照并核权。
@@ -71,12 +71,12 @@
 - [ ] **T07（待验证，依赖 T06）PC 手动文件夹同步**
   - 修改：`clients/desktop/harness/desktop/`、`server/internal/app/workspace_sync_project_upload.go`、`server/internal/store/postgres/workspace_sync*.go`、`runtime/morde-sync/` 和 `runtime/morde-runtime/workspacereplica/`。用户选目录、目标电脑并确认项目名/范围后手动单向同步到 `~/workspace/project/<项目名>/`；再次点击才应用本机增改删，删除仅作用于该来源已同步的对应内容，保留相对路径和未协调的云端内容；界面区分进行中、完成、待处理和失败。
   - 验收：本地合成元数据和替身检查目录越界、冲突、根目录不可访问、撤权、删除范围、待应用与匹配 session 的 Host 回执；实际 PC 检查交互。真实文件传输和应用仍待验证。
-  - 当前证据与缺口：修复 Host 回执忽略项目根目录、父目录或大小写不同的项目路径冲突的问题；本地 `-race` 通过 4 项 Runtime 回执测试、4 项客户端单向/绑定测试、6 项服务端路径/删除范围/回执合同测试及 5 项隔离 PostgreSQL 集成测试，均只使用合成元数据。项目上传开关仍关闭，实际 PC 和真实文件数据面待验收。
+  - 当前证据与缺口：修复 Host 回执忽略项目根目录、父目录或大小写不同的项目路径冲突的问题；本地 `-race` 通过 4 项 Runtime 回执测试、4 项客户端单向/绑定测试、6 项服务端路径/删除范围/回执合同测试及 5 项隔离 PostgreSQL 集成测试，均只使用合成元数据。内置浏览器确认从主会话“文件”面板打开 `/workspaces` 后仍使用同一 PC 外壳；展开“云端电脑”上下文导航可见“文件同步”，没有独立暗色页面或回到对话按钮。桌面客户端菜单不再提供同步快捷入口，云端不可用时仍保留本机恢复视图。项目上传开关仍关闭，实际 PC 安装包、真实文件传输及 Host 应用回执仍待验收。
 
 - [ ] **T15（待验证，依赖 T03）连发消息的安全短时聚合**
   - 修改：`server/internal/app/conversation_route_*`、`server/internal/store/postgres/conversation_route_*`、相关迁移及必要的 PC/iOS 消息投影。每条消息先持久受理；只关联同账号、会话、目标、范围、附件和授权一致的同一工作，聚合有上限；在同一事务中冻结候选并按消息身份幂等结算，迟到消息走已有路由，窗口和结算可恢复。明确允许提前结算的条件，普通问答、停止和独立任务不因聚合无谓等待；任务开始后的补充走原修订链。
   - 验收：用代表性连发样本比较窗口时延和误合并情况，再在本地 PostgreSQL/模型替身覆盖窗口内外、不同目标/附件/账号、明确停止、重启、并发结算及重复请求；检查每条原文和任务关联。
-  - 当前证据与缺口：已修复可停止标记、慢分类漏聚合和结算时的并发误失败；当前工作树无 overlay 通过本机隔离 PostgreSQL、真实路由 worker 与受控模型替身的定向 `-race` 回归，覆盖慢分类、候选上限、澄清/超时、停止、恢复与并发结算。带附件消息当前走已有路由，不参与聚合；350 ms 尚未用代表性真实连发样本评估，实际模型/客户端验收待补。
+  - 当前证据与缺口：已修复可停止标记、慢分类漏聚合和结算时的并发误失败；当前工作树无 overlay 通过本机隔离 PostgreSQL 5 项定向 `-race` 回归，覆盖慢分类、不同目标/授权、候选选择、并发结算和候选上限，应用层 350 ms 固定窗口测试通过。窗口分组测试已补齐恰好 350 ms 的包含边界，与生产候选规则一致。带附件消息当前走已有路由，不参与聚合。350 ms 是收件窗口，不是端到端延迟；受控模型替身预设分类结果，不能用于估计真实误合并率，代表性样本与真实模型/客户端验收待补。
 
 - [ ] **T16（待验证，依赖 T05）任务时间线与工具详情**
   - 修改：`server/internal/api/task_events.go`、`server/internal/app/task_step_detail.go`、`server/internal/store/postgres/task_step_details.go` 和 PC/iOS 任务视图。按时间及步骤/子任务展示同一批有序记录；按工具类型展示已记录且获权的对象、输入、结果、差异或截断提示。
@@ -92,6 +92,7 @@
 - [ ] **T09（待验证，依赖 T01）会话标题搜索**
   - 修改：`web/portal/src/app/api.ts`、`Assistant.tsx` 和样式，复用已有 `q`；查询变化重置分页，旧响应不覆盖新结果，搜索和切换不清除草稿。
   - 验收：内置浏览器及实际 PC 检查分页、切换、空结果、失败和账号隔离。当前代码及定向测试已有记录，手动验收待补。
+  - 当前证据与缺口：当前实现把标题搜索词放入独立查询键并向 API 传 `q`。Portal 定向测试覆盖旧响应、搜索时保留输入、切走再返回恢复草稿、分页游标、空结果和网络失败；本机隔离 PostgreSQL `-race` 测试覆盖大小写搜索分页与另一账号不可见。内置浏览器已确认搜索空态可见、对话区保持原布局且状态提示没有挤占页面内容；实际 PC 页面验收待补。
 
 - [x] **T10（完成）记忆历史与来源合同**
   - 修改：`server/internal/domain/personal/`、`server/internal/app/personal_*`、`server/internal/store/postgres/personal_*`、迁移与 API。历史正文、版本、来源与配额原子处理；旧记忆首次修改保存可用旧正文，恢复用当前版本和幂等键，删除清理历史正文并保留墓碑/抑制。
@@ -100,18 +101,18 @@
 
 - [ ] **T11（待验证，依赖 T10）记忆历史界面**
   - 修改：`web/portal/src/routes/PersonalData.tsx`、`personal-data-store.ts`、`app/api.ts` 和类型；展示来源、时间、可恢复状态及冲突，删除前说明历史正文一并清理。iOS 沿用个人数据同步接收恢复后的新版本。
-  - 验收：内置浏览器和实际 PC 检查查看、恢复、无来源、冲突和删除；iOS 可运行时确认同步不覆盖未提交草稿。当前 Portal 定向测试已有记录，手动跨端验收待补。
+  - 验收：内置浏览器和实际 PC 检查查看、恢复、无来源、冲突和删除；iOS 可运行时确认同步不覆盖未提交草稿。当前为本地 MSW 增加了仅供合成数据使用的记忆历史分页、版本更新和删除路由及隔离测试；Portal 实际页面已走通创建、编辑、查看来源、恢复旧版生成新版本、确认删除，删除后列表为空。记忆界面、API、MSW 定向 136 项测试通过，Portal typecheck、lint 和 diff 检查通过。实际 PC/iOS 客户端仍未安装/验收，保留待验证。
 
 - [ ] **T12（未开始，依赖 T06）Office 文件处理能力**
-  - 修改：`runtime/morde-cloud-runtime/`、`server/internal/app/cloud_dsh_skills.go`、工具代理和授权执行环境。本地上游 `project/deepseek-harness/packages/skill/skill-office/` 包元数据为 `@deepseek-ai/dsh-skill-office@0.2.2-rc.1`、MIT；先核对其与当前 DSH、`dsh-skill`、LibreOffice Kit 的版本、平台、许可证及渲染条件，不兼容时记录原因和最小适配方案。文件操作仍走 Morde 工具与 Workspace。
+  - 修改：`runtime/morde-cloud-runtime/`、`server/internal/app/cloud_dsh_skills.go`、工具代理、授权执行环境及产物证明链。先为获授权 Host 的 Office 二进制输出建立受限的登记、Host 独立字节校验、固定 Workspace 版本发布和恢复路径；禁止直接信任模型提供的路径/哈希。再复用上游渐进加载技能内容并适配 Morde 工具名、依赖检查和失败说明，不将 Agent 进程的路径传给 Host。本地 `project/deepseek-harness` 中 `dsh-skill-office` 为 `0.2.2-rc.1`、MIT；Morde runtime 同样固定 DSH `0.2.2-rc.1`，但没有安装 skill registry、Office 工具或 LibreOffice Kit。升级上游版本须按 runtime 依赖、平台、许可证和旧检查点恢复约定单独评估。
   - 验收：在本地授权环境分别创建、检查、修改并打开 DOCX、XLSX、PPTX 合成样例；缺依赖、无权限和处理失败时显示真实原因。云端文件数据面待验证。
-  - 当前证据与缺口：本机 Codex 附带的文档库和 LibreOffice 对三个不同合成文件完成创建、修改、重新打开和本地导出，并核对导出文本；这是本机环境检查，未接通 Morde。当前 DSH Office 插件未安装，其运行路径位于 Agent 进程而非已授权 Host，不能直接作为 Host 路径使用；插件与 Morde 工具、依赖和授权的适配仍待实现，导出未做视觉检查。
+  - 当前证据与缺口：本机 Codex 附带的文档库和 LibreOffice 曾对三个合成文件完成创建、修改、重新打开和本地导出，并核对导出文本；这是本机环境检查，未接通 Morde。当前 DSH skill-office 仅是技能 provider，读取资源和解析 CLI 路径发生在 Agent Node 进程；Morde `shell_exec` 才在获授权 Host 执行，Hostless Workspace 目前仅读写 UTF-8 文本。Host `file.verify` 虽能对二进制按字节哈希，但交付候选只接受成功 `file_write` 的 durable 证据，shell/Python 生成的 Office 文件无法进入已核验产物链；当前校验上限为单文件 1 MiB、最多 16 个、总计 8 MiB。先实现该安全产物链并验证 Host 环境依赖，再接技能适配；不能仅加技能提示就视为 Office 生成和交付已接通。插件适配、真实 Host 依赖和导出视觉验收未完成。
 
 - [ ] **T13（未开始，依赖 T12）Office 已核验产物查看与下载**
   - 修改：`Assistant.tsx`、iOS `MIFTaskViews.swift` / `MIFLibraryViews.swift` 和本地化；PC 复用已核验产物及可用预览/下载入口，iOS 显示同一已确认产物，不能预览时展示元数据和原因。
   - 验收：用合成元数据覆盖撤权、路径/版本/摘要不符和失败提示；内置浏览器、实际 PC 及可运行的 iOS 分别检查状态。实际跨端文件交付待验证。
 
-- [ ] **T17（未开始，依赖 T04、T16）安全的步骤级重试**
+- [ ] **T17（进行中，依赖 T04、T16）安全的步骤级重试**
   - 修改：`server/internal/domain/task/`、`app/task_*`、`store/postgres/task_*`、API、OpenAPI、必要迁移及 PC/iOS 任务视图。保存失败原因、尝试次数、可重试状态和原调用身份；仅在任务修订、授权、前置结果与副作用均可核实时，经 DSH 和现有工具代理恢复该步骤。
   - 验收：本地隔离环境检查单步骤新尝试、同键重试和并发点击只执行一次；不可重试、撤权、历史输入或副作用未知时拒绝并显示原因；内置浏览器、实际 PC 和可运行 iOS 检查入口/状态。
 
@@ -126,7 +127,7 @@
 - [ ] **T20（进行中，依赖 T05）审批上下文与到期状态**
   - 修改：Task 审批 domain、服务、存储/API、OpenAPI、`Assistant.tsx`、iOS 任务/审批视图和本地化。展示有依据的对象、影响、风险、本次预计与累计费用、替代方案、撤销方式及期限；未知或不适用如实标示，计划确认不扩大具体操作授权或硬限额。
   - 验收：本地 PostgreSQL 和工具替身覆盖批准/拒绝、到期与并发响应、重复提交、版本过期、权限失效和未知费用；内置浏览器、实际 PC 及可运行 iOS 检查卡片和恢复。
-  - 当前证据与缺口：已补 iOS 项目会话与媒体审批的到期校验、对象展示及审批角标到期失效；独立 Morde iOS Simulator 目标此前构建成功，17 项生产策略提取断言通过，当前完整构建又被并发 Codex 类型配置阻断。原 Minis XCTest 构建缺配置及 XCFramework，真实 iOS UI 尚未验收。服务端已增加独立后台扫描，真实本机 PostgreSQL `-race` 覆盖客户端离线、执行槽占满、多个扫描器与审批响应竞争；无可信期限时不伪造，worker 未运行或 Workspace 冻结/转移时待恢复后处理。PC 卡片及完整授权/费用展示仍待核对。
+  - 当前证据与缺口：服务端审批响应增加风险、本次/累计费用、替代方案与撤销方式的结构化披露；缺少可信来源时统一返回 `unknown`，不会编造信息。审批决定写入本身再校验数据库期限，覆盖“响应等待事务锁时到期”的竞态，并在同一事务中过期、拒绝和重排任务。API/OpenAPI、披露状态验证、YAML 解析及本地 PostgreSQL `-race` 8 项审批集成回归通过，含离线、执行槽占满、多扫描器、并发响应和到期等待场景；未增加数据库迁移。Portal 已生成 API 类型并在审批卡显示五项字段、未知/不适用状态及安全校验后的费用金额；Assistant 定向 161 项测试、TypeScript 和 ESLint 通过。内置浏览器以本地 Mock 检查了 PC 对话和任务侧栏，但当前演示数据没有审批卡，卡片的已知/未知文本仍只有组件测试证据。iOS 侧正同步相同字段和未知态；项目会话/审批到期修复的 SwiftPM 测试 52 项通过、独立 Simulator arm64 构建退出码 0，完整 iOS UI 验收尚未完成。
 
 - [ ] **T21（未开始，依赖 T05）任务用量、费用与预算**
   - 修改：`server/internal/app/model_gateway*`、`project_budget*.go`、`server/internal/store/postgres/project_budget.go`、Task 投影/OpenAPI 和 PC/iOS 视图。复用现有 Token 账本及项目金额、币种和费率快照，展示调用次数、用量、时长及可获得的预算/费用，区分已结算、估算、未知和自带模型；任务结束后仍可查看汇总。

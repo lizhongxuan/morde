@@ -1,6 +1,76 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Answer every question to continue." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Beantworte alle Fragen, um fortzufahren." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Answer every question to continue." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Responde a todas las preguntas para continuar." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Répondez à toutes les questions pour continuer." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "続けるには、すべての質問に回答してください。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "계속하려면 모든 질문에 답하세요." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ответьте на все вопросы, чтобы продолжить." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "请回答所有问题以继续。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "請回答所有問題以繼續。" } }
+      }
+    },
+    "Alternatives" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Alternativen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Alternatives" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Alternativas" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Alternatives" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "代替案" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "대안" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Альтернативы" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "替代方案" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "替代方案" } }
+      }
+    },
+    "Answered" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Beantwortet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Answered" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Respondida" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Répondu" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "回答済み" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "답변 완료" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отвечено" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已回答" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已回答" } }
+      }
+    },
+    "Cost of this action" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Kosten dieser Aktion" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cost of this action" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Costo de esta acción" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Coût de cette action" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "この操作の費用" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 작업의 비용" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Стоимость этого действия" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "本次操作费用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "本次操作費用" } }
+      }
+    },
+    "Cumulative cost" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Kumulierte Kosten" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cumulative cost" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Costo acumulado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Coût cumulé" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "累計費用" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "누적 비용" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Накопленная стоимость" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "累计费用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "累計費用" } }
+      }
+    },
     "Approval is no longer valid." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -55,6 +125,20 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ассистент Codex" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 助手" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 助理" } }
+      }
+    },
+    "Codex has a question" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Codex hat eine Frage" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex has a question" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Codex tiene una pregunta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Codex a une question" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex からの質問" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Codex 질문" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Вопрос от Codex" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Codex 有一个问题" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Codex 有一個問題" } }
       }
     },
     "Codex sessions" : {
@@ -267,6 +351,48 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "计划" } }
       }
     },
+    "Question details are unavailable." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Fragendetails sind nicht verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Question details are unavailable." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Los detalles de la pregunta no están disponibles." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Les détails de la question ne sont pas disponibles." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "質問の詳細を利用できません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "질문 세부 정보를 사용할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подробности вопроса недоступны." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "问题详情不可用。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "問題詳細無法使用。" } }
+      }
+    },
+    "Question is no longer available." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Frage ist nicht mehr verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Question is no longer available." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La pregunta ya no está disponible." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La question n’est plus disponible." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "この質問は利用できなくなりました。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 질문은 더 이상 사용할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Вопрос больше недоступен." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此问题已不可用。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "此問題已無法使用。" } }
+      }
+    },
+    "Estimate" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Schätzung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Estimate" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Estimación" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Estimation" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "見積もり" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "추정" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Оценка" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "估算" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "估算" } }
+      }
+    },
     "Read history permission is unavailable." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -279,6 +405,34 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Разрешение на чтение истории недоступно." } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法读取历史记录：权限不可用。" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無法讀取歷史記錄：權限無法使用。" } }
+      }
+    },
+    "Revocation method" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Widerrufsmethode" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Revocation method" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Método de revocación" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Méthode de révocation" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "取り消し方法" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "철회 방법" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отзыв" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "撤销方式" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "撤銷方式" } }
+      }
+    },
+    "Risk" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Risiko" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Risk" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Riesgo" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Risque" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "リスク" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "위험" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Риск" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "风险" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "風險" } }
       }
     },
     "Reasoning summary" : {
@@ -351,6 +505,20 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "登入 Morde 以檢視 Codex 工作階段。" } }
       }
     },
+    "Sending permission is unavailable." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Sendeberechtigung ist nicht verfügbar." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sending permission is unavailable." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El permiso de envío no está disponible." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’autorisation d’envoi est indisponible." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "送信権限を利用できません。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "전송 권한을 사용할 수 없습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Разрешение на отправку недоступно." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "发送权限不可用。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "傳送權限無法使用。" } }
+      }
+    },
     "Status is unknown. Refresh the session before sending again." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -365,6 +533,20 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "狀態未知。再次傳送前請重新整理工作階段。" } }
       }
     },
+    "Settled" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Abgerechnet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Settled" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Liquidado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réglé" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "確定" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "확정" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Оплачено" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已结算" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已結算" } }
+      }
+    },
     "Subagent activity" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -377,6 +559,20 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Активность подагентов" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "子代理活动" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "子代理活動" } }
+      }
+    },
+    "Submit answers" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Antworten senden" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Submit answers" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Enviar respuestas" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Envoyer les réponses" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "回答を送信" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "답변 제출" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отправить ответы" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "提交回答" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "提交回答" } }
       }
     },
     "The request result is unknown; retrying uses the same request ID." : {
@@ -461,6 +657,20 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "Вы" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "你" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "你" } }
+      }
+    },
+    "Your answer" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Deine Antwort" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Your answer" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tu respuesta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Votre réponse" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "回答を入力" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "답변 입력" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ваш ответ" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "你的回答" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "你的回答" } }
       }
     },
     "Authorized PC installation" : {
@@ -164731,20 +164941,6 @@
             "value" : "本週"
           }
         }
-      }
-    },
-    "This tool did not provide cost, alternatives, or a revocation method." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dieses Tool hat keine Angaben zu Kosten, Alternativen oder zum Widerruf gemacht." } },
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "This tool did not provide cost, alternatives, or a revocation method." } },
-        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esta herramienta no proporcionó información sobre el costo, las alternativas ni la revocación." } },
-        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Cet outil n’a fourni aucune information sur le coût, les alternatives ou la révocation." } },
-        "ja" : { "stringUnit" : { "state" : "translated", "value" : "このツールは費用、代替手段、取り消し方法を提示していません。" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 도구는 비용, 대안 또는 취소 방법을 제공하지 않았습니다." } },
-        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Этот инструмент не предоставил сведения о стоимости, альтернативах или отзыве." } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "当前工具未提供费用、替代方案或撤销方式。" } },
-        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "目前工具未提供費用、替代方案或撤銷方式。" } }
       }
     },
     "This will backup /root directory before resetting. You can restore it later." : {

@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
 import { portalApi } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { AccountSettings } from './AccountSettings';
 
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1', name: 'Alice', role: 'user' } }) }));
@@ -58,7 +58,7 @@ describe('AccountSettings', () => {
     results.slice(0, -1).forEach((result) => { setResult(result, true); });
     setResult(results[results.length - 1]!, false);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    const view = render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter><AccountSettings /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    const view = render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter><AccountSettings /></MemoryRouter></ToastProvider></QueryClientProvider>);
     return { ...view, captureStatuses };
   }
 

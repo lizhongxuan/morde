@@ -253,12 +253,12 @@ func codexAfterSequence(c *gin.Context) (int64, bool) {
 }
 
 func streamCodexEvents(c *gin.Context, service CodexService, principal identity.Principal, sessionID string, afterSequence int64, page codex.EventPage) {
-	c.Header("Content-Type", "text/event-stream; charset=utf-8")
-	c.Header("Cache-Control", "no-cache, no-transform")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-	c.Status(http.StatusOK)
-	c.Writer.Flush()
+	flusher, err := beginTaskEventStream(c)
+	if err != nil {
+		writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
+		return
+	}
+	flusher.Flush()
 	poll := time.NewTicker(2 * time.Second)
 	defer poll.Stop()
 	heartbeat := time.NewTicker(15 * time.Second)
@@ -275,7 +275,7 @@ func streamCodexEvents(c *gin.Context, service CodexService, principal identity.
 			if _, err := fmt.Fprintf(c.Writer, "id: %d\nevent: codex\ndata: %s\n\n", event.Sequence, encoded); err != nil {
 				return
 			}
-			c.Writer.Flush()
+			flusher.Flush()
 			afterSequence = event.Sequence
 		}
 		if page.NextCursor != nil {
@@ -293,7 +293,7 @@ func streamCodexEvents(c *gin.Context, service CodexService, principal identity.
 			if _, err := fmt.Fprint(c.Writer, ": keepalive\n\n"); err != nil {
 				return
 			}
-			c.Writer.Flush()
+			flusher.Flush()
 		case <-poll.C:
 			var err error
 			page, err = service.LiveEvents(c.Request.Context(), principal, sessionID, afterSequence, 100)

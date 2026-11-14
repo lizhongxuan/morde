@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { setupServer } from "msw/node";
+import type { components } from "../api/schema";
 import { handlers, resetMockState, setMockWorkspaceSyncConflict } from "./handlers";
 
 const server = setupServer(...handlers);
@@ -105,6 +106,41 @@ describe("portal personal-data mock reads", () => {
     expect(JSON.stringify(responseBody)).not.toContain("task_id");
     const next = await api("/api/personal-data/history/import", json("POST", { ...body, target_conversation_id: responseBody.conversation_id }));
     expect(await next.json()).toMatchObject({ conversation_id: responseBody.conversation_id });
+  });
+
+  it("keeps synthetic memory revisions owner-scoped and purges them with the memory", async () => {
+    const memoryID = "m_0123abcd";
+    const historyPath = `/api/personal-data/memory/${memoryID}/history`;
+    expect((await api(historyPath)).status).toBe(401);
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+
+    const putMemory = (client: typeof api, baseRevision: number, content: string, key: string) => client(
+      `/api/personal-data/memory/${memoryID}`,
+      { ...json("PUT", { base_revision: baseRevision, body: { content } }),
+        headers: { "content-type": "application/json", "Idempotency-Key": key } },
+    );
+    expect((await putMemory(api, 0, "第一版", "memory-change-0001")).status).toBe(200);
+    expect((await putMemory(api, 1, "第二版", "memory-change-0002")).status).toBe(200);
+
+    const firstPage = await api(`${historyPath}?limit=1`);
+    const first = await firstPage.json() as components["schemas"]["PersonalMemoryHistoryPage"];
+    expect(first.items).toMatchObject([{ revision: 2, body: { content: "第二版" }, restorable: true,
+      source_status: "available", sources: [{ kind: "mutation_receipt", id: "memory-change-0002" }] }]);
+    expect(first.next_cursor).toBeTruthy();
+    const secondPage = await api(`${historyPath}?limit=1&cursor=${encodeURIComponent(first.next_cursor!)}`);
+    expect(await secondPage.json()).toMatchObject({ items: [{ revision: 1, body: { content: "第一版" } }], next_cursor: null });
+
+    const memberAPI = createApiClient();
+    await memberAPI("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await putMemory(memberAPI, 0, "成员自己的记忆", "member-memory-001")).status).toBe(200);
+    expect((await memberAPI(`${historyPath}?cursor=${encodeURIComponent(first.next_cursor!)}`)).status).toBe(400);
+    expect(await (await memberAPI(historyPath)).json()).toMatchObject({ items: [{ body: { content: "成员自己的记忆" } }] });
+
+    const deletion = await api(`/api/personal-data/memory/${memoryID}`, {
+      ...json("DELETE", { base_revision: 2 }), headers: { "content-type": "application/json", "Idempotency-Key": "memory-delete-0001" },
+    });
+    expect(deletion.status).toBe(200);
+    expect((await api(historyPath)).status).toBe(404);
   });
 
   it("writes selected rooms memories and goals with owner scope and exact idempotent retries", async () => {

@@ -1177,6 +1177,91 @@ test('returns failed Morde MCP broker results to the DSH model as tool errors an
     .some(block => block.type === 'text' && block.text === 'The search service is temporarily unavailable, so I could not retrieve results.')))
 })
 
+test('retries one exact checkpointed tool call through the server IPC and then runs DSH without tools', async () => {
+  const tool = {
+    name: 'file_write', description: 'Write a file in the task workspace.',
+    parameters: { type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
+      required: ['workspace_id', 'path', 'content'], additionalProperties: false },
+  }
+  const argumentsJSON = '{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}'
+  const argumentsValue = { workspace_id: 'w1234567', path: 'notes.txt', content: 'saved' }
+  const pages = await captureFailedToolSession(tool, argumentsJSON)
+  const tail = pages.at(-1)
+  const retryCallID = 'morde_step_retry_s7654321'
+  const digest = createHash('sha256').update('{"name":"file_write","arguments":{"content":"saved","path":"notes.txt","workspace_id":"w1234567"}}').digest('hex')
+  const stepRetry = {
+    task_id: start.task_id, owner_id: start.owner_id, source_step_id: 's1234567', attempt_step_id: 's7654321', attempt: 2,
+    source_call_id: 'call_retry_source_1', retry_call_id: retryCallID, session_id: start.session_id, task_revision: 1,
+    tool_name: tool.name, request_digest: digest, authorization_version: 1, host_id: 'h1234567', host_runtime_generation: 3,
+    workspace_id: 'w1234567', input_revision: 4, workspace_checkpoint_revision: 4, workspace_binding_version: 2,
+    workspace_revision: 4, checkpoint_through_seq: tail.through_seq, checkpoint_sha256: tail.sha256,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  }
+  const retryFrames = []
+  const resumed = await resumeSession(pages, {
+    tools: [tool],
+    alterStart: value => ({ ...value, step_retry: stepRetry }),
+    onToolCall(frame) {
+      retryFrames.push(frame)
+      assert.equal(frame.call_id, retryCallID)
+      assert.equal(frame.name, tool.name)
+      assert.deepEqual(frame.arguments, argumentsValue)
+      assert.equal(frame.through_seq, tail.through_seq)
+      return { status: 'succeeded', output: '{"bytes_written":5}' }
+    },
+    onModel(frame, proc) {
+      assert.deepEqual(frame.request.tools, [], 'the continuation cannot issue a second tool call')
+      assert.ok(frame.request.messages.some(message => message.role === 'user' && message.source?.plugin === 'morde-step-retry' &&
+        message.content?.some(block => block.type === 'text' && block.text.includes('{"bytes_written":5}'))))
+      replyWithText(proc, frame, 'The file was written after the verified retry.')
+    },
+  })
+  assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(retryFrames.length, 1)
+  assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call' && frame.call_id === retryCallID).length, 1)
+  assert.equal(resumed.modelCalls, 1)
+  assert.equal(resumed.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+  const emitted = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+  assert.equal(emitted.some(event => event.type === 'assistant/message' && event.data.message.content
+    .some(block => block.type === 'tool-call' && block.id === retryCallID)), false)
+})
+
+test('rejects an expired or mismatched step retry before IPC dispatch', async () => {
+  const tool = {
+    name: 'file_write', description: 'Write a file in the task workspace.',
+    parameters: { type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
+      required: ['workspace_id', 'path', 'content'], additionalProperties: false },
+  }
+  const pages = await captureFailedToolSession(tool, '{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}')
+  const tail = pages.at(-1)
+  const digest = createHash('sha256').update('{"name":"file_write","arguments":{"content":"saved","path":"notes.txt","workspace_id":"w1234567"}}').digest('hex')
+  const stepRetry = {
+    task_id: start.task_id, owner_id: start.owner_id, source_step_id: 's1234567', attempt_step_id: 's7654321', attempt: 2,
+    source_call_id: 'call_retry_source_1', retry_call_id: 'morde_step_retry_s7654321', session_id: start.session_id, task_revision: 1,
+    tool_name: tool.name, request_digest: digest, authorization_version: 1, host_id: 'h1234567', host_runtime_generation: 3,
+    workspace_id: 'w1234567', input_revision: 4, workspace_checkpoint_revision: 4, workspace_binding_version: 2,
+    workspace_revision: 4, checkpoint_through_seq: tail.through_seq, checkpoint_sha256: tail.sha256,
+    expires_at: new Date(Date.now() - 60_000).toISOString(),
+  }
+  assert.equal(validStart({ ...resumedStart(pages, [tool]), step_retry: stepRetry }), false)
+  const calls = []
+  const expired = await resumeSession(pages, {
+    tools: [tool], alterStart: value => ({ ...value, step_retry: stepRetry }), onToolCall: frame => calls.push(frame),
+  })
+  assert.notEqual(expired.code, 0)
+  assert.equal(calls.length, 0)
+  assert.equal(expired.modelCalls, 0)
+
+  const changedDigest = { ...stepRetry, expires_at: new Date(Date.now() + 60_000).toISOString(), request_digest: '0'.repeat(64) }
+  const mismatchCalls = []
+  const mismatched = await resumeSession(pages, {
+    tools: [tool], alterStart: value => ({ ...value, step_retry: changedDigest }), onToolCall: frame => mismatchCalls.push(frame),
+  })
+  assert.notEqual(mismatched.code, 0)
+  assert.equal(mismatchCalls.length, 0)
+  assert.equal(mismatched.modelCalls, 0)
+})
+
 test('runs dsh_delegate in an isolated child session and waits for settlement before resuming the parent', async () => {
   const fileRead = fileReadTool
   const delegate = delegateTool
@@ -2057,6 +2142,41 @@ async function captureSession({ interrupt = false, tools = [] } = {}) {
   else assert.equal(code, 0)
   assert.ok(pages.length > 0)
   assert.ok(frames.some(frame => frame.type === 'model'))
+  return pages
+}
+
+async function captureFailedToolSession(tool, argumentsJSON, callID = 'call_retry_source_1') {
+  const pages = []
+  let modelCalls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'checkpoint') {
+      pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+      acknowledgeCheckpoint(proc, frame)
+    }
+    if (frame.type === 'model') {
+      modelCalls++
+      if (modelCalls === 1) {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: callID, name: tool.name, argumentsDelta: argumentsJSON },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      } else {
+        replyWithText(proc, frame, 'The original action did not run.')
+      }
+    }
+    if (frame.type === 'tool_call') {
+      send(proc, {
+        type: 'tool_result', id: frame.id, ...taskFence(frame), call_id: frame.call_id,
+        status: 'failed', output: 'confirmed not dispatched',
+      })
+    }
+  })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 2)
   return pages
 }
 

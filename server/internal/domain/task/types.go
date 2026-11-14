@@ -152,6 +152,7 @@ type Task struct {
 	AgentSessionID              string
 	AgentEngineVersion          string
 	AgentProfileVersion         string
+	StepRetry                   *StepRetryIntent
 	CheckpointDigest            []byte
 	CheckpointThroughSequence   int64
 	EventSequence               int64
@@ -255,10 +256,14 @@ type Step struct {
 	ID             string
 	TaskID         string
 	Sequence       int64
+	Attempt        int64
+	RetryOfStepID  string
 	Kind           string
 	Status         StepStatus
 	Title          string
 	Summary        string
+	FailureReason  string
+	Retryable      bool
 	AgentSessionID string
 	TaskRevision   *int64
 	ToolCallKey    string
@@ -267,6 +272,35 @@ type Step struct {
 	Phase          string
 	DetailState    string
 	CreatedAt      time.Time
+}
+
+// StepRetryIntent is a single-use server-issued replay fence. The model never
+// supplies the arguments; the runtime must recover them from this exact DSH
+// checkpoint and match the stored request digest before dispatch.
+type StepRetryIntent struct {
+	TaskID                      string
+	OwnerID                     string
+	SourceStepID                string
+	AttemptStepID               string
+	Attempt                     int64
+	SourceCallID                string
+	RetryCallID                 string
+	AgentSessionID              string
+	TaskRevision                int64
+	ToolName                    string
+	RequestDigest               []byte
+	AuthorizationVersion        int64
+	HostID                      string
+	HostRuntimeGeneration       int64
+	WorkspaceID                 string
+	InputRevision               *int64
+	WorkspaceCheckpointRevision *int64
+	WorkspaceBindingVersion     int64
+	WorkspaceRevision           *int64
+	CheckpointThroughSequence   int64
+	CheckpointDigest            []byte
+	Consumed                    bool
+	ExpiresAt                   time.Time
 }
 
 func StepCounts(steps []Step) (total, completed int64) {

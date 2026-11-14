@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { NewHost } from './NewHost';
 
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567', quota: { hosts: 2 } } }) }));
@@ -18,7 +18,7 @@ const createdHost: Awaited<ReturnType<typeof portalApi.createHost>> = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('NewHost', () => {

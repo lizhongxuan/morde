@@ -37,6 +37,10 @@ type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskStep = Task['steps'][number];
 type TaskAgent = NonNullable<Task['agents']>[number];
+type TaskApproval = NonNullable<Task['pending_request']>;
+type TaskApprovalTextDisclosure = TaskApproval['disclosures']['risk'];
+type TaskApprovalCostDisclosure = TaskApproval['disclosures']['this_cost'];
+type TaskApprovalAlternativesDisclosure = TaskApproval['disclosures']['alternatives'];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskArtifact = Task['artifacts'][number];
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
@@ -58,6 +62,29 @@ type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { 
 };
 type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string; needsPreparation?: boolean; preparationCancelled?: boolean };
 type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string };
+
+function taskApprovalTextDisclosure(value?: TaskApprovalTextDisclosure): string {
+  if (!value) return '未知';
+  if (value.state !== 'known') return value.state === 'not_applicable' ? '不适用' : '未知';
+  return value.summary?.trim() || '服务端标记为已知，但未提供说明';
+}
+
+function taskApprovalCostDisclosure(value?: TaskApprovalCostDisclosure): string {
+  if (!value) return '未知';
+  if (value.state !== 'known') return value.state === 'not_applicable' ? '不适用' : '未知';
+  if (value.amount_micros === null || !Number.isSafeInteger(value.amount_micros) || value.amount_micros < 0 ||
+    !value.currency || !/^[A-Z]{3}$/.test(value.currency) || !value.basis) return '费用数据不完整';
+  const whole = Math.floor(value.amount_micros / 1_000_000).toLocaleString('zh-CN');
+  const fraction = String(value.amount_micros % 1_000_000).padStart(6, '0').replace(/0+$/u, '');
+  const amount = `${whole}${fraction ? `.${fraction}` : ''}`;
+  return `${value.basis === 'estimate' ? '估算' : '已结算'} ${value.currency} ${amount}`;
+}
+
+function taskApprovalAlternativesDisclosure(value?: TaskApprovalAlternativesDisclosure): string {
+  if (!value) return '未知';
+  if (value.state !== 'known') return value.state === 'not_applicable' ? '不适用' : '未知';
+  return value.options.length ? value.options.join('；') : '服务端标记为已知，但未提供方案';
+}
 
 function conversationTitleFromText(content?: string): string | null {
   const normalized = content?.replace(/\s+/gu, ' ').trim();
@@ -1502,9 +1529,9 @@ export function Assistant() {
         const draftScope = assistantComposerDraftScope(message.serviceInstanceID!, message.actorID);
         const localDraftIdentity = JSON.stringify([draftScope, localDraftID]);
         let canSelectCreatedConversation = true;
-        if (localConversationKeyRef.current === message.conversationCreateKey) await persistActiveComposerDraft();
+        if (localConversationKeyRef.current === message.conversationCreateKey) canSelectCreatedConversation = await persistActiveComposerDraft();
         try {
-          const localDraft = await assistantDraftStorage.get(draftScope, localDraftID);
+          const localDraft = canSelectCreatedConversation ? await assistantDraftStorage.get(draftScope, localDraftID) : null;
           if (localDraft) {
             const latest = composerDraftSnapshots.current.get(localDraftIdentity)?.draft ?? localDraft;
             const migratedDraft = { ...latest, id: targetID, conversationID: targetID };
@@ -2364,7 +2391,13 @@ export function Assistant() {
       {task.pending_request && <section className="notice notice-warning task-detail-attention"
         aria-label={task.pending_request.status === 'expired' ? '审批已到期' : '需要批准的操作'}>
         <h3>{task.pending_request.title}</h3><p>{task.pending_request.object}</p><p>{task.pending_request.content}</p><p>可能影响：{task.pending_request.impact}</p>
-        <p>费用、替代方案和撤销方式：当前工具未提供。</p>
+        <dl className="task-approval-disclosures" aria-label="风险、费用和其他审批信息">
+          <dt>风险</dt><dd>{taskApprovalTextDisclosure(task.pending_request.disclosures?.risk)}</dd>
+          <dt>本次费用</dt><dd>{taskApprovalCostDisclosure(task.pending_request.disclosures?.this_cost)}</dd>
+          <dt>累计费用</dt><dd>{taskApprovalCostDisclosure(task.pending_request.disclosures?.cumulative_cost)}</dd>
+          <dt>替代方案</dt><dd>{taskApprovalAlternativesDisclosure(task.pending_request.disclosures?.alternatives)}</dd>
+          <dt>撤销方式</dt><dd>{taskApprovalTextDisclosure(task.pending_request.disclosures?.revocation)}</dd>
+        </dl>
         {task.pending_request.expires_at && <p>审批到期：{formatDate(task.pending_request.expires_at)}</p>}
         {task.pending_request.status === 'expired' ? <p role="status">审批已到期；该操作已被拒绝并未执行。</p>
           : <div className="inline-actions">{(['approve', 'reject'] as const).map((decision) => <button key={decision} type="button"
@@ -2914,6 +2947,7 @@ export function Assistant() {
             </div>} />}
         </div>}
         {!conversationContentAccessRevoked && taskPanelTab === 'files' && <div className="task-panel-list task-panel-files">
+          <Link className="button button-secondary button-small" to="/workspaces">管理文件同步</Link>
           {messages.hasNextPage && <button type="button" className="button button-small button-secondary" disabled={messages.isFetchingNextPage}
             onClick={() => void loadOlderMessages()}>{messages.isFetchingNextPage ? '正在加载更早消息…' : '加载更早消息中的附件'}</button>}
           {!conversationFiles.length ? <p className="muted">此会话还没有附件或任务成果。</p> : <ScreenPagination items={conversationFiles}

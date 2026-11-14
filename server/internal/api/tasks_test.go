@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,6 +42,14 @@ type taskServiceStub struct {
 	stepDetailCalls        int
 	stepDetailTaskID       string
 	stepDetailStepID       string
+	stepRetryResult        app.TaskStepRetryResult
+	stepRetryCalls         int
+	stepRetryTaskID        string
+	stepRetryStepID        string
+	stepRetryRevision      int64
+	stepRetryAttempt       int64
+	stepRetryDigest        string
+	stepRetryIdempotency   string
 	actionTaskID           string
 	action                 task.Action
 	actionExpected         task.Status
@@ -210,6 +220,15 @@ func (s *taskServiceStub) GetStepDetail(_ context.Context, _ identity.Principal,
 	s.stepDetailCalls++
 	s.stepDetailTaskID, s.stepDetailStepID = taskID, stepID
 	return s.stepDetail, s.err
+}
+
+func (s *taskServiceStub) RetryStep(_ context.Context, _ identity.Principal, taskID, stepID string, revision, attempt int64,
+	digest, idempotencyKey string) (app.TaskStepRetryResult, error) {
+	s.stepRetryCalls++
+	s.stepRetryTaskID, s.stepRetryStepID = taskID, stepID
+	s.stepRetryRevision, s.stepRetryAttempt = revision, attempt
+	s.stepRetryDigest, s.stepRetryIdempotency = digest, idempotencyKey
+	return s.stepRetryResult, s.err
 }
 
 func (s *taskServiceStub) RequestAction(ctx context.Context, principal identity.Principal, taskID string, action task.Action, expected task.Status, key string) (app.TaskActionResult, error) {
@@ -641,12 +660,16 @@ func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 	}
 	view, err := toTaskResponse(value)
 	if err != nil || view.PendingRequest == nil || view.PendingRequest.ID != "r1234567" || view.PendingRequest.Version != 2 ||
-		view.PendingRequest.Status != "pending" || view.PendingRequest.Impact != "The file will leave this Host." || view.PendingRequest.MediaPreviewOperationID != "o1234567" {
+		view.PendingRequest.Status != "pending" || view.PendingRequest.Impact != "The file will leave this Host." || view.PendingRequest.MediaPreviewOperationID != "o1234567" ||
+		!validTaskApprovalDisclosures(view.PendingRequest.Disclosures) || view.PendingRequest.Disclosures.Risk.State != "unknown" ||
+		view.PendingRequest.Disclosures.ThisCost.State != "unknown" || view.PendingRequest.Disclosures.CumulativeCost.State != "unknown" ||
+		view.PendingRequest.Disclosures.Alternatives.State != "unknown" || view.PendingRequest.Disclosures.Revocation.State != "unknown" {
 		t.Fatalf("active pending request response = %#v, %v", view.PendingRequest, err)
 	}
 	encoded, err := json.Marshal(view.PendingRequest)
 	if err != nil || !strings.Contains(string(encoded), `"status":"pending"`) || !strings.Contains(string(encoded), `"media_preview_operation_id":"o1234567"`) ||
-		!strings.Contains(string(encoded), `"expires_at":null`) {
+		!strings.Contains(string(encoded), `"expires_at":null`) || !strings.Contains(string(encoded), `"this_cost":{"state":"unknown"`) ||
+		!strings.Contains(string(encoded), `"alternatives":{"state":"unknown","options":[]}`) {
 		t.Fatalf("pending media preview JSON = %s, err=%v", encoded, err)
 	}
 	value.PendingRequest.MediaPreviewOperationID = "invalid"
@@ -658,6 +681,61 @@ func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 	view, err = toTaskResponse(value)
 	if err != nil || view.PendingRequest != nil {
 		t.Fatalf("resolved pending request must not be offered again: %#v, %v", view.PendingRequest, err)
+	}
+}
+
+func TestTaskApprovalDisclosuresRequireKnownValuesAndCostBasis(t *testing.T) {
+	disclosures := unknownTaskApprovalDisclosures()
+	risk, alternative, revocation := "May expose the selected file to the connected service.", "Review the file before export.", "The external service may not support undo."
+	disclosures.Risk = taskApprovalDisclosureResponse{State: "known", Summary: &risk}
+	disclosures.Alternatives = taskApprovalAlternativesDisclosureResponse{State: "known", Options: []string{alternative}}
+	disclosures.Revocation = taskApprovalDisclosureResponse{State: "known", Summary: &revocation}
+	amount, currency, basis := int64(1250), "CNY", "estimate"
+	disclosures.ThisCost = taskApprovalCostDisclosureResponse{State: "known", AmountMicros: &amount, Currency: &currency, Basis: &basis}
+	if !validTaskApprovalDisclosures(disclosures) {
+		t.Fatal("complete evidence-backed approval disclosures were rejected")
+	}
+	disclosures.ThisCost.Basis = nil
+	if validTaskApprovalDisclosures(disclosures) {
+		t.Fatal("known cost without an estimate/settled basis was accepted")
+	}
+	disclosures = unknownTaskApprovalDisclosures()
+	disclosures.Risk = taskApprovalDisclosureResponse{State: "unknown", Summary: &risk}
+	if validTaskApprovalDisclosures(disclosures) {
+		t.Fatal("unknown disclosure with an unsupported summary was accepted")
+	}
+}
+
+func TestTaskPendingRequestOpenAPIIncludesDisclosureAvailability(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI schema: %v", err)
+	}
+	contract := string(openAPI)
+	start := strings.Index(contract, "    TaskPendingRequest:\n")
+	end := strings.Index(contract[start+1:], "\n    TaskApprovalTextDisclosure:\n")
+	if start < 0 || end < 0 {
+		t.Fatal("Portal OpenAPI TaskPendingRequest schema is missing or unbounded")
+	}
+	pending := contract[start : start+1+end]
+	for _, required := range []string{
+		"required: [id, version, status, kind, title, object, content, impact, disclosures, expires_at]",
+		"disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }",
+		"expires_at: { type: [string, 'null']",
+	} {
+		if !strings.Contains(pending, required) {
+			t.Fatalf("Portal OpenAPI TaskPendingRequest omits %q", required)
+		}
+	}
+	for _, required := range []string{
+		"required: [risk, this_cost, cumulative_cost, alternatives, revocation]",
+		"enum: [known, unknown, not_applicable]",
+		"enum: [estimate, settled, null]",
+		"amount_micros:",
+	} {
+		if !strings.Contains(contract, required) {
+			t.Fatalf("Portal OpenAPI approval disclosure contract omits %q", required)
+		}
 	}
 }
 
@@ -827,6 +905,41 @@ func TestTaskStepDetailRouteIsNoStoreAndRejectsQueryOrBody(t *testing.T) {
 	}
 	if service.stepDetailCalls != 1 {
 		t.Fatalf("invalid detail requests reached service %d times", service.stepDetailCalls-1)
+	}
+}
+
+func TestTaskStepRetryRouteBindsRequestAndRejectsReplacementArguments(t *testing.T) {
+	service := &taskServiceStub{stepRetryResult: app.TaskStepRetryResult{TaskID: "q1234567", SourceStepID: "s1234567",
+		AttemptStepID: "s7654321", Attempt: 2, Status: "queued"}}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries",
+		strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "step-retry-0001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || response.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(response.Body.String(), `"attempt_step_id":"s7654321"`) || service.stepRetryCalls != 1 ||
+		service.stepRetryTaskID != "q1234567" || service.stepRetryStepID != "s1234567" || service.stepRetryRevision != 4 ||
+		service.stepRetryAttempt != 1 || service.stepRetryDigest != strings.Repeat("a", 64) || service.stepRetryIdempotency != "step-retry-0001" {
+		t.Fatalf("step retry response=%d headers=%v body=%s service=%+v", response.Code, response.Header(), response.Body.String(), service)
+	}
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries?force=true", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`"}`)),
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"`+strings.Repeat("a", 64)+`","arguments":{"path":"different"}}`)),
+		httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries", strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1,"expected_request_digest":"bad"}`)),
+	} {
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "step-retry-0001")
+		response = httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("invalid step retry request reached response=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	if service.stepRetryCalls != 1 {
+		t.Fatalf("invalid retry requests reached service: %d calls", service.stepRetryCalls-1)
 	}
 }
 

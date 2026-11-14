@@ -20,6 +20,7 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '工作台' })).not.toBeInTheDocument();
     const workNavigation = screen.getByRole('navigation', { name: '工作导航' });
     expect(within(workNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(workNavigation).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
     expect(within(workNavigation).getByRole('link', { name: '对话' })).toHaveAttribute('href', '/assistant');
     expect(within(workNavigation).getByRole('link', { name: '项目' })).toHaveAttribute('href', '/projects');
     expect(within(workNavigation).getByRole('link', { name: '个人数据' })).toHaveAttribute('href', '/personal');
@@ -27,7 +28,7 @@ describe('PortalLayout', () => {
     expect(within(workNavigation).getAllByRole('link', { name: '云端电脑' })).toHaveLength(1);
     const settingsNavigation = screen.getByRole('navigation', { name: '设置导航' });
     expect(within(settingsNavigation).getByRole('link', { name: '模型与工具' })).toHaveAttribute('href', '/connections');
-    expect(within(settingsNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/workspaces');
+    expect(within(settingsNavigation).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
     expect(within(settingsNavigation).getByRole('link', { name: '客户端' })).toHaveAttribute('href', '/clients');
     expect(within(settingsNavigation).getByRole('link', { name: 'API Key' })).toHaveAttribute('href', '/apikeys');
     expect(within(settingsNavigation).getByRole('link', { name: '账户' })).toHaveAttribute('href', '/settings');
@@ -36,7 +37,15 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 
-  it.each(['/notifications', '/hosts', '/projects', '/workspaces', '/connections', '/clients', '/apikeys', '/settings'])('does not render a sidebar toggle without a context sidebar on %s', (path) => {
+  it('places file sync under the cloud-computer page navigation', () => {
+    const { container } = render(<ToastProvider><MemoryRouter initialEntries={['/workspaces']}><PortalLayout /></MemoryRouter></ToastProvider>);
+    const contextNavigation = screen.getByRole('complementary', { name: '云端电脑子菜单' });
+    expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('aria-current', 'page');
+    expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
+    expect(container.querySelector('.morde-topbar > .notice-center')).toBeInTheDocument();
+  });
+
+  it.each(['/notifications', '/projects', '/connections', '/clients', '/apikeys', '/settings'])('does not render a sidebar toggle without a context sidebar on %s', (path) => {
     const { container } = render(<ToastProvider><MemoryRouter initialEntries={[path]}><PortalLayout /></MemoryRouter></ToastProvider>);
     expect(container.querySelector('#context-sidebar')).toBeNull();
     expect(screen.queryByRole('button', { name: /侧边栏/ })).not.toBeInTheDocument();

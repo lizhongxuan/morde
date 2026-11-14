@@ -692,10 +692,11 @@ export default function Workbench() {
         controlActionError={controlActionError}
         controlActionLabel={controlActionLabel}
         controlActionPending={controlActionPending}
+        notice={notice}
+        noticeKind={noticeKind}
         onControlAction={controlComputer}
         onRetryControl={reloadControl}
       />}
-      {notice && (noticeKind === 'error' ? <FloatingError>{notice}</FloatingError> : <p className="notice" role="status">{notice}</p>)}
       {embedded && !host && !pageError && <p className="panel-loading" role="status">正在确认工作台权限…</p>}
       {embedded && host && !embedTargets.size && !pageError && <p className="panel-loading" role="status">此会话没有可用的电脑功能。</p>}
       {pageError ? (

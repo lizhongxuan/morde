@@ -29,6 +29,7 @@ export type CodexSnapshot = {
   complete: boolean;
   anchored: boolean;
   nextCursor: string | null;
+  metadataStable: boolean;
 };
 
 type PendingRequest = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
@@ -43,6 +44,13 @@ export type ParsedJsonRpcFrame =
   | { type: "response"; id: number | string; result?: unknown; error?: { code: number; message: string } }
   | { type: "notification"; method: string; params?: unknown }
   | { type: "request"; id: number | string; method: string; params?: unknown };
+
+class CodexAppServerRejection extends Error {
+  constructor(readonly code: number) {
+    super("Codex App Server rejected the request");
+    this.name = "CodexAppServerRejection";
+  }
+}
 
 /** Strict frame routing for Codex's versionless JSON-RPC wire, without T3code's Effect runtime. */
 export function parseJsonRpcFrame(line: string): ParsedJsonRpcFrame {
@@ -243,7 +251,7 @@ export class MordeCodexProvider {
         if (!pending) continue;
         clearTimeout(pending.timer);
         this.pending.delete(message.id);
-        if (message.error) pending.reject(new Error("Codex App Server request failed"));
+        if (message.error) pending.reject(new CodexAppServerRejection(message.error.code));
         else pending.resolve(message.result);
       } else if (message.type === "request") {
         this.onRequest(message.id, message.method, message.params);
@@ -343,8 +351,10 @@ export class MordeCodexProvider {
     const after = object(await this.request("thread/read", { threadId: threadID, includeTurns: false }));
     const second = threadFrom(after?.thread);
     if (!second || second.id !== threadID) throw new Error("Codex thread is unavailable");
-    if (first.updatedAt !== second.updatedAt) throw new Error("Codex thread changed during snapshot");
-    return { thread: second, turns, complete, anchored, nextCursor };
+    // Thread metadata often changes while an external Codex GUI is writing an active turn.
+    // Keep its bounded visible item snapshot for best-effort reconciliation, while callers
+    // retain a separate stability gate for terminal turns.
+    return { thread: second, turns, complete, anchored, nextCursor, metadataStable: first.updatedAt === second.updatedAt };
   }
 
   async resume(threadID: string): Promise<void> {
@@ -354,14 +364,31 @@ export class MordeCodexProvider {
     if (!thread || thread.id !== threadID) throw new Error("Codex thread could not be resumed");
   }
 
-  async startTurn(threadID: string, text: string, clientMessageID = randomUUID()): Promise<string> {
-    if (!stableID(threadID) || typeof text !== "string" || !text.trim() || text.length > 32768) throw new Error("Invalid Codex message");
-    const result = object(await this.request("turn/start", {
-      threadId: threadID, input: [{ type: "text", text }], clientUserMessageId: clientMessageID,
-    }, 20_000));
+  async startTurn(threadID: string, text: string, clientMessageID: string = randomUUID()): Promise<string> {
+    const dispatch = codexTurnDispatch(threadID, text, null, clientMessageID);
+    const result = object(await this.request(dispatch.method, dispatch.params, 20_000));
     const turn = object(result?.turn);
     if (!turn || !stableID(turn.id)) throw new Error("Codex did not confirm the turn request");
     return turn.id;
+  }
+
+  async activeTurnID(threadID: string): Promise<string | null> {
+    if (!stableID(threadID)) throw new Error("Invalid Codex thread ID");
+    const result = object(await this.request("thread/turns/list", {
+      threadId: threadID, cursor: null, limit: 1, itemsView: "notLoaded", sortDirection: "desc",
+    }));
+    if (!result || !Array.isArray(result.data)) throw new Error("Codex active turn state is unavailable");
+    const active = result.data.map(object).find((turn) => turn !== null && turn.status === "inProgress" && stableID(turn.id));
+    const turnID = active?.id;
+    return stableID(turnID) ? turnID : null;
+  }
+
+  async steerTurn(threadID: string, turnID: string, text: string, clientMessageID: string): Promise<string> {
+    const dispatch = codexTurnDispatch(threadID, text, turnID, clientMessageID);
+    const result = object(await this.request(dispatch.method, dispatch.params, 20_000));
+    const confirmedTurnID = result?.turnId;
+    if (!stableID(confirmedTurnID)) throw new Error("Codex did not confirm the steered turn");
+    return confirmedTurnID;
   }
 
   async interrupt(threadID: string, turnID: string): Promise<void> {
@@ -405,7 +432,7 @@ export function codexSnapshotItemFingerprint(item: JsonObject): string {
 export type CodexLocalProfile = { profileKey: string; homeDirectory: string; executable: string; createdAt: string };
 export type CodexEventInput = {
   provider_event_id: string;
-  kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "file_change" | "child_agent" | "approval_request" | "approval_status" | "unsupported";
+  kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "file_change" | "child_agent" | "question" | "approval_request" | "approval_status" | "unsupported";
   occurred_at: string;
   turn_id?: string;
   item_id?: string;
@@ -431,6 +458,7 @@ export type CodexGrant = {
   knownItems: Record<string, string>;
   pendingEvents: CodexEventInput[];
   approvals: Record<string, CodexApprovalRequest>;
+  questions: Record<string, CodexUserInputRequest>;
 };
 export type CodexApprovalRequest = {
   id: string;
@@ -443,6 +471,27 @@ export type CodexApprovalRequest = {
   params: JsonObject;
   kind: string;
   summary: string;
+  createdAt: string;
+};
+export type CodexUserInputOption = { label: string; description: string };
+export type CodexUserInputQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  options: CodexUserInputOption[];
+  is_secret: boolean;
+  is_other: boolean;
+};
+export type CodexUserInputRequest = {
+  id: string;
+  rpcID: number | string;
+  version: string;
+  profileKey: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  grantVersion: number;
+  questions: CodexUserInputQuestion[];
   createdAt: string;
 };
 export type CodexCommandLedger = { status: string; providerRequestID?: string; resultCode?: string; resultPending?: boolean };
@@ -470,11 +519,161 @@ type RuntimePersistence = { load: () => unknown | null; save: (value: CodexPersi
 
 const SCOPES = new Set<CodexScope>(["read", "live", "send", "interrupt", "approval"]);
 const FINAL_COMMAND_STATUSES = new Set(["forwarded", "running", "waiting_approval", "completed", "failed", "unknown"]);
+const PROFILE_EXIT_COMMAND_STATUSES = new Set(["dispatching", "claimed", "forwarded", "running", "waiting_approval"]);
 const MAX_LOCAL_EVENTS = 3000;
 const MAX_LOCAL_STATE_BYTES = 8 * 1024 * 1024;
 const MAX_VISIBLE_MESSAGE_BYTES = 2 * 1024 * 1024;
 
 function isCodexScope(value: unknown): value is CodexScope { return typeof value === "string" && SCOPES.has(value as CodexScope); }
+
+function validRpcID(value: unknown): value is number | string {
+  return typeof value === "number" ? Number.isSafeInteger(value) : typeof value === "string" && value.length > 0 &&
+    Buffer.byteLength(value) <= 512 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function validQuestionRequestID(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value) <= 512 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function validQuestionVersion(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function codexUserInputQuestionValid(value: unknown): value is CodexUserInputQuestion {
+  const question = object(value);
+  return !!question && Object.keys(question).every((key) => ["id", "header", "question", "options", "is_secret", "is_other"].includes(key)) &&
+    typeof question.id === "string" && question.id.trim().length > 0 && Buffer.byteLength(question.id) <= 512 && !/[\u0000-\u001f\u007f-\u009f]/.test(question.id) &&
+    typeof question.header === "string" && Buffer.byteLength(question.header) <= 4096 && !question.header.includes("\u0000") &&
+    typeof question.question === "string" && Buffer.byteLength(question.question) <= 4096 && !question.question.includes("\u0000") &&
+    Array.isArray(question.options) && question.options.length <= 64 && question.options.every((value) => {
+      const option = object(value);
+      return !!option && Object.keys(option).length === 2 && typeof option.label === "string" && Buffer.byteLength(option.label) <= 4096 &&
+        typeof option.description === "string" && Buffer.byteLength(option.description) <= 4096 &&
+        !option.label.includes("\u0000") && !option.description.includes("\u0000");
+    }) && typeof question.is_secret === "boolean" && typeof question.is_other === "boolean";
+}
+
+export function codexUserInputQuestions(value: unknown): CodexUserInputQuestion[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64) return null;
+  const questions: CodexUserInputQuestion[] = [];
+  const ids = new Set<string>();
+  for (const questionValue of value) {
+    const row = object(questionValue);
+    if (!row || typeof row.id !== "string" || !validRpcID(row.id) || row.id.trim().length === 0 || ids.has(row.id) ||
+      typeof row.header !== "string" || Buffer.byteLength(row.header) > 4096 ||
+      typeof row.question !== "string" || Buffer.byteLength(row.question) > 4096 ||
+      row.isSecret !== undefined && typeof row.isSecret !== "boolean" || row.isOther !== undefined && typeof row.isOther !== "boolean") return null;
+    ids.add(row.id);
+    const rawOptions = row.options === undefined || row.options === null ? [] : row.options;
+    if (!Array.isArray(rawOptions) || rawOptions.length > 64) return null;
+    const options: CodexUserInputOption[] = [];
+    for (const optionValue of rawOptions) {
+      const option = object(optionValue);
+      if (!option || typeof option.label !== "string" || Buffer.byteLength(option.label) > 4096 ||
+        typeof option.description !== "string" && option.description !== undefined ||
+        typeof option.description === "string" && Buffer.byteLength(option.description) > 4096) return null;
+      options.push({ label: eventText(option.label, 4096), description: eventText(option.description ?? "", 4096) });
+    }
+    questions.push({
+      id: row.id,
+      header: eventText(row.header, 4096),
+      question: eventText(row.question, 4096),
+      options,
+      is_secret: row.isSecret === true,
+      is_other: row.isOther === true,
+    });
+  }
+  return Buffer.byteLength(JSON.stringify(questions)) <= 48 * 1024 && questions.every(codexUserInputQuestionValid) ? questions : null;
+}
+
+function codexQuestionEventPayloadValid(payload: JsonObject): boolean {
+  if (!validQuestionRequestID(payload.question_request_id) || !validQuestionVersion(payload.question_version)) return false;
+  if (payload.status === "pending") return Object.keys(payload).length === 4 && Array.isArray(payload.questions) &&
+    payload.questions.length > 0 && payload.questions.every(codexUserInputQuestionValid) &&
+    new Set(payload.questions.map((question) => (question as CodexUserInputQuestion).id)).size === payload.questions.length;
+  return Object.keys(payload).length === 3 && (payload.status === "answered" || payload.status === "stale") && payload.questions === undefined;
+}
+
+export function codexUserInputVersion(epoch: string, nonce: string,
+  context: Pick<CodexUserInputRequest, "profileKey" | "threadId" | "grantVersion" | "rpcID" | "turnId" | "itemId" | "questions">): string {
+  return hash(JSON.stringify({ epoch, nonce, profileKey: context.profileKey, threadId: context.threadId, grantVersion: context.grantVersion,
+    rpcID: context.rpcID, turnId: context.turnId, itemId: context.itemId, questions: context.questions }));
+}
+
+export function codexQuestionRequestMatches(request: CodexUserInputRequest, profileKey: string, threadId: string,
+  grantVersion: number, requestID: string, version: string): boolean {
+  return validQuestionRequestID(requestID) && validQuestionVersion(version) && request.id === requestID && request.version === version &&
+    request.profileKey === profileKey && request.threadId === threadId && request.grantVersion === grantVersion;
+}
+
+export function codexConsumeQuestionRequest(requests: Record<string, CodexUserInputRequest>, profileKey: string, threadId: string,
+  grantVersion: number, requestID: string, version: string): CodexUserInputRequest | null {
+  if (!Object.hasOwn(requests, requestID)) return null;
+  const request = requests[requestID];
+  if (!request || !codexQuestionRequestMatches(request, profileKey, threadId, grantVersion, requestID, version)) return null;
+  delete requests[requestID];
+  return request;
+}
+
+export function codexQuestionAnswerResponse(questions: CodexUserInputQuestion[], value: unknown): JsonObject | null {
+  const answers = object(value);
+  if (!answers || questions.length < 1 || questions.length > 64 || new Set(questions.map((question) => question.id)).size !== questions.length ||
+    Object.keys(answers).length !== questions.length) return null;
+  const response: [string, { answers: string[] }][] = [];
+  for (const question of questions) {
+    if (!Object.hasOwn(answers, question.id)) return null;
+    const answer = answers[question.id];
+    if (!Array.isArray(answer) || answer.length < 1 || answer.length > 64 ||
+      !answer.every((item) => typeof item === "string" && item.trim().length > 0 && Buffer.byteLength(item) <= 4096 &&
+        !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(item))) return null;
+    response.push([question.id, { answers: answer as string[] }]);
+  }
+  return response.length === Object.keys(answers).length ? { answers: Object.fromEntries(response) } : null;
+}
+
+export function codexQuestionEvent(request: CodexUserInputRequest, status: "pending" | "answered" | "stale", occurredAt = new Date().toISOString()): CodexEventInput {
+  if (status !== "pending") return codexQuestionStatusEvent(request.id, request.version, status, occurredAt, request.turnId, request.itemId);
+  return {
+    provider_event_id: `appserver:question:${hash(`${request.id}:${request.version}:${status}`)}`,
+    kind: "question", occurred_at: occurredAt, turn_id: request.turnId, item_id: request.itemId,
+    payload: {
+      question_request_id: request.id, question_version: request.version, status, questions: request.questions,
+    },
+    source: "live",
+  };
+}
+
+export function codexQuestionStatusEvent(requestID: string, version: string, status: "answered" | "stale", occurredAt = new Date().toISOString(),
+  turnId?: string, itemId?: string): CodexEventInput {
+  return {
+    provider_event_id: `appserver:question:${hash(`${requestID}:${version}:${status}`)}`,
+    kind: "question", occurred_at: occurredAt, ...(stableID(turnId) ? { turn_id: turnId } : {}), ...(stableID(itemId) ? { item_id: itemId } : {}),
+    payload: { question_request_id: requestID, question_version: version, status }, source: "live",
+  };
+}
+
+export function codexQuestionAnswerEvent(request: CodexUserInputRequest, answersValue: unknown, occurredAt = new Date().toISOString()): CodexEventInput | null {
+  const answers = object(codexQuestionAnswerResponse(request.questions, answersValue)?.answers);
+  if (!answers) return null;
+  const text = request.questions.flatMap((question) => {
+    if (question.is_secret) return [];
+    const answer = object(answers[question.id])?.answers;
+    return Array.isArray(answer) && answer.every((item) => typeof item === "string") && answer.length
+      ? [`${question.header || question.question}: ${(answer as string[]).join(", ")}`] : [];
+  }).join("\n");
+  if (!text) return null;
+  return {
+    provider_event_id: `appserver:question_answer:${hash(`${request.id}:${request.version}`)}`,
+    kind: "user_message", occurred_at: occurredAt, turn_id: request.turnId, item_id: request.itemId,
+    payload: { text: eventText(text, 32 * 1024) }, source: "live",
+  };
+}
+
+export function codexCommandsForExitedProfile(commandProfiles: ReadonlyMap<string, string>, commands: Record<string, CodexCommandLedger>, profileKey: string): string[] {
+  return [...commandProfiles.entries()]
+    .filter(([id, profile]) => profile === profileKey && PROFILE_EXIT_COMMAND_STATUSES.has(commands[id]?.status ?? ""))
+    .map(([id]) => id);
+}
 
 function eventInputValid(value: unknown): value is CodexEventInput {
   const row = object(value);
@@ -487,25 +686,29 @@ function eventInputValid(value: unknown): value is CodexEventInput {
     file_change: new Set(["path_label", "change", "summary"]), child_agent: new Set(["agent_label", "status", "summary"]),
     unsupported: new Set(["provider_type", "diagnostic"]), turn_started: new Set(["status"]),
     turn_completed: new Set(["status", "summary"]), turn_failed: new Set(["status", "error_code", "summary"]),
-    turn_cancelled: new Set(["status", "summary"]), approval_request: new Set(["approval_id", "approval_version", "kind", "summary", "object", "detail", "impact"]),
+    turn_cancelled: new Set(["status", "summary"]), question: new Set(["question_request_id", "question_version", "status", "questions"]),
+    approval_request: new Set(["approval_id", "approval_version", "kind", "summary", "object", "detail", "impact"]),
     approval_status: new Set(["approval_id", "approval_version", "status", "summary"]),
   };
   if (!row || !stableID(row.provider_event_id) || typeof row.kind !== "string" || !allowedKeys[row.kind] ||
     !payload || Object.keys(payload).some((key) => !allowedKeys[row.kind as string]!.has(key)) ||
-    !Object.values(payload).every((item) => typeof item === "string" && Buffer.byteLength(item) <= 32 * 1024 && !item.includes("\u0000") ||
+    !Object.entries(payload).every(([key, item]) => row.kind === "question" && key === "questions" ? Array.isArray(item) && item.every(codexUserInputQuestionValid) :
+      typeof item === "string" && Buffer.byteLength(item) <= 32 * 1024 && !item.includes("\u0000") ||
       typeof item === "number" && Number.isFinite(item) || typeof item === "boolean" || Array.isArray(item) && item.length <= 256 && item.every((part) => typeof part === "string" && Buffer.byteLength(part) <= 4096 && !part.includes("\u0000"))) ||
     typeof row.occurred_at !== "string" || !Number.isFinite(Date.parse(row.occurred_at)) ||
     (row.status !== undefined && (typeof row.status !== "string" || row.status.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(row.status))) ||
     (row.source !== "snapshot" && row.source !== "live" && row.source !== "approval") ||
-    (row.turn_id !== undefined && !stableID(row.turn_id)) || (row.item_id !== undefined && !stableID(row.item_id))) return false;
+    (row.turn_id !== undefined && !stableID(row.turn_id)) || (row.item_id !== undefined && !stableID(row.item_id)) ||
+    row.kind === "question" && (row.source !== "live" || !codexQuestionEventPayloadValid(payload))) return false;
   return true;
 }
 
 function validPersistentState(value: unknown, serviceInstanceID: string, installationId: string): value is CodexPersistentState {
   const state = object(value);
+  const commands = object(state?.commands);
   if (!state || state.version !== 1 || state.serviceInstanceID !== serviceInstanceID || state.installationId !== installationId ||
     !Array.isArray(state.profiles) || state.profiles.length > 20 || !Array.isArray(state.grants) || state.grants.length > 500 ||
-    !object(state.commands) || Object.keys(state.commands).length > 10000 ||
+    !commands || Object.keys(commands).length > 10000 ||
     !(state.selectedProfileKey === null || typeof state.selectedProfileKey === "string")) return false;
   const keys = new Set<string>();
   for (const value of state.profiles) {
@@ -519,6 +722,8 @@ function validPersistentState(value: unknown, serviceInstanceID: string, install
   if (state.selectedProfileKey !== null && !keys.has(state.selectedProfileKey)) return false;
   for (const value of state.grants) {
     const grant = object(value);
+    const approvals = object(grant?.approvals);
+    const questions = object(grant?.questions);
     if (!grant || typeof grant.id !== "string" || !/^l[a-z0-9]{7}$/.test(grant.id) || typeof grant.profileKey !== "string" || !keys.has(grant.profileKey) ||
       !stableID(grant.threadId) || typeof grant.title !== "string" || grant.title.length > 512 || typeof grant.cwdLabel !== "string" || grant.cwdLabel.length > 256 ||
       !(grant.updatedAt === null || typeof grant.updatedAt === "string" && Number.isFinite(Date.parse(grant.updatedAt))) || typeof grant.status !== "string" ||
@@ -526,8 +731,8 @@ function validPersistentState(value: unknown, serviceInstanceID: string, install
       !Number.isSafeInteger(grant.grantVersion) || !["pending", "available", "limited", "unknown", "disabled"].includes(String(grant.snapshotState)) || typeof grant.historyComplete !== "boolean" ||
       !(grant.historyCursor === null || typeof grant.historyCursor === "string" && grant.historyCursor.length <= 4096) ||
       !object(grant.candidateTurns) || !object(grant.knownItems) || !Array.isArray(grant.pendingEvents) || !grant.pendingEvents.every(eventInputValid) ||
-      grant.pendingEvents.length > MAX_LOCAL_EVENTS || !object(grant.approvals)) return false;
-    for (const [id, approvalValue] of Object.entries(grant.approvals)) {
+      grant.pendingEvents.length > MAX_LOCAL_EVENTS || !approvals || !questions) return false;
+    for (const [id, approvalValue] of Object.entries(approvals)) {
       const approval = object(approvalValue);
       if (!approval || id !== approval.id || !/^\d{1,24}$/.test(id) && !/^[A-Za-z0-9._~-]{1,128}$/.test(id) ||
         !(typeof approval.rpcID === "string" || typeof approval.rpcID === "number" && Number.isSafeInteger(approval.rpcID)) ||
@@ -535,8 +740,20 @@ function validPersistentState(value: unknown, serviceInstanceID: string, install
         approval.grantVersion !== grant.grantVersion || typeof approval.method !== "string" || !parseApprovalMethod(approval.method) ||
         !object(approval.params) || typeof approval.kind !== "string" || typeof approval.summary !== "string" || typeof approval.createdAt !== "string" || !Number.isFinite(Date.parse(approval.createdAt))) return false;
     }
+    if (Object.keys(questions).length > 100) return false;
+    for (const [id, requestValue] of Object.entries(questions)) {
+      const request = object(requestValue);
+      if (!request || id !== request.id || !validRpcID(request.rpcID) || request.id !== String(request.rpcID) ||
+        typeof request.version !== "string" || !/^[a-f0-9]{64}$/.test(request.version) || request.profileKey !== grant.profileKey ||
+        request.threadId !== grant.threadId || !grant.scopes.includes("live") || !grant.scopes.includes("send") ||
+        request.turnId === undefined || !stableID(request.turnId) ||
+        request.itemId === undefined || !stableID(request.itemId) || request.grantVersion !== grant.grantVersion ||
+        !Array.isArray(request.questions) || request.questions.length < 1 || request.questions.length > 64 ||
+        !request.questions.every(codexUserInputQuestionValid) || new Set(request.questions.map((question) => (question as CodexUserInputQuestion).id)).size !== request.questions.length ||
+        typeof request.createdAt !== "string" || !Number.isFinite(Date.parse(request.createdAt))) return false;
+    }
   }
-  for (const [id, value] of Object.entries(state.commands)) {
+  for (const [id, value] of Object.entries(commands)) {
     const item = object(value);
     if (!/^g[a-z0-9]{7}$/.test(id) || !item || typeof item.status !== "string" || item.status.length > 32 ||
       (item.providerRequestID !== undefined && !stableID(item.providerRequestID)) ||
@@ -552,7 +769,11 @@ function migratePersistentState(value: unknown): unknown {
     ...state,
     grants: state.grants.map((grantValue) => {
       const grant = object(grantValue);
-      return grant && !Object.hasOwn(grant, "historyCursor") ? { ...grant, historyCursor: null } : grantValue;
+      return grant ? {
+        ...(!Object.hasOwn(grant, "historyCursor") ? { historyCursor: null } : {}),
+        ...(!Object.hasOwn(grant, "questions") ? { questions: {} } : {}),
+        ...grant,
+      } : grantValue;
     }),
   };
 }
@@ -565,6 +786,67 @@ function snapshotTurnEvent(status: string): { kind: "turn_completed" | "turn_fai
   return null;
 }
 function turnEventID(status: string, turnID: string): string { return `turn:${status}:${hash(turnID)}`; }
+
+export function codexTurnDispatch(threadID: string, text: string, activeTurnID: string | null, clientMessageID: string): { method: "turn/start" | "turn/steer"; params: JsonObject } {
+  if (!stableID(threadID) || typeof text !== "string" || !text.trim() || text.length > 32768 || !stableID(clientMessageID) ||
+    !(activeTurnID === null || stableID(activeTurnID))) throw new Error("Invalid Codex message");
+  const input = [{ type: "text", text }];
+  return activeTurnID === null
+    ? { method: "turn/start", params: { threadId: threadID, input, clientUserMessageId: clientMessageID } }
+    : { method: "turn/steer", params: { threadId: threadID, expectedTurnId: activeTurnID, input, clientUserMessageId: clientMessageID } };
+}
+
+export function codexApprovalVersion(epoch: string, method: string, params: JsonObject): string {
+  return hash(JSON.stringify({ epoch, method, params }));
+}
+
+export function codexApprovalStatusEvent(approval: Pick<CodexApprovalRequest, "id" | "version" | "params">, status: string, summary?: string): CodexEventInput {
+  const turnID = approval.params.turnId;
+  return {
+    provider_event_id: `morde:approval:${hash(`${approval.id}:${approval.version}:${status}`)}`,
+    kind: "approval_status", occurred_at: new Date().toISOString(),
+    ...(stableID(turnID) ? { turn_id: turnID } : {}),
+    payload: { approval_id: approval.id, approval_version: approval.version, status, ...(summary ? { summary: eventText(summary, 4096) } : {}) },
+    source: "approval",
+  };
+}
+
+export function codexUnsupportedNotificationEvent(method: string, threadID: string, params: JsonObject, occurredAt = new Date().toISOString()): CodexEventInput {
+  const turnID = stableID(params.turnId) ? params.turnId : undefined;
+  const itemID = stableID(params.itemId) ? params.itemId : undefined;
+  const safeMethod = /^[a-zA-Z][A-Za-z0-9/_-]{0,127}$/.test(method) ? method : "unknown";
+  return {
+    provider_event_id: `appserver:unsupported:${hash(`${threadID}\0${safeMethod}\0${turnID ?? ""}\0${itemID ?? ""}`)}`,
+    kind: "unsupported", occurred_at: occurredAt,
+    ...(turnID ? { turn_id: turnID } : {}), ...(itemID ? { item_id: itemID } : {}),
+    payload: { provider_type: "app_server_notification", diagnostic: `Morde 暂不支持 Codex App Server 通知：${safeMethod}` },
+    source: "live",
+  };
+}
+
+export function codexErrorNotificationEvent(threadID: string, params: JsonObject, occurredAt = new Date().toISOString()): { turnID: string; willRetry: boolean; event: CodexEventInput } | null {
+  const turnID = params.turnId;
+  const error = object(params.error);
+  if (!stableID(turnID) || typeof params.willRetry !== "boolean" || typeof error?.message !== "string") return null;
+  const additionalDetails = typeof error.additionalDetails === "string" ? error.additionalDetails.trim() : "";
+  const detail = eventText(additionalDetails || error.message, 4096) || "Codex 返回了错误";
+  return params.willRetry
+    ? {
+        turnID, willRetry: true,
+        event: {
+          provider_event_id: codexProviderEventID("app_server_retry", turnID, `error:${threadID}`), kind: "unsupported", occurred_at: occurredAt,
+          turn_id: turnID, payload: { provider_type: "app_server_error", diagnostic: eventText(`Codex 遇到临时错误，App Server 将自动重试：${detail}`, 4096) }, source: "live",
+        },
+      }
+    : {
+        turnID, willRetry: false,
+        event: {
+          provider_event_id: codexProviderEventID("turn_failed", turnID, `error:${threadID}`), kind: "turn_failed", occurred_at: occurredAt,
+          turn_id: turnID, status: "failed", payload: { status: "failed", error_code: "codex_error", summary: detail }, source: "live",
+        },
+      };
+}
+
 function turnCompletedAt(turn: CodexTurn): string { return unixSecondsISO(turn.completedAt) ?? new Date().toISOString(); }
 
 function visibleText(item: JsonObject): string | null {
@@ -635,7 +917,10 @@ function itemEvent(
   payload: Record<string, unknown>, status?: string,
 ): CodexEventInput {
   const event: CodexEventInput = {
-    provider_event_id: codexItemEventID(kind, turn.id, `${item.id}:${suffix}`), kind,
+    // Including the source item fingerprint gives each visible version a stable ID.
+    // Cloud dedupe can then collapse identical live/snapshot/final projections without
+    // dropping a changed active snapshot.
+    provider_event_id: codexItemEventID(kind, turn.id, `${item.id}:${suffix}:${codexSnapshotItemFingerprint(item)}`), kind,
     occurred_at: turnCompletedAt(turn), turn_id: turn.id, item_id: String(item.id), payload, source: "snapshot",
   };
   if (status !== undefined) event.status = nativeStatus(status);
@@ -650,9 +935,14 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
   const events: CodexEventInput[] = [];
   const pushText = (kind: "user_message" | "assistant_message", text: string) => {
     const chunks = boundedMessageChunks(text);
-    chunks.forEach((chunk, index) => events.push(itemEvent(kind, itemTurn, { ...item, id }, `message:${index}`, {
-      text: chunk, ...(chunks.length > 1 ? { segment_id: `${id}:${index}` } : {}),
-    })));
+    chunks.forEach((chunk, index) => {
+      // Snapshot chunks stay in the assistant_message family. iOS groups each stable
+      // segment_id and keeps the newest version of that segment before joining chunks.
+      events.push(itemEvent(kind, itemTurn, { ...item, id }, `message:${index}`, {
+        text: chunk,
+        ...(chunks.length > 1 || kind === "assistant_message" ? { segment_id: `${id}:${index}` } : {}),
+      }));
+    });
   };
   const pushOutput = (tool: string, summary: string, output: string, status: string, exitCode?: number) => {
     const chunks = boundedMessageChunks(output);
@@ -742,7 +1032,7 @@ export function codexSnapshotItemEvents(turn: CodexTurn, item: JsonObject): Code
           const row = object(option);
           return typeof row?.label === "string" ? [`• ${row.label}`] : typeof option === "string" ? [`• ${option}`] : [];
         }) : []),
-        "Morde 当前只同步问题内容，不提供问题回答协议。",
+        "thread/read 快照只包含问题内容，不包含对应的原始 RPC handle；若问题由其他 Codex App Server 发起，Morde 无法通过此快照回答，请在原 Codex 客户端处理。",
       ].filter(Boolean).join("\n");
       events.push(itemEvent("unsupported", itemTurn, { ...item, id }, `question:${index}`, {
         provider_type: "user_question", diagnostic: eventText(diagnostic),
@@ -769,8 +1059,8 @@ function parseApprovalMethod(method: string): { kind: string; decision: (approve
 }
 
 function approvalSummary(params: JsonObject): string {
-  const command = boundedString(params.command, 160);
-  const reason = boundedString(params.reason, 160);
+  const command = visibleLabel(params.command, 160) || null;
+  const reason = visibleLabel(params.reason, 160) || null;
   const permissionNames = object(params.permissions) ? Object.keys(object(params.permissions)!).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).join(", ") : "";
   return command ?? reason ?? (permissionNames ? `Codex 权限请求：${permissionNames}` : "Codex 请求审批");
 }
@@ -789,14 +1079,14 @@ function approvalPermissionDetail(params: JsonObject): string | null {
   const fileSystem = object(permissions?.fileSystem);
   const requested: string[] = [];
   for (const access of ["read", "write"] as const) {
-    const paths = Array.isArray(fileSystem?.[access]) ? fileSystem[access] as unknown[] : [];
-    for (const path of paths.slice(0, 20)) {
+    const paths = fileSystem?.[access];
+    for (const path of (Array.isArray(paths) ? paths : []).slice(0, 20)) {
       const label = approvalPathLabel(path);
       if (label) requested.push(`${access}: ${label}`);
     }
   }
-  const entries = Array.isArray(fileSystem?.entries) ? fileSystem.entries : [];
-  for (const value of entries.slice(0, 20)) {
+  const entries = fileSystem?.entries;
+  for (const value of (Array.isArray(entries) ? entries : []).slice(0, 20)) {
     const entry = object(value);
     const label = entry && approvalPathLabel(entry.path);
     if (entry && ["read", "write", "deny"].includes(String(entry.access)) && label) requested.push(`${entry.access}: ${label}`);
@@ -808,8 +1098,8 @@ function approvalPermissionDetail(params: JsonObject): string | null {
 
 export function codexApprovalPresentation(kind: string, params: JsonObject): { summary: string; object?: string; detail?: string; impact?: string } {
   const summary = approvalSummary(params);
-  const reason = visibleLabel(params.reason, 4096);
-  const command = visibleLabel(params.command, 4096);
+  const reason = visibleLabel(params.reason, 4096) || null;
+  const command = visibleLabel(params.command, 4096) || null;
   const cwd = approvalPathLabel(params.cwd);
   const grantRoot = approvalPathLabel(params.grantRoot);
   const permissionDetail = approvalPermissionDetail(params);
@@ -840,15 +1130,33 @@ export class MordeCodexRuntime {
   private lastError: string | null = null;
   private deltaIndices = new Map<string, number>();
   private completedTurns = new Set<string>();
+  private failedTurns = new Set<string>();
+  private activeCommandProfiles = new Map<string, string>();
   private generation = 0;
+  private approvalEpoch = randomUUID();
 
   constructor(private readonly api: CodexAPI, private readonly persistence: RuntimePersistence, private readonly onChange: () => void) {}
 
   load(serviceInstanceID: string, installationId: string): void {
     this.generation++;
+    this.active = false;
+    if (this.claimTimer) clearInterval(this.claimTimer);
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.snapshotTimer) clearInterval(this.snapshotTimer);
+    this.claimTimer = this.flushTimer = this.snapshotTimer = null;
+    const oldProviders = new Map(this.providers);
+    this.activeCommandProfiles.clear();
+    for (const grant of this.data?.grants ?? []) {
+      this.invalidateGrantApprovals(grant, oldProviders.get(grant.profileKey), true);
+      this.invalidateGrantQuestions(grant, oldProviders.get(grant.profileKey), true);
+    }
+    this.providers.clear();
+    for (const provider of oldProviders.values()) void provider.stop().catch(() => undefined);
+    this.approvalEpoch = randomUUID();
     this.providerStates.clear();
     this.deltaIndices.clear();
     this.completedTurns.clear();
+    this.failedTurns.clear();
     this.loadFailed = false;
     this.data = {
       version: 1, serviceInstanceID, installationId, profiles: [], selectedProfileKey: null, grants: [], commands: {},
@@ -865,10 +1173,15 @@ export class MordeCodexRuntime {
       this.lastError = "Codex 本机授权状态无法安全读取；Provider 已暂停。";
       this.data = { version: 1, serviceInstanceID, installationId, profiles: [], selectedProfileKey: null, grants: [], commands: {} };
     }
+    for (const grant of this.data.grants) {
+      this.invalidateGrantApprovals(grant, undefined, false);
+      this.invalidateGrantQuestions(grant, undefined, false);
+    }
   }
 
   async start(): Promise<void> {
     if (!this.data || this.active || this.loadFailed) return;
+    this.approvalEpoch = randomUUID();
     this.active = true;
     for (const profile of this.data.profiles) {
       try { await this.ensureProvider(profile); }
@@ -884,11 +1197,18 @@ export class MordeCodexRuntime {
   async stop(): Promise<void> {
     this.generation++;
     this.active = false;
+    this.deltaIndices.clear();
+    this.completedTurns.clear();
+    this.failedTurns.clear();
     if (this.claimTimer) clearInterval(this.claimTimer);
     if (this.flushTimer) clearInterval(this.flushTimer);
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
     this.claimTimer = this.flushTimer = this.snapshotTimer = null;
-    const providers = [...this.providers.values()];
+    const providers = new Map(this.providers);
+    for (const grant of this.data?.grants ?? []) {
+      this.invalidateGrantApprovals(grant, providers.get(grant.profileKey), true);
+      this.invalidateGrantQuestions(grant, providers.get(grant.profileKey), true);
+    }
     this.providers.clear();
     for (const item of Object.values(this.data?.commands ?? {})) {
       if (["dispatching", "claimed", "running", "forwarded", "waiting_approval"].includes(item.status)) {
@@ -897,8 +1217,9 @@ export class MordeCodexRuntime {
         item.resultPending = true;
       }
     }
+    this.activeCommandProfiles.clear();
     try { this.persist(); } catch { this.lastError = "Codex 命令恢复状态未能保存；操作结果可能未知。"; }
-    for (const provider of providers) await provider.stop().catch(() => undefined);
+    for (const provider of providers.values()) await provider.stop().catch(() => undefined);
     for (const profile of this.data?.profiles ?? []) this.providerStates.set(profile.profileKey, { state: "stopped", error: null });
     this.onChange();
   }
@@ -974,12 +1295,12 @@ export class MordeCodexRuntime {
     const old = state.grants.find((grant) => grant.profileKey === profile.profileKey && grant.threadId === threadID);
     const provider = await this.ensureProvider(profile);
     const listed = await provider.listThreads();
-    if (!listed.some((thread) => thread.id === threadID)) throw new Error("线程不在当前 Codex profile 的可授权列表中");
+    if (!listed.items.some((thread) => thread.id === threadID)) throw new Error("线程不在当前 Codex profile 的可授权列表中");
     if (old) {
       await this.updateScopes(old.id, scopesValue);
       return { id: old.id, grantVersion: old.grantVersion };
     }
-    const snapshot = await provider.readSnapshot(threadID, new Set(Object.keys(old?.candidateTurns ?? {})));
+    const snapshot = await provider.readSnapshot(threadID);
     const cwdLabel = safeCwdLabel(snapshot.thread.cwd);
     const discover: CodexDiscoverInput = {
       profile_key: profile.profileKey, thread_id: snapshot.thread.id, title: snapshot.thread.name.slice(0, 512),
@@ -988,9 +1309,9 @@ export class MordeCodexRuntime {
     };
     const response = await this.api.codexDiscover(discover);
     const grant: CodexGrant = old ?? {
-      id: response.id, profileKey: profile.profileKey, threadId, title: discover.title, cwdLabel, updatedAt: discover.updated_at,
+      id: response.id, profileKey: profile.profileKey, threadId: threadID, title: discover.title, cwdLabel, updatedAt: discover.updated_at,
       status: discover.status, scopes: response.scopes, grantVersion: response.grant_version,
-      snapshotState: "pending", historyComplete: false, historyCursor: null, candidateTurns: {}, knownItems: {}, pendingEvents: [], approvals: {},
+      snapshotState: "pending", historyComplete: false, historyCursor: null, candidateTurns: {}, knownItems: {}, pendingEvents: [], approvals: {}, questions: {},
     };
     grant.id = response.id;
     grant.title = discover.title;
@@ -1019,6 +1340,7 @@ export class MordeCodexRuntime {
     const profile = this.requireProfile(grant.profileKey);
     const requested = scopesValue as CodexScope[];
     grant.scopes = grant.scopes.filter((scope) => requested.includes(scope));
+    this.invalidateGrantQuestions(grant, this.providers.get(profile.profileKey), true);
     if (!requested.includes("read")) {
       grant.snapshotState = "disabled";
       grant.snapshotMessage = "读取范围已移除；未确认事件保留在本机并暂停上传。";
@@ -1088,11 +1410,27 @@ export class MordeCodexRuntime {
       provider.setHandlers({
         notification: (method, params) => { if (this.generation === generation && this.active) void this.handleNotification(profile.profileKey, method, params); },
         request: (id, method, params) => { if (this.generation === generation && this.active) this.handleServerRequest(profile.profileKey, id, method, params); },
-        exit: (error) => { if (this.generation === generation) { this.providerStates.set(profile.profileKey, { state: "unavailable", error }); this.onChange(); } },
+        exit: (error) => {
+          if (this.generation !== generation) return;
+          this.approvalEpoch = randomUUID();
+          this.markProfileCommandsUnknown(profile.profileKey);
+          for (const grant of this.data?.grants ?? []) {
+            if (grant.profileKey === profile.profileKey) {
+              this.invalidateGrantApprovals(grant, undefined, false);
+              this.invalidateGrantQuestions(grant, undefined, false);
+            }
+          }
+          this.providerStates.set(profile.profileKey, { state: "unavailable", error });
+          this.onChange();
+        },
       });
       this.providers.set(profile.profileKey, provider);
     }
     if (!provider.isRunning) {
+      this.approvalEpoch = randomUUID();
+      for (const grant of this.data?.grants ?? []) {
+        if (grant.profileKey === profile.profileKey) this.invalidateGrantQuestions(grant, provider, true);
+      }
       this.providerStates.set(profile.profileKey, { state: "connecting", error: null });
       this.onChange();
       try {
@@ -1110,25 +1448,65 @@ export class MordeCodexRuntime {
 
   private async handleNotification(profileKey: string, method: string, value: unknown): Promise<void> {
     const params = object(value);
+    if (!params) return;
     const threadID = params?.threadId;
     if (!stableID(threadID)) return;
     const grant = this.data?.grants.find((item) => item.profileKey === profileKey && item.threadId === threadID);
     if (!grant) return;
     const turn = object(params?.turn);
+    const now = new Date().toISOString();
+    if (method === "error") {
+      const projection = codexErrorNotificationEvent(threadID, params, now);
+      if (!projection) {
+        if (grant.scopes.includes("live")) this.queueEvent(grant, codexUnsupportedNotificationEvent(method, threadID, params, now));
+        return;
+      }
+      if (!projection.willRetry) {
+        const turnKey = `${profileKey}\0${threadID}\0${projection.turnID}`;
+        this.failedTurns.add(turnKey);
+        const ledgers = Object.entries(this.requireState().commands).filter(([id, item]) =>
+          this.activeCommandProfiles.get(id) === profileKey && item.providerRequestID === projection.turnID && ["running", "waiting_approval", "forwarded"].includes(item.status));
+        for (const [id, ledger] of ledgers) {
+          if (ledger.status === "forwarded") {
+            ledger.status = "completed";
+            delete ledger.resultCode;
+          } else {
+            ledger.status = "failed";
+            ledger.resultCode = "codex_error";
+          }
+          ledger.resultPending = true;
+          this.activeCommandProfiles.delete(id);
+        }
+        if (ledgers.length) {
+          try { this.persist(); } catch { this.lastError = "Codex turn 结果无法保存；状态未知。"; }
+          void this.flushResults();
+        }
+      }
+      if (!grant.scopes.includes("live")) return;
+      this.queueEvent(grant, projection.event);
+      return;
+    }
     if (method === "turn/completed" && stableID(turn?.id)) {
       const turnKey = `${profileKey}\0${threadID}\0${turn.id}`;
-      this.completedTurns.add(turnKey);
-      const ledger = Object.values(this.requireState().commands).find((item) => item.providerRequestID === turn.id && item.status === "running");
-      if (ledger) {
-        ledger.status = turn.status === "completed" || turn.status === "interrupted" ? "completed" : "failed";
-        if (turn.status === "interrupted") ledger.resultCode = "turn_interrupted";
+      const completed = turn.status === "completed" || turn.status === "interrupted";
+      if (completed) this.completedTurns.add(turnKey);
+      else this.failedTurns.add(turnKey);
+      const ledgers = Object.entries(this.requireState().commands).filter(([id, item]) =>
+        this.activeCommandProfiles.get(id) === profileKey && item.providerRequestID === turn.id && ["running", "waiting_approval", "forwarded"].includes(item.status));
+      for (const [id, ledger] of ledgers) {
+        ledger.status = ledger.status === "forwarded" ? "completed" : completed ? "completed" : "failed";
+        if (ledger.status === "completed" && turn.status === "interrupted") ledger.resultCode = "turn_interrupted";
+        else if (ledger.status === "failed") ledger.resultCode = "turn_failed";
+        else delete ledger.resultCode;
         ledger.resultPending = true;
+        this.activeCommandProfiles.delete(id);
+      }
+      if (ledgers.length) {
         try { this.persist(); } catch { this.lastError = "Codex turn 结果无法保存；状态未知。"; }
         void this.flushResults();
       }
     }
     if (!grant.scopes.includes("live")) return;
-    const now = new Date().toISOString();
     let event: CodexEventInput | null = null;
     if (method === "turn/started") {
       if (!stableID(turn?.id)) return;
@@ -1138,7 +1516,7 @@ export class MordeCodexRuntime {
       const status = typeof turn.status === "string" ? turn.status : "unknown";
       const kind = status === "completed" ? "turn_completed" : status === "interrupted" ? "turn_cancelled" : "turn_failed";
       event = { provider_event_id: turnEventID(kind, turn.id), kind, occurred_at: now, turn_id: turn.id, status, payload: { status }, source: "live" };
-      } else if (method === "item/agentMessage/delta") {
+    } else if (method === "item/agentMessage/delta") {
       const turnID = params.turnId, itemID = params.itemId, delta = boundedString(params.delta, 24 * 1024);
       if (!stableID(turnID) || !stableID(itemID) || delta === null) return;
       const key = `${threadID}\0${turnID}\0${itemID}`;
@@ -1148,81 +1526,165 @@ export class MordeCodexRuntime {
         provider_event_id: codexProviderEventID("assistant_delta", turnID, `${itemID}:${index}`), kind: "assistant_delta",
         occurred_at: now, turn_id: turnID, item_id: itemID, payload: { text: delta, segment_id: itemID, delta_index: index }, source: "live",
       };
-      } else if (method === "item/started" || method === "item/completed") {
-        const turnID = params.turnId, item = object(params.item);
-        if (!stableID(turnID) || !item || !stableID(item.id) || typeof item.type !== "string") return;
-        const projected = codexSnapshotItemEvents({ id: turnID, status: method === "item/completed" ? "completed" : "inProgress", startedAt: Date.now() / 1000, completedAt: Date.now() / 1000, items: [], itemsView: "full" }, item);
-        for (const itemEvent of projected) {
-          if (method === "item/started" && itemEvent.kind === "tool_result") continue;
-          this.queueEvent(grant, {
-            ...itemEvent, occurred_at: now, source: "live",
-          });
-        }
+    } else if (method === "item/started" || method === "item/completed") {
+      const turnID = params.turnId, item = object(params.item);
+      if (!stableID(turnID) || !item || !stableID(item.id) || typeof item.type !== "string") return;
+      const projected = codexSnapshotItemEvents({ id: turnID, status: method === "item/completed" ? "completed" : "inProgress", startedAt: Date.now() / 1000, completedAt: Date.now() / 1000, items: [], itemsView: "full" }, item);
+      if (!projected.length) {
+        const itemType = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(item.type) ? item.type : "unknown";
+        this.queueEvent(grant, {
+          provider_event_id: codexProviderEventID("unsupported_item", turnID, item.id), kind: "unsupported", occurred_at: now,
+          turn_id: turnID, item_id: item.id,
+          payload: { provider_type: "app_server_item", diagnostic: `Morde 暂不支持 Codex item 类型：${itemType}` }, source: "live",
+        });
         return;
-      } else if (method === "item/reasoning/summaryTextDelta" || method === "item/plan/delta" || method === "item/commandExecution/outputDelta") {
-        const turnID = params.turnId, itemID = params.itemId;
-        const delta = boundedString(params.delta, 24 * 1024);
-        if (!stableID(turnID) || !stableID(itemID) || delta === null) return;
-        const key = `${threadID}\0${turnID}\0${itemID}:${method}`;
-        const index = this.deltaIndices.get(key) ?? 0;
-        this.deltaIndices.set(key, index + 1);
-        const kind = method === "item/reasoning/summaryTextDelta" ? "reasoning_summary" : method === "item/plan/delta" ? "plan" : "tool_result";
-        const payload = kind === "reasoning_summary" ? { text: delta } : kind === "plan" ? { summary: delta, items: [] } : {
-          tool: "command", summary: "Codex command output", output: delta, status: "inProgress",
-        };
-        event = {
-          provider_event_id: codexProviderEventID(kind, turnID, `${itemID}:${method}:${index}`), kind,
-          occurred_at: now, turn_id: turnID, item_id: itemID, status: "in_progress", payload, source: "live",
-        };
-      } else if (method === "turn/plan/updated") {
-        const turnID = params.turnId;
-        if (!stableID(turnID) || !Array.isArray(params.plan)) return;
-        const items = params.plan.flatMap((value) => {
-          const step = object(value);
-          return typeof step?.step === "string" ? [eventText(step.step, 4096)] : [];
-        }).slice(0, 256);
-        const summary = typeof params.explanation === "string" ? eventText(params.explanation) : items.join("\n");
-        event = { provider_event_id: codexProviderEventID("plan", turnID, `turn-plan:${hash(JSON.stringify({ summary, items }))}`), kind: "plan", occurred_at: now,
-          turn_id: turnID, payload: { summary, items }, source: "live" };
+      }
+      for (const itemEvent of projected) {
+        if (method === "item/started" && itemEvent.kind === "tool_result") continue;
+        this.queueEvent(grant, {
+          ...itemEvent, occurred_at: now, source: "live",
+        });
+      }
+      return;
+    } else if (method === "item/reasoning/summaryTextDelta" || method === "item/plan/delta" || method === "item/commandExecution/outputDelta") {
+      const turnID = params.turnId, itemID = params.itemId;
+      const delta = boundedString(params.delta, 24 * 1024);
+      if (!stableID(turnID) || !stableID(itemID) || delta === null) return;
+      const key = `${threadID}\0${turnID}\0${itemID}:${method}`;
+      const index = this.deltaIndices.get(key) ?? 0;
+      this.deltaIndices.set(key, index + 1);
+      const kind = method === "item/reasoning/summaryTextDelta" ? "reasoning_summary" : method === "item/plan/delta" ? "plan" : "tool_result";
+      const payload = kind === "reasoning_summary" ? { text: delta } : kind === "plan" ? { summary: delta, items: [] } : {
+        tool: "command", summary: "Codex command output", output: delta, status: "inProgress",
+      };
+      event = {
+        provider_event_id: codexProviderEventID(kind, turnID, `${itemID}:${method}:${index}`), kind,
+        occurred_at: now, turn_id: turnID, item_id: itemID, status: "in_progress", payload, source: "live",
+      };
+    } else if (method === "turn/plan/updated") {
+      const turnID = params.turnId;
+      if (!stableID(turnID) || !Array.isArray(params.plan)) return;
+      const items = params.plan.flatMap((value) => {
+        const step = object(value);
+        return typeof step?.step === "string" ? [eventText(step.step, 4096)] : [];
+      }).slice(0, 256);
+      const summary = typeof params.explanation === "string" ? eventText(params.explanation) : items.join("\n");
+      event = { provider_event_id: codexProviderEventID("plan", turnID, `turn-plan:${hash(JSON.stringify({ summary, items }))}`), kind: "plan", occurred_at: now,
+        turn_id: turnID, payload: { summary, items }, source: "live" };
     }
-    if (!event) return;
+    if (!event) event = codexUnsupportedNotificationEvent(method, threadID, params, now);
     this.queueEvent(grant, event);
+  }
+
+  private invalidateGrantApprovals(grant: CodexGrant, provider: MordeCodexProvider | undefined, respond: boolean): void {
+    for (const [id, approval] of Object.entries(grant.approvals)) {
+      if (respond && provider) {
+        const capability = parseApprovalMethod(approval.method);
+        if (capability) try { provider.respond(approval.rpcID, capability.decision(false, approval.params)); } catch { /* Old process may already be gone. */ }
+      }
+      delete grant.approvals[id];
+      this.queueEvent(grant, codexApprovalStatusEvent(approval, "stale", "Codex App Server 已停止，待处理审批已失效。"));
+    }
+    if (Object.keys(grant.approvals).length === 0) {
+      try { this.persist(); } catch { this.lastError = "Stale Codex approvals could not be saved; approval responses are disabled."; }
+    }
+  }
+
+  private invalidateGrantQuestions(grant: CodexGrant, provider: MordeCodexProvider | undefined, respond: boolean): void {
+    const requests = Object.values(grant.questions);
+    if (!requests.length) return;
+    const staleEvents: CodexEventInput[] = [];
+    for (const request of requests) {
+      if (respond && provider) {
+        try { provider.respondError(request.rpcID, -32000, "Morde user-input request is stale"); } catch { /* Old process may already be gone. */ }
+      }
+      if (grant.scopes.includes("live")) staleEvents.push(codexQuestionEvent(request, "stale"));
+    }
+    grant.questions = {};
+    if (staleEvents.length && this.queueEvents(grant, staleEvents)) return;
+    try { this.persist(); }
+    catch { this.lastError = "Stale Codex user-input requests could not be saved; answers remain disabled."; }
+  }
+
+  private markProfileCommandsUnknown(profileKey: string): void {
+    const state = this.data;
+    if (!state) return;
+    const commandIDs = codexCommandsForExitedProfile(this.activeCommandProfiles, state.commands, profileKey);
+    if (!commandIDs.length) return;
+    for (const id of commandIDs) {
+      const command = state.commands[id];
+      if (!command) continue;
+      command.status = "unknown";
+      command.resultCode = "provider_process_exited";
+      command.resultPending = true;
+      this.activeCommandProfiles.delete(id);
+    }
+    try { this.persist(); } catch { this.lastError = "Codex App Server 已退出，命令结果未能保存。"; }
+    void this.flushResults();
+    this.onChange();
+  }
+
+  private commandWasInvalidatedByProviderExit(id: string): boolean {
+    const command = this.data?.commands[id];
+    return command?.status === "unknown" && command.resultCode === "provider_process_exited";
   }
 
   private handleServerRequest(profileKey: string, rpcID: number | string, method: string, value: unknown): void {
     const params = object(value);
-    const threadID = params?.threadId;
+    const threadID = stableID(params?.threadId) ? params.threadId : null;
     const grant = stableID(threadID) ? this.data?.grants.find((item) => item.profileKey === profileKey && item.threadId === threadID) : undefined;
     const capability = parseApprovalMethod(method);
     const provider = this.providers.get(profileKey);
     if (!provider) return;
     if (method === "item/tool/requestUserInput") {
-      if (grant && grant.scopes.includes("approval") && params && Array.isArray(params.questions)) {
-        const diagnostic = params.questions.flatMap((value) => {
-          const question = object(value);
-          return question && typeof question.question === "string" ? [eventText(question.question, 4096)] : [];
-        }).slice(0, 16).join("\n");
-        this.queueEvent(grant, {
-          provider_event_id: `appserver:question:${hash(`${threadID}:${String(rpcID)}:${diagnostic}`)}`,
-          kind: "unsupported", occurred_at: new Date().toISOString(),
-          turn_id: stableID(params.turnId) ? params.turnId : undefined,
-          item_id: stableID(params.itemId) ? params.itemId : undefined,
-          payload: { provider_type: "user_question", diagnostic: eventText(`Codex 请求用户输入：\n${diagnostic}\nMorde 当前仅同步问题内容，不能提交回答。`) },
-          source: "approval",
-        });
+      // A live scope is required before any question content is sent to Morde.
+      if (!grant || !params || !grant.scopes.includes("live")) {
+        provider.respondError(rpcID, -32000, "Codex user-input request is unavailable or not authorized by Morde");
+        return;
       }
-      // Morde's command contract currently has approve/reject only; never invent an answer.
-      provider.respondError(rpcID, -32000, "Morde cannot answer this Codex user-input request");
+      const questions = codexUserInputQuestions(params.questions);
+      const turnId = params.turnId;
+      const itemId = params.itemId;
+      if (!validRpcID(rpcID) || !String(rpcID).trim() || !questions || !stableID(turnId) || !stableID(itemId)) {
+        provider.respondError(rpcID, -32600, "Invalid Codex user-input request");
+        return;
+      }
+      const id = String(rpcID);
+      if (Object.hasOwn(grant.questions, id)) {
+        provider.respondError(rpcID, -32600, "Duplicate Codex user-input request id");
+        return;
+      }
+      const base = { profileKey, threadId: grant.threadId, grantVersion: grant.grantVersion, rpcID, turnId, itemId, questions };
+      const record: CodexUserInputRequest = {
+        id, rpcID, profileKey, threadId: grant.threadId, turnId, itemId, grantVersion: grant.grantVersion,
+        questions, version: codexUserInputVersion(this.approvalEpoch, randomUUID(), base), createdAt: new Date().toISOString(),
+      };
+      if (!grant.scopes.includes("send")) {
+        if (this.queueEvents(grant, [codexQuestionEvent(record, "pending"), codexQuestionEvent(record, "stale")])) {
+          provider.respondError(rpcID, -32000, "Codex user-input request cannot be answered without send authorization");
+        } else provider.respondError(rpcID, -32000, "Codex user-input request could not be saved");
+        return;
+      }
+      if (Object.keys(grant.questions).length >= 100) {
+        provider.respondError(rpcID, -32000, "Too many pending Codex user-input requests");
+        return;
+      }
+      grant.questions = Object.assign(Object.create(null) as Record<string, CodexUserInputRequest>, grant.questions);
+      grant.questions[id] = record;
+      if (!this.queueEvent(grant, codexQuestionEvent(record, "pending"))) {
+        delete grant.questions[id];
+        provider.respondError(rpcID, -32000, "Codex user-input request could not be saved");
+      }
       return;
     }
-    if (!params || !grant || !capability || !grant.scopes.includes("approval")) {
+    if (!params || !threadID || !grant || !capability || !grant.scopes.includes("approval")) {
       if (capability) provider.respond(rpcID, capability.decision(false, params ?? undefined));
       else provider.respondError(rpcID, -32000, "Approval request is unavailable or not authorized by Morde");
       return;
     }
     const id = String(rpcID);
     if (!stableID(id) || Buffer.byteLength(id) > 128) { provider.respondError(rpcID, -32600, "Invalid approval request id"); return; }
-    const version = hash(JSON.stringify({ method, params }));
+    const version = codexApprovalVersion(this.approvalEpoch, method, params);
     const presentation = codexApprovalPresentation(capability.kind, params);
     const record: CodexApprovalRequest = {
       id, rpcID, version, profileKey, threadId: threadID, grantVersion: grant.grantVersion,
@@ -1241,6 +1703,17 @@ export class MordeCodexRuntime {
     if (!queued) {
       delete grant.approvals[id];
       provider.respond(rpcID, capability.decision(false, params));
+    } else if (stableID(params.turnId)) {
+      const ledgers = Object.entries(this.requireState().commands).filter(([id, item]) =>
+        this.activeCommandProfiles.get(id) === profileKey && item.providerRequestID === params.turnId && item.status === "running");
+      for (const [, ledger] of ledgers) {
+        ledger.status = "waiting_approval";
+        ledger.resultPending = true;
+      }
+      if (ledgers.length) {
+        try { this.persist(); } catch { this.lastError = "Codex approval wait state could not be saved; result is unknown."; }
+        void this.flushResults();
+      }
     }
   }
 
@@ -1277,7 +1750,7 @@ export class MordeCodexRuntime {
       return;
     }
     const grant = state.grants.find((item) => item.id === command.session_id && item.profileKey === command.profile_key && item.threadId === command.thread_id);
-    const required: CodexScope = command.type === "send" ? "send" : command.type === "interrupt" ? "interrupt" : "approval";
+    const required: CodexScope = command.type === "send" || command.type === "answer_question" ? "send" : command.type === "interrupt" ? "interrupt" : "approval";
     if (!grant || grant.grantVersion !== command.grant_version || !grant.scopes.includes(required)) {
       state.commands[command.id] = { status: "failed", resultCode: "scope_unavailable", resultPending: true };
       this.persist();
@@ -1291,66 +1764,174 @@ export class MordeCodexRuntime {
     }
     state.commands[command.id] = { status: "dispatching" };
     this.persist();
+    this.activeCommandProfiles.set(command.id, profile.profileKey);
     try {
-      const provider = await this.ensureProvider(profile);
-      if (generation !== this.generation || !this.active) return;
-      if (grant.grantVersion !== command.grant_version || !grant.scopes.includes(required)) {
-        state.commands[command.id] = { status: "failed", resultCode: "scope_revoked_before_dispatch", resultPending: true };
-        this.persist();
-        await this.flushResults();
-        return;
-      }
-      if (command.type === "send") {
-        await provider.resume(command.thread_id);
+      let sendDispatchAttempted = false;
+      try {
+        const provider = await this.ensureProvider(profile);
+        if (this.commandWasInvalidatedByProviderExit(command.id)) return;
         if (generation !== this.generation || !this.active) return;
-        if (grant.grantVersion !== command.grant_version || !grant.scopes.includes("send")) {
+        if (grant.grantVersion !== command.grant_version || !grant.scopes.includes(required)) {
           state.commands[command.id] = { status: "failed", resultCode: "scope_revoked_before_dispatch", resultPending: true };
           this.persist();
           await this.flushResults();
           return;
         }
-        const turnID = await provider.startTurn(command.thread_id, command.input.text!);
-        if (generation !== this.generation || !this.active) {
-          const interrupted = state.commands[command.id];
-          if (interrupted) interrupted.providerRequestID = turnID;
-          try { this.persist(); } catch { /* The persisted unknown ledger remains authoritative. */ }
-          return;
-        }
-        const turnKey = `${profile.profileKey}\0${command.thread_id}\0${turnID}`;
-        const completed = this.completedTurns.has(turnKey);
-        state.commands[command.id] = { status: completed ? "completed" : "running", providerRequestID: turnID, resultPending: true };
-      } else if (command.type === "interrupt") {
-        await provider.interrupt(command.thread_id, command.input.turn_id!);
-        if (generation !== this.generation || !this.active) return;
-        state.commands[command.id] = { status: "forwarded", providerRequestID: command.input.turn_id, resultPending: true };
-      } else {
-        const approval = grant.approvals[command.input.approval_id!];
-        if (!approval || approval.version !== command.input.approval_version || approval.grantVersion !== grant.grantVersion || approval.profileKey !== profile.profileKey || approval.threadId !== grant.threadId) {
-          state.commands[command.id] = { status: "failed", resultCode: "approval_stale", resultPending: true };
+        if (command.type === "send") {
+          await provider.resume(command.thread_id);
+          if (this.commandWasInvalidatedByProviderExit(command.id)) return;
+          if (generation !== this.generation || !this.active) return;
+          if (grant.grantVersion !== command.grant_version || !grant.scopes.includes("send")) {
+            state.commands[command.id] = { status: "failed", resultCode: "scope_revoked_before_dispatch", resultPending: true };
+            this.persist();
+            await this.flushResults();
+            return;
+          }
+          const activeTurnID = await provider.activeTurnID(command.thread_id);
+          if (this.commandWasInvalidatedByProviderExit(command.id)) return;
+          if (generation !== this.generation || !this.active) return;
+          if (grant.grantVersion !== command.grant_version || !grant.scopes.includes("send")) {
+            state.commands[command.id] = { status: "failed", resultCode: "scope_revoked_before_dispatch", resultPending: true };
+            this.persist();
+            await this.flushResults();
+            return;
+          }
+          sendDispatchAttempted = true;
+          const turnID = activeTurnID
+            ? await provider.steerTurn(command.thread_id, activeTurnID, command.input.text!, command.id)
+            : await provider.startTurn(command.thread_id, command.input.text!, command.id);
+          if (this.commandWasInvalidatedByProviderExit(command.id)) return;
+          if (generation !== this.generation || !this.active) {
+            const interrupted = state.commands[command.id];
+            if (interrupted) interrupted.providerRequestID = turnID;
+            try { this.persist(); } catch { /* The persisted unknown ledger remains authoritative. */ }
+            return;
+          }
+          const turnKey = `${profile.profileKey}\0${command.thread_id}\0${turnID}`;
+          const failed = this.failedTurns.has(turnKey);
+          const completed = this.completedTurns.has(turnKey);
+          const waitingApproval = Object.values(grant.approvals).some((approval) => approval.params.turnId === turnID);
+          state.commands[command.id] = {
+            status: failed ? "failed" : completed ? "completed" : waitingApproval ? "waiting_approval" : "running",
+            providerRequestID: turnID,
+            ...(failed ? { resultCode: "codex_error" } : {}),
+            resultPending: true,
+          };
+        } else if (command.type === "interrupt") {
+          await provider.interrupt(command.thread_id, command.input.turn_id!);
+          if (this.commandWasInvalidatedByProviderExit(command.id)) return;
+          if (generation !== this.generation || !this.active) return;
+          state.commands[command.id] = { status: "forwarded", providerRequestID: command.input.turn_id, resultPending: true };
+        } else if (command.type === "answer_question") {
+          const requestID = command.input.question_request_id!;
+          const version = command.input.question_version!;
+          const request = grant.questions[requestID];
+          if (!request || !grant.scopes.includes("live") || !grant.scopes.includes("send") ||
+            !codexQuestionRequestMatches(request, profile.profileKey, grant.threadId, grant.grantVersion, requestID, version)) {
+            state.commands[command.id] = { status: "failed", resultCode: "question_stale", resultPending: true };
+            if (grant.scopes.includes("live")) {
+              const staleEvents: CodexEventInput[] = [];
+              if (request) {
+                delete grant.questions[request.id];
+                try { provider.respondError(request.rpcID, -32000, "Morde user-input request is stale"); } catch { /* The original process may have exited. */ }
+                staleEvents.push(codexQuestionEvent(request, "stale"));
+                if (validQuestionRequestID(requestID) && validQuestionVersion(version) && version !== request.version) {
+                  staleEvents.push(codexQuestionStatusEvent(requestID, version, "stale"));
+                }
+              } else if (validQuestionRequestID(requestID) && validQuestionVersion(version)) {
+                staleEvents.push(codexQuestionStatusEvent(requestID, version, "stale"));
+              }
+              if (staleEvents.length) this.queueEvents(grant, staleEvents);
+            } else if (request) {
+              delete grant.questions[request.id];
+              try { provider.respondError(request.rpcID, -32000, "Morde user-input request is stale"); } catch { /* The original process may have exited. */ }
+            }
+          } else {
+            const response = codexQuestionAnswerResponse(request.questions, command.input.answers);
+            const answerEvent = codexQuestionAnswerEvent(request, command.input.answers);
+            if (!response) {
+              state.commands[command.id] = { status: "failed", resultCode: "question_invalid_answers", resultPending: true };
+            } else {
+              const events = [codexQuestionEvent(request, "answered"), ...(answerEvent ? [answerEvent] : [])];
+              const knownEventIds = new Set(grant.pendingEvents.map((event) => event.provider_event_id));
+              const newEventCount = events.filter((event) => {
+                if (knownEventIds.has(event.provider_event_id)) return false;
+                knownEventIds.add(event.provider_event_id);
+                return true;
+              }).length;
+              if (grant.pendingEvents.length + newEventCount > MAX_LOCAL_EVENTS) {
+                state.commands[command.id] = { status: "failed", resultCode: "event_buffer_full", resultPending: true };
+              } else {
+                const consumed = codexConsumeQuestionRequest(grant.questions, profile.profileKey, grant.threadId,
+                  grant.grantVersion, requestID, version);
+                if (!consumed) {
+                  state.commands[command.id] = { status: "failed", resultCode: "question_stale", resultPending: true };
+                  if (grant.scopes.includes("live")) this.queueEvent(grant, codexQuestionEvent(request, "stale"));
+                } else {
+                  try { provider.respond(consumed.rpcID, response); }
+                  catch (error) {
+                    state.commands[command.id] = { status: "unknown", resultCode: "question_response_unknown", resultPending: true };
+                    const staleEvents = grant.scopes.includes("live") ? [codexQuestionEvent(consumed, "stale")] : [];
+                    if (!this.queueEvents(grant, staleEvents)) {
+                      try { this.persist(); } catch { /* Dispatching remains a no-replay fence on disk. */ }
+                    }
+                    this.lastError = safeError(error);
+                  }
+                  if (state.commands[command.id]?.status !== "unknown") {
+                    state.commands[command.id] = { status: "completed", providerRequestID: request.id, resultPending: true };
+                    if (!this.queueEvents(grant, events)) {
+                      this.lastError = "Codex answered the pending question, but its confirmation event could not be saved.";
+                      try { this.persist(); } catch { /* The persisted dispatching ledger prevents replay after restart. */ }
+                    }
+                  }
+                }
+              }
+            }
+          }
         } else {
-          const capability = parseApprovalMethod(approval.method);
-          if (!capability) throw new Error("Codex approval type is unavailable");
-          delete grant.approvals[approval.id];
+          const approval = grant.approvals[command.input.approval_id!];
+          if (!approval || approval.version !== command.input.approval_version || approval.grantVersion !== grant.grantVersion || approval.profileKey !== profile.profileKey || approval.threadId !== grant.threadId) {
+            state.commands[command.id] = { status: "failed", resultCode: "approval_stale", resultPending: true };
+          } else {
+            const capability = parseApprovalMethod(approval.method);
+            if (!capability) throw new Error("Codex approval type is unavailable");
+            provider.respond(approval.rpcID, capability.decision(command.input.decision === "approve", approval.params));
+            delete grant.approvals[approval.id];
+            this.persist();
+            state.commands[command.id] = { status: "forwarded", providerRequestID: approval.id, resultPending: true };
+            this.queueEvent(grant, codexApprovalStatusEvent(approval, command.input.decision === "approve" ? "approved" : "rejected"));
+            if (stableID(approval.params.turnId)) {
+              const stillWaiting = Object.values(grant.approvals).some((pending) => pending.params.turnId === approval.params.turnId);
+              if (!stillWaiting) {
+                for (const [id, ledger] of Object.entries(state.commands)) {
+                  if (this.activeCommandProfiles.get(id) === profile.profileKey && ledger.providerRequestID === approval.params.turnId && ledger.status === "waiting_approval") {
+                    ledger.status = "running";
+                    delete ledger.resultCode;
+                    ledger.resultPending = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+        this.persist();
+      } catch (error) {
+        if (!this.commandWasInvalidatedByProviderExit(command.id)) {
+          const rejection = error instanceof CodexAppServerRejection ? error : null;
+          const knownSendFailure = command.type === "send" && (rejection !== null || !sendDispatchAttempted);
+          state.commands[command.id] = knownSendFailure
+            ? { status: "failed", resultCode: rejection ? `app_server_rejected_${Math.abs(rejection.code)}` : "provider_unavailable", resultPending: true }
+            : { status: "unknown", resultCode: "provider_result_unknown", resultPending: true };
+          this.lastError = safeError(error);
           this.persist();
-          provider.respond(approval.rpcID, capability.decision(command.input.decision === "approve", approval.params));
-          state.commands[command.id] = { status: "forwarded", providerRequestID: approval.id, resultPending: true };
-          this.queueEvent(grant, {
-            provider_event_id: `morde:approval:${hash(`${approval.id}:${approval.version}:${command.input.decision}`)}`,
-            kind: "approval_status", occurred_at: new Date().toISOString(),
-            payload: { approval_id: approval.id, approval_version: approval.version, status: command.input.decision === "approve" ? "approved" : "rejected" }, source: "approval",
-          });
         }
       }
-      this.persist();
-    } catch (error) {
-      state.commands[command.id] = {
-        status: "unknown", resultCode: "provider_result_unknown", resultPending: true,
-      };
-      this.lastError = safeError(error);
-      this.persist();
+      if (!this.commandWasInvalidatedByProviderExit(command.id)) await this.flushResults();
+      this.onChange();
+    } finally {
+      const ledger = state.commands[command.id];
+      if (!ledger || !PROFILE_EXIT_COMMAND_STATUSES.has(ledger.status)) this.activeCommandProfiles.delete(command.id);
     }
-    await this.flushResults();
-    this.onChange();
   }
 
   private async recoverUnknownCommands(): Promise<void> {
@@ -1455,7 +2036,7 @@ export class MordeCodexRuntime {
     } catch (error) {
       if (generation !== this.generation || !this.active) return;
       grant.snapshotState = "unknown";
-      grant.snapshotMessage = "thread/read 快照不稳定或不可用；外部 GUI 变化状态未知。";
+      grant.snapshotMessage = "thread/read 快照不可用；外部 Codex 更新和终态可能尚未同步。";
       this.lastError = safeError(error);
       try { this.persist(); } catch { this.lastError = "thread/read 状态未知，且本机安全存储无法保存该状态。"; }
     } finally { this.snapshotInProgress = false; this.onChange(); }
@@ -1470,26 +2051,35 @@ export class MordeCodexRuntime {
     let bytes = 0;
     let unstable = false;
     let awaitingStable = false;
-    let externalWrite = false;
+    let externalWrite = snapshot.metadataStable === false;
     for (const turn of sorted) {
       if (turn.itemsView !== "full") { unstable = true; break; }
       const signature = hash(JSON.stringify({ id: turn.id, status: turn.status, items: turn.items }));
       const priorSignature = grant.candidateTurns[turn.id];
-      nextCandidates[turn.id] = signature;
-      if (!terminalTurn(turn.status)) {
-        if (turn.status === "inProgress" || turn.status === "unknown") externalWrite = true;
-        continue;
+      const isTerminal = terminalTurn(turn.status);
+      if (!isTerminal) {
+        // Active App Server turns are useful even while their contents are changing.
+        // Emit their bounded visible projection now; the terminal turn event still waits
+        // for a stable, terminal snapshot below.
+        nextCandidates[turn.id] = signature;
+        externalWrite = true;
+      } else {
+        if (snapshot.metadataStable === false) {
+          // A thread metadata race must not discard active projections, but also cannot
+          // count as one of the matching snapshots required to finalize this turn.
+          if (priorSignature !== undefined) nextCandidates[turn.id] = priorSignature;
+          externalWrite = true;
+          continue;
+        }
+        nextCandidates[turn.id] = signature;
+        if (priorSignature === undefined) { awaitingStable = true; continue; }
+        if (priorSignature !== signature) { externalWrite = true; continue; }
       }
-      if (priorSignature === undefined) { awaitingStable = true; continue; }
-      if (priorSignature !== signature) { externalWrite = true; continue; }
       for (const item of turn.items) {
         const key = `${turn.id}:${item.id}`;
         const fingerprint = codexSnapshotItemFingerprint(item);
-        const existingFingerprint = grant.knownItems[key];
-        if (existingFingerprint !== undefined) {
-          if (existingFingerprint !== fingerprint) { unstable = true; break; }
-          continue;
-        }
+        const existingFingerprint = nextKnownItems[key];
+        if (existingFingerprint === fingerprint) continue;
         const mapped = codexSnapshotItemEvents(turn, item);
         if (!mapped.length) mapped.push(itemEvent("unsupported", turn, item, "unsupported", {
           provider_type: eventText(item.type, 128) || "unknown_item",
@@ -1504,6 +2094,7 @@ export class MordeCodexRuntime {
         nextKnownItems[key] = fingerprint;
       }
       if (unstable) break;
+      if (!isTerminal) continue;
       const turnEvent = snapshotTurnEvent(turn.status);
       if (turnEvent) {
         const key = `turn:${turn.id}`;
@@ -1524,7 +2115,7 @@ export class MordeCodexRuntime {
     }
     if (unstable) {
       grant.snapshotState = "unknown";
-      grant.snapshotMessage = "线程项在相邻快照间发生变化或超出本地缓冲；该次对账未确认完成。";
+      grant.snapshotMessage = "线程项在快照间变化或超出本地缓冲；本次未确认终态，后续会继续对账。";
       try { this.persist(); } catch { this.lastError = "线程项状态未知，且本机安全存储无法保存该状态。"; }
       return;
     }
@@ -1543,7 +2134,7 @@ export class MordeCodexRuntime {
     grant.updatedAt = snapshot.thread.updatedAt;
     grant.status = normalizeSessionStatus(snapshot.thread.status);
     grant.snapshotState = externalWrite ? "unknown" : awaitingStable ? "pending" : grant.historyComplete ? "available" : "limited";
-    grant.snapshotMessage = externalWrite ? "发现正在写入或刚变化的 turn；等待稳定快照后再对账。" : awaitingStable ? "等待相邻 thread/read 快照一致。" : grant.historyComplete ? undefined : `历史回填进行中：每批最多 ${snapshot.turns.length} 轮；更早历史尚未同步。`;
+    grant.snapshotMessage = externalWrite ? "活动 turn 的可见项已同步；thread/read 不含外部审批或问题 RPC handle，无法通过此快照回答；等待稳定终态快照。" : awaitingStable ? "等待相邻 thread/read 快照一致。" : grant.historyComplete ? undefined : `历史回填进行中：每批最多 ${snapshot.turns.length} 轮；更早历史尚未同步。`;
     try { this.persist(); }
     catch {
       grant.candidateTurns = previous.candidateTurns;
@@ -1560,8 +2151,18 @@ export class MordeCodexRuntime {
   }
 
   private queueEvent(grant: CodexGrant, event: CodexEventInput): boolean {
-    if (grant.pendingEvents.some((item) => item.provider_event_id === event.provider_event_id)) return true;
-    if (grant.pendingEvents.length >= MAX_LOCAL_EVENTS) {
+    return this.queueEvents(grant, [event]);
+  }
+
+  private queueEvents(grant: CodexGrant, events: CodexEventInput[]): boolean {
+    if (events.some((event) => event.kind === "question" && !grant.scopes.includes("live"))) return false;
+    const known = new Set(grant.pendingEvents.map((event) => event.provider_event_id));
+    const additions = events.filter((event) => {
+      if (known.has(event.provider_event_id)) return false;
+      known.add(event.provider_event_id);
+      return true;
+    });
+    if (grant.pendingEvents.length + additions.length > MAX_LOCAL_EVENTS) {
       grant.snapshotState = "unknown";
       grant.snapshotMessage = "本机未确认事件缓冲已满；等待服务端确认前停止缓存新事件。";
       this.lastError = grant.snapshotMessage;
@@ -1569,7 +2170,7 @@ export class MordeCodexRuntime {
       return false;
     }
     const previousEvents = grant.pendingEvents;
-    grant.pendingEvents = [...previousEvents, event];
+    grant.pendingEvents = [...previousEvents, ...additions];
     try { this.persist(); }
     catch {
       grant.pendingEvents = previousEvents;

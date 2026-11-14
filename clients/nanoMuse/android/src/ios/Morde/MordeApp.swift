@@ -4636,11 +4636,95 @@ private struct MordeUserPreferences: Decodable {
     let default_host_id: String?
 }
 struct MordeBatchItem: Decodable, Identifiable { let id: String; let key: String; let status: String }
+
+struct MordeTaskApprovalDisclosures: Decodable, Equatable {
+    struct Text: Decodable, Equatable {
+        let state: String
+        let summary: String?
+
+        var visibleSummary: String? {
+            guard state == "known", let summary,
+                  !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return summary
+        }
+    }
+
+    struct Cost: Decodable, Equatable {
+        let state: String
+        let basis: String?
+        let amount_micros: Int64?
+        let currency: String?
+
+        func formattedAmount(locale: Locale = .current) -> String? {
+            guard state == "known", ["estimate", "settled"].contains(basis ?? ""),
+                  let amount_micros, amount_micros >= 0,
+                  let currency, currency.range(of: "^[A-Z]{3}$", options: .regularExpression) != nil else { return nil }
+            let formatter = NumberFormatter()
+            formatter.numberStyle = .decimal
+            formatter.maximumFractionDigits = 6
+            formatter.locale = locale
+            let amount = Decimal(amount_micros) / Decimal(1_000_000)
+            guard let value = formatter.string(from: NSDecimalNumber(decimal: amount)) else { return nil }
+            return "\(currency) \(value)"
+        }
+    }
+
+    struct Alternatives: Decodable, Equatable {
+        let state: String
+        let options: [String]
+
+        var visibleOptions: [String]? {
+            guard state == "known", !options.isEmpty,
+                  options.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { return nil }
+            return options
+        }
+    }
+
+    let risk: Text
+    let this_cost: Cost
+    let cumulative_cost: Cost
+    let alternatives: Alternatives
+    let revocation: Text
+}
+
+enum MordeTaskApprovalDisclosurePresentation {
+    static func text(_ disclosure: MordeTaskApprovalDisclosures.Text?) -> String {
+        guard let disclosure else { return AppLocalized("Unknown") }
+        if disclosure.state == "not_applicable" { return AppLocalized("Not applicable") }
+        return disclosure.visibleSummary ?? AppLocalized("Unknown")
+    }
+
+    static func cost(_ disclosure: MordeTaskApprovalDisclosures.Cost?, locale: Locale = .current) -> String {
+        guard let disclosure else { return AppLocalized("Unknown") }
+        if disclosure.state == "not_applicable" { return AppLocalized("Not applicable") }
+        guard let amount = disclosure.formattedAmount(locale: locale) else { return AppLocalized("Unknown") }
+        let basis = AppLocalized(disclosure.basis == "estimate" ? "Estimate" : "Settled")
+        return "\(basis): \(amount)"
+    }
+
+    static func alternatives(_ disclosure: MordeTaskApprovalDisclosures.Alternatives?) -> String {
+        guard let disclosure else { return AppLocalized("Unknown") }
+        if disclosure.state == "not_applicable" { return AppLocalized("Not applicable") }
+        return disclosure.visibleOptions?.map { "• \($0)" }.joined(separator: "\n") ?? AppLocalized("Unknown")
+    }
+
+    static func lines(_ disclosures: MordeTaskApprovalDisclosures?) -> [String] {
+        [
+            "\(AppLocalized("Risk")): \(text(disclosures?.risk))",
+            "\(AppLocalized("Cost of this action")): \(cost(disclosures?.this_cost))",
+            "\(AppLocalized("Cumulative cost")): \(cost(disclosures?.cumulative_cost))",
+            "\(AppLocalized("Alternatives")): \(alternatives(disclosures?.alternatives))",
+            "\(AppLocalized("Revocation method")): \(text(disclosures?.revocation))",
+        ]
+    }
+}
+
 struct MordeTask: Decodable, Identifiable {
     struct Pending: Decodable {
         let id: String; let version: Int; let title: String; let content: String; let impact: String
         let kind: String?; let object: String?; let media_preview_operation_id: String?
         let status: String?; let expires_at: String?
+        let disclosures: MordeTaskApprovalDisclosures?
 
         var isExpired: Bool { status == "expired" }
         var isPendingStatus: Bool { status == nil || status == "pending" }
@@ -13372,12 +13456,14 @@ private enum MIFCodexCommandAction {
     case send(String)
     case interrupt(String)
     case approval(MordeCodexApproval, String)
+    case answerQuestion(MordeCodexUserQuestionRequest, [String: [String]])
 
     var requiredScope: String {
         switch self {
         case .send: "send"
         case .interrupt: "interrupt"
         case .approval: "approval"
+        case .answerQuestion: "send"
         }
     }
 
@@ -13388,6 +13474,9 @@ private enum MIFCodexCommandAction {
         case .approval(let approval, let decision):
             ["type": "approval", "approval_id": approval.id,
              "approval_version": approval.version, "decision": decision]
+        case .answerQuestion(let question, let answers):
+            ["type": "answer_question", "question_request_id": question.id,
+             "question_version": question.version, "answers": answers]
         }
     }
 }
@@ -13397,6 +13486,23 @@ private struct MIFCodexPendingCommand {
     let sessionID: String
     let action: MIFCodexCommandAction
     let idempotencyKey: String
+
+    var replyIdentity: MordeCodexReplyIdentity? {
+        switch action {
+        case .approval(let approval, _):
+            MordeCodexReplyPolicy.identity(sessionID: sessionID, approval: approval)
+        case .answerQuestion(let question, _):
+            MordeCodexReplyPolicy.identity(sessionID: sessionID, question: question)
+        case .send, .interrupt:
+            nil
+        }
+    }
+}
+
+private enum MIFCodexSessionRefreshResult {
+    case refreshed(MordeCodexSession)
+    case missing
+    case failed
 }
 
 @MainActor final class MIFCodexSessionStore: ObservableObject {
@@ -13423,12 +13529,14 @@ private struct MIFCodexPendingCommand {
     @Published private(set) var loadingInstallations = false
     @Published private(set) var installationLoadError: String?
     @Published private(set) var submittingSessions: Set<String> = []
-    @Published private(set) var pendingCommands: [String: MIFCodexPendingCommand] = [:]
+    @Published private var pendingCommands: [String: MIFCodexPendingCommand] = [:]
+    @Published private(set) var inFlightReplies: Set<MordeCodexReplyIdentity> = []
 
     private let client = MordeClient.shared
     private var observation: AnyCancellable?
     private var scopeKey: String?
     private var isSignedInScope: Bool
+    private var replyIdentityByCommandID: [String: MordeCodexReplyIdentity] = [:]
 
     private init() {
         isSignedInScope = client.signedIn
@@ -13452,7 +13560,8 @@ private struct MIFCodexPendingCommand {
     }
     var selectedStreamIdentity: String? {
         guard let scopeKey, let selectedInstallationID, let selectedSessionID else { return nil }
-        return "\(scopeKey)|\(selectedInstallationID)|\(selectedSessionID)"
+        let scopes = selectedSession?.scopes.sorted().joined(separator: ",") ?? ""
+        return "\(scopeKey)|\(selectedInstallationID)|\(selectedSessionID)|\(scopes)"
     }
     var selectedSessionHasRead: Bool { selectedSession?.hasScope("read") == true }
     var selectedSessionHasLive: Bool { selectedSession?.hasScope("live") == true }
@@ -13460,11 +13569,13 @@ private struct MIFCodexPendingCommand {
     var selectedSessionHasApproval: Bool { selectedSession?.hasScope("approval") == true }
     var selectedSessionHasInterrupt: Bool { selectedSession?.hasScope("interrupt") == true }
     var selectedSessionStatus: String {
-        guard let id = selectedSessionID else { return "unknown" }
-        if let value = commandStatusBySession[id] { return value }
-        if let event = events.last(where: { $0.visibleStatus != nil && $0.isSessionStatus }),
+        selectedSession.map { status(for: $0) } ?? "unknown"
+    }
+    func status(for session: MordeCodexSession) -> String {
+        if let value = commandStatusBySession[session.id] { return value }
+        if let event = (eventPagesBySession[session.id] ?? []).last(where: { $0.visibleStatus != nil && $0.isSessionStatus }),
            let status = event.visibleStatus { return eventStatus(event, status: status) }
-        return selectedSession.map { normalizedStatus($0.status) } ?? "unknown"
+        return normalizedStatus(session.status)
     }
     var canSend: Bool {
         guard let id = selectedSessionID, selectedSessionHasRead, selectedSessionHasSend,
@@ -13484,6 +13595,15 @@ private struct MIFCodexPendingCommand {
     var hasEarlierEvents: Bool { events.first.map { $0.sequence > 1 } ?? false }
     var canLoadMoreSessions: Bool { selectedInstallationID.flatMap { nextSessionCursorByInstallation[$0] } != nil }
     var selectedPendingCommand: Bool { selectedSessionID.flatMap { pendingCommands[$0] } != nil }
+    func hasPendingCommand(for sessionID: String) -> Bool { pendingCommands[sessionID] != nil }
+
+    func isReplyInFlight(_ approval: MordeCodexApproval, session: MordeCodexSession) -> Bool {
+        inFlightReplies.contains(MordeCodexReplyPolicy.identity(sessionID: session.id, approval: approval))
+    }
+
+    func isReplyInFlight(_ question: MordeCodexUserQuestionRequest, session: MordeCodexSession) -> Bool {
+        inFlightReplies.contains(MordeCodexReplyPolicy.identity(sessionID: session.id, question: question))
+    }
 
     func loadInstallations() async {
         synchronizeScope()
@@ -13577,6 +13697,14 @@ private struct MIFCodexPendingCommand {
             } else {
                 sessionsByInstallation[installationID] = page.items
             }
+            for session in page.items {
+                if MordeCodexSessionScopePolicy.shouldClearReadHistory(afterRefreshing: session.scopes) {
+                    revokedSessions.insert(session.id)
+                    clearReadHistory(sessionID: session.id)
+                } else {
+                    revokedSessions.remove(session.id)
+                }
+            }
             nextSessionCursorByInstallation[installationID] = page.next_cursor
             revokedInstallations.remove(installationID)
         } catch {
@@ -13596,9 +13724,58 @@ private struct MIFCodexPendingCommand {
         await loadSessions(installationID: installationID, cursor: cursor)
     }
 
+    private func refreshSessionScopes(installationID: String, sessionID: String,
+                                     scope: String) async -> MIFCodexSessionRefreshResult {
+        var cursor: String?
+        var visitedCursors = Set<String>()
+        while client.signedIn, scope == client.taskPageScopeKey {
+            do {
+                let page = try await client.codexSessionPage(installationID: installationID, cursor: cursor)
+                guard client.signedIn, scope == client.taskPageScopeKey else { return .failed }
+                if let refreshed = page.items.first(where: { $0.id == sessionID }) {
+                    var sessions = sessionsByInstallation[installationID] ?? []
+                    if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
+                        sessions[index] = refreshed
+                    } else {
+                        sessions.append(refreshed)
+                    }
+                    sessionsByInstallation[installationID] = sessions
+                    if MordeCodexSessionScopePolicy.shouldClearReadHistory(afterRefreshing: refreshed.scopes) {
+                        revokedSessions.insert(sessionID)
+                        clearReadHistory(sessionID: sessionID)
+                    } else {
+                        revokedSessions.remove(sessionID)
+                    }
+                    return .refreshed(refreshed)
+                }
+                guard let next = page.next_cursor else { return .missing }
+                guard !next.isEmpty, next != cursor, visitedCursors.insert(next).inserted else { return .failed }
+                cursor = next
+            } catch {
+                return .failed
+            }
+        }
+        return .failed
+    }
+
+    private func removeConfirmedMissingSession(installationID: String, sessionID: String) {
+        sessionsByInstallation[installationID]?.removeAll { $0.id == sessionID }
+        revokedSessions.insert(sessionID)
+        clearReadHistory(sessionID: sessionID)
+        eventErrors[sessionID] = nil
+        commandStatusBySession[sessionID] = nil
+        commandErrors[sessionID] = nil
+        pendingCommands[sessionID] = nil
+        clearReplyState(sessionID: sessionID)
+        deleteErrors[sessionID] = nil
+        deletingSessions.remove(sessionID)
+        submittingSessions.remove(sessionID)
+        if selectedSessionID == sessionID { selectedSessionID = nil }
+    }
+
     func loadTimeline(reset: Bool = false) async {
         guard let session = selectedSession, session.hasScope("read"),
-              client.signedIn, !revokedSessions.contains(session.id), let installationID = selectedInstallationID,
+              client.signedIn, !revokedSessions.contains(session.id),
               let scope = scopeKey, scope == client.taskPageScopeKey else { return }
         loadingEvents.insert(session.id)
         eventErrors[session.id] = nil
@@ -13612,9 +13789,14 @@ private struct MIFCodexPendingCommand {
                 target = firstPage?.current_sequence ?? firstPage?.items.last?.sequence
             }
             let targetSequence = max(target ?? 0, 0)
-            var after = max(0, targetSequence - 100)
-            var page = after == 0 ? firstPage ?? (try await client.codexEventPage(sessionID: session.id, afterSequence: 0))
-                : try await client.codexEventPage(sessionID: session.id, afterSequence: after)
+            let after = max(0, targetSequence - 100)
+            var page: MordeCodexEventPage
+            if after == 0 {
+                if let firstPage { page = firstPage }
+                else { page = try await client.codexEventPage(sessionID: session.id, afterSequence: 0) }
+            } else {
+                page = try await client.codexEventPage(sessionID: session.id, afterSequence: after)
+            }
             guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
             var events = try MordeCodexEventPolicy.merge([], incoming: page.items, sessionID: session.id,
                                                          afterSequence: after)
@@ -13637,6 +13819,7 @@ private struct MIFCodexPendingCommand {
             } else {
                 commandStatusBySession[session.id] = normalizedStatus(session.status)
             }
+            for event in events { reconcileReplyEvent(event) }
             revokedSessions.remove(session.id)
         } catch {
             guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
@@ -13668,6 +13851,11 @@ private struct MIFCodexPendingCommand {
                 earlier, incoming: events, sessionID: session.id)
         } catch {
             guard client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id else { return }
+            let failure = error as NSError
+            if [403, 404].contains(failure.code) {
+                revokedSessions.insert(session.id)
+                clearReadHistory(sessionID: session.id)
+            }
             eventErrors[session.id] = eventErrorValue(error)
         }
     }
@@ -13677,7 +13865,7 @@ private struct MIFCodexPendingCommand {
               session.installation_id == installationID,
               let scope = scopeKey else { return }
         if session.hasScope("read"), eventPagesBySession[session.id] == nil { await loadTimeline() }
-        guard session.hasScope("live"), !revokedSessions.contains(session.id) else { return }
+        guard session.hasScope("read"), session.hasScope("live"), !revokedSessions.contains(session.id) else { return }
         while !Task.isCancelled, client.signedIn, scope == client.taskPageScopeKey, selectedSessionID == session.id {
             do {
                 try await client.codexEventStream(installationID: installationID, sessionID: session.id,
@@ -13691,11 +13879,22 @@ private struct MIFCodexPendingCommand {
                     selectedSessionID != session.id { return }
                 let failure = error as NSError
                 if [403, 404].contains(failure.code) {
-                    revokedSessions.insert(session.id)
-                    eventPagesBySession[session.id] = nil
-                    eventCursorBySession[session.id] = nil
-                    eventErrors[session.id] = error.localizedDescription
-                    return
+                    let refreshResult = await refreshSessionScopes(installationID: installationID,
+                                                                   sessionID: session.id, scope: scope)
+                    guard !Task.isCancelled, client.signedIn, scope == client.taskPageScopeKey,
+                          selectedSessionID == session.id else { return }
+                    switch refreshResult {
+                    case .missing:
+                        removeConfirmedMissingSession(installationID: installationID, sessionID: session.id)
+                        return
+                    case .refreshed(let refreshed):
+                        eventErrors[session.id] = error.localizedDescription
+                        guard refreshed.hasScope("read"), refreshed.hasScope("live") else { return }
+                    case .failed:
+                        eventErrors[session.id] = error.localizedDescription
+                    }
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    continue
                 }
                 if isEventGap(error) {
                     if session.hasScope("read") {
@@ -13725,17 +13924,37 @@ private struct MIFCodexPendingCommand {
             action: .interrupt(turnID), idempotencyKey: UUID().uuidString.lowercased()))
     }
 
-    func respondToApproval(_ approval: MordeCodexApproval, decision: String) async -> Bool {
-        guard selectedSessionHasRead, selectedSessionHasApproval, approval.canRespond(),
+    func respondToApproval(_ approval: MordeCodexApproval, in session: MordeCodexSession,
+                           decision: String) async -> Bool {
+        guard selectedSessionID == session.id, selectedInstallationID == session.installation_id,
+              session.hasScope("read"), session.hasScope("approval"), approval.canRespond(),
               ["approve", "reject"].contains(decision),
-              let installationID = selectedInstallationID, let sessionID = selectedSessionID,
-              !selectedPendingCommand else { return false }
+              let installationID = selectedInstallationID,
+              let sessionID = selectedSessionID,
+              !selectedPendingCommand,
+              !inFlightReplies.contains(MordeCodexReplyPolicy.identity(sessionID: sessionID, approval: approval)) else {
+            return false
+        }
         return await submit(MIFCodexPendingCommand(installationID: installationID, sessionID: sessionID,
             action: .approval(approval, decision), idempotencyKey: UUID().uuidString.lowercased()))
     }
 
-    func retryUnconfirmedCommand() async -> Bool {
-        guard let sessionID = selectedSessionID, let command = pendingCommands[sessionID] else { return false }
+    func answerQuestion(_ question: MordeCodexUserQuestionRequest, in session: MordeCodexSession,
+                        answers: [String: [String]]) async -> Bool {
+        guard selectedSessionID == session.id, selectedInstallationID == session.installation_id,
+              session.hasScope("read"), session.hasScope("send"), question.accepts(answers),
+              let installationID = selectedInstallationID, let sessionID = selectedSessionID,
+              !selectedPendingCommand,
+              !inFlightReplies.contains(MordeCodexReplyPolicy.identity(sessionID: sessionID, question: question)) else {
+            return false
+        }
+        return await submit(MIFCodexPendingCommand(installationID: installationID, sessionID: sessionID,
+            action: .answerQuestion(question, answers), idempotencyKey: UUID().uuidString.lowercased()))
+    }
+
+    func retryUnconfirmedCommand(in session: MordeCodexSession) async -> Bool {
+        guard selectedSessionID == session.id,
+              let command = pendingCommands[session.id], command.installationID == session.installation_id else { return false }
         return await submit(command)
     }
 
@@ -13755,6 +13974,7 @@ private struct MIFCodexPendingCommand {
             commandStatusBySession[session.id] = nil
             commandErrors[session.id] = nil
             pendingCommands[session.id] = nil
+            clearReplyState(sessionID: session.id)
             if selectedSessionID == session.id { selectedSessionID = nil }
         } catch {
             guard client.signedIn, scope == client.taskPageScopeKey else { return }
@@ -13779,23 +13999,35 @@ private struct MIFCodexPendingCommand {
             commandStatusBySession[session.id] = normalizedStatus(receipt.status)
             commandErrors[session.id] = nil
             pendingCommands[session.id] = nil
+            if let identity = command.replyIdentity {
+                retainReply(identity, commandID: receipt.command_id)
+                if MordeCodexReplyPolicy.isTerminalCommandStatus(receipt.status) { finishReply(identity) }
+            }
             return true
         } catch {
             guard client.signedIn, scope == client.taskPageScopeKey else { return false }
             let failure = error as NSError
+            var confirmedMissingSession = false
             if [403, 404].contains(failure.code) {
-                revokedSessions.insert(session.id)
-                eventPagesBySession[session.id] = nil
-                eventCursorBySession[session.id] = nil
+                let refreshResult = await refreshSessionScopes(installationID: command.installationID,
+                                                               sessionID: session.id, scope: scope)
+                if case .missing = refreshResult {
+                    confirmedMissingSession = true
+                }
             }
             if failure.domain == NSURLErrorDomain || (500...599).contains(failure.code) {
                 commandStatusBySession[session.id] = "unknown"
                 commandErrors[session.id] = error.localizedDescription
                 pendingCommands[session.id] = command
+                if let identity = command.replyIdentity { retainReply(identity, commandID: nil) }
             } else {
                 commandStatusBySession[session.id] = "failed"
                 commandErrors[session.id] = error.localizedDescription
                 pendingCommands[session.id] = nil
+                if let identity = command.replyIdentity { finishReply(identity) }
+            }
+            if confirmedMissingSession {
+                removeConfirmedMissingSession(installationID: command.installationID, sessionID: session.id)
             }
             return false
         }
@@ -13828,6 +14060,7 @@ private struct MIFCodexPendingCommand {
                 }
                 for next in throughEvent {
                     guard cursor.accept(next, sessionID: session.id) == .accepted else { throw URLError(.cannotParseResponse) }
+                    reconcileReplyEvent(next)
                 }
                 eventPagesBySession[session.id] = try MordeCodexEventPolicy.merge(
                     eventPagesBySession[session.id] ?? [], incoming: throughEvent, sessionID: session.id)
@@ -13840,6 +14073,7 @@ private struct MIFCodexPendingCommand {
             }
             eventErrors[session.id] = nil
             updateStatus(event)
+            reconcileReplyEvent(event)
             return
         }
         eventPagesBySession[session.id] = try MordeCodexEventPolicy.merge(
@@ -13847,12 +14081,57 @@ private struct MIFCodexPendingCommand {
         eventCursorBySession[session.id] = cursor.sequence
         eventErrors[session.id] = nil
         updateStatus(event)
+        reconcileReplyEvent(event)
     }
 
     private func updateStatus(_ event: MordeCodexEvent) {
         guard let status = event.visibleStatus, event.isSessionStatus else { return }
         commandStatusBySession[event.session_id] = eventStatus(event, status: status)
         if commandStatusBySession[event.session_id] != "unknown" { pendingCommands[event.session_id] = nil }
+    }
+
+    private func retainReply(_ identity: MordeCodexReplyIdentity, commandID: String?) {
+        inFlightReplies.insert(identity)
+        if let commandID, !commandID.isEmpty { replyIdentityByCommandID[commandID] = identity }
+        let cached = eventPagesBySession[identity.sessionID] ?? []
+        if cached.contains(where: { MordeCodexReplyPolicy.isTerminal($0, for: identity) }) {
+            finishReply(identity)
+            return
+        }
+        if let commandID,
+           cached.contains(where: { MordeCodexReplyPolicy.terminalCommandID(for: $0) == commandID }) {
+            finishReply(identity)
+        }
+    }
+
+    private func finishReply(_ identity: MordeCodexReplyIdentity) {
+        inFlightReplies.remove(identity)
+        replyIdentityByCommandID = Dictionary(uniqueKeysWithValues:
+            replyIdentityByCommandID.filter { $0.value != identity })
+        if pendingCommands[identity.sessionID]?.replyIdentity == identity {
+            pendingCommands[identity.sessionID] = nil
+        }
+    }
+
+    private func reconcileReplyEvent(_ event: MordeCodexEvent) {
+        if let identity = MordeCodexReplyPolicy.terminalReplyIdentity(for: event) {
+            finishReply(identity)
+        }
+        if let commandID = MordeCodexReplyPolicy.terminalCommandID(for: event),
+           let identity = replyIdentityByCommandID[commandID] {
+            finishReply(identity)
+        }
+    }
+
+    private func clearReadHistory(sessionID: String) {
+        eventPagesBySession[sessionID] = nil
+        eventCursorBySession[sessionID] = nil
+    }
+
+    private func clearReplyState(sessionID: String) {
+        inFlightReplies = Set(inFlightReplies.filter { $0.sessionID != sessionID })
+        replyIdentityByCommandID = Dictionary(uniqueKeysWithValues:
+            replyIdentityByCommandID.filter { $0.value.sessionID != sessionID })
     }
 
     private func eventStatus(_ event: MordeCodexEvent, status: String) -> String {
@@ -13897,6 +14176,7 @@ private struct MIFCodexPendingCommand {
             commandStatusBySession[id] = nil
             commandErrors[id] = nil
             pendingCommands[id] = nil
+            clearReplyState(sessionID: id)
             deleteErrors[id] = nil
             deletingSessions.remove(id)
             submittingSessions.remove(id)
@@ -13925,6 +14205,8 @@ private struct MIFCodexPendingCommand {
         commandErrors = [:]
         deleteErrors = [:]
         pendingCommands = [:]
+        inFlightReplies = []
+        replyIdentityByCommandID = [:]
         deletingSessions = []
         loadingSessions = []
         loadingEvents = []
@@ -20028,8 +20310,11 @@ private struct MordeProjectsRoom: View {
             if let object = pending.object, !object.isEmpty { Text(object).font(.footnote) }
             Text(pending.content)
             Text(pending.impact).font(.footnote).foregroundStyle(.secondary)
-            Text(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
-                .font(.footnote).foregroundStyle(.secondary)
+            LabeledContent(AppLocalized("Risk"), value: MordeTaskApprovalDisclosurePresentation.text(pending.disclosures?.risk))
+            LabeledContent(AppLocalized("Cost of this action"), value: MordeTaskApprovalDisclosurePresentation.cost(pending.disclosures?.this_cost))
+            LabeledContent(AppLocalized("Cumulative cost"), value: MordeTaskApprovalDisclosurePresentation.cost(pending.disclosures?.cumulative_cost))
+            LabeledContent(AppLocalized("Alternatives"), value: MordeTaskApprovalDisclosurePresentation.alternatives(pending.disclosures?.alternatives))
+            LabeledContent(AppLocalized("Revocation method"), value: MordeTaskApprovalDisclosurePresentation.text(pending.disclosures?.revocation))
             if let expiresAt = pending.expirationDate {
                 Text(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
                     .font(.footnote).foregroundStyle(.secondary)

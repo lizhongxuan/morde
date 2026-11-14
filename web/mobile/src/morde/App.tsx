@@ -153,7 +153,7 @@ export default function MordeApp() {
 
   return <div className="morde-mobile mx-auto flex h-dvh max-w-2xl flex-col bg-bg sm:border-x sm:border-border">
     <header className="safe-top flex shrink-0 items-center justify-between border-b border-border px-4 py-3"><div><h1 className="text-xl font-bold">Morde</h1><p className="text-xs text-muted">{user.name} · 云端电脑</p></div><a href="/" className="rounded-full border border-border px-3 py-2 text-sm">PC 用户端</a></header>
-    {error && <div role="alert" className="fixed inset-x-4 z-50 mx-auto flex max-w-xl items-start justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 shadow-lg" style={{ top: "calc(env(safe-area-inset-top, 0px) + 4.5rem)" }}><span>{error}</span><button type="button" onClick={() => void refresh()} className="shrink-0 underline">重试</button></div>}
+    {error && <div role="alert" className="mx-4 mt-3 flex shrink-0 items-start justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800"><span>{error}</span><button type="button" onClick={() => void refresh()} className="shrink-0 underline">重试</button></div>}
     <main className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
       {tab === "chat" && <div className="flex min-h-full flex-col gap-3">
         <div className="flex items-center justify-between gap-2 pt-4"><h2 className="text-lg font-semibold">AI 助手</h2><button type="button" disabled={busy} className="rounded-full border border-border px-3 py-1.5 text-sm" onClick={() => { conversationSelectionGeneration.current++; setSelectedConversation(null); setMessages([]); setDraft(""); pendingSend.current = null; }}>新对话</button></div>

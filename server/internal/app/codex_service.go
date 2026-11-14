@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/codex"
 	"morde/server/internal/domain/identity"
 )
@@ -14,7 +15,8 @@ import (
 type CodexStore interface {
 	DiscoverCodexSession(context.Context, identity.Principal, codex.Discover) (codex.Session, error)
 	ListCodexSessions(context.Context, string, string, string, int32) (codex.SessionPage, error)
-	GetCodexEvents(context.Context, string, string, codex.Scope, int64, int32) (codex.EventPage, error)
+	GetCodexEvents(context.Context, string, string, []codex.Scope, int64, int32) (codex.EventPage, error)
+	WriteAudit(context.Context, audit.Entry) error
 	CreateCodexCommand(context.Context, string, string, string, string, codex.CommandInput, []byte) (codex.Command, error)
 	ClaimCodexCommand(context.Context, string, string) ([]codex.Command, error)
 	ApplyCodexCommandResult(context.Context, string, string, string, codex.CommandResult) (codex.Command, error)
@@ -51,25 +53,56 @@ func (s *CodexService) List(ctx context.Context, principal identity.Principal, i
 		(cursor != "" && !domain.ValidCodexSessionID(cursor)) {
 		return codex.SessionPage{}, domain.InvalidArgument("page", "Codex session page request is invalid")
 	}
-	return s.store.ListCodexSessions(ctx, principal.UserID, installationID, cursor, limit)
+	page, err := s.store.ListCodexSessions(ctx, principal.UserID, installationID, cursor, limit)
+	if err != nil {
+		return codex.SessionPage{}, err
+	}
+	if err := s.store.WriteAudit(ctx, codexReadAuditEntry(principal, audit.ActionCodexSessionListRead, installationID,
+		map[string]any{"cursor": cursor, "row_count": len(page.Items)})); err != nil {
+		return codex.SessionPage{}, fmt.Errorf("audit Codex session list read: %w", err)
+	}
+	return page, nil
 }
 
 func (s *CodexService) Events(ctx context.Context, principal identity.Principal, sessionID string, afterSequence int64, limit int32) (codex.EventPage, error) {
-	return s.events(ctx, principal, sessionID, codex.ScopeRead, afterSequence, limit)
+	page, err := s.events(ctx, principal, sessionID, []codex.Scope{codex.ScopeRead}, afterSequence, limit)
+	if err != nil {
+		return codex.EventPage{}, err
+	}
+	if len(page.Items) > 0 {
+		if err := s.store.WriteAudit(ctx, codexReadAuditEntry(principal, audit.ActionCodexEventPageRead, sessionID,
+			map[string]any{"after_sequence": afterSequence, "row_count": len(page.Items)})); err != nil {
+			return codex.EventPage{}, fmt.Errorf("audit Codex history page read: %w", err)
+		}
+	}
+	return page, nil
 }
 
 func (s *CodexService) LiveEvents(ctx context.Context, principal identity.Principal, sessionID string, afterSequence int64, limit int32) (codex.EventPage, error) {
-	return s.events(ctx, principal, sessionID, codex.ScopeLive, afterSequence, limit)
+	page, err := s.events(ctx, principal, sessionID, []codex.Scope{codex.ScopeRead, codex.ScopeLive}, afterSequence, limit)
+	if err != nil {
+		return codex.EventPage{}, err
+	}
+	if len(page.Items) > 0 {
+		firstSequence := page.Items[0].Sequence
+		lastSequence := page.Items[len(page.Items)-1].Sequence
+		if err := s.store.WriteAudit(ctx, codexReadAuditEntry(principal, audit.ActionCodexEventStreamRead, sessionID,
+			map[string]any{"after_sequence": afterSequence, "first_sequence": firstSequence,
+				"last_sequence": lastSequence, "row_count": len(page.Items)})); err != nil {
+			return codex.EventPage{}, fmt.Errorf("audit Codex event stream batch: %w", err)
+		}
+	}
+	return page, nil
 }
 
-func (s *CodexService) events(ctx context.Context, principal identity.Principal, sessionID string, requiredScope codex.Scope, afterSequence int64, limit int32) (codex.EventPage, error) {
+func (s *CodexService) events(ctx context.Context, principal identity.Principal, sessionID string, requiredScopes []codex.Scope, afterSequence int64, limit int32) (codex.EventPage, error) {
 	if err := validateCodexUser(principal); err != nil {
 		return codex.EventPage{}, err
 	}
 	if !codex.ValidateSessionID(sessionID) || afterSequence < 0 || limit < 1 || limit > codex.MaxEventPageSize {
 		return codex.EventPage{}, domain.InvalidArgument("page", "Codex event page request is invalid")
 	}
-	return s.store.GetCodexEvents(ctx, principal.UserID, sessionID, requiredScope, afterSequence, limit)
+	return s.store.GetCodexEvents(ctx, principal.UserID, sessionID, requiredScopes, afterSequence, limit)
 }
 
 func (s *CodexService) CreateCommand(ctx context.Context, principal identity.Principal, sessionID, idempotencyKey string, input codex.CommandInput) (codex.Command, error) {
@@ -161,4 +194,17 @@ func validateCodexClient(principal identity.Principal) error {
 		return domain.NewError(domain.CodeForbidden, "active Codex client installation is required")
 	}
 	return nil
+}
+
+func codexReadAuditEntry(principal identity.Principal, action audit.Action, target string, detail map[string]any) audit.Entry {
+	actorKind := audit.ActorSession
+	auditDetail := make(map[string]any, len(detail)+1)
+	for key, value := range detail {
+		auditDetail[key] = value
+	}
+	if principal.Kind == identity.KindClient {
+		actorKind = audit.ActorClient
+		auditDetail["actor_installation_id"] = principal.ClientInstallationID
+	}
+	return audit.Entry{ActorID: principal.UserID, ActorKind: actorKind, Action: action, Target: target, Detail: auditDetail}
 }

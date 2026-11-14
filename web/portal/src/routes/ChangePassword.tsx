@@ -3,12 +3,9 @@ import type { FormEvent } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
-import { useToast } from '../app/toast';
-import { FloatingError } from '../components/FloatingError';
 
 export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: string }) {
   const client = useQueryClient();
-  const { notify } = useToast();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
@@ -21,7 +18,7 @@ export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: str
       client.setQueryData(['auth', 'me'], null);
       setChanged(true);
     },
-    onError: (reason) => notify(errorDetails(reason).message, 'error'),
+    onError: (reason) => setError(errorDetails(reason).message),
   });
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -47,7 +44,7 @@ export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: str
           <input id="new-password" name="new_password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
           <label htmlFor="confirm-password">确认新密码</label>
           <input id="confirm-password" name="confirm_password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
-          {error && <FloatingError>{error}</FloatingError>}
+          {error && <p className="form-error" role="alert">{error}</p>}
           <button className="button button-primary button-wide" type="submit" disabled={change.isPending}>{change.isPending ? '正在保存…' : '修改密码'}</button>
         </form>
       </>}

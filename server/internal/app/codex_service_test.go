@@ -3,9 +3,12 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/codex"
 	"morde/server/internal/domain/identity"
 )
@@ -23,6 +26,10 @@ type codexServiceTestStore struct {
 	lastRequestHash     []byte
 	eventSessionOwnerID string
 	pcSessionInstallID  string
+	lastEventScopes     []codex.Scope
+	eventPage           codex.EventPage
+	auditEntries        []audit.Entry
+	auditErr            error
 }
 
 type codexServiceTestCommand struct {
@@ -40,15 +47,26 @@ func (s *codexServiceTestStore) ListCodexSessions(_ context.Context, ownerID, in
 }
 
 func (s *codexServiceTestStore) GetCodexEvents(_ context.Context, ownerID, sessionID string,
-	requiredScope codex.Scope, _ int64, _ int32) (codex.EventPage, error) {
+	requiredScopes []codex.Scope, _ int64, _ int32) (codex.EventPage, error) {
 	s.lastOwnerID, s.lastSessionID = ownerID, sessionID
+	s.lastEventScopes = append([]codex.Scope(nil), requiredScopes...)
 	if ownerID != s.eventSessionOwnerID {
 		return codex.EventPage{}, domain.NewError(domain.CodeNotFound, "Codex session not found")
 	}
-	if !s.grantScopes[requiredScope] {
-		return codex.EventPage{}, domain.NewError(domain.CodeForbidden, "Codex event scope is not granted")
+	for _, requiredScope := range requiredScopes {
+		if !s.grantScopes[requiredScope] {
+			return codex.EventPage{}, domain.NewError(domain.CodeForbidden, "Codex event scope is not granted")
+		}
 	}
-	return codex.EventPage{Items: []codex.Event{}}, nil
+	return s.eventPage, nil
+}
+
+func (s *codexServiceTestStore) WriteAudit(_ context.Context, entry audit.Entry) error {
+	if s.auditErr != nil {
+		return s.auditErr
+	}
+	s.auditEntries = append(s.auditEntries, entry)
+	return nil
 }
 
 func (s *codexServiceTestStore) CreateCodexCommand(_ context.Context, ownerID, installationID, sessionID, key string,
@@ -136,6 +154,9 @@ func TestCodexClientReadsOwnerPCSessionAcrossInstallationsWithSessionGrant(t *te
 	if _, err := service.Events(context.Background(), principal, "l1234567", 0, 10); err != nil {
 		t.Fatalf("owner read of PC session from iOS client error = %v", err)
 	}
+	if len(store.lastEventScopes) != 1 || store.lastEventScopes[0] != codex.ScopeRead {
+		t.Fatalf("history page required scopes = %v, want only read", store.lastEventScopes)
+	}
 	if store.lastOwnerID != principal.UserID || store.lastSessionID != "l1234567" {
 		t.Fatalf("event read was not bound to authenticated owner/session: owner=%q session=%q",
 			store.lastOwnerID, store.lastSessionID)
@@ -166,6 +187,18 @@ func TestCodexClientReadsOwnerPCSessionAcrossInstallationsWithSessionGrant(t *te
 	if _, err := service.LiveEvents(context.Background(), principal, "l1234567", 0, 10); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("live event read without live grant error = %v, want forbidden", err)
 	}
+	store.grantScopes[codex.ScopeRead] = false
+	store.grantScopes[codex.ScopeLive] = true
+	if _, err := service.LiveEvents(context.Background(), principal, "l1234567", 0, 10); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("live event read without read grant error = %v, want forbidden", err)
+	}
+	store.grantScopes[codex.ScopeRead] = true
+	if _, err := service.LiveEvents(context.Background(), principal, "l1234567", 0, 10); err != nil {
+		t.Fatalf("live event read with read and live grants: %v", err)
+	}
+	if len(store.lastEventScopes) != 2 || store.lastEventScopes[0] != codex.ScopeRead || store.lastEventScopes[1] != codex.ScopeLive {
+		t.Fatalf("live stream required scopes = %v, want read and live", store.lastEventScopes)
+	}
 }
 
 func TestCodexIOSClientCanQueueCommandForPCSession(t *testing.T) {
@@ -187,6 +220,159 @@ func TestCodexIOSClientCanQueueCommandForPCSession(t *testing.T) {
 		command.InstallationID != "i7654321" || store.createCalls != 1 {
 		t.Fatalf("cross-install command binding: owner=%q actor install=%q target install=%q calls=%d",
 			store.lastOwnerID, store.lastInstallationID, command.InstallationID, store.createCalls)
+	}
+}
+
+func TestCodexAnswerQuestionRequiresReadAndSendScopes(t *testing.T) {
+	input := codex.CommandInput{Type: codex.CommandAnswerQuestion, QuestionRequestID: "request-1", QuestionVersion: strings.Repeat("a", 64),
+		Answers: map[string][]string{" choice ": {"Option A"}}}
+	for _, test := range []struct {
+		name   string
+		scopes map[codex.Scope]bool
+		wantOK bool
+	}{
+		{name: "read only", scopes: map[codex.Scope]bool{codex.ScopeRead: true}},
+		{name: "send only", scopes: map[codex.Scope]bool{codex.ScopeSend: true}},
+		{name: "read and send", scopes: map[codex.Scope]bool{codex.ScopeRead: true, codex.ScopeSend: true}, wantOK: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &codexServiceTestStore{grantScopes: test.scopes}
+			service, err := NewCodexService(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.CreateCommand(context.Background(), codexServiceTestSessionPrincipal(), "l1234567", "answer-question-0001", input)
+			if test.wantOK && err != nil {
+				t.Fatalf("answer question with read and send scopes: %v", err)
+			}
+			if !test.wantOK && domain.CodeOf(err) != domain.CodeForbidden {
+				t.Fatalf("answer question without both scopes error = %v, want forbidden", err)
+			}
+		})
+	}
+}
+
+func TestCodexListAndHistoryReadAuditsContainOnlyMetadata(t *testing.T) {
+	if !audit.ActionCodexSessionListRead.Valid() || !audit.ActionCodexEventPageRead.Valid() || !audit.ActionCodexEventStreamRead.Valid() {
+		t.Fatal("Codex read audit actions are not in the action allowlist")
+	}
+	for _, test := range []struct {
+		name      string
+		principal identity.Principal
+		actorKind audit.ActorKind
+	}{
+		{name: "session", principal: codexServiceTestSessionPrincipal(), actorKind: audit.ActorSession},
+		{name: "client", principal: codexServiceTestClientPrincipal("i1234567"), actorKind: audit.ActorClient},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &codexServiceTestStore{
+				grantScopes:         map[codex.Scope]bool{codex.ScopeRead: true, codex.ScopeLive: true},
+				eventSessionOwnerID: test.principal.UserID,
+				eventPage: codex.EventPage{Items: []codex.Event{{Sequence: 8, Kind: codex.EventUserMessage,
+					Payload: map[string]any{"text": "private-message", "path_label": "private/path"}}}},
+			}
+			service, err := NewCodexService(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.List(context.Background(), test.principal, "i7654321", "l1234567", 10); err != nil {
+				t.Fatalf("list Codex sessions: %v", err)
+			}
+			if len(store.auditEntries) != 1 {
+				t.Fatalf("list audit count = %d, want 1", len(store.auditEntries))
+			}
+			listAudit := store.auditEntries[0]
+			wantListDetailCount := 2
+			if test.principal.Kind == identity.KindClient {
+				wantListDetailCount++
+			}
+			if listAudit.ActorID != test.principal.UserID || listAudit.ActorKind != test.actorKind ||
+				listAudit.Action != audit.ActionCodexSessionListRead || listAudit.Target != "i7654321" ||
+				len(listAudit.Detail) != wantListDetailCount || listAudit.Detail["cursor"] != "l1234567" || listAudit.Detail["row_count"] != 0 {
+				t.Fatalf("unexpected list audit metadata: %#v", listAudit)
+			}
+			if test.principal.Kind == identity.KindClient && listAudit.Detail["actor_installation_id"] != test.principal.ClientInstallationID {
+				t.Fatalf("list audit actor installation = %v, want %q", listAudit.Detail["actor_installation_id"], test.principal.ClientInstallationID)
+			}
+
+			if _, err := service.Events(context.Background(), test.principal, "l1234567", 7, 10); err != nil {
+				t.Fatalf("read Codex history page: %v", err)
+			}
+			if len(store.auditEntries) != 2 {
+				t.Fatalf("history audit count = %d, want 2 total", len(store.auditEntries))
+			}
+			historyAudit := store.auditEntries[1]
+			wantHistoryDetailCount := 2
+			if test.principal.Kind == identity.KindClient {
+				wantHistoryDetailCount++
+			}
+			if historyAudit.ActorID != test.principal.UserID || historyAudit.ActorKind != test.actorKind ||
+				historyAudit.Action != audit.ActionCodexEventPageRead || historyAudit.Target != "l1234567" ||
+				len(historyAudit.Detail) != wantHistoryDetailCount || historyAudit.Detail["after_sequence"] != int64(7) || historyAudit.Detail["row_count"] != 1 {
+				t.Fatalf("unexpected history audit metadata: %#v", historyAudit)
+			}
+			if test.principal.Kind == identity.KindClient && historyAudit.Detail["actor_installation_id"] != test.principal.ClientInstallationID {
+				t.Fatalf("history audit actor installation = %v, want %q", historyAudit.Detail["actor_installation_id"], test.principal.ClientInstallationID)
+			}
+
+			if _, err := service.LiveEvents(context.Background(), test.principal, "l1234567", 7, 10); err != nil {
+				t.Fatalf("read Codex live stream poll: %v", err)
+			}
+			if len(store.auditEntries) != 3 {
+				t.Fatalf("live stream batch audit count = %d, want 3 total", len(store.auditEntries))
+			}
+			streamAudit := store.auditEntries[2]
+			wantStreamDetailCount := 4
+			if test.principal.Kind == identity.KindClient {
+				wantStreamDetailCount++
+			}
+			if streamAudit.ActorID != test.principal.UserID || streamAudit.ActorKind != test.actorKind ||
+				streamAudit.Action != audit.ActionCodexEventStreamRead || streamAudit.Target != "l1234567" ||
+				len(streamAudit.Detail) != wantStreamDetailCount || streamAudit.Detail["after_sequence"] != int64(7) ||
+				streamAudit.Detail["first_sequence"] != int64(8) || streamAudit.Detail["last_sequence"] != int64(8) ||
+				streamAudit.Detail["row_count"] != 1 {
+				t.Fatalf("unexpected live stream audit metadata: %#v", streamAudit)
+			}
+			if test.principal.Kind == identity.KindClient && streamAudit.Detail["actor_installation_id"] != test.principal.ClientInstallationID {
+				t.Fatalf("stream audit actor installation = %v, want %q", streamAudit.Detail["actor_installation_id"], test.principal.ClientInstallationID)
+			}
+			store.eventPage.Items = nil
+			if _, err := service.Events(context.Background(), test.principal, "l1234567", 8, 10); err != nil {
+				t.Fatalf("read empty Codex history page: %v", err)
+			}
+			if _, err := service.LiveEvents(context.Background(), test.principal, "l1234567", 8, 10); err != nil {
+				t.Fatalf("read empty Codex live poll: %v", err)
+			}
+			if len(store.auditEntries) != 3 {
+				t.Fatalf("empty history page wrote an audit, count=%d", len(store.auditEntries))
+			}
+		})
+	}
+}
+
+func TestCodexReadDoesNotSucceedWhenAuditWriteFails(t *testing.T) {
+	store := &codexServiceTestStore{
+		grantScopes:         map[codex.Scope]bool{codex.ScopeRead: true, codex.ScopeLive: true},
+		eventSessionOwnerID: "u1234567",
+		eventPage:           codex.EventPage{Items: []codex.Event{{Sequence: 1, Payload: map[string]any{"text": "private"}}}},
+		auditErr:            errors.New("audit unavailable"),
+	}
+	service, err := NewCodexService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := codexServiceTestSessionPrincipal()
+	if _, err := service.List(context.Background(), principal, "i1234567", "", 10); err == nil {
+		t.Fatal("session list succeeded without its required audit")
+	}
+	if _, err := service.Events(context.Background(), principal, "l1234567", 0, 10); err == nil {
+		t.Fatal("nonempty history page succeeded without its required audit")
+	}
+	if _, err := service.LiveEvents(context.Background(), principal, "l1234567", 0, 10); err == nil {
+		t.Fatal("nonempty live batch succeeded without its required audit")
+	}
+	if len(store.auditEntries) != 0 {
+		t.Fatalf("failed audit writes were recorded in the test store: %d", len(store.auditEntries))
 	}
 }
 

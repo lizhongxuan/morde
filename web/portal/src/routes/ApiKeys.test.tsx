@@ -4,12 +4,12 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { ApiKeys } from './ApiKeys';
 
 const renderPage = () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const rendered = render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><ApiKeys /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  const rendered = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><ApiKeys /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { client, ...rendered };
 };
 

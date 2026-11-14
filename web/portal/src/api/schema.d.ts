@@ -95,13 +95,13 @@ export interface paths {
         };
         /**
          * Read a durable Codex event page
-         * @description Requires an owner Portal Session or owner Client credential and the session read scope. The reader Client installation may differ from the PC installation that owns the session. Sequences are strictly increasing and never gap over retained data; after_sequence greater than the current sequence is rejected. Each event is limited to 64 KiB and its normalized payload is validated against an event-kind allowlist.
+         * @description Requires an owner Portal Session or owner Client credential and the session read scope. The reader Client installation may differ from the PC installation that owns the session. Sequences are strictly increasing and never gap over retained data; after_sequence greater than the current sequence is rejected. Each event is limited to 64 KiB and its normalized payload is validated against an event-kind allowlist. The history includes server-managed command_status events for durable command progress.
          */
         get: operations["listCodexSessionEvents"];
         put?: never;
         /**
          * Persist normalized events from the bound PC installation
-         * @description Requires the same active Client installation bound to the session and its live scope. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files.
+         * @description Requires the same active Client installation bound to the session. Each event declares source=snapshot, live or approval and requires the matching read, live or approval grant; approval event kinds require approval scope, question events require live scope, and unsupported user_question diagnostics may be historical snapshots (read scope) or approval-sourced diagnostics (approval scope). Question IDs are opaque, preserve their exact bytes, and must be unique within one pending request. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. Source is used only for authorization and is not stored or returned as presentation data. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files. command_status events are server-managed and rejected from PC batches.
          */
         post: operations["appendCodexSessionEvents"];
         delete?: never;
@@ -119,7 +119,7 @@ export interface paths {
         };
         /**
          * Stream newly stored Codex events with SSE
-         * @description Requires an owner Portal Session or owner Client credential and the session live scope. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
+         * @description Requires an owner Portal Session or owner Client credential and both session read and live scopes. Read authorizes access to event-log contents; live authorizes the streaming transport. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
          */
         get: operations["streamCodexSessionEvents"];
         put?: never;
@@ -141,7 +141,7 @@ export interface paths {
         put?: never;
         /**
          * Queue an idempotent command for an authorized PC session
-         * @description Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc. Idempotency-Key retries return the original command; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
+         * @description Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. answer_question uses send scope. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc and its server-managed command_status event is appended in the same transaction using provider_event_id morde:command:<command-id>:<status-version>:<status>. Idempotency-Key retries return the original command without adding another event; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
          */
         post: operations["createCodexSessionCommand"];
         delete?: never;
@@ -161,7 +161,7 @@ export interface paths {
         put?: never;
         /**
          * Claim at most one waiting command for this PC installation
-         * @description Requires the active installation-bound Client credential. The PC polls over HTTPS every two seconds. The queue is database-backed and unrelated to Hub presence. Claim uses a conditional row lock; only waiting_pc commands with a current grant version are returned. A claimed command is never automatically returned to the queue if the PC result is missing.
+         * @description Requires the active installation-bound Client credential. The PC polls over HTTPS every two seconds. The queue is database-backed and unrelated to Hub presence. Claim uses a conditional row lock; only waiting_pc commands with a current grant version are returned. Claim appends the claimed command_status event in the same transaction. A claimed command with no result for 60 seconds becomes unknown on the next PC poll and is never returned to the queue.
          */
         post: operations["claimCodexCommand"];
         delete?: never;
@@ -181,7 +181,7 @@ export interface paths {
         put?: never;
         /**
          * Persist a PC command result
-         * @description Requires the original active PC installation, current session grant version and session authorization. Updates are idempotent and status transitions are one-way; a result of unknown is terminal and never requeued.
+         * @description Requires the original active PC installation, current session grant version and session authorization. Updates are idempotent and validated against allowed state transitions; each new status transition is appended as a command_status event in the same transaction. A result of unknown is terminal and never requeued. Grant-version changes fail commands not yet claimed and mark already claimed or in-flight commands unknown.
          */
         post: operations["reportCodexCommandResult"];
         delete?: never;
@@ -3660,7 +3660,11 @@ export interface paths {
         /** Get safe details for one task step */
         get: operations["getTaskStepDetail"];
         put?: never;
-        post?: never;
+        /**
+         * Queue one verified safe retry of a Task step
+         * @description Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. Request parameters cannot replace the tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
+         */
+        post: operations["retryTaskStep"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5773,7 +5777,10 @@ export interface components {
             provider_event_id: string;
             /** @enum {string} */
             kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "tool_call_summary" | "tool_result_summary" | "command_summary" | "file_change" | "file_change_summary" | "child_agent" | "subagent_summary" | "question" | "approval_request" | "approval_status" | "unsupported";
-            /** @description Authorization source only; it is not stored or returned as event content. @enum {string} */
+            /**
+             * @description Authorization source only; it is not stored or returned as event content. It selects the required read, live or approval grant.
+             * @enum {string}
+             */
             source: "snapshot" | "live" | "approval";
             /** Format: date-time */
             occurred_at: string;
@@ -5802,26 +5809,55 @@ export interface components {
                 approval_id?: string;
                 approval_version?: string;
                 kind?: string;
+                /** @description Bounded user-visible request object; paths are reduced to display labels. */
                 object?: string;
+                /** @description Bounded operation detail or requested permission scope. */
                 detail?: string;
+                /** @description Bounded provider reason when available. */
                 impact?: string;
+                /** @description Opaque App Server user-input request identifier; preserve exact bytes */
+                question_request_id?: string;
+                /** @description Lowercase SHA-256 identity for the pending user-input request. */
+                question_version?: string;
+                /** @description Question IDs must be unique within this request and are preserved byte-for-byte without trimming. */
                 questions?: components["schemas"]["CodexUserQuestion"][];
                 provider_type?: string;
                 diagnostic?: string;
             };
-        };
+        } & unknown;
         CodexEventBatch: {
             events: components["schemas"]["CodexEventInput"][];
         };
         CodexQuestionOption: {
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
             label: string;
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
             description?: string;
         };
         CodexUserQuestion: {
+            /** @description Opaque byte-preserved ID; server rejects blank-only values and controls. */
             id: string;
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
             header: string;
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
             question: string;
+            is_secret?: boolean;
+            is_other?: boolean;
             options: components["schemas"]["CodexQuestionOption"][];
+        };
+        CodexQuestionEventPayload: {
+            /** @description Opaque request identifier preserved byte-for-byte. */
+            question_request_id: string;
+            question_version: string;
+            /** @constant */
+            status: "pending";
+            questions: components["schemas"]["CodexUserQuestion"][];
+        } | {
+            /** @description Opaque request identifier preserved byte-for-byte. */
+            question_request_id: string;
+            question_version: string;
+            /** @enum {string} */
+            status: "answered" | "stale";
         };
         CodexEvent: {
             session_id: string;
@@ -5857,16 +5893,23 @@ export interface components {
                 approval_id?: string;
                 approval_version?: string;
                 kind?: string;
+                object?: string;
+                detail?: string;
+                impact?: string;
                 command_id?: string;
-                type?: "send" | "interrupt" | "approval";
+                /** @enum {string} */
+                type?: "send" | "interrupt" | "approval" | "answer_question";
                 result_code?: string;
+                /** @description Opaque request identifier preserved byte-for-byte. */
+                question_request_id?: string;
+                question_version?: string;
                 questions?: components["schemas"]["CodexUserQuestion"][];
                 provider_type?: string;
                 diagnostic?: string;
             };
             /** Format: date-time */
             stored_at: string;
-        };
+        } & unknown;
         CodexEventPage: {
             items: components["schemas"]["CodexEvent"][];
             /** Format: int64 */
@@ -5898,6 +5941,16 @@ export interface components {
             approval_version: string;
             /** @enum {string} */
             decision: "approve" | "reject";
+        } | {
+            /** @constant */
+            type: "answer_question";
+            /** @description Opaque request identifier preserved byte-for-byte. */
+            question_request_id: string;
+            question_version: string;
+            /** @description Map of opaque question IDs to 1–64 exact answer strings; IDs and accepted answer strings are preserved without trimming. */
+            answers: {
+                [key: string]: string[];
+            };
         };
         CodexCommand: {
             id: string;
@@ -5908,7 +5961,7 @@ export interface components {
             /** Format: int64 */
             grant_version: number;
             /** @enum {string} */
-            type: "send" | "interrupt" | "approval";
+            type: "send" | "interrupt" | "approval" | "answer_question";
             /** @enum {string} */
             status: "waiting_pc" | "claimed" | "forwarded" | "running" | "waiting_approval" | "completed" | "failed" | "unknown";
             input: components["schemas"]["CodexCommandInput"];
@@ -8748,11 +8801,18 @@ export interface components {
         TaskStep: {
             id: components["schemas"]["StepId"];
             sequence: number;
+            /** Format: int64 */
+            attempt: number;
+            retry_of_step_id?: components["schemas"]["StepId"] | null;
             /** @enum {string} */
             kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "progress" | "result";
             status: components["schemas"]["TaskStepStatus"];
             title: string;
             summary: string;
+            /** @enum {string|null} */
+            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | null;
+            /** @description True only when the persisted Host evidence confirms the previous tool attempt was not dispatched. */
+            retryable: boolean;
             /** @description Opaque Agent session ID that actually emitted this step. */
             agent_id?: string;
             /** Format: int64 */
@@ -8763,6 +8823,22 @@ export interface components {
             detail_state?: "not_recorded" | "available" | "expired" | "restricted";
             /** Format: date-time */
             created_at: string;
+        };
+        TaskStepRetryRequest: {
+            /** Format: int64 */
+            expected_task_revision: number;
+            /** Format: int64 */
+            expected_attempt: number;
+        };
+        TaskStepRetryResult: {
+            task_id: components["schemas"]["TaskId"];
+            source_step_id: components["schemas"]["StepId"];
+            attempt_step_id: components["schemas"]["StepId"];
+            /** Format: int64 */
+            attempt: number;
+            /** @enum {string} */
+            status: "queued";
+            replayed: boolean;
         };
         TaskAgentExecution: {
             /** @description Opaque DSH Agent session identifier. */
@@ -8843,6 +8919,7 @@ export interface components {
             object: string;
             content: string;
             impact: string;
+            disclosures: components["schemas"]["TaskApprovalDisclosures"];
             /**
              * Format: date-time
              * @description Null unless a trusted service policy explicitly sets an expiry.
@@ -8850,6 +8927,35 @@ export interface components {
             expires_at: string | null;
             /** @description Present only while an image */
             media_preview_operation_id?: components["schemas"]["OperationId"];
+        };
+        /** @description A known disclosure includes its evidence-backed summary. Unknown and not_applicable disclosures have a null summary. */
+        TaskApprovalTextDisclosure: {
+            /** @enum {string} */
+            state: "known" | "unknown" | "not_applicable";
+            summary: string | null;
+        };
+        /** @description A known amount includes its currency and whether it is an estimate or settled charge. Unknown and not_applicable amounts have null basis, amount_micros and currency. */
+        TaskApprovalCostDisclosure: {
+            /** @enum {string} */
+            state: "known" | "unknown" | "not_applicable";
+            /** @enum {string|null} */
+            basis: "estimate" | "settled" | null;
+            /** Format: int64 */
+            amount_micros: number | null;
+            currency: string | null;
+        };
+        /** @description Known options are substantiated alternatives. Unknown and not_applicable disclosures use an empty options array. */
+        TaskApprovalAlternativesDisclosure: {
+            /** @enum {string} */
+            state: "known" | "unknown" | "not_applicable";
+            options: string[];
+        };
+        TaskApprovalDisclosures: {
+            risk: components["schemas"]["TaskApprovalTextDisclosure"];
+            this_cost: components["schemas"]["TaskApprovalCostDisclosure"];
+            cumulative_cost: components["schemas"]["TaskApprovalCostDisclosure"];
+            alternatives: components["schemas"]["TaskApprovalAlternativesDisclosure"];
+            revocation: components["schemas"]["TaskApprovalTextDisclosure"];
         };
         TaskClarificationRequest: {
             id: components["schemas"]["ClarificationId"];
@@ -16208,6 +16314,42 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryTaskStep: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskStepRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description A new attempt was queued, or the previously queued attempt was returned for an idempotent replay. */
+            202: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepRetryResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

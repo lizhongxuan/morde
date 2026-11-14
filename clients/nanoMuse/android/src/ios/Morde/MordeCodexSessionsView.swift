@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // nanoMuse: Keep the Morde Codex page's user-visible strings in the shared catalogue.
 @MainActor
@@ -35,7 +36,7 @@ struct MordeCodexSessionsRoom: View {
         }
         .background(NanoMuseTones.canvas.ignoresSafeArea())
         .task { await store.loadInstallations() }
-        .onChange(of: store.cacheScopeIdentity) { _, _ in draft = "" }
+        .onChange(of: store.cacheScopeIdentity) { _ in draft = "" }
         .task(id: store.selectedStreamIdentity) {
             guard store.selectedSessionID != nil else { return }
             await store.followSelectedSession()
@@ -137,7 +138,16 @@ struct MordeCodexSessionsRoom: View {
                         let cwd = session.cwd_label
                         Text(cwd).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
-                    statusBadge(statusLabel(session.status))
+                    if !session.thread_id.isEmpty {
+                        Text("\(AppLocalized("Session ID")) · \(session.shortThreadID)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    if let updatedAt = session.updatedAtDate {
+                        let relativeTime = RelativeDateTimeFormatter().localizedString(for: updatedAt, relativeTo: Date())
+                        Text("\(AppLocalized("Last active")) · \(relativeTime)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    statusBadge(statusLabel(store.status(for: session)))
                     if let error = store.deleteErrors[session.id] {
                         Text(error).font(.caption).foregroundStyle(.orange).lineLimit(2)
                     }
@@ -147,6 +157,16 @@ struct MordeCodexSessionsRoom: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("morde.codex.session.\(session.id)")
+            if !session.thread_id.isEmpty {
+                Button {
+                    UIPasteboard.general.string = session.thread_id
+                } label: {
+                    Image(systemName: "doc.on.doc").frame(width: 38, height: 38).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(AppLocalized("Copy"))
+                .accessibilityIdentifier("morde.codex.copyThread.\(session.id)")
+            }
             Button {
                 deleteTarget = session
             } label: {
@@ -234,6 +254,11 @@ struct MordeCodexSessionsRoom: View {
     private func timelineItem(_ item: MordeCodexTimelineItem, session: MordeCodexSession) -> some View {
         if let approval = item.approval {
             approvalCard(approval, session: session)
+        } else if let question = item.question {
+            MordeCodexQuestionCard(question: question, session: session,
+                commandPending: store.selectedPendingCommand || store.submittingSessions.contains(session.id) ||
+                    store.isReplyInFlight(question, session: session),
+                onSubmit: { answers in await store.answerQuestion(question, in: session, answers: answers) })
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -284,17 +309,18 @@ struct MordeCodexSessionsRoom: View {
                 } else {
                     HStack {
                         Button(AppLocalized("Approve")) {
-                            Task { _ = await store.respondToApproval(approval, decision: "approve") }
+                            Task { _ = await store.respondToApproval(approval, in: session, decision: "approve") }
                         }
                         .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("morde.codex.approval.approve.\(approval.id)")
                         Button(AppLocalized("Reject"), role: .destructive) {
-                            Task { _ = await store.respondToApproval(approval, decision: "reject") }
+                            Task { _ = await store.respondToApproval(approval, in: session, decision: "reject") }
                         }
                         .buttonStyle(.bordered)
                         .accessibilityIdentifier("morde.codex.approval.reject.\(approval.id)")
                     }
-                    .disabled(store.selectedPendingCommand || store.submittingSessions.contains(session.id))
+                    .disabled(store.selectedPendingCommand || store.submittingSessions.contains(session.id) ||
+                        store.isReplyInFlight(approval, session: session))
                 }
             }
         }
@@ -308,9 +334,9 @@ struct MordeCodexSessionsRoom: View {
             if let error = store.commandErrors[session.id] {
                 Text(commandErrorText(error)).font(.footnote).foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                if store.pendingCommands[session.id] != nil {
+                if store.hasPendingCommand(for: session.id) {
                     Button(AppLocalized("Retry the same request")) {
-                        Task { _ = await store.retryUnconfirmedCommand() }
+                        Task { _ = await store.retryUnconfirmedCommand(in: session) }
                     }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("morde.codex.retrySameRequest")
@@ -376,6 +402,7 @@ struct MordeCodexSessionsRoom: View {
         case .file: AppLocalized("File change summary")
         case .agent: AppLocalized("Subagent activity")
         case .approval: AppLocalized("Waiting for approval")
+        case .question: AppLocalized("Codex has a question")
         case .status: AppLocalized("Turn status")
         case .commandStatus: AppLocalized("Command status")
         case .unsupported: AppLocalized("Unsupported event")
@@ -397,7 +424,11 @@ struct MordeCodexSessionsRoom: View {
     }
 
     private func emptyState(_ text: String) -> some View {
-        ContentUnavailableView(text, systemImage: "desktopcomputer")
+        VStack(spacing: 8) {
+            Image(systemName: "desktopcomputer").font(.title2).foregroundStyle(.secondary).accessibilityHidden(true)
+            Text(text).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity).padding(24)
     }
 
     private func failureState(_ message: String, retry: @escaping () -> Void) -> some View {
@@ -406,5 +437,116 @@ struct MordeCodexSessionsRoom: View {
             Button(AppLocalized("Retry"), action: retry).buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity).padding(24)
+    }
+}
+
+@MainActor
+private struct MordeCodexQuestionCard: View {
+    let question: MordeCodexUserQuestionRequest
+    let session: MordeCodexSession
+    let commandPending: Bool
+    let onSubmit: ([String: [String]]) async -> Bool
+
+    @State private var selectedOptions: [String: Set<Int>] = [:]
+    @State private var customAnswers: [String: String] = [:]
+    @State private var submitting = false
+
+    private var answers: [String: [String]] {
+        var result: [String: [String]] = [:]
+        for item in question.questions {
+            var values = item.options.enumerated().compactMap { index, option in
+                selectedOptions[item.id, default: []].contains(index) ? option.label : nil
+            }
+            if let custom = customAnswers[item.id],
+               !custom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                values.append(custom)
+            }
+            result[item.id] = values
+        }
+        return result
+    }
+
+    private var canSubmit: Bool {
+        question.accepts(answers) && session.hasScope("read") && session.hasScope("send") && !commandPending && !submitting
+    }
+
+    private func answerBinding(for id: String) -> Binding<String> {
+        Binding(get: { customAnswers[id, default: ""] }, set: { customAnswers[id] = $0 })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(AppLocalized("Codex has a question"), systemImage: "questionmark.circle")
+                .font(.headline)
+            if question.status == "answered" {
+                Text(AppLocalized("Answered")).font(.caption).foregroundStyle(.secondary)
+            } else if question.status == "stale" {
+                Text(AppLocalized("Question is no longer available.")).font(.footnote).foregroundStyle(.secondary)
+            } else if !session.hasScope("read") || !session.hasScope("send") {
+                Text(AppLocalized("Sending permission is unavailable.")).font(.footnote).foregroundStyle(.secondary)
+            } else if question.questions.isEmpty {
+                Text(AppLocalized("Question details are unavailable.")).font(.footnote).foregroundStyle(.secondary)
+            } else {
+                Text(AppLocalized("Answer every question to continue."))
+                    .font(.caption).foregroundStyle(.secondary)
+                ForEach(question.questions) { item in
+                    VStack(alignment: .leading, spacing: 6) {
+                        if !item.header.isEmpty { Text(item.header).font(.subheadline.weight(.semibold)) }
+                        Text(item.question).font(.body).textSelection(.enabled)
+                        ForEach(item.options.indices, id: \.self) { index in
+                            let option = item.options[index]
+                            Button {
+                                var selected = selectedOptions[item.id, default: []]
+                                if !selected.insert(index).inserted { selected.remove(index) }
+                                selectedOptions[item.id] = selected
+                            } label: {
+                                Label(option.label, systemImage: selectedOptions[item.id, default: []].contains(index)
+                                    ? "checkmark.square.fill" : "square")
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("morde.codex.question.\(item.id).option.\(index)")
+                            if !option.description.isEmpty {
+                                Text(option.description).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        if item.isOther || item.options.isEmpty {
+                            let prompt = AppLocalized(item.options.isEmpty ? "Your answer" : "Other")
+                            if item.isSecret {
+                                SecureField(prompt, text: answerBinding(for: item.id))
+                                    .textFieldStyle(.roundedBorder)
+                            } else {
+                                TextField(prompt, text: answerBinding(for: item.id), axis: .vertical)
+                                    .lineLimit(1...3)
+                                    .textFieldStyle(.roundedBorder)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                Button(AppLocalized("Submit answers")) {
+                    Task {
+                        submitting = true
+                        let succeeded = await onSubmit(answers)
+                        if succeeded { clearAnswers() }
+                        submitting = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSubmit)
+                .accessibilityIdentifier("morde.codex.question.submit.\(question.id)")
+            }
+        }
+        .padding(14)
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(NanoMuseTones.hairline))
+        .onChange(of: question.status) { status in
+            if status == "answered" || status == "stale" { clearAnswers() }
+        }
+    }
+
+    private func clearAnswers() {
+        selectedOptions.removeAll()
+        customAnswers.removeAll()
     }
 }

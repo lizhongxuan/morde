@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import type { components } from '../../api/schema';
 import { portalApi } from '../../app/api';
-import { ToastProvider } from '../../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminUserDetail } from './AdminUserDetail';
 
 const user: components['schemas']['AdminUser'] = {
@@ -23,7 +23,7 @@ const call: UnknownModelCall = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={['/admin/users/u1234567']}><Routes>
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/admin/users/u1234567']}><Routes>
     <Route path="/admin/users/:id" element={<AdminUserDetail />} />
   </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
 }

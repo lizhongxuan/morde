@@ -61,4 +61,10 @@ func TestListConversationsOrdersAndPaginatesByLastActivity(t *testing.T) {
 	if err != nil || len(searched.Items) != 1 || searched.Items[0].ID != middleCreated.ID || searched.NextCursor != "" {
 		t.Fatalf("second search page = %#v, err=%v", searched, err)
 	}
+
+	outsider := createTestUser(t, store, 1, 1000, 2048)
+	isolated, err := store.ListConversations(ctx, outsider.ID, nil, app.PageRequest{Limit: 5, Search: "PLANNING"})
+	if err != nil || len(isolated.Items) != 0 {
+		t.Fatalf("search leaked another account's conversations: %#v, err=%v", isolated, err)
+	}
 }

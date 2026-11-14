@@ -26,6 +26,8 @@ type Props = {
   controlActionError: string;
   controlActionLabel: string;
   controlActionPending: boolean;
+  notice?: string;
+  noticeKind?: 'success' | 'error';
   onControlAction: () => void;
   onRetryControl: () => void;
 };
@@ -48,6 +50,8 @@ export default function TopBar({
   controlActionError,
   controlActionLabel,
   controlActionPending,
+  notice,
+  noticeKind = 'success',
   onControlAction,
   onRetryControl,
 }: Props) {
@@ -98,6 +102,7 @@ export default function TopBar({
             ? `操作租约${control.control_lease_held_by_me ? '由你持有' : '有效'} · ${formatRemaining(control.control_lease_expires_at, now)}`
             : '当前没有有效操作租约'}
         </span>}
+        {notice && <span className="workbench-status" data-kind={noticeKind} role={noticeKind === 'error' ? 'alert' : 'status'}>{notice}</span>}
       </div>
       <div className="top-actions">
         {!embedded && <button className="button button-secondary host-return-button" type="button" onClick={returnToPreviousPage}>返回云端电脑</button>}

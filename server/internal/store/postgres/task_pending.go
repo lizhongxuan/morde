@@ -90,12 +90,29 @@ FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, ta
 			requestExpired = true
 			return nil
 		}
+		requestStatus = string(task.PendingRequestApproved)
+		if decision == task.PendingDecisionReject {
+			requestStatus = string(task.PendingRequestRejected)
+		}
+		updated, err := tx.Exec(ctx, `UPDATE task_pending_requests SET status=$3, decision=$4, responded_at=clock_timestamp()
+WHERE id=$1 AND task_id=$2 AND status='pending' AND (expires_at IS NULL OR expires_at > clock_timestamp())`,
+			pendingID, taskID, requestStatus, string(decision))
+		if err != nil {
+			return fmt.Errorf("persist pending request decision: %w", err)
+		}
+		if updated.RowsAffected() != 1 {
+			if err := expirePendingRequestTx(ctx, tx, taskID, pendingID, version, leaseVersion); err != nil {
+				return err
+			}
+			requestExpired = true
+			return nil
+		}
 		stored, replayed, err := reserveIdempotency(ctx, tx, record, taskID, pendingID)
 		if err != nil {
 			return err
 		}
 		if replayed {
-			return nil
+			return domain.NewError(domain.CodeConflict, "pending request was already answered")
 		}
 		if mediaPreviewOperationID != "" {
 			if !domain.ValidOperationID(mediaPreviewOperationID) {
@@ -115,14 +132,6 @@ WHERE task_id=$1 AND operation_id=$2 AND state='preview' AND cleanup_state='pend
 			if decision == task.PendingDecisionApprove && updated.RowsAffected() != 1 {
 				return domain.NewError(domain.CodeConflict, "task media preview is expired or no longer available")
 			}
-		}
-		requestStatus = string(task.PendingRequestApproved)
-		if decision == task.PendingDecisionReject {
-			requestStatus = string(task.PendingRequestRejected)
-		}
-		if _, err := tx.Exec(ctx, `UPDATE task_pending_requests SET status=$3, decision=$4, responded_at=clock_timestamp()
-WHERE id=$1 AND task_id=$2`, pendingID, taskID, requestStatus, string(decision)); err != nil {
-			return fmt.Errorf("persist pending request decision: %w", err)
 		}
 		payload, err := json.Marshal(map[string]any{
 			"pending_id": pendingID, "pending_version": version, "decision": string(decision),

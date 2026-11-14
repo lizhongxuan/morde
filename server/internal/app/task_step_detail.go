@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -106,6 +107,9 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		TaskRevision: *activity.current.CurrentRevision, CallKey: activity.call.CallID, ToolName: activity.call.Name,
 		RequestDigest: append([]byte(nil), activity.digest...), Phase: phase, DetailState: "not_recorded",
 		Truncated: truncated}
+	if step.Status == task.StepFailed && phase == "prepare" {
+		progress.FailureReason, progress.Retryable = "not_dispatched", true
+	}
 	if activity.sealer != nil {
 		ciphertext, digest, size, err := sealTaskStepDetail(activity.sealer, activity.current.OwnerID, activity.current.ID, step.ID,
 			progress.TaskRevision, detail)
@@ -115,6 +119,68 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		progress.DetailState, progress.DetailCiphertext, progress.DetailSHA256, progress.DetailSizeBytes = "available", ciphertext, digest, size
 	}
 	return progress, nil
+}
+
+// SupportsSafeTaskStepRetryTool reports whether the existing Host operation
+// runner can bind a tool name to its task operation journal.
+func SupportsSafeTaskStepRetryTool(name string) bool {
+	_, ok := runtimeToolMappingByName(name)
+	return ok
+}
+
+// MatchesTaskStepRetryCall binds the one-time retry identity to the exact
+// arguments restored from the pinned DSH checkpoint.
+func MatchesTaskStepRetryCall(intent task.StepRetryIntent, call ModelToolCall) bool {
+	fence := call.TaskFence
+	if fence == nil || call.CallID != intent.RetryCallID || call.Name != intent.ToolName ||
+		fence.TaskID != intent.TaskID || fence.OwnerID != intent.OwnerID || fence.AgentSessionID != intent.AgentSessionID ||
+		fence.AgentRootSessionID != intent.AgentSessionID || fence.AuthorizationVersion != intent.AuthorizationVersion ||
+		fence.ThroughSequence != intent.CheckpointThroughSequence {
+		return false
+	}
+	return MatchesTaskStepRetryArguments(intent, call.Name, call.Arguments)
+}
+
+func MatchesTaskStepRetryArguments(intent task.StepRetryIntent, name, rawArguments string) bool {
+	if name != intent.ToolName || !SupportsSafeTaskStepRetryTool(name) {
+		return false
+	}
+	arguments, err := canonicalStepRetryArguments(rawArguments)
+	if err != nil {
+		return false
+	}
+	digest, err := agentOperationHash(name, arguments)
+	return err == nil && bytes.Equal(digest[:], intent.RequestDigest)
+}
+
+func canonicalStepRetryArguments(raw string) (json.RawMessage, error) {
+	validated, err := validateAgentToolArguments(raw)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(validated))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return canonical, nil
+}
+
+// ConsumeTaskStepRetryIntent forwards the one-time admission check to the
+// durable Store. The worker uses this boundary before entering the existing
+// tool broker.
+func (s *AgentCheckpointService) ConsumeTaskStepRetryIntent(ctx context.Context, intent task.StepRetryIntent,
+	fence AgentInstanceFence) error {
+	consumer, ok := s.store.(TaskStepRetryIntentConsumer)
+	if !ok {
+		return fmt.Errorf("task step retry admission is unavailable")
+	}
+	return consumer.ConsumeTaskStepRetryIntent(ctx, intent, fence)
 }
 
 func taskToolResultSummary(step task.Step) string {

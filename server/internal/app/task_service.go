@@ -699,6 +699,75 @@ func (s *TaskService) GetStepDetail(ctx context.Context, principal identity.Prin
 	return result, nil
 }
 
+// RetryStep reserves an immutable retry of one confirmed, not-dispatched Host
+// tool call. It never accepts replacement arguments from the caller.
+func (s *TaskService) RetryStep(ctx context.Context, principal identity.Principal, taskID, stepID string,
+	expectedRevision, expectedAttempt int64, idempotencyKey string) (TaskStepRetryResult, error) {
+	if err := validateTaskPrincipal(principal); err != nil {
+		return TaskStepRetryResult{}, err
+	}
+	if !domain.ValidTaskID(taskID) || !domain.ValidStepID(stepID) {
+		return TaskStepRetryResult{}, domain.NewError(domain.CodeNotFound, "task step not found")
+	}
+	if expectedRevision < 0 || expectedAttempt < 1 {
+		return TaskStepRetryResult{}, domain.InvalidArgument("retry", "step retry fence is invalid")
+	}
+	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+		return TaskStepRetryResult{}, err
+	}
+	details, err := s.store.GetTask(ctx, taskID, principal.UserID)
+	if err != nil {
+		return TaskStepRetryResult{}, err
+	}
+	current := details.Task
+	authorization, err := s.authorizeTask(ctx, principal, current.HostID, taskControlScope)
+	if err != nil {
+		return TaskStepRetryResult{}, hideTaskAccessError(err)
+	}
+	if authorization.Kind != current.Authorization.Kind || authorization.TokenID != current.Authorization.TokenID ||
+		authorization.ClientInstallationID != current.Authorization.ClientInstallationID || authorization.Version != current.Authorization.Version ||
+		!sameTaskAuthorizationScopes(authorization.Scopes, current.Authorization.Scopes) {
+		return TaskStepRetryResult{}, domain.NewError(domain.CodeForbidden, "task authorization changed")
+	}
+	retryStore, ok := s.store.(TaskStepRetryStore)
+	if !ok {
+		return TaskStepRetryResult{}, domain.NewError(domain.CodeInternal, "task step retry storage is unavailable")
+	}
+	attemptStepID, err := domain.NewStepID()
+	if err != nil {
+		return TaskStepRetryResult{}, fmt.Errorf("generate task step retry identity: %w", err)
+	}
+	request := TaskStepRetryRequest{TaskID: taskID, StepID: stepID, ExpectedTaskRevision: expectedRevision,
+		ExpectedAttempt: expectedAttempt, AttemptStepID: attemptStepID, RetryCallID: "morde_step_retry_" + attemptStepID}
+	idempotency, err := idempotencyRecord(principal.UserID, "task.step.retry", idempotencyKey, struct {
+		TaskID        string `json:"task_id"`
+		StepID        string `json:"step_id"`
+		Revision      int64  `json:"expected_task_revision"`
+		Attempt       int64  `json:"expected_attempt"`
+	}{taskID, stepID, expectedRevision, expectedAttempt}, attemptStepID, stepID)
+	if err != nil {
+		return TaskStepRetryResult{}, err
+	}
+	reserved, err := retryStore.RequestTaskStepRetry(ctx, idempotency, request)
+	if err != nil {
+		return TaskStepRetryResult{}, err
+	}
+	return TaskStepRetryResult{TaskID: taskID, SourceStepID: stepID, AttemptStepID: reserved.Intent.AttemptStepID,
+		Attempt: reserved.Intent.Attempt, Status: "queued", Replayed: reserved.Replayed}, nil
+}
+
+func sameTaskAuthorizationScopes(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // Project Task owners can differ from the Workspace-owning member reading artifacts.
 func (s *TaskService) taskArtifactWorkspaceVisible(ctx context.Context, requesterID, workspaceID string) (bool, error) {
 	reader, ok := s.store.(taskWorkspaceSnapshotReader)

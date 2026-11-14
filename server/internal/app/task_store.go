@@ -154,6 +154,40 @@ type TaskStepDetailReader interface {
 	GetTaskStepDetail(context.Context, string, string, string) (TaskStepDetailRecord, error)
 }
 
+type TaskStepRetryRequest struct {
+	TaskID               string
+	StepID               string
+	ExpectedTaskRevision int64
+	ExpectedAttempt      int64
+	AttemptStepID        string
+	RetryCallID          string
+}
+
+type TaskStepRetryRecord struct {
+	Intent   task.StepRetryIntent
+	Replayed bool
+}
+
+type TaskStepRetryResult struct {
+	TaskID        string `json:"task_id"`
+	SourceStepID  string `json:"source_step_id"`
+	AttemptStepID string `json:"attempt_step_id"`
+	Attempt       int64  `json:"attempt"`
+	Status        string `json:"status"`
+	Replayed      bool   `json:"replayed"`
+}
+
+// TaskStepRetryStore atomically validates and reserves one retry intent. The
+// consumer is called at the DSH tool-call admission boundary before the
+// existing broker can execute the attempt.
+type TaskStepRetryStore interface {
+	RequestTaskStepRetry(context.Context, IdempotencyRecord, TaskStepRetryRequest) (TaskStepRetryRecord, error)
+}
+
+type TaskStepRetryIntentConsumer interface {
+	ConsumeTaskStepRetryIntent(context.Context, task.StepRetryIntent, AgentInstanceFence) error
+}
+
 type TaskToolCallProgress struct {
 	AgentSessionID       string
 	AgentInstanceID      string
@@ -165,6 +199,8 @@ type TaskToolCallProgress struct {
 	RequestDigest        []byte
 	Phase                string
 	DetailState          string
+	FailureReason        string
+	Retryable            bool
 	DetailCiphertext     []byte
 	DetailSHA256         []byte
 	DetailSizeBytes      int32

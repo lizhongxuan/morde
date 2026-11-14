@@ -186,19 +186,17 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     const appActions = applicationMenu[0].submenu;
     assert.deepEqual(appActions.map((item) => item.label), ['Open Morde', 'Settings', undefined, 'Quit Morde']);
     const settings = appActions.find((item) => item.label === 'Settings').submenu;
-    assert.deepEqual(settings.map((item) => item.label), ['Local Sync', 'Sign Out This PC']);
-    settings[0].click();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
-    assert.equal(contents.getURL(), 'https://portal.example/workspaces');
+    assert.deepEqual(settings.map((item) => item.label), ['Sign Out This PC']);
     await handlers.get('morde:open-assistant')({ sender: mainWindow.webContents });
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
     assert.equal(contents.getURL(), assistantURL);
-    settings[0].click();
-    await new Promise((resolve) => setImmediate(resolve));
+
+    // The conversation's Files panel opens this route within Portal; no desktop-menu shortcut is exposed.
+    contents.url = 'https://portal.example/workspaces';
     appActions[0].click();
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
-    const portalNavigation = [assistantURL, 'https://portal.example/workspaces', assistantURL, 'https://portal.example/workspaces'];
+    assert.equal(contents.getURL(), 'https://portal.example/workspaces');
+    const portalNavigation = [assistantURL];
     assert.deepEqual(contents.loaded, portalNavigation);
     assert.equal(handlers.has('morde:show-web'), false);
 

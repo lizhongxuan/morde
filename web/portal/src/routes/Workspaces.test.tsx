@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { components } from '../api/schema';
 import { portalApi } from '../app/api';
 import type { PendingWorkspaceRestore } from '../app/workspace-restore';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Workspaces } from './Workspaces';
 
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567' } }) }));
@@ -44,7 +44,7 @@ function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace']
     client.setQueryData(['workspaces'], { items: initialWorkspaces });
     client.setQueryData(['hosts'], { items: initialHosts });
   }
-  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[initialEntry]}><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[initialEntry]}><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 function setProjectBridge(value: unknown) {
@@ -316,7 +316,7 @@ describe('Workspaces', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('无法读取主机绑定状态');
     expect(alert).toHaveTextContent('电脑列表暂不可用');
-    expect(alert.closest('.toast-region')?.parentElement).toBe(document.body);
+    expect(alert.closest('.notice-center-panel')).toBeInTheDocument();
     await user.click(within(alert).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(screen.queryByText(/无法读取主机绑定状态/)).not.toBeInTheDocument());
   });
@@ -751,7 +751,7 @@ describe('Workspaces', () => {
     let finishHosts!: (value: { items: typeof host[] }) => void;
     const hosts = vi.spyOn(portalApi, 'hosts').mockImplementation(() => new Promise((resolve) => { finishHosts = resolve; }));
 
-    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await waitFor(() => expect(hosts).toHaveBeenCalled());
     const deleteButton = await screen.findByRole('button', { name: '删除工作区 项目工作区' });
@@ -768,7 +768,7 @@ describe('Workspaces', () => {
     const remove = vi.spyOn(portalApi, 'deleteWorkspace').mockRejectedValue(new Error('工作区仍有主机绑定'));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await user.click(await screen.findByRole('button', { name: '删除工作区 项目工作区' }));
     expect(screen.getByRole('heading', { name: '删除工作区' })).toBeInTheDocument();
@@ -812,7 +812,7 @@ describe('Workspaces', () => {
       .mockResolvedValue({ items: [{ ...workspace, state: 'deleted' }] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText('删除中')).toBeInTheDocument();
     expect(screen.getByText('已用 / 配额')).toBeInTheDocument();
@@ -832,7 +832,7 @@ describe('Workspaces', () => {
       .mockResolvedValue({ items: [] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText(/同步：已同步 v2/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '删除工作区 保留工作区' })).toBeDisabled();

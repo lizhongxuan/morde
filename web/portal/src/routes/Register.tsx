@@ -3,12 +3,9 @@ import type { FormEvent } from 'react';
 import { Link, Navigate, useNavigate } from 'react-router';
 import { errorDetails, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
-import { useToast } from '../app/toast';
-import { FloatingError } from '../components/FloatingError';
 
 export function Register() {
   const { user, loading } = useAuth();
-  const { notify } = useToast();
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
@@ -27,7 +24,7 @@ export function Register() {
       navigate('/login', { replace: true, state: { registered: true } });
     } catch (reason) {
       const details = errorDetails(reason);
-      notify(details.code === 'conflict' ? '用户名已被使用，请更换用户名。' : details.message, 'error');
+      setValidationError(details.code === 'conflict' ? '用户名已被使用，请更换用户名。' : details.message);
     } finally { setBusy(false); }
   };
 
@@ -43,7 +40,7 @@ export function Register() {
         <input id="register-password" name="password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={password} onChange={(event) => setPassword(event.target.value)} />
         <label htmlFor="register-confirmation">确认密码</label>
         <input id="register-confirmation" name="confirmation" type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
-        {validationError && <FloatingError>{validationError}</FloatingError>}
+        {validationError && <p className="form-error" role="alert">{validationError}</p>}
         <button className="button button-primary button-wide" type="submit" disabled={busy}>{busy ? '正在注册…' : '注册'}</button>
       </form>
       <p className="login-register-link">已有账号？<Link to="/login">返回登录</Link></p>

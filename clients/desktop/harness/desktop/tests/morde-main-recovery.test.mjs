@@ -1211,7 +1211,7 @@ test('live sync preserves conflicts and refuses automatic restart', async () => 
   }
 });
 
-test('web-view connection failures never forward raw errors on the sync-state IPC channel', async () => {
+test('web-view connection failures stay in the desktop shell and never expose the standalone sync screen', async () => {
   const originalFetch = globalThis.fetch;
   const h = harness(auth);
   try {
@@ -1226,6 +1226,7 @@ test('web-view connection failures never forward raw errors on the sync-state IP
     }
     assert.ok(event);
     assert.equal(event.message, 'Morde 云端页面暂时无法连接；本机同步状态未改变。');
+    assert.equal((await h.handlers.get('morde:state')({ sender: h.windows.at(-1).webContents })).view, 'offline');
     const serialized = JSON.stringify(event);
     for (const secret of ['/private/workspace', 'sync-secret', 'private file contents']) assert.equal(serialized.includes(secret), false);
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }

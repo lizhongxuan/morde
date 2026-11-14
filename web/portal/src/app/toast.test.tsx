@@ -1,7 +1,8 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import { ToastProvider, useToast } from './toast';
+import { ToastNoticeCenter, ToastProvider, useToast } from './toast';
+import { FloatingNotice } from '../components/FloatingError';
 
 function TriggerActionToast({ action }: { action: () => void }) {
   const { notify } = useToast();
@@ -9,16 +10,19 @@ function TriggerActionToast({ action }: { action: () => void }) {
 }
 
 describe('ToastProvider', () => {
-  it('shows persistent actions in its fixed notification region', async () => {
+  it('groups persistent errors in the folded notice center', async () => {
     const user = userEvent.setup();
     const retry = vi.fn();
-    render(<main data-testid="page-layout"><ToastProvider><TriggerActionToast action={retry} /></ToastProvider></main>);
+    render(<ToastProvider><ToastNoticeCenter /><main data-testid="page-layout"><TriggerActionToast action={retry} /><FloatingNotice>云端状态待确认</FloatingNotice></main></ToastProvider>);
 
     await user.click(screen.getByRole('button', { name: '显示错误' }));
+    const summary = await screen.findByLabelText('错误与状态，2 条');
+    expect(summary.closest('details')).not.toHaveAttribute('open');
+    await user.click(summary);
     const alert = screen.getByRole('alert');
-    const region = alert.closest('.toast-region');
-    expect(region).toBeInTheDocument();
-    expect(region?.parentElement).toBe(document.body);
+    expect(alert.closest('.notice-center-panel')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('云端状态待确认');
+    expect(document.querySelector('.toast-region')).toBeNull();
     expect(screen.getByTestId('page-layout')).not.toContainElement(alert);
     await user.click(screen.getByRole('button', { name: '重试' }));
 

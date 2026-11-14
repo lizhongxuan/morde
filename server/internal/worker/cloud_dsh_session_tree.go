@@ -42,6 +42,7 @@ type cloudDSHSessionState struct {
 	history          *cloudDSHCheckpointHistory
 	images           *cloudDSHImageRegistry
 	lastStream       *cloudDSHTextStream
+	stepRetryResult  *app.AgentToolResult
 	settled          bool
 }
 
@@ -850,6 +851,48 @@ func sameWorkerToolNames(left, right []string) bool {
 	return true
 }
 
+func cloudDSHStepRetryStartPayload(intent task.StepRetryIntent) map[string]any {
+	return map[string]any{
+		"task_id": intent.TaskID, "owner_id": intent.OwnerID, "source_step_id": intent.SourceStepID,
+		"attempt_step_id": intent.AttemptStepID, "attempt": intent.Attempt, "source_call_id": intent.SourceCallID,
+		"retry_call_id": intent.RetryCallID, "session_id": intent.AgentSessionID, "task_revision": intent.TaskRevision,
+		"tool_name": intent.ToolName, "request_digest": hex.EncodeToString(intent.RequestDigest),
+		"authorization_version": intent.AuthorizationVersion, "host_id": intent.HostID,
+		"host_runtime_generation": intent.HostRuntimeGeneration, "workspace_id": intent.WorkspaceID,
+		"input_revision":                cloudDSHNullableInt64(intent.InputRevision),
+		"workspace_checkpoint_revision": cloudDSHNullableInt64(intent.WorkspaceCheckpointRevision),
+		"workspace_binding_version":     intent.WorkspaceBindingVersion,
+		"workspace_revision":            cloudDSHNullableInt64(intent.WorkspaceRevision),
+		"checkpoint_through_seq":        intent.CheckpointThroughSequence,
+		"checkpoint_sha256":             hex.EncodeToString(intent.CheckpointDigest),
+		"expires_at":                    intent.ExpiresAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func cloudDSHNullableInt64(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func markCloudDSHRetrySourceReconciled(history *cloudDSHCheckpointHistory, intent task.StepRetryIntent) error {
+	if history == nil {
+		return errors.New("dsh retry checkpoint history is unavailable")
+	}
+	call := history.calls[intent.SourceCallID]
+	if call == nil || !call.historical || !call.callSeen || !call.resultSeen || call.reconciled || call.name != intent.ToolName ||
+		len(call.resultImages) != 0 || !strings.HasPrefix(call.resultText, "Tool failed: ") || len(call.resultText) == len("Tool failed: ") ||
+		!app.MatchesTaskStepRetryArguments(intent, call.name, string(call.arguments)) {
+		return errors.New("dsh retry source checkpoint does not contain the exact failed call")
+	}
+	call.status = app.AgentToolFailed
+	call.output = strings.TrimPrefix(call.resultText, "Tool failed: ")
+	call.reconciled = true
+	history.recordFileWriteOutput(intent.SourceCallID, call.resultText)
+	return nil
+}
+
 func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
 	input io.WriteCloser, output io.ReadCloser, resume, toolsAllowed, streamAllowed bool, completion *app.CloudDSHTaskCompletion, onStart func()) error {
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -890,6 +933,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}
 	if !validCloudDSHToolDefinitions(rootDefinitions) {
 		return errors.New("dsh tool definitions are unavailable")
+	}
+	if value.StepRetry != nil {
+		if !resume || !toolsAllowed || e.options.Tools == nil ||
+			!cloudDSHToolAllowed(rootDefinitions, value.StepRetry.ToolName) {
+			return errors.New("dsh step retry tool is not available in the pinned task context")
+		}
 	}
 	rootThrough := int64(-1)
 	var rootDigest []byte
@@ -1235,6 +1284,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 			}
 			if len(revisionBatch) != 0 {
+				if value.StepRetry != nil {
+					return errors.New("dsh step retry cannot include a new task revision")
+				}
 				batchBytes := 0
 				for _, message := range revisionBatch {
 					batchBytes += len(message["content"].(string))
@@ -1248,6 +1300,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				start["revision_messages"] = revisionBatch
 			}
 			if toolsAllowed && e.options.Children != nil {
+				if value.StepRetry != nil && len(backgroundJobs) != 0 {
+					return errors.New("dsh step retry cannot include background jobs")
+				}
 				start["background_jobs"] = backgroundJobs
 			}
 			if resume {
@@ -1288,6 +1343,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				start["resume"] = true
 				start["checkpoint_through_seq"] = rootThrough
 				start["checkpoint_sha256"] = hex.EncodeToString(rootDigest)
+				if value.StepRetry != nil {
+					start["step_retry"] = cloudDSHStepRetryStartPayload(*value.StepRetry)
+				}
 				if outputContinuationPrompt != "" {
 					start["prompt"] = outputContinuationPrompt
 				}
@@ -1474,6 +1532,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			state.readThrough = page.Through
 			if state.readThrough == state.restoreThrough {
 				state.history.finishRestore()
+				if value.StepRetry != nil && state.identity.SessionID == rootIdentity.SessionID {
+					if state.restoreThrough != value.StepRetry.CheckpointThroughSequence ||
+						!bytes.Equal(state.restoreDigest, value.StepRetry.CheckpointDigest) ||
+						markCloudDSHRetrySourceReconciled(state.history, *value.StepRetry) != nil {
+						return errors.New("dsh safe retry source does not match the pinned checkpoint")
+					}
+				}
 			}
 		case "checkpoint":
 			if !cloudDSHID.MatchString(frame.ID) || frame.From == nil || frame.Through == nil ||
@@ -1569,6 +1634,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		case "settled":
 			if state.identity.SessionID != rootIdentity.SessionID || frame.Through == nil || *frame.Through != state.through ||
 				state.through < 0 || frame.State != "completed_candidate" ||
+				(value.StepRetry != nil && state.stepRetryResult == nil) ||
 				(state.resume && (state.readThrough != state.restoreThrough || state.lastModel < 0 && !state.history.hasCompletedResult())) ||
 				(!state.resume && state.lastModel < 0) {
 				return errors.New("dsh did not produce a completed candidate")
@@ -1681,10 +1747,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				!cloudDSHToolAllowed(state.definitions, frame.Name) || frame.Name == cloudDSHDelegateToolName || !validCloudDSHJSONObject(frame.Arguments) {
 				return errors.New("dsh tool call frame is invalid")
 			}
+			retryCall := value.StepRetry != nil && state.identity.SessionID == rootIdentity.SessionID && frame.CallID == value.StepRetry.RetryCallID
+			reservedRetryCall := strings.HasPrefix(frame.CallID, "morde_step_retry_")
+			if reservedRetryCall && !retryCall || value.StepRetry != nil && !retryCall {
+				return errors.New("dsh step retry call has no matching persistent intent")
+			}
 			arguments, ok := canonicalCloudDSHJSON(frame.Arguments)
 			recoveryCall := state.resume && state.history.isRecoveryCall(frame.CallID)
-			if !ok || (recoveryCall && (state.readThrough != state.restoreThrough || state.history.validateRecoveryToolCall(frame.CallID, frame.Name, arguments) != nil)) ||
-				(!recoveryCall && (!state.history.allHistoricalCallsReconciled() || state.history.validateToolCall(frame.CallID, frame.Name, arguments) != nil)) {
+			if !ok || (retryCall && (recoveryCall || !state.history.allHistoricalCallsReconciled() || state.history.calls[frame.CallID] != nil ||
+				state.history.calls[value.StepRetry.SourceCallID] == nil || !app.MatchesTaskStepRetryArguments(*value.StepRetry, frame.Name, string(arguments)))) ||
+				(!retryCall && recoveryCall && (state.readThrough != state.restoreThrough || state.history.validateRecoveryToolCall(frame.CallID, frame.Name, arguments) != nil)) ||
+				(!retryCall && !recoveryCall && (!state.history.allHistoricalCallsReconciled() || state.history.validateToolCall(frame.CallID, frame.Name, arguments) != nil)) {
 				return errors.New("dsh tool arguments are invalid")
 			}
 			cancelRequested, err := e.cloudDSHJobCancelRequested(ctx, fence, state)
@@ -1692,6 +1765,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("dsh background job authorization changed")
 			}
 			if cancelRequested {
+				if retryCall {
+					return context.Canceled
+				}
 				continue
 			}
 			toolCallID := frame.CallID
@@ -1700,6 +1776,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			call := app.ModelToolCall{CallID: toolCallID, Name: frame.Name, Arguments: string(arguments),
 				TaskFence: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
+			if retryCall {
+				consumer, ok := e.options.Checkpoints.(app.TaskStepRetryIntentConsumer)
+				if !ok || !app.MatchesTaskStepRetryCall(*value.StepRetry, call) {
+					return errors.New("dsh step retry call does not match its persistent intent")
+				}
+				if err := consumer.ConsumeTaskStepRetryIntent(ctx, *value.StepRetry, fence); err != nil {
+					return errors.New("dsh step retry intent could not be consumed")
+				}
+			}
 			if protectsMemory {
 				versions, err := cloudDSHMemoryWritesWithReceipts(states, false, recoveredPersonalWrites)
 				if err != nil || memoryValidator.ValidatePersonalMemoryProof(ctx, value, memoryProof, versions) != nil {
@@ -1780,7 +1865,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh tool image could not be validated")
 			}
-			if err := state.history.noteToolResult(frame.CallID, frame.Name, arguments, result.Status, result.Output, toolImages); err != nil {
+			if retryCall {
+				settled := result
+				settled.Images = append([]app.ModelImage(nil), result.Images...)
+				state.stepRetryResult = &settled
+			} else if err := state.history.noteToolResult(frame.CallID, frame.Name, arguments, result.Status, result.Output, toolImages); err != nil {
 				return err
 			}
 			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "tool_result", "id": frame.ID,

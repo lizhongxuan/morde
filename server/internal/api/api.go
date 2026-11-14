@@ -621,6 +621,7 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/auth/client-web-session", "/api/auth/client-logout", "/api/auth/client-schedule-grant":
 			return true
 		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
+			"/api/tasks/:id/steps/:step_id/retries",
 			"/api/conversations/:id/message-uploads/:client_message_id/commit",
 			"/api/conversations/:id/messages/:message_id/retry-processing",
 			"/api/projects/:id/conversations", "/api/projects/:id/conversations/:conversation_id/messages",

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import type { components } from '../../api/schema';
 import { portalApi } from '../../app/api';
-import { ToastProvider } from '../../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminUsers } from './AdminUsers';
 
 const currentUser = vi.hoisted(() => ({ id: 'uadmin01', name: 'admin', role: 'super_admin' }));
@@ -41,7 +41,7 @@ function setup(records: AdminUser[]) {
     return next;
   });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={['/admin/users']}><Routes>
+  render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/admin/users']}><Routes>
     <Route path="/admin/users" element={<AdminUsers />} />
   </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { list, update };

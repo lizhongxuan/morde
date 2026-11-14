@@ -26,7 +26,7 @@ test.describe("Assistant durable tasks", () => {
     await page.getByRole("button", { name: "登录" }).click();
 
     const routes = ["/assistant", "/personal", "/goals", "/hosts", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/projects", "/workspaces"];
-    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals"]);
+    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals", "/hosts", "/workspaces"]);
     for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }, { width: 480, height: 720 }]) {
       await page.setViewportSize(viewport);
       for (const route of routes) {
@@ -54,7 +54,7 @@ test.describe("Assistant durable tasks", () => {
     }
   });
 
-  test("starts with one stopped 1-core 2-GiB computer and shows the quota message", async ({ page }) => {
+  test("shows the quota error in a topbar popover without shifting the page", async ({ page }) => {
     await page.goto("/");
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
@@ -71,17 +71,22 @@ test.describe("Assistant durable tasks", () => {
     }));
     await page.getByRole("button", { name: "＋ 创建电脑", exact: true }).click();
     const alert = page.getByRole("alert").filter({ hasText: "达到云端电脑上限,无法再创建" });
+    const noticeCenter = page.locator(".morde-topbar > .notice-center");
+    await expect(noticeCenter).toBeVisible();
+    await expect(noticeCenter).toHaveCSS("position", "static");
+    await expect(noticeCenter.locator("details")).not.toHaveAttribute("open");
+    await noticeCenter.locator("summary").click();
     await expect(alert).toBeVisible();
-    await expect(page.locator(".toast-region")).toHaveCSS("position", "fixed");
-    expect(await alert.evaluate((node) => node.closest(".morde-shell"))).toBeNull();
+    expect(await alert.evaluate((node) => node.closest(".morde-topbar"))).not.toBeNull();
     const layoutAfter = await page.evaluate(() => [".morde-topbar", ".morde-sidebar", ".morde-main"].map((selector) => {
       const { x, y, width, height } = document.querySelector(selector)!.getBoundingClientRect();
       return [x, y, width, height];
     }));
     expect(layoutAfter).toEqual(layoutBefore);
+    await expect(page.locator(".notice-center-panel")).toHaveCSS("position", "absolute");
   });
 
-  test("keeps assistant error notifications above the composer at compact viewport sizes", async ({ page }) => {
+  test("opens assistant notifications without shifting or covering the composer", async ({ page }) => {
     await page.goto("/");
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
@@ -91,30 +96,52 @@ test.describe("Assistant durable tasks", () => {
       await page.setViewportSize(viewport);
       await page.goto("/assistant");
       const composer = page.locator(".assistant-composer");
-      const region = page.locator(".toast-region");
+      const noticeCenter = page.locator(".notice-center");
+      const region = page.locator(".notice-center-panel > div");
       await expect(composer).toBeVisible();
+      let previousComposerTop = await composer.evaluate((element) => element.getBoundingClientRect().top);
+      let stableReads = 0;
+      for (let attempt = 0; attempt < 20 && stableReads < 2; attempt++) {
+        await page.waitForTimeout(80);
+        const currentComposerTop = await composer.evaluate((element) => element.getBoundingClientRect().top);
+        stableReads = currentComposerTop === previousComposerTop ? stableReads + 1 : 0;
+        previousComposerTop = currentComposerTop;
+      }
+      expect(stableReads).toBeGreaterThanOrEqual(2);
+      const layoutBefore = await page.evaluate(() => ({
+        topbar: document.querySelector(".morde-topbar")!.getBoundingClientRect().toJSON(),
+        main: document.querySelector(".morde-main")!.getBoundingClientRect().toJSON(),
+        composer: document.querySelector(".assistant-composer")!.getBoundingClientRect().toJSON(),
+      }));
       await region.evaluate((element) => {
         for (const message of ["网络异常，部分对话数据暂时无法读取。", "模型连接暂不可用。"]) {
           const error = document.createElement("div");
-          error.className = "toast toast-error";
+          error.className = "toast-notice toast-error toast-error-notice";
           error.setAttribute("role", "alert");
           error.textContent = message;
           element.append(error);
         }
       });
+      await expect(noticeCenter).toBeVisible();
+      await expect(noticeCenter).toHaveCSS("position", "static");
+      await noticeCenter.locator("summary").click();
       const errors = region.getByRole("alert");
       await expect(errors).toHaveCount(2);
       await expect(errors.first()).toBeVisible();
       const geometry = await page.evaluate(() => ({
-        errorBottoms: Array.from(document.querySelectorAll(".toast-region [role=alert]"), (element) => element.getBoundingClientRect().bottom),
+        panel: document.querySelector(".notice-center-panel")!.getBoundingClientRect().toJSON(),
+        topbar: document.querySelector(".morde-topbar")!.getBoundingClientRect().toJSON(),
+        main: document.querySelector(".morde-main")!.getBoundingClientRect().toJSON(),
         composerTop: document.querySelector(".assistant-composer")!.getBoundingClientRect().top,
-        topbarBottom: document.querySelector(".morde-topbar")!.getBoundingClientRect().bottom,
-        regionTop: document.querySelector(".toast-region")!.getBoundingClientRect().top,
-        regionPosition: getComputedStyle(document.querySelector(".toast-region")!).position,
+        regionPosition: getComputedStyle(document.querySelector(".notice-center-panel")!).position,
       }));
-      expect(geometry.regionPosition).toBe("fixed");
-      expect(geometry.regionTop).toBeGreaterThanOrEqual(geometry.topbarBottom + 8);
-      expect(geometry.errorBottoms.every((bottom) => bottom <= geometry.composerTop - 8), `${viewport.width}x${viewport.height}`).toBeTruthy();
+      expect(geometry.regionPosition).toBe("absolute");
+      expect(geometry.topbar.height).toBe(layoutBefore.topbar.height);
+      expect(geometry.main).toEqual(layoutBefore.main);
+      expect(geometry.composerTop).toBe(layoutBefore.composer.top);
+      expect(geometry.panel.bottom, `${viewport.width}x${viewport.height}`).toBeLessThan(geometry.composerTop - 8);
+      expect(geometry.panel.right).toBeLessThanOrEqual(viewport.width);
+      expect(geometry.panel.left).toBeGreaterThanOrEqual(0);
     }
   });
 

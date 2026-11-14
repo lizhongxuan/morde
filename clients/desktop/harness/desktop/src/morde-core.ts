@@ -30,8 +30,8 @@ export type CodexQueuedCommand = {
   profile_key: string;
   thread_id: string;
   grant_version: number;
-  type: "send" | "interrupt" | "approval";
-  input: { text?: string; turn_id?: string; approval_id?: string; approval_version?: string; decision?: "approve" | "reject" };
+  type: "send" | "interrupt" | "approval" | "answer_question";
+  input: { text?: string; turn_id?: string; approval_id?: string; approval_version?: string; decision?: "approve" | "reject"; question_request_id?: string; question_version?: string; answers?: Record<string, string[]> };
 };
 
 const IDS = { host: /^h[a-z0-9]{7}$/, workspace: /^w[a-z0-9]{7}$/ };
@@ -356,7 +356,7 @@ export class MordeAPI {
         typeof row.session_id !== "string" || !/^l[a-z0-9]{7}$/.test(row.session_id) ||
         typeof row.profile_key !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(row.profile_key) ||
         typeof row.thread_id !== "string" || !row.thread_id || row.thread_id.length > 512 ||
-        !Number.isSafeInteger(row.grant_version) || !["send", "interrupt", "approval"].includes(String(row.type)) ||
+        !Number.isSafeInteger(row.grant_version) || !["send", "interrupt", "approval", "answer_question"].includes(String(row.type)) ||
         !input || typeof input !== "object") throw new Error("Invalid Morde Codex command");
       const normalized: CodexQueuedCommand["input"] = {};
       if (input.text !== undefined) {
@@ -379,8 +379,38 @@ export class MordeAPI {
         if (input.decision !== "approve" && input.decision !== "reject") throw new Error("Invalid Morde Codex approval decision");
         normalized.decision = input.decision;
       }
+      if (input.question_request_id !== undefined) {
+        if (typeof input.question_request_id !== "string" || !input.question_request_id.trim() ||
+          Buffer.byteLength(input.question_request_id) > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(input.question_request_id)) {
+          throw new Error("Invalid Morde Codex question request ID");
+        }
+        normalized.question_request_id = input.question_request_id;
+      }
+      if (input.question_version !== undefined) {
+        if (typeof input.question_version !== "string" || !/^[a-f0-9]{64}$/.test(input.question_version)) {
+          throw new Error("Invalid Morde Codex question version");
+        }
+        normalized.question_version = input.question_version;
+      }
+      if (input.answers !== undefined) {
+        const answers = input.answers as Record<string, unknown> | null;
+        const entries = answers && typeof answers === "object" && !Array.isArray(answers) ? Object.entries(answers) : [];
+        if (entries.length < 1 || entries.length > 64) throw new Error("Invalid Morde Codex question answers");
+        const normalizedAnswers: Record<string, string[]> = {};
+        for (const [questionID, value] of entries) {
+          if (!questionID.trim() || Buffer.byteLength(questionID) > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(questionID) ||
+            !Array.isArray(value) || value.length < 1 || value.length > 64 ||
+            !value.every((answer) => typeof answer === "string" && answer.trim().length > 0 && Buffer.byteLength(answer) <= 4096 &&
+              !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(answer))) {
+            throw new Error("Invalid Morde Codex question answers");
+          }
+          Object.defineProperty(normalizedAnswers, questionID, { value: value as string[], enumerable: true, configurable: true, writable: true });
+        }
+        normalized.answers = normalizedAnswers;
+      }
       const complete = row.type === "send" ? typeof normalized.text === "string" : row.type === "interrupt" ? Boolean(normalized.turn_id) :
-        Boolean(normalized.approval_id && normalized.approval_version && normalized.decision);
+        row.type === "approval" ? Boolean(normalized.approval_id && normalized.approval_version && normalized.decision) :
+        Boolean(normalized.question_request_id && normalized.question_version && normalized.answers);
       if (!complete) throw new Error("Incomplete Morde Codex command");
       return {
         id: row.id, session_id: row.session_id, profile_key: row.profile_key, thread_id: row.thread_id,

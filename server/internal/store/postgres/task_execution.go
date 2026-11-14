@@ -204,8 +204,9 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 }
 
 func listTaskStepsWithActivity(ctx context.Context, tx pgx.Tx, taskID string) ([]task.Step, error) {
-	rows, err := tx.Query(ctx, `SELECT id,task_id,sequence,kind,status,title,summary,created_at,COALESCE(agent_session_id,''),
-task_revision,COALESCE(tool_call_key,''),COALESCE(tool_name,''),request_digest,COALESCE(phase,''),detail_state
+	rows, err := tx.Query(ctx, `SELECT id,task_id,sequence,attempt_no,COALESCE(retry_of_step_id,''),kind,status,title,summary,
+COALESCE(failure_reason,''),retryable,created_at,COALESCE(agent_session_id,''),task_revision,COALESCE(tool_call_key,''),
+COALESCE(tool_name,''),request_digest,COALESCE(phase,''),detail_state
 FROM task_steps WHERE task_id=$1 ORDER BY sequence`, taskID)
 	if err != nil {
 		return nil, err
@@ -215,8 +216,9 @@ FROM task_steps WHERE task_id=$1 ORDER BY sequence`, taskID)
 	for rows.Next() {
 		var step task.Step
 		var revision pgtype.Int8
-		if err := rows.Scan(&step.ID, &step.TaskID, &step.Sequence, &step.Kind, &step.Status, &step.Title, &step.Summary, &step.CreatedAt,
-			&step.AgentSessionID, &revision, &step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState); err != nil {
+		if err := rows.Scan(&step.ID, &step.TaskID, &step.Sequence, &step.Attempt, &step.RetryOfStepID, &step.Kind, &step.Status,
+			&step.Title, &step.Summary, &step.FailureReason, &step.Retryable, &step.CreatedAt, &step.AgentSessionID, &revision,
+			&step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState); err != nil {
 			return nil, err
 		}
 		if revision.Valid {
@@ -1030,6 +1032,11 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 		claimed = rowTaskDomain(row)
 		claimed.ConversationContext = conversationContext
 		claimed.DependencyResults = dependencyResults
+		stepRetry, err := loadClaimedStepRetryIntent(ctx, tx, claimed.ID, claimed.CurrentRevision)
+		if err != nil {
+			return err
+		}
+		claimed.StepRetry = stepRetry
 		return nil
 	})
 	return claimed, found, err
@@ -1418,6 +1425,11 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			!utf8.ValidString(call.Phase) || strings.ContainsRune(call.Phase, '\x00') {
 			return task.Event{}, domain.InvalidArgument("tool_call", "task tool call progress is invalid")
 		}
+		if (call.FailureReason != "" && call.FailureReason != "not_dispatched") ||
+			(call.Retryable && (call.FailureReason != "not_dispatched" || call.Phase != "prepare" || progress.Steps[0].Status != task.StepFailed)) ||
+			(call.FailureReason == "not_dispatched" && (call.Phase != "prepare" || progress.Steps[0].Status != task.StepFailed)) {
+			return task.Event{}, domain.InvalidArgument("tool_call.failure", "task tool failure evidence is invalid")
+		}
 		if call.DetailState == "available" {
 			if len(call.DetailCiphertext) < 29 || len(call.DetailCiphertext) > 65564 || len(call.DetailSHA256) != 32 ||
 				call.DetailSizeBytes < 1 || call.DetailSizeBytes > 65536 || len(progress.Steps[0].ID) == 0 {
@@ -1431,6 +1443,10 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 		step.AgentSessionID, step.TaskRevision = call.AgentSessionID, &taskRevision
 		step.ToolCallKey, step.ToolName = call.CallKey, call.ToolName
 		step.RequestDigest, step.Phase, step.DetailState = append([]byte(nil), call.RequestDigest...), call.Phase, call.DetailState
+		step.FailureReason, step.Retryable = call.FailureReason, call.Retryable
+		if step.Attempt < 1 {
+			step.Attempt = 1
+		}
 		progress.Steps[0] = step
 	}
 	if pending := progress.PendingRequest; pending != nil {
@@ -1627,16 +1643,21 @@ WHERE ai.task_id=$1 AND ai.owner_id=$2 AND ai.agent_instance_id=$3 AND ai.agent_
 			var existingToolName string
 			var existingRevision int64
 			var existingDigest []byte
-			err = tx.QueryRow(ctx, `SELECT id,tool_name,task_revision,request_digest FROM task_steps
+			var existingAttempt int64
+			var existingRetryOf string
+			err = tx.QueryRow(ctx, `SELECT id,tool_name,task_revision,request_digest,attempt_no,COALESCE(retry_of_step_id,'') FROM task_steps
 WHERE task_id=$1 AND agent_session_id=$2 AND tool_call_key=$3 FOR UPDATE`, current.ID, call.AgentSessionID, call.CallKey).
-				Scan(&existingStepID, &existingToolName, &existingRevision, &existingDigest)
+				Scan(&existingStepID, &existingToolName, &existingRevision, &existingDigest, &existingAttempt, &existingRetryOf)
 			if err == nil {
 				if existingStepID != progress.Steps[0].ID || existingToolName != call.ToolName || existingRevision != call.TaskRevision ||
 					!bytes.Equal(existingDigest, call.RequestDigest) {
 					return domain.NewError(domain.CodeIdempotencyConflict, "tool call identity was reused with different inputs")
 				}
+				progress.Steps[0].Attempt, progress.Steps[0].RetryOfStepID = existingAttempt, existingRetryOf
 			} else if !errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("read existing task tool call step: %w", err)
+			} else if progress.Steps[0].Attempt < 1 {
+				progress.Steps[0].Attempt = 1
 			}
 		}
 		if current.WorkspaceID.Valid && !current.ProjectID.Valid {
@@ -1878,9 +1899,13 @@ SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND step_id=$2 AND parent_ses
 			if childSessionStep {
 				return domain.NewError(domain.CodeForbidden, "task progress cannot change a child Agent Session step")
 			}
+			if step.Attempt < 1 {
+				step.Attempt = 1
+			}
 			result, err := tx.Exec(ctx, `INSERT INTO task_steps
-(id,task_id,sequence,kind,status,title,summary,agent_session_id,task_revision,tool_call_key,tool_name,request_digest,phase,detail_state)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+(id,task_id,sequence,kind,status,title,summary,agent_session_id,task_revision,tool_call_key,tool_name,request_digest,phase,detail_state,
+ attempt_no,retry_of_step_id,failure_reason,retryable)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, title=EXCLUDED.title, summary=EXCLUDED.summary,
  agent_session_id=COALESCE(task_steps.agent_session_id,EXCLUDED.agent_session_id),
  task_revision=COALESCE(task_steps.task_revision,EXCLUDED.task_revision),
@@ -1888,6 +1913,8 @@ ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, title=EXCLUDED.title, sum
  tool_name=COALESCE(task_steps.tool_name,EXCLUDED.tool_name),
  request_digest=COALESCE(task_steps.request_digest,EXCLUDED.request_digest),
 phase=CASE WHEN EXCLUDED.agent_session_id IS NOT NULL THEN EXCLUDED.phase ELSE task_steps.phase END,
+failure_reason=EXCLUDED.failure_reason,
+retryable=EXCLUDED.retryable,
 detail_state=CASE WHEN EXCLUDED.agent_session_id IS NOT NULL
   THEN CASE WHEN EXCLUDED.detail_state='not_recorded' AND task_steps.detail_state='available' THEN 'available' ELSE EXCLUDED.detail_state END
   ELSE task_steps.detail_state END
@@ -1895,10 +1922,12 @@ WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.seque
  AND (task_steps.agent_session_id IS NULL OR EXCLUDED.agent_session_id IS NULL OR
    (task_steps.agent_session_id=EXCLUDED.agent_session_id AND task_steps.task_revision=EXCLUDED.task_revision
     AND task_steps.tool_call_key=EXCLUDED.tool_call_key AND task_steps.tool_name=EXCLUDED.tool_name
-    AND task_steps.request_digest=EXCLUDED.request_digest))`,
+		    AND task_steps.request_digest=EXCLUDED.request_digest AND task_steps.attempt_no=EXCLUDED.attempt_no
+		    AND task_steps.retry_of_step_id IS NOT DISTINCT FROM EXCLUDED.retry_of_step_id))`,
 				step.ID, progress.TaskID, step.Sequence, step.Kind, string(step.Status), step.Title, step.Summary,
 				nullableText(step.AgentSessionID), step.TaskRevision, nullableText(step.ToolCallKey), nullableText(step.ToolName),
-				step.RequestDigest, nullableText(step.Phase), step.DetailState)
+				step.RequestDigest, nullableText(step.Phase), step.DetailState, step.Attempt, nullableText(step.RetryOfStepID),
+				nullableText(step.FailureReason), step.Retryable)
 			if err != nil {
 				return fmt.Errorf("persist task step: %w", err)
 			}

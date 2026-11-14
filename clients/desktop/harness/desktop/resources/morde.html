@@ -9,31 +9,13 @@
       <label>账号<input id="name" type="text" autocomplete="username" required></label>
       <label>密码<input id="password" type="password" autocomplete="current-password" required></label>
       <button id="submit" type="submit">登录</button></form>
+    <div id="message" role="status" aria-live="polite"></div>
     <p><button id="register" class="text-button" type="button">注册账号</button><button id="download" class="text-button" type="button">下载安装包</button></p>
   </section>
-  <section id="sync-page" hidden><div class="pc-local-shell">
-    <aside class="pc-local-sidebar" aria-label="PC 用户端导航">
-      <span class="pc-local-brand" aria-label="Morde">M</span>
-      <button id="open-assistant" class="pc-local-nav" type="button">对话</button>
-      <span class="pc-local-nav selected" aria-current="page">文件同步</span>
-    </aside>
-    <div class="pc-local-body"><header class="pc-local-topbar"><strong>Morde</strong><span>本机文件同步</span></header>
-    <div class="pc-local-content"><div class="sync-page-heading"><h1>文件同步</h1></div>
-    <p id="expiry-warning" class="card" role="status" hidden>客户端登录将在 7 天内到期，请重新登录。</p>
-    <section id="codex-panel" class="card">
-      <h2>接续本机 Codex 会话</h2>
-      <p>Codex 在本机运行。选择 CODEX_HOME profile 后，按线程逐项授权；Morde 仅同步已授权范围。Codex Desktop 自身的即时变化无法从 App Server 通知中订阅，页面会用有界快照核对已授权线程的稳定历史。</p>
-      <div id="codex-content"></div>
-    </section>
-    <section id="project-upload" class="card">
-      <h2>上传项目到云端电脑</h2>
-      <p>选择云端电脑和本机项目文件夹，再点击上传。每次只从本机上传到 <code>~/workspace/project/&lt;项目名&gt;/</code>；云端修改不会下载到本机。电脑关机时，云端确认与电脑应用是两个状态。</p>
-      <div id="project-upload-content"></div>
-    </section>
-    <h2>已有 Workspace 同步</h2><p>以下为已有的 Workspace 同步和恢复入口。</p>
-    <div id="workspaces"></div>
-    </div></div></div>
+  <section id="offline-page" class="offline-page" hidden><h1>暂时无法连接 Morde</h1>
+    <p id="offline-message" role="status" aria-live="polite">服务暂时不可用。网络恢复后，可从 PC 端「云端电脑」下的「文件同步」入口继续操作。</p>
+    <div class="offline-actions"><button id="retry-assistant" type="button">重试连接</button><button id="sign-out" class="text-button" type="button">退出登录</button></div>
   </section>
 </main>
-<div id="message" role="status" aria-live="polite"></div><script src="morde.js"></script>
+<script src="morde.js"></script>
 </body></html>

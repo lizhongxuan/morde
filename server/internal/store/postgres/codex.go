@@ -189,7 +189,7 @@ func (s *Store) ListCodexSessions(ctx context.Context, ownerID, installationID, 
 	return page, nil
 }
 
-func (s *Store) GetCodexEvents(ctx context.Context, ownerID, sessionID string, requiredScope codex.Scope, afterSequence int64, limit int32) (codex.EventPage, error) {
+func (s *Store) GetCodexEvents(ctx context.Context, ownerID, sessionID string, requiredScopes []codex.Scope, afterSequence int64, limit int32) (codex.EventPage, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return codex.EventPage{}, fmt.Errorf("begin Codex event page snapshot: %w", err)
@@ -197,7 +197,7 @@ func (s *Store) GetCodexEvents(ctx context.Context, ownerID, sessionID string, r
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := sqlcgen.New(tx)
 	row, err := queries.CodexGetSessionForRead(ctx, sqlcgen.CodexGetSessionForReadParams{
-		OwnerID: ownerID, ID: sessionID, Column3: []string{string(requiredScope)},
+		OwnerID: ownerID, ID: sessionID, Column3: codexScopeStrings(requiredScopes),
 	})
 	if err != nil {
 		return codex.EventPage{}, storeError("get Codex session", "Codex session", err)
@@ -206,7 +206,7 @@ func (s *Store) GetCodexEvents(ctx context.Context, ownerID, sessionID string, r
 		return codex.EventPage{}, domain.InvalidArgument("after_sequence", "Codex event cursor is ahead of the session")
 	}
 	items, err := queries.CodexListEvents(ctx, sqlcgen.CodexListEventsParams{
-		OwnerID: ownerID, SessionID: sessionID, Column3: []string{string(requiredScope)}, Sequence: afterSequence, Limit: limit + 1,
+		OwnerID: ownerID, SessionID: sessionID, Column3: codexScopeStrings(requiredScopes), Sequence: afterSequence, Limit: limit + 1,
 	})
 	if err != nil {
 		return codex.EventPage{}, fmt.Errorf("list Codex events: %w", err)
@@ -371,6 +371,7 @@ WHERE c.owner_id=$1 AND c.installation_id=$2 AND c.status='waiting_pc'
   AND i.revoked_at IS NULL AND (i.expires_at IS NULL OR i.expires_at>statement_timestamp())
   AND 'read'=ANY(g.scopes)
   AND CASE c.type WHEN 'send' THEN 'send'=ANY(g.scopes)
+                  WHEN 'answer_question' THEN 'send'=ANY(g.scopes)
                   WHEN 'interrupt' THEN 'interrupt'=ANY(g.scopes)
                   WHEN 'approval' THEN 'approval'=ANY(g.scopes) ELSE false END
 ORDER BY c.created_at,c.id
@@ -491,6 +492,8 @@ FOR UPDATE OF s,g`, sessionID, ownerID, installationID).Scan(new(string), &grant
 		requiredScope := codex.ScopeRead
 		switch codex.CommandType(commandType) {
 		case codex.CommandSend:
+			requiredScope = codex.ScopeSend
+		case codex.CommandAnswerQuestion:
 			requiredScope = codex.ScopeSend
 		case codex.CommandInterrupt:
 			requiredScope = codex.ScopeInterrupt

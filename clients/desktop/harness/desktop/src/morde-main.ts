@@ -118,7 +118,7 @@ let webView: WebContentsView | null = null;
 let webPartition: Session | null = null;
 let webAttached = false;
 let webOpenTask: { window: BrowserWindow; promise: Promise<void> } | null = null;
-let view: "web" | "sync" = "web";
+let view: "web" | "offline" = "web";
 let webRefreshTimer: NodeJS.Timeout | null = null;
 let credentialExpiryTimer: NodeJS.Timeout | null = null;
 let authorizationCheckTimer: NodeJS.Timeout | null = null;
@@ -2132,16 +2132,20 @@ function positionWeb(): void {
   const bounds = mainWindow.getContentBounds();
   webView.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height });
 }
-function showView(next: "web" | "sync"): void {
+function showView(next: "web" | "offline"): void {
   view = next;
   if (mainWindow && webView) {
     if (next === "web") {
       if (!webAttached) { mainWindow.contentView.addChildView(webView); webAttached = true; webView.webContents.focus(); }
       positionWeb();
     }
-    if (next === "sync" && webAttached) { mainWindow.contentView.removeChildView(webView); webAttached = false; }
+    if (next === "offline" && webAttached) { mainWindow.contentView.removeChildView(webView); webAttached = false; }
   }
   notifyState();
+}
+function showOffline(): void {
+  showView("offline");
+  mainWindow?.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
 }
 
 async function refreshWebSession(auth: Credentials, initial?: WebSession): Promise<void> {
@@ -2190,7 +2194,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
     const restoreFromLogin = () => {
       void refreshWebSession(auth).then(() => {
         if (credentials === auth && mainWindow === owner && webPartition === partition && !content.webContents.isDestroyed()) return content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined);
-      }).catch(() => { if (credentials === auth && mainWindow === owner) showView("sync"); });
+      }).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
     };
     content.webContents.setWindowOpenHandler((details) => {
       const entry = hostEntryURL(details.url, auth.origin);
@@ -2878,31 +2882,16 @@ function makeWindow(): BrowserWindow {
   win.on("closed", () => { detachWeb(); mainWindow = null; });
   return win;
 }
-function showWindow(nextView: "web" | "sync" = "web"): void {
+function showWindow(): void {
   const created = !mainWindow;
   if (created) mainWindow = makeWindow();
   if (credentials) {
-    if (nextView === "sync") {
-      const owner = mainWindow;
-      const auth = credentials;
-      void (async () => {
-        if (!webView) await openAssistant();
-        if (!owner || mainWindow !== owner || owner.isDestroyed() || credentials !== auth || !webView) return;
-        const target = `${auth.origin}/workspaces`;
-        showView("web");
-        if (webView.webContents.getURL() !== target) await webView.webContents.loadURL(target, documentLoadOptions);
-      })().catch(() => {
-        if (!owner || mainWindow !== owner || owner.isDestroyed() || credentials !== auth) return;
-        owner.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
-        showView("sync");
-      });
-    } else if (webView) showView("web");
+    if (webView) showView("web");
     else {
       const owner = mainWindow;
       void openAssistant().catch(() => {
         if (!owner || mainWindow !== owner || owner.isDestroyed()) return;
-        owner.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
-        showView("sync");
+        showOffline();
       });
     }
   }
@@ -2920,7 +2909,6 @@ function signOutFromMenu(): void {
 
 function menuSettings() {
   return [
-    { label: zh ? "本机同步" : "Local Sync", click: () => showWindow("sync") },
     { label: zh ? "退出此电脑" : "Sign Out This PC", click: signOutFromMenu },
   ];
 }

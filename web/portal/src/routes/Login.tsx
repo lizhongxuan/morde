@@ -3,16 +3,15 @@ import type { FormEvent } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router';
 import { errorDetails } from '../app/api';
 import { useAuth } from '../app/auth';
-import { useToast } from '../app/toast';
 
 export function Login({ defaultTo = '/assistant', allowRegister = true }: { defaultTo?: string; allowRegister?: boolean }) {
   const { user, loading, signIn } = useAuth();
-  const { notify } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
   const stateFrom = (location.state as { from?: string } | null)?.from;
   const queryFrom = new URLSearchParams(location.search).get('next');
   const registered = (location.state as { registered?: boolean } | null)?.registered === true;
@@ -23,6 +22,7 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    setError('');
     setBusy(true);
     try { await signIn(name.trim(), password); navigate(from, { replace: true }); }
     catch (reason) {
@@ -32,7 +32,7 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
           : details.code === 'account_pending' ? '账号正在等待管理员审核，通过后才能登录。'
             : details.code === 'account_rejected' ? '账号审核未通过，请联系管理员。'
               : details.code === 'account_disabled' ? '账号已被禁用，请联系管理员。' : details.message;
-      notify(message, 'error');
+      setError(message);
     } finally { setBusy(false); }
   };
 
@@ -48,6 +48,7 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
         <input id="login-name" name="name" autoComplete="username" required value={name} onChange={(event) => setName(event.target.value)} />
         <label htmlFor="login-password">密码</label>
         <input id="login-password" name="password" type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} />
+        {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button button-primary button-wide" type="submit" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
       </form>
       {allowRegister && <p className="login-register-link">还没有账号？<Link to="/register">注册账号</Link></p>}

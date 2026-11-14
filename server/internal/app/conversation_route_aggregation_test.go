@@ -21,6 +21,10 @@ func TestConversationRouteAggregationUsesFixed350MillisecondWindow(t *testing.T)
 			t.Fatalf("window %s groups = %v, want %v", window, got, expected)
 		}
 	}
+	boundary := []time.Duration{0, 350 * time.Millisecond, 351 * time.Millisecond}
+	if got, expected := fixedWindowGroups(boundary, 350*time.Millisecond), [][]int{{0, 1}, {2}}; !reflect.DeepEqual(got, expected) {
+		t.Fatalf("window boundary groups = %v, want %v", got, expected)
+	}
 
 	// A slow first classifier does not move the acceptance-time deadline. At
 	// 420 ms it is still running, but the later request is no longer joinable.
@@ -42,7 +46,7 @@ func fixedWindowGroups(arrivals []time.Duration, window time.Duration) [][]int {
 	}
 	groups := [][]int{{0}}
 	for index := 1; index < len(arrivals); index++ {
-		if arrivals[index]-arrivals[0] < window {
+		if arrivals[index]-arrivals[0] <= window {
 			groups[0] = append(groups[0], index)
 		} else {
 			groups = append(groups, []int{index})

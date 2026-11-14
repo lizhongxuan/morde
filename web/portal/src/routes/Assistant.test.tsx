@@ -15,7 +15,7 @@ import type { components } from '../api/schema';
 import { messageOutbox } from '../app/message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import type { MainConversation } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Assistant, assistantMainConversationCacheKey, assistantRecentConversationKey, mergeTaskAssistantMessage, resolveTaskObservationURL } from './Assistant';
 import { assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
 import type { AssistantComposerDraft } from './assistant-drafts';
@@ -34,6 +34,13 @@ type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type TaskSummary = components['schemas']['TaskSummary'];
 type AcceptConversationMessageRequest = components['schemas']['AcceptConversationMessageRequest'];
+const unknownApprovalDisclosures: components['schemas']['TaskApprovalDisclosures'] = {
+  risk: { state: 'unknown', summary: null },
+  this_cost: { state: 'unknown', basis: null, amount_micros: null, currency: null },
+  cumulative_cost: { state: 'unknown', basis: null, amount_micros: null, currency: null },
+  alternatives: { state: 'unknown', options: [] },
+  revocation: { state: 'unknown', summary: null },
+};
 const clientContract = JSON.parse(readFileSync(
   resolve(process.cwd(), '../../server/openapi/fixtures/morde-client-v1.json'), 'utf8',
 )) as {
@@ -110,7 +117,7 @@ function acceptedReceipt(conversationID: string, body: AcceptConversationMessage
 
 function renderPage(initialState: unknown = null) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  const view = render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[{ pathname: '/assistant', state: initialState }]}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  const view = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[{ pathname: '/assistant', state: initialState }]}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { ...view, client };
 }
 
@@ -264,6 +271,45 @@ describe('Assistant durable tasks', () => {
     expect(composer).toHaveValue('保留中的草稿');
     finishOlderSearch?.({ items: [matching], next_cursor: null });
     await waitFor(() => expect(within(sidebar).queryByRole('button', { name: /项目计划/ })).not.toBeInTheDocument());
+
+    await user.clear(search);
+    await user.type(search, '项目');
+    const matchingRow = await within(sidebar).findByRole('button', { name: /项目计划/ });
+    await user.click(matchingRow);
+    await user.click(within(sidebar).getByRole('button', { name: /主会话/ }));
+    await waitFor(() => expect(composer).toHaveValue('保留中的草稿'));
+  });
+
+  it('paginates title-search results and shows empty and unavailable states', async () => {
+    const firstPage = Array.from({ length: 5 }, (_, index) => ({ ...conversation,
+      id: `c${String(index + 1).padStart(7, '0')}`, is_main: false, title: `分页项目 ${index + 1}` }));
+    const finalPage = { ...conversation, id: 'c7654321', is_main: false, title: '分页项目 6' };
+    mockCommon({ conversations: [conversation], mainConversation: { status: 'ready', conversation_id: conversation.id, version: 1 } });
+    vi.mocked(portalApi.conversations).mockImplementation(async (cursor, _limit, q) => {
+      if (q === '分页') return cursor
+        ? { items: [finalPage], next_cursor: null }
+        : { items: firstPage, next_cursor: 'search-next-001' };
+      if (q === '无匹配') return { items: [], next_cursor: null };
+      if (q === '网络错误') throw new Error('network unavailable');
+      return { items: [conversation], next_cursor: null };
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    const sidebar = await screen.findByRole('complementary', { name: '对话' });
+    const search = within(sidebar).getByRole('searchbox', { name: '搜索旁聊标题' });
+    await user.type(search, '分页');
+    expect(await within(sidebar).findByRole('button', { name: /分页项目 5/ })).toBeInTheDocument();
+    await user.click(within(sidebar).getByRole('button', { name: '更多' }));
+    expect(await within(sidebar).findByRole('button', { name: /分页项目 6/ })).toBeInTheDocument();
+    expect(portalApi.conversations).toHaveBeenCalledWith('search-next-001', 5, '分页');
+
+    await user.clear(search);
+    await user.type(search, '无匹配');
+    expect(await within(sidebar).findByText('没有找到匹配标题的旁聊。')).toBeInTheDocument();
+    await user.clear(search);
+    await user.type(search, '网络错误');
+    expect(await within(sidebar).findByText('旁聊历史暂不可用')).toBeInTheDocument();
   });
 
   it('connects an authorized cloud computer to the selected conversation through a one-time form ticket', async () => {
@@ -717,7 +763,7 @@ describe('Assistant durable tasks', () => {
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
 
-    render(<StrictMode><QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={['/assistant']}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider></StrictMode>);
+    render(<StrictMode><QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/assistant']}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider></StrictMode>);
 
     expect(await findReadyComposer()).toHaveValue('恢复之前的会话草稿');
   });
@@ -811,7 +857,7 @@ describe('Assistant durable tasks', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('无法刷新服务端主会话');
-    expect(alert.closest('.toast-region')).toBeInTheDocument();
+    expect(alert.closest('.notice-center-panel')).toBeInTheDocument();
     expect(alert.closest('.assistant-page')).toBeNull();
     await user.click(within(alert).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(screen.queryByText(/无法刷新服务端主会话/)).not.toBeInTheDocument());
@@ -922,7 +968,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const sidebar = screen.getByRole('complementary', { name: '对话' });
-    expect(await within(sidebar).findByRole('button', { name: /^主会话/ })).toBeInTheDocument();
+    await waitFor(() => expect(within(sidebar).getByRole('button', { name: /^主会话/ })).toBeInTheDocument());
     expect(sidebar.querySelector('.conversation-row')?.textContent).toContain('主会话');
     const sideGroup = within(sidebar).getByText('旁聊').closest('details')!;
     expect(sideGroup.open).toBe(false);
@@ -931,6 +977,9 @@ describe('Assistant durable tasks', () => {
     expect(sideGroup.open).toBe(true);
     expect(within(sideGroup).getAllByRole('button').filter((button) => button.classList.contains('conversation-item')))
       .toHaveLength(5);
+    const sideTitles = () => within(sideGroup).getAllByRole('button').filter((button) => button.classList.contains('conversation-item'))
+      .map((button) => button.querySelector('strong')?.textContent);
+    expect(sideTitles()).toEqual(side.slice(0, 5).map((item) => item.title));
     expect(within(sideGroup).getByRole('button', { name: /旁路 1/ })).toBeInTheDocument();
     expect(within(sideGroup).queryByRole('button', { name: /旁路 6/ })).not.toBeInTheDocument();
 
@@ -939,11 +988,13 @@ describe('Assistant durable tasks', () => {
     expect(await within(sideGroup).findByRole('button', { name: /旁路 10/ })).toBeInTheDocument();
     expect(within(sideGroup).getAllByRole('button').filter((button) => button.classList.contains('conversation-item')))
       .toHaveLength(10);
+    expect(sideTitles()).toEqual(side.slice(0, 10).map((item) => item.title));
     expect(within(sideGroup).queryByRole('button', { name: /旁路 11/ })).not.toBeInTheDocument();
     await user.click(within(sideGroup).getByRole('button', { name: '更多' }));
     expect(await within(sideGroup).findByRole('button', { name: /旁路 15/ })).toBeInTheDocument();
     expect(within(sideGroup).getAllByRole('button').filter((button) => button.classList.contains('conversation-item')))
       .toHaveLength(15);
+    expect(sideTitles()).toEqual(side.map((item) => item.title));
     expect(within(sideGroup).queryByRole('button', { name: /旁路 16/ })).not.toBeInTheDocument();
     expect(list).toHaveBeenNthCalledWith(1, undefined, 5, undefined);
     expect(list).toHaveBeenNthCalledWith(2, 'cursor-2', 5, undefined);
@@ -1108,6 +1159,43 @@ describe('Assistant durable tasks', () => {
     expect(putChunk).not.toHaveBeenCalled();
   });
 
+  it('keeps an attachment prepared while migration is still saving', async () => {
+    mockCommon();
+    let finishCreate!: (value: Conversation) => void;
+    vi.spyOn(portalApi, 'createConversation').mockImplementation(() => new Promise((resolve) => { finishCreate = resolve; }));
+    let releaseSave!: () => void;
+    let targetSaveStarted = false;
+    const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+    vi.mocked(assistantDraftStorage.put).mockImplementation(async (scope, draft) => {
+      if (draft.id === conversation.id && !targetSaveStarted) { targetSaveStarted = true; await saveGate; }
+      assistantDraftRecords.set(`${scope}\u0000${draft.id}`, draft);
+    });
+    let finishDocument!: (value: unknown) => void;
+    const documentReady = new Promise((resolve) => { finishDocument = resolve; });
+    const destroyDocument = vi.fn().mockResolvedValue(undefined);
+    pdfMock.getDocument.mockReturnValue({ promise: documentReady, destroy: destroyDocument });
+    const putChunk = vi.spyOn(portalApi, 'putPersonalAttachmentChunk').mockRejectedValue(new Error('attachment transfer must not run'));
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(await findReadyComposer(), '待处理的合成消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(finishCreate).toBeDefined());
+    fireEvent.change(screen.getByLabelText('添加附件'), { target: { files: [new File(['local'], 'local.pdf', { type: 'application/pdf' })] } });
+    await waitFor(() => expect(pdfMock.getDocument).toHaveBeenCalled());
+    finishCreate(conversation);
+    await waitFor(() => expect(targetSaveStarted).toBe(true));
+    finishDocument({ numPages: 1, getPage: async () => ({
+      getTextContent: async () => ({ items: [{ str: '本地合成内容' }] }), cleanup: vi.fn(),
+    }) });
+    await waitFor(() => expect(destroyDocument).toHaveBeenCalled());
+    releaseSave();
+    await waitFor(() => expect(portalApi.acceptConversationMessage).toHaveBeenCalledOnce());
+    expect(await screen.findByText('local.pdf · 已提取文字')).toBeInTheDocument();
+    await waitFor(() => expect([...assistantDraftRecords.values()].find((draft) => draft.id === conversation.id)?.attachments[0]?.name).toBe('local.pdf.txt'));
+    expect([...assistantDraftRecords.values()].filter((draft) => draft.id.startsWith('local:'))).toEqual([]);
+    expect(putChunk).not.toHaveBeenCalled();
+  });
+
   it('can cancel attachment preparation after a local draft is migrated', async () => {
     mockCommon();
     let finishCreate!: (value: Conversation) => void;
@@ -1126,6 +1214,87 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: '取消读取' }));
     await waitFor(() => expect(destroyDocument).toHaveBeenCalledOnce());
     expect(await screen.findByRole('button', { name: '继续读取' })).toBeInTheDocument();
+  });
+
+  it('does not restore an attachment removed after migration when preparation finishes', async () => {
+    mockCommon();
+    let finishCreate!: (value: Conversation) => void;
+    vi.spyOn(portalApi, 'createConversation').mockImplementation(() => new Promise((resolve) => { finishCreate = resolve; }));
+    let finishDocument!: (value: unknown) => void;
+    const documentReady = new Promise((resolve) => { finishDocument = resolve; });
+    const destroyDocument = vi.fn().mockResolvedValue(undefined);
+    pdfMock.getDocument.mockReturnValue({ promise: documentReady, destroy: destroyDocument });
+    const putChunk = vi.spyOn(portalApi, 'putPersonalAttachmentChunk').mockRejectedValue(new Error('attachment transfer must not run'));
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(await findReadyComposer(), '待处理的合成消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(finishCreate).toBeDefined());
+    fireEvent.change(screen.getByLabelText('添加附件'), { target: { files: [new File(['local'], 'local.pdf', { type: 'application/pdf' })] } });
+    await waitFor(() => expect(pdfMock.getDocument).toHaveBeenCalled());
+    finishCreate(conversation);
+    await waitFor(() => expect(portalApi.acceptConversationMessage).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole('button', { name: '移除附件 local.pdf' }));
+    finishDocument({ numPages: 1, getPage: async () => ({
+      getTextContent: async () => ({ items: [{ str: '本地合成内容' }] }), cleanup: vi.fn(),
+    }) });
+    await waitFor(() => expect(destroyDocument).toHaveBeenCalled());
+    await waitFor(() => expect([...assistantDraftRecords.values()].find((draft) => draft.id === conversation.id)?.attachments).toEqual([]));
+    expect(screen.queryByRole('button', { name: /移除附件 local.pdf/ })).not.toBeInTheDocument();
+    expect([...assistantDraftRecords.values()].filter((draft) => draft.id.startsWith('local:'))).toEqual([]);
+    expect(putChunk).not.toHaveBeenCalled();
+  });
+
+  it('keeps a local draft when its last save fails before migration', async () => {
+    mockCommon();
+    let finishCreate!: (value: Conversation) => void;
+    vi.spyOn(portalApi, 'createConversation').mockImplementation(() => new Promise((resolve) => { finishCreate = resolve; }));
+    const user = userEvent.setup();
+    renderPage();
+    const composer = await findReadyComposer();
+    await user.type(composer, '待处理的合成消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(finishCreate).toBeDefined());
+    await waitFor(() => expect(composer).toHaveValue(''));
+    await user.type(composer, '尚未保存的新输入');
+    assistantDraftRecords.clear();
+    vi.mocked(assistantDraftStorage.put).mockImplementation(async (scope, draft) => {
+      if (draft.id.startsWith('local:')) throw new Error('本地草稿保存失败');
+      assistantDraftRecords.set(`${scope}\u0000${draft.id}`, draft);
+    });
+    finishCreate(conversation);
+    await waitFor(() => expect(portalApi.acceptConversationMessage).toHaveBeenCalledOnce());
+    expect(screen.getByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
+    expect(composer).toHaveValue('尚未保存的新输入');
+    expect(assistantDraftStorage.remove).not.toHaveBeenCalled();
+  });
+
+  it.each(['target write', 'source removal'] as const)('keeps the original draft when migration fails at %s', async (failure) => {
+    mockCommon();
+    let finishCreate!: (value: Conversation) => void;
+    vi.spyOn(portalApi, 'createConversation').mockImplementation(() => new Promise((resolve) => { finishCreate = resolve; }));
+    const user = userEvent.setup();
+    renderPage();
+    const composer = await findReadyComposer();
+    await user.type(composer, '待处理的合成消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(finishCreate).toBeDefined());
+    await waitFor(() => expect(composer).toHaveValue(''));
+    await user.type(composer, '迁移期间的新输入');
+    if (failure === 'target write') {
+      vi.mocked(assistantDraftStorage.put).mockImplementation(async (scope, draft) => {
+        if (draft.id === conversation.id) throw new Error('目标草稿保存失败');
+        assistantDraftRecords.set(`${scope}\u0000${draft.id}`, draft);
+      });
+    } else {
+      vi.mocked(assistantDraftStorage.remove).mockRejectedValue(new Error('原草稿删除失败'));
+    }
+    finishCreate(conversation);
+    await waitFor(() => expect(portalApi.acceptConversationMessage).toHaveBeenCalledOnce());
+    expect(screen.getByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
+    expect(composer).toHaveValue('迁移期间的新输入');
+    expect([...assistantDraftRecords.values()].find((draft) => draft.id.startsWith('local:'))?.content).toBe('迁移期间的新输入');
+    if (failure === 'target write') expect(assistantDraftStorage.remove).not.toHaveBeenCalled();
   });
 
   it('does not accept the same draft twice while it is being saved locally', async () => {
@@ -1563,6 +1732,7 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(within(taskPanel).getByText('旁聊任务')).toBeInTheDocument());
     await user.click(within(taskPanel).getByRole('button', { name: '文件' }));
     const filesPanel = document.querySelector<HTMLElement>('#assistant-task-panel .task-panel-files')!;
+    expect(within(filesPanel).getByRole('link', { name: '管理文件同步' })).toHaveAttribute('href', '/workspaces');
     expect(within(filesPanel).getByRole('link', { name: '下载消息附件 1' })).toHaveAttribute(
       'href', '/api/personal-data/attachments/a7654321');
     expect(within(filesPanel).queryByRole('link', { name: /a1234567/ })).not.toBeInTheDocument();
@@ -2875,7 +3045,7 @@ describe('Assistant durable tasks', () => {
     const secondOutput = { ...reply, id: 'm4567890', sequence: 4, task_id: secondMessage.task_id,
       content: '第二项任务正在读取网页。', output_status: 'streaming' as const, output_task_revision: 1 };
     const approval = { id: 'k2345678', version: 2, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '报告.md',
-      content: '准备创建报告。', impact: '会新增一个文件。', expires_at: null };
+      content: '准备创建报告。', impact: '会新增一个文件。', disclosures: unknownApprovalDisclosures, expires_at: null };
     const firstTask: Task = {
       ...task, status: 'waiting_user', objective: '第一项任务：审批写入', current_step: 's1234567', event_sequence: 5,
       result: null, finished_at: null, waiting_reason: 'approval', current_revision: 1, desired_revision: 1,
@@ -3087,7 +3257,7 @@ describe('Assistant durable tasks', () => {
 
   it('allows a new task while another task waits for approval', async () => {
     mockCommon({ conversations: [conversation], messages: [message, reply] });
-    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null };
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null,
       waiting_reason: 'approval', pending_request: approval, finished_at: null });
     const accept = vi.spyOn(portalApi, 'acceptConversationMessage');
@@ -3161,7 +3331,7 @@ describe('Assistant durable tasks', () => {
 
   it.each(['approve', 'reject'] as const)('sends the versioned %s decision for the exact pending approval', async (decision) => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null };
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'approval', pending_request: approval, finished_at: null });
     const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockResolvedValue({ task_id: task.id, action: 'respond', status: 'queued', unsettled_operation_ids: [] });
     const user = userEvent.setup();
@@ -3177,7 +3347,8 @@ describe('Assistant durable tasks', () => {
   it('shows a server-confirmed expired approval and hides both decision actions', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'expired' as const,
-      title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: '2026-10-21T08:00:00Z' };
+      title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures,
+      expires_at: '2026-10-21T08:00:00Z' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'queued', result: null, waiting_reason: null,
       pending_request: approval, finished_at: null });
     renderPage();
@@ -3185,13 +3356,43 @@ describe('Assistant durable tasks', () => {
     const panel = await findTaskActivity(task.id);
     expect(within(panel).getByRole('region', { name: '审批已到期' })).toHaveTextContent('审批已到期；该操作已被拒绝并未执行。');
     expect(panel).toHaveTextContent('到期：');
+    expect(panel).toHaveTextContent(/风险未知/u);
+    expect(panel).toHaveTextContent(/本次费用未知/u);
+    expect(panel).toHaveTextContent(/累计费用未知/u);
+    expect(panel).toHaveTextContent(/替代方案未知/u);
+    expect(panel).toHaveTextContent(/撤销方式未知/u);
     expect(within(panel).queryByRole('button', { name: '批准并继续' })).not.toBeInTheDocument();
     expect(within(panel).queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
   });
 
+  it('shows evidence-backed approval risk, cost, alternatives, and revocation disclosures', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const,
+      title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null,
+      disclosures: {
+        risk: { state: 'known' as const, summary: '需要核对写入范围。' },
+        this_cost: { state: 'known' as const, basis: 'estimate' as const, amount_micros: 1_250_000, currency: 'USD' },
+        cumulative_cost: { state: 'known' as const, basis: 'settled' as const, amount_micros: 2_000_000, currency: 'USD' },
+        alternatives: { state: 'known' as const, options: ['只预览', '延迟执行'] },
+        revocation: { state: 'known' as const, summary: '执行前可停止任务。' },
+      },
+    };
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null,
+      waiting_reason: 'approval', pending_request: approval, finished_at: null });
+    renderPage();
+    await openTaskDynamics();
+    const panel = await findTaskActivity(task.id);
+    const card = within(panel).getByRole('region', { name: '需要批准的操作' });
+    expect(card).toHaveTextContent('风险需要核对写入范围。');
+    expect(card).toHaveTextContent('本次费用估算 USD 1.25');
+    expect(card).toHaveTextContent('累计费用已结算 USD 2');
+    expect(card).toHaveTextContent('替代方案只预览；延迟执行');
+    expect(card).toHaveTextContent('撤销方式执行前可停止任务。');
+  });
+
   it('reuses the approval idempotency key after a lost response', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null };
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'approval', pending_request: approval, finished_at: null });
     const respond = vi.spyOn(portalApi, 'respondToTaskApproval')
       .mockRejectedValueOnce(new Error('连接中断'))
@@ -3210,7 +3411,7 @@ describe('Assistant durable tasks', () => {
 
   it('prevents duplicate approval calls while the first response is pending', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null };
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'approval', pending_request: approval, finished_at: null });
     const response = { task_id: task.id, action: 'respond', status: 'queued' as const, unsettled_operation_ids: [] };
     let release!: (value: typeof response) => void;
@@ -3230,7 +3431,7 @@ describe('Assistant durable tasks', () => {
 
   it('refreshes after another device changes the pending approval version', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null };
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     const freshTask = { ...task, status: 'queued' as const, result: null, waiting_reason: null, pending_request: null, finished_at: null };
     const getTask = vi.spyOn(portalApi, 'task').mockResolvedValueOnce({ ...task, status: 'waiting_user', result: null, waiting_reason: 'approval', pending_request: approval, finished_at: null }).mockResolvedValueOnce(freshTask);
     vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(new ApiError({
@@ -3327,7 +3528,7 @@ describe('Assistant durable tasks', () => {
 
   it.each(['approval', 'clarification'] as const)('does not report a %s response as successful after access is revoked', async (kind) => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', expires_at: null };
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: kind,
       pending_request: kind === 'approval' ? approval : null,

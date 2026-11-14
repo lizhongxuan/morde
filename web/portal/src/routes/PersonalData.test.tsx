@@ -450,6 +450,60 @@ describe('PersonalData', () => {
     expect(apiMocks.memoryHistory).toHaveBeenNthCalledWith(2, 'm_history01', 'history-next-001', 25);
   });
 
+  it('hides unavailable or unrecorded history bodies and never offers restoration without provenance', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 4,
+      items: [{ object_type: 'memory', object_id: 'm_history02', revision: 2, body: { content: '当前记忆' } }],
+      next_cursor: null,
+    });
+    apiMocks.memoryHistory.mockResolvedValue({ items: [
+      { revision: 2, changed_at: '2026-11-10T12:00:00Z', body: null, restorable: false,
+        source_status: 'unrecorded', sources: [] },
+      { revision: 1, changed_at: '2026-11-09T12:00:00Z', body: null, restorable: false,
+        source_status: 'unavailable', sources: [] },
+    ], next_cursor: null });
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.click(screen.getByRole('button', { name: '历史版本' }));
+
+    expect(await screen.findByText('未保存该版本正文，无法恢复。')).toBeInTheDocument();
+    expect(screen.getByText('来源当前不可访问，正文已隐藏，无法恢复。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '恢复此版本' })).not.toBeInTheDocument();
+    expect(apiMocks.replace).not.toHaveBeenCalled();
+  });
+
+  it('keeps a remote revision conflict visible after restoring a saved history entry', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 4,
+      items: [{ object_type: 'memory', object_id: 'm_history03', revision: 3, body: { content: '服务端当前内容' } }],
+      next_cursor: null,
+    });
+    apiMocks.memoryHistory.mockResolvedValue({ items: [{ revision: 2, changed_at: '2026-11-10T12:00:00Z',
+      body: { content: '旧版本内容' }, restorable: true, source_status: 'available',
+      sources: [{ kind: 'mutation_receipt', id: 'memory-receipt-02' }] }], next_cursor: null });
+    apiMocks.replace.mockRejectedValueOnce(Object.assign(new Error('服务端版本已变化'), { status: 409 }));
+    apiMocks.getObject.mockResolvedValueOnce({ object_type: 'memory', object_id: 'm_history03', revision: 4,
+      body: { content: '冲突后重新读取的服务端内容' } });
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.click(screen.getByRole('button', { name: '历史版本' }));
+    await screen.findByText('旧版本内容');
+    await user.click(screen.getByRole('button', { name: '恢复此版本' }));
+
+    const conflict = await screen.findByRole('region', { name: '保留的冲突草稿' });
+    expect(conflict).toHaveTextContent('服务端版本已变化');
+    expect(conflict).toHaveTextContent('远端版本 4');
+    expect(conflict).toHaveTextContent('冲突后重新读取的服务端内容');
+    expect(within(conflict).getByRole('button', { name: '基于当前远端版本另存此草稿' })).toBeInTheDocument();
+    expect(apiMocks.replace).toHaveBeenCalledWith(
+      'memory', 'm_history03', 3, { content: '旧版本内容' }, expect.any(String), currentUser.id, 'service-personal-test',
+    );
+  });
+
   it('deletes an existing memory with its current revision', async () => {
     const user = userEvent.setup();
     apiMocks.snapshot.mockResolvedValue({

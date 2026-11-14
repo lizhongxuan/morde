@@ -84,3 +84,14 @@ it("clears the previous account's computer list while the next account loads", a
   await act(async () => { resolveHosts([]); await nextHosts; });
   renderer.unmount();
 });
+
+it("keeps page-level errors in document flow instead of over the mobile header", async () => {
+  mockCommon();
+  vi.spyOn(morde, "workspaces").mockRejectedValue(new Error("项目服务暂不可用"));
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(<MordeApp />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  const alert = renderer.root.findByProps({ role: "alert" });
+  expect(alert.props.className).not.toMatch(/\bfixed\b/);
+  expect(alert.findByType("span").children.join(" ")).toContain("项目服务暂不可用");
+  renderer.unmount();
+});

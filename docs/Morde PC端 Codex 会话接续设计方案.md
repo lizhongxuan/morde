@@ -1,7 +1,7 @@
 # Morde PC 端 Codex 会话接续设计方案
 
-> 状态：设计稿，尚未实施。
-> 需求依据：[Morde PC 端 Codex 会话接续需求文档](Morde%20PC端%20Codex%20会话接续需求文档.md)；实施任务见[TODO 清单](实施/Morde%20PC端%20Codex%20会话接续实施任务todo清单文档.md)。产品范围以需求文档为准；本方案补充实现边界，不代表能力已接通。
+> 状态：CX-00 至 CX-06 的合同与实现源码已完成；测试、构建、迁移及真实设备验收待 CX-07。代码状态不代表实机能力已验证。
+> 需求依据：[Morde PC 端 Codex 会话接续需求文档](Morde%20PC端%20Codex%20会话接续需求文档.md)；实施任务见[TODO 清单](实施/Morde%20PC端%20Codex%20会话接续实施任务todo清单文档.md)。产品范围以需求文档为准；本方案补充实现边界，真实设备能力仍以 CX-07 验收结果为准。
 
 ## 1. 设计目标
 
@@ -106,7 +106,7 @@ Codex App Server 是 PC 端 Provider 的本地子进程，不是第二套 Morde 
 
 - command ID、原生线程 ID、Provider 请求 ID 和 dispatched / confirmed / unknown 状态；
 - 等待云端确认的有序事件批次及最后确认游标；
-- 审批请求 ID、版本摘要、到期状态及已发送决定；
+- 审批请求及结构化用户输入请求 ID、版本摘要、原始 RPC ID 和未处理请求；
 - 不保存可通过重新拉取获得的完整历史副本，不把 CODEX_HOME、认证材料或项目文件路径清单同步上云。
 
 重启后先从云端领取未完成命令，再用 App Server 读取线程状态进行对账。若 Provider 已接受请求但确认丢失，标记结果未知并恢复事件；不得通过重发消息来“修复”状态。
@@ -118,6 +118,7 @@ Codex App Server 是 PC 端 Provider 的本地子进程，不是第二套 Morde 
 | PC 连接 | offline、connecting、online、revoked、unavailable |
 | 命令/Turn | waiting_pc、claimed、forwarded、running、waiting_approval、completed、failed、unknown |
 | 审批 | pending、approved、rejected、expired、stale |
+| 结构化用户输入请求 | pending、answered、stale |
 | 事件同步 | 按 session 的单调 sequence；客户端保存 last_seen_sequence，发现游标缺口时先补历史，不跳过缺口 |
 
 状态以持久记录和 Provider 确认作为依据。PC 离线、休眠或结果未知时不得把命令显示成已执行；关闭 iOS 不改变 PC 上已开始的执行。
@@ -132,7 +133,7 @@ Codex App Server 是 PC 端 Provider 的本地子进程，不是第二套 Morde 
 | --- | --- | --- |
 | **GET /api/codex/sessions?installation_id=&cursor=&limit=** | 返回当前用户对指定安装获授权的 Morde session、线程标题/状态与 next cursor | 需要当前用户登录及 session read；无权安装返回 forbidden，不枚举他人线程 |
 | **GET /api/codex/sessions/{id}/events?after_sequence=&limit=** | 返回严格递增、可分页事件及 current sequence；用于首屏、缺口修复和离线恢复 | 校验 owner、安装授权及 read scope；无效旧游标要求重新取快照 |
-| **GET /api/codex/sessions/{id}/events/stream?after_sequence=** | SSE 按序推送新入库事件；断线后由 after_sequence 续接 | SSE 不是持久化来源；连接结束不取消 turn |
+| **GET /api/codex/sessions/{id}/events/stream?after_sequence=** | SSE 按序推送新入库事件；断线后由 after_sequence 续接 | 同时需要 `read` 和 `live`；read 授权事件内容，live 授权流式传输。SSE 不是持久化来源；连接结束不取消 turn |
 | **POST /api/codex/sessions/{id}/commands** | Header：Idempotency-Key；body 为 send、interrupt 或 approval 中一种及相应目标。返回 command ID、接受状态和当前序号 | 所有命令先检查 read，再检查对应 send、interrupt 或 approval scope；重复键返回首次结果；PC 离线时可返回 waiting_pc，不伪报转发成功 |
 | **DELETE /api/codex/sessions/{id}** | 删除该镜像会话、云端事件及未执行命令 | 当前 owner 登录；撤销读取和待处理命令；不代表 PC 上正在执行的 turn 已停止 |
 
@@ -149,7 +150,7 @@ PC 使用短周期 HTTPS claim 轮询而不是现有 `/api/hub` 的内存态 gen
 
 ### 5.3 事件字段
 
-最小规范化事件字段包括 **session_id**、**sequence**、**provider_event_id**、**kind**、**occurred_at**、**turn_id**、**item_id**、**parent_item_id**、**status** 及对应类型的用户可见内容。PC 写入事件另带 `source=snapshot|live|approval` 供服务端逐事件核验 read/live/approval scope；此授权标记不作为云端事件内容返回。payload 按类型校验，不接受任意工具参数或任意路径读取指令。
+最小规范化事件字段包括 **session_id**、**sequence**、**provider_event_id**、**kind**、**occurred_at**、**turn_id**、**item_id**、**parent_item_id**、**status** 及对应类型的用户可见内容。审批请求 payload 只允许 `approval_id`、`approval_version`、`kind`、`summary`、`object`、`detail`、`impact`；绝对路径缩减为末尾目录标签，命令及 Provider 原因按敏感对话处理并限制长度。结构化问题事件 `kind=question` 使用 `source=live`，只允许绑定 `question_request_id`、64 位小写 SHA-256 `question_version`、`status` 和白名单 `questions`；问题 ID 保持 App Server 原样，且同一请求内必须唯一。问题标题、正文、选项标题和说明按 App Server 原样保存，单字段最多 4096 UTF-8 字节，允许 LF、CR、TAB。其他 App Server 进程的 thread history 若包含问题文本，只以 `kind=unsupported` 的白名单诊断和 `source=snapshot` 按 `read` scope 展示，不带可回答 RPC handle；不允许用 `live` source 绕开 question request/version 合同。PC 写入事件另带 `source=snapshot|live|approval` 供服务端逐事件核验 scope；此授权标记不作为云端事件内容返回。payload 按类型校验，不接受任意工具参数或任意路径读取指令。
 
 至少覆盖官方接口实际提供的，以及云端命令本身的持久进度：
 
@@ -169,7 +170,7 @@ PC 使用短周期 HTTPS claim 轮询而不是现有 `/api/hub` 的内存态 gen
 
 以下字段名和枚举供 CX-02、CX-03、CX-04、CX-05 共用，最终以 OpenAPI 为准：
 
-列表返回 `{"items":[session...],"next_cursor":null}`；session 包含 `id`、`installation_id`、`profile_key`、`thread_id`、`title`、`cwd_label`、`updated_at`、`status`、`scopes`、`grant_version`、`last_sequence`。`discover` 返回 `{"session":session}`；仅在 PC 用户明确选择 scope 后调用，重复调用只更新元数据与该次明确选择的 scope，不自动扩权。iOS 列表与历史需 `read`，事件 SSE 需 `live`，命令先需 `read` 再需该类型的操作 scope。
+列表返回 `{"items":[session...],"next_cursor":null}`；session 包含 `id`、`installation_id`、`profile_key`、`thread_id`、`title`、`cwd_label`、`updated_at`、`status`、`scopes`、`grant_version`、`last_sequence`。`discover` 返回 `{"session":session}`；仅在 PC 用户明确选择 scope 后调用，重复调用只更新元数据与该次明确选择的 scope，不自动扩权。iOS 列表与历史需 `read`；SSE 同时需 `read+live`，由 `read` 授权事件内容、`live` 授权流式传输；命令先需 `read` 再需该类型的操作 scope。`answer_question` 属于用户发送内容，使用 `send` scope。
 
 ~~~json
 POST /api/codex/sessions/discover
@@ -200,7 +201,10 @@ POST /api/codex/sessions/{id}/commands
 {"type": "send", "text": "user message"}
 {"type": "interrupt", "turn_id": "native-turn-id"}
 {"type": "approval", "approval_id": "id", "approval_version": "version", "decision": "approve"}
+{"type": "answer_question", "question_request_id": "100", "question_version": "sha256", "answers": {"choice-id": ["A"]}}
 ~~~
+
+结构化问题 pending 事件携带 `{question_request_id, question_version, status:"pending", questions}`；回答或 PC 进程失效分别追加 `status:"answered"` 或 `status:"stale"`。`questions` 保留 App Server 的 question ID、标题、问题、选项和 secret/other 标记；ID 在一份请求内唯一并按原值保存。`answer_question` command 要求 `read+send` scope，必须带 request ID/version，并为每个原始 question ID 提供答案数组。PC 只有在本地仍存在匹配 profile、thread、grant version 和请求版本的待处理 RPC 时才响应；RPC 写入成功后，在同一次本地持久化中移除 request、结算命令并保存已回答事件。缺少 send 时，若 live 可用则上报 pending/stale 并拒绝 RPC；权限变化、重启、进程退出或错版回答会拒绝并使对应请求 stale。App Server 答案采用 `{answers:{[questionId]:{answers:[...]}}}`。重复、过期或撤权后的答案不得再次提交；标记为 secret 的答案不回显到额外的 user-message 事件。
 
 `GET /sessions/{id}/events` 返回 `{"items":[event...],"current_sequence":42,"next_cursor":null}`；每个事件由服务端附加 `session_id` 和 `sequence`。SSE 的 `id` 是 sequence，`data` 是同一事件对象。命令创建返回 `{"id":"command-id","session_id":"session-id","type":"send","status":"waiting_pc","created_at":"..."}`。PC `claim` 请求体为空对象，返回零或一个 `items`；领取后的命令包含 `id`、session/thread/profile 标识、grant_version、type 与类型载荷。PC `result` 请求只允许 `forwarded|running|waiting_approval|completed|failed|unknown`，结果更新幂等。PC event batch 的确认返回 `{"items":[{"provider_event_id":"...","sequence":43}],"last_sequence":43}`；已确认的重复 ID 返回原 sequence，不产生新事件。Session 删除成功返回 204。
 
@@ -225,7 +229,14 @@ POST /api/codex/sessions/{id}/commands
 4. iOS 从云端事件日志用 SSE 接收增量，并在重连、游标缺口或快照过期时按 after_sequence 分页补齐。
 5. 若命令在 Provider 接受后失去确认，PC / 云端使用 thread/read 和 App Server 状态进行对账；无法确认则标记 unknown，由用户决定是否重新发送。
 
-### 6.3 审批与撤权
+### 6.3 Codex 结构化用户输入
+
+1. PC 收到 `item/tool/requestUserInput` 后，按白名单将问题、选项和 secret/other 标记作为 `question` live 事件持久化；用户输入请求使用 `live` scope 展示，回答使用 `send` scope。
+2. iOS 将各问题呈现为选项/文本输入卡片，secret 字段使用安全输入；提交时按 question ID 原样构造 `answers`。answers 和幂等键随 Morde command API 传递，不发送到普通 Conversation/Task。
+3. PC 校验 request ID/version、thread/profile/grant 与每题答案后，一次性回复原 RPC。App Server 进程退出、重启或授权失效后请求变为 stale；Morde 不伪造空答案。
+4. 其他进程的 Codex GUI 问题若只在 thread history snapshot 中可见，则以无 response handle 的 unsupported 诊断显示；GUI 外部审批同样不伪造成 Morde 可回复的 approval。只有真实到达本机 Morde App Server 的原始请求才能走对应的一次性响应合同。
+
+### 6.4 审批与撤权
 
 - 每个审批使用 PC 生成的稳定 approval ID 和 request version/hash。iOS 回复携带这两个值；PC 在写 App Server response 前比对待处理请求及未过期状态。
 - 一个审批最多执行一次；已变化、已过期、已撤权、已响应的旧审批返回 stale，不得转成自由文本或发给另一操作。
@@ -235,13 +246,13 @@ POST /api/codex/sessions/{id}/commands
 ## 7. 安全、可靠性与隐私
 
 - **认证：** PC 使用注册的 Morde Client installation credential 连接 /api/hub 和 PC API；iOS 用 Morde 原生 Client 身份。所有会话、命令、事件请求按已认证 owner 与安装复核，不接收请求体里的 owner 作为授权依据。
-- **授权：** read history、live events、send、interrupt、approval 独立检查。更改 grant version 后，旧命令/审批失效；PC 只处理 owner 和 thread mapping 完全匹配的命令。
+- **授权：** read history、live events、send（含结构化问题回答）、interrupt、approval 独立检查。更改 grant version 后，旧命令/审批/问题请求失效；PC 只处理 owner 和 thread mapping 完全匹配的命令。
 - **账号与安装隔离：** 所有持久行包含 owner 归属；API 查询必须按当前 owner 过滤并结合安装授权。事件序号和 Provider ID 只在对应 Morde session 内唯一。
 - **传输及限制：** PC 主动以 HTTPS 请求云端，云端不开放对 PC 的公网入站端口。Client 凭证只在 Electron main 使用；新增 HTTP event batch 要有最大正文、请求频率、超时和每 session 缓冲上限。
 - **内容边界：** 不上传 Codex auth 文件、token、项目文件、附件或任意本地目录。只回传用户已授权的线程可见内容、工具输出和文件变更摘要；可见的项目路径和命令输出按敏感对话信息处理。
 - **数据生命周期：** 镜像事件和命令正文无限期保留至用户删除该 Codex 镜像会话或账号删除，不设自动 TTL；`DELETE /api/codex/sessions/{id}` 撤销访问并删除云端会话映射、事件和未执行命令。撤权阻止后续读取与命令，但不等于删除历史，也不声称已停止本地 turn。PC 本地未确认事件按 ACK 清理，已授权 profile/thread 范围保存在本机加密配置中。
 - **断线与重启：** 云端事件是可续读持久来源，PC 轮询领取数据库持久命令；PC 本地账本保护未确认批次。客户端重试不重建已受理命令；无法判定执行结果时明确显示 unknown。
-- **审计：** 记录 grant 变更、PC 绑定/解绑、消息受理、命令执行结果、审批决定、撤权和跨端读取的必要元信息。不写访问凭证、完整项目文件或任意未授权输出。
+- **审计：** 记录 grant 变更、PC 绑定/解绑、消息受理、命令执行结果、审批决定、撤权和跨端读取的必要元信息。列表读取、非空历史页读取及 SSE 检索到的非空事件批次只记录操作者、读取端 installation ID、目标 installation/session ID、游标或序号范围与条数；不记录正文，也不为心跳或空轮询逐条写审计。不写访问凭证、完整项目文件或任意未授权输出。
 
 ## 8. UI 及平台边界
 

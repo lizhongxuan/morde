@@ -59,7 +59,7 @@ describe('registration page', () => {
     expect(document.querySelector('.morde-shell')).not.toBeInTheDocument();
   });
 
-  it('keeps password validation in the form and shows API errors in the fixed notification layer', async () => {
+  it('keeps password validation and API errors beside the registration form', async () => {
     const user = userEvent.setup();
     renderRoute('/register');
     await user.type(screen.getByRole('textbox', { name: '用户名' }), 'new-user');
@@ -73,9 +73,8 @@ describe('registration page', () => {
     await user.clear(screen.getByLabelText('确认密码'));
     await user.type(screen.getByLabelText('确认密码'), 'secret-pass');
     await user.click(screen.getByRole('button', { name: '注册' }));
-    const error = await screen.findByRole('alert');
-    expect(error).toHaveTextContent('用户名已被使用，请更换用户名。');
-    expect(error.closest('.toast-region')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('用户名已被使用，请更换用户名。'));
+    expect(screen.getByRole('alert').closest('form')).toBeInTheDocument();
   });
 
   it('keeps registration off the administrator login page', () => {

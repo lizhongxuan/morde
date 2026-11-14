@@ -218,7 +218,7 @@ struct MIFApprovalInboxRoom: View {
         if let object = pending.object, !object.isEmpty { factLines.append(object) }
         if !pending.content.isEmpty { factLines.append(pending.content) }
         if !pending.impact.isEmpty { factLines.append(pending.impact) }
-        factLines.append(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
+        factLines.append(contentsOf: MordeTaskApprovalDisclosurePresentation.lines(pending.disclosures))
         if let expiresAt = pending.expirationDate {
             factLines.append(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
         }

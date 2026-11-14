@@ -199,7 +199,7 @@ paths:
       tags: [Codex]
       operationId: appendCodexSessionEvents
       summary: Persist normalized events from the bound PC installation
-      description: Requires the same active Client installation bound to the session. Each event declares source=snapshot, live or approval and requires the matching read, live or approval grant. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. Source is used only for authorization and is not stored or returned as presentation data. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files. command_status events are server-managed and rejected from PC batches.
+      description: Requires the same active Client installation bound to the session. Each event declares source=snapshot, live or approval and requires the matching read, live or approval grant; approval event kinds require approval scope, question events require live scope, and unsupported user_question diagnostics may be historical snapshots (read scope) or approval-sourced diagnostics (approval scope). Question IDs are opaque, preserve their exact bytes, and must be unique within one pending request. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. Source is used only for authorization and is not stored or returned as presentation data. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files. command_status events are server-managed and rejected from PC batches.
       security:
         - clientCredential: []
       parameters:
@@ -226,7 +226,7 @@ paths:
       tags: [Codex]
       operationId: streamCodexSessionEvents
       summary: Stream newly stored Codex events with SSE
-      description: Requires an owner Portal Session or owner Client credential and the session live scope. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
+      description: Requires an owner Portal Session or owner Client credential and both session read and live scopes. Read authorizes access to event-log contents; live authorizes the streaming transport. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
       security:
         - portalSession: []
         - clientCredential: []
@@ -251,7 +251,7 @@ paths:
       tags: [Codex]
       operationId: createCodexSessionCommand
       summary: Queue an idempotent command for an authorized PC session
-      description: Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc and its server-managed command_status event is appended in the same transaction using provider_event_id morde:command:<command-id>:<status-version>:<status>. Idempotency-Key retries return the original command without adding another event; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
+      description: Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. answer_question uses send scope. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc and its server-managed command_status event is appended in the same transaction using provider_event_id morde:command:<command-id>:<status-version>:<status>. Idempotency-Key retries return the original command without adding another event; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
       security:
         - portalSession: []
         - clientCredential: []
@@ -5379,6 +5379,36 @@ paths:
               schema: { $ref: '#/components/schemas/TaskStepDetail' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Tasks]
+      operationId: retryTaskStep
+      summary: Queue one verified safe retry of a Task step
+      description: Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. Request parameters cannot replace the tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskStepRetryRequest' }
+      responses:
+        '202':
+          description: A new attempt was queued, or the previously queued attempt was returned for an idempotent replay.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskStepRetryResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/file-fetches/{fetch_id}:
     parameters:
       - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
@@ -8435,7 +8465,7 @@ components:
       properties:
         provider_event_id: { type: string, minLength: 1, maxLength: 512 }
         kind: { type: string, enum: [user_message, assistant_message, assistant_delta, reasoning_summary, plan, turn_started, turn_completed, turn_failed, turn_cancelled, tool_call, tool_result, tool_call_summary, tool_result_summary, command_summary, file_change, file_change_summary, child_agent, subagent_summary, question, approval_request, approval_status, unsupported] }
-        source: { type: string, enum: [snapshot, live, approval], description: 'Authorization source only; it is not stored or returned as event content.' }
+        source: { type: string, enum: [snapshot, live, approval], description: 'Authorization source only; it is not stored or returned as event content. It selects the required read, live or approval grant.' }
         occurred_at: { type: string, format: date-time }
         turn_id: { type: string, maxLength: 512 }
         item_id: { type: string, maxLength: 512 }
@@ -8468,13 +8498,25 @@ components:
             object: { type: string, maxLength: 4096, description: Bounded user-visible request object; paths are reduced to display labels. }
             detail: { type: string, maxLength: 4096, description: Bounded operation detail or requested permission scope. }
             impact: { type: string, maxLength: 4096, description: Bounded provider reason when available. }
+            question_request_id: { type: string, minLength: 1, maxLength: 512, description: Opaque App Server user-input request identifier; preserve exact bytes, reject blank-only values and controls. }
+            question_version: { type: string, pattern: '^[a-f0-9]{64}$', description: Lowercase SHA-256 identity for the pending user-input request. }
             questions:
               type: array
               minItems: 1
               maxItems: 64
+              description: Question IDs must be unique within this request and are preserved byte-for-byte without trimming.
               items: { $ref: '#/components/schemas/CodexUserQuestion' }
             provider_type: { type: string }
             diagnostic: { type: string }
+      allOf:
+        - if:
+            properties:
+              kind: { const: question }
+            required: [kind]
+          then:
+            properties:
+              source: { const: live }
+              payload: { $ref: '#/components/schemas/CodexQuestionEventPayload' }
     CodexEventBatch:
       type: object
       additionalProperties: false
@@ -8490,20 +8532,59 @@ components:
       additionalProperties: false
       required: [label]
       properties:
-        label: { type: string, minLength: 1, maxLength: 4096 }
-        description: { type: string, maxLength: 4096 }
+        label:
+          type: string
+          maxLength: 4096
+          pattern: '^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$'
+          description: Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters.
+        description:
+          type: string
+          maxLength: 4096
+          pattern: '^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$'
+          description: Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters.
     CodexUserQuestion:
       type: object
       additionalProperties: false
       required: [id, header, question, options]
       properties:
-        id: { type: string, minLength: 1, maxLength: 512 }
-        header: { type: string, minLength: 1, maxLength: 4096 }
-        question: { type: string, minLength: 1, maxLength: 4096 }
+        id: { type: string, minLength: 1, maxLength: 512, description: Opaque byte-preserved ID; server rejects blank-only values and controls. }
+        header:
+          type: string
+          maxLength: 4096
+          pattern: '^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$'
+          description: Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters.
+        question:
+          type: string
+          maxLength: 4096
+          pattern: '^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$'
+          description: Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters.
+        is_secret: { type: boolean }
+        is_other: { type: boolean }
         options:
           type: array
           maxItems: 64
           items: { $ref: '#/components/schemas/CodexQuestionOption' }
+    CodexQuestionEventPayload:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [question_request_id, question_version, status, questions]
+          properties:
+            question_request_id: { type: string, minLength: 1, maxLength: 512, description: Opaque request identifier preserved byte-for-byte. }
+            question_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+            status: { type: string, const: pending }
+            questions:
+              type: array
+              minItems: 1
+              maxItems: 64
+              items: { $ref: '#/components/schemas/CodexUserQuestion' }
+        - type: object
+          additionalProperties: false
+          required: [question_request_id, question_version, status]
+          properties:
+            question_request_id: { type: string, minLength: 1, maxLength: 512, description: Opaque request identifier preserved byte-for-byte. }
+            question_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+            status: { type: string, enum: [answered, stale] }
     CodexEvent:
       type: object
       additionalProperties: false
@@ -8542,9 +8623,14 @@ components:
             approval_id: { type: string }
             approval_version: { type: string }
             kind: { type: string }
+            object: { type: string, maxLength: 4096 }
+            detail: { type: string, maxLength: 4096 }
+            impact: { type: string, maxLength: 4096 }
             command_id: { type: string, pattern: '^g[a-z0-9]{7}$' }
-            type: { type: string, enum: [send, interrupt, approval] }
+            type: { type: string, enum: [send, interrupt, approval, answer_question] }
             result_code: { type: string, maxLength: 128 }
+            question_request_id: { type: string, minLength: 1, maxLength: 512, description: Opaque request identifier preserved byte-for-byte. }
+            question_version: { type: string, pattern: '^[a-f0-9]{64}$' }
             questions:
               type: array
               minItems: 1
@@ -8553,6 +8639,14 @@ components:
             provider_type: { type: string }
             diagnostic: { type: string }
         stored_at: { type: string, format: date-time }
+      allOf:
+        - if:
+            properties:
+              kind: { const: question }
+            required: [kind]
+          then:
+            properties:
+              payload: { $ref: '#/components/schemas/CodexQuestionEventPayload' }
     CodexEventPage:
       type: object
       additionalProperties: false
@@ -8597,6 +8691,24 @@ components:
             approval_id: { type: string, minLength: 1, maxLength: 512 }
             approval_version: { type: string, minLength: 1, maxLength: 256 }
             decision: { type: string, enum: [approve, reject] }
+        - type: object
+          additionalProperties: false
+          required: [type, question_request_id, question_version, answers]
+          properties:
+            type: { type: string, const: answer_question }
+            question_request_id: { type: string, minLength: 1, maxLength: 512, description: Opaque request identifier preserved byte-for-byte. }
+            question_version: { type: string, pattern: '^[a-f0-9]{64}$' }
+            answers:
+              type: object
+              minProperties: 1
+              maxProperties: 64
+              description: Map of opaque question IDs to 1–64 exact answer strings; IDs and accepted answer strings are preserved without trimming.
+              propertyNames: { type: string, minLength: 1, maxLength: 512 }
+              additionalProperties:
+                type: array
+                minItems: 1
+                maxItems: 64
+                items: { type: string, minLength: 1, maxLength: 4096, description: Exact answer text; server rejects blank-only values and controls other than LF, CR and TAB. }
     CodexCommand:
       type: object
       additionalProperties: false
@@ -8608,7 +8720,7 @@ components:
         profile_key: { type: string }
         thread_id: { type: string }
         grant_version: { type: integer, format: int64, minimum: 1 }
-        type: { type: string, enum: [send, interrupt, approval] }
+        type: { type: string, enum: [send, interrupt, approval, answer_question] }
         status: { type: string, enum: [waiting_pc, claimed, forwarded, running, waiting_approval, completed, failed, unknown] }
         input: { $ref: '#/components/schemas/CodexCommandInput' }
         result_code: { type: string, maxLength: 128 }
@@ -11902,20 +12014,41 @@ components:
         updated_at: { type: string, format: date-time }
     TaskStep:
       type: object
-      required: [id, sequence, kind, status, title, summary, created_at]
+      required: [id, sequence, attempt, kind, status, title, summary, retryable, created_at]
       properties:
         id: { $ref: '#/components/schemas/StepId' }
         sequence: { type: integer, minimum: 1 }
+        attempt: { type: integer, format: int64, minimum: 1 }
+        retry_of_step_id: { oneOf: [{ $ref: '#/components/schemas/StepId' }, { type: 'null' }] }
         kind: { type: string, enum: [plan, model, tool, wait, clarification, budget, verification, verify, batch_item, batch_result, subagent, progress, result] }
         status: { $ref: '#/components/schemas/TaskStepStatus' }
         title: { type: string }
         summary: { type: string }
+        failure_reason: { type: [string, 'null'], enum: [not_dispatched, tool_failed_after_dispatch, side_effect_unknown, authorization_changed, resource_changed, null] }
+        retryable: { type: boolean, description: True only when the persisted Host evidence confirms the previous tool attempt was not dispatched. }
         agent_id: { type: string, maxLength: 128, description: Opaque Agent session ID that actually emitted this step. }
         task_revision: { type: integer, format: int64, minimum: 0 }
         tool_name: { type: string, maxLength: 128 }
         phase: { type: string, maxLength: 64 }
         detail_state: { type: string, enum: [not_recorded, available, expired, restricted] }
         created_at: { type: string, format: date-time }
+    TaskStepRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_task_revision, expected_attempt]
+      properties:
+        expected_task_revision: { type: integer, format: int64, minimum: 0 }
+        expected_attempt: { type: integer, format: int64, minimum: 1 }
+    TaskStepRetryResult:
+      type: object
+      required: [task_id, source_step_id, attempt_step_id, attempt, status, replayed]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        source_step_id: { $ref: '#/components/schemas/StepId' }
+        attempt_step_id: { $ref: '#/components/schemas/StepId' }
+        attempt: { type: integer, format: int64, minimum: 2 }
+        status: { type: string, enum: [queued] }
+        replayed: { type: boolean }
     TaskAgentExecution:
       type: object
       required: [id, parent_id, step_id, task_revision, role, status, observed_at]
@@ -11971,7 +12104,7 @@ components:
     TaskPendingRequest:
       type: object
       description: Exact, versioned approval context. The latest expired request remains a read-only snapshot; approved, rejected, or cancelled requests keep the existing hidden behavior. expires_at is null unless a trusted service policy explicitly sets an expiry.
-      required: [id, version, status, kind, title, object, content, impact, expires_at]
+      required: [id, version, status, kind, title, object, content, impact, disclosures, expires_at]
       properties:
         id: { $ref: '#/components/schemas/ClarificationId' }
         version: { type: integer, minimum: 1 }
@@ -11981,8 +12114,45 @@ components:
         object: { type: string }
         content: { type: string }
         impact: { type: string }
+        disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }
         expires_at: { type: [string, 'null'], format: date-time, description: Null unless a trusted service policy explicitly sets an expiry. }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId', description: Present only while an image, video or speech output awaits the Task owner's save decision; use it with the Task media preview route. }
+    TaskApprovalTextDisclosure:
+      type: object
+      additionalProperties: false
+      required: [state, summary]
+      description: A known disclosure includes its evidence-backed summary. Unknown and not_applicable disclosures have a null summary.
+      properties:
+        state: { type: string, enum: [known, unknown, not_applicable] }
+        summary: { type: [string, 'null'], maxLength: 512 }
+    TaskApprovalCostDisclosure:
+      type: object
+      additionalProperties: false
+      required: [state, basis, amount_micros, currency]
+      description: A known amount includes its currency and whether it is an estimate or settled charge. Unknown and not_applicable amounts have null basis, amount_micros and currency.
+      properties:
+        state: { type: string, enum: [known, unknown, not_applicable] }
+        basis: { type: [string, 'null'], enum: [estimate, settled, null] }
+        amount_micros: { type: [integer, 'null'], format: int64, minimum: 0 }
+        currency: { type: [string, 'null'], pattern: '^[A-Z]{3}$' }
+    TaskApprovalAlternativesDisclosure:
+      type: object
+      additionalProperties: false
+      required: [state, options]
+      description: Known options are substantiated alternatives. Unknown and not_applicable disclosures use an empty options array.
+      properties:
+        state: { type: string, enum: [known, unknown, not_applicable] }
+        options: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
+    TaskApprovalDisclosures:
+      type: object
+      additionalProperties: false
+      required: [risk, this_cost, cumulative_cost, alternatives, revocation]
+      properties:
+        risk: { $ref: '#/components/schemas/TaskApprovalTextDisclosure' }
+        this_cost: { $ref: '#/components/schemas/TaskApprovalCostDisclosure' }
+        cumulative_cost: { $ref: '#/components/schemas/TaskApprovalCostDisclosure' }
+        alternatives: { $ref: '#/components/schemas/TaskApprovalAlternativesDisclosure' }
+        revocation: { $ref: '#/components/schemas/TaskApprovalTextDisclosure' }
     TaskClarificationRequest:
       type: object
       required: [id, version, question]

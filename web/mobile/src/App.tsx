@@ -141,6 +141,7 @@ export default function App() {
           </div>
         )}
         {!state.lite && <DesktopRemoteHint />}
+        {state.toast && <p role="status" className="mx-auto w-full max-w-[900px] shrink-0 px-4 py-2 text-center text-[13.5px] text-muted">{state.toast}</p>}
         {/* `tabbar-room` keeps the screens, the chat's composer included, above the floating bar;
             a wide window has the sidebar instead and gives the room back. */}
         <main className={cx("tabbar-room mx-auto min-h-0 w-full flex-1 wide:max-w-[900px]", !state.lite && "wide:pb-0")}>
@@ -203,11 +204,6 @@ export default function App() {
       <ChatsDrawer />
       <FileViewer path={state.viewer} onClose={() => openFile(null)} />
       {firstSteps}
-      {state.toast && (
-        <div className="pointer-events-none fixed inset-x-0 bottom-[calc(6rem+env(safe-area-inset-bottom))] z-[70] flex justify-center px-4">
-          <div role="status" className="rise rounded-2xl bg-fg text-bg px-4 py-2 text-[13.5px] shadow-lg max-w-sm text-center">{state.toast}</div>
-        </div>
-      )}
     </div>
   );
 }

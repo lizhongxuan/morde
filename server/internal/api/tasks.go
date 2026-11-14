@@ -46,6 +46,10 @@ type TaskStepDetailService interface {
 	GetStepDetail(context.Context, identity.Principal, string, string) (app.TaskStepDetail, error)
 }
 
+type TaskStepRetryService interface {
+	RetryStep(context.Context, identity.Principal, string, string, int64, int64, string) (app.TaskStepRetryResult, error)
+}
+
 type TaskRevisionFencedActionService interface {
 	RequestActionWithRevisionFence(context.Context, identity.Principal, string, task.Action, task.Status, *app.TaskActionRevisionFence, string) (app.TaskActionResult, error)
 }
@@ -206,16 +210,119 @@ type taskWorkspaceViewDeletionResponse struct {
 }
 
 type taskPendingRequestResponse struct {
-	ID                      string     `json:"id"`
-	Version                 int64      `json:"version"`
-	Status                  string     `json:"status"`
-	Kind                    string     `json:"kind"`
-	Title                   string     `json:"title"`
-	Object                  string     `json:"object"`
-	Content                 string     `json:"content"`
-	Impact                  string     `json:"impact"`
-	ExpiresAt               *time.Time `json:"expires_at"`
-	MediaPreviewOperationID string     `json:"media_preview_operation_id,omitempty"`
+	ID                      string                          `json:"id"`
+	Version                 int64                           `json:"version"`
+	Status                  string                          `json:"status"`
+	Kind                    string                          `json:"kind"`
+	Title                   string                          `json:"title"`
+	Object                  string                          `json:"object"`
+	Content                 string                          `json:"content"`
+	Impact                  string                          `json:"impact"`
+	Disclosures             taskApprovalDisclosuresResponse `json:"disclosures"`
+	ExpiresAt               *time.Time                      `json:"expires_at"`
+	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
+}
+
+type taskApprovalDisclosureResponse struct {
+	State   string  `json:"state"`
+	Summary *string `json:"summary"`
+}
+
+type taskApprovalCostDisclosureResponse struct {
+	State        string  `json:"state"`
+	Basis        *string `json:"basis"`
+	AmountMicros *int64  `json:"amount_micros"`
+	Currency     *string `json:"currency"`
+}
+
+type taskApprovalAlternativesDisclosureResponse struct {
+	State   string   `json:"state"`
+	Options []string `json:"options"`
+}
+
+type taskApprovalDisclosuresResponse struct {
+	Risk           taskApprovalDisclosureResponse             `json:"risk"`
+	ThisCost       taskApprovalCostDisclosureResponse         `json:"this_cost"`
+	CumulativeCost taskApprovalCostDisclosureResponse         `json:"cumulative_cost"`
+	Alternatives   taskApprovalAlternativesDisclosureResponse `json:"alternatives"`
+	Revocation     taskApprovalDisclosureResponse             `json:"revocation"`
+}
+
+func unknownTaskApprovalDisclosure() taskApprovalDisclosureResponse {
+	return taskApprovalDisclosureResponse{State: "unknown"}
+}
+
+func unknownTaskApprovalCostDisclosure() taskApprovalCostDisclosureResponse {
+	return taskApprovalCostDisclosureResponse{State: "unknown"}
+}
+
+func unknownTaskApprovalDisclosures() taskApprovalDisclosuresResponse {
+	return taskApprovalDisclosuresResponse{
+		Risk: unknownTaskApprovalDisclosure(), ThisCost: unknownTaskApprovalCostDisclosure(),
+		CumulativeCost: unknownTaskApprovalCostDisclosure(),
+		Alternatives:   taskApprovalAlternativesDisclosureResponse{State: "unknown", Options: []string{}},
+		Revocation:     unknownTaskApprovalDisclosure(),
+	}
+}
+
+func validTaskApprovalDisclosures(value taskApprovalDisclosuresResponse) bool {
+	return validTaskApprovalTextDisclosure(value.Risk) && validTaskApprovalCostDisclosure(value.ThisCost) &&
+		validTaskApprovalCostDisclosure(value.CumulativeCost) && validTaskApprovalAlternativesDisclosure(value.Alternatives) &&
+		validTaskApprovalTextDisclosure(value.Revocation)
+}
+
+func validTaskApprovalTextDisclosure(value taskApprovalDisclosureResponse) bool {
+	switch value.State {
+	case "known":
+		return value.Summary != nil && validTaskText(*value.Summary, 512) && !strings.ContainsRune(*value.Summary, '\x00')
+	case "unknown", "not_applicable":
+		return value.Summary == nil
+	default:
+		return false
+	}
+}
+
+func validTaskApprovalCostDisclosure(value taskApprovalCostDisclosureResponse) bool {
+	switch value.State {
+	case "known":
+		return value.Basis != nil && (*value.Basis == "estimate" || *value.Basis == "settled") &&
+			value.AmountMicros != nil && *value.AmountMicros >= 0 && value.Currency != nil && validTaskCurrency(*value.Currency)
+	case "unknown", "not_applicable":
+		return value.Basis == nil && value.AmountMicros == nil && value.Currency == nil
+	default:
+		return false
+	}
+}
+
+func validTaskApprovalAlternativesDisclosure(value taskApprovalAlternativesDisclosureResponse) bool {
+	switch value.State {
+	case "known":
+		if value.Options == nil || len(value.Options) > 8 {
+			return false
+		}
+		for _, option := range value.Options {
+			if !validTaskText(option, 512) || strings.ContainsRune(option, '\x00') {
+				return false
+			}
+		}
+		return true
+	case "unknown", "not_applicable":
+		return len(value.Options) == 0
+	default:
+		return false
+	}
+}
+
+func validTaskCurrency(value string) bool {
+	if len(value) != 3 {
+		return false
+	}
+	for _, character := range value {
+		if character < 'A' || character > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 type taskClarificationRequestResponse struct {
@@ -279,18 +386,22 @@ type taskUsageResponse struct {
 }
 
 type taskStepResponse struct {
-	ID           string          `json:"id"`
-	Sequence     int64           `json:"sequence"`
-	Kind         string          `json:"kind"`
-	Status       task.StepStatus `json:"status"`
-	Title        string          `json:"title"`
-	Summary      string          `json:"summary"`
-	AgentID      *string         `json:"agent_id,omitempty"`
-	TaskRevision *int64          `json:"task_revision,omitempty"`
-	ToolName     *string         `json:"tool_name,omitempty"`
-	Phase        *string         `json:"phase,omitempty"`
-	DetailState  string          `json:"detail_state"`
-	CreatedAt    time.Time       `json:"created_at"`
+	ID            string          `json:"id"`
+	Sequence      int64           `json:"sequence"`
+	Attempt       int64           `json:"attempt"`
+	RetryOfStepID *string         `json:"retry_of_step_id,omitempty"`
+	Kind          string          `json:"kind"`
+	Status        task.StepStatus `json:"status"`
+	Title         string          `json:"title"`
+	Summary       string          `json:"summary"`
+	FailureReason *string         `json:"failure_reason,omitempty"`
+	Retryable     bool            `json:"retryable"`
+	AgentID       *string         `json:"agent_id,omitempty"`
+	TaskRevision  *int64          `json:"task_revision,omitempty"`
+	ToolName      *string         `json:"tool_name,omitempty"`
+	Phase         *string         `json:"phase,omitempty"`
+	DetailState   string          `json:"detail_state"`
+	CreatedAt     time.Time       `json:"created_at"`
 }
 
 type taskAgentResponse struct {
@@ -381,6 +492,11 @@ type taskApprovalResponseRequest struct {
 	Decision task.PendingDecision `json:"decision"`
 }
 
+type taskStepRetryRequest struct {
+	ExpectedTaskRevision int64 `json:"expected_task_revision"`
+	ExpectedAttempt      int64 `json:"expected_attempt"`
+}
+
 func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	if service == nil {
 		return
@@ -391,6 +507,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.GET("/tasks/:id", h.getTask(service))
 	if detailService, ok := service.(TaskStepDetailService); ok {
 		group.GET("/tasks/:id/steps/:step_id", h.getTaskStepDetail(detailService))
+	}
+	if retryService, ok := service.(TaskStepRetryService); ok {
+		group.POST("/tasks/:id/steps/:step_id/retries", h.retryTaskStep(retryService))
 	}
 	if fetchService, ok := service.(TaskFileFetchQueryService); ok {
 		group.GET("/tasks/:id/file-fetches/:fetch_id", h.getTaskFileFetch(fetchService))
@@ -431,6 +550,44 @@ func (h *api) getTaskStepDetail(service TaskStepDetailService) gin.HandlerFunc {
 		c.Header("Pragma", "no-cache")
 		c.Header("Referrer-Policy", "no-referrer")
 		c.JSON(http.StatusOK, value)
+	}
+}
+
+func (h *api) retryTaskStep(service TaskStepRetryService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" {
+			writeError(c, domain.InvalidArgument("request", "task step retry does not accept a query string"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		stepID, ok := safeIDParam(c, "step_id", "step_id", domain.ValidStepID)
+		if !ok {
+			return
+		}
+		var request taskStepRetryRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if request.ExpectedTaskRevision < 0 || request.ExpectedAttempt < 1 {
+			writeError(c, domain.InvalidArgument("retry", "task revision and attempt are required"))
+			return
+		}
+		result, err := service.RetryStep(c.Request.Context(), principal, taskID, stepID, request.ExpectedTaskRevision,
+			request.ExpectedAttempt, c.GetHeader("Idempotency-Key"))
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusAccepted, result)
 	}
 }
 
@@ -993,17 +1150,19 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			}
 		} else {
 			active := pendingStatus == "pending"
+			disclosures := unknownTaskApprovalDisclosures()
 			if (active && value.Task.Status != task.StatusWaitingUser) ||
 				!domain.ValidPendingRequestID(pending.ID) || pending.TaskID != value.Task.ID || pending.Version < 1 || pending.Kind != "approval" ||
 				(pending.ExpiresAt != nil && pending.ExpiresAt.IsZero()) ||
 				(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
-				!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) {
+				!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) ||
+				!validTaskApprovalDisclosures(disclosures) {
 				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 			}
 			response.PendingRequest = &taskPendingRequestResponse{
 				ID: pending.ID, Version: pending.Version, Status: pendingStatus, Kind: pending.Kind, Title: pending.Title,
 				Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
-				ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
+				Disclosures: disclosures, ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
 			}
 		}
 	}
@@ -1062,13 +1221,18 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		if detailState != "not_recorded" && detailState != "available" && detailState != "expired" && detailState != "restricted" {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
+		attempt := step.Attempt
+		if attempt < 1 {
+			attempt = 1
+		}
 		if step.AgentSessionID != "" && !validTaskAgentID(step.AgentSessionID) ||
 			(step.TaskRevision != nil && *step.TaskRevision < 0) || (step.ToolName != "" && !validTaskText(step.ToolName, 128)) ||
 			(step.Phase != "" && !validTaskText(step.Phase, 64)) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.Steps = append(response.Steps, taskStepResponse{
-			ID: step.ID, Sequence: step.Sequence, Kind: step.Kind, Status: step.Status, Title: step.Title,
+			ID: step.ID, Sequence: step.Sequence, Attempt: attempt, RetryOfStepID: optionalTaskText(step.RetryOfStepID),
+			Kind: step.Kind, Status: step.Status, Title: step.Title, FailureReason: optionalTaskText(step.FailureReason), Retryable: step.Retryable,
 			Summary: step.Summary, CreatedAt: step.CreatedAt, AgentID: optionalTaskText(step.AgentSessionID), TaskRevision: step.TaskRevision,
 			ToolName: optionalTaskText(step.ToolName), Phase: optionalTaskText(step.Phase), DetailState: detailState,
 		})

@@ -84,11 +84,12 @@ type Discover struct {
 
 var profileKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 var nativeIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,512}$`)
+var questionVersionPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 func (value Discover) Validate() error {
 	if !profileKeyPattern.MatchString(value.ProfileKey) || !nativeIDPattern.MatchString(value.ThreadID) ||
 		!validVisibleString(value.Title, 0, 512) || !validVisibleString(value.CWDLabel, 0, 256) ||
-		strings.ContainsAny(value.CWDLabel, "/\\:") || !value.Status.Valid() {
+		strings.ContainsAny(value.CWDLabel, "/\\") || !value.Status.Valid() {
 		return errors.New("Codex thread metadata is invalid")
 	}
 	if value.UpdatedAt != nil && (value.UpdatedAt.IsZero() || value.UpdatedAt.After(time.Now().UTC().Add(24*time.Hour))) {
@@ -157,7 +158,7 @@ var eventPayloadKeys = map[EventKind]map[string]struct{}{
 	EventFileChangeSummary: keys("path_label", "change", "summary", "changes"),
 	EventChildAgent:        keys("agent_label", "status", "summary"),
 	EventSubagentSummary:   keys("agent_label", "status", "summary"),
-	EventQuestion:          keys("summary", "questions"),
+	EventQuestion:          keys("question_request_id", "question_version", "status", "questions"),
 	EventApprovalRequest:   keys("approval_id", "approval_version", "kind", "summary", "object", "detail", "impact"),
 	EventApprovalStatus:    keys("approval_id", "approval_version", "status", "summary"),
 	EventCommandStatus:     keys("command_id", "type", "status", "result_code"),
@@ -253,7 +254,7 @@ func (value EventInput) Validate() error {
 		value.OccurredAt.IsZero() || value.OccurredAt.After(time.Now().UTC().Add(24*time.Hour)) ||
 		!validOptionalNativeID(value.TurnID) || !validOptionalNativeID(value.ItemID) ||
 		!validOptionalNativeID(value.ParentItemID) || !validOptionalVisibleString(value.Status, 128) || value.Payload == nil ||
-		(value.Kind != EventCommandStatus && !value.Source.Valid()) {
+		!value.validSourceForKind() {
 		return errors.New("Codex event fields are invalid")
 	}
 	if value.Kind != EventCommandStatus && strings.HasPrefix(value.ProviderEventID, "morde:command:") {
@@ -264,10 +265,8 @@ func (value EventInput) Validate() error {
 		value.Status != stringValue(value.Payload["status"])) {
 		return errors.New("Codex command status event is invalid")
 	}
-	if value.Kind == EventQuestion {
-		if _, ok := value.Payload["questions"]; !ok {
-			return errors.New("Codex question event has no questions")
-		}
+	if value.Kind == EventQuestion && !validQuestionEvent(value.Payload) {
+		return errors.New("Codex question event is invalid")
 	}
 	for key, item := range value.Payload {
 		if _, ok := allowed[key]; !ok || !validEventPayloadValue(value.Kind, key, item) {
@@ -281,12 +280,38 @@ func (value EventInput) Validate() error {
 	return nil
 }
 
+func (value EventInput) validSourceForKind() bool {
+	if value.Kind == EventCommandStatus {
+		return value.Source == ""
+	}
+	if !value.Source.Valid() {
+		return false
+	}
+
+	switch value.Kind {
+	case EventQuestion:
+		return value.Source == EventSourceLive
+	case EventApprovalRequest, EventApprovalStatus:
+		return value.Source == EventSourceApproval
+	case EventUnsupported:
+		if stringValue(value.Payload["provider_type"]) == "user_question" {
+			// Historical snapshots may contain App Server user-input items that
+			// are only exposed as unsupported diagnostics. Their source still
+			// determines the required read or approval scope.
+			return value.Source == EventSourceSnapshot || value.Source == EventSourceApproval
+		}
+		return value.Source == EventSourceSnapshot || value.Source == EventSourceLive
+	default:
+		return value.Source == EventSourceSnapshot || value.Source == EventSourceLive
+	}
+}
+
 func validCommandStatusPayload(payload map[string]any) bool {
 	if len(payload) != 4 || !domain.ValidCodexCommandID(stringValue(payload["command_id"])) {
 		return false
 	}
 	commandType := CommandType(stringValue(payload["type"]))
-	if commandType != CommandSend && commandType != CommandInterrupt && commandType != CommandApproval {
+	if commandType != CommandSend && commandType != CommandInterrupt && commandType != CommandApproval && commandType != CommandAnswerQuestion {
 		return false
 	}
 	if !CommandStatus(stringValue(payload["status"])).Valid() {
@@ -307,7 +332,35 @@ func validEventPayloadValue(kind EventKind, key string, value any) bool {
 	if kind == EventQuestion && key == "questions" {
 		return validQuestions(value)
 	}
+	if kind == EventQuestion && key == "status" {
+		status := stringValue(value)
+		return status == "pending" || status == "answered" || status == "stale"
+	}
+	if kind == EventQuestion && key == "question_request_id" {
+		return validOpaqueQuestionID(value)
+	}
+	if kind == EventQuestion && key == "question_version" {
+		return questionVersionPattern.MatchString(stringValue(value))
+	}
 	return validPayloadValue(value)
+}
+
+func validQuestionEvent(payload map[string]any) bool {
+	version := stringValue(payload["question_version"])
+	status := stringValue(payload["status"])
+	if !validOpaqueQuestionID(payload["question_request_id"]) || !questionVersionPattern.MatchString(version) {
+		return false
+	}
+	switch status {
+	case "pending":
+		questions, exists := payload["questions"]
+		return exists && len(payload) == 4 && validQuestions(questions)
+	case "answered", "stale":
+		_, hasQuestions := payload["questions"]
+		return !hasQuestions && len(payload) == 3
+	default:
+		return false
+	}
 }
 
 func validQuestions(value any) bool {
@@ -315,19 +368,32 @@ func validQuestions(value any) bool {
 	if !ok || len(questions) == 0 || len(questions) > 64 {
 		return false
 	}
+	seenIDs := make(map[string]struct{}, len(questions))
 	for _, value := range questions {
 		question, ok := value.(map[string]any)
-		if !ok || len(question) != 4 {
+		if !ok || len(question) < 4 || len(question) > 6 {
 			return false
 		}
 		for key := range question {
-			if key != "id" && key != "header" && key != "question" && key != "options" {
+			if key != "id" && key != "header" && key != "question" && key != "options" && key != "is_secret" && key != "is_other" {
 				return false
 			}
 		}
-		if !validQuestionText(question["id"], 512, false) || !validQuestionText(question["header"], 4096, false) ||
-			!validQuestionText(question["question"], 4096, false) {
+		if !validOpaqueQuestionID(question["id"]) || !validQuestionText(question["header"], 4096) ||
+			!validQuestionText(question["question"], 4096) {
 			return false
+		}
+		questionID := question["id"].(string)
+		if _, duplicate := seenIDs[questionID]; duplicate {
+			return false
+		}
+		seenIDs[questionID] = struct{}{}
+		for _, key := range []string{"is_secret", "is_other"} {
+			if flag, exists := question[key]; exists {
+				if _, ok := flag.(bool); !ok {
+					return false
+				}
+			}
 		}
 		options, ok := question["options"].([]any)
 		if !ok || len(options) > 64 {
@@ -343,10 +409,10 @@ func validQuestions(value any) bool {
 					return false
 				}
 			}
-			if !validQuestionText(option["label"], 4096, false) {
+			if !validQuestionText(option["label"], 4096) {
 				return false
 			}
-			if description, exists := option["description"]; exists && !validQuestionText(description, 4096, true) {
+			if description, exists := option["description"]; exists && !validQuestionText(description, 4096) {
 				return false
 			}
 		}
@@ -354,10 +420,59 @@ func validQuestions(value any) bool {
 	return true
 }
 
-func validQuestionText(value any, maximum int, allowEmpty bool) bool {
+func validQuestionAnswers(answers map[string][]string) bool {
+	if len(answers) == 0 || len(answers) > 64 {
+		return false
+	}
+	for questionID, values := range answers {
+		if !validOpaqueQuestionID(questionID) || len(values) == 0 || len(values) > 64 {
+			return false
+		}
+		for _, answer := range values {
+			if !validQuestionAnswer(answer) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validQuestionAnswer(value string) bool {
+	if !utf8.ValidString(value) || len(value) == 0 || len(value) > 4096 || strings.TrimSpace(value) == "" {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) && character != '\n' && character != '\r' && character != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+func validOpaqueQuestionID(value any) bool {
 	text, ok := value.(string)
-	return ok && utf8.ValidString(text) && len(text) <= maximum &&
-		(allowEmpty || text != "") && strings.TrimSpace(text) == text && !strings.ContainsRune(text, '\x00')
+	if !ok || !utf8.ValidString(text) || len(text) == 0 || len(text) > 512 || strings.TrimSpace(text) == "" {
+		return false
+	}
+	for _, character := range text {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validQuestionText(value any, maximum int) bool {
+	text, ok := value.(string)
+	if !ok || !utf8.ValidString(text) || len(text) > maximum {
+		return false
+	}
+	for _, character := range text {
+		if unicode.IsControl(character) && character != '\n' && character != '\r' && character != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func validPayloadValue(value any) bool {
@@ -430,9 +545,10 @@ func (batch EventBatch) Validate() (int, error) {
 type CommandType string
 
 const (
-	CommandSend      CommandType = "send"
-	CommandInterrupt CommandType = "interrupt"
-	CommandApproval  CommandType = "approval"
+	CommandSend           CommandType = "send"
+	CommandInterrupt      CommandType = "interrupt"
+	CommandApproval       CommandType = "approval"
+	CommandAnswerQuestion CommandType = "answer_question"
 )
 
 type CommandStatus string
@@ -468,28 +584,40 @@ func (status CommandStatus) ValidResult() bool {
 }
 
 type CommandInput struct {
-	Type            CommandType `json:"type"`
-	Text            string      `json:"text,omitempty"`
-	TurnID          string      `json:"turn_id,omitempty"`
-	ApprovalID      string      `json:"approval_id,omitempty"`
-	ApprovalVersion string      `json:"approval_version,omitempty"`
-	Decision        string      `json:"decision,omitempty"`
+	Type              CommandType         `json:"type"`
+	Text              string              `json:"text,omitempty"`
+	TurnID            string              `json:"turn_id,omitempty"`
+	ApprovalID        string              `json:"approval_id,omitempty"`
+	ApprovalVersion   string              `json:"approval_version,omitempty"`
+	QuestionRequestID string              `json:"question_request_id,omitempty"`
+	QuestionVersion   string              `json:"question_version,omitempty"`
+	Answers           map[string][]string `json:"answers,omitempty"`
+	Decision          string              `json:"decision,omitempty"`
 }
 
 func (command CommandInput) Validate() error {
 	switch command.Type {
 	case CommandSend:
-		if !validCommandText(command.Text) || command.TurnID != "" || command.ApprovalID != "" || command.ApprovalVersion != "" || command.Decision != "" {
+		if !validCommandText(command.Text) || command.TurnID != "" || command.ApprovalID != "" || command.ApprovalVersion != "" ||
+			command.QuestionRequestID != "" || command.QuestionVersion != "" || command.Answers != nil || command.Decision != "" {
 			return errors.New("Codex send command is invalid")
 		}
 	case CommandInterrupt:
-		if !validVisibleString(command.TurnID, 1, 512) || command.Text != "" || command.ApprovalID != "" || command.ApprovalVersion != "" || command.Decision != "" {
+		if !validVisibleString(command.TurnID, 1, 512) || command.Text != "" || command.ApprovalID != "" || command.ApprovalVersion != "" ||
+			command.QuestionRequestID != "" || command.QuestionVersion != "" || command.Answers != nil || command.Decision != "" {
 			return errors.New("Codex interrupt command is invalid")
 		}
 	case CommandApproval:
 		if !validVisibleString(command.ApprovalID, 1, 512) || !validVisibleString(command.ApprovalVersion, 1, 256) ||
-			(command.Decision != "approve" && command.Decision != "reject") || command.Text != "" || command.TurnID != "" {
+			(command.Decision != "approve" && command.Decision != "reject") || command.Text != "" || command.TurnID != "" ||
+			command.QuestionRequestID != "" || command.QuestionVersion != "" || command.Answers != nil {
 			return errors.New("Codex approval command is invalid")
+		}
+	case CommandAnswerQuestion:
+		if !validOpaqueQuestionID(command.QuestionRequestID) || !questionVersionPattern.MatchString(command.QuestionVersion) ||
+			!validQuestionAnswers(command.Answers) || command.Text != "" || command.TurnID != "" || command.ApprovalID != "" ||
+			command.ApprovalVersion != "" || command.Decision != "" {
+			return errors.New("Codex question answer command is invalid")
 		}
 	default:
 		return errors.New("Codex command type is invalid")
@@ -512,6 +640,8 @@ func validCommandText(value string) bool {
 func (command CommandInput) RequiredScope() Scope {
 	switch command.Type {
 	case CommandSend:
+		return ScopeSend
+	case CommandAnswerQuestion:
 		return ScopeSend
 	case CommandInterrupt:
 		return ScopeInterrupt

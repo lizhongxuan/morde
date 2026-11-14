@@ -33,6 +33,22 @@ describe('TopBar countdown', () => {
     expect(screen.queryByRole('button', { name: '返回云端电脑' })).not.toBeInTheDocument();
   });
 
+  it('keeps transient messages in the header flow instead of a floating card', () => {
+    const { container } = render(<TopBar
+      host={null}
+      renewing={false}
+      onRenew={vi.fn()}
+      {...controlProps}
+      notice="远程桌面连接失败"
+      noticeKind="error"
+    />);
+
+    const message = screen.getByRole('alert');
+    expect(message).toHaveTextContent('远程桌面连接失败');
+    expect(message).toHaveClass('workbench-status');
+    expect(message.closest('.top-bar')).toBe(container.querySelector('.top-bar'));
+  });
+
   it('updates the remaining time once per second and marks expired hosts', async () => {
     vi.useFakeTimers();
     const now = new Date('2026-10-19T00:00:00.000Z');

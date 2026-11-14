@@ -184,11 +184,24 @@ export class ResilientAssistantDraftStorage implements AssistantDraftStorage {
 
   async remove(scope: string, id: string): Promise<void> {
     const key = `${scope}\u0000${id}`;
-    this.revisions.set(key, (this.revisions.get(key) ?? 0) + 1);
+    const previous = this.memory.get(key);
+    const previousDirty = this.dirty.get(key);
+    const revision = (this.revisions.get(key) ?? 0) + 1;
+    this.revisions.set(key, revision);
     this.removed.add(key);
     this.memory.delete(key);
     this.dirty.delete(key);
-    await this.write(key, () => this.durable.remove(scope, id));
+    try {
+      await this.write(key, () => this.durable.remove(scope, id));
+    } catch (error) {
+      if (this.revisions.get(key) === revision) {
+        this.revisions.set(key, revision + 1);
+        this.removed.delete(key);
+        if (previous) this.memory.set(key, previous);
+        if (previousDirty) this.dirty.set(key, previousDirty);
+      }
+      throw error;
+    }
   }
 }
 

@@ -273,3 +273,62 @@ func TestPostgresApprovalResponseBeforeDeadlineSurvivesExpiryScan(t *testing.T) 
 		t.Fatalf("approval changed during scan or replay: status=%s decision=%s events=%d err=%v", status, decision, responseCount, err)
 	}
 }
+
+func TestPostgresApprovalThatExpiresWhileResponseWriteWaitsIsRejected(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	host := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	expiresAt := time.Now().UTC().Add(3 * time.Second)
+	taskID, pendingID := createApprovalExpiryTask(t, store, owner.ID, host.ID, "expires-during-response", &expiresAt)
+	record := app.IdempotencyRecord{OwnerID: owner.ID, Operation: "task.pending.respond", Key: "expires-during-response-key",
+		RequestHash: hashBytes("approve-expiring:" + pendingID), ResourceID: taskID, RelatedID: pendingID}
+
+	blocker, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, `LOCK TABLE task_pending_requests IN SHARE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	response := make(chan error, 1)
+	go func() {
+		response <- store.RespondToPendingRequest(ctx, record, taskID, pendingID, 1, task.PendingDecisionApprove)
+	}()
+
+	lockDeadline := time.Now().Add(time.Second)
+	blocked := false
+	for time.Now().Before(lockDeadline) {
+		if err := store.pool.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM pg_stat_activity
+WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock'
+  AND query LIKE '%UPDATE task_pending_requests SET status=%')`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !blocked || time.Now().After(expiresAt) {
+		t.Fatalf("response was not blocked on its decision write before expiry: blocked=%t expires_at=%s", blocked, expiresAt)
+	}
+	time.Sleep(time.Until(expiresAt) + 50*time.Millisecond)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-response; domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("response after deadline = %v, want conflict", err)
+	}
+	var pendingStatus, decision, taskStatus string
+	var idempotencyRows int64
+	if err := store.pool.QueryRow(ctx, `SELECT p.status,p.decision,t.status,
+(SELECT count(*) FROM idempotency_keys WHERE owner_id=$3 AND operation=$4 AND key=$5)
+FROM task_pending_requests p JOIN tasks t ON t.id=p.task_id WHERE p.id=$1 AND p.task_id=$2`,
+		pendingID, taskID, owner.ID, record.Operation, record.Key).Scan(&pendingStatus, &decision, &taskStatus, &idempotencyRows); err != nil ||
+		pendingStatus != "expired" || decision != "reject" || taskStatus != "queued" || idempotencyRows != 0 {
+		t.Fatalf("late approval state = pending:%s decision:%s task:%s idempotency_rows:%d err=%v",
+			pendingStatus, decision, taskStatus, idempotencyRows, err)
+	}
+}

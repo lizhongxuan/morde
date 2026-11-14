@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
 import type { HostMember } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { HostMemberManager } from './HostMemberManager';
 
 const hostId = 'h1234567';
@@ -15,7 +15,7 @@ const member: HostMember = {
 
 function renderManager(hostId: string) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={queryClient}><ToastProvider><HostMemberManager hostId={hostId} /></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><HostMemberManager hostId={hostId} /></ToastProvider></QueryClientProvider>);
 }
 
 async function loginOwner() {

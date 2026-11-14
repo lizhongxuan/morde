@@ -78,4 +78,41 @@ describe('assistant draft recovery', () => {
     expect(stored).toEqual(updated);
     expect(await storage.get('scope', old.id)).toEqual(updated);
   });
+
+  it('keeps the original draft readable when its durable removal fails', async () => {
+    const draft: AssistantComposerDraft = { id: 'local:one', conversationID: null, content: '保留的草稿',
+      modelID: '', hostID: '', mcpConnectorIDs: [], attachments: [], updatedAt: 1 };
+    const durable: AssistantDraftStorage = {
+      get: vi.fn().mockResolvedValue(draft), list: vi.fn().mockResolvedValue([draft]),
+      put: vi.fn().mockResolvedValue(undefined), remove: vi.fn().mockRejectedValue(new Error('delete failed')),
+    };
+    const storage = new ResilientAssistantDraftStorage(durable);
+    await storage.put('scope', draft);
+    await expect(storage.remove('scope', draft.id)).rejects.toThrow('delete failed');
+    expect(await storage.get('scope', draft.id)).toEqual(draft);
+    expect(await storage.list('scope')).toEqual([draft]);
+  });
+
+  it('does not restore a failed removal over a newer draft', async () => {
+    const old: AssistantComposerDraft = { id: 'local:one', conversationID: null, content: '旧草稿',
+      modelID: '', hostID: '', mcpConnectorIDs: [], attachments: [], updatedAt: 1 };
+    const updated = { ...old, content: '新草稿', updatedAt: 2 };
+    let releaseRemoval!: () => void;
+    let stored: AssistantComposerDraft | null = null;
+    const gate = new Promise<void>((resolve) => { releaseRemoval = resolve; });
+    const durable: AssistantDraftStorage = {
+      get: vi.fn().mockImplementation(async () => stored), list: vi.fn().mockImplementation(async () => stored ? [stored] : []),
+      put: vi.fn().mockImplementation(async (_scope, draft: AssistantComposerDraft) => { stored = draft; }),
+      remove: vi.fn().mockImplementation(async () => { await gate; throw new Error('delete failed'); }),
+    };
+    const storage = new ResilientAssistantDraftStorage(durable);
+    await storage.put('scope', old);
+    const removal = storage.remove('scope', old.id).catch((error: Error) => error);
+    const newWrite = storage.put('scope', updated);
+    releaseRemoval();
+    expect(await removal).toEqual(new Error('delete failed'));
+    await newWrite;
+    expect(stored).toEqual(updated);
+    expect(await storage.get('scope', old.id)).toEqual(updated);
+  });
 });

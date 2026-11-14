@@ -48,6 +48,16 @@ indirect enum MordeCodexJSONValue: Codable, Equatable, Sendable {
         return value
     }
 
+    var arrayValue: [MordeCodexJSONValue]? {
+        guard case .array(let value) = self else { return nil }
+        return value
+    }
+
+    var boolValue: Bool? {
+        guard case .bool(let value) = self else { return nil }
+        return value
+    }
+
     var foundationValue: Any {
         switch self {
         case .object(let value): value.mapValues(\.foundationValue)
@@ -64,6 +74,7 @@ indirect enum MordeCodexJSONValue: Codable, Equatable, Sendable {
 struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
     let id: String
     let installation_id: String
+    let thread_id: String
     let title: String
     let cwd_label: String
     let updated_at: String?
@@ -73,7 +84,7 @@ struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
     let turn_id: String?
 
     private enum CodingKeys: String, CodingKey {
-        case id, session_id, installation_id, title, cwd_label, updated_at, status, scopes
+        case id, session_id, installation_id, thread_id, title, cwd_label, updated_at, status, scopes
         case last_sequence, turn_id, current_turn_id
     }
 
@@ -82,6 +93,7 @@ struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
         id = try values.decodeIfPresent(String.self, forKey: .id)
             ?? values.decode(String.self, forKey: .session_id)
         installation_id = try values.decode(String.self, forKey: .installation_id)
+        thread_id = try values.decode(String.self, forKey: .thread_id)
         title = try values.decode(String.self, forKey: .title)
         cwd_label = try values.decode(String.self, forKey: .cwd_label)
         updated_at = try values.decodeIfPresent(String.self, forKey: .updated_at)
@@ -92,7 +104,23 @@ struct MordeCodexSession: Decodable, Equatable, Identifiable, Sendable {
             ?? values.decodeIfPresent(String.self, forKey: .turn_id)
     }
 
+    var shortThreadID: String { String(thread_id.suffix(8)) }
+
+    var updatedAtDate: Date? {
+        guard let updated_at else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: updated_at) ?? ISO8601DateFormatter().date(from: updated_at)
+    }
+
     func hasScope(_ scope: String) -> Bool { scopes.contains(scope) }
+}
+
+enum MordeCodexSessionScopePolicy {
+    static func shouldClearReadHistory(afterRefreshing scopes: [String]?) -> Bool {
+        guard let scopes else { return false }
+        return !scopes.contains("read")
+    }
 }
 
 struct MordeCodexEvent: Decodable, Equatable, Identifiable, Sendable {
@@ -111,6 +139,14 @@ struct MordeCodexEvent: Decodable, Equatable, Identifiable, Sendable {
     var id: Int64 { sequence }
     var values: [String: MordeCodexJSONValue] { payload }
     var visibleStatus: String? { status ?? values["status"]?.stringValue }
+    var diagnostic: String? {
+        guard normalizedKind == "unsupported",
+              let diagnostic = values["diagnostic"]?.stringValue,
+              !diagnostic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              diagnostic.utf8.count <= 24 * 1024,
+              !MordeCodexEventPolicy.isRawJSON(diagnostic) else { return nil }
+        return diagnostic
+    }
     var text: String? {
         func first(_ keys: [String]) -> String? {
             keys.lazy.compactMap { values[$0]?.stringValue }
@@ -126,7 +162,7 @@ struct MordeCodexEvent: Decodable, Equatable, Identifiable, Sendable {
                 .compactMap { $0 }.joined(separator: " · ")
             return text.isEmpty ? nil : text
         }
-        switch normalizedKind {
+        return switch normalizedKind {
         case "user_message", "assistant_message", "assistant_delta": first(["text", "summary"])
         case "reasoning_summary", "plan": joinedItems() ?? first(["summary", "text"])
         case "turn_started", "turn_completed", "turn_failed", "turn_cancelled": first(["summary", "text"])
@@ -175,11 +211,39 @@ struct MordeCodexEvent: Decodable, Equatable, Identifiable, Sendable {
             version: version,
             title: value(["title", "summary"]) ?? "",
             object: value(["object", "path_label"]),
-            detail: value(["content", "description", "text"]),
+            detail: value(["detail", "content", "description", "text"]),
             impact: value(["impact"]),
             status: value(["approval_status", "status"]) ?? visibleStatus ??
                 (normalizedKind == "approval_request" ? "pending" : "unknown"),
             expiresAt: value(["expires_at"]))
+    }
+
+    var questionRequest: MordeCodexUserQuestionRequest? {
+        guard normalizedKind == "question",
+              let requestID = values["question_request_id"]?.stringValue, !requestID.isEmpty,
+              let version = values["question_version"]?.stringValue,
+              version.utf8.count == 64,
+              version.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102) }),
+              let status = values["status"]?.stringValue,
+              ["pending", "answered", "stale"].contains(status) else { return nil }
+        let questionValues = values["questions"]?.arrayValue ?? []
+        let questions = questionValues.compactMap { MordeCodexUserInputQuestion(value: $0) }
+        guard questions.count == questionValues.count,
+              Set(questions.map(\.id)).count == questions.count else { return nil }
+        guard status != "pending" || !questions.isEmpty else { return nil }
+        return MordeCodexUserQuestionRequest(id: requestID, version: version, status: status, questions: questions)
+    }
+
+    var replyIdentity: MordeCodexReplyIdentity? {
+        if let approval {
+            return MordeCodexReplyIdentity(sessionID: session_id, kind: .approval,
+                                           requestID: approval.id, version: approval.version)
+        }
+        if let question = questionRequest {
+            return MordeCodexReplyIdentity(sessionID: session_id, kind: .question,
+                                           requestID: question.id, version: question.version)
+        }
+        return nil
     }
 }
 
@@ -201,12 +265,121 @@ struct MordeCodexApproval: Equatable, Sendable {
     }
 
     func canRespond(at now: Date = Date()) -> Bool {
-        status.lowercased() == "pending" && (expirationDate().map { $0 > now } ?? true)
+        guard status.lowercased() == "pending" else { return false }
+        guard expiresAt != nil else { return true }
+        guard let expiration = expirationDate() else { return false }
+        return expiration > now
     }
 
     var isNoLongerPending: Bool {
         ["expired", "stale", "approved", "rejected", "resolved", "cancelled", "canceled", "completed"]
             .contains(status.lowercased())
+    }
+}
+
+struct MordeCodexUserInputOption: Equatable, Sendable {
+    let label: String
+    let description: String
+}
+
+struct MordeCodexUserInputQuestion: Equatable, Sendable, Identifiable {
+    let id: String
+    let header: String
+    let question: String
+    let options: [MordeCodexUserInputOption]
+    let isSecret: Bool
+    let isOther: Bool
+
+    fileprivate init?(value: MordeCodexJSONValue) {
+        guard let row = value.objectValue,
+              let id = row["id"]?.stringValue, !id.isEmpty,
+              let header = row["header"]?.stringValue,
+              let question = row["question"]?.stringValue else { return nil }
+        let optionValues = row["options"]?.arrayValue ?? []
+        var options: [MordeCodexUserInputOption] = []
+        for value in optionValues {
+            guard let option = value.objectValue, let label = option["label"]?.stringValue else { return nil }
+            options.append(MordeCodexUserInputOption(label: label, description: option["description"]?.stringValue ?? ""))
+        }
+        self.id = id
+        self.header = header
+        self.question = question
+        self.options = options
+        isSecret = row["is_secret"]?.boolValue ?? false
+        isOther = row["is_other"]?.boolValue ?? false
+    }
+}
+
+struct MordeCodexUserQuestionRequest: Equatable, Sendable {
+    let id: String
+    let version: String
+    let status: String
+    let questions: [MordeCodexUserInputQuestion]
+
+    func withStatus(_ status: String) -> Self {
+        Self(id: id, version: version, status: status, questions: questions)
+    }
+
+    func accepts(_ answers: [String: [String]]) -> Bool {
+        guard status == "pending", !questions.isEmpty,
+              Set(answers.keys) == Set(questions.map(\.id)) else { return false }
+        return questions.allSatisfy { question in
+            guard let values = answers[question.id], !values.isEmpty, values.count <= 64 else { return false }
+            let controls = CharacterSet.controlCharacters
+            let allowedControls = CharacterSet(charactersIn: "\n\r\t")
+            return values.allSatisfy { value in
+                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && value.utf8.count <= 4096 &&
+                    value.unicodeScalars.allSatisfy { !controls.contains($0) || allowedControls.contains($0) }
+            }
+        }
+    }
+}
+
+enum MordeCodexReplyKind: Hashable, Sendable {
+    case approval
+    case question
+}
+
+struct MordeCodexReplyIdentity: Hashable, Sendable {
+    let sessionID: String
+    let kind: MordeCodexReplyKind
+    let requestID: String
+    let version: String
+}
+
+enum MordeCodexReplyPolicy {
+    static func isTerminalCommandStatus(_ status: String) -> Bool {
+        ["completed", "failed", "cancelled", "canceled", "interrupted", "rejected"]
+            .contains(status.lowercased())
+    }
+
+    static func identity(sessionID: String, approval: MordeCodexApproval) -> MordeCodexReplyIdentity {
+        MordeCodexReplyIdentity(sessionID: sessionID, kind: .approval,
+                                requestID: approval.id, version: approval.version)
+    }
+
+    static func identity(sessionID: String, question: MordeCodexUserQuestionRequest) -> MordeCodexReplyIdentity {
+        MordeCodexReplyIdentity(sessionID: sessionID, kind: .question,
+                                requestID: question.id, version: question.version)
+    }
+
+    static func terminalReplyIdentity(for event: MordeCodexEvent) -> MordeCodexReplyIdentity? {
+        guard let identity = event.replyIdentity else { return nil }
+        if let approval = event.approval, approval.isNoLongerPending { return identity }
+        if let question = event.questionRequest, ["answered", "stale"].contains(question.status) { return identity }
+        return nil
+    }
+
+    static func terminalCommandID(for event: MordeCodexEvent) -> String? {
+        guard event.normalizedKind == "command_status",
+              let status = event.visibleStatus,
+              isTerminalCommandStatus(status),
+              let commandID = event.values["command_id"]?.stringValue, !commandID.isEmpty else { return nil }
+        return commandID
+    }
+
+    static func isTerminal(_ event: MordeCodexEvent, for identity: MordeCodexReplyIdentity) -> Bool {
+        terminalReplyIdentity(for: event) == identity
     }
 }
 
@@ -264,6 +437,12 @@ struct MordeCodexEventCursor: Equatable, Sendable {
     }
 }
 
+private struct MordeCodexTextItemKey: Hashable {
+    let kind: MordeCodexTimelineKind
+    let turnID: String?
+    let itemID: String
+}
+
 enum MordeCodexEventPolicy {
     enum MergeError: Error, Equatable {
         case invalidEvent
@@ -317,25 +496,55 @@ enum MordeCodexEventPolicy {
 
     static func timelineItems(_ events: [MordeCodexEvent]) -> [MordeCodexTimelineItem] {
         var output: [MordeCodexTimelineItem] = []
-        var assistantIndex: [String: Int] = [:]
-        for event in events.sorted(by: { $0.sequence < $1.sequence }) {
-            let itemID = event.item_id ?? "sequence-\(event.sequence)"
-            if event.isAssistantDelta || event.isAssistantMessage {
-                let text = event.text ?? ""
-                if let index = assistantIndex[itemID] {
-                    let previous = output[index]
-                    output[index] = MordeCodexTimelineItem(
-                        id: previous.id,
-                        sequence: event.sequence,
-                        kind: .assistant,
-                        text: event.isAssistantMessage ? text : previous.text + text,
-                        status: event.status,
-                        approval: nil)
-                } else {
-                    assistantIndex[itemID] = output.count
-                    output.append(MordeCodexTimelineItem(id: "assistant-\(itemID)", sequence: event.sequence,
-                        kind: .assistant, text: text, status: event.status, approval: nil))
-                }
+        let ordered = events.sorted(by: { $0.sequence < $1.sequence })
+        var messageEvents: [MordeCodexTextItemKey: [MordeCodexEvent]] = [:]
+        for event in ordered {
+            let kind: MordeCodexTimelineKind?
+            if event.isUserMessage { kind = .user }
+            else if event.isAssistantDelta || event.isAssistantMessage { kind = .assistant }
+            else { kind = nil }
+            guard let kind else { continue }
+            let key = MordeCodexTextItemKey(kind: kind, turnID: event.turn_id,
+                                            itemID: event.item_id ?? "sequence-\(event.sequence)")
+            messageEvents[key, default: []].append(event)
+        }
+        var questions: [String: MordeCodexUserQuestionRequest] = [:]
+        var questionStatuses: [String: String] = [:]
+        for event in ordered {
+            guard let request = event.questionRequest else { continue }
+            let key = "\(request.id)\0\(request.version)"
+            if request.status == "pending", questions[key] == nil { questions[key] = request }
+            questionStatuses[key] = request.status
+        }
+        var emittedQuestions = Set<String>()
+        var emittedMessages = Set<MordeCodexTextItemKey>()
+        for event in ordered {
+            let textKind: MordeCodexTimelineKind?
+            if event.isUserMessage { textKind = .user }
+            else if event.isAssistantDelta || event.isAssistantMessage { textKind = .assistant }
+            else { textKind = nil }
+            if let textKind {
+                let key = MordeCodexTextItemKey(kind: textKind, turnID: event.turn_id,
+                                                itemID: event.item_id ?? "sequence-\(event.sequence)")
+                guard emittedMessages.insert(key).inserted, let group = messageEvents[key] else { continue }
+                let snapshots = group.filter { $0.isUserMessage || $0.isAssistantMessage }
+                let source = snapshots.isEmpty ? group : snapshots
+                let text = joinedMessageText(source, kind: textKind)
+                let latest = source.max(by: { $0.sequence < $1.sequence }) ?? event
+                output.append(MordeCodexTimelineItem(
+                    id: "\(textKind == .user ? "user" : "assistant")-\(key.turnID ?? "")-\(key.itemID)",
+                    sequence: latest.sequence, kind: textKind, text: text, status: latest.visibleStatus,
+                    approval: nil, question: nil))
+                continue
+            }
+            if let request = event.questionRequest {
+                let key = "\(request.id)\0\(request.version)"
+                guard emittedQuestions.insert(key).inserted else { continue }
+                let original = questions[key] ?? request
+                let latestStatus = questionStatuses[key] ?? request.status
+                output.append(MordeCodexTimelineItem(id: "question-\(request.id)-\(request.version)",
+                    sequence: event.sequence, kind: .question, text: nil, status: latestStatus,
+                    approval: nil, question: original.withStatus(latestStatus)))
                 continue
             }
             let kind: MordeCodexTimelineKind
@@ -351,18 +560,66 @@ enum MordeCodexEventPolicy {
             else if ["turn_status", "turn_started", "turn_completed", "turn_failed", "turn_interrupted",
                      "turn_cancelled", "status", "question"].contains(event.normalizedKind) { kind = .status }
             else { kind = .unsupported }
-            let visibleText = (kind == .unsupported ||
-                (kind != .user && kind != .assistant && isRawJSON(event.text))) ? nil : event.text
+            let visibleText: String?
+            if kind == .unsupported {
+                visibleText = event.diagnostic
+            } else {
+                visibleText = kind != .user && kind != .assistant && isRawJSON(event.text) ? nil : event.text
+            }
             output.append(MordeCodexTimelineItem(id: "event-\(event.sequence)", sequence: event.sequence,
                 kind: kind, text: visibleText, status: event.visibleStatus,
-                approval: kind == .approval ? event.approval : nil))
+                approval: kind == .approval ? event.approval : nil, question: nil))
         }
         return output
     }
+
+    private static func joinedMessageText(_ events: [MordeCodexEvent], kind: MordeCodexTimelineKind) -> String {
+        guard !events.isEmpty else { return "" }
+        let ordered: [MordeCodexEvent]
+        if kind == .assistant, events.allSatisfy(\.isAssistantDelta) {
+            let indexed = events.compactMap { event -> (Int, MordeCodexEvent)? in
+                guard let value = event.values["delta_index"] else { return nil }
+                let index: Int?
+                switch value {
+                case .integer(let number): index = Int(exactly: number)
+                case .number(let number): index = number.isFinite ? Int(exactly: number) : nil
+                default: index = nil
+                }
+                return index.map { ($0, event) }
+            }
+            if indexed.count == events.count {
+                ordered = latestEventsByIndex(indexed).map { $0.1 }
+            } else {
+                ordered = events.sorted { $0.sequence < $1.sequence }
+            }
+        } else {
+            let indexed = events.compactMap { event -> (Int, MordeCodexEvent)? in
+                guard let itemID = event.item_id,
+                      let segmentID = event.values["segment_id"]?.stringValue,
+                      segmentID.hasPrefix(itemID + ":"),
+                      let index = Int(segmentID.split(separator: ":").last ?? "") else { return nil }
+                return (index, event)
+            }
+            if indexed.count == events.count, indexed.count > 1 {
+                ordered = latestEventsByIndex(indexed).map { $0.1 }
+            } else {
+                ordered = [events.max(by: { $0.sequence < $1.sequence })!]
+            }
+        }
+        return ordered.compactMap(\.text).joined()
+    }
+
+    private static func latestEventsByIndex(_ indexed: [(Int, MordeCodexEvent)]) -> [(Int, MordeCodexEvent)] {
+        var latest: [Int: MordeCodexEvent] = [:]
+        for (index, event) in indexed where latest[index].map({ $0.sequence < event.sequence }) ?? true {
+            latest[index] = event
+        }
+        return latest.keys.sorted().compactMap { index in latest[index].map { (index, $0) } }
+    }
 }
 
-enum MordeCodexTimelineKind: Equatable, Sendable {
-    case user, assistant, reasoning, plan, tool, file, agent, approval, status, commandStatus, unsupported
+enum MordeCodexTimelineKind: Hashable, Sendable {
+    case user, assistant, reasoning, plan, tool, file, agent, approval, question, status, commandStatus, unsupported
 }
 
 struct MordeCodexTimelineItem: Identifiable, Equatable, Sendable {
@@ -372,6 +629,7 @@ struct MordeCodexTimelineItem: Identifiable, Equatable, Sendable {
     let text: String?
     let status: String?
     let approval: MordeCodexApproval?
+    let question: MordeCodexUserQuestionRequest?
 }
 
 enum MordeCodexSSEParserError: Error {

@@ -387,6 +387,15 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		!utf8.ValidString(value.Objective) || strings.TrimSpace(value.Objective) == "" || len(value.Objective) > cloudDSHMaxText {
 		return errors.New("dsh task is invalid or requires unsupported recovery")
 	}
+	if value.StepRetry != nil && !validCloudDSHStepRetryForTask(value, time.Now()) {
+		return errors.New("dsh task step retry is expired or outside its immutable execution fence")
+	}
+	if value.StepRetry != nil {
+		if _, ok := e.options.Checkpoints.(app.TaskStepRetryIntentConsumer); !ok || e.options.Tools == nil ||
+			!app.SupportsSafeTaskStepRetryTool(value.StepRetry.ToolName) {
+			return errors.New("dsh task step retry admission is unavailable")
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -581,6 +590,35 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		return nil
 	}
 	return err
+}
+
+func validCloudDSHStepRetryForTask(value task.Task, now time.Time) bool {
+	intent := value.StepRetry
+	if intent == nil || intent.Consumed || !intent.ExpiresAt.After(now) || !domain.ValidTaskID(intent.TaskID) ||
+		!domain.ValidUserID(intent.OwnerID) || !domain.ValidStepID(intent.SourceStepID) || !domain.ValidStepID(intent.AttemptStepID) ||
+		intent.TaskID != value.ID || intent.OwnerID != value.OwnerID || intent.Attempt < 2 ||
+		intent.RetryCallID != "morde_step_retry_"+intent.AttemptStepID || intent.SourceCallID == "" || len(intent.SourceCallID) > 256 ||
+		intent.AgentSessionID != value.AgentSessionID || intent.TaskRevision < 0 || value.CurrentRevision == nil ||
+		*value.CurrentRevision != intent.TaskRevision || value.DesiredRevision == nil || *value.DesiredRevision != intent.TaskRevision ||
+		intent.AuthorizationVersion != value.Authorization.Version || intent.AuthorizationVersion < 1 || intent.HostID != value.HostID ||
+		intent.HostRuntimeGeneration < 1 || intent.ToolName == "" || !app.SupportsSafeTaskStepRetryTool(intent.ToolName) ||
+		len(intent.RequestDigest) != sha256.Size || intent.CheckpointThroughSequence != value.CheckpointThroughSequence ||
+		len(intent.CheckpointDigest) != sha256.Size || !bytes.Equal(intent.CheckpointDigest, value.CheckpointDigest) ||
+		(intent.WorkspaceID == "" && (value.WorkspaceID != "" || intent.InputRevision != nil || intent.WorkspaceCheckpointRevision != nil ||
+			intent.WorkspaceBindingVersion != 0 || intent.WorkspaceRevision != nil)) ||
+		(intent.WorkspaceID != "" && (intent.WorkspaceID != value.WorkspaceID || !sameCloudDSHInt64(intent.InputRevision, value.InputRevision) ||
+			!sameCloudDSHInt64(intent.WorkspaceCheckpointRevision, value.WorkspaceCheckpointRevision) ||
+			intent.WorkspaceBindingVersion < 1 || intent.WorkspaceRevision == nil)) {
+		return false
+	}
+	return true
+}
+
+func sameCloudDSHInt64(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel context.CancelCauseFunc, value task.Task, fence app.AgentInstanceFence, expires time.Time,

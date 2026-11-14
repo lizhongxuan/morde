@@ -25,6 +25,55 @@ final class MIFApprovalViewsTests: XCTestCase {
         XCTAssertFalse(summary.isPartial)
     }
 
+    func testApprovalDisclosureContractRendersKnownValuesAndNotApplicableState() throws {
+        let task = try task(
+            id: "q3456789",
+            pending: #"{"id":"r3456789","version":1,"kind":"approval","title":"Review","content":"Proceed?","impact":"Updates a file.","disclosures":{"risk":{"state":"known","summary":"May overwrite the selected file."},"this_cost":{"state":"known","basis":"estimate","amount_micros":1250000,"currency":"USD"},"cumulative_cost":{"state":"unknown","basis":null,"amount_micros":null,"currency":null},"alternatives":{"state":"known","options":["Preview only","Cancel"]},"revocation":{"state":"not_applicable","summary":null}}}"#,
+            clarification: "null"
+        )
+        let disclosures = try XCTUnwrap(task.pending_request?.disclosures)
+
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.text(disclosures.risk), "May overwrite the selected file.")
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.cost(disclosures.this_cost, locale: Locale(identifier: "en_US")),
+                       "\(AppLocalized("Estimate")): USD 1.25")
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.cost(disclosures.cumulative_cost), AppLocalized("Unknown"))
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.alternatives(disclosures.alternatives), "• Preview only\n• Cancel")
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.text(disclosures.revocation), AppLocalized("Not applicable"))
+
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.lines(disclosures), [
+            "\(AppLocalized("Risk")): May overwrite the selected file.",
+            "\(AppLocalized("Cost of this action")): \(AppLocalized("Estimate")): USD 1.25",
+            "\(AppLocalized("Cumulative cost")): \(AppLocalized("Unknown"))",
+            "\(AppLocalized("Alternatives")): • Preview only\n• Cancel",
+            "\(AppLocalized("Revocation method")): \(AppLocalized("Not applicable"))",
+        ])
+    }
+
+    func testUnknownApprovalDisclosuresAndMissingDisclosuresStayExplicitlyUnknown() throws {
+        let unknown = try task(
+            id: "q4567890",
+            pending: #"{"id":"r4567890","version":1,"kind":"approval","title":"Review","content":"Proceed?","impact":"Updates a file.","disclosures":{"risk":{"state":"unknown","summary":null},"this_cost":{"state":"unknown","basis":null,"amount_micros":null,"currency":null},"cumulative_cost":{"state":"unknown","basis":null,"amount_micros":null,"currency":null},"alternatives":{"state":"unknown","options":[]},"revocation":{"state":"unknown","summary":null}}}"#,
+            clarification: "null"
+        )
+        let unknownDisclosures = try XCTUnwrap(unknown.pending_request?.disclosures)
+        let expectedUnknownLines = [
+            "\(AppLocalized("Risk")): \(AppLocalized("Unknown"))",
+            "\(AppLocalized("Cost of this action")): \(AppLocalized("Unknown"))",
+            "\(AppLocalized("Cumulative cost")): \(AppLocalized("Unknown"))",
+            "\(AppLocalized("Alternatives")): \(AppLocalized("Unknown"))",
+            "\(AppLocalized("Revocation method")): \(AppLocalized("Unknown"))",
+        ]
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.lines(unknownDisclosures), expectedUnknownLines)
+
+        let legacy = try task(
+            id: "q5678901",
+            pending: #"{"id":"r5678901","version":1,"kind":"approval","title":"Legacy","content":"Proceed?","impact":"Updates a file."}"#,
+            clarification: "null"
+        )
+        XCTAssertNil(legacy.pending_request?.disclosures)
+        XCTAssertEqual(MordeTaskApprovalDisclosurePresentation.lines(legacy.pending_request?.disclosures), expectedUnknownLines)
+    }
+
     func testEventChainIsAssignedOnlyToFirstPendingApproval() throws {
         let first = try task(
             id: "q1234567",

@@ -150,6 +150,8 @@ let personalObjects = new Map<string, { ownerID: string; value: PersonalObject }
 let personalChanges: Array<{ ownerID: string; value: components["schemas"]["PersonalChange"] }> = [];
 const personalSequences = new Map<string, number>();
 const personalMutationReplays = new Map<string, { request: string; response: PersonalMutationReceipt }>();
+const personalMemoryHistory = new Map<string, components["schemas"]["PersonalMemoryRevision"][]>();
+const personalMemoryHistoryCursors = new Map<string, { ownerID: string; objectID: string; offset: number }>();
 const recordConsents = new Map<string, RecordConsent[]>();
 const recordQuotas = new Map<string, RecordQuota>();
 const recordGrants = new Map<string, RecordAdminGrant[]>();
@@ -444,6 +446,8 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   personalChanges = [];
   personalSequences.clear();
   personalMutationReplays.clear();
+  personalMemoryHistory.clear();
+  personalMemoryHistoryCursors.clear();
   recordConsents.clear();
   recordQuotas.clear();
   recordGrants.clear();
@@ -1617,6 +1621,29 @@ export const handlers = [
     return json({ owner_id: user.id, used_bytes: 0, reserved_bytes: 0, quota_bytes: defaultPersonalDataQuota.quota_bytes,
       max_attachment_bytes: defaultPersonalDataQuota.max_attachment_bytes, remaining_bytes: defaultPersonalDataQuota.quota_bytes, version: 1 });
   }),
+  http.get("/api/personal-data/:type/:objectID/history", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const type = String(params.type);
+    const objectID = String(params.objectID);
+    const key = personalObjectKey(user.id, type, objectID);
+    if (type !== "memory" || !personalObjects.has(key)) return failure("not_found", "个人记忆不存在或无权访问", 404);
+    const query = new URL(request.url).searchParams;
+    const limit = Number(query.get("limit") ?? 100);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return failure("invalid_argument", "历史分页参数无效", 400);
+    const cursor = query.get("cursor");
+    const page = cursor ? personalMemoryHistoryCursors.get(cursor) : undefined;
+    if (cursor && (!page || page.ownerID !== user.id || page.objectID !== objectID)) return failure("invalid_argument", "历史游标无效", 400);
+    const revisions = personalMemoryHistory.get(key) ?? [];
+    const offset = page?.offset ?? 0;
+    const items = revisions.slice(offset, offset + limit);
+    const hasMore = offset + items.length < revisions.length;
+    let nextCursor: string | null = null;
+    if (hasMore) {
+      nextCursor = id("history");
+      personalMemoryHistoryCursors.set(nextCursor, { ownerID: user.id, objectID, offset: offset + items.length });
+    }
+    return json({ items, next_cursor: nextCursor });
+  }),
   http.get("/api/personal-data/:type/:objectID", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
     const type = String(params.type);
@@ -1652,9 +1679,47 @@ export const handlers = [
     if ((current?.revision ?? 0) !== baseRevision) return failure("conflict", "个人资料版本已变化", 409);
     const value: PersonalObject = { object_type: type as PersonalObject["object_type"], object_id: objectID, revision: baseRevision + 1, body: body as PersonalObject["body"] };
     const sequence = savePersonalObject(user.id, value, mutationID);
+    if (type === "memory") {
+      const historyKey = personalObjectKey(user.id, type, objectID);
+      const history = personalMemoryHistory.get(historyKey) ?? [];
+      history.unshift({ revision: value.revision, changed_at: now(), body: value.body as components["schemas"]["PersonalMemory"],
+        restorable: true, source_status: "available", sources: [{ kind: "mutation_receipt", id: mutationID }] });
+      personalMemoryHistory.set(historyKey, history);
+    }
     const receipt: PersonalMutationReceipt = { object_type: type as PersonalMutationReceipt["object_type"], object_id: objectID, result_revision: value.revision, account_change_sequence: sequence, replay: false };
     personalMutationReplays.set(replayKey, { request: normalizedRequest, response: receipt });
     return json(receipt, 200);
+  }),
+  http.delete("/api/personal-data/:type/:objectID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const type = String(params.type);
+    const objectID = String(params.objectID);
+    const mutationID = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{1,160}$/.test(objectID) || (type === "memory" && !/^m_[a-f0-9]{8}$/.test(objectID))) return failure("invalid_argument", "个人资料编号无效", 400);
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(mutationID)) return failure("invalid_argument", "需要有效的 Idempotency-Key", 400);
+    const requestBody = await request.json().catch(() => null) as { base_revision?: unknown } | null;
+    if (!requestBody || Object.keys(requestBody).some((field) => field !== "base_revision") ||
+      !Number.isSafeInteger(requestBody.base_revision) || Number(requestBody.base_revision) < 0) return failure("invalid_argument", "个人资料删除版本无效", 400);
+    const replayKey = `${user.id}\u0000${type}\u0000${objectID}\u0000${mutationID}`;
+    const normalizedRequest = JSON.stringify({ operation: "delete", type, objectID, base_revision: requestBody.base_revision });
+    const prior = personalMutationReplays.get(replayKey);
+    if (prior) return prior.request === normalizedRequest
+      ? json({ ...prior.response, replay: true }) : failure("idempotency_conflict", "幂等键已用于不同的个人资料变更", 409);
+    const key = personalObjectKey(user.id, type, objectID);
+    const current = personalObjects.get(key)?.value;
+    if (!current) return failure("not_found", "个人资料不存在或无权访问", 404);
+    if (current.object_type === "schedule") return failure("invalid_argument", "计划需要通过计划接口管理", 400);
+    if (Number(requestBody.base_revision) !== current.revision) return failure("conflict", "个人资料版本已变化", 409);
+    const sequence = (personalSequences.get(user.id) ?? 0) + 1;
+    personalSequences.set(user.id, sequence);
+    personalObjects.delete(key);
+    personalMemoryHistory.delete(key);
+    personalChanges.push({ ownerID: user.id, value: { change_sequence: sequence, object_type: current.object_type,
+      object_id: objectID, revision: current.revision + 1, operation: "delete", mutation_id: mutationID } });
+    const receipt: PersonalMutationReceipt = { object_type: current.object_type, object_id: objectID,
+      result_revision: current.revision + 1, account_change_sequence: sequence, replay: false };
+    personalMutationReplays.set(replayKey, { request: normalizedRequest, response: receipt });
+    return json(receipt);
   }),
   http.get("/api/sync/snapshot", ({ cookies }) => {
     const user = sessionUser(cookies)!;

@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
 import { portalApi } from '../../app/api';
-import { ToastProvider } from '../../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminModels } from './AdminModels';
 
 type ModelConnection = Awaited<ReturnType<typeof portalApi.adminModelConnections>>['items'][number];
@@ -17,7 +17,7 @@ const model: ModelConnection = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><AdminModels /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><AdminModels /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin platform model connections', () => {

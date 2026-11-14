@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 
@@ -7,8 +7,10 @@ type Toast = { id: number; message: string; kind: 'success' | 'error' | 'info'; 
 type ToastContextValue = {
   notify: (message: string, kind?: Toast['kind'], action?: ToastAction) => number;
   dismiss: (id: number) => void;
-  overlayRegion: HTMLDivElement | null;
   noticeRegion: HTMLDivElement | null;
+  noticeCount: number;
+  noticeLabel: string;
+  noticeDetails: RefObject<HTMLDetailsElement | null>;
   closeNotices: () => void;
 };
 const ToastContext = createContext<ToastContextValue | null>(null);
@@ -18,25 +20,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const [noticeCount, setNoticeCount] = useState(0);
   const [noticeLabel, setNoticeLabel] = useState('状态提示');
   const noticeDetails = useRef<HTMLDetailsElement>(null);
-  const [overlayRegion] = useState<HTMLDivElement | null>(() => {
-    if (typeof document === 'undefined') return null;
-    const region = document.createElement('div');
-    region.className = 'toast-region';
-    region.setAttribute('aria-live', 'polite');
-    region.setAttribute('aria-relevant', 'additions');
-    return region;
-  });
   const [noticeRegion] = useState<HTMLDivElement | null>(() => typeof document === 'undefined' ? null : document.createElement('div'));
-  useLayoutEffect(() => {
-    if (!overlayRegion) return;
-    document.body.append(overlayRegion);
-    return () => overlayRegion.remove();
-  }, [overlayRegion]);
   useLayoutEffect(() => {
     if (!noticeRegion) return;
     const update = () => {
       setNoticeCount(noticeRegion.childElementCount);
-      setNoticeLabel(noticeRegion.querySelector('[data-notice-label]')?.getAttribute('data-notice-label') || '状态提示');
+      const errors = noticeRegion.querySelectorAll('.toast-error-notice, .toast-error').length;
+      const notices = noticeRegion.childElementCount - errors;
+      setNoticeLabel(errors && notices ? '错误与状态' : errors ? '错误提示' : noticeRegion.querySelector('[data-notice-label]')?.getAttribute('data-notice-label') || '状态提示');
     };
     const observer = new MutationObserver(update);
     observer.observe(noticeRegion, { childList: true });
@@ -51,26 +42,26 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     if (!action) window.setTimeout(() => dismiss(id), 6000);
     return id;
   }, [dismiss]);
-  const value = useMemo(() => ({ notify, dismiss, overlayRegion, noticeRegion, closeNotices }), [notify, dismiss, overlayRegion, noticeRegion, closeNotices]);
+  const value = useMemo(() => ({ notify, dismiss, noticeRegion, noticeCount, noticeLabel, noticeDetails, closeNotices }), [notify, dismiss, noticeRegion, noticeCount, noticeLabel, closeNotices]);
   return <ToastContext.Provider value={value}>
     {children}
-    {overlayRegion && createPortal(items.map((item) => <div className={`toast toast-${item.kind}`} key={item.id} role={item.kind === 'error' ? 'alert' : 'status'}>{item.message}{item.action && <button type="button" className="button button-small button-secondary" onClick={item.action.onClick}>{item.action.label}</button>}<button type="button" className="icon-button" aria-label="关闭通知" onClick={() => dismiss(item.id)}>×</button></div>), overlayRegion)}
-    {noticeRegion && typeof document !== 'undefined' && createPortal(<div className="notice-center" hidden={!noticeCount}>
-      <details ref={noticeDetails}><summary aria-label={`${noticeLabel}，${noticeCount} 条`}><span>{noticeLabel}</span><span aria-live="polite">{noticeCount}</span></summary>
-        <div className="notice-center-panel" ref={(element) => { if (element && noticeRegion.parentElement !== element) element.append(noticeRegion); }} />
-      </details>
-    </div>, document.body)}
+    {noticeRegion && createPortal(items.map((item) => <div className={`toast-notice toast-${item.kind}${item.kind === 'error' ? ' toast-error-notice' : ''}`} key={item.id} role={item.kind === 'error' ? 'alert' : 'status'}>{item.message}{item.action && <button type="button" className="button button-small button-secondary" onClick={item.action.onClick}>{item.action.label}</button>}<button type="button" className="icon-button" aria-label="关闭通知" onClick={() => dismiss(item.id)}>×</button></div>), noticeRegion)}
   </ToastContext.Provider>;
+}
+
+export function ToastNoticeCenter() {
+  const { noticeRegion, noticeCount, noticeLabel, noticeDetails } = useToast();
+  return <div className="notice-center" hidden={!noticeCount}>
+    <details ref={noticeDetails}><summary aria-label={`${noticeLabel}，${noticeCount} 条`}><span aria-live="polite">{noticeLabel}</span><span aria-live="polite">{noticeCount}</span></summary>
+      <div className="notice-center-panel" ref={(element) => { if (element && noticeRegion && noticeRegion.parentElement !== element) element.append(noticeRegion); }} />
+    </details>
+  </div>;
 }
 
 export function useToast() {
   const value = useContext(ToastContext);
   if (!value) throw new Error('useToast 必须在 ToastProvider 内使用');
   return value;
-}
-
-export function useToastOverlayRegion() {
-  return useContext(ToastContext)?.overlayRegion ?? null;
 }
 
 export function useNoticeOverlayRegion() {
