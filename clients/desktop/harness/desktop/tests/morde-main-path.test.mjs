@@ -112,6 +112,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
       };
     }
     async webSession() { return { credential: 'renewed-web-secret', expiresAt }; }
+    async userPreferences() { return { defaultHostID: 'h1234567' }; }
     async host(id) { return { url: `https://${id}.hosts.example` }; }
     async requireWorkspaceSyncCapability() {}
     async workspace(id) { workspaceRequests.push(id); if (workspaceOffline) throw new Error('Workspace API offline'); return { state: 'ready' }; }

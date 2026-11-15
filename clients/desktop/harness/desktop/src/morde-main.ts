@@ -4,11 +4,12 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync 
 import { access, lstat, realpath } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type ProjectSyncFolder, type WebSession } from "./morde-core";
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, SyncRunError, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
 import { startLocalPortalServer, type LocalPortalServer } from "./morde-local-portal";
+import { exchangeHostEmbedTicket } from "./morde-embed-auth";
 
 // Keep the original name until safeStorage has opened the existing encryption key.
 app.setName("Morde");
@@ -119,7 +120,24 @@ let workspaceSyncOperationInProgress = false;
 let syncChildPid: number | undefined;
 let webView: WebContentsView | null = null;
 let webPartition: Session | null = null;
+type NativeWorkbenchEmbed = {
+  auth: Credentials;
+  hostID: string;
+  hostOrigin: string;
+  conversationID: string;
+  nonce: string;
+  targets: HostEmbedTarget[];
+  initialTarget: HostEmbedTarget;
+  parent: WebContents;
+  view: WebContentsView;
+  partition: Session;
+  attached: boolean;
+  initialized: boolean;
+  visible: boolean;
+};
+let nativeWorkbenchEmbed: NativeWorkbenchEmbed | null = null;
 let localPortalServer: LocalPortalServer | null = null;
+let localPortalServerClose: Promise<void> | null = null;
 let webAttached = false;
 let webOpenTask: { window: BrowserWindow; promise: Promise<void> } | null = null;
 let view: "web" | "offline" = "web";
@@ -135,6 +153,8 @@ let exitReady = false;
 let quitInProgress = false;
 const hostWindows = new Set<BrowserWindow>();
 const hostWorkbenchReturnHandlers = new Map<WebContents, () => boolean>();
+const guardedWebSessions = new WeakSet<Session>();
+const webLogoutWatchers = new WeakSet<Session>();
 const api = new MordeAPI(() => credentials, () => app.getVersion());
 const codex = new MordeCodexRuntime(api, {
   load: () => {
@@ -1500,11 +1520,11 @@ function notifyState(): void {
   }
 }
 function clearTimer(timer: NodeJS.Timeout | null): null { if (timer) clearTimeout(timer); return null; }
-function closeHostWindows(): void { for (const window of hostWindows) window.close(); }
+function closeHostWindows(): void { void closeNativeWorkbenchEmbed().catch(() => undefined); for (const window of hostWindows) window.close(); }
 
 type HostProjectUploadContext = { host: Record<string, unknown>; workspaceBinding: Record<string, unknown> };
 
-async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown, workspaceIDInput: unknown): Promise<HostProjectUploadContext> {
+async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown, workspaceIDInput: unknown, requireRunning = false): Promise<HostProjectUploadContext> {
   const hostID = checkedId("host", hostIDInput);
   const workspaceID = checkedId("workspace", workspaceIDInput);
   const [meValue, hostValue] = await Promise.all([api.me(), api.host(hostID)]) as [Record<string, unknown>, Record<string, unknown>];
@@ -1514,6 +1534,7 @@ async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown
     !["running", "stopped"].includes(String(hostValue.state)) || !Array.isArray(workspaces) || workspaces.length !== 1) {
     throw new Error("请选择自己拥有且文件目录已就绪的云端电脑");
   }
+  if (requireRunning && hostValue.state !== "running") throw new Error("默认云端电脑未运行，项目同步已暂停；启动后可重试。");
   const binding = workspaces[0] as Record<string, unknown> | null;
   const workspace = binding?.workspace as Record<string, unknown> | null;
   if (!binding || binding.state !== "active" || !workspace || workspace.id !== workspaceID || workspace.state !== "ready") {
@@ -1522,19 +1543,29 @@ async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown
   return { host: hostValue, workspaceBinding: binding };
 }
 
+async function requireProjectDefaultHost(auth: Credentials, hostID: string, session?: WebSession): Promise<void> {
+  const portalSession = session ?? await api.webSession();
+  const preferences = await api.userPreferences(portalSession);
+  if (credentials !== auth || activeProfile !== profileID(auth)) throw new Error("Authorization changed while checking the default cloud computer");
+  if (!preferences.defaultHostID) throw new Error("请先设置默认云端电脑；项目同步已暂停。");
+  if (preferences.defaultHostID !== hostID) throw new Error("默认云端电脑已更改。请检查原项目绑定；不会自动切换目标。");
+}
+
 async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
   const auth = credentials;
   if (!auth || !activeProfile || activeProfile !== profileID(auth)) throw new Error("请先登录 Morde");
   if (profileError) throw new Error(profileError);
   await api.requireProjectUploadCapability();
   const [meValue, hostsValue, portalSession] = await Promise.all([api.me(), api.hosts(), api.webSession()]) as [Record<string, unknown>, { items?: unknown }, WebSession];
+  const preferences = await api.userPreferences(portalSession);
   if (credentials !== auth || activeProfile !== profileID(auth)) throw new Error("Authorization changed while loading cloud computers");
   if (!meValue || typeof meValue.id !== "string" || !hostsValue || !Array.isArray(hostsValue.items)) throw new Error("云端电脑列表无效");
+  if (!preferences.defaultHostID) return [];
   const targets: ProjectTarget[] = [];
   for (const rawHost of hostsValue.items) {
     const host = rawHost as Record<string, unknown> | null;
     if (!host || typeof host.id !== "string" || !/^h[a-z0-9]{7}$/.test(host.id) || host.owner_id !== meValue.id ||
-      !["running", "stopped"].includes(String(host.state)) || !Array.isArray(host.workspaces) || host.workspaces.length !== 1) continue;
+      host.id !== preferences.defaultHostID || !["running", "stopped"].includes(String(host.state)) || !Array.isArray(host.workspaces) || host.workspaces.length !== 1) continue;
     const binding = host.workspaces[0] as Record<string, unknown> | null;
     const workspace = binding?.workspace as Record<string, unknown> | null;
     if (!binding || binding.state !== "active" || !workspace || typeof workspace.id !== "string" ||
@@ -1545,12 +1576,16 @@ async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
     const projectFolders = folders.filter((folder) => folder.folderKind === "project").map((folder) => ({
       folderID: folder.folderID, projectName: folder.projectName!, relativePath: folder.relativePath, state: folder.state,
     }));
+    const blockedMessages = [
+      ...(host.state === "running" ? [] : ["默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。"]),
+      ...(rootFolder ? ["此电脑仍有旧版整目录同步，不能同时启用项目同步。"] : []),
+    ];
     targets.push({
       hostId: host.id, hostName: typeof host.name === "string" && host.name ? host.name : host.id,
       hostState: host.state as "running" | "stopped",
       workspaceId: workspace.id, workspaceName: typeof workspace.name === "string" && workspace.name ? workspace.name : workspace.id,
       folders: projectFolders,
-      ...(rootFolder ? { blockedMessage: "此电脑仍有旧版整目录同步，不能同时启用项目同步。" } : {}),
+      ...(blockedMessages.length ? { blockedMessage: blockedMessages.join(" ") } : {}),
     });
   }
   return targets;
@@ -1564,8 +1599,9 @@ async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: un
   if (profileError) throw new Error(profileError);
   const hostID = checkedId("host", hostIDInput), workspaceID = checkedId("workspace", workspaceIDInput);
   await api.requireProjectUploadCapability();
-  await checkedOwnedHostWorkspace(auth, hostID, workspaceID);
   const portalSession = await api.webSession();
+  await requireProjectDefaultHost(auth, hostID, portalSession);
+  await checkedOwnedHostWorkspace(auth, hostID, workspaceID, true);
   const folders = await api.hostProjectFolders(hostID, portalSession);
   if (folders.some((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked")) {
     throw new Error("此电脑仍有旧版整目录同步，暂不能启用项目同步");
@@ -1599,9 +1635,10 @@ async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: un
 }
 
 async function ensureProjectFolder(auth: Credentials, mapping: ProjectMapping, projectName: string): Promise<ProjectSyncFolder> {
-  const { host } = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
-  if (credentials !== auth) throw new Error("Authorization changed before project folder registration");
   const session = await api.webSession();
+  await requireProjectDefaultHost(auth, mapping.hostId, session);
+  const { host } = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId, true);
+  if (credentials !== auth) throw new Error("Authorization changed before project folder registration");
   const folders = await api.hostProjectFolders(mapping.hostId, session);
   if (folders.some((folder) => folder.folderKind === "workspace_root" && folder.state !== "revoked")) {
     throw new Error("目标电脑仍登记为旧版整目录同步；项目同步已停止");
@@ -1806,7 +1843,8 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
     return resolveCompletedProjectUpload(auth, mapping, syncCheckpoint);
   }
   await api.requireProjectUploadCapability();
-  const selectedTarget = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId);
+  await requireProjectDefaultHost(auth, mapping.hostId);
+  const selectedTarget = await checkedOwnedHostWorkspace(auth, mapping.hostId, mapping.workspaceId, true);
   const selectedHostName = safeHostDisplayName(selectedTarget.host.name, mapping.hostId);
   const confirmation = await dialog.showMessageBox(mainWindow!, {
     type: "warning", buttons: ["上传项目", "取消"], defaultId: 1, cancelId: 1,
@@ -1817,6 +1855,7 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
   });
   if (confirmation.response !== 0) return { cancelled: true };
   if (credentials !== auth) throw new Error("Authorization changed before project upload");
+  await requireProjectDefaultHost(auth, mapping.hostId);
   await confirmProjectMapping(mapping);
   await assertNoLiveSyncForDirectory(mapping.directory, mapping.workspaceId);
   if (workspaceSyncProfile?.bindings[mapping.workspaceId]?.enabled) throw new Error("先暂停此工作区已有的固定同步绑定");
@@ -1829,7 +1868,8 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
   if (!currentMapping || currentMapping.folderId !== folder.folderID) throw new Error("本机项目目录映射保存状态未确认");
   const checked = await checkedProjectDirectory(currentMapping.directory, currentMapping.workspaceId, currentMapping.selectionID);
   if (checked.directory !== currentMapping.directory || checked.dev !== currentMapping.dev || checked.ino !== currentMapping.ino) throw new Error("项目文件夹身份已变化，请重新选择");
-  await checkedOwnedHostWorkspace(auth, currentMapping.hostId, currentMapping.workspaceId);
+  await requireProjectDefaultHost(auth, currentMapping.hostId);
+  await checkedOwnedHostWorkspace(auth, currentMapping.hostId, currentMapping.workspaceId, true);
   if (syncCheckpoint && syncCheckpoint.folderId !== folder.folderID) throw new Error("当前恢复点属于其他项目目录");
   if (!syncCheckpoint) {
     syncCheckpoint = {
@@ -1927,7 +1967,7 @@ function detachWeb(): void {
     if (!webView.webContents.isDestroyed()) webView.webContents.close();
     webView = null;
   }
-  if (webPartition) void webPartition.clearStorageData({ storages: ["cookies", "localstorage"] });
+  if (webPartition) void webPartition.clearStorageData({ storages: ["cookies"] });
   webPartition = null;
   webRefreshTimer = clearTimer(webRefreshTimer);
 }
@@ -2010,14 +2050,32 @@ async function ensureLocalPortalServer(serviceOrigin: string, hostFrameSource?: 
   const directory = process.env.MORDE_TEST_PORTAL_ASSETS || (app.isPackaged
     ? join(process.resourcesPath, "portal")
     : resolve(__dirname, "../../../../../web/portal/dist"));
-  localPortalServer = await startLocalPortalServer(directory, serviceOrigin, hostFrameSource);
+  const savedPort = readLocalPortalPort();
+  const server = await startLocalPortalServer(directory, serviceOrigin, hostFrameSource, savedPort ?? 0);
+  if (savedPort === null) {
+    try { savePrivate("portal-local-origin.json", JSON.stringify({ version: 1, port: Number(new URL(server.origin).port) })); }
+    catch (error) { await server.close(); throw error; }
+  }
+  localPortalServer = server;
   return localPortalServer;
 }
 
 async function stopLocalPortalServer(): Promise<void> {
   const server = localPortalServer;
   localPortalServer = null;
-  if (server) await server.close().catch(() => undefined);
+  if (server) localPortalServerClose = server.close().catch(() => undefined);
+  await localPortalServerClose;
+  localPortalServerClose = null;
+}
+
+function readLocalPortalPort(): number | null {
+  const raw = readOptional("portal-local-origin.json");
+  if (raw === null) return null;
+  try {
+    const value = JSON.parse(raw) as { version?: unknown; port?: unknown };
+    if (value.version === 1 && Number.isSafeInteger(value.port) && (value.port as number) >= 1024 && (value.port as number) <= 65535) return value.port as number;
+  } catch { /* Preserve damaged local state and fail closed below. */ }
+  throw new Error("Local Portal origin state is invalid; local profile data was preserved");
 }
 
 function isTrustedProjectSyncPage(value: string, origin: string): boolean {
@@ -2180,6 +2238,166 @@ async function hostOrigin(id: string, shared: boolean, serviceOrigin: string): P
   return url.origin;
 }
 
+function closeNativeWorkbenchEmbed(nonce?: string): Promise<void> {
+  const embed = nativeWorkbenchEmbed;
+  if (!embed || nonce && embed.nonce !== nonce) return Promise.resolve();
+  nativeWorkbenchEmbed = null;
+  hostWorkbenchReturnHandlers.delete(embed.view.webContents);
+  if (embed.attached && mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(embed.view);
+  embed.view.setVisible(false);
+  if (!embed.view.webContents.isDestroyed()) embed.view.webContents.close();
+  return embed.partition.clearStorageData();
+}
+
+function trustedNativeWorkbenchPage(value: string, embed: NativeWorkbenchEmbed): boolean {
+  const url = sameOriginURL(value, embed.hostOrigin);
+  if (!url || url.pathname !== "/__ch/wb/" || url.hash) return false;
+  const query = url.searchParams;
+  return query.getAll("embed").length === 1 && query.get("embed") === "1" &&
+    query.getAll("embed_nonce").length === 1 && query.get("embed_nonce") === embed.nonce &&
+    query.getAll("tab").length === 1 && embed.targets.includes(query.get("tab") as HostEmbedTarget) &&
+    [...query.keys()].every((key) => ["embed", "embed_nonce", "tab"].includes(key));
+}
+
+function nativeWorkbenchBridgeEvent(event: { sender: WebContents; senderFrame: { url: string } | null }, auth: Credentials): boolean {
+  const contents = webView?.webContents;
+  const url = contents && !contents.isDestroyed() ? sameOriginURL(contents.getURL(), portalOriginFor(auth)) : null;
+  return Boolean(contents && credentials === auth && event.sender === contents && event.senderFrame === contents.mainFrame && url?.pathname === "/assistant");
+}
+
+async function openNativeWorkbenchEmbed(input: unknown): Promise<{ hostID: string; hostOrigin: string; conversationID: string; nonce: string; targets: HostEmbedTarget[] }> {
+  const auth = credentials;
+  if (!auth || credentialExpired(auth.clientExpiresAt) || !webView || !mainWindow || mainWindow.isDestroyed()) throw new Error("请先登录 Morde，并保持客户端授权有效。");
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid Workbench request");
+  const value = input as Record<string, unknown>;
+  const hostID = checkedId("host", value.hostID);
+  const conversationID = value.conversationID;
+  const initialTarget = value.initialTarget;
+  const targets = value.targets;
+  if (typeof conversationID !== "string" || !/^c[a-z0-9]{7}$/.test(conversationID) ||
+    typeof initialTarget !== "string" || !["browser", "terminal", "workspace", "files", "vscode"].includes(initialTarget) ||
+    !Array.isArray(targets) || !targets.every((target) => typeof target === "string") || typeof value.shared !== "boolean") {
+    throw new Error("Invalid Workbench request");
+  }
+  const selectedTargets = targets as HostEmbedTarget[];
+  await closeNativeWorkbenchEmbed();
+  const host = await hostOrigin(hostID, value.shared, auth.origin);
+  if (credentials !== auth) throw new Error("Morde authorization changed; reconnect the computer");
+  const portalSession = await api.webSession();
+  const ticket = await api.issueHostEmbedTicket(hostID, conversationID, initialTarget, selectedTargets, portalSession);
+  if (credentials !== auth) throw new Error("Morde authorization changed; reconnect the computer");
+  if (!ticket.targets.every((target) => selectedTargets.includes(target)) || !ticket.targets.includes(initialTarget as HostEmbedTarget)) {
+    throw new Error("Host authorization targets changed; refresh and reconnect");
+  }
+  const exchanged = await exchangeHostEmbedTicket(ticket.exchangeURL, host, auth.origin, ticket.ticket, ticket.embedNonce,
+    initialTarget as HostEmbedTarget, ticket.targets);
+  if (credentials !== auth || !webView || !mainWindow || mainWindow.isDestroyed()) throw new Error("Morde authorization changed; reconnect the computer");
+  const partition = session.fromPartition(`morde-workbench-${profileID(auth)}`);
+  await partition.clearStorageData();
+  await partition.cookies.set({ url: host, name: "ch_embed", value: exchanged.cookie.value, path: "/", httpOnly: true,
+    secure: exchanged.cookie.secure, sameSite: "strict", expirationDate: exchanged.cookie.expirationDate });
+  if (credentials !== auth) { void partition.clearStorageData().catch(() => undefined); throw new Error("Morde authorization changed; reconnect the computer"); }
+  const content = new WebContentsView({ webPreferences: {
+    session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
+    preload: join(__dirname, "morde-preload.js"), additionalArguments: preloadArguments("host-workbench"),
+  } });
+  content.setBorderRadius(12);
+  const embed: NativeWorkbenchEmbed = { auth, hostID, hostOrigin: host, conversationID, nonce: ticket.embedNonce,
+    targets: ticket.targets, initialTarget: initialTarget as HostEmbedTarget, parent: webView.webContents, view: content,
+    partition, attached: true, initialized: false, visible: false };
+  nativeWorkbenchEmbed = embed;
+  installDownloadAndClipboard(partition, auth.origin);
+  mainWindow.contentView.addChildView(content);
+  content.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+  content.setVisible(false);
+  hostWorkbenchReturnHandlers.set(content.webContents, () => {
+    if (nativeWorkbenchEmbed !== embed || credentials !== auth || !trustedNativeWorkbenchPage(content.webContents.getURL(), embed)) return false;
+    void closeNativeWorkbenchEmbed(embed.nonce).catch(() => undefined);
+    return true;
+  });
+  content.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  content.webContents.on("will-navigate", (event, url) => { if (!trustedNativeWorkbenchPage(url, embed)) event.preventDefault(); });
+  content.webContents.on("will-redirect", (event, url) => { if (!trustedNativeWorkbenchPage(url, embed)) event.preventDefault(); });
+  content.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== -3 && nativeWorkbenchEmbed === embed) embed.parent.send("morde:portal-workbench-message", { type: "error", nonce: embed.nonce, error: "工作台页面加载失败，请重试。" });
+  });
+  content.webContents.on("render-process-gone", () => {
+    if (nativeWorkbenchEmbed === embed) embed.parent.send("morde:portal-workbench-message", { type: "error", nonce: embed.nonce, error: "工作台进程已停止，请重新连接。" });
+  });
+  void content.webContents.loadURL(exchanged.url, documentLoadOptions).catch(() => {
+    if (nativeWorkbenchEmbed === embed) embed.parent.send("morde:portal-workbench-message", { type: "error", nonce: embed.nonce, error: "无法打开工作台，请重试。" });
+  });
+  return { hostID, hostOrigin: host, conversationID, nonce: embed.nonce, targets: embed.targets };
+}
+
+function setNativeWorkbenchBounds(nonce: unknown, value: unknown): { updated: boolean } {
+  const embed = nativeWorkbenchEmbed;
+  if (typeof nonce !== "string" || !embed || nonce !== embed.nonce || credentials !== embed.auth || !mainWindow || mainWindow.isDestroyed() ||
+    !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Host Workbench bounds request");
+  const bounds = value as Record<string, unknown>;
+  if (![bounds.x, bounds.y, bounds.width, bounds.height].every((item) => typeof item === "number" && Number.isFinite(item)) ||
+    (bounds.x as number) < 0 || (bounds.y as number) < 0 || (bounds.width as number) < 0 || (bounds.height as number) < 0) {
+    throw new Error("Invalid Host Workbench bounds request");
+  }
+  const [width = 0, height = 0] = mainWindow.getContentSize();
+  const rect = { x: Math.floor(bounds.x as number), y: Math.floor(bounds.y as number),
+    width: Math.ceil(bounds.width as number), height: Math.ceil(bounds.height as number) };
+  if (rect.x + rect.width > width || rect.y + rect.height > height) throw new Error("Host Workbench bounds exceed the Morde window");
+  embed.view.setBounds(rect);
+  embed.visible = rect.width > 0 && rect.height > 0;
+  embed.view.setVisible(embed.visible);
+  return { updated: true };
+}
+
+function sendNativeWorkbenchCommand(nonce: unknown, value: unknown): { sent: boolean } {
+  const embed = nativeWorkbenchEmbed;
+  if (typeof nonce !== "string" || !embed || nonce !== embed.nonce || credentials !== embed.auth ||
+    !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Host Workbench command");
+  const message = value as Record<string, unknown>;
+  if (message.type === "init" && message.conversation_id === embed.conversationID && typeof message.visible === "boolean") {
+    embed.initialized = true;
+    embed.visible = message.visible;
+  } else if (message.type === "visibility" && embed.initialized && typeof message.visible === "boolean") {
+    embed.visible = message.visible;
+  } else throw new Error("Invalid Host Workbench command");
+  if (embed.view.webContents.isDestroyed() || !trustedNativeWorkbenchPage(embed.view.webContents.getURL(), embed)) return { sent: false };
+  embed.view.webContents.send("morde:host-workbench-message", {
+    channel: "morde.workbench.embed", version: 1, nonce: embed.nonce, type: message.type,
+    conversation_id: embed.conversationID, visible: embed.visible,
+  });
+  return { sent: true };
+}
+
+function notifyNativeWorkbenchReady(event: { sender: WebContents; senderFrame: { url: string } | null }, nonce: unknown): { ready: boolean } {
+  const embed = nativeWorkbenchEmbed;
+  if (typeof nonce !== "string" || !embed || event.sender !== embed.view.webContents || event.senderFrame !== event.sender.mainFrame ||
+    credentials !== embed.auth || !trustedNativeWorkbenchPage(event.sender.getURL(), embed)) throw new Error("Invalid Host Workbench sender");
+  if (embed.initialized) event.sender.send("morde:host-workbench-message", {
+    channel: "morde.workbench.embed", version: 1, nonce: embed.nonce, type: "init",
+    conversation_id: embed.conversationID, visible: embed.visible,
+  });
+  embed.parent.send("morde:portal-workbench-message", { type: "ready", nonce: embed.nonce });
+  return { ready: true };
+}
+
+function notifyNativeWorkbenchState(event: { sender: WebContents; senderFrame: { url: string } | null }, value: unknown): { accepted: boolean } {
+  const embed = nativeWorkbenchEmbed;
+  if (!embed || event.sender !== embed.view.webContents || event.senderFrame !== event.sender.mainFrame || credentials !== embed.auth ||
+    !trustedNativeWorkbenchPage(event.sender.getURL(), embed) || !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Host Workbench sender");
+  const message = value as Record<string, unknown>;
+  if (message.nonce !== embed.nonce || message.type !== "state" || message.conversation_id !== embed.conversationID || message.host_id !== embed.hostID ||
+    typeof message.workbench_ready !== "boolean" || !["connecting", "connected", "disconnected", "failed"].includes(String(message.remote_desktop)) ||
+    !["ai", "user", "unknown"].includes(String(message.control_state)) || typeof message.control_lease_active !== "boolean" ||
+    typeof message.control_lease_held_by_me !== "boolean") throw new Error("Invalid Host Workbench state");
+  embed.parent.send("morde:portal-workbench-message", {
+    type: "state", nonce: embed.nonce, conversation_id: embed.conversationID, host_id: embed.hostID,
+    workbench_ready: message.workbench_ready, remote_desktop: message.remote_desktop,
+    control_state: message.control_state, control_lease_active: message.control_lease_active,
+    control_lease_held_by_me: message.control_lease_held_by_me,
+  });
+  return { accepted: true };
+}
+
 function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string | null }, auth: Credentials, portalOrigin: string, isRecoveryPage: (value: string) => boolean): void {
   hostWindows.add(win);
   const contents = win.webContents;
@@ -2234,14 +2452,32 @@ function guardHostWindow(win: BrowserWindow, entry: { id: string; target: string
 }
 
 function installDownloadAndClipboard(partition: Session, portalOrigin: string): void {
+  if (guardedWebSessions.has(partition)) return;
+  guardedWebSessions.add(partition);
   partition.on("will-download", (_event, item, contents) => {
     const source = contents.getURL();
-    if (!sameOriginURL(source, portalOrigin) && ![...hostWindows].some((win) => win.webContents === contents)) { item.cancel(); return; }
+    if (!sameOriginURL(source, portalOrigin) && ![...hostWindows].some((win) => win.webContents === contents) && nativeWorkbenchEmbed?.view.webContents !== contents) { item.cancel(); return; }
     item.setSaveDialogOptions({ title: "保存 Morde 文件" });
   });
   partition.setPermissionRequestHandler((contents, permission, callback) => {
-    const trusted = Boolean(sameOriginURL(contents.getURL(), portalOrigin)) || [...hostWindows].some((win) => win.webContents === contents);
+    const trusted = Boolean(sameOriginURL(contents.getURL(), portalOrigin)) || [...hostWindows].some((win) => win.webContents === contents) || nativeWorkbenchEmbed?.view.webContents === contents;
     callback(trusted && permission === "clipboard-sanitized-write");
+  });
+}
+
+function installNativeEditContextMenu(contents: WebContents, owner: BrowserWindow): void {
+  contents.on("context-menu", (_event, params) => {
+    if (!params.isEditable && !params.selectionText) return;
+    const flags = params.editFlags;
+    Menu.buildFromTemplate([
+      { role: "undo", enabled: flags.canUndo },
+      { role: "redo", enabled: flags.canRedo },
+      { type: "separator" },
+      { role: "cut", enabled: flags.canCut },
+      { role: "copy", enabled: flags.canCopy },
+      { role: "paste", enabled: flags.canPaste },
+      { role: "selectAll", enabled: flags.canSelectAll },
+    ]).popup({ window: owner });
   });
 }
 
@@ -2251,6 +2487,7 @@ function positionWeb(): void {
   webView.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height });
 }
 function showView(next: "web" | "offline"): void {
+  if (next === "offline") void closeNativeWorkbenchEmbed().catch(() => undefined);
   view = next;
   if (mainWindow && webView) {
     if (next === "web") {
@@ -2291,10 +2528,8 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
   const auth = credentials;
   if (!auth) throw new Error("Log in to Morde first");
   if (mainWindow !== owner || owner.isDestroyed()) return;
-  let newPartition = false;
   if (!webPartition) {
-    webPartition = session.fromPartition(`morde-user-${randomUUID()}`);
-    newPartition = true;
+    webPartition = session.fromPartition(`persist:morde-user-${profileID(auth)}`);
   }
   const partition = webPartition;
   if (!partition) return;
@@ -2303,17 +2538,19 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
   const appOrigin = portalOriginFor(auth);
   if (!appOrigin) throw new Error("Local Portal is unavailable");
   const assistantURL = `${appOrigin}/assistant`;
-  if (newPartition) {
-    installDownloadAndClipboard(partition, appOrigin);
+  installDownloadAndClipboard(partition, appOrigin);
+  if (!webLogoutWatchers.has(partition)) {
     partition.webRequest.onCompleted({ urls: [`${appOrigin}/api/auth/logout`] }, (details) => {
       if (credentials === auth && details.statusCode === 204 && details.method === "POST") clearAuthorization();
     });
+    webLogoutWatchers.add(partition);
   }
   if (!webView) {
     const content = new WebContentsView({ webPreferences: {
       session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
       preload: join(__dirname, "morde-preload.js"), additionalArguments: preloadArguments("portal"),
     } });
+    installNativeEditContextMenu(content.webContents, owner);
     webView = content;
     const registerDocumentRecovery = installDocumentErrorRecovery(partition);
     const isRecoveryPage = registerDocumentRecovery(content.webContents, assistantURL, "返回助手");
@@ -2612,6 +2849,16 @@ function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promis
   });
 }
 
+function workbenchPortalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown): void {
+  ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+    const auth = credentials;
+    if (!auth || !nativeWorkbenchBridgeEvent(event, auth)) throw new Error("Invalid Morde Assistant window");
+    if (logoutInProgress) throw new Error("Sign-out is in progress");
+    if (credentialExpired(auth.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
+    try { return await fn(...args); } catch (error) { return sendError(error); }
+  });
+}
+
 function register(): void {
   ipcMain.handle("morde:return-to-portal-hosts", async (event) => {
     const returnToPortalHosts = hostWorkbenchReturnHandlers.get(event.sender);
@@ -2621,6 +2868,16 @@ function register(): void {
     if (!returnToPortalHosts()) throw new Error("Host Workbench is not on a trusted page or its authorization changed");
     return { returned: true };
   });
+  workbenchPortalBridgeHandler("morde:portal-workbench-open", (input) => openNativeWorkbenchEmbed(input));
+  workbenchPortalBridgeHandler("morde:portal-workbench-bounds", (nonce, bounds) => setNativeWorkbenchBounds(nonce, bounds));
+  workbenchPortalBridgeHandler("morde:portal-workbench-command", (nonce, command) => sendNativeWorkbenchCommand(nonce, command));
+  workbenchPortalBridgeHandler("morde:portal-workbench-close", (nonce) => {
+    if (typeof nonce !== "string" || !nativeWorkbenchEmbed || nonce !== nativeWorkbenchEmbed.nonce) return { closed: false };
+    closeNativeWorkbenchEmbed(nonce);
+    return { closed: true };
+  });
+  ipcMain.handle("morde:host-workbench-ready", (event, nonce) => notifyNativeWorkbenchReady(event, nonce));
+  ipcMain.handle("morde:host-workbench-state", (event, state) => notifyNativeWorkbenchState(event, state));
   handler("morde:state", () => publicState());
   handler("morde:open-assistant", async () => { await openAssistant(); return { opened: true }; });
   codexBridgeHandler("morde:codex-state", () => ({ authenticated: Boolean(credentials), codex: credentials ? codex.publicState() : null }));

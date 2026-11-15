@@ -331,19 +331,28 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("npm run build", gates)
         self.assertNotIn("web/mobile run build", package["scripts"]["build"])
 
-    def test_desktop_bundles_user_portal_while_server_keeps_admin_routes(self):
+    def test_desktop_bundles_user_portal_while_legacy_server_routes_are_gated(self):
         repository = ROOT.parents[1]
         desktop = (repository / "clients/desktop/harness/desktop/src/morde-main.ts").read_text()
         desktop_config = (repository / "clients/desktop/harness/desktop/electron-builder.yml").read_text()
         server = (repository / "server/cmd/portal/main.go").read_text()
         static = (repository / "server/internal/api/static.go").read_text()
         config = (ROOT / "portal.yaml").read_text()
+        env_example = (ROOT / ".env.example").read_text()
+        readme = (ROOT / "README.md").read_text()
         self.assertIn('join(process.resourcesPath, "portal")', desktop)
         self.assertIn("from: ../../../../web/portal/dist", desktop_config)
         self.assertIn('if path == "/admin" || strings.HasPrefix(path, "/admin/")', static)
-        self.assertNotIn("servePortal(c)", static)
+        self.assertIn("if path == \"/app\" || strings.HasPrefix(path, \"/app/\")", static)
+        self.assertIn("if h.options.LegacyPCPortalEnabled", static)
+        self.assertIn("h.servePortal(c)", static)
         self.assertIn("PortalFiles: os.DirFS(cfg.PortalWeb.Dir)", server)
+        self.assertIn('legacyPCPortalEnabledEnv = "CH_PORTAL_LEGACY_PC_ENABLED"', server)
+        self.assertIn("parseLegacyPCPortalEnabled(os.LookupEnv(legacyPCPortalEnabledEnv))", server)
         self.assertIn("dir: web/portal/dist", config)
+        self.assertNotIn("legacy_pc_enabled", config)
+        self.assertIn("CH_PORTAL_LEGACY_PC_ENABLED=true", env_example)
+        self.assertIn("旧二进制会忽略未识别的变量", readme)
 
     def test_installer_accepts_only_existing_local_docker_socket(self):
         installer = (ROOT / "install-portal-service.sh").read_text()

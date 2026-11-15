@@ -72,6 +72,49 @@ test('account login sends one password request and receives separate Client, Syn
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('project sync reads the account default computer through its short-lived Portal session', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return json({ default_host_id: 'h1234567' });
+  };
+  try {
+    const session = { credential: 'web-secret', expiresAt: future };
+    const result = await new MordeAPI(() => credentials).userPreferences(session);
+    assert.deepEqual(result, { defaultHostID: 'h1234567' });
+    assert.equal(calls[0].url, 'https://portal.example/api/me/preferences');
+    assert.equal(calls[0].options.headers.cookie, 'ch_portal=web-secret');
+    assert.equal('authorization' in calls[0].options.headers, false);
+    globalThis.fetch = async () => json({ default_host_id: '../other' });
+    await assert.rejects(() => new MordeAPI(() => credentials).userPreferences(session), /Invalid host ID/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Host embed tickets use the short-lived Portal session and reject targets outside the request', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return json({ exchange_url: 'https://h1234567.hosts.example.test/__ch/embed-auth', ticket: 'A'.repeat(43),
+      embed_nonce: 'B'.repeat(32), targets: ['browser', 'terminal'], expires_at: future }, 201);
+  };
+  try {
+    const api = new MordeAPI(() => credentials);
+    const session = { credential: 'web-secret', expiresAt: future };
+    const result = await api.issueHostEmbedTicket('h1234567', 'c1234567', 'browser', ['browser', 'terminal'], session);
+    assert.deepEqual(result, { exchangeURL: 'https://h1234567.hosts.example.test/__ch/embed-auth', ticket: 'A'.repeat(43),
+      embedNonce: 'B'.repeat(32), targets: ['browser', 'terminal'] });
+    assert.equal(calls[0].url, 'https://portal.example/api/hosts/h1234567/embed-tickets');
+    assert.equal(calls[0].options.headers.cookie, 'ch_portal=web-secret');
+    assert.equal(calls[0].options.headers.origin, credentials.origin);
+    assert.equal('authorization' in calls[0].options.headers, false);
+    assert.deepEqual(JSON.parse(calls[0].options.body), { conversation_id: 'c1234567', target: 'browser', targets: ['browser', 'terminal'] });
+    await assert.rejects(() => api.issueHostEmbedTicket('h1234567', 'c1234567', 'browser', ['browser'], session), /Invalid Morde Host embed ticket response/);
+    await assert.rejects(() => api.issueHostEmbedTicket('h1234567', '../other', 'browser', ['browser'], session), /Invalid Morde Host embed request/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('login keeps the full signed int64 attempt generation in the JSON request', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

@@ -1,14 +1,16 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Link, NavLink, Outlet, useLocation, useNavigate, useNavigationType } from 'react-router';
 import { useAuth } from '../app/auth';
-import { errorDetails } from '../app/api';
+import { errorDetails, portalApi } from '../app/api';
 import { ToastNoticeCenter, useToast } from '../app/toast';
 import { ConfirmDialog } from './ConfirmDialog';
 import { MordeIcon, type MordeIconName } from './MordeIcon';
 
 const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
-  { to: '/hosts', label: '云端电脑', icon: 'monitor' },
   { to: '/assistant', label: '对话', icon: 'spark' },
+  { to: '/reviews', label: '审核', icon: 'shield' },
+  { to: '/hosts', label: '云端电脑', icon: 'monitor' },
   { to: '/codex', label: 'Codex 会话', icon: 'spark' },
   { to: '/projects', label: '项目', icon: 'folder' },
   { to: '/personal', label: '个人数据', icon: 'user' },
@@ -21,6 +23,7 @@ const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
   { to: '/apikeys', label: 'API Key', icon: 'key' },
   { to: '/settings', label: '账户', icon: 'user' },
 ];
+const settingsEntry = { to: '/connections', label: '设置与授权', icon: 'settings' as const };
 
 type PageNavigationItem = { label: string; to: string; icon: MordeIconName; query?: [string, string] };
 type PageNavigation = { title: string; items: PageNavigationItem[]; queryDefault?: [string, string] };
@@ -71,6 +74,8 @@ const personalSections: Array<[string, string, MordeIconName]> = [
 ];
 
 const pageNavigationFor = (pathname: string): PageNavigation | null => {
+  if (settingLinks.some(({ to }) => to === pathname)) return { title: '设置与授权', items: settingLinks };
+  if (pathname === '/reviews') return { title: '审核', items: [{ label: '审核事项', icon: 'shield', to: '/reviews' }] };
   if (pathname === '/hosts') return {
     title: '云端电脑',
     queryDefault: ['sync', '0'],
@@ -117,6 +122,11 @@ export function PortalLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const { canGoBack, canGoForward, goBack, goForward } = useContext(RouteHistoryContext);
+  const approvalCount = useQuery({
+    queryKey: ['task-approvals', 'count', user?.id],
+    queryFn: () => portalApi.taskApprovals(),
+    enabled: Boolean(user), staleTime: 15_000, refetchInterval: 30_000,
+  });
   const [contextSidebarCollapsed, setContextSidebarCollapsed] = useState(readContextSidebarCollapsed);
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
   const pageNavigation = pageNavigationFor(location.pathname);
@@ -146,13 +156,22 @@ export function PortalLayout() {
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">
         <span className="morde-nav-heading">工作</span>
-        {primaryLinks.filter(({ to }) => to !== '/projects' || user?.role === 'user').map(({ to, label, icon, end }) => <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
-      </nav>
-      <nav className="morde-navigation" aria-label="设置导航">
-        <span className="morde-nav-heading morde-nav-heading-spaced">设置与授权</span>
-        {settingLinks.map(({ to, label, icon }) => <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
+        {primaryLinks.filter(({ to }) => to !== '/projects' || user?.role === 'user').map(({ to, label, icon, end }) => {
+          const count = approvalCount.data?.pending_count;
+          const accessibleLabel = to !== '/reviews' ? label : approvalCount.isError ? '审核状态暂不可用'
+            : count === undefined ? '审核' : count > 0 ? `审核，有 ${count} 项待处理` : '审核';
+          return <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to}
+            aria-label={accessibleLabel} title={accessibleLabel}>
+            <MordeIcon name={icon} /><span>{label}</span>
+            {to === '/reviews' && count !== undefined && count > 0 && <span className="morde-nav-count" aria-hidden="true">{count > 99 ? '99+' : count}</span>}
+            {to === '/reviews' && approvalCount.isError && <span className="morde-nav-count morde-nav-count-error" aria-hidden="true">!</span>}
+          </NavLink>;
+        })}
       </nav>
       <div className="morde-sidebar-bottom">
+        <nav className="morde-navigation" aria-label="设置导航">
+          <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={settingsEntry.to} aria-label={settingsEntry.label} title={settingsEntry.label}><MordeIcon name={settingsEntry.icon} /><span>{settingsEntry.label}</span></NavLink>
+        </nav>
         <div className="morde-profile">
           <details className="morde-account-menu">
             <summary className="morde-avatar" aria-label="账号菜单" title="账号菜单">{user?.name.slice(0, 1) || 'M'}</summary>

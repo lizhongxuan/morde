@@ -71,16 +71,25 @@ describe('Hosts', () => {
     expect(screen.getByRole('navigation', { name: '云端电脑视图' })).toHaveTextContent('我的电脑共享给我的');
   });
 
-  it('links each Host card and its detail panel to that Host project sync target', async () => {
-    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+  it('links only the configured default Host to the account project sync entry', async () => {
+    const otherHost: Host = { ...ownedHost, id: 'h7654321', name: '备用主机' };
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost, otherHost] });
+    vi.mocked(portalApi.preferences).mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: ownedHost.id, updated_at: null });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openMoreActions(user, ownedHost);
-    expect(screen.getByRole('link', { name: '项目目录与同步' })).toHaveAttribute('href', `/hosts?sync=1&host=${ownedHost.id}`);
-    await user.click(screen.getByRole('button', { name: '详情与管理' }));
-    expect(screen.getByRole('link', { name: '管理本机项目同步' })).toHaveAttribute('href', `/hosts?sync=1&host=${ownedHost.id}`);
+    const defaultCard = document.getElementById(`host-${ownedHost.id}`);
+    if (!defaultCard) throw new Error('Default Host card is not rendered');
+    expect(within(defaultCard).getByRole('link', { name: '项目目录与同步' })).toHaveAttribute('href', '/hosts?sync=1');
+    await user.click(within(defaultCard).getByRole('button', { name: '详情与管理' }));
+    expect(within(defaultCard).getByRole('link', { name: '管理本机项目同步' })).toHaveAttribute('href', '/hosts?sync=1');
+    await openMoreActions(user, otherHost);
+    const otherCard = document.getElementById(`host-${otherHost.id}`);
+    if (!otherCard) throw new Error('Non-default Host card is not rendered');
+    expect(within(otherCard).getByText('本机文件同步固定使用默认电脑')).toBeInTheDocument();
+    expect(within(otherCard).queryByRole('link', { name: '项目目录与同步' })).not.toBeInTheDocument();
   });
 
   it('sets an owned default computer and links to that computer file sync', async () => {
@@ -112,7 +121,7 @@ describe('Hosts', () => {
     await waitFor(() => expect(setDefault).toHaveBeenCalledWith({ host_id: nextHost.id }));
     await waitFor(() => expect(selector).toHaveValue(nextHost.id));
     expect(document.querySelector('.host-default-workspace strong')).toHaveTextContent('~/workspace/（随电脑持久保存）');
-    expect(document.querySelector('.host-default-workspace a')).toHaveAttribute('href', `/hosts?sync=1&host=${nextHost.id}`);
+    expect(document.querySelector('.host-default-workspace a')).toHaveAttribute('href', '/hosts?sync=1');
   });
 
   it('keeps the previous default computer and the page usable when saving a new default fails', async () => {

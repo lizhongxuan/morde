@@ -715,6 +715,30 @@ paths:
               schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
+  /api/me/task-approvals:
+    get:
+      tags: [Tasks]
+      operationId: listMyTaskApprovals
+      summary: List approval snapshots visible to the current user
+      description: Requires current task-control authorization to see unexpired pending approvals and task-read authorization to see handled or expired snapshots, plus current project membership. Pending approvals are actionable only while unexpired; handled approvals remain available as read-only snapshots. pending_count counts the full set of unexpired approvals the caller can handle, independent of pagination. A conversation_id filter returns only that conversation's records and count. Request hashes, tool call IDs, credentials and private runtime details are never returned.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: conversation_id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/ConversationId' }
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Authorized approval snapshots ordered by request creation time
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskApprovalPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
   /api/me/invite-code:
     get:
       tags: [Portal]
@@ -4012,10 +4036,15 @@ paths:
       - { $ref: '#/components/parameters/ProjectConversationId' }
     get:
       tags: [Projects]
-      operationId: listProjectConversationActiveTasks
-      summary: List visible active tasks in a shared conversation
+      operationId: listProjectConversationTasks
+      summary: List visible tasks in a shared conversation
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - name: view
+          in: query
+          required: false
+          description: Task status view. Defaults to active; panel combines active and recent tasks with running tasks first, then update time descending and task ID descending.
+          schema: { type: string, enum: [active, recent, panel], default: active }
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
       responses:
@@ -5154,8 +5183,8 @@ paths:
         - name: view
           in: query
           required: false
-          description: Task status view. Defaults to active.
-          schema: { type: string, enum: [active, recent], default: active }
+          description: Task status view. Defaults to active; panel combines active and recent tasks with running tasks first, then update time descending and task ID descending.
+          schema: { type: string, enum: [active, recent, panel], default: active }
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
       responses:
@@ -12711,6 +12740,47 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/TaskSummary' } }
         next_cursor: { type: [string, 'null'] }
+    TaskApprovalPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, pending_count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/TaskApprovalItem' } }
+        next_cursor: { type: [string, 'null'] }
+        pending_count: { type: integer, format: int64, minimum: 0, description: Full current-account count of unexpired pending approvals the caller can handle in this query scope. }
+    TaskApprovalItem:
+      type: object
+      additionalProperties: false
+      required: [task_id, conversation_id, project_id, host_id, task_status, task_event_sequence, task_updated_at, approval]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        project_id: { type: [string, 'null'], pattern: '^j[a-z0-9]{7}$' }
+        host_id: { type: [string, 'null'], pattern: '^h[a-z0-9]{7}$' }
+        task_status: { $ref: '#/components/schemas/TaskStatus' }
+        task_event_sequence: { type: integer, format: int64, minimum: 0 }
+        task_updated_at: { type: string, format: date-time }
+        approval: { $ref: '#/components/schemas/TaskApprovalSnapshot' }
+    TaskApprovalSnapshot:
+      type: object
+      additionalProperties: false
+      description: Authorized request context retained after approval or rejection so a conversation timeline can restore the read-only card. Expired pending requests are returned with status expired and cannot be answered.
+      required: [id, version, status, decision, kind, title, object, content, impact, disclosures, expires_at, responded_at, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/ClarificationId' }
+        version: { type: integer, minimum: 1 }
+        status: { type: string, enum: [pending, approved, rejected, cancelled, expired] }
+        decision: { type: string, enum: ['', approve, reject] }
+        kind: { const: approval }
+        title: { type: string, maxLength: 512 }
+        object: { type: string, maxLength: 512 }
+        content: { type: string, maxLength: 512 }
+        impact: { type: string, maxLength: 512 }
+        disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }
+        expires_at: { type: [string, 'null'], format: date-time }
+        responded_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        media_preview_operation_id: { $ref: '#/components/schemas/OperationId' }
     ConversationActiveTask:
       allOf:
         - { $ref: '#/components/schemas/TaskSummary' }

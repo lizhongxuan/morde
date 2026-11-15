@@ -37,6 +37,7 @@ const projectTarget = {
   hostId: host.id, hostName: host.name, hostState: 'running' as const,
   workspaceId: workspace.id, workspaceName: workspace.name, folders: [],
 };
+const defaultProjectHost = { ...host, workspaces: [binding] };
 
 function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace'][], initialHosts: components['schemas']['Host'][] = [], initialEntry = '/workspaces', projectSyncOnly = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, ...(initialWorkspaces ? { staleTime: Infinity } : {}) }, mutations: { retry: false } } });
@@ -54,10 +55,16 @@ function setProjectBridge(value: unknown) {
   } });
 }
 
+function useDefaultProjectHost(value = defaultProjectHost) {
+  vi.mocked(portalApi.hosts).mockResolvedValue({ items: [value] });
+  vi.mocked(portalApi.preferences).mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: value.id, updated_at: null });
+}
+
 describe('Workspaces', () => {
   beforeEach(() => {
     vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
   });
   afterEach(() => {
     cleanup();
@@ -89,18 +96,29 @@ describe('Workspaces', () => {
   });
 
   it('does not fall back from an unavailable linked Host without explicit selection', async () => {
-    const linkedHost = { ...host, workspaces: [binding] };
-    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [linkedHost] });
+    const linkedHost = defaultProjectHost;
+    useDefaultProjectHost(linkedHost);
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
-    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null,
-      default_host_id: linkedHost.id, updated_at: null });
     setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn() });
 
     renderWorkspaces(undefined, [], '/hosts?sync=1&host=h7654321', true);
 
-    expect(await screen.findByText(/无法确认链接指定的云端电脑文件访问权限/)).toBeInTheDocument();
+    expect(await screen.findByText(/此链接指定的电脑已不是当前默认电脑/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
     expect(portalApi.workspaces).not.toHaveBeenCalled();
+  });
+
+  it('does not request targets or open a local picker until a default computer is configured', async () => {
+    const projectUploadTargets = vi.fn().mockResolvedValue([projectTarget]);
+    const selectProjectDirectory = vi.fn();
+    setProjectBridge({ projectUploadTargets, selectProjectDirectory });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    renderWorkspaces();
+
+    expect(await screen.findByText(/尚未设置默认云端电脑/)).toBeInTheDocument();
+    expect(projectUploadTargets).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
   });
 
   it('fails closed when the project upload gate is not advertised and does not read target metadata', async () => {
@@ -138,11 +156,11 @@ describe('Workspaces', () => {
       hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } });
     setProjectBridge({ projectUploadTargets, selectProjectDirectory, uploadProject });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
-    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
+    useDefaultProjectHost();
     const user = userEvent.setup();
     renderWorkspaces();
 
-    expect(await screen.findByText(host.name)).toBeInTheDocument();
+    expect(await screen.findByRole('group', { name: '同步目标电脑' })).toHaveTextContent(host.name);
     expect(projectUploadTargets).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole('button', { name: '选择本机目录' }));
 
@@ -168,7 +186,7 @@ describe('Workspaces', () => {
       uploadProject: vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
         hostApplication: { status: 'applied', impacts: [] } }) });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
-    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
+    useDefaultProjectHost();
     const user = userEvent.setup();
     renderWorkspaces();
     await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
@@ -185,7 +203,7 @@ describe('Workspaces', () => {
       uploadProject: vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed',
         hostApplication: { status: 'conflict', impacts: [{ path: 'notes/a.txt', state: 'conflict' }, { path: '../outside', state: 'conflict' }] } }) });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
-    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: null, updated_at: null });
+    useDefaultProjectHost();
     const user = userEvent.setup();
     renderWorkspaces();
     await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
@@ -227,48 +245,46 @@ describe('Workspaces', () => {
     expect(await screen.findByText('同步已停止，恢复点已保留。')).toBeInTheDocument();
   });
 
-  it('preselects the configured default computer and its bound Workspace', async () => {
+  it('shows only the configured default computer and never offers a target selector', async () => {
     const alternateTarget = { ...projectTarget, hostId: 'h7654321', hostName: '备用电脑', workspaceId: 'w7654321', workspaceName: '备用工作区' };
     const projectUploadTargets = vi.fn().mockResolvedValue([alternateTarget, projectTarget]);
-    setProjectBridge({ projectUploadTargets, selectProjectDirectory: vi.fn() });
+    const selectProjectDirectory = vi.fn().mockResolvedValue({
+      selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo',
+    });
+    setProjectBridge({ projectUploadTargets, selectProjectDirectory });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
-    const configuredHost = { ...host, workspaces: [binding] };
-    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [configuredHost] });
-    vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null,
-      default_host_id: configuredHost.id, updated_at: null });
+    const configuredHost = defaultProjectHost;
+    useDefaultProjectHost(configuredHost);
     const user = userEvent.setup();
     renderWorkspaces([], [configuredHost]);
 
-    const targetButtons = await screen.findAllByRole('button', { name: '使用此目标' });
-    expect(targetButtons).toHaveLength(1);
-    expect(targetButtons[0]).toHaveAttribute('aria-pressed', 'false');
-    await user.click(screen.getByRole('button', { name: '下一页' }));
-    const defaultTargetButton = await screen.findByRole('button', { name: '使用此目标' });
-    expect(defaultTargetButton).toHaveAttribute('aria-pressed', 'true');
-    expect(defaultTargetButton.closest('article')).toHaveTextContent('开发电脑');
-    expect(defaultTargetButton.closest('article')).toHaveTextContent('默认');
+    const target = await screen.findByRole('group', { name: '同步目标电脑' });
+    expect(target).toHaveTextContent('开发电脑');
+    expect(target).not.toHaveTextContent('备用电脑');
+    expect(screen.queryByRole('button', { name: '使用此目标' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '选择本机目录' }));
+    expect(selectProjectDirectory).toHaveBeenCalledWith(host.id, workspace.id);
   });
 
-  it('explains when the configured default computer is unavailable and does not silently select another target', async () => {
+  it('explains when the configured default computer is unavailable and never offers another target', async () => {
     const alternateTarget = { ...projectTarget, hostId: 'h7654321', hostName: '备用电脑', workspaceId: 'w7654321', workspaceName: '备用工作区' };
     const alternateBinding = { ...binding, workspace: { ...binding.workspace, id: alternateTarget.workspaceId, name: alternateTarget.workspaceName } };
     const alternateHost = { ...host, id: alternateTarget.hostId, name: alternateTarget.hostName, workspaces: [alternateBinding] };
-    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([alternateTarget]), selectProjectDirectory: vi.fn() });
+    const selectProjectDirectory = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([alternateTarget]), selectProjectDirectory });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
     const configuredHost = { ...host, workspaces: [binding] };
-    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [configuredHost] });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [alternateHost] });
     vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null,
       default_host_id: configuredHost.id, updated_at: null });
-    const user = userEvent.setup();
     renderWorkspaces([], [configuredHost, alternateHost]);
 
-    expect(await screen.findByText(/设置中的默认电脑当前不可用于目录选择/)).toBeInTheDocument();
-    const alternateTargetButton = screen.getByRole('button', { name: '使用此目标' });
-    expect(alternateTargetButton).toHaveAttribute('aria-pressed', 'false');
+    expect(await screen.findByText(/默认云端电脑当前不可用于项目同步/)).toBeInTheDocument();
+    expect(screen.queryByText('备用电脑')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '使用此目标' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
-
-    await user.click(alternateTargetButton);
-    expect(screen.getByRole('button', { name: '选择本机目录' })).toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
   });
 
   it('routes new cloud-file creation through cloud-computer creation', async () => {

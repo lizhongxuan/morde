@@ -1034,6 +1034,37 @@ func TestHealthMCPAndPortalStaticRoutes(t *testing.T) {
 	}
 }
 
+func TestLegacyPCPortalRoutesCanRemainEnabledDuringClientMigration(t *testing.T) {
+	services := newServices()
+	options := validOptions()
+	options.LegacyPCPortalEnabled = true
+	router, err := New(services.deps(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/", "/assistant", "/hosts/new", "/register", "/download"} {
+		response := requestHTML(router, path)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "<title>portal</title>") {
+			t.Errorf("legacy PC route %s = %d %s", path, response.Code, response.Body)
+		}
+	}
+	asset := request(router, http.MethodGet, "/assets/app.js", "", "", "")
+	if asset.Code != http.StatusOK || !strings.Contains(asset.Body.String(), "portal") {
+		t.Errorf("legacy PC asset = %d %s", asset.Code, asset.Body)
+	}
+	if mobile := requestHTML(router, "/app/hosts/"+testHostID); mobile.Code != http.StatusNotFound {
+		t.Errorf("mobile Web route remained enabled: %d %s", mobile.Code, mobile.Body)
+	}
+	admin := requestHTML(router, "/admin/workspaces/"+testWorkspaceID)
+	if admin.Code != http.StatusOK || !strings.Contains(admin.Body.String(), "<title>admin</title>") {
+		t.Errorf("admin route during PC migration = %d %s", admin.Code, admin.Body)
+	}
+	unknownAPI := request(router, http.MethodGet, "/api/unknown", "", "Bearer "+apiKeyCredential(), "")
+	if unknownAPI.Code != http.StatusNotFound || strings.Contains(unknownAPI.Body.String(), "<title>portal</title>") {
+		t.Errorf("unknown API fell through to legacy portal: %d %s", unknownAPI.Code, unknownAPI.Body)
+	}
+}
+
 func TestDisabledMCPReturnsNotFoundWithoutAuthentication(t *testing.T) {
 	services := newServices()
 	deps := services.deps()

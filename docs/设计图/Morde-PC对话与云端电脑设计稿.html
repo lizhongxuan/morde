@@ -67,9 +67,10 @@
     .rail { grid-column: 1; grid-row: 2; display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 12px 6px 10px; border-right: 1px solid var(--line); background: #f5f5f3; }
     .brand-mark, .tiny-mark, .message-avatar { background: #fff var(--morde-logo) center / 86% auto no-repeat; border: 1px solid #e1e8f4; box-shadow: 0 3px 10px #3966d514; }
     .brand-mark { display: grid; place-items: center; width: 34px; height: 34px; margin-bottom: 8px; border-radius: 11px; }
-    .rail .icon-button { width: 38px; height: 38px; color: #797d84; }
+    .rail .icon-button { position: relative; width: 38px; height: 38px; color: #797d84; }
     .rail .icon-button.active { color: #242933; background: #e6e7e5; }
     .rail .icon-button:hover { color: #29303a; }
+    .rail-dot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border: 1px solid #f5f5f3; border-radius: 50%; background: #e0a44c; }
     .rail-spacer { flex: 1; }
     .avatar { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 50%; color: #fff; background: #3e70dc; font-size: 11px; font-weight: 700; }
     .sidebar { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--line); background: #fafaf9; }
@@ -104,12 +105,23 @@
     .thread { width: min(100%, 760px); min-height: 100%; margin: 0 auto; padding: 28px 34px 26px; }
     .date-label { margin: 0 0 28px; color: #858a91; text-align: center; font-size: 11px; }
     .message { display: flex; gap: 10px; margin-bottom: 23px; }
-    .message.user { justify-content: flex-end; }
-    .message.user .message-body { max-width: min(82%, 520px); padding: 11px 15px; border-radius: 16px 16px 5px 16px; background: #eef1f7; color: #313944; }
+    .message.user { justify-content: flex-end; margin-bottom: 26px; }
+    .message.user .message-body { position: relative; max-width: min(82%, 520px); padding: 11px 15px 30px; border-radius: 16px 16px 5px 16px; background: #eef1f7; color: #313944; }
     .message.assistant .message-body { max-width: 650px; padding: 2px 0; color: #32363e; }
     .message-body { min-width: 0; font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; white-space: pre-wrap; }
     .message-avatar { display: grid; place-items: center; width: 25px; height: 25px; flex: none; margin-top: 2px; border-radius: 9px; }
     .message-name { display: block; margin-bottom: 5px; color: #747981; font-size: 11px; font-weight: 700; }
+    .message-reaction { position: absolute; left: 7px; bottom: 4px; display: grid; place-items: center; width: 28px; height: 25px; border: 2px solid #fff; border-radius: 14px; background: #f2f3f5; font-size: 14px; line-height: 1; }
+    .thinking-dots { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 9px 12px; border-radius: 15px; background: #f1f2f4; }
+    .thinking-dots span { width: 6px; height: 6px; border-radius: 50%; background: #8b9199; animation: thinking-bounce 1.1s ease-in-out infinite; }
+    .thinking-dots span:nth-child(2) { animation-delay: .15s; }
+    .thinking-dots span:nth-child(3) { animation-delay: .3s; }
+    @keyframes thinking-bounce { 0%, 60%, 100% { opacity: .45; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-4px); } }
+    @media (prefers-reduced-motion: reduce) { .thinking-dots span { animation: none; } }
+    .chat-approval { flex: 1; min-width: 0; max-width: 480px; padding: 14px; border: 1px solid #e1e6f0; border-radius: 13px; background: #fff; box-shadow: 0 4px 16px #2739580d; }
+    .chat-approval h3 { margin: 0; color: #303744; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+    .chat-approval p { margin: 8px 0 0; color: #697587; font-size: 12px; line-height: 1.7; }
+    .chat-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
     .welcome { display: grid; place-content: center; justify-items: center; min-height: 68%; color: #565b65; text-align: center; }
     .welcome .brand-mark { width: 46px; height: 46px; margin: 0 0 16px; font-size: 23px; }
     .welcome h2 { margin: 0 0 7px; font-size: 20px; letter-spacing: -.4px; }
@@ -117,7 +129,7 @@
     .composer-outer { flex: none; padding: 0 24px 21px; }
     .composer { width: min(100%, 760px); margin: 0 auto; padding: 13px 13px 10px; border: 1px solid #dedfe2; border-radius: 17px; background: #fff; box-shadow: 0 4px 20px #1f29370b, 0 1px 3px #1f293708; }
     .composer:focus-within { border-color: #9eb2fb; box-shadow: 0 0 0 3px #dce5ff80; }
-    .composer textarea { display: block; width: 100%; min-height: 52px; max-height: 130px; padding: 2px 3px; resize: vertical; border: 0; outline: 0; background: transparent; color: #30343a; font-size: 14px; line-height: 1.6; }
+    .composer textarea { display: block; width: 100%; min-height: 52px; max-height: 130px; padding: 2px 3px; resize: none; border: 0; outline: 0; background: transparent; color: #30343a; font-size: 14px; line-height: 1.6; }
     .composer textarea::placeholder { color: #858b94; }
     .composer-bottom { display: flex; align-items: center; gap: 6px; min-width: 0; margin-top: 5px; }
     .composer-bottom .icon-button { width: 30px; height: 30px; color: #7e838b; }
@@ -186,26 +198,16 @@
     .sharing-tip p { margin: 5px 0 0; }
     .panel-scroll { min-height: 0; padding: 19px 20px 24px; overflow-y: auto; }
     .task-list, .task-detail { flex: 1; padding: 17px 20px 28px; }
-    .task-list-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 14px; color: #8c929b; font-size: 12px; }
-    .task-list-top .icon-button { width: 30px; height: 30px; color: #858d99; }
-    .task-group + .task-group { margin-top: 24px; }
-    .section-label { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; color: #626b79; font-size: 13px; font-weight: 650; }
-    .section-label span:last-child { color: #a5acb6; font-weight: 500; }
-    details.task-group > summary { cursor: pointer; list-style: none; }
-    details.task-group > summary::-webkit-details-marker { display: none; }
-    details.task-group > summary .icon { width: 14px; height: 14px; transition: transform .15s; }
-    details.task-group[open] > summary .icon { transform: rotate(90deg); }
-    .task-card { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 14px; border: 1px solid #e8ebf0; border-radius: 12px; background: #fff; box-shadow: 0 2px 8px #27395808; text-align: left; }
+    .task-list-top { margin-bottom: 14px; color: #8c929b; font-size: 12px; }
+    .task-card { display: flex; align-items: center; gap: 12px; width: 100%; margin-bottom: 8px; padding: 14px; border: 1px solid #e8ebf0; border-radius: 12px; background: #fff; box-shadow: 0 2px 8px #27395808; text-align: left; }
     .task-card:hover { border-color: #cbd7f5; background: #fbfcff; }
     .task-card-icon { display: grid; place-items: center; flex: none; width: 34px; height: 34px; border-radius: 10px; color: #b0792d; background: #fff5e5; font-size: 16px; font-weight: 700; }
     .task-card-icon.running { color: #4a6dd5; background: #eef3ff; }
     .task-card-icon.done { color: #519475; background: #edf8f2; }
     .task-card-body { flex: 1; min-width: 0; }
-    .task-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-    .task-card strong { min-width: 0; color: #303744; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
-    .task-card-description { display: block; margin: 7px 0 0; color: #737d8b; font-size: 12px; line-height: 1.6; }
-    .task-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; color: #929ba8; font-size: 12px; }
-    .task-card-foot span:last-child { color: #6680c7; }
+    .task-card-top { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .task-card strong { flex: 1 1 80px; min-width: 0; color: #303744; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+    .task-card-link { flex: none; color: #6680c7; font-size: 11px; white-space: nowrap; }
     .tag { flex: none; padding: 4px 7px; border-radius: 6px; color: #a17631; background: #fff4e0; font-size: 12px; white-space: nowrap; }
     .tag.running { color: #4668bb; background: #eef3ff; }
     .tag.done { color: #458265; background: #edf8f2; }
@@ -213,7 +215,6 @@
     .task-detail h3 { margin: 0; font-size: 15px; line-height: 1.5; }
     .task-detail h4 { margin: 24px 0 8px; color: #46505e; font-size: 12px; }
     .task-detail p { color: #737d8b; font-size: 12px; line-height: 1.7; }
-    .detail-box { margin-top: 22px; padding: 15px; border: 1px solid #f2e4c9; border-radius: 10px; background: #fffbf4; }
     .task-work { margin-top: 22px; border-top: 1px solid #eef0f3; color: #596472; font-size: 12px; }
     .task-work summary { padding: 14px 0; cursor: pointer; font-weight: 650; }
     .task-work ol { margin: 0; padding: 0 0 0 18px; color: #7e8996; line-height: 2; }
@@ -326,17 +327,14 @@
       .computer-stage { padding-inline: 16px; }
     }
     @media (max-width: 900px) {
-      .app { grid-template-columns: 50px 0 minmax(0, 1fr) 0; }
+      .app { --panel: min(350px, 44vw); grid-template-columns: 50px 0 minmax(0, 1fr) 0; }
       .app .sidebar, .app .context-panel { display: none; }
-      .app:not(.panel-hidden):not(.mobile-sidebar) { grid-template-columns: 50px 0 0 minmax(0, 1fr); }
-      .app:not(.panel-hidden):not(.mobile-sidebar) .main { display: none; }
+      .app:not(.panel-hidden):not(.mobile-sidebar) { grid-template-columns: 50px 0 minmax(0, 1fr) var(--panel); }
       .app:not(.panel-hidden):not(.mobile-sidebar) .context-panel { display: flex; }
       .app.mobile-sidebar { grid-template-columns: 50px var(--sidebar-size) minmax(0, 1fr) 0; }
       .app.mobile-sidebar .sidebar { display: flex; }
       .app.mobile-sidebar .main { display: flex; }
       .app.mobile-sidebar .context-panel { display: none; }
-      .app:not(.panel-hidden):not(.mobile-sidebar) .panel-chrome { flex: 1; width: auto; }
-      .app:not(.panel-hidden):not(.mobile-sidebar) .topbar-spacer { display: none; }
       .app.mobile-sidebar .panel-chrome { display: none; }
       .app.mobile-sidebar .open-sidebar { display: inline-grid; }
       .panel-expanded { grid-template-columns: 50px 0 0 minmax(0, 1fr) !important; }
@@ -349,8 +347,16 @@
       .main-header { padding-inline: 12px; }
       .thread { padding-inline: 16px; }
       .composer-outer { padding-inline: 10px; }
-      .composer-select { max-width: 91px; }
-      .control-pill { font-size: 11px; }
+      .composer { padding-inline: 9px; }
+      .composer-bottom { flex-wrap: wrap; gap: 2px; }
+      .composer-bottom .icon-button { width: 26px; height: 26px; }
+      .composer-select { min-width: 22px; max-width: 91px; }
+      .send-button { flex-basis: 30px; width: 30px; height: 30px; }
+      .desktop-dock { bottom: 5px; gap: 3px; padding: 4px; }
+      .dock-icon { width: clamp(18px, 5vw, 26px); height: clamp(18px, 5vw, 26px); }
+      .dock-icon .icon { width: 14px; height: 14px; }
+      .control-pill { flex-wrap: wrap; justify-content: center; gap: 4px; padding: 6px; border-radius: 16px; font-size: 11px; white-space: normal; }
+      .control-pill button { min-height: 28px; padding: 4px 8px; font-size: 11px; }
     }
     .app.non-chat-mode { grid-template-columns: 54px var(--page-nav) minmax(0, 1fr) 0 !important; }
     .app.non-chat-mode.page-nav-hidden { --page-nav: 0px; }
@@ -381,8 +387,8 @@
     .page-nav-tabs .icon { width: 21px; height: 21px; padding: 2px; color: #7f858e; }
     .sidebar-scroll { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 8px; }
     .side-chat-list { flex: 1; min-height: 0; }
-    .messages { overflow: hidden; }
-    .thread { height: 100%; min-height: 0; padding-block: 16px; column-gap: 68px; }
+    .thread { padding-block: 16px; }
+    .history-hint { margin: 0 0 16px; color: #858a91; text-align: center; font-size: 11px; }
     .date-label { margin-bottom: 16px; }
     .message { margin-bottom: 16px; }
     .message-body { box-decoration-break: clone; -webkit-box-decoration-break: clone; }
@@ -390,13 +396,9 @@
     .panel-scroll { padding: 14px 16px; }
     .task-list, .task-detail { padding: 12px 16px; }
     .task-list-top { margin-bottom: 8px; }
-    .task-group + .task-group { margin-top: 12px; }
-    .section-label { margin-bottom: 6px; }
     .task-card { gap: 9px; padding: 10px; }
     .task-card-icon { width: 28px; height: 28px; }
-    .task-card-description { margin-top: 3px; }
-    .task-card-foot { margin-top: 5px; }
-    .task-detail-heading, .detail-box, .task-work { margin-top: 12px; }
+    .task-detail-heading, .task-work { margin-top: 12px; }
     .task-detail h4 { margin-top: 14px; }
     .settings-view { overflow: hidden; padding-bottom: 12px; }
     .settings-inner { display: flex; flex-direction: column; height: 100%; min-height: 0; }
@@ -417,7 +419,6 @@
     .settings-form label, .profile-form label { gap: 4px; }
     .settings-form input, .settings-form select, .settings-form textarea, .profile-form input, .profile-form select, .profile-form textarea { min-height: 34px; padding: 7px 9px; }
     .paged-flow { height: 0; flex: 1 1 0; min-height: 0; overflow: hidden; column-count: 1; column-gap: 24px; column-fill: auto; }
-    .thread.paged-flow { height: 100%; column-gap: 68px; }
     .paged-flow .feature-card, .paged-flow .task-card, .paged-flow label, .paged-flow .session { break-inside: avoid-column; }
     .paged-flow .settings-section-head, .paged-flow h1, .paged-flow h2, .paged-flow h3 { break-after: avoid-column; }
     .pagination { display: flex; flex: none; align-items: center; justify-content: center; gap: 8px; min-height: 34px; color: #7d8795; font-size: 11px; }
@@ -425,8 +426,6 @@
     .pagination button { min-height: 26px; padding: 3px 8px; border: 1px solid #e5e9ef; border-radius: 6px; color: #59677a; background: #fff; font-size: 11px; }
     .pagination button:not(:disabled):hover { border-color: #b9c9f6; color: #315ad8; }
     .pagination span { min-width: 42px; text-align: center; white-space: nowrap; }
-    @media (max-width: 1100px) { .thread.paged-flow { column-gap: 48px; } }
-    @media (max-width: 520px) { .thread.paged-flow { column-gap: 32px; } }
   </style>
 </head>
 <body>
@@ -442,10 +441,10 @@
     <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="10" r="4"/><path d="m11 13 7 7m-3-3 2-2m0 4 2-2"/></symbol>
     <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/></symbol>
+    <symbol id="i-review" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="3"/><path d="m8 12 3 3 5-6"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8Z"/><path d="M19.3 13.5a7.5 7.5 0 0 0 0-3l1.4-1.1-1.5-2.6-1.7.6a8 8 0 0 0-2.6-1.5L14.6 4h-3l-.4 1.9a8 8 0 0 0-2.6 1.5l-1.7-.6-1.5 2.6 1.4 1.1a7.5 7.5 0 0 0 0 3l-1.4 1.1 1.5 2.6 1.7-.6a8 8 0 0 0 2.6 1.5l.4 1.9h3l.4-1.9a8 8 0 0 0 2.6-1.5l1.7.6 1.5-2.6Z"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4 4"/></symbol>
-    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2 6M20 4v7h-7"/></symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6M8 12h12"/></symbol>
     <symbol id="i-forward" viewBox="0 0 24 24"><path d="m10 6 6 6-6 6M16 12H4"/></symbol>
@@ -475,7 +474,7 @@
             <button class="panel-tab-close" type="button" data-close-tab="computer" aria-label="关闭云端电脑标签" title="关闭标签">×</button>
           </div>
           <div class="panel-tab-wrap" data-tab-wrap="tasks">
-            <button class="panel-tab" id="tab-tasks" type="button" role="tab" aria-selected="false" aria-controls="panel-tasks" data-panel="tasks"><svg class="icon"><use href="#i-list"/></svg><span class="tab-title">任务动态</span><span class="small-dot" id="pendingDot"></span></button>
+            <button class="panel-tab" id="tab-tasks" type="button" role="tab" aria-selected="false" aria-controls="panel-tasks" data-panel="tasks"><svg class="icon"><use href="#i-list"/></svg><span class="tab-title">任务动态</span><span class="small-dot" id="pendingDot" hidden></span></button>
             <button class="panel-tab-close" type="button" data-close-tab="tasks" aria-label="关闭任务动态标签" title="关闭标签">×</button>
           </div>
           <div class="panel-tab-wrap" data-tab-wrap="files">
@@ -500,7 +499,7 @@
         <button class="icon-button" id="expandPanel" type="button" aria-label="放大会话侧边栏" aria-pressed="false" title="放大"><svg class="icon"><use href="#i-expand"/></svg></button>
         <button class="icon-button" id="closePanel" type="button" aria-label="收起会话侧边栏" title="收起侧边栏"><svg class="icon"><use href="#i-panel-right"/></svg></button>
       </div>
-      <button class="icon-button open-sidebar" id="showPanel" type="button" aria-label="打开会话侧边栏，有 1 项待处理" aria-controls="contextPanel" aria-expanded="false" title="打开侧边栏"><svg class="icon"><use href="#i-panel-right"/></svg><span class="open-sidebar-dot" id="closedPendingDot"></span></button>
+      <button class="icon-button open-sidebar" id="showPanel" type="button" aria-label="打开会话侧边栏" aria-controls="contextPanel" aria-expanded="false" title="打开侧边栏"><svg class="icon"><use href="#i-panel-right"/></svg><span class="open-sidebar-dot" id="closedPendingDot" hidden></span></button>
       <div class="window-controls" aria-hidden="true" title="Windows 原生窗口控制位置示意">
         <span><svg viewBox="0 0 12 12"><path d="M1 6h10"/></svg></span>
         <span><svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9"/></svg></span>
@@ -511,6 +510,7 @@
     <nav class="rail" aria-label="主导航">
       <span class="brand-mark" aria-label="Morde"></span>
       <button class="icon-button active" id="navChat" type="button" aria-label="对话" title="对话"><svg class="icon"><use href="#i-chat"/></svg></button>
+      <button class="icon-button" id="navReview" type="button" aria-label="审核，有 1 项待处理" title="审核"><svg class="icon"><use href="#i-review"/></svg><span class="rail-dot" id="approvalDot" aria-hidden="true"></span></button>
       <button class="icon-button" id="navPersonal" type="button" aria-label="个人数据" title="个人数据"><svg class="icon"><use href="#i-user"/></svg></button>
       <button class="icon-button" id="navGoals" type="button" aria-label="目标与计划" title="目标与计划"><svg class="icon"><use href="#i-target"/></svg></button>
       <div class="rail-spacer"></div>
@@ -543,6 +543,11 @@
         <div class="page-nav-tabs" role="tablist" aria-label="目标与计划分类" aria-orientation="vertical">
           <button class="active" type="button" role="tab" id="tab-goal-targets" aria-controls="goal-targets" aria-selected="true" data-goal-tab="targets"><svg class="icon" aria-hidden="true"><use href="#i-target"/></svg>目标</button>
           <button type="button" role="tab" id="tab-goal-schedules" aria-controls="goal-schedules" aria-selected="false" data-goal-tab="schedules"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg>定时计划</button>
+        </div>
+      </section>
+      <section data-page-menu="reviews" hidden>
+        <div class="page-nav-tabs" role="tablist" aria-label="审核分类" aria-orientation="vertical">
+          <button class="active" type="button" role="tab" id="tab-review-requests" aria-controls="review-requests" aria-selected="true" data-review-tab="requests"><svg class="icon" aria-hidden="true"><use href="#i-review"/></svg>审核事项</button>
         </div>
       </section>
       <div class="platform-preview"><label for="pagePlatform">窗口预览</label><select id="pagePlatform" data-platform-preview aria-label="预览窗口系统"><option value="mac">macOS</option><option value="windows">Windows</option></select></div>
@@ -587,7 +592,15 @@
         <div class="main-heading"><strong id="chatTitle">主会话</strong><span id="chatSubtitle">与 Morde 对话</span></div>
       </header>
       <section class="chat-view" id="chatView" aria-label="对话">
-        <div class="messages" id="messages"><div class="thread" id="thread" aria-live="polite"></div></div>
+        <div class="messages" id="messages" role="region" aria-label="对话消息" tabindex="0"><div class="thread" id="thread" aria-live="polite"></div></div>
+        <template id="chatApprovalTemplate">
+          <article class="chat-approval" aria-label="审核请求：读取工作资料">
+            <h3>确认读取工作资料</h3>
+            <p>读取已授权目录中的工作资料，用于整理工作计划。读取内容会提供给此任务处理。</p>
+            <div class="chat-approval-actions"><button class="primary-button" type="button" data-approval-decision="已允许">允许</button><button class="secondary-button" type="button" data-approval-decision="已拒绝">拒绝</button></div>
+            <p class="chat-approval-result" hidden>审核选择已记录，任务后续状态等待更新。</p>
+          </article>
+        </template>
         <div class="composer-outer">
           <form class="composer" id="composer">
             <span class="attachment-chip" id="attachmentChip" hidden>会议记录.txt <button id="removeAttachment" type="button" aria-label="移除示例附件">×</button></span>
@@ -597,8 +610,6 @@
               <button class="icon-button" id="attachButton" type="button" aria-label="添加示例附件" title="添加附件"><svg class="icon"><use href="#i-clip"/></svg></button>
               <label class="sr-only" for="modelSelect">模型</label>
               <select class="composer-select" id="modelSelect"><option>自动选择模型</option><option>团队通用模型 · 团队</option></select>
-              <label class="sr-only" for="computerSelect">电脑目标</label>
-              <select class="composer-select" id="computerSelect"><option>不指定电脑</option><option>我的云端电脑</option></select>
               <span class="composer-spacer"></span>
               <button class="icon-button" id="voiceButton" type="button" aria-label="语音输入" title="语音输入"><svg class="icon"><use href="#i-mic"/></svg></button>
               <button class="send-button" id="sendButton" type="submit" aria-label="发送消息" disabled><svg class="icon"><use href="#i-send"/></svg></button>
@@ -643,14 +654,14 @@
             </section>
           </div>
           <div id="settings-computers" role="tabpanel" aria-labelledby="tab-settings-computers" data-settings-panel="computers" hidden>
-            <section class="settings-section"><div class="settings-section-head"><div><h3>我的电脑</h3><p>管理电脑、文件和运行状态。</p></div><button class="primary-button" type="button" data-demo-action>＋ 创建电脑</button></div>
-              <article class="feature-card compact-item"><div class="feature-card-header"><span class="feature-icon"><svg class="icon"><use href="#i-monitor"/></svg></span><div class="feature-card-main"><div class="feature-card-title"><h3>我的云端电脑</h3><span class="feature-badge good">● 运行中</span></div><p>示例电脑 · Morde 拥有控制权</p><div class="computer-facts"><span>规格 <strong>1 核 / 2 GiB</strong></span><span>到期 <strong>11 月 12 日 15:15</strong></span><span>文件 <strong>Default Workspace</strong></span></div></div></div>
+            <section class="settings-section"><div class="settings-section-head"><div><h3>我的电脑</h3><p>Morde 需要时会在授权范围内自动使用默认电脑；普通文字对话无需启动电脑。</p></div><button class="primary-button" type="button" data-demo-action>＋ 创建电脑</button></div>
+              <article class="feature-card compact-item"><div class="feature-card-header"><span class="feature-icon"><svg class="icon"><use href="#i-monitor"/></svg></span><div class="feature-card-main"><div class="feature-card-title"><h3>我的云端电脑</h3><span class="feature-badge">默认电脑</span><span class="feature-badge good">● 运行中</span></div><p>示例电脑 · Morde 拥有控制权</p><div class="computer-facts"><span>规格 <strong>1 核 / 2 GiB</strong></span><span>到期 <strong>11 月 12 日 15:15</strong></span></div></div></div>
                 <div class="feature-actions"><button class="primary-button" type="button" id="previewOpenComputer">打开电脑</button><button class="quiet-button" type="button" data-demo-action>文件与版本</button><button class="quiet-button" type="button" data-demo-action>续期</button></div>
                 <details class="more-menu"><summary class="quiet-button">更多管理 ▾</summary><div class="more-menu-items"><button class="quiet-button" type="button" data-demo-action>共享成员</button><button class="quiet-button" type="button" data-demo-action>释放运行资源</button><button class="quiet-button" type="button" disabled title="电脑运行中暂不能复制">复制电脑</button><button class="quiet-button danger" type="button" data-demo-action>删除电脑</button></div><p class="settings-note">资源释放、复制和删除会在实际操作前说明影响及确认。</p></details>
               </article>
             </section>
             <section class="settings-section"><div class="settings-section-head"><div><h3>共享给我的电脑</h3><p>按授予的权限查看桌面、终端或文件。</p></div></div><div class="feature-card feature-empty"><svg class="icon"><use href="#i-user"/></svg><strong>暂无共享电脑</strong><p>其他成员共享后会显示在这里。</p></div></section>
-            <section class="settings-section"><div class="settings-section-head"><div><h3>文件夹同步</h3><p>选择本机文件夹和目标电脑后，由你手动发起单向同步。</p></div></div><div class="feature-card"><div class="feature-card-title"><h3>尚未选择文件夹</h3><span class="feature-badge">待设置</span></div><p>本机更改后需再次点击同步；发生冲突时会提示你处理。</p><div class="feature-actions"><button class="quiet-button" type="button" data-demo-action>选择本机文件夹</button><button class="quiet-button" type="button" data-demo-action>选择目标电脑</button><button class="quiet-button" type="button" disabled>开始同步</button></div></div></section>
+            <section class="settings-section"><div class="settings-section-head"><div><h3>文件夹同步</h3><p>选择本机文件夹后，手动单向同步到默认云端电脑。</p></div></div><div class="feature-card"><div class="feature-card-title"><h3>尚未选择文件夹</h3><span class="feature-badge">待设置</span></div><p>本机更改后需再次点击同步；发生冲突时会提示你处理。</p><div class="feature-actions"><button class="quiet-button" type="button" data-demo-action>选择本机文件夹</button><button class="quiet-button" type="button" disabled>开始同步</button></div></div></section>
           </div>
           <div id="settings-clients" role="tabpanel" aria-labelledby="tab-settings-clients" data-settings-panel="clients" hidden><section class="settings-section"><div class="settings-section-head"><div><h3>客户端与设备</h3><p>查看已登录的设备与授权状态。</p></div><button class="quiet-button" type="button" data-demo-action>下载客户端</button></div><article class="feature-card"><div class="feature-card-header"><span class="feature-icon"><svg class="icon"><use href="#i-monitor"/></svg></span><div class="feature-card-main"><div class="feature-card-title"><h3>Morde Desktop</h3><span class="feature-badge good">当前设备</span><span class="feature-badge">有效</span></div><p>示例设备 · 授权有效期与状态在这里显示</p></div></div><div class="feature-actions"><button class="quiet-button" type="button" data-demo-action>设备详情</button><button class="quiet-button danger" type="button" data-demo-action>撤销授权</button></div></article><p class="settings-note">撤销设备会终止该设备的电脑和文件同步授权，不删除本机文件。</p></section></div>
           <div id="settings-keys" role="tabpanel" aria-labelledby="tab-settings-keys" data-settings-panel="keys" hidden><section class="settings-section"><div class="settings-section-head"><div><h3>API Key</h3><p>管理供已授权工具使用的密钥。</p></div><button class="primary-button" type="button" data-demo-action>＋ 创建 API Key</button></div><div class="feature-card"><div class="feature-card-title"><h3>MCP 服务地址</h3><span class="feature-badge">当前实例</span></div><p>连接工具时使用当前实例提供的地址。</p><div class="feature-actions"><button class="quiet-button" type="button" data-demo-action>复制地址</button></div></div><div class="feature-card feature-empty"><svg class="icon"><use href="#i-list"/></svg><strong>暂无 API Key</strong><p>创建时可设置名称与有效期，密钥只显示一次。</p></div></section></div>
@@ -667,12 +678,24 @@
           <section class="settings-subpanel" id="personal-library" role="tabpanel" aria-labelledby="tab-personal-library" data-personal-panel="library" hidden><div class="settings-section-head"><div><h3>资源库</h3><p>查看个人附件、上传状态和可用空间。</p></div><button class="quiet-button" type="button" data-demo-action>＋ 添加文件</button></div><div class="feature-card feature-empty"><svg class="icon"><use href="#i-folder"/></svg><strong>资源库还是空的</strong><p>添加的文件及上传状态会显示在这里。</p></div></section>
           <section class="settings-subpanel" id="personal-preferences" role="tabpanel" aria-labelledby="tab-personal-preferences" data-personal-panel="preferences" hidden><div class="settings-section-head"><div><h3>偏好</h3><p>设置你希望关注的内容。</p></div></div><form class="feature-card profile-form" data-preview-form><label class="form-wide">动态偏好<textarea rows="4" placeholder="写下你想关注的内容"></textarea></label><div class="form-wide settings-actions"><button class="primary-button" type="submit" aria-label="保存偏好">保存</button></div></form></section>
         </div>
+        <div class="settings-inner" data-other-panel="reviews" hidden>
+          <section class="settings-subpanel" id="review-requests" role="tabpanel" aria-labelledby="tab-review-requests">
+            <div class="settings-section-head"><div><h3>审核事项</h3><p id="approvalSummary">1 项待审核</p></div></div>
+            <article class="feature-card">
+              <div class="feature-card-title"><h3>确认读取工作资料</h3><span class="tag" id="approvalStatus">待审核</span></div>
+              <p>来自主会话 · 整理工作资料 · 请求于 10:32</p>
+              <p>读取已授权目录中的工作资料，用于整理工作计划。读取内容会提供给此任务处理。</p>
+              <div class="detail-actions" id="approvalActions"><button class="primary-button" id="approveTask" type="button">批准并继续</button><button class="secondary-button" id="rejectTask" type="button">拒绝</button></div>
+              <p id="approvalResult" role="status" hidden>审核选择已记录，任务后续状态等待更新。</p>
+            </article>
+          </section>
+        </div>
         <div class="settings-inner" data-other-panel="goals" hidden>
           <div class="feature-grid"><section class="feature-card" id="goal-targets" role="tabpanel" aria-labelledby="tab-goal-targets" data-goal-panel="targets"><div class="settings-section-head"><div><h3>目标</h3><p>跟进你正在关注的事情。</p></div><button class="quiet-button" type="button" data-toggle-form="goalForm">＋ 新建目标</button></div><form class="profile-form" id="goalForm" data-preview-form hidden><label class="form-wide">目标名称<input type="text" placeholder="写下目标" required></label><label class="form-wide">说明<textarea rows="3" placeholder="补充目标内容"></textarea></label><div class="form-wide settings-actions"><button class="secondary-button" type="button" data-close-form="goalForm">取消</button><button class="primary-button" type="submit" aria-label="保存目标">保存</button></div></form><div class="feature-empty"><svg class="icon"><use href="#i-target"/></svg><strong>还没有目标</strong><p>创建后可查看进展、编辑或暂停。</p></div></section>
             <section class="feature-card" id="goal-schedules" role="tabpanel" aria-labelledby="tab-goal-schedules" data-goal-panel="schedules" hidden><div class="settings-section-head"><div><h3>定时计划</h3><p>安排 Morde 在指定时间工作。</p></div><button class="quiet-button" type="button" data-toggle-form="scheduleForm">＋ 新建计划</button></div>
               <form class="profile-form" id="scheduleForm" data-preview-form hidden>
                 <label class="form-wide">计划内容<textarea rows="3" placeholder="告诉 Morde 要做什么" required></textarea></label>
-                <label>模型<select><option>团队通用模型</option></select></label><label>电脑<select><option>仅文本，不指定电脑</option><option>我的云端电脑</option></select></label>
+                <label>模型<select><option>团队通用模型</option></select></label>
                 <label>运行频率<select id="scheduleKind"><option value="daily">每天</option><option value="once">一次</option><option value="weekly">每周</option><option value="interval">每 N 小时</option></select></label>
                 <label data-schedule-field="date">开始日期<input type="date"></label><label data-schedule-field="clock">本地时间<input type="time" value="09:00"></label>
                 <label data-schedule-field="once" hidden>运行时间<input type="datetime-local"></label><label data-schedule-field="interval" hidden>间隔小时<input type="number" min="1" max="168" value="6"></label>
@@ -711,47 +734,31 @@
           <p>可以重新连接或关闭侧栏。已受理的任务会按实际状态继续。</p>
           <div class="error-actions"><button class="secondary-button" type="button" data-return-chat>返回</button><button class="primary-button" type="button" data-recover>重新连接</button></div>
         </div>
-        <div class="panel-empty" id="computerEmpty" hidden><svg class="icon"><use href="#i-monitor"/></svg>此会话尚未关联云端电脑</div>
+        <div class="panel-empty" id="computerEmpty" hidden><svg class="icon"><use href="#i-monitor"/></svg>此会话尚未使用云端电脑，需要时 Morde 会自动获取默认电脑。</div>
       </section>
       <section class="panel-page" id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden>
         <div class="panel-scroll task-list" id="taskList">
-          <div class="task-list-top"><span id="taskSummary">3 项任务 · 1 项待处理</span><button class="icon-button" id="refreshTasks" type="button" aria-label="刷新任务" title="刷新任务"><svg class="icon"><use href="#i-refresh"/></svg></button></div>
+          <div class="task-list-top"><span id="taskSummary">5 项任务 · 自动更新</span></div>
           <div class="task-note" id="taskError" role="alert" hidden><span id="taskErrorText"></span> <button class="back-link" id="retryTasks" type="button">重试</button></div>
-          <div class="task-group" id="approvalGroup" data-owner="main">
-            <div class="section-label"><span>待你处理</span><span>1</span></div>
-            <button class="task-card" id="approvalTask" type="button"><span class="task-card-icon" aria-hidden="true">!</span><span class="task-card-body"><span class="task-card-top"><strong>确认读取工作资料</strong><span class="tag">待审批</span></span><span class="task-card-description">需要你确认读取范围</span><span class="task-card-foot"><span>更新于 10:32</span><span>查看并处理 ›</span></span></span></button>
-          </div>
-          <div class="task-group" data-owner="main">
-            <div class="section-label"><span>进行中</span><span>1</span></div>
-            <button class="task-card" id="progressTask" type="button"><span class="task-card-icon running" aria-hidden="true">↻</span><span class="task-card-body"><span class="task-card-top"><strong>整理本周工作安排</strong><span class="tag running">进行中</span></span><span class="task-card-description">正在整理已有信息</span><span class="task-card-foot"><span>更新于 10:28</span><span>查看详情 ›</span></span></span></button>
-          </div>
-          <div class="task-group" data-owner="week" hidden>
-            <div class="section-label"><span>进行中</span><span>1</span></div>
-            <button class="task-card" id="weekTask" type="button"><span class="task-card-icon running" aria-hidden="true">↻</span><span class="task-card-body"><span class="task-card-top"><strong>梳理本周优先事项</strong><span class="tag running">进行中</span></span><span class="task-card-description">正在归纳需要优先处理的事项</span><span class="task-card-foot"><span>更新于 10:16</span><span>查看详情 ›</span></span></span></button>
-          </div>
-          <div class="task-group" id="resolvedGroup" data-owner="main" hidden>
-            <div class="section-label"><span>状态待确认</span><span>1</span></div>
-            <button class="task-card" id="resolvedTask" type="button"><span class="task-card-icon" aria-hidden="true">!</span><span class="task-card-body"><span class="task-card-top"><strong>确认读取工作资料</strong><span class="tag" id="resolvedTag">已处理</span></span><span class="task-card-description">审批选择已记录，任务状态等待更新</span><span class="task-card-foot"><span>刚刚</span><span>查看详情 ›</span></span></span></button>
-          </div>
-          <details class="task-group" data-owner="main"><summary class="section-label"><svg class="icon"><use href="#i-chevron"/></svg><span>最近结束</span><span>1</span></summary>
-            <button class="task-card" id="completedTask" type="button"><span class="task-card-icon done" aria-hidden="true">✓</span><span class="task-card-body"><span class="task-card-top"><strong>收集工作安排</strong><span class="tag done">已完成</span></span><span class="task-card-description">已整理可用的工作信息</span><span class="task-card-foot"><span>更新于 10:05</span><span>查看详情 ›</span></span></span></button>
-          </details>
+          <button class="task-card" id="completedTask" type="button" data-owner="main" data-status="done" data-updated="2026-11-15T10:05:00"><span class="task-card-icon done" aria-hidden="true">✓</span><span class="task-card-body"><span class="task-card-top"><strong>收集工作安排</strong><span class="tag done">已完成</span><span class="task-card-link">查看详情 ›</span></span></span></button>
+          <button class="task-card" id="progressTask" type="button" data-owner="main" data-status="running" data-updated="2026-11-15T10:28:00"><span class="task-card-icon running" aria-hidden="true">↻</span><span class="task-card-body"><span class="task-card-top"><strong>整理本周工作安排</strong><span class="tag running">进行中</span><span class="task-card-link">查看详情 ›</span></span></span></button>
+          <button class="task-card" id="weekTask" type="button" data-owner="week" data-status="running" data-updated="2026-11-15T10:16:00" hidden><span class="task-card-icon running" aria-hidden="true">↻</span><span class="task-card-body"><span class="task-card-top"><strong>梳理本周优先事项</strong><span class="tag running">进行中</span><span class="task-card-link">查看详情 ›</span></span></span></button>
+          <button class="task-card" id="earlierProgressTask" type="button" data-owner="main" data-status="running" data-updated="2026-11-15T10:18:00"><span class="task-card-icon running" aria-hidden="true">↻</span><span class="task-card-body"><span class="task-card-top"><strong>梳理页面需求</strong><span class="tag running">进行中</span><span class="task-card-link">查看详情 ›</span></span></span></button>
+          <button class="task-card" id="recentCompletedTask" type="button" data-owner="main" data-status="done" data-updated="2026-11-15T10:35:00"><span class="task-card-icon done" aria-hidden="true">✓</span><span class="task-card-body"><span class="task-card-top"><strong>汇总已确认事项</strong><span class="tag done">已完成</span><span class="task-card-link">查看详情 ›</span></span></span></button>
+          <button class="task-card" id="waitingTask" type="button" data-owner="main" data-status="waiting" data-updated="2026-11-15T10:32:00"><span class="task-card-icon" aria-hidden="true">!</span><span class="task-card-body"><span class="task-card-top"><strong>整理工作资料</strong><span class="tag">等待审核</span><span class="task-card-link">查看详情 ›</span></span></span></button>
           <div class="panel-empty" id="taskEmpty" hidden><svg class="icon"><use href="#i-list"/></svg>还没有任务<br>需要执行的工作会显示在这里</div>
         </div>
         <div class="panel-scroll task-detail" id="taskDetail" hidden>
           <button class="back-link" id="backTaskList" type="button"><svg class="icon"><use href="#i-back"/></svg>返回任务列表</button>
-          <div class="task-detail-heading"><h3 id="detailTitle">确认读取工作资料</h3><span class="tag" id="detailStatus">待审批</span></div><p id="detailSubtitle">更新于 10:32</p>
-          <div class="detail-box" id="approvalBox"><strong style="font-size:12px">需要你的确认</strong><p>读取已授权目录中的工作资料，用于整理工作计划。读取内容会提供给此任务处理。</p>
-            <div class="detail-actions"><button class="primary-button" id="approveTask" type="button">批准并继续</button><button class="secondary-button" id="rejectTask" type="button">拒绝</button></div>
-          </div>
-          <h4>当前进展</h4><p id="detailProgress">等待你确认读取范围。</p>
+          <div class="task-detail-heading"><h3 id="detailTitle">整理本周工作安排</h3><span class="tag running" id="detailStatus">进行中</span></div>
+          <h4>当前进展</h4><p id="detailProgress">正在整理已有信息。</p>
           <details class="task-work" id="taskWork"><summary>工作过程</summary><ol><li>已整理需求</li><li id="taskWorkCurrent">正在整理已有信息</li></ol></details>
           <div class="detail-actions" id="taskControls"><button class="secondary-button" type="button" data-demo-task-action>暂停任务</button><button class="secondary-button" type="button" data-demo-task-action>停止任务</button><button class="secondary-button" type="button" data-demo-task-action>补充任务</button></div>
         </div>
       </section>
       <section class="panel-page" id="panel-files" role="tabpanel" aria-labelledby="tab-files" hidden>
         <div class="panel-scroll" id="fileList">
-          <div class="file-card"><h3>工作计划</h3><p>我的云端电脑 · 上次同步已完成</p>
+          <div class="file-card"><h3>工作计划</h3><p>默认云端电脑 · 上次同步已完成</p>
             <div class="file-list"><div class="file-row"><svg class="icon"><use href="#i-folder"/></svg>会议记录 <small>文件夹</small></div><button class="file-row" id="openDocument" type="button"><svg class="icon"><use href="#i-file"/></svg>本周安排.md <small>打开文档</small></button></div>
             <button class="secondary-button" id="syncExample" type="button">同步本机文件夹</button>
             <p style="margin-top:9px">本机修改后，需要再次点击同步。</p>
@@ -806,10 +813,19 @@
     const narrow = window.matchMedia('(max-width: 900px)');
     const chats = {
       main: { title: '主会话', subtitle: '与 Morde 对话', draft: '', messages: [
+        { role: 'user', text: '这周有几件事情要推进，先帮我梳理一下。' },
+        { role: 'assistant', text: '好的。你可以先告诉我有哪些事情，以及有没有明确的截止时间。' },
+        { role: 'user', text: '要确认 PC 页面需求，还要跟进几个正在进行的任务。' },
+        { role: 'assistant', text: '我会先把页面需求和进行中的任务分开整理，再标出需要协作和确认的事项。' },
+        { role: 'user', text: '工作资料也有些分散，需要整理一下。' },
+        { role: 'assistant', text: '收到。我会把资料整理列为一项工作，并保留需要你确认的读取范围。' },
+        { role: 'user', text: '优先处理影响交付的事情，其他事项安排在后面。' },
+        { role: 'assistant', text: '明白，我会先列出影响交付的事项，再安排协作和资料整理，方便你检查优先级。' },
         { role: 'user', text: '帮我整理一下这周的工作计划，顺便打开我的云端电脑。' },
         { role: 'assistant', text: '我先把这周的安排整理成三个重点：\n\n1. 确认 PC 端的页面需求和交互。\n2. 跟进正在进行的任务，处理需要确认的事项。\n3. 整理工作资料，方便后续继续处理。\n\n你可以在侧边栏查看云端电脑，需要自己操作时再接管。' },
         { role: 'user', text: '好的，我先看看电脑。' },
-        { role: 'assistant', text: '可以。我会保留当前任务进度，你随时可以切回对话。' }
+        { role: 'assistant', text: '可以。我会保留当前任务进度，你随时可以切回对话。' },
+        { role: 'approval' }
       ] },
       week: { title: '本周工作计划', subtitle: '旁聊', draft: '', messages: [
         { role: 'user', text: '帮我把本周的事情按优先级列一下。' },
@@ -827,12 +843,11 @@
     const conversationComputers = { main: true };
     let humanControl = false;
     let autoExpandedForControl = false;
-    let taskResolved = false;
-    let taskDecision = '';
     let newChatCount = 0;
     let toastTimer;
-    let chatPager;
     let sidePager;
+    // shortcut: 历史仅使用本地示例数据，接入服务时改为按需获取。
+    const historyBatchSize = 6;
 
     function setPlatform(value) {
       const platform = value === 'windows' ? 'windows' : 'mac';
@@ -849,7 +864,7 @@
       clearTimeout(toastTimer);
       toastTimer = setTimeout(function () { toast.hidden = true; }, 2600);
     }
-    function createPager(flow, label, anchor, onPage, followLatest) {
+    function createPager(flow, label) {
       flow.classList.add('paged-flow');
       const nav = document.createElement('nav');
       nav.className = 'pagination is-single';
@@ -864,7 +879,7 @@
       next.setAttribute('aria-label', label + '下一页');
       count.setAttribute('aria-live', 'polite');
       nav.append(previous, count, next);
-      (anchor || flow).after(nav);
+      flow.after(nav);
       let page = 0;
       let pages = 1;
       let step = 1;
@@ -874,8 +889,7 @@
         const style = getComputedStyle(flow);
         step = Math.max(1, flow.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) + (parseFloat(style.columnGap) || 0));
         pages = 1 + Math.ceil(Math.max(0, flow.scrollWidth - flow.clientWidth - 1) / step);
-        if (requested === Infinity || (requested === undefined && followLatest && followLatest())) page = pages - 1;
-        else if (typeof requested === 'number') page = requested;
+        if (typeof requested === 'number') page = requested;
         page = Math.max(0, Math.min(page, pages - 1));
         flow.scrollLeft = page * step;
         nav.classList.toggle('is-single', pages === 1);
@@ -883,7 +897,6 @@
         previous.disabled = page === 0;
         next.disabled = page === pages - 1;
         count.textContent = (page + 1) + ' / ' + pages;
-        if (onPage) onPage(page, pages);
       }
       function schedule() {
         if (queued) return;
@@ -944,6 +957,7 @@
     }
     function renderChat() {
       const chat = chats[currentChat];
+      if (chat.historyStart === undefined) chat.historyStart = Math.max(0, chat.messages.length - historyBatchSize);
       thread.replaceChildren();
       if (!chat.messages.length) {
         const welcome = document.createElement('div');
@@ -958,19 +972,43 @@
         welcome.append(mark, title, hint);
         thread.append(welcome);
       } else {
-        const date = document.createElement('p');
-        date.className = 'date-label';
-        date.textContent = '今天';
-        thread.append(date);
-        chat.messages.forEach(function (message) {
+        const historyLabel = document.createElement('p');
+        historyLabel.className = chat.historyStart ? 'history-hint' : 'date-label';
+        historyLabel.textContent = chat.historyStart ? '向上滚动加载更早消息' : '今天';
+        thread.append(historyLabel);
+        chat.messages.slice(chat.historyStart).forEach(function (message) {
           const row = document.createElement('div');
-          row.className = 'message ' + message.role;
-          if (message.role === 'assistant') {
+          row.className = 'message ' + (message.role === 'user' ? 'user' : 'assistant');
+          if (message.role !== 'user') {
             const avatar = document.createElement('span');
             avatar.className = 'message-avatar';
             avatar.setAttribute('aria-hidden', 'true');
-            avatar.setAttribute('aria-hidden', 'true');
             row.append(avatar);
+          }
+          if (message.role === 'approval') {
+            const card = document.getElementById('chatApprovalTemplate').content.firstElementChild.cloneNode(true);
+            const resolved = document.getElementById('approvalActions').hidden;
+            card.querySelector('.chat-approval-actions').hidden = resolved;
+            const result = card.querySelector('.chat-approval-result');
+            result.hidden = !resolved;
+            if (resolved) result.textContent = document.getElementById('approvalStatus').textContent + '。任务后续状态等待更新。';
+            row.append(card);
+            thread.append(row);
+            return;
+          }
+          if (message.role === 'thinking') {
+            const dots = document.createElement('span');
+            dots.className = 'thinking-dots';
+            dots.setAttribute('role', 'status');
+            dots.setAttribute('aria-label', 'Morde 正在思考');
+            for (let i = 0; i < 3; i++) {
+              const dot = document.createElement('span');
+              dot.setAttribute('aria-hidden', 'true');
+              dots.append(dot);
+            }
+            row.append(dots);
+            thread.append(row);
+            return;
           }
           const body = document.createElement('div');
           body.className = 'message-body';
@@ -983,9 +1021,21 @@
           const text = document.createElement('span');
           text.textContent = message.text;
           body.append(text);
+          if (message.role === 'user' && message.received !== false) {
+            const reaction = document.createElement('span');
+            reaction.className = 'message-reaction';
+            reaction.setAttribute('role', 'img');
+            reaction.setAttribute('aria-label', 'Morde 已收到消息');
+            reaction.textContent = '👌🏻';
+            body.append(reaction);
+          }
           row.append(body);
           thread.append(row);
         });
+      }
+      if (chat.historyStart > 0 && messages.clientHeight && messages.scrollHeight <= messages.clientHeight) {
+        chat.historyStart = Math.max(0, chat.historyStart - historyBatchSize);
+        return renderChat();
       }
       input.value = chat.draft;
       attachmentChip.hidden = !chat.attachment;
@@ -997,13 +1047,34 @@
       });
       chatTitle.textContent = chat.title;
       chatSubtitle.textContent = chat.subtitle;
-      if (chatPager) chatPager.refresh(chat.followLatest === false ? chat.historyPage || 0 : Infinity);
+      messages.scrollTop = chat.followLatest === false ? chat.scrollTop || 0 : messages.scrollHeight;
       updateTaskView();
       updateConversationPanels();
     }
+    messages.addEventListener('scroll', function () {
+      const chat = chats[currentChat];
+      chat.scrollTop = messages.scrollTop;
+      chat.followLatest = messages.scrollHeight - messages.clientHeight - messages.scrollTop <= 2;
+      if (messages.scrollTop <= 0 && chat.historyStart > 0) {
+        const previousHeight = messages.scrollHeight;
+        chat.historyStart = Math.max(0, chat.historyStart - historyBatchSize);
+        chat.followLatest = false;
+        renderChat();
+        messages.scrollTop += messages.scrollHeight - previousHeight;
+        chat.scrollTop = messages.scrollTop;
+      }
+    });
+    thread.addEventListener('click', function (event) {
+      const button = event.target.closest('[data-approval-decision]');
+      if (button) resolveApproval(button.dataset.approvalDecision);
+    });
     function selectChat(id) {
       if (!chats[id]) return;
       chats[currentChat].draft = input.value;
+      if (!chatView.hidden) {
+        chats[currentChat].scrollTop = messages.scrollTop;
+        chats[currentChat].followLatest = messages.scrollHeight - messages.clientHeight - messages.scrollTop <= 2;
+      }
       if (currentChat !== id) {
         conversationPanels[currentChat] = { activePanel: activePanel, openTabs: openTabs };
         document.getElementById('taskDetail').hidden = true;
@@ -1020,10 +1091,11 @@
       }
       showChat();
       renderChat();
-      if (narrow.matches) closePanel();
+      if (narrow.matches) setSidebarVisible(false);
     }
     function openPanel(name) {
       if (name === 'document' && currentChat !== 'main') return;
+      const followLatest = !chatView.hidden && messages.clientHeight && messages.scrollHeight - messages.clientHeight - messages.scrollTop <= 2;
       showChat();
       app.classList.remove('panel-hidden', 'mobile-sidebar');
       if (narrow.matches) setSidebarVisible(false);
@@ -1031,6 +1103,7 @@
       document.querySelector('[data-tab-wrap="' + name + '"]').hidden = false;
       activePanel = name;
       showPanel.setAttribute('aria-expanded', 'true');
+      if (followLatest) messages.scrollTop = messages.scrollHeight;
       document.querySelectorAll('.panel-tab').forEach(function (tab) {
         const active = tab.dataset.panel === name;
         tab.closest('.panel-tab-wrap').classList.toggle('active', active);
@@ -1070,22 +1143,26 @@
       else closePanel();
     }
     function updateTaskView() {
-      let shown = 0;
-      document.querySelectorAll('.task-group').forEach(function (group) {
-        const matches = group.dataset.owner === currentChat;
-        const visible = matches && (group.id !== 'approvalGroup' || !taskResolved) && (group.id !== 'resolvedGroup' || taskResolved);
-        group.hidden = !visible;
-        if (visible) shown += 1;
+      const cards = Array.from(document.querySelectorAll('#taskList .task-card'));
+      const sorted = cards.slice().sort(function (a, b) {
+        return Number(b.dataset.status === 'running') - Number(a.dataset.status === 'running') || b.dataset.updated.localeCompare(a.dataset.updated);
       });
-      const pending = currentChat === 'main' && !taskResolved;
+      if (sorted.some(function (card, index) { return card !== cards[index]; })) {
+        sorted.forEach(function (card) { document.getElementById('taskEmpty').before(card); });
+      }
+      let shown = 0;
+      cards.forEach(function (card) {
+        card.hidden = card.dataset.owner !== currentChat;
+        if (!card.hidden) shown += 1;
+      });
       const stale = previewState.value === 'task-error';
       document.getElementById('taskError').hidden = !stale;
       document.getElementById('taskErrorText').textContent = shown ? '任务状态暂不可用，以下为最近一次已确认状态。' : '任务状态暂不可用，请重试。';
       document.getElementById('taskEmpty').hidden = shown !== 0 || stale;
-      document.getElementById('taskSummary').textContent = stale ? (shown ? '最近一次已确认状态' : '任务状态暂不可用') : shown ? shown + ' 项任务' + (pending ? ' · 1 项待处理' : '') : '暂无任务';
-      document.getElementById('pendingDot').hidden = !pending && !stale;
-      document.getElementById('closedPendingDot').hidden = !pending && !stale;
-      showPanel.setAttribute('aria-label', stale ? '打开会话侧边栏，任务状态暂不可用' : pending ? '打开会话侧边栏，有 1 项待处理' : '打开会话侧边栏');
+      document.getElementById('taskSummary').textContent = stale ? (shown ? '最近一次已确认状态' : '任务状态暂不可用') : shown ? shown + ' 项任务 · 自动更新' : '暂无任务';
+      document.getElementById('pendingDot').hidden = !stale;
+      document.getElementById('closedPendingDot').hidden = !stale;
+      showPanel.setAttribute('aria-label', stale ? '打开会话侧边栏，任务状态暂不可用' : '打开会话侧边栏');
     }
     function updateConversationPanels() {
       const isMain = currentChat === 'main';
@@ -1140,16 +1217,20 @@
       if (!text) return;
       const target = currentChat;
       chats[target].followLatest = true;
-      chats[target].messages.push({ role: 'user', text: text + (chats[target].attachment ? '\n[示例附件：会议记录.txt]' : '') });
+      const thinking = { role: 'thinking' };
+      chats[target].messages.push({ role: 'user', received: true, text: text + (chats[target].attachment ? '\n[示例附件：会议记录.txt]' : '') }, thinking);
       chats[target].draft = '';
       chats[target].attachment = false;
       input.value = '';
       attachmentChip.hidden = true;
       renderChat();
+      // shortcut: 思考状态使用示例延时，接入服务后改用真实状态。
       setTimeout(function () {
-        chats[target].messages.push({ role: 'assistant', text: replyFor(text) });
+        const index = chats[target].messages.indexOf(thinking);
+        if (index < 0) return;
+        chats[target].messages.splice(index, 1, { role: 'assistant', text: replyFor(text) });
         if (currentChat === target && !chatView.hidden) renderChat();
-      }, 350);
+      }, 1800);
     }
 
     sidebarToggle.addEventListener('click', function () {
@@ -1208,7 +1289,7 @@
     });
     document.getElementById('navChat').addEventListener('click', function () {
       showChat();
-      if (narrow.matches || app.classList.contains('panel-expanded')) closePanel();
+      if (app.classList.contains('panel-expanded')) closePanel();
       renderChat();
     });
     function showOtherPage(button, title, panel) {
@@ -1227,6 +1308,9 @@
     }
     document.getElementById('navPersonal').addEventListener('click', function () {
       showOtherPage(this, '个人数据', 'personal');
+    });
+    document.getElementById('navReview').addEventListener('click', function () {
+      showOtherPage(this, '审核', 'reviews');
     });
     document.getElementById('navGoals').addEventListener('click', function () {
       showOtherPage(this, '目标与计划', 'goals');
@@ -1410,10 +1494,12 @@
     });
     function openTaskDetail(kind) {
       const details = {
-        approval: { title: '确认读取工作资料', status: taskResolved ? taskDecision : '待审批', time: '10:32', progress: taskResolved ? '审批选择已记录，任务后续状态等待更新。' : '等待你确认读取范围。' },
-        progress: { title: '整理本周工作安排', status: '进行中', time: '10:28', progress: '正在整理已有信息。' },
-        week: { title: '梳理本周优先事项', status: '进行中', time: '10:16', progress: '正在归纳需要优先处理的事项。' },
-        completed: { title: '收集工作安排', status: '已完成', time: '10:05', progress: '已整理可用的工作信息。' }
+        progress: { title: '整理本周工作安排', status: '进行中', progress: '正在整理已有信息。' },
+        earlierProgress: { title: '梳理页面需求', status: '进行中', progress: '正在整理待确认的页面需求。' },
+        week: { title: '梳理本周优先事项', status: '进行中', progress: '正在归纳需要优先处理的事项。' },
+        waiting: { title: '整理工作资料', status: document.querySelector('#waitingTask .tag').textContent, progress: document.getElementById('approvalActions').hidden ? '审核已处理，任务状态等待更新。' : '等待读取工作资料的审核结果。' },
+        recentCompleted: { title: '汇总已确认事项', status: '已完成', progress: '已汇总当前可用的确认结果。' },
+        completed: { title: '收集工作安排', status: '已完成', progress: '已整理可用的工作信息。' }
       };
       const task = details[kind];
       document.getElementById('taskList').hidden = true;
@@ -1422,38 +1508,39 @@
       document.getElementById('detailTitle').textContent = task.title;
       document.getElementById('detailStatus').textContent = task.status;
       document.getElementById('detailStatus').className = 'tag' + (task.status === '进行中' ? ' running' : task.status === '已完成' ? ' done' : '');
-      document.getElementById('detailSubtitle').textContent = '更新于 ' + task.time;
       document.getElementById('detailProgress').textContent = task.progress;
-      document.getElementById('approvalBox').hidden = kind !== 'approval' || taskResolved;
-      document.getElementById('taskWork').hidden = kind === 'approval';
       document.getElementById('taskWork').open = false;
       document.getElementById('taskWorkCurrent').textContent = task.progress;
-      document.getElementById('taskControls').hidden = kind === 'completed' || (kind === 'approval' && taskResolved);
+      document.getElementById('taskControls').hidden = task.status === '已完成';
     }
-    document.getElementById('approvalTask').addEventListener('click', function () { openTaskDetail('approval'); });
-    document.getElementById('resolvedTask').addEventListener('click', function () { openTaskDetail('approval'); });
     document.getElementById('progressTask').addEventListener('click', function () { openTaskDetail('progress'); });
+    document.getElementById('earlierProgressTask').addEventListener('click', function () { openTaskDetail('earlierProgress'); });
     document.getElementById('weekTask').addEventListener('click', function () { openTaskDetail('week'); });
+    document.getElementById('waitingTask').addEventListener('click', function () { openTaskDetail('waiting'); });
+    document.getElementById('recentCompletedTask').addEventListener('click', function () { openTaskDetail('recentCompleted'); });
     document.getElementById('completedTask').addEventListener('click', function () { openTaskDetail('completed'); });
     document.getElementById('backTaskList').addEventListener('click', function () { document.getElementById('taskDetail').hidden = true; document.getElementById('taskList').hidden = false; });
     document.getElementById('openDocument').addEventListener('click', function () { openPanel('document'); });
-    function resolveTask(label) {
-      taskResolved = true;
-      taskDecision = label;
-      document.getElementById('resolvedTag').textContent = label;
-      updateTaskView();
-      openTaskDetail('approval');
+    function resolveApproval(label) {
+      if (document.getElementById('approvalActions').hidden) return;
+      document.getElementById('approvalStatus').textContent = label;
+      document.getElementById('approvalSummary').textContent = '1 项已处理';
+      document.getElementById('approvalActions').hidden = true;
+      document.getElementById('approvalResult').hidden = false;
+      document.getElementById('approvalDot').hidden = true;
+      document.getElementById('navReview').setAttribute('aria-label', '审核');
+      document.querySelector('#waitingTask .tag').textContent = '状态待更新';
+      if (currentChat === 'main' && !chatView.hidden) renderChat();
       showToast('已记录示例选择，不会执行真实操作。');
     }
-    document.getElementById('approveTask').addEventListener('click', function () { resolveTask('已允许'); });
-    document.getElementById('rejectTask').addEventListener('click', function () { resolveTask('已拒绝'); });
-    function refreshTasks() {
+    document.getElementById('approveTask').addEventListener('click', function () { resolveApproval('已允许'); });
+    document.getElementById('rejectTask').addEventListener('click', function () { resolveApproval('已拒绝'); });
+    function retryTasks() {
       if (previewState.value === 'task-error') previewState.value = 'normal';
       updateTaskView();
       showToast('已刷新示例任务。');
     }
-    document.getElementById('refreshTasks').addEventListener('click', refreshTasks);
-    document.getElementById('retryTasks').addEventListener('click', refreshTasks);
+    document.getElementById('retryTasks').addEventListener('click', retryTasks);
     document.querySelectorAll('[data-demo-task-action]').forEach(function (button) { button.addEventListener('click', function () { showToast('设计预览不会操作真实任务。'); }); });
     document.getElementById('syncExample').addEventListener('click', function () { showToast('设计预览不会读取或同步本机文件。'); });
     previewState.addEventListener('change', function () { setPreviewState(previewState.value); });
@@ -1480,7 +1567,7 @@
       if (!otherView.hidden) {
         const page = document.querySelector('[data-other-panel]:not([hidden])').dataset.otherPanel;
         const selected = document.querySelector('[data-page-menu="' + page + '"] [aria-selected="true"]');
-        return { page: page, tab: selected.dataset.personalTab || selected.dataset.goalTab };
+        return { page: page, tab: selected.dataset.personalTab || selected.dataset.goalTab || selected.dataset.reviewTab };
       }
       const panel = app.classList.contains('panel-hidden') ? null : activePanel;
       const detail = document.getElementById('taskDetail');
@@ -1507,9 +1594,10 @@
         if (location.page === 'settings') {
           document.getElementById('navSettings').click();
           selectSettingsTab(location.tab);
-        } else if (location.page === 'personal' || location.page === 'goals') {
-          document.getElementById(location.page === 'personal' ? 'navPersonal' : 'navGoals').click();
-          document.querySelector('[data-' + (location.page === 'personal' ? 'personal' : 'goal') + '-tab="' + location.tab + '"]').click();
+        } else if (location.page === 'personal' || location.page === 'goals' || location.page === 'reviews') {
+          const menu = location.page === 'personal' ? 'personal' : location.page === 'goals' ? 'goal' : 'review';
+          document.getElementById(location.page === 'personal' ? 'navPersonal' : location.page === 'goals' ? 'navGoals' : 'navReview').click();
+          document.querySelector('[data-' + menu + '-tab="' + location.tab + '"]').click();
         } else if (location.page === 'error') {
           setPreviewState('page-error');
         } else {
@@ -1528,7 +1616,7 @@
     historyBack.addEventListener('click', function () { restoreNavigation(navigationIndex - 1); });
     historyForward.addEventListener('click', function () { restoreNavigation(navigationIndex + 1); });
     document.addEventListener('click', function (event) {
-      if (event.target.closest('#navChat, #navPersonal, #navGoals, #navSettings, #newChat, [data-chat], [data-settings-tab], [data-personal-tab], [data-goal-tab], [data-settings-link], .panel-tab, [data-close-tab], [data-add-panel], #showPanel, #closePanel, [data-return-chat], [data-recover], #previewOpenComputer, #openDocument, #approvalTask, #resolvedTask, #progressTask, #weekTask, #completedTask, #backTaskList')) recordNavigation();
+      if (event.target.closest('#navChat, #navReview, #navPersonal, #navGoals, #navSettings, #newChat, [data-chat], [data-settings-tab], [data-personal-tab], [data-goal-tab], [data-review-tab], [data-settings-link], .panel-tab, [data-close-tab], [data-add-panel], #showPanel, #closePanel, [data-return-chat], [data-recover], #previewOpenComputer, #openDocument, #taskList .task-card, #backTaskList')) recordNavigation();
     });
     previewState.addEventListener('change', recordNavigation);
     narrow.addEventListener('change', function () {
@@ -1536,10 +1624,6 @@
       updateSidebarControl();
       showPanel.setAttribute('aria-expanded', String(!app.classList.contains('panel-hidden')));
     });
-    chatPager = createPager(thread, '对话历史', messages, function (page, pages) {
-      chats[currentChat].historyPage = page;
-      chats[currentChat].followLatest = page === pages - 1;
-    }, function () { return chats[currentChat].followLatest !== false; });
     sidePager = createPager(sideChatList, '旁聊');
     document.querySelectorAll('[data-settings-panel]').forEach(function (panel) { pageContainer(panel, '设置列表'); });
     document.querySelectorAll('[data-personal-panel]').forEach(function (panel) { pageContainer(panel, '个人数据'); });

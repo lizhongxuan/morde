@@ -20,7 +20,7 @@ type projectConversationRoutesService interface {
 	Get(context.Context, identity.Principal, string, string) (conversation.Conversation, error)
 	ListMessages(context.Context, identity.Principal, string, string, app.PageRequest) (app.MessagePage, error)
 	AcceptMessage(context.Context, identity.Principal, string, string, app.AcceptConversationMessageCommand) (conversation.Message, bool, error)
-	ListTasks(context.Context, identity.Principal, string, string, app.PageRequest) (app.TaskPage, error)
+	ListTasksWithView(context.Context, identity.Principal, string, string, app.ConversationTaskView, app.PageRequest) (app.TaskPage, error)
 }
 
 type projectConversationResponse struct {
@@ -205,7 +205,19 @@ func RegisterProjectConversationRoutes(group *gin.RouterGroup, service projectCo
 		if !ok {
 			return
 		}
-		result, err := service.ListTasks(c.Request.Context(), principal, projectID, conversationID, page)
+		view, ok := singleQuery(c, "view")
+		if !ok {
+			return
+		}
+		if view == "" {
+			view = string(app.ConversationTaskViewActive)
+		}
+		taskView := app.ConversationTaskView(view)
+		if taskView != app.ConversationTaskViewActive && taskView != app.ConversationTaskViewRecent && taskView != app.ConversationTaskViewPanel {
+			writeError(c, domain.InvalidArgument("view", "conversation task view is invalid"))
+			return
+		}
+		result, err := service.ListTasksWithView(c.Request.Context(), principal, projectID, conversationID, taskView, page)
 		if err != nil {
 			writeError(c, err)
 			return

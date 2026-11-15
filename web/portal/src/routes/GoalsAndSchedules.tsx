@@ -16,7 +16,7 @@ type Schedule = components['schemas']['Schedule'];
 type ScheduleRun = components['schemas']['ScheduleRun'];
 type ScheduleCreateRequest = components['schemas']['ScheduleCreateRequest'];
 type ScheduleUpdateRequest = components['schemas']['ScheduleUpdateRequest'];
-type ScheduleFields = Omit<ScheduleCreateRequest, 'observation'>;
+type ScheduleFields = Omit<ScheduleCreateRequest, 'observation' | 'host_id'> & { host_id?: string | null };
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type AvailableModel = Awaited<ReturnType<typeof loadAvailableModels>>['items'][number];
 
@@ -82,6 +82,7 @@ export function GoalsAndSchedules() {
     getNextPageParam: (page) => page.next_cursor || undefined,
   });
   const hosts = useQuery({ queryKey: ['hosts'], queryFn: portalApi.hosts });
+  const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences, retry: false, enabled: activeView === 'schedules' });
   const models = useQuery({ queryKey: ['available-models'], queryFn: loadAvailableModels });
   const goalDetail = useQuery({
     queryKey: ['goals', 'detail', expandedGoalID],
@@ -182,6 +183,9 @@ export function GoalsAndSchedules() {
   const goalRecords = (goals.data?.pages.flatMap((page) => page.items.map(toGoalRecord).filter((item): item is GoalRecord => item !== null)) ?? []);
   const scheduleRecords = schedules.data?.pages.flatMap((page) => page.items) ?? [];
   const hostItems = hosts.data?.items ?? [];
+  const defaultHostID = preferences.data?.default_host_id ?? null;
+  const defaultHost = defaultHostID ? hostItems.find((host) => host.id === defaultHostID) ?? null : null;
+  const defaultHostUnavailable = hosts.isSuccess && Boolean(defaultHostID && !defaultHost);
   const modelItems = models.data?.items ?? [];
   const detail = goalDetail.data ? toGoalRecord(goalDetail.data) : null;
   const scheduleWriteError = scheduleCreate.error ?? scheduleUpdate.error ?? scheduleAction.error;
@@ -242,14 +246,17 @@ export function GoalsAndSchedules() {
     <section className="connection-section" aria-labelledby="schedules-title" hidden={activeView !== 'schedules'}>
       <div className="connection-section-heading">
         <div><h2 id="schedules-title" className="sr-only">定时计划</h2><p className="muted">查看计划版本、运行状态和历史记录。</p></div>
-        <button type="button" className="button button-primary" disabled={scheduleWriteDenied || hosts.isPending || models.isPending || !modelItems.length} onClick={() => setScheduleForm({ mode: 'create' })}>＋ 新建云端计划</button>
+        <button type="button" className="button button-primary" disabled={scheduleWriteDenied || hosts.isPending || hosts.isError || preferences.isPending || preferences.isError || defaultHostUnavailable || models.isPending || !modelItems.length} onClick={() => setScheduleForm({ mode: 'create' })}>＋ 新建云端计划</button>
       </div>
       {scheduleWriteDenied && <FloatingError className="error-inline" role="alert">服务端拒绝了计划写操作（403）。此页已切换为只读状态，不会请求或保存额外授权凭据。</FloatingError>}
       {scheduleWriteError && <FloatingError className="error-card" role="alert">{errorDetails(scheduleWriteError).message}</FloatingError>}
+      {preferences.isError && <FloatingError className="error-card" role="alert">无法读取默认云端电脑设置，不能确定新计划的运行目标。<button type="button" className="button button-secondary" onClick={() => void preferences.refetch()}>重试</button></FloatingError>}
+      {defaultHostUnavailable && <FloatingNotice className="notice-warning" data-notice-label="默认主机不可用">当前默认云端电脑不可用。请先在云端电脑页面重新选择默认电脑；不会自动切换到其他电脑。</FloatingNotice>}
       {scheduleForm && <ScheduleEditor
         key={scheduleForm.mode === 'edit' ? scheduleForm.schedule.id : 'new-schedule'}
         initial={scheduleForm.mode === 'edit' ? scheduleForm.schedule : null}
         hosts={hostItems}
+        defaultHost={defaultHost}
         models={modelItems}
         busy={scheduleCreate.isPending || scheduleUpdate.isPending}
         onCancel={() => setScheduleForm(null)}
@@ -333,9 +340,10 @@ function GoalEditorForm({ initial, busy, onCancel, onSubmit }: { initial?: GoalB
   </form>;
 }
 
-function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
+function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, onSubmit }: {
   initial: Schedule | null;
   hosts: Host[];
+  defaultHost: Host | null;
   models: AvailableModel[];
   busy: boolean;
   onCancel: () => void;
@@ -377,8 +385,11 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
               ...(initial?.timing.kind === 'every_n_hours' && initial.timing.anchor_at !== undefined ? { anchor_at: initial.timing.anchor_at } : {}),
             };
       setFormError('');
+      const hostField = initial
+        ? hostID === (initial.host_id ?? '') ? {} : { host_id: hostID || null }
+        : { host_id: defaultHost?.id ?? null };
       onSubmit({
-        host_id: hostID || null,
+        ...hostField,
         model_id: modelID,
         objective: objective.trim(),
         timing,
@@ -394,7 +405,10 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
   return <form className="form-card form-stack schedule-editor" onSubmit={submit}>
     <h3>{initial ? `编辑计划定义 · 版本 ${initial.version}` : '新建云端计划'}</h3>
     <div className="schedule-form-grid">
-      <label>主机<select value={hostID} onChange={(event) => setHostID(event.target.value)}>{!initial?.observation && <option value="">仅文本计划（无主机）</option>}{initial?.host_id && !hosts.some((host) => host.id === initial.host_id) && <option value={initial.host_id}>{initial.host_id}</option>}{hosts.map((host) => <option key={host.id} value={host.id}>{host.name} · {host.state}</option>)}</select></label>
+      {initial ? <label>主机<select value={hostID} onChange={(event) => setHostID(event.target.value)}>{!initial.observation && <option value="">仅文本计划（无主机）</option>}{initial.host_id && !hosts.some((host) => host.id === initial.host_id) && <option value={initial.host_id}>{initial.host_id}</option>}{hosts.map((host) => <option key={host.id} value={host.id}>{host.name} · {host.state}</option>)}</select></label>
+        : <p className="muted schedule-form-wide" role="note">{defaultHost
+          ? `创建时固定使用默认云端电脑“${defaultHost.name || defaultHost.id}”；之后修改默认电脑不会迁移此计划。`
+          : '未设置默认云端电脑，此计划仅使用模型，不会操作电脑。'}</p>}
       <label>模型<select value={modelID} required onChange={(event) => setModelID(event.target.value)}>{initial && !models.some((model) => model.id === initial.model_id) && <option value={initial.model_id}>{initial.model_id}</option>}{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model_name}</option>)}</select></label>
       <label className="schedule-form-wide">计划内容<textarea value={objective} maxLength={32768} rows={3} required onChange={(event) => setObjective(event.target.value)} placeholder="描述计划运行时需要完成的工作" /></label>
     </div>

@@ -16,7 +16,12 @@ const capabilitiesWithWorkspaceSync = { ...capabilitiesResponse, supported_featu
 const auth = { origin: 'https://portal.example', serviceInstanceID, accountName: 'user', installationId: 'i1234567', clientCredential: 'client-secret', clientExpiresAt: future, syncCredential: 'sync-secret', syncExpiresAt: future };
 const loginResponse = { installation_id: auth.installationId, client_credential: auth.clientCredential, client_expires_at: future, sync_credential: auth.syncCredential, sync_expires_at: future, web_session_credential: 'web-secret', web_session_expires_at: future, web_session_host_frame_source: 'https://*.hosts.example.test' };
 const json = (value, status = 200) => new Response(JSON.stringify(value && typeof value === 'object' && 'web_session_credential' in value && !('web_session_host_frame_source' in value) ? { ...value, web_session_host_frame_source: 'https://*.hosts.example.test' } : value), { status, headers: { 'content-type': 'application/json' } });
-const loginFetch = (url, fallback = loginResponse) => json(String(url).endsWith('/api/capabilities') ? capabilitiesResponse : fallback);
+const loginFetch = (url, fallback = loginResponse) => {
+  const path = String(url);
+  if (path.endsWith('/api/capabilities')) return json(capabilitiesResponse);
+  if (path.endsWith('/api/me/preferences')) return json({ default_host_id: 'h1234567' });
+  return json(fallback);
+};
 const appURL = (h, path) => `${new URL(h.views[0].webContents.url).origin}${path}`;
 async function waitFor(predicate, message = 'timed out waiting for the Portal session cookie', timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -96,7 +101,7 @@ function harness(initialAuth = null, existingRoot = null) {
       },
       events: new Map(), on(event, fn) { this.events.set(event, fn); },
       setPermissionRequestHandler(fn) { this.permissionRequest = fn; },
-      async clearStorageData() { this.cleared = true; },
+      async clearStorageData(options) { this.cleared = options; },
     };
     partitions.push(partition);
     return partition;
@@ -151,7 +156,7 @@ test('one desktop login stores Client and Sync only, injects an HttpOnly Web coo
     assert.equal(body.attempt_generation, 1);
     assert.match(calls[1].options.headers['Idempotency-Key'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.equal(h.partitions.length, 1);
-    assert.match(h.partitions[0].name, /^morde-user-/);
+    assert.match(h.partitions[0].name, /^persist:morde-user-[a-f0-9]{64}$/);
     assert.deepEqual(h.partitions[0].cookies.values.map((item) => ({ name: item.name, httpOnly: item.httpOnly, secure: item.secure, sameSite: item.sameSite })), [{ name: 'ch_portal', httpOnly: true, secure: false, sameSite: 'strict' }]);
     assert.match(h.partitions[0].cookies.values[0].url, /^http:\/\/127\.0\.0\.1:\d+$/);
     assert.match(h.views[0].options.webPreferences.preload, /morde-preload\.js$/);
@@ -697,7 +702,7 @@ test('restart renews the Web session, while logout preserves local folder mappin
     assert.equal(existsSync(checkpointFile), true);
     assert.equal(existsSync(legacyMappings), true);
     assert.equal(existsSync(legacyCheckpoint), true);
-    assert.equal(h.partitions[0].cleared, true);
+    assert.deepEqual(h.partitions[0].cleared, { storages: ['cookies'] });
     assert.equal(h.views[0].webContents.closed, true);
     assert.equal(calls.at(-1).url, 'https://portal.example/api/auth/client-logout');
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }
@@ -786,6 +791,10 @@ test('a revoked installation automatically signs out while preserving its pendin
     await h.ready();
     const signedIn = await h.invoke('morde:login', auth.origin, auth.accountName, 'password');
     assert.equal(signedIn.authenticated, true);
+    const originalPartition = h.partitions[0].name;
+    const originalLocalOrigin = h.partitions[0].cookies.values[0].url;
+    const savedLocalOrigin = JSON.parse(readFileSync(join(h.userData, 'portal-local-origin.json'), 'utf8'));
+    assert.equal(Number(new URL(originalLocalOrigin).port), savedLocalOrigin.port);
     assert.deepEqual(signedIn.syncCheckpoint, { workspaceId: 'w1234567', mode: 'upload', installationId: auth.installationId, scope: ['src'] });
     assert.equal(authorizationChecks.length, 1);
 
@@ -797,7 +806,7 @@ test('a revoked installation automatically signs out while preserving its pendin
     const signedOut = await h.invoke('morde:state');
     assert.equal(signedOut.authenticated, false);
     assert.equal(h.views[0].webContents.closed, true);
-    assert.equal(h.partitions[0].cleared, true);
+    assert.deepEqual(h.partitions[0].cleared, { storages: ['cookies'] });
     assert.equal(existsSync(join(h.userData, 'credentials.bin')), false);
     assert.equal(existsSync(mappingFile), true);
     assert.equal(existsSync(checkpointFile), true);
@@ -809,6 +818,9 @@ test('a revoked installation automatically signs out while preserving its pendin
     revoked = false;
     const restored = await h.invoke('morde:login', auth.origin, auth.accountName, 'password');
     assert.equal(restored.authenticated, true);
+    await waitFor(() => h.partitions[1]?.cookies.values[0]);
+    assert.equal(h.partitions[1].name, originalPartition);
+    assert.equal(h.partitions[1].cookies.values[0].url, originalLocalOrigin);
     assert.deepEqual(restored.syncCheckpoint, signedIn.syncCheckpoint);
     assert.equal(JSON.parse(readFileSync(checkpointFile, 'utf8')).idempotencyKey, checkpoint.idempotencyKey);
     await h.invoke('morde:logout');
@@ -819,6 +831,33 @@ test('a revoked installation automatically signs out while preserving its pendin
     globalThis.fetch = originalFetch;
     h.cleanup();
   }
+});
+
+test('retry after the initial Web session outage installs the Portal session guards', async () => {
+  const originalFetch = globalThis.fetch;
+  let online = false, webSessionCalls = 0;
+  globalThis.fetch = async (url) => {
+    if (!String(url).endsWith('/api/auth/client-web-session')) return loginFetch(url);
+    webSessionCalls++;
+    if (!online) throw new TypeError('network offline');
+    return json({ web_session_credential: 'recovered-web', web_session_expires_at: future });
+  };
+  const h = harness(auth);
+  try {
+    await h.ready();
+    await waitFor(() => h.windows[0].webContents.messages.some(([channel, state]) => channel === 'morde:state' && state.view === 'offline'),
+      'timed out waiting for the offline view');
+    assert.equal(h.partitions.length, 1);
+    assert.equal(h.views.length, 0);
+
+    online = true;
+    assert.deepEqual(await h.invoke('morde:open-assistant'), { opened: true });
+    assert.equal(webSessionCalls, 2);
+    assert.equal((await h.invoke('morde:state')).view, 'web');
+    assert.equal(h.windows[0].contentView.attached[0], h.views[0]);
+    assert.equal(typeof h.partitions[0].permissionRequest, 'function');
+    assert.equal(typeof h.partitions[0].webRequest.completed, 'function');
+  } finally { globalThis.fetch = originalFetch; h.cleanup(); }
 });
 
 test('scheduled Web session refresh keeps the desktop running during a network outage', async () => {
@@ -1590,7 +1629,7 @@ test('Workspace sync status IPC rechecks the active local binding and returns on
   }
 });
 
-test('project upload registers only folder metadata and reports a stopped Host as pending apply', async () => {
+test('project upload registers only folder metadata and waits for the Host application receipt', async () => {
   const originalFetch = globalThis.fetch;
   const Sync = require('../out/morde-sync.js').MordeSync;
   const originalRun = Sync.prototype.run;
@@ -1600,7 +1639,7 @@ test('project upload registers only folder metadata and reports a stopped Host a
   const info = statSync(directory, { bigint: true });
   const folderID = 'morde-0123456789abcdef0123456789abcdef';
   const host = {
-    id: 'h1234567', name: 'offline computer', owner_id: 'u1234567', state: 'stopped',
+    id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running',
     workspaces: [{ state: 'active', binding_version: 2, desired_revision: 9, applied_revision: 6,
       workspace: { id: 'w1234567', name: 'workspace', state: 'ready' } }],
   };
@@ -1617,6 +1656,7 @@ test('project upload registers only folder metadata and reports a stopped Host a
     if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
       supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
     if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
+    if (path.endsWith('/api/me/preferences')) return json({ default_host_id: 'h1234567' });
     if (path.endsWith('/api/hosts')) return json({ items: [host, { ...host, id: 'h7654321', owner_id: 'u7654321' }] });
     if (path.endsWith('/api/hosts/h1234567')) return json(host);
     if (path.endsWith('/api/workspaces/w1234567/sync-sessions/p2345678')) return json({
@@ -1665,7 +1705,7 @@ test('project upload registers only folder metadata and reports a stopped Host a
     await h.ready();
     const targets = await h.invoke('morde:project-upload-targets');
     assert.deepEqual(targets.map((target) => target.hostId), ['h1234567']);
-    assert.equal(targets[0].hostState, 'stopped');
+    assert.equal(targets[0].hostState, 'running');
     const selection = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
     assert.deepEqual(selection, {
       selectionID: selection.selectionID, hostId: 'h1234567', workspaceId: 'w1234567',
@@ -1678,8 +1718,8 @@ test('project upload registers only folder metadata and reports a stopped Host a
     await assert.rejects(h.invoke('morde:login', 'https://other.example', 'other', 'password'), /local Workspace operations before changing accounts/);
     releaseSyncRun();
     const conflict = await pendingConflict;
-    assert.match(confirmation.message, /offline computer/);
-    assert.match(confirmation.detail, /目标电脑：offline computer（h1234567）/);
+    assert.match(confirmation.message, /default computer/);
+    assert.match(confirmation.detail, /目标电脑：default computer（h1234567）/);
     assert.match(confirmation.detail, /完整扫描所选本机根目录/);
     assert.match(confirmation.detail, /整次扫描失败并保留恢复点/);
     assert.match(confirmation.detail, /不会把不可访问内容视为删除/);
@@ -1739,6 +1779,84 @@ test('project upload registers only folder metadata and reports a stopped Host a
   }
 });
 
+test('project sync exposes only the default computer and pauses selection when it is stopped', async () => {
+  const originalFetch = globalThis.fetch;
+  const directory = mkdtempSync(join(tmpdir(), 'morde-project-target-check-'));
+  const defaultHost = { id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'stopped',
+    workspaces: [{ state: 'active', workspace: { id: 'w1234567', state: 'ready' } }] };
+  const alternateHost = { ...defaultHost, id: 'h7654321', name: 'other computer', state: 'running',
+    workspaces: [{ state: 'active', workspace: { id: 'w7654321', state: 'ready' } }] };
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
+      supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
+    if (path.endsWith('/api/me/preferences')) return json({ default_host_id: 'h1234567' });
+    if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
+    if (path.endsWith('/api/hosts')) return json({ items: [defaultHost, alternateHost] });
+    if (path.endsWith('/api/hosts/h1234567/sync-folders')) return json({ items: [] });
+    if (path.endsWith('/api/hosts/h1234567')) return json(defaultHost);
+    if (path.endsWith('/api/hosts/h7654321')) return json(alternateHost);
+    if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });
+    throw new Error('unexpected metadata request ' + path);
+  };
+  const h = harness(auth);
+  let pickerOpened = false;
+  h.dialog.showOpenDialog = async () => { pickerOpened = true; return { canceled: false, filePaths: [directory] }; };
+  try {
+    await h.ready();
+    const targets = await h.invoke('morde:project-upload-targets');
+    assert.deepEqual(targets.map((target) => target.hostId), ['h1234567']);
+    assert.match(targets[0].blockedMessage, /默认云端电脑未运行/);
+    await assert.rejects(h.invoke('morde:project-select-directory', 'h7654321', 'w7654321'), /默认云端电脑已更改/);
+    await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /默认云端电脑未运行/);
+    assert.equal(pickerOpened, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('project upload stops if the account default changes while confirmation is open', async () => {
+  const originalFetch = globalThis.fetch;
+  const Sync = require('../out/morde-sync.js').MordeSync;
+  const originalRun = Sync.prototype.run;
+  const projectRoot = mkdtempSync(join(homedir(), 'morde-project-default-change-'));
+  const directory = join(projectRoot, 'demo');
+  mkdirSync(directory);
+  const host = { id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running',
+    workspaces: [{ state: 'active', workspace: { id: 'w1234567', state: 'ready' } }] };
+  let defaultHostID = 'h1234567', registered = false, syncStarted = false;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
+      supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
+    if (path.endsWith('/api/me/preferences')) return json({ default_host_id: defaultHostID });
+    if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
+    if (path.endsWith('/api/hosts/h1234567/sync-folders') && options.method === 'POST') { registered = true; return json({}, 201); }
+    if (path.endsWith('/api/hosts/h1234567/sync-folders')) return json({ items: [] });
+    if (path.endsWith('/api/hosts/h1234567')) return json(host);
+    if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });
+    throw new Error('unexpected metadata request ' + path);
+  };
+  Sync.prototype.run = async () => { syncStarted = true; throw new Error('sync must not start after the default target changes'); };
+  const h = harness(auth);
+  h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
+  h.dialog.showMessageBox = async () => { defaultHostID = 'h7654321'; return { response: 0 }; };
+  try {
+    await h.ready();
+    const selection = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
+    await assert.rejects(h.invoke('morde:project-upload', selection.selectionID, 'demo'), /默认云端电脑已更改/);
+    assert.equal(registered, false);
+    assert.equal(syncStarted, false);
+  } finally {
+    Sync.prototype.run = originalRun;
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('legacy project mappings receive a private source binding before reuse', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => loginFetch(url);
@@ -1780,7 +1898,7 @@ test('project upload resumes the same confirmed session after desktop restart', 
   mkdirSync(directory);
   const folderID = 'morde-abcdef0123456789abcdef0123456789';
   const host = {
-    id: 'h1234567', name: 'stopped computer', owner_id: 'u1234567', state: 'stopped',
+    id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running',
     workspaces: [{ state: 'active', binding_version: 4, desired_revision: 3, applied_revision: 2,
       workspace: { id: 'w1234567', name: 'workspace', state: 'ready' } }],
   };
@@ -1792,6 +1910,7 @@ test('project upload resumes the same confirmed session after desktop restart', 
     const path = String(url);
     if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
       supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
+    if (path.endsWith('/api/me/preferences')) return json({ default_host_id: 'h1234567' });
     if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
     if (path.endsWith('/api/hosts/h1234567')) return json(host);
     if (path.endsWith('/api/workspaces/w1234567/sync-sessions/p1234567')) return json({
@@ -1943,6 +2062,7 @@ test('project upload rejects a replaced local directory before registration or t
     calls.push({ path, method: options.method || 'GET' });
     if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
       supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
+    if (path.endsWith('/api/me/preferences')) return json({ default_host_id: 'h1234567' });
     if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
     if (path.endsWith('/api/hosts/h1234567')) return json(host);
     if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });
@@ -1984,6 +2104,7 @@ test('project upload keeps a missing local root from becoming an empty upload', 
     calls.push({ path, method: options.method || 'GET' });
     if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
       supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync', 'project_upload'] });
+    if (path.endsWith('/api/me/preferences')) return json({ default_host_id: 'h1234567' });
     if (path.endsWith('/api/me')) return json({ id: 'u1234567' });
     if (path.endsWith('/api/hosts/h1234567')) return json(host);
     if (path.endsWith('/api/auth/client-web-session')) return json({ web_session_credential: 'portal-session', web_session_expires_at: future });

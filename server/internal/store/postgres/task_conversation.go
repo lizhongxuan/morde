@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"morde/server/internal/app"
@@ -786,7 +787,7 @@ func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, c
 	if !domain.ValidUserID(actorID) || !domain.ValidConversationID(conversationID) || (projectID != "" && !project.ValidID(projectID)) {
 		return app.TaskPage{}, domain.NewError(domain.CodeNotFound, "conversation not found")
 	}
-	if view != app.ConversationTaskViewActive && view != app.ConversationTaskViewRecent {
+	if view != app.ConversationTaskViewActive && view != app.ConversationTaskViewRecent && view != app.ConversationTaskViewPanel {
 		return app.TaskPage{}, domain.InvalidArgument("view", "conversation task view is invalid")
 	}
 	for _, hostID := range hostIDs {
@@ -794,7 +795,7 @@ func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, c
 			return app.TaskPage{}, domain.InvalidArgument("host_ids", "host id is invalid")
 		}
 	}
-	limit, cursorAt, cursorID, err := pagination(page.Limit, page.Cursor)
+	limit, cursorAt, cursorID, cursorRank, err := conversationTaskPagination(page, view)
 	if err != nil {
 		return app.TaskPage{}, err
 	}
@@ -820,7 +821,7 @@ func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, c
 		queries := sqlcgen.New(tx)
 		rows, err = queries.ListConversationTasks(ctx, sqlcgen.ListConversationTasksParams{
 			ConversationID: conversationID, ProjectID: nullableText(projectID), ActorID: actorID, TaskView: string(view),
-			HostIds: hostIDs, CursorAt: cursorAt, CursorID: cursorID, PageLimit: limit + 1,
+			HostIds: hostIDs, CursorAt: cursorAt, CursorRank: cursorRank, CursorID: cursorID, PageLimit: limit + 1,
 		})
 		if err != nil {
 			return err
@@ -859,11 +860,40 @@ func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, c
 		return app.TaskPage{}, fmt.Errorf("list conversation tasks: %w", err)
 	}
 	result := app.TaskPage{Items: items, K2Projections: k2Projections, PendingCountsByHostID: pendingCountsByHostID}
-	result.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
+	if view == app.ConversationTaskViewPanel {
+		result.NextCursor = nextConversationTaskPanelCursor(items, limit)
+	} else {
+		result.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
+	}
 	if int32(len(items)) > limit {
 		result.Items = items[:limit]
 	}
 	return result, nil
+}
+
+func conversationTaskPagination(page app.PageRequest, view app.ConversationTaskView) (int32, pgtype.Timestamptz, string, int32, error) {
+	limit, cursorAt, cursorID, err := pagination(page.Limit, page.Cursor)
+	if err != nil || view != app.ConversationTaskViewPanel || !cursorAt.Valid {
+		return limit, cursorAt, cursorID, 0, err
+	}
+	rankText, id, ok := strings.Cut(cursorID, ":")
+	rank, parseErr := strconv.ParseInt(rankText, 10, 32)
+	if !ok || parseErr != nil || (rank != 0 && rank != 1) || !domain.ValidTaskID(id) {
+		return 0, pgtype.Timestamptz{}, "", 0, domain.InvalidArgument("cursor", "page cursor is invalid")
+	}
+	return limit, cursorAt, id, int32(rank), nil
+}
+
+func nextConversationTaskPanelCursor(items []task.Task, pageSize int32) string {
+	if int32(len(items)) <= pageSize || pageSize < 1 {
+		return ""
+	}
+	item := items[pageSize-1]
+	rank := 1
+	if item.Status == task.StatusRunning {
+		rank = 0
+	}
+	return app.EncodePageCursor(item.UpdatedAt, strconv.Itoa(rank)+":"+item.ID)
 }
 
 func (s *Store) attachConversationMessageAttachmentIDs(ctx context.Context, ownerID, conversationID string, items []conversation.Message) error {

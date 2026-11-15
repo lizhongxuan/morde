@@ -85,8 +85,9 @@ function proxyRequest(request: IncomingMessage, response: ServerResponse, servic
   request.pipe(upstream);
 }
 
-export async function startLocalPortalServer(directory: string, serviceOrigin: string, hostFrameSource?: string): Promise<LocalPortalServer> {
+export async function startLocalPortalServer(directory: string, serviceOrigin: string, hostFrameSource?: string, port = 0): Promise<LocalPortalServer> {
   if (!isAbsolute(directory)) throw new Error("Portal asset directory must be absolute");
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("Invalid local Portal port");
   const service = new URL(serviceOrigin);
   if ((service.protocol !== "https:" && !(service.protocol === "http:" && ["localhost", "portal.localhost", "127.0.0.1", "[::1]"].includes(service.hostname))) ||
     service.username || service.password || service.pathname !== "/" || service.search || service.hash) throw new Error("Invalid Morde service origin");
@@ -145,7 +146,7 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
     });
   });
 
-  server.listen(0, "127.0.0.1");
+  server.listen(port, "127.0.0.1");
   await once(server, "listening");
   server.unref();
   const address = server.address();

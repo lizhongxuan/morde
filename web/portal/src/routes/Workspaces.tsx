@@ -297,7 +297,7 @@ export function Workspaces({ projectSyncOnly = false }: { projectSyncOnly?: bool
 function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof useAuth>['user']; projectSyncOnly: boolean }) {
   const client = useQueryClient();
   const { notify } = useToast();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const computerID = searchParams.get('host') ?? '';
   const [selected, setSelected] = useState<Workspace | null>(null);
   const [legacyCreateRecovery, setLegacyCreateRecovery] = useState(() => readPendingWorkspaceCreate(user?.id));
@@ -318,7 +318,6 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
   const [writersStoppedConfirmed, setWritersStoppedConfirmed] = useState(false);
   const projectBridge = portalProjectBridge();
   const projectBridgeAvailable = Boolean(projectBridge?.projectUploadTargets && projectBridge.selectProjectDirectory);
-  const [selectedProjectTargetKey, setSelectedProjectTargetKey] = useState('');
   const [projectDirectorySelection, setProjectDirectorySelection] = useState<ProjectDirectorySelection | null>(null);
   const [projectNameDraft, setProjectNameDraft] = useState('');
   const [confirmedProjectName, setConfirmedProjectName] = useState('');
@@ -379,13 +378,15 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     enabled: projectUploadGateEnabled,
     retry: false,
   });
+  const defaultHostID = projectPreferences.data?.default_host_id ?? null;
   const projectTargets = useQuery({
-    queryKey: ['project-upload-targets', user?.id],
+    queryKey: ['project-upload-targets', user?.id, defaultHostID],
     queryFn: async () => {
       if (!projectBridge?.projectUploadTargets) throw new Error('当前桌面客户端不支持项目目录选择。');
-      return parseProjectUploadTargets(await projectBridge.projectUploadTargets());
+      return parseProjectUploadTargets(await projectBridge.projectUploadTargets()).filter((target) => target.hostId === defaultHostID);
     },
-    enabled: projectBridgeAvailable && projectCapabilities.isSuccess && projectUploadGateEnabled,
+    enabled: projectBridgeAvailable && projectCapabilities.isSuccess && projectUploadGateEnabled
+      && projectPreferences.isSuccess && Boolean(defaultHostID),
     retry: false,
   });
   const hosts = useQuery({
@@ -394,18 +395,23 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       || host.workspaces.some((binding) => binding.state === 'preparing' || binding.state === 'active' || binding.state === 'unbinding')) ? 3000 : false,
   });
   const computer = computerID ? hosts.data?.items.find((host) => host.id === computerID && host.owner_id === user?.id) : undefined;
-  const configuredDefaultHost = hosts.data?.items.find((host) => host.owner_id === user?.id
-    && host.id === projectPreferences.data?.default_host_id);
-  const configuredDefaultWorkspace = configuredDefaultHost?.workspaces.find((binding) => binding.state !== 'detached');
+  const configuredDefaultHost = hosts.data?.items.find((host) => host.owner_id === user?.id && host.id === defaultHostID);
+  const activeDefaultBindings = configuredDefaultHost?.workspaces.filter((binding) => binding.state !== 'detached') ?? [];
+  const configuredDefaultWorkspace = activeDefaultBindings.length === 1 ? activeDefaultBindings[0] : undefined;
+  const configuredDefaultWorkspaceReady = Boolean(configuredDefaultWorkspace?.state === 'active'
+    && configuredDefaultWorkspace.workspace.state === 'ready' && configuredDefaultWorkspace.sync_state === 'healthy'
+    && configuredDefaultWorkspace.sync_conflicts.length === 0
+    && configuredDefaultWorkspace.applied_revision === configuredDefaultWorkspace.desired_revision
+    && configuredDefaultWorkspace.applied_revision === configuredDefaultWorkspace.workspace.revision);
   const configuredDefaultProjectTarget = configuredDefaultHost && configuredDefaultWorkspace
-    ? projectTargets.data?.find((target) => target.hostId === configuredDefaultHost.id
+    ? projectTargets.data?.find((target) => target.hostId === defaultHostID
       && target.workspaceId === configuredDefaultWorkspace.workspace.id)
     : undefined;
-  const requestedProjectTarget = computer && projectTargets.data?.find((target) => target.hostId === computerID);
-  const selectedProjectTarget = computerID ? requestedProjectTarget
-    : projectTargets.data?.find((target) => `${target.hostId}/${target.workspaceId}` === selectedProjectTargetKey)
-    ?? configuredDefaultProjectTarget
-    ?? (projectPreferences.isSuccess && !projectPreferences.data.default_host_id ? projectTargets.data?.[0] : undefined);
+  const projectTargetRouteMismatch = projectPreferences.isSuccess && Boolean(computerID && computerID !== defaultHostID);
+  const selectedProjectTarget = projectTargetRouteMismatch ? undefined : configuredDefaultProjectTarget;
+  const selectedProjectTargetUnavailable = !selectedProjectTarget || selectedProjectTarget.hostState !== 'running'
+    || configuredDefaultHost?.workspace_runtime_online !== true || !configuredDefaultWorkspaceReady
+    || projectPreferences.isFetching || projectTargets.isFetching || Boolean(selectedProjectTarget.blockedMessage);
   const scopedProjectState = localProjectState;
   const scopedProjectSelection = projectDirectorySelection;
   const savedProjectSelection = scopedProjectState?.projectMappings.find((item) => item.hostId === selectedProjectTarget?.hostId
@@ -653,7 +659,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     catch (error) { notify(errorDetails(error).message, 'error'); }
   };
   const chooseProjectDirectory = async () => {
-    if (!selectedProjectTarget || !projectUploadGateEnabled || !projectBridge?.selectProjectDirectory) return;
+    if (!selectedProjectTarget || selectedProjectTargetUnavailable || !projectUploadGateEnabled || !projectBridge?.selectProjectDirectory) return;
     const target = selectedProjectTarget;
     const ownerID = user?.id;
     const revision = ++projectSelectionRevision.current;
@@ -787,7 +793,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       }}>{restoreWorkflowBusy ? '正在核对并恢复…' : '核对状态并继续恢复'}</button>}
     </FloatingNotice>}
     <section className="design-panel" aria-labelledby="project-upload-title">
-      <div className="design-panel-header"><div><h2 id="project-upload-title">文件同步</h2><p>选择云端电脑和本机文件夹，手动单向同步到电脑的项目目录。</p></div></div>
+      <div className="design-panel-header"><div><h2 id="project-upload-title">文件同步</h2><p>将本机文件夹手动单向同步到默认云端电脑的项目目录。</p></div></div>
       {!projectBridgeAvailable && <p className="muted" role="status">本机文件同步需要 Morde 桌面客户端，请在桌面客户端继续。</p>}
       {projectBridgeAvailable && projectCapabilities.isPending && <FloatingNotice className="notice-info">正在确认服务端文件同步能力…</FloatingNotice>}
       {projectBridgeAvailable && projectCapabilities.isError && <FloatingError>无法确认服务端项目同步能力。为保护云端数据，项目目录和同步操作已关闭。<button type="button" className="button button-secondary button-small" onClick={() => void projectCapabilities.refetch()}>重试</button></FloatingError>}
@@ -803,60 +809,31 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         disabled={!projectBridge?.stopProjectSync || projectStopBusy} onClick={() => void stopProjectUpload()}>{projectStopBusy ? '正在停止…' : '停止同步'}</button>}
       {projectBridgeAvailable && projectUploadGateEnabled && <>
         {projectPreferences.isPending && <FloatingNotice className="notice-info">正在读取默认云端电脑设置…</FloatingNotice>}
-        {projectPreferences.isError && <FloatingError>无法读取默认电脑设置。请重试，或在下方手动选择已授权目标。<button type="button" className="button button-secondary button-small" onClick={() => void projectPreferences.refetch()}>重试</button></FloatingError>}
-        {projectTargets.isPending && <FloatingNotice className="notice-info">正在读取当前账号可用的云端电脑…</FloatingNotice>}
-        {projectTargets.isError && <FloatingError>无法读取云端电脑列表。请检查桌面连接后重试。 <button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></FloatingError>}
-        {projectTargets.isSuccess && !projectTargets.data.length && <p className="empty-card">当前账号没有可用于项目同步的云端电脑。</p>}
-        {projectTargets.isSuccess && projectTargets.data.length > 0 && <>
-          {computerID && !requestedProjectTarget && hosts.isSuccess && <p className="notice notice-warning" role="status">无法确认链接指定的云端电脑文件访问权限。请手动选择有权限的电脑；系统不会自动切换目标。</p>}
-          {projectPreferences.isSuccess && projectPreferences.data.default_host_id && (hosts.isSuccess || hosts.isError) && !configuredDefaultProjectTarget && <p className="notice notice-warning" role="status">
-            {hosts.isError
-              ? '无法核对设置中的默认电脑文件目录。请先重试读取主机状态，或手动选择已授权目标；系统不会自动切换目标。'
-              : '设置中的默认电脑当前不可用于目录选择。请手动选择一个可用目标；系统不会自动切换目标。'}
-          </p>}
-          <ScreenPagination
-            items={projectTargets.data}
-            getKey={(target) => `${target.hostId}/${target.workspaceId}`}
-            estimatedItemHeight={62}
-            height="min(max(calc(100dvh - 470px), 74px), 180px)"
-            gap={6}
-            ariaLabel="项目同步目标"
-            className="project-target-list"
-            renderItem={(target) => {
-              const key = `${target.hostId}/${target.workspaceId}`;
-              const isSelected = (selectedProjectTarget?.hostId === target.hostId && selectedProjectTarget.workspaceId === target.workspaceId);
-              const isConfiguredDefault = configuredDefaultHost?.id === target.hostId
-                && configuredDefaultWorkspace?.workspace.id === target.workspaceId;
-              return <article className="schedule-card" style={{ padding: '8px 10px' }}>
-                <div className="schedule-card-heading">
-                  <div><strong>{target.hostName}{isConfiguredDefault && <small className="table-sub"> · 默认</small>}</strong><span>{target.hostState === 'running' ? '运行中' : '已停止'} · 已有项目 {target.folders.length} 个</span></div>
-                  <button type="button" className={`button ${isSelected ? 'button-primary' : 'button-secondary'} button-small`} aria-pressed={isSelected}
-                    disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running'}
-                    onClick={() => {
-                      if (selectedProjectTargetKey === key && computerID === target.hostId) return;
-                      projectSelectionRevision.current += 1;
-                      setSelectedProjectTargetKey(key);
-                      setSearchParams((current) => {
-                        const next = new URLSearchParams(current);
-                        next.set('host', target.hostId);
-                        return next;
-                      }, { replace: true });
-                      setProjectDirectorySelection(null);
-                      setProjectNameDraft('');
-                      setConfirmedProjectName('');
-                      setProjectNameError('');
-                      setProjectDirectoryError('');
-                      setProjectDirectoryNotice('');
-                    }}>使用此目标</button>
-                </div>
-                {target.blockedMessage && isSelected && <small className="table-sub">{target.blockedMessage}</small>}
-              </article>;
-            }}
-          />
-          {selectedProjectTarget && <div className="form-stack" style={{ marginTop: 10 }}>
-            {selectedProjectTarget.blockedMessage && <p className="notice notice-warning" role="status">{selectedProjectTarget.blockedMessage}</p>}
+        {projectPreferences.isError && <FloatingError>无法读取默认电脑设置，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectPreferences.refetch()}>重试</button></FloatingError>}
+        {projectPreferences.isSuccess && !defaultHostID && <p className="notice notice-warning" role="status">尚未设置默认云端电脑。请先在<Link to="/hosts">云端电脑页面</Link>设置默认电脑；文件同步不会改用其他电脑。</p>}
+        {projectTargetRouteMismatch && <p className="notice notice-warning" role="status">此链接指定的电脑已不是当前默认电脑，文件同步已暂停。请从<Link to="/hosts?sync=1">云端电脑页面</Link>重新打开默认电脑的同步入口。</p>}
+        {defaultHostID && hosts.isPending && <FloatingNotice className="notice-info">正在核对默认云端电脑和文件目录…</FloatingNotice>}
+        {defaultHostID && hosts.isError && <FloatingError>无法核对默认云端电脑及其文件目录，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
+        {defaultHostID && hosts.isSuccess && !configuredDefaultHost && <p className="notice notice-warning" role="status">默认云端电脑不可用或已失去访问权限。请先检查默认电脑设置；文件同步不会改用其他电脑。</p>}
+        {configuredDefaultHost && configuredDefaultHost.state !== 'running' && <p className="notice notice-warning" role="status">默认云端电脑当前{hostStateLabel[configuredDefaultHost.state] || configuredDefaultHost.state}，同步已暂停。请先恢复默认电脑。</p>}
+        {configuredDefaultHost?.state === 'running' && configuredDefaultHost.workspace_runtime_online !== true && <p className="notice notice-warning" role="status">默认云端电脑的文件服务未确认在线，文件同步已暂停。</p>}
+        {configuredDefaultHost && !configuredDefaultWorkspace && <p className="notice notice-warning" role="status">默认云端电脑的文件目录未就绪或无法唯一确认，文件同步已暂停。</p>}
+        {configuredDefaultWorkspace && !configuredDefaultWorkspaceReady && <p className="notice notice-warning" role="status">默认云端电脑的文件状态未确认完成或存在冲突，文件同步已暂停。</p>}
+        {projectPreferences.isSuccess && Boolean(defaultHostID) && configuredDefaultHost && configuredDefaultWorkspace && projectTargets.isPending
+          && <FloatingNotice className="notice-info">正在核对默认电脑的项目同步权限…</FloatingNotice>}
+        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <FloatingError>无法核对默认电脑的项目同步权限，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></FloatingError>}
+        {projectTargets.isSuccess && defaultHostID && configuredDefaultHost && configuredDefaultWorkspace && !configuredDefaultProjectTarget
+          && <p className="notice notice-warning" role="status">默认云端电脑当前不可用于项目同步（目录未就绪、授权变化或仍有旧版同步）。文件同步已暂停，不会切换到其他电脑。</p>}
+        {configuredDefaultProjectTarget && <article className="schedule-card" role="group" aria-label="同步目标电脑" style={{ padding: '8px 10px' }}>
+          <div className="schedule-card-heading">
+            <div><strong>{configuredDefaultProjectTarget.hostName} · 默认电脑</strong><span>{configuredDefaultProjectTarget.hostState === 'running' ? '运行中' : '已停止'} · 已有项目 {configuredDefaultProjectTarget.folders.length} 个</span></div>
+          </div>
+          <p className="muted">目标目录：~/workspace/project/&lt;项目名&gt;/</p>
+          {configuredDefaultProjectTarget.blockedMessage && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}
+        </article>}
+        {selectedProjectTarget && !selectedProjectTargetUnavailable && <div className="form-stack" style={{ marginTop: 10 }}>
             <div className="inline-actions">
-              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running' || Boolean(selectedProjectTarget.blockedMessage)} onClick={() => void chooseProjectDirectory()}>
+              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running'} onClick={() => void chooseProjectDirectory()}>
                 {projectDirectoryBusy ? '正在打开目录选择器…' : projectSelectionMatchesTarget ? '重新选择本机目录' : '选择本机目录'}
               </button>
               {projectSelectionMatchesTarget && scopedProjectSelection && <span role="status">已选：{scopedProjectSelection.directoryName}</span>}
@@ -884,7 +861,6 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
               </div>
             </>}
           </div>}
-        </>}
       </>}
       {projectCheckpoint?.legacyRecovery && <div className="notice notice-warning" role="status">
         <p>检测到旧版项目同步恢复点，缺少服务端来源身份，不能自动续传。核对云端 session 后可清除本机恢复点；这不会删除云端文件，也不会将旧记录中的本机删除操作同步到云端。</p>

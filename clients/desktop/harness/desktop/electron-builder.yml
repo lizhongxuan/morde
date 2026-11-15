@@ -19,6 +19,9 @@ extraResources:
   - from: ../../../../web/portal/dist
     to: portal
     filter: ["index.html", "assets/**/*", "ocr/**/*"]
+  - from: ../../../../web/workbench/dist
+    to: workbench
+    filter: ["index.html", "assets/**/*"]
   - from: bin
     to: bin
     filter: ["morde-sync", "morde-sync.exe", "morde-sync.sha256", "morde-syncthing", "morde-syncthing.exe", "morde-syncthing.sha256"]

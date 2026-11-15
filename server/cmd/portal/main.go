@@ -49,6 +49,18 @@ import (
 )
 
 const defaultConfigPath = "/etc/cloudhost/portal.yaml"
+const legacyPCPortalEnabledEnv = "CH_PORTAL_LEGACY_PC_ENABLED"
+
+func parseLegacyPCPortalEnabled(value string, set bool) (bool, error) {
+	if !set {
+		return true, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean: %w", legacyPCPortalEnabledEnv, err)
+	}
+	return enabled, nil
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -140,6 +152,10 @@ func parseConfigFlag(name string, args []string, stderr io.Writer) (string, erro
 
 func serve(ctx context.Context, configPath string) error {
 	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	legacyPCPortalEnabled, err := parseLegacyPCPortalEnabled(os.LookupEnv(legacyPCPortalEnabledEnv))
 	if err != nil {
 		return err
 	}
@@ -792,7 +808,7 @@ func serve(ctx context.Context, configPath string) error {
 		SessionTTL: cfg.Security.SessionTTL,
 		HostScheme: cfg.Domains.Scheme, PortalDomain: cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
 		PreviewPortMin: cfg.Gateway.PreviewPortMin, PreviewPortDeny: cfg.Gateway.PreviewPortDeny,
-		PortalFiles: os.DirFS(cfg.PortalWeb.Dir),
+		PortalFiles: os.DirFS(cfg.PortalWeb.Dir), LegacyPCPortalEnabled: legacyPCPortalEnabled,
 	})
 	if err != nil {
 		return err

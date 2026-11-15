@@ -7,6 +7,7 @@ import (
 
 func TestClientCredentialsCanUseOutboxRoutesOnlyForUserOperations(t *testing.T) {
 	for _, item := range []struct{ method, path string }{
+		{http.MethodGet, "/api/me/task-approvals"},
 		{http.MethodGet, "/api/conversations/:id/tasks"},
 		{http.MethodGet, "/api/conversations/:id/message-uploads/:client_message_id"},
 		{http.MethodPut, "/api/conversations/:id/message-uploads/:client_message_id"},

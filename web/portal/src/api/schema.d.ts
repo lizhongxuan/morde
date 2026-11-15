@@ -452,6 +452,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me/task-approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List approval snapshots visible to the current user
+         * @description Requires current task-control authorization to see unexpired pending approvals and task-read authorization to see handled or expired snapshots, plus current project membership. Pending approvals are actionable only while unexpired; handled approvals remain available as read-only snapshots. pending_count counts the full set of unexpired approvals the caller can handle, independent of pagination. A conversation_id filter returns only that conversation's records and count. Request hashes, tool call IDs, credentials and private runtime details are never returned.
+         */
+        get: operations["listMyTaskApprovals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/me/invite-code": {
         parameters: {
             query?: never;
@@ -2734,8 +2754,8 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List visible active tasks in a shared conversation */
-        get: operations["listProjectConversationActiveTasks"];
+        /** List visible tasks in a shared conversation */
+        get: operations["listProjectConversationTasks"];
         put?: never;
         post?: never;
         delete?: never;
@@ -9535,6 +9555,50 @@ export interface components {
             items: components["schemas"]["TaskSummary"][];
             next_cursor: string | null;
         };
+        TaskApprovalPage: {
+            items: components["schemas"]["TaskApprovalItem"][];
+            next_cursor: string | null;
+            /**
+             * Format: int64
+             * @description Full current-account count of unexpired pending approvals the caller can handle in this query scope.
+             */
+            pending_count: number;
+        };
+        TaskApprovalItem: {
+            task_id: components["schemas"]["TaskId"];
+            conversation_id: components["schemas"]["ConversationId"];
+            project_id: string | null;
+            host_id: string | null;
+            task_status: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            task_event_sequence: number;
+            /** Format: date-time */
+            task_updated_at: string;
+            approval: components["schemas"]["TaskApprovalSnapshot"];
+        };
+        /** @description Authorized request context retained after approval or rejection so a conversation timeline can restore the read-only card. Expired pending requests are returned with status expired and cannot be answered. */
+        TaskApprovalSnapshot: {
+            id: components["schemas"]["ClarificationId"];
+            version: number;
+            /** @enum {string} */
+            status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
+            /** @enum {string} */
+            decision: "" | "approve" | "reject";
+            /** @constant */
+            kind: "approval";
+            title: string;
+            object: string;
+            content: string;
+            impact: string;
+            disclosures: components["schemas"]["TaskApprovalDisclosures"];
+            /** Format: date-time */
+            expires_at: string | null;
+            /** Format: date-time */
+            responded_at: string | null;
+            /** Format: date-time */
+            created_at: string;
+            media_preview_operation_id?: components["schemas"]["OperationId"];
+        };
         ConversationActiveTask: components["schemas"]["TaskSummary"] & {
             /** Format: int64 */
             event_sequence: number;
@@ -11087,6 +11151,35 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyTaskApprovals: {
+        parameters: {
+            query?: {
+                conversation_id?: components["schemas"]["ConversationId"];
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorized approval snapshots ordered by request creation time */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskApprovalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };
@@ -14877,9 +14970,11 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listProjectConversationActiveTasks: {
+    listProjectConversationTasks: {
         parameters: {
             query?: {
+                /** @description Task status view. Defaults to active; panel combines active and recent tasks with running tasks first, then update time descending and task ID descending. */
+                view?: "active" | "recent" | "panel";
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];
@@ -16398,8 +16493,8 @@ export interface operations {
     listConversationTasks: {
         parameters: {
             query?: {
-                /** @description Task status view. Defaults to active. */
-                view?: "active" | "recent";
+                /** @description Task status view. Defaults to active; panel combines active and recent tasks with running tasks first, then update time descending and task ID descending. */
+                view?: "active" | "recent" | "panel";
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];

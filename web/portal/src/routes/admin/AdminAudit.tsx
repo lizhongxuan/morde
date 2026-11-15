@@ -34,7 +34,7 @@ export function AdminAudit() {
     </form>
     <section className="form-card release-audit" aria-labelledby="release-audit-heading">
       <h2 id="release-audit-heading">桌面发行验收</h2>
-      {releases.isPending ? <p role="status">正在读取已验收发行…</p> : releases.isError ? <FloatingError className="error-card" role="alert">{releases.error instanceof Error ? releases.error.message : '暂时无法读取桌面发行记录'}</FloatingError> : releases.data.artifacts.length === 0 ? <p className="muted">当前没有通过平台验收的桌面发行包。</p> : <div className="table-wrap"><table><thead><tr><th>版本</th><th>平台</th><th>验收时间</th><th>签名</th><th>已验收能力</th><th>证据编号</th></tr></thead><tbody>
+      {releases.isPending ? <p role="status">正在读取已验收发行…</p> : releases.isError ? <FloatingError className="error-card" role="alert">{releases.error instanceof Error ? releases.error.message : '暂时无法读取桌面发行记录'}</FloatingError> : releases.data.artifacts.length === 0 ? <p className="muted">当前没有通过平台验收的桌面发行包。</p> : <div className="table-wrap"><table><thead><tr><th>版本</th><th>平台</th><th>验收时间</th><th>签名</th><th>已验收能力</th><th>证据编号</th><th>安装包</th></tr></thead><tbody>
         {releases.data.artifacts.map((item) => <tr key={`${item.platform}:${item.architecture}`}>
           <td>{releases.data.version}</td>
           <td>{item.platform} · {item.architecture}</td>
@@ -42,6 +42,7 @@ export function AdminAudit() {
           <td><code>{item.acceptance.signature_status}</code></td>
           <td>{item.acceptance.capabilities.map((capability) => desktopCapabilityNames[capability]).join('、')}</td>
           <td><code>{item.acceptance.evidence_ref}</code></td>
+          <td><a className="button button-small button-secondary" href={item.download_url} download={item.filename} aria-label={`下载 ${item.filename}`}>下载</a></td>
         </tr>)}
       </tbody></table></div>}
     </section>

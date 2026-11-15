@@ -38,6 +38,9 @@ type taskServiceStub struct {
 	conversationTaskID     string
 	conversationTaskView   app.ConversationTaskView
 	conversationTaskCalls  int
+	approvalConversationID string
+	approvalPage           app.TaskApprovalPage
+	approvalCalls          int
 	getID                  string
 	getDetails             *app.TaskDetails
 	stepDetail             app.TaskStepDetail
@@ -212,6 +215,12 @@ func (s *taskServiceStub) ListConversationTasks(_ context.Context, _ identity.Pr
 	s.conversationTaskID = id
 	s.conversationTaskView = view
 	return s.conversationTasks, s.err
+}
+
+func (s *taskServiceStub) ListTaskApprovals(_ context.Context, _ identity.Principal, conversationID string, _ app.PageRequest) (app.TaskApprovalPage, error) {
+	s.approvalCalls++
+	s.approvalConversationID = conversationID
+	return s.approvalPage, s.err
 }
 
 func (s *taskServiceStub) Get(_ context.Context, _ identity.Principal, id string) (app.TaskDetails, error) {
@@ -1389,11 +1398,53 @@ func TestConversationTasksAcceptsRecentViewAndRejectsInvalidViews(t *testing.T) 
 	if response.Code != http.StatusOK || service.conversationTaskView != app.ConversationTaskViewRecent {
 		t.Fatalf("recent tasks response=%d view=%q body=%s", response.Code, service.conversationTaskView, response.Body.String())
 	}
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/tasks?view=panel", nil))
+	if response.Code != http.StatusOK || service.conversationTaskView != app.ConversationTaskViewPanel {
+		t.Fatalf("panel tasks response=%d view=%q body=%s", response.Code, service.conversationTaskView, response.Body.String())
+	}
 	calls := service.conversationTaskCalls
 	response = httptest.NewRecorder()
 	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/tasks?view=all", nil))
 	if response.Code != http.StatusBadRequest || service.conversationTaskCalls != calls {
 		t.Fatalf("invalid view response=%d list calls=%d want=%d body=%s", response.Code, service.conversationTaskCalls, calls, response.Body.String())
+	}
+}
+
+func TestTaskApprovalListReturnsAuthorizedSnapshotShapeAndFilter(t *testing.T) {
+	now := time.Now().UTC()
+	service := &taskServiceStub{approvalPage: app.TaskApprovalPage{
+		Items: []app.TaskApproval{{TaskID: "q1234567", ConversationID: "c1234567", ProjectID: "j1234567", HostID: "h1234567",
+			TaskStatus: task.StatusWaitingUser, TaskEventSeq: 9, TaskUpdatedAt: now,
+			Request: task.PendingRequest{ID: "r1234567", TaskID: "q1234567", Version: 2, Kind: "approval", Title: "Confirm access",
+				Object: "Workspace", Content: "Read selected file", Impact: "File content may be disclosed", Status: task.PendingRequestApproved,
+				Decision: task.PendingDecisionApprove, CreatedAt: now, RespondedAt: &now}}}, NextCursor: "next", PendingCount: 3,
+	}}
+	engine := taskAPIRouter(service, nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/me/task-approvals?conversation_id=c1234567&limit=1", nil))
+	var body taskApprovalPageResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK || service.approvalCalls != 1 ||
+		response.Header().Get("Cache-Control") != "private, no-store" || response.Header().Get("Pragma") != "no-cache" ||
+		service.approvalConversationID != "c1234567" || len(body.Items) != 1 || body.NextCursor == nil || *body.NextCursor != "next" || body.PendingCount != 3 ||
+		body.Items[0].Approval.Status != "approved" || body.Items[0].Approval.Decision != task.PendingDecisionApprove || body.Items[0].ProjectID == nil ||
+		*body.Items[0].ProjectID != "j1234567" || body.Items[0].TaskEventSequence != 9 || strings.Contains(response.Body.String(), "request_hash") || strings.Contains(response.Body.String(), "tool_name") {
+		t.Fatalf("task approvals = %d %s page=%#v err=%v", response.Code, response.Body.String(), body, err)
+	}
+}
+
+func TestTaskApprovalSnapshotReturnsExpiredStatusForPastPendingRequest(t *testing.T) {
+	now := time.Now().UTC()
+	expiresAt := now.Add(-time.Minute)
+	value := app.TaskApproval{
+		TaskID: "q1234567", ConversationID: "c1234567", TaskStatus: task.StatusWaitingUser, TaskEventSeq: 2, TaskUpdatedAt: now,
+		Request: task.PendingRequest{ID: "r1234567", TaskID: "q1234567", Version: 1, Kind: "approval", Title: "Confirm access",
+			Object: "Workspace", Content: "Read selected file", Impact: "File content may be disclosed", Status: task.PendingRequestPending,
+			CreatedAt: now.Add(-2 * time.Minute), ExpiresAt: &expiresAt},
+	}
+	response, err := toTaskApprovalResponse(value)
+	if err != nil || response.Approval.Status != string(task.PendingRequestExpired) || response.Approval.Decision != "" {
+		t.Fatalf("expired pending snapshot = %#v err=%v", response, err)
 	}
 }
 

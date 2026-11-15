@@ -1041,8 +1041,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 /* Morde conversation layout */
 .morde-shell:has(.assistant-page) { background: #fff; }
 .morde-brand-mark, .assistant-logo {
-  flex: none; border: 1px solid #e7edf7; background: #fff url('./assets/morde-logo.png') center / contain no-repeat;
-  box-shadow: 0 4px 12px rgb(22 109 226 / 7%); color: transparent;
+  flex: none; background: transparent url('../../../images/morde-logo-reference.png') center / contain no-repeat; color: transparent;
 }
 .morde-brand-mark { width: 38px; height: 38px; border-radius: 13px; }
 .morde-shell:has(.assistant-page) .morde-nav-link.active { color: #0969e6; background: #edf5ff; }
@@ -1097,9 +1096,15 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .chat-message-row-assistant .chat-message-body { flex: 1; max-width: 620px; }
 .assistant-page .chat-message { max-width: none; padding: 11px 16px; border: 0; color: #344052; font-size: 14px; line-height: 1.7; }
 .assistant-page .chat-message-user { border-radius: 17px 17px 5px 17px; background: #dcecff; color: #263b55; }
-.assistant-page .chat-message-user-started { position: relative; padding-bottom: 30px; }
-.assistant-page .chat-task-started { position: absolute; right: 7px; bottom: 4px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: #f1f2f4; font-size: 14px; line-height: 1; }
+.assistant-page .chat-message-user-received { position: relative; padding-bottom: 30px; }
+.assistant-page .chat-message-received { position: absolute; left: 7px; bottom: 4px; width: 28px; height: 25px; display: grid; place-items: center; border: 2px solid #fff; border-radius: 14px; background: #f2f3f5; font-size: 14px; line-height: 1; }
 .assistant-page .chat-message-assistant { border-radius: 17px 17px 17px 5px; background: #f1f2f4; }
+.assistant-page .chat-thinking-row { align-items: center; }
+.assistant-page .thinking-dots { min-height: 29px; padding: 9px 12px; display: inline-flex; align-items: center; gap: 5px; border-radius: 15px; background: #f1f2f4; }
+.assistant-page .thinking-dots span { width: 6px; height: 6px; border-radius: 50%; background: #8b9199; animation: assistant-thinking-bounce 1.1s ease-in-out infinite; }
+.assistant-page .thinking-dots span:nth-child(2) { animation-delay: .15s; }
+.assistant-page .thinking-dots span:nth-child(3) { animation-delay: .3s; }
+@keyframes assistant-thinking-bounce { 0%, 60%, 100% { opacity: .45; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-4px); } }
 .assistant-page .chat-message-author { min-height: 26px; margin: 0; color: #607089; font-size: 11px; }
 .assistant-page .chat-message-user .chat-message-author { display: none; }
 .assistant-page .chat-message-status { margin: 4px 10px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #68778d; font-size: 11px; line-height: 1.4; }
@@ -1256,7 +1261,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .assistant-page .assistant-layout-with-task-panel .task-panel-list { padding-bottom: max(160px, 24dvh); }
 }
 @media (hover: none) { .assistant-reply-time { opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { .assistant-reply-time { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .assistant-reply-time { transition: none; } .assistant-page .thinking-dots span { animation: none; } }
 
 .assistant-page .task-panel-list[hidden] { display: none; }
 .assistant-page .task-panel-filters { display: flex; gap: 6px; }
@@ -1361,7 +1366,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .morde-shell:not(.morde-admin-shell) > .morde-topbar { grid-column: 1 / -1; grid-row: 1; position: relative; top: auto; min-height: 58px; height: auto; padding: 0 16px; background: #fff; backdrop-filter: none; }
 .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page { width: 100%; max-width: none; min-height: 0; flex: 1 1 auto; margin: 0; padding: 18px 24px 24px; overflow: auto; }
 .morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand { flex: 0 0 auto; justify-content: flex-start; padding: 0 5px 17px; }
-.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand-mark { width: 38px; height: 38px; border-radius: 12px; background-image: url('./assets/morde-logo.png'); background-size: contain; background-position: center; background-color: #fff; color: transparent; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand-mark { width: 38px; height: 38px; border-radius: 12px; color: transparent; }
 .morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-navigation { min-height: 0; overflow: auto; }
 .morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-heading { display: block; }
 .morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link { min-height: 38px; }
@@ -1407,7 +1412,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 
 /* Keep the Codex-style app rail narrow; the collapsible context sidebar sits beside it. */
-.morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 56px; --pc-page-sidebar-width: 0px; --pc-context-sidebar-width: 248px; }
+.morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 54px; --pc-page-sidebar-width: 0px; --pc-context-sidebar-width: 248px; }
 .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-page-sidebar-width: 0px; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed { --pc-page-sidebar-width: 0px; }
@@ -1513,6 +1518,37 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .workspace-list .schedule-actions .button-small { min-height: 24px; padding: 3px 6px; font-size: 10px; }
   .workspace-list .workspace-bind-actions { gap: 4px; }
   .workspace-list .workspace-bind-actions select { min-height: 24px; padding-block: 3px; font-size: 10px; }
+}
+
+.morde-shell:not(.morde-admin-shell) .morde-nav-count { position: absolute; top: 1px; right: 1px; min-width: 17px; height: 17px; padding: 0 4px; display: grid; place-items: center; border: 1px solid #fff; border-radius: 999px; background: #c7483e; color: #fff; font-size: 9px; font-weight: 750; line-height: 1; }
+.morde-shell:not(.morde-admin-shell) .morde-nav-count-error { background: #97722b; }
+.chat-approval-row { display: flex; justify-content: flex-start; margin: 4px 0 14px 46px; }
+.chat-approval { width: min(100%, 480px); min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); color: var(--ink); box-shadow: 0 4px 16px rgb(39 57 88 / 5%); }
+.task-approval-card-heading, .review-item-heading { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.task-approval-card-heading h3 { min-width: 0; margin: 0; color: var(--ink); font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.task-approval-card-heading > span, .review-item-heading > span { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
+.chat-approval p { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.chat-approval .task-approval-card-object { color: var(--ink); font-weight: 650; }
+.task-approval-disclosures { margin: 9px 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; font-size: 12px; line-height: 1.5; }
+.task-approval-disclosures dt { color: var(--muted); }
+.task-approval-disclosures dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.chat-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.reviews-page { width: min(100%, 920px); margin: 0 auto; }
+.reviews-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.reviews-heading h1 { margin: 0; color: var(--ink); font-size: 24px; }
+.reviews-heading p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+.reviews-pending-count { flex: 0 0 auto; padding: 6px 10px; border: 1px solid #e6c6b7; border-radius: 999px; background: #fff2e9; color: #8c4429; font-size: 12px; font-weight: 700; }
+.reviews-section { margin: 0 0 24px; }
+.reviews-section h2 { margin: 0 0 10px; color: var(--ink); font-size: 16px; }
+.reviews-list { display: grid; gap: 12px; }
+.review-item { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.review-item .chat-approval { width: 100%; max-width: none; margin: 9px 0 0; box-shadow: none; }
+.review-item-context { margin: 5px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.review-open-conversation { margin-top: 9px; }
+.reviews-load-more { display: grid; justify-items: center; gap: 8px; padding: 8px 0 24px; }
+@media (max-width: 680px) {
+  .reviews-heading { align-items: flex-start; }
+  .chat-approval-row { margin-left: 0; }
 }
 
 /* PC follows the system appearance; the admin shell keeps its existing theme. */

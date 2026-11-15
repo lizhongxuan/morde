@@ -312,6 +312,10 @@ type ProjectConversationTaskAppender interface {
 	ListConversationActiveTasks(context.Context, identity.Principal, string, string, PageRequest) (TaskPage, error)
 }
 
+type ProjectConversationTaskLister interface {
+	ListConversationTasks(context.Context, identity.Principal, string, string, ConversationTaskView, PageRequest) (TaskPage, error)
+}
+
 type ProjectConversationService struct {
 	store  ProjectConversationStore
 	access ProjectAccessChecker
@@ -473,6 +477,17 @@ func (s *ProjectConversationService) AcceptMessage(ctx context.Context, principa
 
 func (s *ProjectConversationService) ListTasks(ctx context.Context, principal identity.Principal, projectID, conversationID string, page PageRequest) (TaskPage, error) {
 	return s.tasks.ListConversationActiveTasks(ctx, principal, projectID, conversationID, page)
+}
+
+func (s *ProjectConversationService) ListTasksWithView(ctx context.Context, principal identity.Principal, projectID, conversationID string, view ConversationTaskView, page PageRequest) (TaskPage, error) {
+	if view == ConversationTaskViewActive {
+		return s.ListTasks(ctx, principal, projectID, conversationID, page)
+	}
+	lister, ok := s.tasks.(ProjectConversationTaskLister)
+	if !ok {
+		return TaskPage{}, domain.NewError(domain.CodeInternal, "project conversation task query is unavailable")
+	}
+	return lister.ListConversationTasks(ctx, principal, projectID, conversationID, view, page)
 }
 
 func validateProjectConversationResult(value conversation.Conversation, projectID string) error {

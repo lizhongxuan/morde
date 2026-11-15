@@ -737,6 +737,20 @@ describe('typed Portal API client', () => {
     ]);
   });
 
+  it('loads a page of approval snapshots scoped to the selected conversation', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ items: [], next_cursor: 'approval-next', pending_count: 2 });
+    }));
+
+    const page = await portalApi.taskApprovals({ conversationID: 'c1234567', cursor: 'approval-cursor' });
+
+    expect(page.pending_count).toBe(2);
+    expect(new URL(request!.url).pathname).toBe('/api/me/task-approvals');
+    expect(new URL(request!.url).search).toBe('?limit=100&conversation_id=c1234567&cursor=approval-cursor');
+  });
+
   it('requires explicit confirmation before deleting host-owned storage', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

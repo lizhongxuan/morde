@@ -27,6 +27,10 @@ type taskStoreStub struct {
 	listHostIDs            []string
 	listTasksPage          TaskPage
 	listTaskView           ConversationTaskView
+	taskApprovalsPage      TaskApprovalPage
+	taskApprovalsActorID   string
+	taskApprovalsHostIDs   []string
+	taskApprovalsFilter    string
 	listConvPage           ConversationPage
 	messagePage            MessagePage
 	details                TaskDetails
@@ -91,6 +95,65 @@ func TestConversationTaskListFiltersPendingCountByCurrentHostAuthorization(t *te
 	if _, err := service.ListConversationTasks(context.Background(), taskTestPrincipal(), "", "c1234567", ConversationTaskView("all"), PageRequest{}); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("invalid conversation task view error = %v", err)
 	}
+}
+
+func TestTaskApprovalListFiltersByCurrentReadOrControlAuthorizationAndCountsAllPages(t *testing.T) {
+	now := time.Now().UTC()
+	store := &taskStoreStub{taskApprovalsPage: TaskApprovalPage{
+		Items: []TaskApproval{
+			{TaskID: "q1234567", ConversationID: "c1234567", HostID: "h1234567", TaskStatus: task.StatusWaitingUser, TaskEventSeq: 3,
+				TaskUpdatedAt: now, Request: task.PendingRequest{ID: "r1234567", TaskID: "q1234567", Version: 1, Kind: "approval", Title: "Read file",
+					Object: "Workspace", Content: "Read one file", Impact: "File content is visible", Status: task.PendingRequestApproved,
+					Decision: task.PendingDecisionApprove, CreatedAt: now, RespondedAt: &now}},
+			{TaskID: "q7654321", ConversationID: "c1234567", HostID: "h7654321", TaskStatus: task.StatusWaitingUser, TaskEventSeq: 4,
+				TaskUpdatedAt: now, Request: task.PendingRequest{ID: "r7654321", TaskID: "q7654321", Version: 1, Kind: "approval", Title: "Read file",
+					Object: "Workspace", Content: "Read one file", Impact: "File content is visible", Status: task.PendingRequestPending, CreatedAt: now}},
+			{TaskID: "q6543210", ConversationID: "c1234567", HostID: "h7654321", TaskStatus: task.StatusCancelled, TaskEventSeq: 5,
+				TaskUpdatedAt: now, Request: task.PendingRequest{ID: "r6543210", TaskID: "q6543210", Version: 1, Kind: "approval", Title: "Read file",
+					Object: "Workspace", Content: "Read one file", Impact: "File content is visible", Status: task.PendingRequestCancelled, CreatedAt: now, RespondedAt: &now}},
+		}, NextCursor: "next", PendingCountsByHostID: map[string]int64{"h1234567": 2, "h7654321": 7, "": 1},
+	}}
+	authorizer := &taskApprovalScopeAuthorizer{denyControlHost: "h7654321"}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
+
+	page, err := service.ListTaskApprovals(context.Background(), taskTestPrincipal(), "c1234567", PageRequest{Limit: 10})
+	if err != nil || len(page.Items) != 2 || page.Items[0].Request.Status != task.PendingRequestApproved || page.Items[1].Request.Status != task.PendingRequestCancelled || page.PendingCount != 3 ||
+		page.PendingCountsByHostID != nil || page.NextCursor != "next" || store.taskApprovalsActorID != "u1234567" ||
+		store.taskApprovalsFilter != "c1234567" || store.taskApprovalsHostIDs != nil {
+		t.Fatalf("authorized task approval page = %+v err=%v store=%+v", page, err, store)
+	}
+	if scopes := authorizer.scopeByHost["h1234567"]; len(scopes) != 2 || scopes[0] != taskReadScope || scopes[1] != taskControlScope {
+		t.Fatalf("handled approval and pending count did not use their required scopes: %#v", authorizer.scopeByHost)
+	}
+	if scopes := authorizer.scopeByHost["h7654321"]; len(scopes) != 3 || scopes[0] != taskControlScope || scopes[1] != taskReadScope || scopes[2] != taskControlScope {
+		t.Fatalf("approval records were checked with unexpected scopes: %#v", authorizer.scopeByHost)
+	}
+	if _, err := service.ListTaskApprovals(context.Background(), taskTestPrincipal(), "invalid", PageRequest{}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("invalid conversation filter error = %v", err)
+	}
+}
+
+type taskApprovalScopeAuthorizer struct {
+	denyControlHost string
+	scopeByHost     map[string][]identity.Scope
+}
+
+func (a *taskApprovalScopeAuthorizer) AuthorizeTaskAction(_ context.Context, _ string, _ identity.Kind, _ string, hostID string, _ []identity.Scope, scope identity.Scope) error {
+	if a.scopeByHost == nil {
+		a.scopeByHost = make(map[string][]identity.Scope)
+	}
+	a.scopeByHost[hostID] = append(a.scopeByHost[hostID], scope)
+	if hostID == a.denyControlHost && scope == taskControlScope {
+		return domain.NewError(domain.CodeForbidden, "task control is unavailable")
+	}
+	return nil
+}
+
+func (a *taskApprovalScopeAuthorizer) AuthorizeTaskExecution(ctx context.Context, principal identity.Principal, hostID string, scope identity.Scope) (task.Authorization, error) {
+	if err := a.AuthorizeTaskAction(ctx, principal.UserID, principal.Kind, principal.TokenID, hostID, principal.Scopes, scope); err != nil {
+		return task.Authorization{}, err
+	}
+	return task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID, Version: 1}, nil
 }
 
 type taskWorkspaceStoreStub struct {
@@ -236,6 +299,11 @@ func (s *taskStoreStub) SetTaskMCPConnectorToolSchema(context.Context, string, s
 func (s *taskStoreStub) ListTasks(_ context.Context, _ string, filter TaskListRequest) (TaskPage, error) {
 	s.listHostIDs = filter.HostIDs
 	return s.listTasksPage, s.storeErr
+}
+
+func (s *taskStoreStub) ListTaskApprovals(_ context.Context, actorID string, hostIDs []string, conversationID string, _ PageRequest) (TaskApprovalPage, error) {
+	s.taskApprovalsActorID, s.taskApprovalsHostIDs, s.taskApprovalsFilter = actorID, hostIDs, conversationID
+	return s.taskApprovalsPage, s.storeErr
 }
 
 func (s *taskStoreStub) ListConversationActiveTasks(_ context.Context, _ string, _, _ string, hostIDs []string, _ PageRequest) (TaskPage, error) {

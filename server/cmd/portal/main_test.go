@@ -541,3 +541,31 @@ func TestParseWorkspaceImportFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestParseLegacyPCPortalEnabled(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		value       string
+		set         bool
+		wantEnabled bool
+		wantErr     bool
+	}{
+		{name: "unset keeps legacy routes", wantEnabled: true},
+		{name: "explicit true", value: "true", set: true, wantEnabled: true},
+		{name: "explicit false", value: "false", set: true},
+		{name: "invalid value", value: "later", set: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			enabled, err := parseLegacyPCPortalEnabled(test.value, test.set)
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), legacyPCPortalEnabledEnv) {
+					t.Fatalf("parseLegacyPCPortalEnabled() error = %v, want invalid environment value", err)
+				}
+				return
+			}
+			if err != nil || enabled != test.wantEnabled {
+				t.Fatalf("parseLegacyPCPortalEnabled() = (%t, %v), want (%t, nil)", enabled, err, test.wantEnabled)
+			}
+		})
+	}
+}

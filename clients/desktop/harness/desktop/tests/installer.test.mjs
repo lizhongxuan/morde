@@ -36,6 +36,9 @@ test("the installer includes only the Morde desktop runtime", () => {
     "  - package.json",
   ]);
   const extra = block("extraResources").filter((line) => line.trim() && !line.trim().startsWith("#"));
+  assert.ok(extra.includes("  - from: ../../../../web/workbench/dist"));
+  assert.ok(extra.includes("    to: workbench"));
+  assert.ok(extra.includes('    filter: ["index.html", "assets/**/*"]'));
   assert.ok(extra.includes('    filter: ["morde-sync", "morde-sync.exe", "morde-sync.sha256", "morde-syncthing", "morde-syncthing.exe", "morde-syncthing.sha256"]'));
   assert.ok(extra.includes("  - from: resources/THIRD_PARTY_NOTICES.morde-sync.md"));
   assert.ok(extra.includes("    to: legal/THIRD_PARTY_NOTICES.morde-sync.md"));

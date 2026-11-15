@@ -37,11 +37,30 @@ type TaskPage struct {
 	K2Projections         map[string]TaskK2Projection
 }
 
+type TaskApproval struct {
+	TaskID         string
+	ConversationID string
+	ProjectID      string
+	HostID         string
+	TaskStatus     task.Status
+	TaskEventSeq   int64
+	TaskUpdatedAt  time.Time
+	Request        task.PendingRequest
+}
+
+type TaskApprovalPage struct {
+	Items                 []TaskApproval
+	NextCursor            string
+	PendingCount          int64
+	PendingCountsByHostID map[string]int64
+}
+
 type ConversationTaskView string
 
 const (
 	ConversationTaskViewActive ConversationTaskView = "active"
 	ConversationTaskViewRecent ConversationTaskView = "recent"
+	ConversationTaskViewPanel  ConversationTaskView = "panel"
 )
 
 type TaskListRequest struct {
@@ -437,6 +456,13 @@ type TaskStore interface {
 	AnswerClarificationRequest(context.Context, IdempotencyRecord, string, string, int64, string, task.FileDeliveryIntent, string) error
 	// RecordValidatedArtifact persists batch artifact proof after the caller reads it back from a committed Workspace revision.
 	RecordValidatedArtifact(context.Context, string, task.Artifact, string, int64) (task.Artifact, error)
+}
+
+// TaskApprovalQueryStore lists approval snapshots only within the actor's
+// current task and project visibility. Host control authorization is enforced
+// by the app service before any approval data is returned.
+type TaskApprovalQueryStore interface {
+	ListTaskApprovals(context.Context, string, []string, string, PageRequest) (TaskApprovalPage, error)
 }
 
 // TaskPendingRequestExpirer atomically rejects an expired pending approval and

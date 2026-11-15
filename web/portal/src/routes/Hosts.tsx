@@ -157,7 +157,7 @@ export function Hosts() {
       <div className="host-default-workspace">
         <span>电脑数据目录</span>
         <strong>{defaultHost ? '~/workspace/（随电脑持久保存）' : '选择电脑后显示'}</strong>
-        {defaultHost && <Link to={`/hosts?sync=1&host=${encodeURIComponent(defaultHost.id)}`}>文件同步</Link>}
+        {defaultHost && <Link to="/hosts?sync=1">文件同步</Link>}
       </div>
       {preferences.isError && <FloatingError className="error-inline" role="alert">默认设置暂不可用。
         <button type="button" className="button button-small button-secondary" onClick={() => void preferences.refetch()}>重试</button>
@@ -184,7 +184,7 @@ export function Hosts() {
           : host.state !== 'stopped' ? '请先停止源电脑。'
             : host.control_state !== 'ai' ? '请先将电脑控制权交还给云端 AI。'
               : !filesReady ? '源电脑文件尚未全部确认或仍有冲突。' : undefined;
-        return <HostCard key={host.id} host={host} busy={update.isPending && update.variables?.host.id === host.id}
+        return <HostCard key={host.id} host={host} isDefaultHost={host.id === preferences.data?.default_host_id} busy={update.isPending && update.variables?.host.id === host.id}
           canEnter={ownsHost && filesReady}
           enterReason={!ownsHost ? '仅电脑所有者可以进入工作环境。' : blockedFiles
             ? '电脑文件正在准备、同步或存在冲突；打开和移交操作暂不可用。'
@@ -266,8 +266,8 @@ function prioritizeHostForHash<T extends { id: string }>(items: readonly T[], ho
   return target ? [target, ...items.slice(0, index), ...items.slice(index + 1)] : items;
 }
 
-function HostCard({ host, busy, canEnter, enterReason, filesRestorable, canShowCopy, canCopy, copyReason, copyPending, onCopy, onEnter, onRenew, onRelease, onRestore, onDelete }: {
-  host: Host; busy: boolean; canEnter: boolean; enterReason?: string; filesRestorable: boolean; canShowCopy: boolean; canCopy: boolean; copyReason?: string; copyPending: boolean;
+function HostCard({ host, isDefaultHost, busy, canEnter, enterReason, filesRestorable, canShowCopy, canCopy, copyReason, copyPending, onCopy, onEnter, onRenew, onRelease, onRestore, onDelete }: {
+  host: Host; isDefaultHost: boolean; busy: boolean; canEnter: boolean; enterReason?: string; filesRestorable: boolean; canShowCopy: boolean; canCopy: boolean; copyReason?: string; copyPending: boolean;
   onCopy: () => void; onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -292,7 +292,8 @@ function HostCard({ host, busy, canEnter, enterReason, filesRestorable, canShowC
       <details className="host-more-actions">
         <summary aria-label={`更多操作 ${name}`}>更多操作</summary>
         <div>
-          <Link className="button button-secondary" to={`/hosts?sync=1&host=${encodeURIComponent(host.id)}`}>项目目录与同步</Link>
+          {isDefaultHost ? <Link className="button button-secondary" to="/hosts?sync=1">项目目录与同步</Link>
+            : <span className="muted">本机文件同步固定使用默认电脑</span>}
           {!canEnter && <p className="host-action-reason" id={enterHelpID} role="status">{enterReason}</p>}
           <button type="button" className="button button-secondary" aria-controls={`host-details-${host.id}`} aria-expanded={detailsOpen} onClick={(event) => {
             setDetailsOpen((value) => !value);
@@ -314,7 +315,7 @@ function HostCard({ host, busy, canEnter, enterReason, filesRestorable, canShowC
     <div className="host-facts">
       <div><span>规格</span><strong>{formatCpu(host.resources?.cpu_limit_milli)} / {formatMemory(host.resources?.mem_limit_mib)}</strong></div>
       <div><span>到期时间</span><strong>{formatDate(host.expires_at)}</strong></div>
-      <div><span>电脑专属文件</span><strong>{fileState}</strong><Link to={`/hosts?sync=1&host=${encodeURIComponent(host.id)}`}>管理本机项目同步</Link></div>
+      <div><span>电脑专属文件</span><strong>{fileState}</strong>{isDefaultHost && <Link to="/hosts?sync=1">管理本机项目同步</Link>}</div>
       <div><span>运行状态</span><strong>{hostReasonLabel[host.state_reason] || host.state_reason || (host.state === 'running' ? '运行正常' : host.state === 'stopped' ? '可恢复' : '等待状态更新')}</strong></div>
       <div><span>电脑文件服务</span><strong>{runtimeState}</strong><small className="table-sub">最近观测：{host.workspace_runtime_last_seen_at ? formatDate(host.workspace_runtime_last_seen_at) : '未知'}</small></div>
       <div><span>桌面连接</span><strong>由 noVNC 工作台单独检测</strong></div>

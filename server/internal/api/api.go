@@ -114,19 +114,20 @@ type Deps struct {
 }
 
 type Options struct {
-	Logger            *zap.Logger
-	Metrics           prometheus.Registerer
-	ServiceInstanceID string
-	APIMaxBodyBytes   int64
-	MCPMaxBodyBytes   int64
-	CookieSecure      bool
-	SessionTTL        time.Duration
-	HostScheme        string
-	PortalDomain      string
-	HostSuffix        string
-	PreviewPortMin    int
-	PreviewPortDeny   []int
-	PortalFiles       fs.FS
+	Logger                *zap.Logger
+	Metrics               prometheus.Registerer
+	ServiceInstanceID     string
+	APIMaxBodyBytes       int64
+	MCPMaxBodyBytes       int64
+	CookieSecure          bool
+	SessionTTL            time.Duration
+	HostScheme            string
+	PortalDomain          string
+	HostSuffix            string
+	PreviewPortMin        int
+	PreviewPortDeny       []int
+	PortalFiles           fs.FS
+	LegacyPCPortalEnabled bool
 }
 
 type api struct {
@@ -604,7 +605,7 @@ func clientCredentialRoute(method, path string) bool {
 	switch method {
 	case http.MethodGet:
 		switch path {
-		case "/api/me", "/api/me/record-captures", "/api/me/main-conversation", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
+		case "/api/me", "/api/me/record-captures", "/api/me/main-conversation", "/api/me/task-approvals", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
 			"/api/hosts/:id/control",
 			"/api/codex/connections", "/api/codex/sessions", "/api/codex/sessions/:id/events", "/api/codex/sessions/:id/events/stream",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",

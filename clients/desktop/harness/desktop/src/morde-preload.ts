@@ -26,6 +26,11 @@ if (mode === "codex") {
 } else if (mode === "portal") {
   contextBridge.exposeInMainWorld("morde", {
     projectUploadTargets: () => call("morde:portal-project-upload-targets"),
+    openHostWorkbenchEmbed: (request: { hostID: string; conversationID: string; initialTarget: string; targets: string[]; shared: boolean }) => call("morde:portal-workbench-open", request),
+    setHostWorkbenchBounds: (nonce: string, bounds: { x: number; y: number; width: number; height: number }) => call("morde:portal-workbench-bounds", nonce, bounds),
+    sendHostWorkbenchCommand: (nonce: string, command: { type: "init" | "visibility"; conversation_id: string; visible: boolean }) => call("morde:portal-workbench-command", nonce, command),
+    closeHostWorkbenchEmbed: (nonce: string) => call("morde:portal-workbench-close", nonce),
+    onHostWorkbenchMessage: (listener: (value: unknown) => void) => listen("morde:portal-workbench-message", listener),
     selectProjectDirectory: (hostId: string, workspaceId: string) => call("morde:portal-project-select-directory", hostId, workspaceId),
     uploadProject: (selectionId: string, projectName: string) => call("morde:portal-project-upload", selectionId, projectName),
     stopProjectSync: (selectionId: string) => call("morde:portal-project-stop", selectionId),
@@ -55,6 +60,9 @@ if (mode === "codex") {
 } else if (mode === "host-workbench") {
   contextBridge.exposeInMainWorld("morde", {
     returnToPortalHosts: () => call("morde:return-to-portal-hosts"),
+    hostWorkbenchReady: (nonce: string) => call("morde:host-workbench-ready", nonce),
+    sendHostWorkbenchState: (state: unknown) => call("morde:host-workbench-state", state),
+    onHostWorkbenchMessage: (listener: (value: unknown) => void) => listen("morde:host-workbench-message", listener),
   });
 } else {
 const bridge = {

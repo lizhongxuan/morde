@@ -62,6 +62,52 @@ func (q *Queries) CountConversationPendingTaskHosts(ctx context.Context, arg Cou
 	return items, nil
 }
 
+const countPendingTaskApprovalHosts = `-- name: CountPendingTaskApprovalHosts :many
+SELECT COALESCE(tasks.host_id, '') AS host_id, count(*)::bigint AS task_count
+FROM task_pending_requests pending
+JOIN tasks ON tasks.id = pending.task_id
+WHERE pending.status = 'pending' AND (pending.expires_at IS NULL OR pending.expires_at > now())
+  AND ((tasks.project_id IS NULL AND tasks.owner_id = $1 AND tasks.initiator_id = tasks.owner_id)
+    OR (tasks.project_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
+      WHERE pm.project_id = tasks.project_id AND pm.user_id = $1
+    )))
+  AND ($2::text[] IS NULL OR tasks.host_id = ANY($2::text[]))
+  AND ($3::text = '' OR tasks.conversation_id = $3)
+GROUP BY COALESCE(tasks.host_id, '')
+`
+
+type CountPendingTaskApprovalHostsParams struct {
+	ActorID        string   `json:"actor_id"`
+	HostIds        []string `json:"host_ids"`
+	ConversationID string   `json:"conversation_id"`
+}
+
+type CountPendingTaskApprovalHostsRow struct {
+	HostID    string `json:"host_id"`
+	TaskCount int64  `json:"task_count"`
+}
+
+func (q *Queries) CountPendingTaskApprovalHosts(ctx context.Context, arg CountPendingTaskApprovalHostsParams) ([]CountPendingTaskApprovalHostsRow, error) {
+	rows, err := q.db.Query(ctx, countPendingTaskApprovalHosts, arg.ActorID, arg.HostIds, arg.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CountPendingTaskApprovalHostsRow
+	for rows.Next() {
+		var i CountPendingTaskApprovalHostsRow
+		if err := rows.Scan(&i.HostID, &i.TaskCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getTask = `-- name: GetTask :one
 SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent, workspace_checkpoint_revision, project_id, initiator_id, current_revision, desired_revision, workspace_owner_id, workspace_project_resource_version, queue_priority FROM tasks WHERE id = $1 AND owner_id = $2
 `
@@ -249,12 +295,23 @@ WHERE tasks.conversation_id = $1
       WHERE pm.project_id = tasks.project_id AND pm.user_id = $3
     )))
   AND (($4::text = 'active' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling'))
-    OR ($4::text = 'recent' AND tasks.status IN ('completed', 'failed', 'cancelled')))
+    OR ($4::text = 'recent' AND tasks.status IN ('completed', 'failed', 'cancelled'))
+    OR ($4::text = 'panel' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling', 'completed', 'failed', 'cancelled')))
   AND ($5::text[] IS NULL OR tasks.host_id = ANY($5::text[]))
-  AND ($6::timestamptz IS NULL OR tasks.created_at < $6::timestamptz
-    OR (tasks.created_at = $6::timestamptz AND tasks.id < $7))
-ORDER BY tasks.created_at DESC, tasks.id DESC
-LIMIT $8
+  AND (($4::text = 'panel' AND (
+      $6::timestamptz IS NULL
+      OR CASE WHEN tasks.status = 'running' THEN 0 ELSE 1 END > $7::integer
+      OR (CASE WHEN tasks.status = 'running' THEN 0 ELSE 1 END = $7::integer AND
+        (tasks.updated_at < $6::timestamptz OR
+          (tasks.updated_at = $6::timestamptz AND tasks.id < $8)))
+    )) OR ($4::text <> 'panel' AND (
+      $6::timestamptz IS NULL OR tasks.created_at < $6::timestamptz
+      OR (tasks.created_at = $6::timestamptz AND tasks.id < $8)
+    )))
+ORDER BY CASE WHEN $4::text = 'panel' AND tasks.status = 'running' THEN 0 ELSE 1 END,
+         CASE WHEN $4::text = 'panel' THEN tasks.updated_at ELSE tasks.created_at END DESC,
+         tasks.id DESC
+LIMIT $9
 `
 
 type ListConversationTasksParams struct {
@@ -264,6 +321,7 @@ type ListConversationTasksParams struct {
 	TaskView       string             `json:"task_view"`
 	HostIds        []string           `json:"host_ids"`
 	CursorAt       pgtype.Timestamptz `json:"cursor_at"`
+	CursorRank     int32              `json:"cursor_rank"`
 	CursorID       string             `json:"cursor_id"`
 	PageLimit      int32              `json:"page_limit"`
 }
@@ -276,6 +334,7 @@ func (q *Queries) ListConversationTasks(ctx context.Context, arg ListConversatio
 		arg.TaskView,
 		arg.HostIds,
 		arg.CursorAt,
+		arg.CursorRank,
 		arg.CursorID,
 		arg.PageLimit,
 	)
@@ -339,6 +398,107 @@ func (q *Queries) ListConversationTasks(ctx context.Context, arg ListConversatio
 			&i.WorkspaceOwnerID,
 			&i.WorkspaceProjectResourceVersion,
 			&i.QueuePriority,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTaskApprovals = `-- name: ListTaskApprovals :many
+SELECT pending.id, pending.task_id, pending.version, pending.kind, pending.title, pending.object,
+       pending.content, pending.impact, COALESCE(pending.media_preview_operation_id, '') AS media_preview_operation_id,
+       pending.status, pending.decision, pending.created_at, pending.expires_at, pending.responded_at,
+       tasks.conversation_id, COALESCE(tasks.project_id, '') AS project_id, COALESCE(tasks.host_id, '') AS host_id,
+       tasks.status AS task_status, tasks.event_seq AS task_event_seq, tasks.updated_at AS task_updated_at
+FROM task_pending_requests pending
+JOIN tasks ON tasks.id = pending.task_id
+WHERE ((tasks.project_id IS NULL AND tasks.owner_id = $1 AND tasks.initiator_id = tasks.owner_id)
+    OR (tasks.project_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
+      WHERE pm.project_id = tasks.project_id AND pm.user_id = $1
+    )))
+  AND ($2::text[] IS NULL OR tasks.host_id = ANY($2::text[]))
+  AND ($3::text = '' OR tasks.conversation_id = $3)
+  AND ($4::timestamptz IS NULL OR pending.created_at < $4::timestamptz
+    OR (pending.created_at = $4::timestamptz AND pending.id < $5))
+ORDER BY pending.created_at DESC, pending.id DESC
+LIMIT $6
+`
+
+type ListTaskApprovalsParams struct {
+	ActorID        string             `json:"actor_id"`
+	HostIds        []string           `json:"host_ids"`
+	ConversationID string             `json:"conversation_id"`
+	CursorAt       pgtype.Timestamptz `json:"cursor_at"`
+	CursorID       string             `json:"cursor_id"`
+	PageLimit      int32              `json:"page_limit"`
+}
+
+type ListTaskApprovalsRow struct {
+	ID                      string             `json:"id"`
+	TaskID                  string             `json:"task_id"`
+	Version                 int64              `json:"version"`
+	Kind                    string             `json:"kind"`
+	Title                   string             `json:"title"`
+	Object                  string             `json:"object"`
+	Content                 string             `json:"content"`
+	Impact                  string             `json:"impact"`
+	MediaPreviewOperationID string             `json:"media_preview_operation_id"`
+	Status                  string             `json:"status"`
+	Decision                string             `json:"decision"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt               pgtype.Timestamptz `json:"expires_at"`
+	RespondedAt             pgtype.Timestamptz `json:"responded_at"`
+	ConversationID          string             `json:"conversation_id"`
+	ProjectID               string             `json:"project_id"`
+	HostID                  string             `json:"host_id"`
+	TaskStatus              string             `json:"task_status"`
+	TaskEventSeq            int64              `json:"task_event_seq"`
+	TaskUpdatedAt           pgtype.Timestamptz `json:"task_updated_at"`
+}
+
+func (q *Queries) ListTaskApprovals(ctx context.Context, arg ListTaskApprovalsParams) ([]ListTaskApprovalsRow, error) {
+	rows, err := q.db.Query(ctx, listTaskApprovals,
+		arg.ActorID,
+		arg.HostIds,
+		arg.ConversationID,
+		arg.CursorAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTaskApprovalsRow
+	for rows.Next() {
+		var i ListTaskApprovalsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Version,
+			&i.Kind,
+			&i.Title,
+			&i.Object,
+			&i.Content,
+			&i.Impact,
+			&i.MediaPreviewOperationID,
+			&i.Status,
+			&i.Decision,
+			&i.CreatedAt,
+			&i.ExpiresAt,
+			&i.RespondedAt,
+			&i.ConversationID,
+			&i.ProjectID,
+			&i.HostID,
+			&i.TaskStatus,
+			&i.TaskEventSeq,
+			&i.TaskUpdatedAt,
 		); err != nil {
 			return nil, err
 		}

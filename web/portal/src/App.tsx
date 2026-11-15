@@ -22,6 +22,7 @@ import { Notifications } from './routes/Notifications';
 import { PersonalData } from './routes/PersonalData';
 import { Projects } from './routes/Projects';
 import { Codex } from './routes/Codex';
+import { Reviews } from './routes/Reviews';
 import { AdminAudit } from './routes/admin/AdminAudit';
 import { AdminHosts } from './routes/admin/AdminHosts';
 import { AdminLayout } from './routes/admin/AdminLayout';
@@ -95,6 +96,7 @@ function UserRoutes() {
       <Route element={<PortalLayout />}>
         <Route index element={<Navigate to="/assistant" replace />} />
         <Route path="assistant" element={<Assistant />} />
+        <Route path="reviews" element={<Reviews />} />
         <Route path="projects" element={<Projects />} />
         <Route path="local-projects" element={<LegacyLocalProjectsRedirect />} />
         <Route path="codex" element={<Codex />} />

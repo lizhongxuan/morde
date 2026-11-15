@@ -46,6 +46,7 @@ function mockFetch(calls) {
     if (url.pathname === '/api/auth/client-web-session') return json({ web_session_credential: 'local-web-session', web_session_expires_at: future });
     if (url.pathname === '/api/auth/client-logout') return new Response(null, { status: 204 });
     if (url.pathname === '/api/me') return json({ id: 'u1234567' });
+    if (url.pathname === '/api/me/preferences') return json({ default_host_id: 'h1234567' });
     if (url.pathname === '/api/hosts') return json({ items: [host] });
     if (url.pathname === '/api/hosts/h1234567') return json(host);
     if (url.pathname === '/api/hosts/h1234567/sync-folders') return json({ items: [] });
@@ -69,7 +70,7 @@ function harness({ checkpoint } = {}) {
     const profile = createHash('sha256').update(`${auth.origin}\0${auth.serviceInstanceID}\0${auth.accountName}\0${auth.installationId}`).digest('hex');
     writeFileSync(join(userData, `sync-checkpoint-${profile}.json`), JSON.stringify(checkpoint));
   }
-  const handlers = new Map(), windows = [], views = [], partitions = [], appEvents = new Map();
+  const handlers = new Map(), windows = [], views = [], partitions = [], appEvents = new Map(), menus = [];
   let nextContentsID = 1;
   let portalLoaded;
   const portalReady = new Promise((resolve) => { portalLoaded = resolve; });
@@ -112,14 +113,17 @@ function harness({ checkpoint } = {}) {
     isMinimized() { return this.minimized; }
     restore() { this.minimized = false; this.restored = true; }
     getContentBounds() { return this.contentBounds; }
+    getContentSize() { return [this.contentBounds.width, this.contentBounds.height]; }
     focus() { this.focused = true; }
     isDestroyed() { return this.destroyed ?? false; }
     close() { this.destroyed = true; this.events.get('closed')?.(); }
   }
 
   class FakeView {
-    constructor(options) { this.options = options; this.webContents = new FakeContents(); this.webContents.isPortal = true; views.push(this); }
+    constructor(options) { this.options = options; this.webContents = new FakeContents(); this.webContents.isPortal = views.length === 0; views.push(this); }
     setBounds(bounds) { this.bounds = bounds; }
+    setBorderRadius(radius) { this.borderRadius = radius; }
+    setVisible(visible) { this.visible = visible; }
   }
 
   const fakeSession = { fromPartition(name) {
@@ -149,7 +153,7 @@ function harness({ checkpoint } = {}) {
     },
     BrowserWindow: FakeWindow, WebContentsView: FakeView, session: fakeSession,
     ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) }, dialog,
-    Menu: { buildFromTemplate: (template) => template, setApplicationMenu() {} },
+    Menu: { buildFromTemplate: (template) => ({ template, popup: (options) => menus.push({ template, options }) }), setApplicationMenu() {} },
     safeStorage: {
       isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'test',
       encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString(),
@@ -169,7 +173,7 @@ function harness({ checkpoint } = {}) {
   finally { Module._load = originalLoad; }
 
   return {
-    root, userData, handlers, windows, views, partitions, appEvents, dialog,
+    root, userData, handlers, windows, views, partitions, appEvents, dialog, menus,
     async ready() {
       let timeout;
       try {
@@ -191,6 +195,32 @@ function harness({ checkpoint } = {}) {
     },
   };
 }
+
+test('Portal text fields expose native editing commands in the context menu', async () => {
+  const originalFetch = globalThis.fetch;
+  mockFetch([]);
+  const h = harness();
+  try {
+    await h.ready();
+    const listener = h.views[0].webContents.events.get('context-menu');
+    assert.equal(typeof listener, 'function');
+    const params = { isEditable: true, selectionText: '', editFlags: {
+      canUndo: true, canRedo: false, canCut: true, canCopy: false, canPaste: true, canSelectAll: true,
+    } };
+    listener({}, params);
+    const menu = h.menus.at(-1);
+    assert.equal(menu.options.window, h.windows[0]);
+    assert.deepEqual(menu.template.map(({ role, enabled }) => [role ?? 'separator', enabled]), [
+      ['undo', true], ['redo', false], ['separator', undefined], ['cut', true], ['copy', false], ['paste', true], ['selectAll', true],
+    ]);
+    const menuCount = h.menus.length;
+    listener({}, { ...params, isEditable: false });
+    assert.equal(h.menus.length, menuCount);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
 
 test('Codex dialogs use the correct overload with or without a parent window', async () => {
   const originalFetch = globalThis.fetch;
@@ -494,6 +524,71 @@ test('MCP OAuth windows use a dedicated HTTPS-only popup guard', async () => {
     redirect({ preventDefault() { prevented = true; } }, 'about:blank');
     assert.equal(prevented, true);
     assert.deepEqual(oauthContents.open({ url: 'https://evil.example.test' }), { action: 'deny' });
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('native Workbench exchange keeps the ticket and strict cookie in an isolated same-window view', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const nonce = 'B'.repeat(32);
+  const ticket = 'A'.repeat(43);
+  const exchangeTarget = `https://host.example/__ch/wb/?embed=1&embed_nonce=${nonce}&tab=browser`;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = new URL(String(input));
+    calls.push({ url, options });
+    if (url.pathname === '/api/auth/client-web-session') return json({ web_session_credential: 'local-web-session', web_session_expires_at: future });
+    if (url.pathname === '/api/hosts/h1234567') return json(host);
+    if (url.pathname === '/api/hosts/h1234567/embed-tickets') return json({ exchange_url: 'https://host.example/__ch/embed-auth',
+      ticket, embed_nonce: nonce, targets: ['browser', 'terminal'], expires_at: future }, 201);
+    if (url.pathname === '/__ch/embed-auth') return new Response(null, { status: 303,
+      headers: { location: exchangeTarget, 'set-cookie': 'ch_embed=opaque.signed; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Strict' } });
+    return json({ error: { code: 'not_found', message: 'local mock route missing' } }, 404);
+  };
+  const h = harness();
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/assistant');
+    const opened = await h.invoke('morde:portal-workbench-open', portal, [{ hostID: 'h1234567', conversationID: 'c1234567',
+      initialTarget: 'browser', targets: ['browser', 'terminal'], shared: false }]);
+    assert.deepEqual(opened, { hostID: 'h1234567', hostOrigin: 'https://host.example', conversationID: 'c1234567', nonce,
+      targets: ['browser', 'terminal'] });
+    assert.equal(JSON.stringify(opened).includes(ticket), false, 'the one-time ticket never returns to Portal JavaScript');
+    assert.equal(calls.find((call) => call.url.pathname === '/api/hosts/h1234567/embed-tickets').options.headers.cookie, 'ch_portal=local-web-session');
+    const exchange = calls.find((call) => call.url.pathname === '/__ch/embed-auth');
+    assert.equal(exchange.options.headers.origin, auth.origin);
+    assert.equal(exchange.options.headers.authorization, undefined);
+    const workbench = h.views[1];
+    const partition = h.partitions.at(-1);
+    assert.equal(workbench.options.webPreferences.session, partition);
+    assert.match(partition.name, /^morde-workbench-/);
+    assert.equal(partition.name.startsWith('persist:'), false);
+    assert.deepEqual(partition.cookies.values[0], { url: 'https://host.example', name: 'ch_embed', value: 'opaque.signed', path: '/',
+      httpOnly: true, secure: true, sameSite: 'strict', expirationDate: partition.cookies.values[0].expirationDate });
+    assert.equal(workbench.webContents.url, exchangeTarget);
+    assert.equal(h.windows[0].contentView.attached.includes(workbench), true);
+    assert.deepEqual(workbench.options.webPreferences.additionalArguments, ['--morde-preload-mode=host-workbench']);
+
+    await assert.rejects(h.invoke('morde:portal-workbench-bounds', portal, ['wrong-nonce', { x: 0, y: 0, width: 100, height: 100 }]), /Invalid Host Workbench bounds request/);
+    assert.deepEqual(await h.invoke('morde:portal-workbench-bounds', portal, [nonce, { x: 12, y: 20, width: 700, height: 500 }]), { updated: true });
+    assert.deepEqual(workbench.bounds, { x: 12, y: 20, width: 700, height: 500 });
+    assert.deepEqual(await h.invoke('morde:portal-workbench-command', portal, [nonce,
+      { type: 'init', conversation_id: 'c1234567', visible: true }]), { sent: true });
+    const ready = await h.invoke('morde:host-workbench-ready', workbench.webContents, [nonce]);
+    assert.deepEqual(ready, { ready: true });
+    assert.equal(workbench.webContents.messages.some(([channel, message]) => channel === 'morde:host-workbench-message' && message.type === 'init'), true);
+    assert.equal(portal.messages.some(([channel, message]) => channel === 'morde:portal-workbench-message' && message.type === 'ready'), true);
+    await h.invoke('morde:host-workbench-state', workbench.webContents, [{ nonce, type: 'state', conversation_id: 'c1234567', host_id: 'h1234567',
+      workbench_ready: true, remote_desktop: 'connected', control_state: 'ai', control_lease_active: false, control_lease_held_by_me: false }]);
+    assert.equal(portal.messages.some(([channel, message]) => channel === 'morde:portal-workbench-message' && message.type === 'state' && message.host_id === 'h1234567'), true);
+
+    assert.deepEqual(await h.invoke('morde:portal-workbench-close', portal, [nonce]), { closed: true });
+    assert.equal(h.windows[0].contentView.attached.includes(workbench), false);
+    assert.equal(workbench.webContents.isDestroyed(), true);
+    assert.equal(partition.cleared, true);
   } finally {
     globalThis.fetch = originalFetch;
     h.cleanup();

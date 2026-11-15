@@ -27,6 +27,7 @@ type projectConversationRoutesStub struct {
 	getCalls       int
 	messageCalls   int
 	acceptCalls    int
+	taskView       app.ConversationTaskView
 	replayed       bool
 }
 
@@ -58,8 +59,9 @@ func (s *projectConversationRoutesStub) ListMessages(_ context.Context, principa
 		TaskID: "q1234567", DeliveryStatus: conversation.DeliveryApplied, CreatedAt: time.Now().UTC()}}}, nil
 }
 
-func (s *projectConversationRoutesStub) ListTasks(_ context.Context, principal identity.Principal, projectID, conversationID string, _ app.PageRequest) (app.TaskPage, error) {
+func (s *projectConversationRoutesStub) ListTasksWithView(_ context.Context, principal identity.Principal, projectID, conversationID string, view app.ConversationTaskView, _ app.PageRequest) (app.TaskPage, error) {
 	s.principal, s.projectID, s.conversationID = principal, projectID, conversationID
+	s.taskView = view
 	return app.TaskPage{Items: []task.Task{}}, nil
 }
 
@@ -141,8 +143,12 @@ func TestProjectConversationRoutesExposeSharedHistoryAndActor(t *testing.T) {
 	got = projectConversationAPIRequest(router, http.MethodGet, base+"/c1234567/tasks", "", "")
 	var active conversationActiveTaskPageResponse
 	if err := json.Unmarshal(got.Body.Bytes(), &active); err != nil || got.Code != http.StatusOK || active.Items == nil || len(active.Items) != 0 ||
-		service.projectID != "j1234567" || service.conversationID != "c1234567" {
+		service.projectID != "j1234567" || service.conversationID != "c1234567" || service.taskView != app.ConversationTaskViewActive {
 		t.Fatalf("list active project tasks = %d %s page=%#v err=%v", got.Code, got.Body, active, err)
+	}
+	got = projectConversationAPIRequest(router, http.MethodGet, base+"/c1234567/tasks?view=panel", "", "")
+	if got.Code != http.StatusOK || service.taskView != app.ConversationTaskViewPanel {
+		t.Fatalf("list project panel tasks = %d %s view=%q", got.Code, got.Body, service.taskView)
 	}
 }
 

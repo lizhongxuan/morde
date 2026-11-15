@@ -15,6 +15,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
 
@@ -36,6 +37,10 @@ type TaskService interface {
 	RespondToPendingRequest(context.Context, identity.Principal, string, string, int64, task.PendingDecision, string) error
 	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
+}
+
+type TaskApprovalQueryService interface {
+	ListTaskApprovals(context.Context, identity.Principal, string, app.PageRequest) (app.TaskApprovalPage, error)
 }
 
 type TaskFileFetchQueryService interface {
@@ -74,6 +79,40 @@ type TaskMCPConnectorGrantService interface {
 type taskPageResponse struct {
 	Items      []taskSummaryResponse `json:"items"`
 	NextCursor *string               `json:"next_cursor"`
+}
+
+type taskApprovalPageResponse struct {
+	Items        []taskApprovalResponse `json:"items"`
+	NextCursor   *string                `json:"next_cursor"`
+	PendingCount int64                  `json:"pending_count"`
+}
+
+type taskApprovalResponse struct {
+	TaskID            string                       `json:"task_id"`
+	ConversationID    string                       `json:"conversation_id"`
+	ProjectID         *string                      `json:"project_id"`
+	HostID            *string                      `json:"host_id"`
+	TaskStatus        task.Status                  `json:"task_status"`
+	TaskEventSequence int64                        `json:"task_event_sequence"`
+	TaskUpdatedAt     time.Time                    `json:"task_updated_at"`
+	Approval          taskApprovalSnapshotResponse `json:"approval"`
+}
+
+type taskApprovalSnapshotResponse struct {
+	ID                      string                          `json:"id"`
+	Version                 int64                           `json:"version"`
+	Status                  string                          `json:"status"`
+	Decision                task.PendingDecision            `json:"decision"`
+	Kind                    string                          `json:"kind"`
+	Title                   string                          `json:"title"`
+	Object                  string                          `json:"object"`
+	Content                 string                          `json:"content"`
+	Impact                  string                          `json:"impact"`
+	Disclosures             taskApprovalDisclosuresResponse `json:"disclosures"`
+	ExpiresAt               *time.Time                      `json:"expires_at"`
+	RespondedAt             *time.Time                      `json:"responded_at"`
+	CreatedAt               time.Time                       `json:"created_at"`
+	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
 }
 
 type taskSummaryResponse struct {
@@ -527,6 +566,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 		return
 	}
 	group.GET("/tasks", h.listTasks(service))
+	if approvalService, ok := service.(TaskApprovalQueryService); ok {
+		group.GET("/me/task-approvals", h.listTaskApprovals(approvalService))
+	}
 	group.POST("/tasks", h.submitTask(service))
 	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
@@ -994,6 +1036,76 @@ func (h *api) listTasks(service TaskService) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, response)
 	}
+}
+
+func (h *api) listTaskApprovals(service TaskApprovalQueryService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		conversationID, ok := singleQuery(c, "conversation_id")
+		if !ok {
+			return
+		}
+		page, ok := requestPage(c)
+		if !ok {
+			return
+		}
+		result, err := service.ListTaskApprovals(c.Request.Context(), principal, conversationID, page)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response := taskApprovalPageResponse{Items: make([]taskApprovalResponse, 0, len(result.Items)),
+			NextCursor: cursorPointer(result.NextCursor), PendingCount: result.PendingCount}
+		for _, item := range result.Items {
+			view, err := toTaskApprovalResponse(item)
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			response.Items = append(response.Items, view)
+		}
+		c.Header("Cache-Control", "private, no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.JSON(http.StatusOK, response)
+	}
+}
+
+func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error) {
+	request := value.Request
+	status := string(request.Status)
+	if request.Status == task.PendingRequestPending && request.ExpiresAt != nil && !time.Now().Before(*request.ExpiresAt) {
+		status = string(task.PendingRequestExpired)
+	}
+	if !domain.ValidTaskID(value.TaskID) || !domain.ValidConversationID(value.ConversationID) || value.TaskEventSeq < 0 || value.Request.CreatedAt.IsZero() ||
+		value.TaskUpdatedAt.IsZero() || !domain.ValidPendingRequestID(request.ID) || request.TaskID != value.TaskID || request.Version < 1 ||
+		request.Kind != "approval" || (status != "pending" && status != "approved" && status != "rejected" && status != "cancelled" && status != "expired") ||
+		!validTaskText(request.Title, 512) || !validTaskText(request.Object, 512) || !validTaskText(request.Content, 512) || !validTaskText(request.Impact, 512) ||
+		(request.ExpiresAt != nil && request.ExpiresAt.IsZero()) || (request.RespondedAt != nil && request.RespondedAt.IsZero()) ||
+		(request.MediaPreviewOperationID != "" && !domain.ValidOperationID(request.MediaPreviewOperationID)) {
+		return taskApprovalResponse{}, domain.NewError(domain.CodeInternal, "task approval query returned an invalid request")
+	}
+	if (value.ProjectID != "" && !project.ValidID(value.ProjectID)) || (value.HostID != "" && !domain.ValidHostID(value.HostID)) {
+		return taskApprovalResponse{}, domain.NewError(domain.CodeInternal, "task approval query returned an invalid task")
+	}
+	if (request.Status == task.PendingRequestPending && request.Decision != "") ||
+		(request.Status == task.PendingRequestApproved && request.Decision != task.PendingDecisionApprove) ||
+		((request.Status == task.PendingRequestRejected || request.Status == task.PendingRequestExpired) && request.Decision != task.PendingDecisionReject) ||
+		(request.Status == task.PendingRequestCancelled && request.Decision != "") {
+		return taskApprovalResponse{}, domain.NewError(domain.CodeInternal, "task approval query returned an invalid decision")
+	}
+	return taskApprovalResponse{
+		TaskID: value.TaskID, ConversationID: value.ConversationID, ProjectID: optionalTaskText(value.ProjectID), HostID: optionalTaskText(value.HostID),
+		TaskStatus: value.TaskStatus, TaskEventSequence: value.TaskEventSeq, TaskUpdatedAt: value.TaskUpdatedAt,
+		Approval: taskApprovalSnapshotResponse{ID: request.ID, Version: request.Version, Status: status, Decision: request.Decision,
+			Kind: request.Kind, Title: request.Title, Object: request.Object, Content: request.Content, Impact: request.Impact,
+			Disclosures: unknownTaskApprovalDisclosures(), ExpiresAt: request.ExpiresAt, RespondedAt: request.RespondedAt,
+			CreatedAt: request.CreatedAt, MediaPreviewOperationID: request.MediaPreviewOperationID},
+	}, nil
 }
 
 func (h *api) getTask(service TaskService) gin.HandlerFunc {

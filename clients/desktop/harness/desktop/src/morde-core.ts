@@ -12,6 +12,8 @@ export type Credentials = {
 };
 
 export type WebSession = { credential: string; expiresAt: string; hostFrameSource: string };
+export type HostEmbedTarget = "browser" | "terminal" | "workspace" | "files" | "vscode";
+export type HostEmbedTicket = { exchangeURL: string; ticket: string; embedNonce: string; targets: HostEmbedTarget[] };
 export type ClientLoginAttempt = { clientInstanceID: string; attemptGeneration: string; idempotencyKey: string };
 export type ProjectSyncFolder = { folderID: string; workspaceID: string; folderKind: "workspace_root" | "project"; projectName?: string; relativePath: string; state: "pending_node" | "active" | "revoked"; syncAvailable: boolean };
 export type CodexScope = "read" | "live" | "send" | "interrupt" | "approval";
@@ -354,6 +356,25 @@ export class MordeAPI {
     return validSession(await this.request("/api/auth/client-web-session", "POST"));
   }
 
+  async issueHostEmbedTicket(hostID: unknown, conversationID: unknown, target: unknown, targets: unknown, web: WebSession): Promise<HostEmbedTicket> {
+    const host = checkedId("host", hostID);
+    const allowed = new Set<HostEmbedTarget>(["browser", "terminal", "workspace", "files", "vscode"]);
+    if (typeof conversationID !== "string" || !/^c[a-z0-9]{7}$/.test(conversationID) || typeof target !== "string" || !allowed.has(target as HostEmbedTarget) ||
+      !Array.isArray(targets) || targets.length < 1 || targets.length > allowed.size ||
+      !targets.every((item) => typeof item === "string" && allowed.has(item as HostEmbedTarget)) || new Set(targets).size !== targets.length ||
+      !targets.includes(target)) throw new Error("Invalid Morde Host embed request");
+    const origin = this.credentials()?.origin;
+    if (!origin) throw new Error("Log in to Morde again");
+    const value = await this.portalRequest(`/api/hosts/${host}/embed-tickets`, web, "POST", { conversation_id: conversationID, target, targets }, undefined, origin) as Record<string, unknown> | null;
+    if (!value || typeof value.exchange_url !== "string" || typeof value.ticket !== "string" || !/^[\w-]{43}$/.test(value.ticket) ||
+      typeof value.embed_nonce !== "string" || !/^[\w-]{32}$/.test(value.embed_nonce) || !Array.isArray(value.targets) ||
+      value.targets.length < 1 || !value.targets.every((item) => typeof item === "string" && allowed.has(item as HostEmbedTarget) && targets.includes(item)) ||
+      !value.targets.includes(target) || typeof value.expires_at !== "string" || credentialExpired(value.expires_at)) {
+      throw new Error("Invalid Morde Host embed ticket response");
+    }
+    return { exchangeURL: value.exchange_url, ticket: value.ticket, embedNonce: value.embed_nonce, targets: value.targets as HostEmbedTarget[] };
+  }
+
   async logout(): Promise<void> {
     await this.request("/api/auth/client-logout", "POST");
   }
@@ -498,7 +519,7 @@ export class MordeAPI {
     return { provider_event_ids: ids, last_sequence: value.last_sequence as number };
   }
 
-  private async portalRequest(path: string, session: WebSession, method = "GET", body?: unknown, idempotencyKey?: string): Promise<unknown> {
+  private async portalRequest(path: string, session: WebSession, method = "GET", body?: unknown, idempotencyKey?: string, requestOrigin?: string): Promise<unknown> {
     const auth = this.credentials();
     if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
     if (!session || typeof session.credential !== "string" || !session.credential || credentialExpired(session.expiresAt)) {
@@ -507,6 +528,7 @@ export class MordeAPI {
     const response = await fetch(`${auth.origin}${path}`, {
       method, headers: {
         cookie: `ch_portal=${session.credential}`, accept: "application/json",
+        ...(requestOrigin ? { origin: requestOrigin } : {}),
         ...(body === undefined ? {} : { "content-type": "application/json" }),
         ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
       },
@@ -571,6 +593,14 @@ export class MordeAPI {
 
   me(): Promise<unknown> {
     return this.request("/api/me");
+  }
+
+  async userPreferences(session: WebSession): Promise<{ defaultHostID: string | null }> {
+    const value = await this.portalRequest("/api/me/preferences", session) as Record<string, unknown> | null;
+    if (!value || Array.isArray(value) || !(value.default_host_id === null || typeof value.default_host_id === "string")) {
+      throw new Error("Invalid Morde user preferences response");
+    }
+    return { defaultHostID: value.default_host_id === null ? null : checkedId("host", value.default_host_id) };
   }
 
   host(id: unknown): Promise<unknown> {

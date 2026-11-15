@@ -478,7 +478,7 @@ func (s *TaskService) ListConversationTasks(ctx context.Context, principal ident
 	if err := validateTaskPrincipal(principal); err != nil {
 		return TaskPage{}, err
 	}
-	if view != ConversationTaskViewActive && view != ConversationTaskViewRecent {
+	if view != ConversationTaskViewActive && view != ConversationTaskViewRecent && view != ConversationTaskViewPanel {
 		return TaskPage{}, domain.InvalidArgument("view", "conversation task view is invalid")
 	}
 	if !domain.ValidConversationID(conversationID) {

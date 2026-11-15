@@ -49,6 +49,7 @@ function showEmbeddedWorkbench(nonce: string) {
 
 afterEach(() => {
   window.history.replaceState({}, '', '/');
+  Reflect.deleteProperty(window, 'morde');
   Reflect.deleteProperty(document, 'referrer');
 });
 
@@ -141,6 +142,31 @@ describe('Workbench MVP navigation', () => {
     expect(screen.queryByRole('button', { name: 'Workspace' })).not.toBeInTheDocument();
     expect([...container.querySelectorAll<HTMLButtonElement>('.tab-button')].map((button) => button.dataset.tab))
       .toEqual(['browser', 'terminal', 'files', 'vscode']);
+  });
+
+  it('uses the native nonce bridge for a top-level Workbench and reports its authorized state', async () => {
+    const nonce = 'n'.repeat(32);
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${nonce}&tab=browser`);
+    const ready = vi.fn().mockResolvedValue({ ready: true });
+    const sendState = vi.fn().mockResolvedValue({ accepted: true });
+    let receive: ((value: unknown) => void) | undefined;
+    Object.defineProperty(window, 'morde', { configurable: true, value: {
+      hostWorkbenchReady: ready,
+      sendHostWorkbenchState: sendState,
+      onHostWorkbenchMessage: (listener: (value: unknown) => void) => { receive = listener; return () => { receive = undefined; }; },
+    } });
+    const { container } = render(<Workbench />);
+
+    await waitFor(() => expect(ready).toHaveBeenCalledWith(nonce));
+    expect(container.querySelector('main')).toHaveClass('is-embedded');
+    await waitFor(() => expect(gatewayApi.control).toHaveBeenCalledOnce());
+    act(() => receive?.({ channel: 'morde.workbench.embed', version: 1, type: 'init', nonce,
+      conversation_id: 'c1234567', visible: true }));
+
+    await waitFor(() => expect(gatewayApi.control).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(sendState).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'state', nonce, conversation_id: 'c1234567', host_id: host.id, workbench_ready: true,
+    })));
   });
 
   it('shows only server-authorized embed targets and falls back when the requested tab is not authorized', async () => {

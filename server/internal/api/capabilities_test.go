@@ -650,8 +650,8 @@ func TestConversationTaskOpenAPIIsReadOnly(t *testing.T) {
 		strings.Contains(route, "    post:\n") {
 		t.Fatalf("Portal OpenAPI conversation Task route must only list tasks:\n%s", route)
 	}
-	if !strings.Contains(route, "enum: [active, recent]") || !strings.Contains(route, "default: active") {
-		t.Fatalf("Portal OpenAPI conversation Task view must default to active and support recent:\n%s", route)
+	if !strings.Contains(route, "enum: [active, recent, panel]") || !strings.Contains(route, "default: active") || !strings.Contains(route, "running tasks first") {
+		t.Fatalf("Portal OpenAPI conversation Task view must default to active and include the ordered panel view:\n%s", route)
 	}
 	if strings.Contains(contract, "submitConversationTask") || strings.Contains(contract, "SubmitConversationTaskRequest") ||
 		strings.Contains(contract, "SubmittedConversationTaskResponse") {

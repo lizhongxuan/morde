@@ -237,6 +237,11 @@ export const portalApi = {
     throw new Error('任务页数超过读取上限');
   },
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  taskApprovals: async (options: { conversationID?: string; cursor?: string } = {}): Promise<components['schemas']['TaskApprovalPage']> =>
+    unwrapApiResponse(await api.GET('/api/me/task-approvals', { params: { query: {
+      limit: 100, ...(options.conversationID ? { conversation_id: options.conversationID } : {}),
+      ...(options.cursor ? { cursor: options.cursor } : {}),
+    } } })),
   taskArtifactContentURL: (id: string, artifactID: string) => `/api/tasks/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifactID)}/content`,
   taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
     params: { path: { id, step_id: stepID } },

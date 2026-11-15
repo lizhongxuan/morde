@@ -456,12 +456,19 @@ func (h *api) listConversationActiveTasks(service TaskService) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		view := app.ConversationTaskView(c.DefaultQuery("view", string(app.ConversationTaskViewActive)))
-		if view != app.ConversationTaskViewActive && view != app.ConversationTaskViewRecent {
+		view, ok := singleQuery(c, "view")
+		if !ok {
+			return
+		}
+		if view == "" {
+			view = string(app.ConversationTaskViewActive)
+		}
+		taskView := app.ConversationTaskView(view)
+		if taskView != app.ConversationTaskViewActive && taskView != app.ConversationTaskViewRecent && taskView != app.ConversationTaskViewPanel {
 			writeError(c, domain.InvalidArgument("view", "conversation task view is invalid"))
 			return
 		}
-		result, err := service.ListConversationTasks(c.Request.Context(), principal, "", id, view, page)
+		result, err := service.ListConversationTasks(c.Request.Context(), principal, "", id, taskView, page)
 		if err != nil {
 			writeError(c, err)
 			return

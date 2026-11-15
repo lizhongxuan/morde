@@ -18,6 +18,11 @@ import { returnToPreviousPage } from './navigation';
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
 type MobileMenu = 'browser' | 'terminal' | 'files' | null;
 type EmbedContext = { origin: string; nonce: string };
+type NativeWorkbenchBridge = {
+  hostWorkbenchReady?: (nonce: string) => Promise<unknown>;
+  sendHostWorkbenchState?: (state: unknown) => Promise<unknown>;
+  onHostWorkbenchMessage?: (listener: (value: unknown) => void) => () => void;
+};
 const embedChannel = 'morde.workbench.embed';
 const embedProtocolVersion = 1;
 const primaryTabs: { id: Tab; label: string }[] = [
@@ -47,10 +52,11 @@ function hasEmbedControlTarget(targets: Set<Tab>): boolean {
   return targets.has('browser');
 }
 
-function parseEmbedContext(search: string, referrer: string): EmbedContext | null {
+function parseEmbedContext(search: string, referrer: string, native = false): EmbedContext | null {
   const query = new URLSearchParams(search);
   const nonce = query.get('embed_nonce') ?? '';
   if (query.get('embed') !== '1' || !/^[\w-]{24,128}$/.test(nonce)) return null;
+  if (native) return { origin: '', nonce };
   try {
     const origin = new URL(referrer).origin;
     if (!origin || (new URL(origin).protocol !== 'https:' && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))) return null;
@@ -84,7 +90,11 @@ function controlActionCompleted(control: GatewayControl, action: GatewayControlA
 
 export default function Workbench() {
   const query = new URLSearchParams(window.location.search);
-  const [embedContext] = useState(() => parseEmbedContext(window.location.search, document.referrer));
+  const [nativeBridge] = useState(() => {
+    const bridge = (window as Window & { morde?: NativeWorkbenchBridge }).morde;
+    return bridge?.hostWorkbenchReady && bridge.sendHostWorkbenchState && bridge.onHostWorkbenchMessage ? bridge : null;
+  });
+  const [embedContext] = useState(() => parseEmbedContext(window.location.search, document.referrer, Boolean(nativeBridge)));
   const embedded = embedContext !== null;
   const taskObservationOnly = query.has('task_id');
   const taskObservationID = query.get('task_id') ?? '';
@@ -164,12 +174,8 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!embedContext) return;
-    const send = (type: 'ready' | 'state', details: Record<string, unknown> = {}) => {
-      window.parent.postMessage({ channel: embedChannel, version: embedProtocolVersion, type, nonce: embedContext.nonce, ...details }, embedContext.origin);
-    };
-    const onMessage = (event: MessageEvent<unknown>) => {
-      if (event.source !== window.parent || event.origin !== embedContext.origin || !embedMessageMatches(event.data, embedContext)) return;
-      const message = event.data;
+    const onMessage = (message: Record<string, unknown>) => {
+      if (!embedMessageMatches(message, embedContext)) return;
       if (message.type === 'init' && typeof message.visible === 'boolean' &&
         typeof message.conversation_id === 'string' && /^[\w-]{8,128}$/.test(message.conversation_id)) {
         embedInitializedRef.current = true;
@@ -184,14 +190,26 @@ export default function Workbench() {
         if (message.visible && !wasVisible) void reloadControl();
       }
     };
-    window.addEventListener('message', onMessage);
-    send('ready');
-    return () => window.removeEventListener('message', onMessage);
-  }, [embedContext, reloadControl]);
+    if (nativeBridge) {
+      const unsubscribe = nativeBridge.onHostWorkbenchMessage?.((value) => {
+        if (!value || typeof value !== 'object') return;
+        onMessage(value as Record<string, unknown>);
+      });
+      void Promise.resolve(nativeBridge.hostWorkbenchReady?.(embedContext.nonce)).catch(() => undefined);
+      return unsubscribe;
+    }
+    const onWindowMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== window.parent || event.origin !== embedContext.origin || !event.data || typeof event.data !== 'object') return;
+      onMessage(event.data as Record<string, unknown>);
+    };
+    window.addEventListener('message', onWindowMessage);
+    window.parent.postMessage({ channel: embedChannel, version: embedProtocolVersion, type: 'ready', nonce: embedContext.nonce }, embedContext.origin);
+    return () => window.removeEventListener('message', onWindowMessage);
+  }, [embedContext, nativeBridge, reloadControl]);
 
   useEffect(() => {
     if (!embedContext) return;
-    window.parent.postMessage({
+    const message = {
       channel: embedChannel,
       version: embedProtocolVersion,
       type: 'state',
@@ -203,9 +221,11 @@ export default function Workbench() {
       control_state: control?.control_state ?? 'unknown',
       control_lease_active: control?.control_lease_active ?? false,
       control_lease_held_by_me: control?.control_lease_held_by_me ?? false,
-    }, embedContext.origin);
+    };
+    if (nativeBridge) void Promise.resolve(nativeBridge.sendHostWorkbenchState?.(message)).catch(() => undefined);
+    else window.parent.postMessage(message, embedContext.origin);
   }, [browserStatus, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_state,
-    controlLoading, embedContext, embedConversationID, embedded, hostID, hostSessionOnly, initialTab, pageError]);
+    controlLoading, embedContext, embedConversationID, embedded, hostID, hostSessionOnly, initialTab, nativeBridge, pageError]);
 
   useEffect(() => {
     if (hostSessionOnly) return;
