@@ -71,7 +71,7 @@ func (s *WorkspaceService) SetWorkspaceCurrentInitializer(initializer WorkspaceC
 
 func (s *WorkspaceService) SetHostWorkspaceVolumes(volumes *WorkspaceVolumeService) error {
 	if s == nil || volumes == nil {
-		return errors.New("Host workspace volume service is required")
+		return errors.New("host workspace volume service is required")
 	}
 	s.hostWorkspaceVolumes = volumes
 	return nil

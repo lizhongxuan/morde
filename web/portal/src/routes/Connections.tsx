@@ -51,7 +51,7 @@ export function Connections() {
         client.invalidateQueries({ queryKey: ['model-connections'] }),
         client.invalidateQueries({ queryKey: ['available-models'] }),
       ]);
-      notify('个人模型检查完成。', 'success');
+      notify(capabilities.tools ? '个人模型文本和工具调用均已验证。' : '文字对话可用；工具调用尚未验证。', capabilities.tools ? 'success' : 'info');
     },
     onError: () => { void refreshModels(); },
   });
@@ -76,7 +76,6 @@ export function Connections() {
     event.preventDefault();
     if (saving) return;
     const submittedDraft = draft;
-    const selectedPresetID = presetID;
     setSaving(true);
     setDraft((current) => ({ ...current, apiKey: '' }));
     setSaveError(null);
@@ -95,14 +94,14 @@ export function Connections() {
       setSaveError(null);
       setChecked(null);
       await refreshModels();
-      if (!editingID && selectedPresetID) {
+      if (!editingID) {
         try {
           await check.mutateAsync(saved.id);
         } catch (error) {
           notify(`个人模型已保存，但连接检查失败：${modelCheckErrorMessage(error)}`, 'error');
         }
       } else {
-        notify(editingID ? '个人模型已更新。' : '个人模型已保存到 Morde 服务端。', 'success');
+        notify('个人模型已更新。', 'success');
       }
     } catch (error) {
       setSaveError(error instanceof Error ? error : new Error('保存个人模型失败。'));
@@ -177,7 +176,7 @@ export function Connections() {
             <optgroup label="Z.ai / GLM">
               {modelConnectionPresets.filter((preset) => preset.id.startsWith('glm-')).map((preset) => <option key={preset.id} value={preset.id}>{preset.modelName}</option>)}
             </optgroup>
-          </select><small className="muted">{editingID ? '选择后会自动填写显示名称、模型名和服务地址。' : '选择后会自动填写显示名称、模型名和服务地址；保存时会检查文本和工具调用能力。检查可能产生少量服务商费用。'}</small></div>
+          </select><small className="muted">{editingID ? '选择后会自动填写显示名称、模型名和服务地址。' : '选择后会自动填写显示名称、模型名和服务地址；保存后会检查文本和工具调用能力，可能产生少量服务商费用。'}</small></div>
           <div><label htmlFor="personal-model-name">显示名称</label><input id="personal-model-name" value={draft.name} maxLength={80} required onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></div>
           <div><label htmlFor="personal-model-provider-name">模型名</label><input id="personal-model-provider-name" value={draft.modelName} maxLength={256} required onChange={(event) => setDraft({ ...draft, modelName: event.target.value })} /></div>
           <div><label htmlFor="personal-model-context-window">上下文窗口（tokens）</label><input id="personal-model-context-window" type="number" min={4096} max={1000000} step={1} value={draft.contextWindowTokens} onChange={(event) => setDraft({ ...draft, contextWindowTokens: event.target.value })} /><small className="muted">按服务商模型文档填写。压缩需要此值；留空时会安全停用该模型的自动压缩。</small></div>
@@ -185,7 +184,7 @@ export function Connections() {
           <div className="connection-form-wide"><label htmlFor="personal-model-api-key">API 密钥</label><input id="personal-model-api-key" type="password" autoComplete="new-password" value={draft.apiKey} maxLength={4096} required={!editingID} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} /><small className="muted">{editingID ? '留空保留已保存的密钥，输入新值才会替换。' : '仅发送给服务端并加密保存。服务端不会返回密钥；不要在此输入共享密钥。'}</small></div>
         </div>
         {saveError && <FloatingError className="error-inline" role="alert">{errorDetails(saveError).message}</FloatingError>}
-        <div className="form-actions"><button type="button" className="button button-secondary" disabled={saving} onClick={cancelForm}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? '正在保存…' : editingID ? '保存修改' : presetID ? '保存并检查连接' : '保存个人模型'}</button></div>
+        <div className="form-actions"><button type="button" className="button button-secondary" disabled={saving} onClick={cancelForm}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? '正在保存…' : editingID ? '保存修改' : '保存并检查连接'}</button></div>
       </form>}
       {models.isPending ? <div className="loading-card" role="status">正在读取模型连接…</div>
         : models.isError ? <FloatingError className="error-card" role="alert">{errorDetails(models.error).message}<button className="button button-secondary" type="button" onClick={() => void models.refetch()}>重试</button></FloatingError>

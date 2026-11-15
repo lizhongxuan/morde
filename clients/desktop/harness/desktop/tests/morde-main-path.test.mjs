@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { mordeUserDataDirectory } from '../out/morde-core.js';
 import { createRequire } from 'node:module';
+
+process.env.MORDE_TEST_PORTAL_ASSETS = fileURLToPath(new URL('./portal-fixture', import.meta.url));
 
 test('system directory protection handles Windows paths and filesystem roots', async () => {
   const root = mkdtempSync(join(tmpdir(), 'morde-system-path-'));
@@ -49,6 +52,8 @@ test('authenticated WebView restores Assistant and workspace folder selection en
   const handlers = new Map(), windows = [], views = [], appEvents = new Map(), paths = { appData: join(root, 'app-data') };
   const workspaceRequests = [], preservedCalls = [];
   let applicationMenu = [];
+  const applicationNames = [];
+  let storageAvailable = false;
   let workspaceOffline = false, blockedPreservedMethod = '', releasePreserved;
   let childOwnsFolder = false, stopSyncResult = true, fakeSyncState = 'idle', startSyncForExit = false, quitCount = 0, shutdownWarnings = 0;
   const workspaceRoot = join(root, 'workspaces');
@@ -130,7 +135,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
   }
   const electron = {
     app: {
-      setName() {}, getPath: (key) => paths[key] ?? root, setPath: (key, value) => { paths[key] = value; }, getLocale: () => 'en',
+      setName: (name) => applicationNames.push(name), getPath: (key) => paths[key] ?? root, setPath: (key, value) => { paths[key] = value; }, getLocale: () => 'en',
       getVersion: () => '0.1.0', requestSingleInstanceLock: () => true, isPackaged: false, whenReady: () => Promise.resolve(),
       on: (name, fn) => appEvents.set(name, fn), quit() { quitCount++; },
     },
@@ -145,7 +150,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
       showOpenDialog: async () => selectedDirectory ? { canceled: false, filePaths: [selectedDirectory] } : { canceled: true, filePaths: [] },
     },
     Menu: { buildFromTemplate: (items) => items, setApplicationMenu: (items) => { applicationMenu = items; } },
-    safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() },
+    safeStorage: { isEncryptionAvailable: () => storageAvailable, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() },
     shell: { openExternal: async () => {} },
     Tray: class { setToolTip() {} setContextMenu() {} on() {} },
   };
@@ -177,14 +182,18 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     const mainWindow = windows[0];
+    assert.deepEqual(applicationNames, ['Morde']);
+    storageAvailable = true;
+    await handlers.get('morde:state')({ sender: mainWindow.webContents });
+    assert.deepEqual(applicationNames, ['Morde', 'morde-pc']);
     await handlers.get('morde:login')({ sender: mainWindow.webContents }, 'https://portal.example', 'user', 'password');
     const contents = views[0].webContents;
-    const assistantURL = 'https://portal.example/assistant';
+    const assistantURL = `${new URL(views[0].webContents.url).origin}/assistant`;
     assert.deepEqual(contents.loaded, [assistantURL]);
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).accountName, 'user');
     assert.equal(applicationMenu[1].role, 'editMenu');
     const appActions = applicationMenu[0].submenu;
-    assert.deepEqual(appActions.map((item) => item.label), ['Open Morde', 'Settings', undefined, 'Quit Morde']);
+    assert.deepEqual(appActions.map((item) => item.label), ['Open morde-pc', 'Settings', undefined, 'Quit morde-pc']);
     const settings = appActions.find((item) => item.label === 'Settings').submenu;
     assert.deepEqual(settings.map((item) => item.label), ['Codex sessions and access', 'Sign Out This PC']);
     await handlers.get('morde:open-assistant')({ sender: mainWindow.webContents });
@@ -192,10 +201,10 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     assert.equal(contents.getURL(), assistantURL);
 
     // The conversation's Files panel opens this route within Portal; no desktop-menu shortcut is exposed.
-    contents.url = 'https://portal.example/workspaces';
+    contents.url = `${new URL(assistantURL).origin}/workspaces`;
     appActions[0].click();
     assert.equal((await handlers.get('morde:state')({ sender: mainWindow.webContents })).view, 'web');
-    assert.equal(contents.getURL(), 'https://portal.example/workspaces');
+    assert.equal(contents.getURL(), `${new URL(assistantURL).origin}/workspaces`);
     const portalNavigation = [assistantURL];
     assert.deepEqual(contents.loaded, portalNavigation);
     assert.equal(handlers.has('morde:show-web'), false);
@@ -206,7 +215,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     assert.equal(prevented, true);
     assert.deepEqual(contents.loaded, portalNavigation);
 
-    const observationPopup = contents.open({ url: 'about:blank' });
+    const observationPopup = contents.open({ url: 'about:blank', frameName: 'morde-task-observation' });
     assert.equal(observationPopup.action, 'allow');
     const observationContents = observationPopup.createWindow({ webPreferences: {} });
     const observationWindow = windows.at(-1);
@@ -226,10 +235,20 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     assert.equal(prevented, true, 'Task observation popups must not navigate into other Workbench features');
 
     prevented = false;
-    navigate({ preventDefault() { prevented = true; } }, 'https://portal.example/login');
+    const portalOrigin = new URL(assistantURL).origin;
+    const settingsURL = `${portalOrigin}/settings?section=privacy`;
+    navigate({ preventDefault() { prevented = true; } }, `${portalOrigin}/login?next=${encodeURIComponent('/settings?section=privacy')}`);
     assert.equal(prevented, true);
     for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(contents.loaded, [...portalNavigation, assistantURL]);
+    assert.deepEqual(contents.loaded, [...portalNavigation, settingsURL]);
+
+    for (const unsafeNext of ['//evil.example/settings', '/\\evil.example/settings', '/login?next=%2Fsettings', '/admin']) {
+      prevented = false;
+      navigate({ preventDefault() { prevented = true; } }, `${portalOrigin}/login?next=${encodeURIComponent(unsafeNext)}`);
+      assert.equal(prevented, true);
+      for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.deepEqual(contents.loaded, [...portalNavigation, settingsURL, assistantURL, assistantURL, assistantURL, assistantURL]);
 
     const invoke = handlers.get('morde:choose-directory');
     selectedDirectory = workspaceA;

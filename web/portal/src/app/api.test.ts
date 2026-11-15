@@ -353,7 +353,7 @@ describe('typed Portal API client', () => {
     expect(await requests[1]!.json()).toEqual({ capability: 'tools' });
   });
 
-  it('surfaces a failed tool capability probe after text succeeds', async () => {
+  it('keeps text capability verified when the tool probe fails', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(new Request(input, init));
@@ -361,8 +361,8 @@ describe('typed Portal API client', () => {
       return Response.json({ error: { code: 'upstream_error', message: 'tool probe failed' } }, { status: 502 });
     }));
 
-    await expect(portalApi.checkModelConnection('p1234567', 'model-probe-key-001')).rejects.toMatchObject({
-      code: 'upstream_error', status: 502,
+    await expect(portalApi.checkModelConnection('p1234567', 'model-probe-key-001')).resolves.toEqual({
+      text: true, tools: false, vision: false, text_stream: false,
     });
     expect(requests).toHaveLength(2);
     expect(await requests[0]!.json()).toEqual({ capability: 'text' });

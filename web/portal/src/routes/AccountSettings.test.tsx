@@ -87,6 +87,30 @@ describe('AccountSettings', () => {
     expect(personalSyncStore.subscribeStatus).toHaveBeenCalledWith('u1', expect.any(Function), window.location.origin, 'service-account-test');
   });
 
+  it('loads private account data only when its tab is opened', async () => {
+    const recordConsents = vi.spyOn(portalApi, 'recordConsents').mockResolvedValue({ items: [] });
+    const personalDataQuota = vi.spyOn(portalApi, 'personalDataQuota').mockResolvedValue({ owner_id: 'u1', used_bytes: 0, reserved_bytes: 0,
+      quota_bytes: 1000, max_attachment_bytes: 500, remaining_bytes: 1000, version: 1 });
+    const records = vi.spyOn(portalApi, 'myRecords').mockResolvedValue({ items: [], next_before: '' });
+    const captureStatuses = vi.spyOn(portalApi, 'myRecordCaptureStatuses').mockResolvedValue(emptyCapturePage);
+    const user = userEvent.setup();
+    renderSettings();
+
+    expect(recordConsents).not.toHaveBeenCalled();
+    expect(personalDataQuota).not.toHaveBeenCalled();
+    expect(records).not.toHaveBeenCalled();
+    expect(captureStatuses).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('tab', { name: '隐私与同意' }));
+    await waitFor(() => expect(recordConsents).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole('tab', { name: '个人数据' }));
+    await waitFor(() => expect(personalDataQuota).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole('tab', { name: '记录状态' }));
+    await waitFor(() => expect(captureStatuses).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole('tab', { name: '已保存记录' }));
+    await waitFor(() => expect(records).toHaveBeenCalledOnce());
+  });
+
   it('updates one independent consent and reloads its server state', async () => {
     const user = userEvent.setup();
     vi.spyOn(portalApi, 'recordConsents')
@@ -166,11 +190,11 @@ describe('AccountSettings', () => {
       payload_bytes: 100 + index, attachment_bytes: 0, attachment_count: 0, state: 'active' as const });
     renderSettings({ items: [item(0), item(1), item(2), item(3)], next_before: 'page-two' });
     const recordsQuery = vi.mocked(portalApi.myRecords);
-    recordsQuery.mockResolvedValueOnce({ items: [item(4)], next_before: '' });
     await user.click(screen.getByRole('tab', { name: '已保存记录' }));
     const hasRecordBytes = (bytes: string) => screen.getAllByRole('article').some((article) => article.textContent?.includes(bytes));
 
     await waitFor(() => expect(hasRecordBytes('100 B')).toBe(true));
+    recordsQuery.mockResolvedValueOnce({ items: [item(4)], next_before: '' });
     await user.click(screen.getByRole('button', { name: '下一页' }));
     await waitFor(() => expect(hasRecordBytes('104 B')).toBe(true));
     expect(hasRecordBytes('100 B')).toBe(false);

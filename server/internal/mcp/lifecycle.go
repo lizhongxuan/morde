@@ -122,11 +122,6 @@ func (s *service) hostOutput(value host.Host) hostOutput {
 	}
 }
 
-func arrayArg(args map[string]any, name string) []any {
-	value, _ := args[name].([]any)
-	return value
-}
-
 func boolArg(args map[string]any, name string) bool {
 	value, _ := args[name].(bool)
 	return value

@@ -143,8 +143,8 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertFalse(try task(started: true, current: 2, desired: 2).isWaitingForRevisionStart)
         XCTAssertFalse(try task(started: nil, current: 1, desired: 2).isWaitingForRevisionStart)
         XCTAssertFalse(try task(started: false, current: 1, desired: 1, status: "failed").isWaitingForRevisionStart)
-        let oldStep = MordeTask.Step(id: "s1234567", sequence: 1, kind: "progress", status: "succeeded",
-            title: "开始处理", summary: "正在处理你的请求。", created_at: "2026-11-04T00:00:01Z")
+        let oldStep = makeStep(id: "s1234567", sequence: 1, kind: "progress", status: "succeeded",
+            title: "开始处理", summary: "正在处理你的请求。", createdAt: "2026-11-04T00:00:01Z")
         XCTAssertTrue(MIFTaskPresentation.visibleSteps([oldStep], waitingForRevisionStart: true).isEmpty)
         XCTAssertEqual(MIFTaskPresentation.visibleSteps([oldStep], waitingForRevisionStart: false).count, 1)
     }
@@ -222,12 +222,12 @@ final class MIFTaskViewsTests: XCTestCase {
     }
 
     func testSnapshotStepsAreSortedAndBudgetStepsAreHidden() {
-        let later = MordeTask.Step(id: "s2345678", sequence: 2, kind: "agent", status: "succeeded",
-                                   title: "Second", summary: "Finished", created_at: "2026-11-04T00:00:02Z")
-        let budget = MordeTask.Step(id: "s3456789", sequence: 3, kind: "budget", status: "succeeded",
-                                    title: "Budget", summary: "Sensitive usage detail", created_at: "2026-11-04T00:00:03Z")
-        let first = MordeTask.Step(id: "s1234567", sequence: 1, kind: "agent", status: "running",
-                                   title: "First", summary: "Working", created_at: "2026-11-04T00:00:01Z")
+        let later = makeStep(id: "s2345678", sequence: 2, kind: "agent", status: "succeeded",
+                             title: "Second", summary: "Finished", createdAt: "2026-11-04T00:00:02Z")
+        let budget = makeStep(id: "s3456789", sequence: 3, kind: "budget", status: "succeeded",
+                              title: "Budget", summary: "Sensitive usage detail", createdAt: "2026-11-04T00:00:03Z")
+        let first = makeStep(id: "s1234567", sequence: 1, kind: "agent", status: "running",
+                             title: "First", summary: "Working", createdAt: "2026-11-04T00:00:01Z")
 
         let visible = MIFTaskPresentation.visibleSteps([later, budget, first])
 
@@ -256,12 +256,12 @@ final class MIFTaskViewsTests: XCTestCase {
     }
 
     func testNonRetryableStepFailureReasonsExplainKnownStatesAndHideUnknownValues() throws {
-        let knownReasons = [
-            ("not_dispatched", "Step was not dispatched. Refresh the task and confirm its state."),
-            ("tool_failed_after_dispatch", "Step failed after dispatch. Check for partial results before retrying."),
-            ("side_effect_unknown", "This step may already have changed something. Check its result before retrying."),
-            ("authorization_changed", "Authorization changed. Refresh the task and check authorization before retrying."),
-            ("resource_changed", "The target resource changed. Refresh the task and check its state before retrying."),
+        let knownReasons: [(String, String)] = [
+            ("not_dispatched", AppLocalized("Step was not dispatched. Refresh the task and confirm its state.")),
+            ("tool_failed_after_dispatch", AppLocalized("Step failed after dispatch. Check for partial results before retrying.")),
+            ("side_effect_unknown", AppLocalized("This step may already have changed something. Check its result before retrying.")),
+            ("authorization_changed", AppLocalized("Authorization changed. Refresh the task and check authorization before retrying.")),
+            ("resource_changed", AppLocalized("The target resource changed. Refresh the task and check its state before retrying.")),
         ]
         for (reason, explanation) in knownReasons {
             let payload: [String: Any] = [
@@ -271,7 +271,7 @@ final class MIFTaskViewsTests: XCTestCase {
             ]
             let step = try JSONDecoder().decode(MordeTask.Step.self,
                 from: JSONSerialization.data(withJSONObject: payload))
-            XCTAssertEqual(MIFTaskPresentation.stepFailureExplanation(step), AppLocalized(explanation), reason)
+            XCTAssertEqual(MIFTaskPresentation.stepFailureExplanation(step), explanation, reason)
             XCTAssertFalse(MIFTaskPresentation.canRetryStep(step), reason)
         }
 
@@ -303,9 +303,9 @@ final class MIFTaskViewsTests: XCTestCase {
     }
 
     func testToolStepsUseReadableNamesAndKeepTheirRealStatuses() throws {
-        let tool = MordeTask.Step(id: "s1234567", sequence: 1, kind: "tool", status: "failed",
+        let tool = makeStep(id: "s1234567", sequence: 1, kind: "tool", status: "failed",
             title: "Run cloud dsh tool: morde_web_search",
-            summary: "Checking current authorization, budget, and Host control.", created_at: "2026-11-04T00:00:01Z")
+            summary: "Checking current authorization, budget, and Host control.", createdAt: "2026-11-04T00:00:01Z")
         XCTAssertEqual(MIFTaskPresentation.stepDescription(tool), "\(AppLocalized("Search the web")) · \(AppLocalized("Failed"))")
         XCTAssertEqual(tool.status, "failed")
         let event = try makeEvent(sequence: 1, type: "task.step",
@@ -316,8 +316,8 @@ final class MIFTaskViewsTests: XCTestCase {
     }
 
     func testStartedProgressIsVisibleWithoutClaimingTheTaskFinished() throws {
-        let step = MordeTask.Step(id: "s1234567", sequence: 1, kind: "progress", status: "succeeded",
-            title: "开始处理", summary: "正在处理你的请求。", created_at: "2026-11-04T00:00:01Z")
+        let step = makeStep(id: "s1234567", sequence: 1, kind: "progress", status: "succeeded",
+            title: "开始处理", summary: "正在处理你的请求。", createdAt: "2026-11-04T00:00:01Z")
         XCTAssertEqual(MIFTaskPresentation.visibleSteps([step]).map(\.id), [step.id])
         XCTAssertEqual(MIFTaskPresentation.stepStatusLabel(step.status, kind: step.kind, title: step.title),
                        AppLocalized("Task started"))
@@ -349,13 +349,13 @@ final class MIFTaskViewsTests: XCTestCase {
     }
 
     func testTaskListDetailUsesServerStepCountsAndKeepsCurrentDetail() {
-        let running = MordeTask.Step(id: "s2345678", sequence: 2, kind: "agent", status: "running",
-                                    title: "Second", summary: "Deploying", created_at: "2026-11-04T00:00:02Z")
-        let budget = MordeTask.Step(id: "s3456789", sequence: 3, kind: "budget", status: "succeeded",
-                                   title: "Private budget", summary: "Private usage detail",
-                                   created_at: "2026-11-04T00:00:03Z")
-        let completed = MordeTask.Step(id: "s1234567", sequence: 1, kind: "agent", status: "succeeded",
-                                       title: "First", summary: "Finished", created_at: "2026-11-04T00:00:01Z")
+        let running = makeStep(id: "s2345678", sequence: 2, kind: "agent", status: "running",
+                               title: "Second", summary: "Deploying", createdAt: "2026-11-04T00:00:02Z")
+        let budget = makeStep(id: "s3456789", sequence: 3, kind: "budget", status: "succeeded",
+                              title: "Private budget", summary: "Private usage detail",
+                              createdAt: "2026-11-04T00:00:03Z")
+        let completed = makeStep(id: "s1234567", sequence: 1, kind: "agent", status: "succeeded",
+                                 title: "First", summary: "Finished", createdAt: "2026-11-04T00:00:01Z")
         let task = makeTask(id: "q1234567", status: "running", currentStep: "Deploying", stepCount: 2,
                             completedStepCount: 1,
                             steps: [running, budget, completed])
@@ -371,9 +371,9 @@ final class MIFTaskViewsTests: XCTestCase {
         let result = makeTask(id: "q2345678", status: "completed", result: "Delivered")
         let completedWithStaleStep = makeTask(id: "q4567890", status: "completed",
                                               currentStep: "Old step", result: "Delivered")
-        let budget = MordeTask.Step(id: "s3456789", sequence: 1, kind: "budget", status: "succeeded",
-                                    title: "Private budget", summary: "Private usage detail",
-                                    created_at: "2026-11-04T00:00:01Z")
+        let budget = makeStep(id: "s3456789", sequence: 1, kind: "budget", status: "succeeded",
+                              title: "Private budget", summary: "Private usage detail",
+                              createdAt: "2026-11-04T00:00:01Z")
         let hiddenBudget = makeTask(id: "q3456789", status: "completed", stepCount: 0,
                                     completedStepCount: 0, steps: [budget])
         let serverReported = makeTask(id: "q5678901", status: "running", stepCount: 7,
@@ -425,20 +425,33 @@ final class MIFTaskViewsTests: XCTestCase {
                                                              index: 1, rowCount: 2), .current)
     }
 
+    private func makeStep(id: String, sequence: Int, kind: String, status: String,
+                          title: String, summary: String, createdAt: String) -> MordeTask.Step {
+        MordeTask.Step(id: id, sequence: sequence, kind: kind, status: status,
+                       title: title, summary: summary, created_at: createdAt,
+                       agent_id: nil, task_revision: nil, tool_name: nil, phase: nil,
+                       detail_state: nil, truncated: nil, retryable: nil, attempt: nil,
+                       failure_reason: nil, retry_of_step_id: nil)
+    }
+
     private func makeTask(id: String, status: String, batchItems: [MordeBatchItem]? = nil,
                           currentStep: String? = nil, result: String? = nil,
                           stepCount: Int64 = 0, completedStepCount: Int64 = 0,
                           steps: [MordeTask.Step]? = nil) -> MordeTask {
         // nanoMuse: model_id has no memberwise default, so fixture tasks provide nil explicitly.
         MordeTask(owner_id: nil, initiator_id: nil, id: id, conversation_id: "c1234567", host_id: nil,
-                  execution_location: "server", model_id: nil, workspace_id: nil, input_revision: nil,
+                  execution_location: "server", model_id: nil, queue_priority: nil,
+                  workspace_id: nil, input_revision: nil,
                   objective: "Synthetic task", status: status, event_sequence: 1,
                   current_revision: nil, desired_revision: nil, current_revision_started: nil,
                   result: result, result_message_pending: nil,
                   result_message_published: nil,
                   current_step: currentStep, waiting_reason: nil, stop_request: nil,
-                  step_count: stepCount, completed_step_count: completedStepCount, pending_request: nil,
-                  clarification_request: nil, batch_items: batchItems, steps: steps, artifacts: nil,
+                  step_count: stepCount, completed_step_count: completedStepCount,
+                  budget: nil, usage: nil, billing: nil, pending_request: nil,
+                  clarification_request: nil, batch_items: batchItems, dependencies: nil,
+                  child_jobs: nil, result_review: nil, plan: nil,
+                  steps: steps, agents: nil, artifacts: nil,
                   updated_at: "2026-11-04T00:00:00Z", assistant_message: nil)
     }
 

@@ -4,7 +4,7 @@ build:
 	go build ./...
 
 lint:
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./cmd/... ./internal/... ./migrations
 
 test:
 	go test ./...

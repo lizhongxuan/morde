@@ -6,11 +6,11 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { validateDesktopRelease } from './validate-desktop-release.mjs';
 
-function fixture() {
+function fixture(prefix = 'morde-pc') {
   const root = mkdtempSync(join(tmpdir(), 'morde-release-'));
   const fileRoot = join(root, 'public', 'downloads', 'files');
   mkdirSync(fileRoot, { recursive: true });
-  const filename = 'morde-desktop-0.1.0-macos-arm64.dmg';
+  const filename = `${prefix}-0.1.0-macos-arm64.dmg`;
   const bytes = Buffer.from('test package');
   writeFileSync(join(fileRoot, filename), bytes);
   const manifestPath = join(root, 'public', 'downloads', 'manifest.json');
@@ -35,6 +35,12 @@ function fixture() {
 
 test('validates package metadata and the actual file hash', (t) => {
   const value = fixture();
+  t.after(() => rmSync(value.root, { recursive: true, force: true }));
+  assert.match(validateDesktopRelease(value.manifestPath, value.publicRoot), /已校验 1 个/);
+});
+
+test('continues to validate previously published desktop packages', (t) => {
+  const value = fixture('morde-desktop');
   t.after(() => rmSync(value.root, { recursive: true, force: true }));
   assert.match(validateDesktopRelease(value.manifestPath, value.publicRoot), /已校验 1 个/);
 });

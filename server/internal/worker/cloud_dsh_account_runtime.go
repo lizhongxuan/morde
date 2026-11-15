@@ -254,7 +254,7 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID, co
 	session = &cloudDSHAccountRuntimeSession{manager: m, runtime: ready, process: process, frames: frames,
 		leaseExpiresAt: ready.LeaseExpiresAt, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask),
 		coordinators: make(map[string]*cloudDSHAccountCoordinator), coordinatorSlots: make(chan struct{}, max(1, ready.MaxConcurrentTasks)),
-		stopped: make(map[cloudDSHIdentity]struct{}),
+		stopped: make(map[cloudDSHTaskRuntimeIdentity]struct{}),
 		input:   &cloudDSHRuntimeInput{target: process.Input}}
 	go session.route()
 	m.mu.Lock()
@@ -557,9 +557,14 @@ type cloudDSHAccountRuntimeSession struct {
 	coordinators        map[string]*cloudDSHAccountCoordinator
 	coordinatorSlots    chan struct{}
 	coordinatorSequence int64
-	stopped             map[cloudDSHIdentity]struct{}
+	stopped             map[cloudDSHTaskRuntimeIdentity]struct{}
 	failed              error
 	stopping            bool
+}
+
+type cloudDSHTaskRuntimeIdentity struct {
+	cloudDSHIdentity
+	RuntimeSequence int64 `json:"runtime_sequence"`
 }
 
 func (s *cloudDSHAccountRuntimeSession) closed() bool {
@@ -656,43 +661,47 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 		kind == "coordinator_settled" || kind == "coordinator_failed" || kind == "coordinator_terminated" {
 		return s.routeCoordinatorFrame(kind, frame)
 	}
-	var identity cloudDSHIdentity
-	if json.Unmarshal(raw, &identity) != nil || !cloudDSHIdentityValid(identity) {
+	var taskIdentity cloudDSHTaskRuntimeIdentity
+	if json.Unmarshal(raw, &taskIdentity) != nil || !cloudDSHIdentityValid(taskIdentity.cloudDSHIdentity) || taskIdentity.RuntimeSequence < 1 {
 		return errors.New("account Agent Runtime Task fence is invalid")
 	}
+	identity := taskIdentity.cloudDSHIdentity
 	s.mu.Lock()
 	var task *cloudDSHAccountTask
+	var taskWithSameID *cloudDSHAccountTask
 	for fence, candidate := range s.tasks {
 		if fence.TaskID == identity.TaskID {
-			task = candidate
-			break
-		}
-	}
-	if task == nil {
-		for stopped := range s.stopped {
-			if stopped.TaskID == identity.TaskID && stopped.OwnerID == identity.OwnerID && stopped.AgentID == identity.AgentID &&
-				stopped.SessionID == identity.SessionID && stopped.Generation == identity.Generation &&
-				stopped.AuthorizationVersion == identity.AuthorizationVersion {
-				if kind == "settled" || kind == "failed" || kind == "task_terminated" {
-					delete(s.stopped, stopped)
-				}
-				s.mu.Unlock()
-				return nil
+			taskWithSameID = candidate
+			if candidate.sequence == taskIdentity.RuntimeSequence {
+				task = candidate
+				break
 			}
 		}
-	} else if task.fence.OwnerID != identity.OwnerID || task.fence.AgentInstanceID != identity.AgentID ||
+	}
+	if _, stopped := s.stopped[taskIdentity]; stopped {
+		if kind == "settled" || kind == "failed" || kind == "task_terminated" {
+			delete(s.stopped, taskIdentity)
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	if task == nil && taskWithSameID != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("account Agent Runtime %s frame does not match the registered Task", kind)
+	}
+	if task != nil && (task.fence.OwnerID != identity.OwnerID || task.fence.AgentInstanceID != identity.AgentID ||
 		task.fence.AgentGeneration != identity.Generation || task.fence.AuthorizationVersion != identity.AuthorizationVersion ||
 		((kind == "task_process_ready" || kind == "task_started" || kind == "task_terminated" || kind == "settled" || kind == "failed") &&
-			task.fence.AgentSessionID != identity.SessionID) {
+			task.fence.AgentSessionID != identity.SessionID)) {
 		s.mu.Unlock()
-		return errors.New("account Agent Runtime frame names an unknown Task")
+		return fmt.Errorf("account Agent Runtime %s frame does not match the registered Task", kind)
 	}
 	if task != nil && (kind == "settled" || kind == "failed" || kind == "task_terminated") {
 		task.terminal = true
 	}
 	s.mu.Unlock()
 	if task == nil {
-		return errors.New("account Agent Runtime frame names an unknown Task")
+		return fmt.Errorf("account Agent Runtime %s frame names an unknown Task", kind)
 	}
 	switch kind {
 	case "task_process_ready":
@@ -1057,9 +1066,9 @@ func (s *cloudDSHAccountRuntimeSession) stopTask(ctx context.Context, task *clou
 	s.mu.Lock()
 	delete(s.tasks, task.fence)
 	if !task.terminal {
-		s.stopped[cloudDSHIdentity{TaskID: task.fence.TaskID, OwnerID: task.fence.OwnerID,
+		s.stopped[cloudDSHTaskRuntimeIdentity{cloudDSHIdentity: cloudDSHIdentity{TaskID: task.fence.TaskID, OwnerID: task.fence.OwnerID,
 			AgentID: task.fence.AgentInstanceID, SessionID: task.fence.AgentSessionID,
-			Generation: task.fence.AgentGeneration, AuthorizationVersion: task.fence.AuthorizationVersion}] = struct{}{}
+			Generation: task.fence.AgentGeneration, AuthorizationVersion: task.fence.AuthorizationVersion}, RuntimeSequence: task.sequence}] = struct{}{}
 	}
 	stopRequested := !s.hasActiveWorkLocked(nil)
 	if stopRequested {

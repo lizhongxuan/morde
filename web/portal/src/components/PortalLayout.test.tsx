@@ -39,18 +39,19 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 
-  it('places project sync under the cloud-computer page navigation', () => {
+  it('places project sync under Cloud Computers in the PC navigation', () => {
     const { container } = render(<ToastProvider><MemoryRouter initialEntries={['/hosts?sync=1']}><PortalLayout /></MemoryRouter></ToastProvider>);
     const contextNavigation = screen.getByRole('complementary', { name: '云端电脑子菜单' });
     expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('aria-current', 'page');
     expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/hosts?sync=1');
-    expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
-    expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).not.toHaveAttribute('aria-current', 'page');
-    expect(within(screen.getByRole('navigation', { name: '工作导航' })).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
-    expect(container.querySelector('.morde-topbar > .notice-center')).toBeInTheDocument();
+    expect(within(contextNavigation).getByRole('link', { name: '我的电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(contextNavigation).getByRole('link', { name: '我的电脑' })).not.toHaveAttribute('aria-current', 'page');
+    expect(within(screen.getByRole('navigation', { name: '设置导航' })).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
+    expect(container.querySelector('.morde-top-actions > .notice-center')).toBeInTheDocument();
+    expect(container.querySelector('.morde-main > .notice-center')).toBeNull();
   });
 
-  it.each(['/notifications', '/projects', '/connections', '/clients', '/apikeys', '/settings'])('does not render a sidebar toggle without a context sidebar on %s', (path) => {
+  it.each(['/notifications', '/projects', '/connections', '/clients', '/apikeys'])('does not render a sidebar toggle without a context sidebar on %s', (path) => {
     const { container } = render(<ToastProvider><MemoryRouter initialEntries={[path]}><PortalLayout /></MemoryRouter></ToastProvider>);
     expect(container.querySelector('#context-sidebar')).toBeNull();
     expect(screen.queryByRole('button', { name: /侧边栏/ })).not.toBeInTheDocument();

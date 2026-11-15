@@ -1190,7 +1190,7 @@ struct MIFTaskDetailView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if hasActionFooter, let task {
                 taskActions(task)
-                    .padding(.bottom, 104)
+                    .padding(.bottom, isClarificationFocused ? 0 : 104)
             }
         }
         .background(NanoMuseTones.canvas.ignoresSafeArea())
@@ -1282,6 +1282,9 @@ struct MIFTaskDetailView: View {
                 MIFTaskInlineError(message: detailError)
             }
             taskSummary(task)
+            MIFTaskQueuePrioritySection(task: task, busy: isPerformingAction || store.actionInFlight || isLoadingDetail || detailError != nil) { priority in
+                Task { await changeQueuePriority(priority, taskID: task.id) }
+            }
             MIFTaskBillingSection(task: task)
             MIFTaskPlanSection(task: task)
             taskSteps(task)
@@ -2142,6 +2145,17 @@ struct MIFTaskDetailView: View {
         _ = await store.actOnTask(taskID: taskID, action: option.action)
     }
 
+    private func changeQueuePriority(_ priority: String, taskID: String) async {
+        guard let scope = loadedScopeKey, scope == store.scopeKey, taskID == self.taskID,
+              let task = store.details[taskID], task.status == "queued", task.queue_priority != priority,
+              !isLoadingDetail, detailError == nil, !store.actionInFlight else { return }
+        let generation = UUID()
+        actionGeneration = generation
+        isPerformingAction = true
+        defer { if generation == actionGeneration { isPerformingAction = false } }
+        _ = await store.actOnTask(taskID: taskID, action: .setPriority(priority))
+    }
+
 }
 
 private struct MIFTaskListRow: View {
@@ -2380,6 +2394,59 @@ struct MIFTaskBillingSection: View {
         var fraction = String(repeating: "0", count: 6 - rawFraction.count) + rawFraction
         while fraction.last == "0" { fraction.removeLast() }
         return "\(currency) \(whole)\(fraction.isEmpty ? "" : ".\(fraction)")"
+    }
+}
+
+struct MIFTaskQueuePrioritySection: View {
+    let task: MordeTask
+    let busy: Bool
+    let onSelect: (String) -> Void
+
+    private var selectedPriority: String? {
+        guard let priority = task.queue_priority,
+              ["pinned", "normal", "background"].contains(priority) else { return nil }
+        return priority
+    }
+
+    var body: some View {
+        if task.status == "queued", selectedPriority != nil {
+            MIFTaskSection(title: AppLocalized("Queue priority")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("\(AppLocalized("Current")): \(label(selectedPriority))")
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
+                    HStack(spacing: 8) {
+                        ForEach(["pinned", "normal", "background"], id: \.self) { priority in
+                            Button {
+                                onSelect(priority)
+                            } label: {
+                                Text(label(priority))
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .frame(minHeight: 38)
+                                    .foregroundStyle(priority == selectedPriority ? Color.white : NanoMuseTones.action)
+                                    .background(priority == selectedPriority ? NanoMuseTones.action : NanoMuseTones.fill,
+                                                in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(busy || priority == selectedPriority)
+                            .accessibilityIdentifier("morde.task.priority.\(priority)")
+                            .accessibilityAddTraits(priority == selectedPriority ? .isSelected : [])
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+            }
+            .accessibilityIdentifier("morde.task.queuePriority")
+        }
+    }
+
+    private func label(_ priority: String?) -> String {
+        switch priority {
+        case "pinned": AppLocalized("Pinned")
+        case "normal": AppLocalized("Default")
+        case "background": AppLocalized("Background")
+        default: AppLocalized("Unknown")
+        }
     }
 }
 

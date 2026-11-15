@@ -609,6 +609,9 @@ struct NanoMuseHomeView: View {
             if !signedIn { approvalCountTracker.clear() }
             keyboard.reset()
         }
+        .nmOnChange(of: tab) { _ in
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        }
     }
 
     private static func drawerDestination(for tab: NanoMuseTab) -> MIFDrawerDestination {

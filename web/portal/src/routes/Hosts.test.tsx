@@ -61,17 +61,14 @@ describe('Hosts', () => {
   });
   afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
-  it('opens the existing workspace and file-sync view inside cloud computers', async () => {
+  it('keeps file synchronization in Settings instead of the cloud-computer view', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
-    await user.click(screen.getByRole('link', { name: '文件同步' }));
-    expect(await screen.findByRole('heading', { name: '文件同步' })).toBeInTheDocument();
-    expect(document.querySelector('.hosts-page > .workspace-route')).toBeInTheDocument();
-    expect(document.querySelector('.hosts-page .page-heading')).toBeNull();
+    expect(screen.queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: '云端电脑视图' })).toHaveTextContent('我的电脑共享给我的');
   });
 
   it('links each Host card and its detail panel to that Host project sync target', async () => {

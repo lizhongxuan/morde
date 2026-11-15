@@ -887,7 +887,7 @@ WHERE s.id=$1 AND s.owner_id=$2 AND s.installation_id=$3 AND g.revoked_at IS NUL
 FOR UPDATE OF s,g`, sessionID, ownerID, installationID).Scan(new(string), &grantVersion, &scopes); err != nil {
 			return storeError("authorize Codex command result", "Codex command", err)
 		}
-		requiredScope := codex.ScopeRead
+		var requiredScope codex.Scope
 		switch codex.CommandType(commandType) {
 		case codex.CommandSend:
 			requiredScope = codex.ScopeSend

@@ -941,7 +941,7 @@ html[data-nm-platform='darwin']:not([data-nm-fullscreen]) .nm-room-top { height:
 .nm-idea-hero-mark { font-size: 40px; line-height: 1; }
 .nm-idea-kind { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-size: 13px; color: var(--dsw-alias-label-secondary); }
 .nm-idea-actions { display: flex; gap: 8px; }
-.nm-room-toast { margin: 0 0 10px; padding: 8px 12px; border-radius: 10px; background: var(--dsw-alias-bg-layer-2); font-size: 13px; color: var(--dsw-alias-label-secondary); }
+.nm-room-toast { box-sizing: border-box; width: min(420px, 100%); margin: 0 0 12px auto; padding: 8px 12px; border: 1px solid var(--nm-divider); border-radius: 10px; background: var(--dsw-alias-bg-primary, var(--nm-base)); color: var(--dsw-alias-label-secondary); box-shadow: 0 8px 24px rgb(20 30 45 / 12%); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
 /* goals: the agent's progress and the flag */
 .nm-goal-bar { position: relative; height: 5px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); overflow: hidden; margin-top: 6px; }
 .nm-goal-bar > span { position: absolute; inset: 0 auto 0 0; border-radius: 999px; background: var(--nm-accent, #1d6fe0); }

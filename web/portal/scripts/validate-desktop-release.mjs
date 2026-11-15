@@ -41,9 +41,11 @@ export function validateDesktopRelease(manifestPath, publicRoot) {
     }
     const target = targets[artifact.platform];
     const extension = Object.hasOwn(target, artifact.architecture) ? target[artifact.architecture] : undefined;
-    const filename = `morde-desktop-${manifest.version}-${artifact.platform}-${artifact.architecture}${extension ?? ''}`;
+    const suffix = `${manifest.version}-${artifact.platform}-${artifact.architecture}${extension ?? ''}`;
+    const filename = artifact.filename;
+    const validFilename = filename === `morde-pc-${suffix}` || filename === `morde-desktop-${suffix}`;
     const key = `${artifact.platform}:${artifact.architecture}`;
-    if (!extension || seen.has(key) || artifact.filename !== filename || artifact.download_url !== `/downloads/files/${filename}`
+    if (!extension || seen.has(key) || !validFilename || artifact.download_url !== `/downloads/files/${filename}`
       || !Number.isSafeInteger(artifact.bytes) || artifact.bytes < 1 || typeof artifact.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(artifact.sha256)
       || !validAcceptance(artifact.acceptance, artifact.platform)) {
       throw new Error(`桌面发行条目无效：${key}`);

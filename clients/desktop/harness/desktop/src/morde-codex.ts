@@ -206,7 +206,7 @@ export class MordeCodexProvider {
     });
     try {
       const initialized = object(await this.request("initialize", {
-        clientInfo: { name: "morde", title: "Morde Client", version: "1" },
+        clientInfo: { name: "morde", title: "morde-pc", version: "1" },
         capabilities: { experimentalApi: true },
       }, 20_000));
       const receivedHome = typeof initialized?.codexHome === "string" ? initialized.codexHome : "";

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -83,7 +84,12 @@ func TestPostgresTaskWorkerExpiresOfflineApproval(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- w.Run(runCtx) }()
-	defer func() { cancel(); <-done }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("task worker stopped with an error: %v", err)
+		}
+	}()
 	select {
 	case claimed := <-executor.claimed:
 		if claimed.ID != dueTask {
@@ -127,7 +133,12 @@ func TestPostgresTaskWorkerExpiresApprovalWhileExecutionSlotBusy(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- w.Run(runCtx) }()
-	defer func() { cancel(); <-done }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("task worker stopped with an error: %v", err)
+		}
+	}()
 	select {
 	case claimed := <-executor.claimed:
 		if claimed.ID != busy.Task.ID {
@@ -288,7 +299,11 @@ func TestPostgresApprovalThatExpiresWhileResponseWriteWaitsIsRejected(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer blocker.Rollback(ctx)
+	defer func() {
+		if err := blocker.Rollback(ctx); err != nil {
+			t.Errorf("rollback blocker transaction: %v", err)
+		}
+	}()
 	if _, err := blocker.Exec(ctx, `LOCK TABLE task_pending_requests IN SHARE MODE`); err != nil {
 		t.Fatal(err)
 	}

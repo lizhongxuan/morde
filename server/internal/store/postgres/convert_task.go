@@ -42,7 +42,7 @@ func taskDomain(row sqlcgen.Task) task.Task {
 		AgentEngineVersion: row.AgentEngineVersion, AgentProfileVersion: row.AgentProfileVersion,
 		CheckpointDigest: append([]byte(nil), row.CheckpointDigest...), CheckpointThroughSequence: row.CheckpointThroughSeq,
 		EventSequence: row.EventSeq,
-		ApplicationID: row.ApplicationID, ModelID: row.ModelID, Objective: row.Objective,
+		ApplicationID: row.ApplicationID, ModelID: row.ModelID, Objective: row.Objective, QueuePriority: task.QueuePriority(row.QueuePriority),
 		FileDeliveryIntent: task.FileDeliveryIntent(row.FileDeliveryIntent), Status: task.Status(row.Status),
 		Authorization: task.Authorization{
 			Kind: row.AuthKind, TokenID: row.AuthTokenID,

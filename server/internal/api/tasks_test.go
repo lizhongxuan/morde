@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -55,6 +57,11 @@ type taskServiceStub struct {
 	actionRevisionFence    *app.TaskActionRevisionFence
 	actionKey              string
 	actionCalls            int
+	priorityCalls          int
+	priorityTaskID         string
+	priorityValue          task.QueuePriority
+	priorityEventSequence  int64
+	priorityKey            string
 	retryTaskID            string
 	retryItemID            string
 	retryKey               string
@@ -240,6 +247,14 @@ func (s *taskServiceStub) RequestActionWithRevisionFence(_ context.Context, _ id
 	return app.TaskActionResult{Task: apiTestTask(), Action: action, UnsettledOperationIDs: []string{"o1234567"}}, s.err
 }
 
+func (s *taskServiceStub) SetPriority(_ context.Context, _ identity.Principal, taskID string, priority task.QueuePriority, expectedEventSequence int64, key string) (task.Task, error) {
+	s.priorityCalls++
+	s.priorityTaskID, s.priorityValue, s.priorityEventSequence, s.priorityKey = taskID, priority, expectedEventSequence, key
+	value := apiTestTask()
+	value.QueuePriority, value.EventSequence = priority, expectedEventSequence+1
+	return value, s.err
+}
+
 func (s *taskServiceStub) RetryBatchItem(_ context.Context, _ identity.Principal, taskID, batchItemID, idempotencyKey string) error {
 	s.retryCalls++
 	s.retryTaskID, s.retryItemID, s.retryKey = taskID, batchItemID, idempotencyKey
@@ -362,7 +377,8 @@ func TestCloudTaskResponseDoesNotRequireAHost(t *testing.T) {
 
 func TestTaskActionRetriesOneBatchItem(t *testing.T) {
 	service := &taskServiceStub{}
-	engine := taskAPIRouter(service, nil)
+	registry := prometheus.NewRegistry()
+	engine := taskAPIRouterWithMetrics(service, nil, registry)
 	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/actions", strings.NewReader(`{"action":"retry_batch_item","batch_item_id":"b1234567"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "retry-key-101")
@@ -371,11 +387,18 @@ func TestTaskActionRetriesOneBatchItem(t *testing.T) {
 	if response.Code != http.StatusAccepted || service.retryCalls != 1 || service.retryTaskID != "q1234567" || service.retryItemID != "b1234567" || service.retryKey != "retry-key-101" {
 		t.Fatalf("status=%d calls=%d task=%s item=%s key=%s body=%s", response.Code, service.retryCalls, service.retryTaskID, service.retryItemID, service.retryKey, response.Body.String())
 	}
+	if got := testWorkflowMetric(t, registry, "cloudhost_task_retries_total", "kind", "batch_item", "result", "accepted").GetCounter().GetValue(); got != 1 {
+		t.Fatalf("accepted batch retry metric = %v, want 1", got)
+	}
 }
 
 func TestTaskActionRespondsToExactPendingRequest(t *testing.T) {
-	service := &taskServiceStub{}
-	engine := taskAPIRouter(service, nil)
+	createdAt := time.Now().UTC().Add(-30 * time.Second)
+	service := &taskServiceStub{getDetails: &app.TaskDetails{PendingRequest: &task.PendingRequest{
+		ID: "r1234567", Version: 2, Status: task.PendingRequestPending, CreatedAt: createdAt,
+	}}}
+	registry := prometheus.NewRegistry()
+	engine := taskAPIRouterWithMetrics(service, nil, registry)
 	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/approvals/r1234567/responses", strings.NewReader(`{"version":2,"decision":"approve"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "approval-key-001")
@@ -385,6 +408,10 @@ func TestTaskActionRespondsToExactPendingRequest(t *testing.T) {
 		service.responseID != "r1234567" || service.responseVersion != 2 || service.responseDecision != task.PendingDecisionApprove || service.responseKey != "approval-key-001" {
 		t.Fatalf("status=%d calls=%d task=%s pending=%s version=%d decision=%s key=%s body=%s", response.Code, service.responseCalls,
 			service.responseTaskID, service.responseID, service.responseVersion, service.responseDecision, service.responseKey, response.Body.String())
+	}
+	metric := testWorkflowMetric(t, registry, "cloudhost_task_approval_wait_seconds", "decision", "approve")
+	if metric.GetHistogram().GetSampleCount() != 1 || metric.GetHistogram().GetSampleSum() < 29 {
+		t.Fatalf("approval wait metric = %#v, want one sample of about 30s", metric.GetHistogram())
 	}
 }
 
@@ -440,6 +467,26 @@ func TestTaskActionRequestsRevisionFencedPause(t *testing.T) {
 	}
 }
 
+func TestTaskActionSetsQueuePriorityWithEventFence(t *testing.T) {
+	service := &taskServiceStub{}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/actions", strings.NewReader(`{"action":"set_priority","queue_priority":"pinned","expected_event_sequence":4}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "priority-key-001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	var body taskActionResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusAccepted || service.priorityCalls != 1 || service.priorityTaskID != "q1234567" ||
+		service.priorityValue != task.QueuePriorityPinned || service.priorityEventSequence != 4 || service.priorityKey != "priority-key-001" ||
+		body.TaskID != "q1234567" || body.Action != "set_priority" || body.Status != task.StatusQueued ||
+		body.QueuePriority != task.QueuePriorityPinned || body.EventSequence == nil || *body.EventSequence != 5 {
+		t.Fatalf("status=%d calls=%d priority=%#v response=%#v body=%s", response.Code, service.priorityCalls, service, body, response.Body.String())
+	}
+}
+
 func TestTaskActionRejectsUnsupportedOrExtendedRequests(t *testing.T) {
 	for _, body := range []string{
 		`{"action":"cancel","batch_item_id":"b1234567"}`,
@@ -454,6 +501,10 @@ func TestTaskActionRejectsUnsupportedOrExtendedRequests(t *testing.T) {
 		`{"action":"retry_batch_item","batch_item_id":"b1234567","expected_current_revision":3,"expected_desired_revision":4}`,
 		`{"action":"retry_batch_item","batch_item_id":"b1234567","force":true}`,
 		`{"action":"retry_batch_item"}`,
+		`{"action":"set_priority","queue_priority":"urgent","expected_event_sequence":4}`,
+		`{"action":"set_priority","queue_priority":"pinned"}`,
+		`{"action":"set_priority","queue_priority":"normal","expected_event_sequence":-1}`,
+		`{"action":"set_priority","queue_priority":"background","expected_event_sequence":4,"expected_status":"queued"}`,
 		`{"action":"respond","pending_id":"r1234567","pending_version":1,"decision":"maybe"}`,
 		`{"action":"respond","pending_id":"bad","pending_version":1,"decision":"approve"}`,
 		`{"action":"respond","pending_id":"r1234567","pending_version":0,"decision":"approve"}`,
@@ -930,7 +981,8 @@ func TestTaskStepDetailRouteIsNoStoreAndRejectsQueryOrBody(t *testing.T) {
 func TestTaskStepRetryRouteBindsRequestAndRejectsReplacementArguments(t *testing.T) {
 	service := &taskServiceStub{stepRetryResult: app.TaskStepRetryResult{TaskID: "q1234567", SourceStepID: "s1234567",
 		AttemptStepID: "s7654321", Attempt: 2, Status: "queued"}}
-	engine := taskAPIRouter(service, nil)
+	registry := prometheus.NewRegistry()
+	engine := taskAPIRouterWithMetrics(service, nil, registry)
 	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/steps/s1234567/retries",
 		strings.NewReader(`{"expected_task_revision":4,"expected_attempt":1}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -942,6 +994,9 @@ func TestTaskStepRetryRouteBindsRequestAndRejectsReplacementArguments(t *testing
 		service.stepRetryTaskID != "q1234567" || service.stepRetryStepID != "s1234567" || service.stepRetryRevision != 4 ||
 		service.stepRetryAttempt != 1 || service.stepRetryIdempotency != "step-retry-0001" {
 		t.Fatalf("step retry response=%d headers=%v body=%s service=%+v", response.Code, response.Header(), response.Body.String(), service)
+	}
+	if got := testWorkflowMetric(t, registry, "cloudhost_task_retries_total", "kind", "step", "result", "accepted").GetCounter().GetValue(); got != 1 {
+		t.Fatalf("accepted step retry metric = %v, want 1", got)
 	}
 
 	for _, request := range []*http.Request{
@@ -1498,7 +1553,8 @@ func TestTaskEventsResumeAfterLastEventIDWithoutStreamingAssistantContent(t *tes
 		Payload:   []byte(`{"role":"assistant","message_id":"m1234567","turn_id":"s1234567","delta":"Hello "}`),
 		CreatedAt: time.Now().UTC(),
 	}}}
-	engine := taskAPIRouter(service, nil)
+	registry := prometheus.NewRegistry()
+	engine := taskAPIRouterWithMetrics(service, nil, registry)
 	request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events", nil)
 	request.Header.Set("Last-Event-ID", "7")
 	requestContext, cancel := context.WithCancel(request.Context())
@@ -1520,6 +1576,9 @@ func TestTaskEventsResumeAfterLastEventIDWithoutStreamingAssistantContent(t *tes
 	}
 	if strings.Contains(response.Body.String(), "Hello ") || strings.Contains(response.Body.String(), `"delta"`) {
 		t.Fatalf("unreviewed assistant content was exposed in SSE: %s", response.Body.String())
+	}
+	if got := testWorkflowMetric(t, registry, "cloudhost_task_event_resume_requests_total", "result", "resumed").GetCounter().GetValue(); got != 1 {
+		t.Fatalf("resumed event stream metric = %v, want 1", got)
 	}
 }
 
@@ -1726,6 +1785,7 @@ func TestTaskEventPayloadsExposeOnlyTypeAllowlistedFields(t *testing.T) {
 		{"response", "task.response", `{"decision":"approve","status":"queued","pending_id":"r1234567","answer":"private answer"}`, []string{"decision", "status", "pending_id"}, []string{"answer"}},
 		{"result", "task.result", `{"status":"completed","reason":"done","result":"unreviewed result","error":"private error"}`, []string{"status", "reason"}, []string{"result", "error"}},
 		{"plan", "task.plan", `{"step_id":"s1234567","sequence":4,"task_revision":2,"plan_revision":3,"plan":{"goal":"private plan"},"detail":{"call_id":"private call"}}`, []string{"step_id", "sequence", "task_revision", "plan_revision"}, []string{"goal", "call_id"}},
+		{"priority", "task.priority", `{"priority":"pinned","previous_priority":"normal","private":"never expose"}`, []string{"priority", "previous_priority"}, []string{"private"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1846,6 +1906,10 @@ func (w *deadlineRecorder) SetWriteDeadline(time.Time) error {
 }
 
 func taskAPIRouter(tasks TaskService, conversations ConversationService) *gin.Engine {
+	return taskAPIRouterWithMetrics(tasks, conversations, prometheus.NewRegistry())
+}
+
+func taskAPIRouterWithMetrics(tasks TaskService, conversations ConversationService, registry prometheus.Registerer) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	engine.Use(func(c *gin.Context) {
@@ -1853,13 +1917,52 @@ func taskAPIRouter(tasks TaskService, conversations ConversationService) *gin.En
 		c.Next()
 	})
 	group := engine.Group("/api")
-	handler := &api{options: Options{ServiceInstanceID: "11111111-1111-4111-8111-111111111111"}}
+	workflow, err := newWorkflowMetrics(registry)
+	if err != nil {
+		panic(err)
+	}
+	handler := &api{options: Options{ServiceInstanceID: "11111111-1111-4111-8111-111111111111"}, workflow: workflow}
 	handler.registerTasks(group, tasks)
 	if ticketService, ok := tasks.(TaskWorkbenchObservationTicketService); ok {
 		handler.registerTaskWorkbenchObservationTickets(group, ticketService)
 	}
 	handler.registerConversations(group, conversations, tasks)
 	return engine
+}
+
+func testWorkflowMetric(t *testing.T, registry prometheus.Gatherer, name string, labels ...string) *dto.Metric {
+	t.Helper()
+	if len(labels)%2 != 0 {
+		t.Fatal("metric labels must be name/value pairs")
+	}
+	want := make(map[string]string, len(labels)/2)
+	for i := 0; i < len(labels); i += 2 {
+		want[labels[i]] = labels[i+1]
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			got := make(map[string]string, len(metric.GetLabel()))
+			for _, label := range metric.GetLabel() {
+				got[label.GetName()] = label.GetValue()
+			}
+			match := len(got) == len(want)
+			for key, value := range want {
+				match = match && got[key] == value
+			}
+			if match {
+				return metric
+			}
+		}
+	}
+	t.Fatalf("metric %s with labels %v was not gathered", name, want)
+	return nil
 }
 
 func apiTestTask() task.Task {

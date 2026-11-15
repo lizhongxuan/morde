@@ -2,10 +2,11 @@
  * The nanoMuse browser half: the Muse look on the harness's Web client. The
  * left column (an icon rail beside the harness's chats browser), the agent
  * pinned over the conversation with its status line, a Devices page, the
- * first-run welcome, the nanoMuse section in Settings and the toasts other
- * devices send. Everything here is a slot registration — the harness's client
- * stays the harness's; we occupy the seats it declares (and, for the sidebar,
- * take over the one seat whose stock occupant the bundle layer switches off,
+ * first-run welcome, the nanoMuse section in Settings and accessibility
+ * announcements for actions other devices complete. Everything here is a
+ * slot registration — the harness's client stays the harness's; we occupy the
+ * seats it declares (and, for the sidebar, take over the one seat whose stock
+ * occupant the bundle layer switches off,
  * declaring the same children so every other plugin's contribution still
  * lands where it did).
  */

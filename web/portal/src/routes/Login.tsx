@@ -41,7 +41,7 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
       <div className="login-brand"><span className="morde-brand-mark" aria-hidden="true">M</span><span>Morde 云端电脑</span></div>
       <h1 id="login-heading">登录</h1>
       <p className="muted">登录后与 AI 助手对话，管理你的电脑与文件。</p>
-      <Link className="login-download-link" to="/download">下载 Morde Desktop</Link>
+      <Link className="login-download-link" to="/download">下载 morde-pc</Link>
       {registered && <p className="notice notice-success" role="status">申请已提交，等待管理员审核通过后才能登录。</p>}
       <form onSubmit={(event) => void submit(event)}>
         <label htmlFor="login-name">用户名</label>

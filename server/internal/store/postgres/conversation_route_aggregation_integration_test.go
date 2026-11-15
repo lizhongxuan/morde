@@ -57,10 +57,10 @@ func TestPostgresConversationRouteAggregationMigrationPreservesLegacyAndEvidence
 		t.Fatal(err)
 	}
 	defer closeProvider()
+	legacy := acceptAggregationMessage(t, f, "route-aggregation-legacy", "Legacy request")
 	if _, err := provider.DownTo(ctx, 197); err != nil {
 		t.Fatalf("remove unused aggregation migration: %v", err)
 	}
-	legacy := acceptAggregationMessage(t, f, "route-aggregation-legacy", "Legacy request")
 	if _, err := provider.UpTo(ctx, 198); err != nil {
 		t.Fatalf("migrate legacy route: %v", err)
 	}

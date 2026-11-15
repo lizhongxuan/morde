@@ -24,7 +24,7 @@ const targets = [
 ];
 
 async function fixture(t) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "morde-client-downloads-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "morde-pc-downloads-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const distDir = path.join(root, "dist");
   const outputDir = path.join(root, "portal", "downloads");
@@ -33,7 +33,7 @@ async function fixture(t) {
 }
 
 function filename(target) {
-  return `morde-desktop-${version}-${target.platform}-${target.architecture}${target.extension}`;
+  return `morde-pc-${version}-${target.platform}-${target.architecture}${target.extension}`;
 }
 
 function createTestKeyPair() {
@@ -106,7 +106,7 @@ async function assertNotStaged(outputDir, target) {
   await assert.rejects(readFile(path.join(outputDir, "files", filename(target))), { code: "ENOENT" });
 }
 
-test("stages current Morde-client filenames only after Ed25519 verification", async (t) => {
+test("stages current morde-pc filenames only after Ed25519 verification", async (t) => {
   const { distDir, outputDir } = await fixture(t);
   const { privateKey, publicKeyPEM } = createTestKeyPair();
   trustKeys(t, { [keyID]: publicKeyPEM });

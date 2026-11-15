@@ -45,7 +45,8 @@ test("the installer includes only the Morde desktop runtime", () => {
   assert.ok(extra.includes("    to: legal/THIRD_PARTY_NOTICES.syncthing.md"));
   assert.ok(!extra.some((line) => /dsh\/|runtime\/(?!morde-sync\/LICENSE)|nanomuse-desktop/.test(line)));
   const metadata = JSON.parse(readFileSync(new URL("package.json", here), "utf8"));
-  assert.equal(metadata.description, "Morde desktop client");
+  assert.equal(metadata.name, "morde-pc");
+  assert.equal(metadata.description, "morde-pc desktop client");
 });
 
 test("the Windows build has no upstream updater feed", () => {
@@ -56,7 +57,7 @@ test("the Windows build has no upstream updater feed", () => {
 });
 
 test("the Linux x64 package uses the Portal download manifest name", () => {
-  assert.ok(block("linux").includes("  artifactName: morde-desktop-${version}-linux-x64.${ext}"));
+  assert.ok(block("linux").includes("  artifactName: morde-pc-${version}-linux-x64.${ext}"));
 });
 
 test("the whitelisted Morde resources exist in the source tree", () => {

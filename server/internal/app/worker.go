@@ -386,13 +386,13 @@ func (w *WorkerApp) reconcileDeletingHost(ctx context.Context, value host.Host) 
 		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing or ambiguous")
 	}
 	if w.service.hostWorkspaceDeleter == nil {
-		return errors.New("Host workspace deletion is unavailable")
+		return errors.New("host workspace deletion is unavailable")
 	}
 	if err := w.service.hostWorkspaceDeleter.DeleteHostWorkspace(ctx, value.OwnerID, value.ID); err != nil {
 		return fmt.Errorf("delete Host workspace %s: %w", value.ID, err)
 	}
 	if w.service.volumes == nil {
-		return errors.New("Host persistent volume deletion is unavailable")
+		return errors.New("host persistent volume deletion is unavailable")
 	}
 	for _, volumeName := range []string{domain.ProfileVolumeName(value.ID), domain.RuntimeVolumeName(value.ID)} {
 		if err := w.service.volumes.DeleteVolume(ctx, volumeName); err != nil {

@@ -610,36 +610,18 @@ func TestFirstProjectUploadConflictsWithExistingDestinationWithoutTransfer(t *te
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "project-upload-existing-destination")
 	hostValue := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, workspaceValue.ID)
 	portal := workspaceSyncPortalPrincipal(t, store, owner.ID)
-
-	seedService, err := app.NewWorkspaceSyncService(store, workspaceTransferTestBlocks{}, workspace.MaxSyncManifestBytes, 1<<30)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seed, err := seedService.CreateSyncSession(ctx, portal, workspaceValue.ID, workspace.CreateSyncSession{
-		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
-		EmptyDirectories: []string{"project/demo/existing"},
-	}, "project-upload-existing-destination-seed")
-	if err != nil {
-		t.Fatalf("create metadata-only destination seed: %v", err)
-	}
-	if len(seed.TransferBlocks) != 0 {
-		t.Fatalf("destination seed unexpectedly planned content blocks: %#v", seed.TransferBlocks)
-	}
-	if _, err := seedService.CommitSyncSession(ctx, portal, workspaceValue.ID, seed.ID, "project-upload-existing-destination-seed-commit"); err != nil {
-		t.Fatalf("commit metadata-only destination seed: %v", err)
-	}
-	workspaceBefore, err := store.GetWorkspace(ctx, workspaceValue.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	folderService, err := app.NewWorkspaceSyncDeviceService(store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	folder, err := folderService.CreateFolder(ctx, portal, hostValue.ID, "demo", "project-upload-existing-destination-folder")
 	if err != nil {
-		t.Fatalf("register project folder over existing destination: %v", err)
+		t.Fatalf("register project folder for existing destination: %v", err)
+	}
+	applySyntheticProjectMutationForTest(t, store, workspaceValue.ID, "project/demo/existing", nil, nil)
+	workspaceBefore, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
 	installationID := createTestClientInstallation(t, store.pool, owner.ID, nil)
 	syncToken := clientTestToken(t, owner.ID, installationID, identity.KindDevice, nil)

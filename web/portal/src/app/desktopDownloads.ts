@@ -23,7 +23,7 @@ const capabilities: DesktopCapability[] = ['install', 'launch_idle_network', 'us
 export const desktopCapabilityNames: Record<DesktopCapability, string> = {
   install: '原生安装',
   launch_idle_network: '启动与闲置网络',
-  user_web_workbench: '用户 Web 与云端电脑',
+  user_web_workbench: 'PC 客户端与云端电脑',
   workspace_sync_recovery: 'Workspace 同步与恢复',
   update: '更新',
   uninstall: '卸载',
@@ -41,12 +41,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseDownload(value: unknown, version: string): DesktopDownload | null {
   if (!isRecord(value)) return null;
   const { platform, architecture, filename, download_url: downloadURL, bytes, sha256, acceptance } = value;
+  if (typeof filename !== 'string') return null;
   if (!isRecord(acceptance) || !['verified', 'pending', 'failed'].includes(String(acceptance.status))) return null;
   if (acceptance.status !== 'verified') return null;
   if (typeof platform !== 'string' || !Object.hasOwn(targets, platform) || typeof architecture !== 'string') return null;
   const extension = targets[platform]?.[architecture];
   if (!extension) return null;
-  const expectedFilename = `morde-desktop-${version}-${platform}-${architecture}${extension}`;
+  const suffix = `${version}-${platform}-${architecture}${extension}`;
+  const validFilename = filename === `morde-pc-${suffix}` || filename === `morde-desktop-${suffix}`;
   const expectedSignature = platform === 'macos' ? 'signed_and_notarized' : platform === 'windows' ? 'signed' : 'not_applicable';
   const verifiedAt = acceptance.verified_at;
   const evidenceRef = acceptance.evidence_ref;
@@ -58,8 +60,8 @@ function parseDownload(value: unknown, version: string): DesktopDownload | null 
     && new Set(verifiedCapabilities).size === capabilities.length
     && capabilities.every((capability) => verifiedCapabilities.includes(capability));
   if (
-    filename !== expectedFilename
-    || downloadURL !== `/downloads/files/${expectedFilename}`
+    !validFilename
+    || downloadURL !== `/downloads/files/${filename}`
     || typeof bytes !== 'number' || !Number.isSafeInteger(bytes) || bytes < 1
     || typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)
     || !validTimestamp || !validEvidenceRef || !validCapabilities
@@ -67,7 +69,7 @@ function parseDownload(value: unknown, version: string): DesktopDownload | null 
   ) return null;
   return {
     platform: platform as DesktopDownload['platform'], architecture: architecture as DesktopDownload['architecture'],
-    filename: expectedFilename, download_url: downloadURL, bytes, sha256,
+    filename, download_url: downloadURL, bytes, sha256,
     acceptance: {
       status: 'verified', verified_at: verifiedAt, evidence_ref: evidenceRef,
       signature_status: expectedSignature, capabilities: [...capabilities],
@@ -101,7 +103,10 @@ export function parseDesktopDownloads(value: unknown, currentOrigin: string): De
   return { version: downloads.length ? value.version : null, artifacts: downloads };
 }
 
-export async function getDesktopDownloads(fetcher: typeof fetch = fetch, currentOrigin = window.location.origin): Promise<DesktopDownloads> {
+export async function getDesktopDownloads(
+  fetcher: typeof fetch = fetch,
+  currentOrigin = document.querySelector<HTMLMetaElement>('meta[name="morde-service-origin"]')?.content || window.location.origin,
+): Promise<DesktopDownloads> {
   const response = await fetcher('/downloads/manifest.json', { cache: 'no-cache' });
   if (response.status === 404) return emptyDownloads;
   if (!response.ok) throw new Error('暂时无法读取安装包列表，请重试');

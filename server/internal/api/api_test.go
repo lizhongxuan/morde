@@ -1002,9 +1002,10 @@ func TestHealthMCPAndPortalStaticRoutes(t *testing.T) {
 	assertError(t, request(router, http.MethodGet, "/mcp", "", "", ""), http.StatusUnauthorized, "unauthenticated")
 	assertError(t, requestWithCookie(router, http.MethodGet, "/mcp", &http.Cookie{Name: portalCookieName, Value: sessionCredential()}, ""), http.StatusUnauthorized, "unauthenticated")
 
-	portal := requestHTML(router, "/hosts/new")
-	if portal.Code != http.StatusOK || !strings.Contains(portal.Body.String(), "<title>portal</title>") || portal.Header().Get("Content-Security-Policy") != portalCSP+"; frame-src 'self' https://*.example-hosts.test" || portal.Header().Get("X-Content-Type-Options") != "nosniff" || portal.Header().Get("Cache-Control") != "no-cache" {
-		t.Fatalf("portal SPA response = %d headers=%v body=%q", portal.Code, portal.Header(), portal.Body)
+	for _, path := range []string{"/", "/assistant", "/hosts/new", "/register", "/download", "/app/hosts/" + testHostID, "/assets/app.js"} {
+		if response := requestHTML(router, path); response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), "<title>portal</title>") {
+			t.Errorf("user application route %s = %d %s", path, response.Code, response.Body)
+		}
 	}
 	admin := requestHTML(router, "/admin/workspaces/"+testWorkspaceID)
 	if admin.Code != http.StatusOK || !strings.Contains(admin.Body.String(), "<title>admin</title>") || admin.Header().Get("Content-Security-Policy") != portalCSP || admin.Header().Get("X-Content-Type-Options") != "nosniff" || admin.Header().Get("Cache-Control") != "no-cache" {
@@ -1026,28 +1027,6 @@ func TestHealthMCPAndPortalStaticRoutes(t *testing.T) {
 	missingAdminAsset := requestHTML(router, "/admin/assets/missing.js")
 	if missingAdminAsset.Code != http.StatusNotFound || strings.Contains(missingAdminAsset.Body.String(), "<title>admin</title>") {
 		t.Fatalf("missing admin asset fell through to SPA: %d %s", missingAdminAsset.Code, missingAdminAsset.Body)
-	}
-	appPage := requestHTML(router, "/app/hosts/"+testHostID)
-	if appPage.Code != http.StatusOK || !strings.Contains(appPage.Body.String(), "<title>app</title>") || appPage.Header().Get("Content-Security-Policy") != portalCSP || appPage.Header().Get("Cache-Control") != "no-cache" {
-		t.Fatalf("app SPA response = %d headers=%v body=%q", appPage.Code, appPage.Header(), appPage.Body)
-	}
-	for _, path := range []string{"/app/", "/app/foo"} {
-		page := requestHTML(router, path)
-		if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "<title>app</title>") {
-			t.Fatalf("app route %s = %d %s", path, page.Code, page.Body)
-		}
-	}
-	appAsset := request(router, http.MethodGet, "/app/assets/app.js", "", "", "")
-	if appAsset.Code != http.StatusOK || !strings.Contains(appAsset.Body.String(), "mobile") {
-		t.Fatalf("app asset = %d %s", appAsset.Code, appAsset.Body)
-	}
-	missingAppAsset := requestHTML(router, "/app/assets/missing.js")
-	if missingAppAsset.Code != http.StatusNotFound || strings.Contains(missingAppAsset.Body.String(), "<title>app</title>") {
-		t.Fatalf("missing app asset fell through to SPA: %d %s", missingAppAsset.Code, missingAppAsset.Body)
-	}
-	asset := request(router, http.MethodGet, "/assets/app.js", "", "", "")
-	if asset.Code != http.StatusOK || !strings.Contains(asset.Header().Get("Content-Type"), "javascript") {
-		t.Fatalf("portal asset = %d headers=%v", asset.Code, asset.Header())
 	}
 	unknownAPI := request(router, http.MethodGet, "/api/unknown", "", "Bearer "+apiKeyCredential(), "")
 	if unknownAPI.Code != http.StatusNotFound || strings.Contains(unknownAPI.Body.String(), "<title>portal</title>") {
@@ -1995,6 +1974,7 @@ func TestClientLoginHTTPContract(t *testing.T) {
 	started := requestWithHeader(router, http.MethodPost, "/api/auth/client-login",
 		`{"name":"alice","password":"secret","platform":"desktop","display_name":"laptop","client_instance_id":"9f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":1}`, "", "", "Idempotency-Key", "login-12345678")
 	if started.Code != http.StatusOK || !strings.Contains(started.Body.String(), `"web_session_credential":"web-secret"`) ||
+		!strings.Contains(started.Body.String(), `"web_session_host_frame_source":"https://*.example-hosts.test"`) ||
 		stub.key != "login-12345678" || stub.attempt.InstanceID != "9f0de095-66ba-49c6-a87b-0c527f4f81a1" || stub.attempt.Generation != 1 || started.Header().Get("Set-Cookie") != "" {
 		t.Fatalf("login = %d %s, key=%q attempt=%+v cookie=%q", started.Code, started.Body, stub.key, stub.attempt, started.Header().Get("Set-Cookie"))
 	}
@@ -2005,6 +1985,7 @@ func TestClientLoginHTTPContract(t *testing.T) {
 	auth := "Bearer " + client
 	web := request(router, http.MethodPost, "/api/auth/client-web-session", "", auth, "")
 	if web.Code != http.StatusOK || !strings.Contains(web.Body.String(), `"web_session_credential":"web-secret"`) ||
+		!strings.Contains(web.Body.String(), `"web_session_host_frame_source":"https://*.example-hosts.test"`) ||
 		stub.principal.Kind != identity.KindClient {
 		t.Fatalf("web session = %d %s, principal=%#v", web.Code, web.Body, stub.principal)
 	}

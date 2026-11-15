@@ -405,6 +405,22 @@ func TestHubEnforcesGlobalConnectionLimit(t *testing.T) {
 	}
 }
 
+func TestHubAcceptsTenThousandConnectionsAcrossAccounts(t *testing.T) {
+	service, _ := newHubFixture(t)
+	for index := range HubMaxConnections {
+		ownerID := fmt.Sprintf("u%07x", index/HubMaxConnectionsPerAccount)
+	if err := service.attach(newHubTestSession(ownerID, index%HubMaxConnectionsPerAccount)); err != nil {
+			t.Fatalf("attach connection %d: %v", index, err)
+		}
+	}
+	if got := service.OnlineInstallationCount(); got != 10_000 {
+		t.Fatalf("online installation count = %d, want 10000", got)
+	}
+	if err := service.attach(newHubTestSession("u0000313", 0)); err == nil {
+		t.Fatal("Hub accepted a connection above the 10000-connection target")
+	}
+}
+
 func newHubTestSession(ownerID string, index int) *hubSession {
 	id := fmt.Sprintf("i%07x", index)
 	return &hubSession{

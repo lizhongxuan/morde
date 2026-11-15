@@ -129,19 +129,23 @@ validate_workspace_sync_data_layout() {
   validate_postgres_wal_archive_layout "$root_device"
 }
 
+systemd_list_contains() {
+  local property=$1 expected=$2 actual
+  actual=$(systemctl show --property="$property" --value morde-portal.service) || return 1
+  python3 -c 'import shlex, sys; sys.exit(0 if sys.argv[1] in shlex.split(sys.argv[2]) else 1)' "$expected" "$actual"
+}
+
 check_workspace_sync_mount_bindings() {
-  local enabled bindings ordered mount_unit
+  local enabled mount_unit
   enabled=$(workspace_sync_enabled_from_config)
   [[ $enabled == true || $enabled == false ]] || die 'workspace_sync_node.enabled must be a literal true or false'
   check_workspace_sync_current_root_config
   check_workspace_sync_data_root_config
-  bindings=$(systemctl show --property=BindsTo --value morde-portal.service) || die 'could not inspect Portal mount dependencies'
-  ordered=$(systemctl show --property=After --value morde-portal.service) || die 'could not inspect Portal mount ordering'
   workspace_sync_mount_units "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR"
   validate_workspace_sync_data_layout
   for mount_unit in "${sync_mount_units[@]}"; do
-    case " $bindings " in *" $mount_unit "*) ;; *) die "Portal unit is not bound to Workspace sync mount $mount_unit; rerun install-portal-service.sh" ;; esac
-    case " $ordered " in *" $mount_unit "*) ;; *) die "Portal unit does not order after Workspace sync mount $mount_unit; rerun install-portal-service.sh" ;; esac
+    systemd_list_contains BindsTo "$mount_unit" || die "Portal unit is not bound to Workspace sync mount $mount_unit; rerun install-portal-service.sh"
+    systemd_list_contains After "$mount_unit" || die "Portal unit does not order after Workspace sync mount $mount_unit; rerun install-portal-service.sh"
   done
 }
 
@@ -239,15 +243,20 @@ for key in CH_WORKSPACE_STORAGE_ROOT_DIR CH_SITE_STORAGE_ROOT_DIR CH_WORKSPACE_S
   [[ $path == /* && -d $path && ! -L $path && $(stat -c '%u:%a' "$path") == "$portal_uid:700" ]] || die "$key must be a mode 0700 directory owned by $portal_user"
   runuser -u "$portal_user" -- test -w "$path" || die "$portal_user cannot write $key"
 done
-for path in "$repo_root" "$repo_root/deploy/single/portal.yaml" "$repo_root/web/portal/dist/index.html" "$repo_root/web/portal/dist/admin/index.html" "$repo_root/web/portal/dist/app/index.html" "$repo_root/web/workbench/dist/index.html"; do
+for path in "$repo_root" "$repo_root/deploy/single/portal.yaml" "$repo_root/web/portal/dist/admin/index.html" "$repo_root/web/workbench/dist/index.html"; do
   runuser -u "$portal_user" -- test -r "$path" || die "$portal_user cannot read $path"
 done
-for path in "$repo_root" "$repo_root/web/portal/dist" "$repo_root/web/portal/dist/app" "$repo_root/web/workbench/dist"; do
+for path in "$repo_root" "$repo_root/web/portal/dist" "$repo_root/web/workbench/dist"; do
   runuser -u "$portal_user" -- test -x "$path" || die "$portal_user cannot traverse $path"
 done
 runuser -u "$portal_user" -- test -x "$repo_root/.local/bin/portal" || die 'Portal binary is missing or not executable by the service account'
 python3 "$repo_root/deploy/single/validate-portal-binary.py" "$repo_root/.local/bin/portal" "$(uname -m)" || die 'Portal binary is not a Linux executable for this host architecture'
 quota_socket_root=/var/lib/morde-quota
+if ! getent group 65532 >/dev/null 2>&1; then
+  command -v groupadd >/dev/null 2>&1 || die 'groupadd is required to provision the Workspace sync socket group'
+  getent group morde-workspace-sync >/dev/null 2>&1 && die 'morde-workspace-sync exists with an unexpected GID'
+  groupadd --system --gid 65532 morde-workspace-sync
+fi
 if [[ ! -e $quota_socket_root && ! -L $quota_socket_root ]]; then
   install -d -o "$portal_user" -g "$(id -gn "$portal_user")" -m 0700 "$quota_socket_root"
 fi

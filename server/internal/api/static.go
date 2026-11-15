@@ -34,41 +34,6 @@ func (h *api) noRoute(c *gin.Context) {
 		h.serveAdmin(c)
 		return
 	}
-	if path == "/app" || strings.HasPrefix(path, "/app/") {
-		h.serveApp(c)
-		return
-	}
-	h.servePortal(c)
-}
-
-func (h *api) serveApp(c *gin.Context) {
-	httpserver.SetRoute(c, "app_static")
-	files := h.options.PortalFiles
-	if files == nil {
-		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
-		return
-	}
-	name := strings.TrimPrefix(c.Request.URL.Path, "/app/")
-	if name == c.Request.URL.Path || name == "" || name == "." {
-		name = "index.html"
-	}
-	if !fs.ValidPath(name) {
-		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
-		return
-	}
-	fileName := path.Join("app", name)
-	if file, err := files.Open(fileName); err == nil {
-		info, statErr := file.Stat()
-		_ = file.Close()
-		if statErr == nil && !info.IsDir() {
-			h.servePortalFile(c, fileName)
-			return
-		}
-	}
-	if name == "index.html" || (path.Ext(name) == "" && acceptsHTML(c)) {
-		h.servePortalFile(c, "app/index.html")
-		return
-	}
 	httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
 }
 
@@ -112,37 +77,6 @@ func (h *api) serveAdmin(c *gin.Context) {
 	}
 	if name == "index.html" || (path.Ext(name) == "" && acceptsHTML(c)) {
 		h.servePortalFile(c, "admin/index.html")
-		return
-	}
-	httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
-}
-
-func (h *api) servePortal(c *gin.Context) {
-	httpserver.SetRoute(c, "portal_static")
-	files := h.options.PortalFiles
-	if files == nil {
-		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
-		return
-	}
-	name := strings.TrimPrefix(c.Request.URL.Path, "/")
-	if name == "" {
-		name = "index.html"
-	}
-	if !fs.ValidPath(name) {
-		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
-		return
-	}
-	file, err := files.Open(name)
-	if err == nil {
-		info, statErr := file.Stat()
-		_ = file.Close()
-		if statErr == nil && !info.IsDir() {
-			h.servePortalFile(c, name)
-			return
-		}
-	}
-	if acceptsHTML(c) {
-		h.servePortalFile(c, "index.html")
 		return
 	}
 	httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))

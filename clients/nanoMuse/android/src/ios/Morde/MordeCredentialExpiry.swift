@@ -1443,7 +1443,7 @@ struct MordeTaskEventCursor: Equatable, Sendable {
 enum MordeTaskEventSnapshotPolicy {
     static func requiresRefresh(type: String) -> Bool {
         ["task.status", "task.step", "task.operation", "task.message", "task.batch_item",
-         "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan"].contains(type)
+         "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan", "task.priority"].contains(type)
     }
 }
 
@@ -1833,6 +1833,24 @@ enum MordeConversationMessagePagePolicy {
         messages.allSatisfy {
             $0.conversation_id == conversationID && MordeConversationVariantPresentation.hasValidProjection($0)
         }
+    }
+}
+
+struct MordeConversationHistoryCursorState {
+    private(set) var requestedCursors = Set<String>()
+
+    mutating func acceptPage(requestCursor: String, nextCursor: String?) -> Bool {
+        guard !requestCursor.isEmpty, !requestedCursors.contains(requestCursor) else { return false }
+        if let nextCursor {
+            guard !nextCursor.isEmpty, nextCursor != requestCursor,
+                  !requestedCursors.contains(nextCursor) else { return false }
+        }
+        requestedCursors.insert(requestCursor)
+        return true
+    }
+
+    mutating func reset() {
+        requestedCursors.removeAll()
     }
 }
 

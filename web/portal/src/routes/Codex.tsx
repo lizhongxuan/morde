@@ -303,7 +303,7 @@ export function Codex() {
 
   return <section className="codex-route">
     <header className="page-heading"><p className="eyebrow">本机 AI</p><h1>Codex 会话</h1><p>连接本机 Codex 配置后，Morde 会同步该配置可访问的普通与归档会话，包括消息、工具调用、结果和 Codex 提供的推理摘要。iOS 可查看这些会话并在授权范围内接续原会话。</p></header>
-    {!codexBridge && <p className="notice notice-warning" role="status">Codex 会话同步需要 Morde PC 客户端，请在桌面客户端打开此页面。</p>}
+    {!codexBridge && <p className="notice notice-warning" role="status">Codex 会话同步需要 morde-pc，请在客户端打开此页面。</p>}
     {stateError && <FloatingError role="alert">{stateError}<button className="button button-secondary button-small" type="button" onClick={() => void refreshState()}>重试</button></FloatingError>}
     {state && !state.authenticated && <FloatingNotice className="notice-warning">请先登录 Morde，再连接本机 Codex。</FloatingNotice>}
     {codexBridge && state?.authenticated && <>

@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -27,10 +28,12 @@ type ConversationRouteWorkerOptions struct {
 	PollInterval  time.Duration
 	MaxConcurrent int
 	Logger        *zap.Logger
+	Metrics       prometheus.Registerer
 }
 
 type ConversationRouteWorker struct {
 	options ConversationRouteWorkerOptions
+	metrics *conversationRouteMetrics
 }
 
 func NewConversationRouteWorker(options ConversationRouteWorkerOptions) (*ConversationRouteWorker, error) {
@@ -41,7 +44,11 @@ func NewConversationRouteWorker(options ConversationRouteWorkerOptions) (*Conver
 		(options.SummaryStore != nil && options.SummarySealer == nil) {
 		return nil, errors.New("conversation routing dependencies and bounded worker options are required")
 	}
-	return &ConversationRouteWorker{options: options}, nil
+	metrics, err := newConversationRouteMetrics(options.Metrics)
+	if err != nil {
+		return nil, err
+	}
+	return &ConversationRouteWorker{options: options, metrics: metrics}, nil
 }
 
 // Run routes independent messages concurrently; each worker owns a separate
@@ -230,11 +237,15 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				return true, w.failRoute(ctx, claim, "routing_action_unavailable", err)
 			}
 			if started {
+				if w.metrics != nil {
+					w.metrics.aggregationStates.WithLabelValues("waiting").Inc()
+				}
 				return true, nil
 			}
 		}
 	}
 	if err := w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, decision); err != nil {
+		w.observeRouteDecision(claim, decision, "failed")
 		if domain.CodeOf(err) == domain.CodeConflict && (claim.Input.ResultReviewID != "" || routeCtx.Err() == nil) {
 			return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 		}
@@ -243,7 +254,49 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", err)
 	}
+	w.observeRouteDecision(claim, decision, "applied")
 	return true, nil
+}
+
+func (w *ConversationRouteWorker) observeRouteDecision(claim app.ConversationRouteClaim, decision app.ConversationRouteDecision, result string) {
+	if w.metrics == nil {
+		return
+	}
+	action := "other"
+	switch decision.Action {
+	case app.ConversationRouteNew:
+		action = "new"
+		if len(decision.AggregateMessageIDs) > 0 {
+			action = "aggregate"
+		}
+	case app.ConversationRouteJoin:
+		action = "join"
+	case app.ConversationRouteUpdate:
+		action = "update"
+	case app.ConversationRouteStatus:
+		action = "status"
+	case app.ConversationRouteStop:
+		action = "stop"
+	case app.ConversationRouteClarify:
+		action = "clarify"
+	case app.ConversationRouteReply:
+		action = "reply"
+	}
+	w.metrics.actions.WithLabelValues(action, result).Inc()
+	if claim.AggregationStartedAt.IsZero() || result != "applied" || claim.AggregationStartedAt.After(time.Now()) {
+		return
+	}
+	w.metrics.aggregationWaitTime.Observe(time.Since(claim.AggregationStartedAt).Seconds())
+	state := "resolved"
+	switch action {
+	case "aggregate":
+		state = "aggregated"
+	case "update", "join":
+		state = "corrected"
+	case "clarify":
+		state = "clarified"
+	}
+	w.metrics.aggregationStates.WithLabelValues(state).Inc()
 }
 
 func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.ConversationRouteClaim, reason string, cause error) error {

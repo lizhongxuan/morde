@@ -345,16 +345,14 @@ func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error)
 		Stream:          request.OnTextDelta != nil,
 		ToolChoice:      choice,
 	}
-	// GPT-6 Luna spends a small capability probe's entire output budget on
-	// its default reasoning effort unless the probe explicitly selects none.
-	// Keep this opt-in limited to the verified first-party model: OpenAI-
-	// compatible endpoints and older models may reject the Responses field.
+	// These first-party APIs document the Responses reasoning toggle; generic
+	// OpenAI-compatible endpoints may reject it.
 	if request.ReasoningEffort != "" {
 		if request.ReasoningEffort != "max" || !isOpenAIGPT6Luna(request.Endpoint) {
 			return nil, errors.New("model reasoning effort is invalid")
 		}
 		payload.Reasoning = &responseReasoning{Effort: request.ReasoningEffort}
-	} else if request.DisableThinking && isOpenAIGPT6Luna(request.Endpoint) {
+	} else if request.DisableThinking && (isOpenAIGPT6Luna(request.Endpoint) || isDeepSeek(request.Endpoint)) {
 		payload.Reasoning = &responseReasoning{Effort: "none"}
 	}
 	if len(tools) == 0 {
@@ -954,6 +952,11 @@ func isOpenAIGPT6Luna(endpoint app.ModelEndpoint) bool {
 	}
 	parsed, err := url.Parse(endpoint.BaseURL)
 	return err == nil && strings.EqualFold(parsed.Hostname(), "api.openai.com")
+}
+
+func isDeepSeek(endpoint app.ModelEndpoint) bool {
+	parsed, err := url.Parse(endpoint.BaseURL)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "api.deepseek.com")
 }
 
 type responseInputItem struct {

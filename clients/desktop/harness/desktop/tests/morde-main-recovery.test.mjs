@@ -5,16 +5,24 @@ import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
+process.env.MORDE_TEST_PORTAL_ASSETS = fileURLToPath(new URL('./portal-fixture', import.meta.url));
 const future = '2099-01-01T00:00:00Z';
 const serviceInstanceID = '12345678-1234-4234-8234-123456789abc';
 const capabilitiesResponse = { service_instance_id: serviceInstanceID, api_version: '1', hub_version: null, event_version: null, minimum_client_version: null, supported_features: ['password_login', 'client_installations', 'ordered_client_login'], default_max_request_bytes: 1048576 };
 const capabilitiesWithWorkspaceSync = { ...capabilitiesResponse, supported_features: [...capabilitiesResponse.supported_features, 'workspace_sync'] };
 const auth = { origin: 'https://portal.example', serviceInstanceID, accountName: 'user', installationId: 'i1234567', clientCredential: 'client-secret', clientExpiresAt: future, syncCredential: 'sync-secret', syncExpiresAt: future };
-const loginResponse = { installation_id: auth.installationId, client_credential: auth.clientCredential, client_expires_at: future, sync_credential: auth.syncCredential, sync_expires_at: future, web_session_credential: 'web-secret', web_session_expires_at: future };
-const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+const loginResponse = { installation_id: auth.installationId, client_credential: auth.clientCredential, client_expires_at: future, sync_credential: auth.syncCredential, sync_expires_at: future, web_session_credential: 'web-secret', web_session_expires_at: future, web_session_host_frame_source: 'https://*.hosts.example.test' };
+const json = (value, status = 200) => new Response(JSON.stringify(value && typeof value === 'object' && 'web_session_credential' in value && !('web_session_host_frame_source' in value) ? { ...value, web_session_host_frame_source: 'https://*.hosts.example.test' } : value), { status, headers: { 'content-type': 'application/json' } });
 const loginFetch = (url, fallback = loginResponse) => json(String(url).endsWith('/api/capabilities') ? capabilitiesResponse : fallback);
+const appURL = (h, path) => `${new URL(h.views[0].webContents.url).origin}${path}`;
+async function waitFor(predicate, message = 'timed out waiting for the Portal session cookie', timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(predicate(), message);
+}
 const profileFile = (h, value, name) => join(h.userData, `${name}-${createHash('sha256').update(`${value.origin}\0${value.serviceInstanceID}\0${value.accountName}\0${value.installationId}`).digest('hex')}.json`);
 const liveSyncProfileFile = (h, value) => join(h.userData, `live-sync-${createHash('sha256').update(`${value.origin}\0${value.serviceInstanceID}\0${value.accountName}\0${value.installationId}`).digest('hex')}.bin`);
 const workspaceSyncProfileFile = (h, value) => join(h.userData, `workspace-sync-${createHash('sha256').update(`${value.origin}\0${value.serviceInstanceID}\0${value.accountName}\0${value.installationId}`).digest('hex')}.bin`);
@@ -144,7 +152,8 @@ test('one desktop login stores Client and Sync only, injects an HttpOnly Web coo
     assert.match(calls[1].options.headers['Idempotency-Key'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.equal(h.partitions.length, 1);
     assert.match(h.partitions[0].name, /^morde-user-/);
-    assert.deepEqual(h.partitions[0].cookies.values.map((item) => ({ name: item.name, httpOnly: item.httpOnly, secure: item.secure, sameSite: item.sameSite })), [{ name: 'ch_portal', httpOnly: true, secure: true, sameSite: 'strict' }]);
+    assert.deepEqual(h.partitions[0].cookies.values.map((item) => ({ name: item.name, httpOnly: item.httpOnly, secure: item.secure, sameSite: item.sameSite })), [{ name: 'ch_portal', httpOnly: true, secure: false, sameSite: 'strict' }]);
+    assert.match(h.partitions[0].cookies.values[0].url, /^http:\/\/127\.0\.0\.1:\d+$/);
     assert.match(h.views[0].options.webPreferences.preload, /morde-preload\.js$/);
     assert.deepEqual(h.views[0].options.webPreferences.additionalArguments, ['--morde-preload-mode=portal']);
     assert.equal(h.views[0].options.webPreferences.sandbox, true);
@@ -463,12 +472,12 @@ test('Host popups are limited to the same-origin entry and Admin opens an indepe
     await h.invoke('morde:login', auth.origin, 'user', 'password');
     const open = h.views[0].webContents.open;
     assert.equal(open({ url: 'https://evil.example/' }).action, 'deny');
-    assert.equal(open({ url: 'https://portal.example/client-authorize' }).action, 'deny');
-    assert.equal(open({ url: 'https://portal.example/host-entry/h1234567?target=desktop' }).action, 'allow');
-    assert.equal(open({ url: 'https://portal.example/host-entry/h1234567?target=invalid' }).action, 'deny');
-    assert.equal(open({ url: 'https://portal.example/admin/' }).action, 'deny');
+    assert.equal(open({ url: appURL(h, '/client-authorize') }).action, 'deny');
+    assert.equal(open({ url: appURL(h, '/host-entry/h1234567?target=desktop') }).action, 'allow');
+    assert.equal(open({ url: appURL(h, '/host-entry/h1234567?target=invalid') }).action, 'deny');
+    assert.equal(open({ url: appURL(h, '/admin/') }).action, 'deny');
     let blocked = false;
-    h.views[0].webContents.events.get('will-navigate')({ preventDefault() { blocked = true; } }, 'https://portal.example/admin/');
+    h.views[0].webContents.events.get('will-navigate')({ preventDefault() { blocked = true; } }, appURL(h, '/admin/'));
     assert.equal(blocked, true);
     assert.deepEqual(h.shellURLs, ['https://portal.example/admin/', 'https://portal.example/admin/']);
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }
@@ -505,8 +514,8 @@ test('public registration returns to the local login when its SPA link changes r
     await h.ready();
     await h.invoke('morde:public-page', 'register', 'https://portal.example');
     const register = h.windows.at(-1);
-    assert.equal(register.webContents.url, 'https://portal.example/register');
-    register.webContents.events.get('did-navigate-in-page')({}, 'https://portal.example/login');
+    assert.match(register.webContents.url, /^http:\/\/127\.0\.0\.1:\d+\/register$/);
+    register.webContents.events.get('did-navigate-in-page')({}, `${new URL(register.webContents.url).origin}/login`);
     assert.equal(register.isDestroyed(), true);
     assert.equal(h.windows[0].isDestroyed(), false);
   } finally { h.cleanup(); }
@@ -523,9 +532,9 @@ test('Web replaces top-level API error documents with a recoverable page without
     const contents = h.views[0].webContents;
     const request = partition.webRequest.headersReceived;
     let navigationResult;
-    request({ url: 'https://portal.example/api/missing', webContentsId: contents.id, resourceType: 'mainFrame', statusCode: 404, responseHeaders: { 'content-type': ['application/json'] } }, (result) => { navigationResult = result; });
+    request({ url: appURL(h, '/api/missing'), webContentsId: contents.id, resourceType: 'mainFrame', statusCode: 404, responseHeaders: { 'content-type': ['application/json'] } }, (result) => { navigationResult = result; });
     assert.deepEqual(navigationResult, { cancel: true });
-    contents.events.get('did-fail-load')({}, -3, 'ERR_ABORTED', 'https://portal.example/api/missing', true);
+    contents.events.get('did-fail-load')({}, -3, 'ERR_ABORTED', appURL(h, '/api/missing'), true);
     await new Promise((resolve) => setImmediate(resolve));
     assert.match(contents.url, /^data:text\/html;charset=utf-8,/);
     const page = decodeURIComponent(contents.url.slice(contents.url.indexOf(',') + 1));
@@ -533,7 +542,7 @@ test('Web replaces top-level API error documents with a recoverable page without
     assert.match(page, /返回助手/);
 
     let apiResult;
-    request({ url: 'https://portal.example/api/missing', webContentsId: contents.id, resourceType: 'xhr', statusCode: 404, responseHeaders: { 'content-type': ['application/json'] } }, (result) => { apiResult = result; });
+    request({ url: appURL(h, '/api/missing'), webContentsId: contents.id, resourceType: 'xhr', statusCode: 404, responseHeaders: { 'content-type': ['application/json'] } }, (result) => { apiResult = result; });
     assert.deepEqual(apiResult, {});
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }
 });
@@ -562,7 +571,7 @@ test('Host window checks a one-time ticket against the Host origin before naviga
   try {
     await h.ready();
     await h.invoke('morde:login', auth.origin, 'user', 'password');
-    const popup = h.views[0].webContents.open({ url: 'https://portal.example/host-entry/h1234567' });
+    const popup = h.views[0].webContents.open({ url: appURL(h, '/host-entry/h1234567') });
     const guest = new h.views[0].webContents.constructor();
     const contents = popup.createWindow({ webContents: guest, webPreferences: { sandbox: true } });
     const win = h.windows.at(-1);
@@ -604,7 +613,7 @@ test('shared Host windows recheck the current shared Host origin before navigati
   try {
     await h.ready();
     await h.invoke('morde:login', auth.origin, 'user', 'password');
-    const popup = h.views[0].webContents.open({ url: 'https://portal.example/host-entry/h1234567?target=desktop' });
+    const popup = h.views[0].webContents.open({ url: appURL(h, '/host-entry/h1234567?target=desktop') });
     const guest = new h.views[0].webContents.constructor();
     popup.createWindow({ webContents: guest });
     const win = h.windows.at(-1);
@@ -626,7 +635,7 @@ test('revoking a session closes its open Host windows', async () => {
   try {
     await h.ready();
     await h.invoke('morde:login', auth.origin, 'user', 'password');
-    const popup = h.views[0].webContents.open({ url: 'https://portal.example/host-entry/h1234567' });
+    const popup = h.views[0].webContents.open({ url: appURL(h, '/host-entry/h1234567') });
     popup.createWindow({});
     const hostWindow = h.windows.at(-1);
     assert.equal(hostWindow.isDestroyed(), false);
@@ -644,11 +653,11 @@ test('Host entry failure returns to the usable main Web window', async () => {
   try {
     await h.ready();
     await h.invoke('morde:login', auth.origin, 'user', 'password');
-    const popup = h.views[0].webContents.open({ url: 'https://portal.example/host-entry/h1234567' });
+    const popup = h.views[0].webContents.open({ url: appURL(h, '/host-entry/h1234567') });
     popup.createWindow({});
     const win = h.windows.at(-1);
     h.windows[0].focused = false;
-    win.webContents.events.get('did-navigate-in-page')({}, 'https://portal.example/hosts');
+    win.webContents.events.get('did-navigate-in-page')({}, appURL(h, '/hosts'));
     assert.equal(win.isDestroyed(), true);
     assert.equal(h.windows[0].focused, true);
     assert.equal(h.windows[0].contentView.attached[0], h.views[0]);
@@ -660,7 +669,7 @@ test('restart renews the Web session, while logout preserves local folder mappin
   const calls = [];
   globalThis.fetch = async (url, options) => {
     calls.push({ url, options });
-    return url.endsWith('client-logout') ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ web_session_credential: 'renewed-web', web_session_expires_at: future }), { headers: { 'content-type': 'application/json' } });
+    return url.endsWith('client-logout') ? new Response(null, { status: 204 }) : json({ web_session_credential: 'renewed-web', web_session_expires_at: future });
   };
   const h = harness(auth);
   const mappingsFile = profileFile(h, auth, 'mappings');
@@ -679,6 +688,7 @@ test('restart renews the Web session, while logout preserves local folder mappin
     assert.equal(existsSync(checkpointFile), true);
     assert.deepEqual(JSON.parse(readFileSync(legacyMappings, 'utf8'))[0], { workspaceId: 'w7654321', directory: '/tmp/legacy', dev: '1', ino: '2' });
     assert.equal(JSON.parse(readFileSync(legacyCheckpoint, 'utf8')).idempotencyKey, 'legacy-key');
+    await waitFor(() => h.partitions[0]?.cookies.values[0]);
     assert.equal(h.partitions[0].cookies.values[0].value, 'renewed-web');
     assert.equal(calls[0].url, 'https://portal.example/api/auth/client-web-session');
     await h.invoke('morde:logout');
@@ -820,7 +830,7 @@ test('scheduled Web session refresh keeps the desktop running during a network o
   globalThis.fetch = async () => {
     requests++;
     if (requests > 1) throw new TypeError('network offline');
-    return new Response(JSON.stringify({ web_session_credential: 'first-web', web_session_expires_at: new Date(Date.now() + 61_000).toISOString() }), { headers: { 'content-type': 'application/json' } });
+    return json({ web_session_credential: 'first-web', web_session_expires_at: new Date(Date.now() + 61_000).toISOString() });
   };
   const h = harness(auth);
   try {
@@ -929,7 +939,7 @@ test('service instance and installation changes isolate mappings and Workspace c
 
 test('damaged sync recovery point preserves the file and blocks new local operations', async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ web_session_credential: 'renewed-web', web_session_expires_at: future }), { headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async () => json({ web_session_credential: 'renewed-web', web_session_expires_at: future });
   const h = harness(auth);
   const checkpointFile = profileFile(h, auth, 'sync-checkpoint');
   writeFileSync(profileFile(h, auth, 'mappings'), JSON.stringify([{ workspaceId: 'w1234567', directory: '/tmp/example', dev: '1', ino: '2' }]));
@@ -950,7 +960,7 @@ test('damaged sync recovery point preserves the file and blocks new local operat
 
 test('invalid local Workspace mapping is preserved instead of being replaced on folder selection', async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ web_session_credential: 'renewed-web', web_session_expires_at: future }), { headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async () => json({ web_session_credential: 'renewed-web', web_session_expires_at: future });
   const h = harness(auth);
   const mappingsFile = profileFile(h, auth, 'mappings');
   const damaged = JSON.stringify([{ workspaceId: 'w1234567', dev: '1', ino: '2' }]);
@@ -965,7 +975,7 @@ test('invalid local Workspace mapping is preserved instead of being replaced on 
 
 test('duplicate Workspace mappings are preserved and pause local sync instead of selecting an arbitrary folder', async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ web_session_credential: 'renewed-web', web_session_expires_at: future }), { headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async () => json({ web_session_credential: 'renewed-web', web_session_expires_at: future });
   const h = harness(auth);
   const mappingsFile = profileFile(h, auth, 'mappings');
   const damaged = JSON.stringify([
@@ -985,13 +995,16 @@ test('duplicate Workspace mappings are preserved and pause local sync instead of
 
 test('closing and reopening the macOS window restores the authenticated Web view', async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ web_session_credential: 'renewed-web', web_session_expires_at: future }), { headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async () => json({ web_session_credential: 'renewed-web', web_session_expires_at: future });
   const h = harness(auth);
   try {
     await h.ready();
+    await waitFor(() => h.views.length === 1 && h.windows[0].contentView.attached[0] === h.views[0], 'timed out waiting for the initial authenticated Web view', 10_000);
     h.windows[0].close();
     h.appEvents.get('activate')();
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitFor(() => h.windows.length === 2 && h.views.length === 2
+      && h.windows[1].contentView.attached[0] === h.views[1], 'timed out waiting for the reopened authenticated Web view', 10_000)
+      .catch(() => assert.fail(`timed out reopening Web view (windows=${h.windows.length}, views=${h.views.length}, attached=${JSON.stringify(h.windows.map((win) => win.contentView.attached.map((view) => h.views.indexOf(view))))})`));
     assert.equal(h.windows.length, 2);
     assert.equal(h.views.length, 2);
     assert.equal(h.windows[1].contentView.attached[0], h.views[1]);

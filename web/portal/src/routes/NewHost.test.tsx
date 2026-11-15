@@ -3,11 +3,12 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useAuth } from '../app/auth';
 import { portalApi } from '../app/api';
 import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { NewHost } from './NewHost';
 
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567', quota: { hosts: 2 } } }) }));
+vi.mock('../app/auth', () => ({ useAuth: vi.fn(() => ({ user: { id: 'u1234567', quota: { hosts: 2 } } })) }));
 
 const createdHost: Awaited<ReturnType<typeof portalApi.createHost>> = {
   id: 'h1234567', name: '测试电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'creating',
@@ -22,8 +23,37 @@ function renderPage() {
 }
 
 describe('NewHost', () => {
-  beforeEach(() => { vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] }); });
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({ user: { id: 'u1234567', quota: { hosts: 2 } } } as never);
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+  });
   afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); });
+
+  it('shows the quota limit with a route back to the computer list', async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { id: 'u1234567', quota: { hosts: 1 } } } as never);
+    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [createdHost] });
+    renderPage();
+
+    expect(await screen.findByRole('heading', { name: '无法创建云端电脑' })).toBeInTheDocument();
+    expect(screen.getByText(/已达到云端电脑数量上限/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '返回云端电脑' })).toHaveAttribute('href', '/hosts');
+    expect(screen.queryByRole('textbox', { name: /云端电脑名称/ })).not.toBeInTheDocument();
+  });
+
+  it('allows an uncertain create to reconcile with its original idempotency key at quota', async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { id: 'u1234567', quota: { hosts: 1 } } } as never);
+    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [createdHost] });
+    localStorage.setItem('morde.pending-host-create.u1234567', JSON.stringify({ name: '研究电脑', hostIdempotencyKey: 'request-host-01' }));
+    const createHost = vi.spyOn(portalApi, 'createHost').mockResolvedValue(createdHost);
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByRole('button', { name: '继续上次创建' })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: /云端电脑名称/ })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: '继续上次创建' }));
+
+    await waitFor(() => expect(createHost).toHaveBeenCalledWith({ name: '研究电脑' }, 'request-host-01'));
+  });
 
   it('creates a cloud computer without asking the user to choose a Workspace', async () => {
     vi.mocked(portalApi.hosts).mockResolvedValue({ items: [

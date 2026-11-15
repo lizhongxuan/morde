@@ -123,6 +123,15 @@ func TestWorkspaceProjectFolderRegistrationGatesSyncUntilPathSupport(t *testing.
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-project-folder-gate")
+	legacyRootSession := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, legacyRootSession, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "project-folder-legacy-root", legacyRootSession.ID)); err != nil {
+		t.Fatalf("create legacy root Workspace session before Host binding: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_sessions SET state='completed',stage='complete',updated_at=clock_timestamp()
+WHERE workspace_id=$1 AND id=$2`, value.ID, legacyRootSession.ID); err != nil {
+		t.Fatal(err)
+	}
 	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
 	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
 	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
@@ -138,10 +147,43 @@ func TestWorkspaceProjectFolderRegistrationGatesSyncUntilPathSupport(t *testing.
 		t.Fatal(err)
 	}
 	portal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: sessionToken.ID}
-	projectSession := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
-	if _, _, err := createTestWorkspaceSyncSession(ctx, store, projectSession, nil,
-		syncTestIdempotency(owner.ID, "workspace.sync.create", "project-folder-active-session", projectSession.ID)); err != nil {
-		t.Fatalf("create pre-existing root Workspace session: %v", err)
+	client := syncDeviceTestPrincipal(t, store, owner.ID)
+	rootCertificate := []byte("root challenge issued before project metadata")
+	rootCertificateHash := sha256.Sum256(rootCertificate)
+	rootChallenge := newSyncDeviceTestChallenge(t, owner.ID, value.ID, client.ClientInstallationID,
+		"DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD", rootCertificate, rootCertificateHash[:])
+	if err := store.CreateWorkspaceSyncDeviceChallenge(ctx, client, rootChallenge); err != nil {
+		t.Fatalf("create legacy root challenge before project metadata: %v", err)
+	}
+
+	activeFolder := workspace.SyncFolder{
+		OwnerID: owner.ID, FolderID: "morde-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Kind: workspace.SyncFolderKindProject,
+		ProjectName: "active", RelativePath: "project/active", State: "pending_node",
+	}
+	activeKeyHash := sha256.Sum256([]byte("active-project-folder-register-key"))
+	activeRequestHash := sha256.Sum256([]byte("active-project-folder-register-request"))
+	if _, err := store.RegisterWorkspaceSyncFolder(ctx, portal, hostValue.ID, activeFolder, activeKeyHash[:], activeRequestHash[:]); err != nil {
+		t.Fatalf("register existing project folder: %v", err)
+	}
+	syncToken := clientTestToken(t, owner.ID, client.ClientInstallationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, syncToken); err != nil {
+		t.Fatal(err)
+	}
+	device := identity.Principal{
+		UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: syncToken.ID,
+		ClientInstallationID: client.ClientInstallationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	syncService, err := app.NewWorkspaceSyncServiceWithOptions(store, workspaceTransferTestBlocks{}, workspace.MaxSyncManifestBytes, 1<<30,
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectSession, err := syncService.CreateSyncSession(ctx, device, value.ID, workspace.CreateSyncSession{
+		FolderID: activeFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+	}, "project-folder-active-session")
+	if err != nil {
+		t.Fatalf("create active project upload session: %v", err)
 	}
 
 	projectFolder := workspace.SyncFolder{
@@ -157,16 +199,8 @@ func TestWorkspaceProjectFolderRegistrationGatesSyncUntilPathSupport(t *testing.
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&folderRows); err != nil {
 		t.Fatal(err)
 	}
-	if folderRows != 0 {
-		t.Fatalf("active-session conflict left %d sync folder rows", folderRows)
-	}
-	client := syncDeviceTestPrincipal(t, store, owner.ID)
-	rootCertificate := []byte("root challenge issued before project metadata")
-	rootCertificateHash := sha256.Sum256(rootCertificate)
-	rootChallenge := newSyncDeviceTestChallenge(t, owner.ID, value.ID, client.ClientInstallationID,
-		"DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD-DDDDDDD", rootCertificate, rootCertificateHash[:])
-	if err := store.CreateWorkspaceSyncDeviceChallenge(ctx, client, rootChallenge); err != nil {
-		t.Fatalf("create legacy root challenge before project metadata: %v", err)
+	if folderRows != 1 {
+		t.Fatalf("active-session conflict left %d sync folder rows; want the existing project only", folderRows)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_sessions SET state='completed',stage='complete',updated_at=clock_timestamp()
 WHERE workspace_id=$1 AND id=$2`, value.ID, projectSession.ID); err != nil {
@@ -222,8 +256,8 @@ WHERE workspace_id=$1 AND id=$2`, value.ID, projectSession.ID); err != nil {
 	if _, err := store.ListDeviceWorkspaceSyncProgress(ctx, owner.ID, value.ID); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
 		t.Fatalf("project Workspace progress error = %v, want unavailable", err)
 	}
-	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, projectSession.ID,
-		syncTestIdempotency(owner.ID, "workspace.sync.commit", "project-folder-commit-gate", projectSession.ID)); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, legacyRootSession.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "project-folder-commit-gate", legacyRootSession.ID)); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable {
 		t.Fatalf("project Workspace commit error = %v, want unavailable", err)
 	}
 	reservationID, err := domain.NewPendingRequestID()
@@ -265,7 +299,7 @@ WHERE workspace_id=$1 AND id=$2`, value.ID, projectSession.ID); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_folders SET project_name='changed',relative_path='project/changed' WHERE workspace_id=$1`, value.ID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_folders SET project_name='changed',relative_path='project/changed' WHERE workspace_id=$1 AND folder_id=$2`, value.ID, registeredFolder.FolderID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.GetWorkspaceSyncDeviceChallenge(ctx, client, value.ID, projectChallenge.ID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
@@ -274,7 +308,7 @@ WHERE workspace_id=$1 AND id=$2`, value.ID, projectSession.ID); err != nil {
 	if _, err := store.RegisterWorkspaceSyncDevice(ctx, client, value.ID, projectChallenge.ID, keyHash, requestHash, bindingID, registeredFolder.FolderID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("project registration after challenged path change = %v, want workspace conflict", err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_folders SET project_name='demo',relative_path='project/demo' WHERE workspace_id=$1`, value.ID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_folders SET project_name='demo',relative_path='project/demo' WHERE workspace_id=$1 AND folder_id=$2`, value.ID, registeredFolder.FolderID); err != nil {
 		t.Fatal(err)
 	}
 	legacyCertificate := []byte("legacy root certificate")

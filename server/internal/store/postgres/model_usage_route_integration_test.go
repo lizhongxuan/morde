@@ -511,7 +511,7 @@ func TestConversationRouteRetryAttemptsMigrationKeepsUnknownEvidence(t *testing.
 	if _, err := provider.UpTo(ctx, 195); err != nil {
 		t.Fatalf("reapply retry-attempt migration: %v", err)
 	}
-	if _, err := provider.UpTo(ctx, 198); err != nil {
+	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("restore current schema before exercising the route worker: %v", err)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT aggregation_started_at,aggregation_deadline,aggregation_state

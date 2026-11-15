@@ -2,7 +2,7 @@
 
 需求依据：[Morde PC 端 Codex 会话接续需求文档](../Morde%20PC端%20Codex%20会话接续需求文档.md)。实现边界依据：[设计方案](../Morde%20PC端%20Codex%20会话接续设计方案.md)、根目录 AGENTS.md、server/AGENTS.md、clients/nanoMuse/AGENTS.md 与 runtime/morde-cloud-runtime/AGENTS.md。
 
-当前状态：CX-00 至 CX-06 的实现已完成，PC 新增本地 Codex 会话管理窗口；CX-07 统一验证待后续执行。运行中外部 GUI turn 会通过有界快照回传可见项，终态仍需连续稳定快照；外部 GUI 的审批/问题若无原 RPC handle 则明确不可代答。云端保留合法问题文本并按 snapshot/live/approval scope 校验；iOS 在仅撤销 live 时保留 read 历史、撤销 read 或确认会话不存在时清理历史，并按请求 ID/version 阻止重复回答。尚未运行测试、构建或迁移，也未执行真实设备验收；Codex Desktop 外部 GUI 增量、同线程发送和审批尚未实测，完成 CX-07 前不得宣称全功能可用。
+当前状态：CX-00 至 CX-06 的实现已完成，PC 新增本地 Codex 会话管理窗口；CX-07 本机 Portal 已部署并通过原生 PC 客户端完成服务版本探测，但初始管理员必须先改密，客户端登录尚未完成。运行中外部 GUI turn 会通过有界快照回传可见项，终态仍需连续稳定快照；外部 GUI 的审批/问题若无原 RPC handle 则明确不可代答。云端保留合法问题文本并按 snapshot/live/approval scope 校验；iOS 在仅撤销 live 时保留 read 历史、撤销 read 或确认会话不存在时清理历史，并按请求 ID/version 阻止重复回答。本轮未运行自动化测试；已构建并部署 Portal、在独立本地数据库完成迁移至 206。尚未执行真实 Codex GUI/iOS 功能验收；完成 CX-07 前不得宣称全功能可用。
 
 ## 使用方法
 
@@ -137,9 +137,10 @@ flowchart LR
 - **验收：**端到端集成测试验证撤权生效、旧票据/命令/审批失效、同账号多安装隔离、另一用户完全不可见、iOS 关闭不取消 turn、PC 断线补发事件无丢失/重复、结果未知时不重发。
 - **依赖：**CX-03、CX-04、CX-05；retention 以 CX-00/CX-01 结论为准。
 
-### CX-07（待后续统一验收）完成真实 PC + iOS 验收并登记发布能力
+### CX-07（进行中：本机 Portal 已部署，管理员改密及真实 Codex/iOS 验收待完成）完成真实 PC + iOS 验收并登记发布能力
 
 - **验收环境：**真实打包 Morde PC、真实 Codex 安装与已有登录、真实 Morde iOS；分别记录 macOS/Windows/Linux 中属于本次发行范围的平台结果。模拟 Provider/Hub 只能作为定向测试，不能替代真实 GUI thread。
+- **2026-11-15 本机服务与 PC 连接记录（部分验收）：**在独立 `morde-basic` Lima VM 中部署本仓库 Portal、静态资源、PostgreSQL 与 OpenSandbox；Portal 由 `morde-portal.service` 管理并监听 VM 回环地址 `127.0.0.1:7080`，PC 使用 Lima 提供的本机回环转发 `http://127.0.0.1:7080`。本机全新隔离数据库迁移结果为 `current=206, latest=206`；原有 Docker Desktop `morde-local-postgres`（此前版本 160）未迁移、未改写。网络策略与 OpenSandbox API 检查通过，Portal `/api/capabilities` 返回 API 版本 `1` 和客户端所需功能。已在实际 Morde Electron 客户端（`io.morde.client`，不是浏览器或演示页）验证版本探测并发起本地登录；服务端返回“请先在管理后台修改密码，再登录客户端”，说明初始管理员的首次改密门禁阻止 PC 登录。没有代用户设置新密码，登录尚未完成；登录页已设置为本机 Portal 地址并清空密码框。未访问外部测试服务器、未使用远端账号、未改动既有数据库。Host Runtime 回调地址仍为保留域名 `.test`，且 Portal 为本地 HTTP；未创建 Host，Host 创建/外部访问不在本次验证结论内。专用 16 GiB VM workspace raw disk 与 Mac APFS 共用物理后端，属于本地开发环境，不等同于独立硬件存储。
 - **必测场景：**既有 Codex GUI 线程发现、历史读取、桌面外部更新监听、iOS 发消息经云端与 PC 到达同一 thread、assistant delta 与可见工具/计划/文件摘要/审批/结构化问题返回、审批批准/拒绝/过期、结构化问题按选项和文本回答及重启/撤权后 stale、PC 与云端断线恢复、iOS 关闭后任务继续、重复请求单次 turn、撤权、账号/安装隔离。
 - **证据：**只保留版本、事件类型、状态和必要脱敏元信息；不得把真实项目文件、认证材料、完整本机日志或截图发到外部服务。报告明确写出真实设备/模拟器、平台、功能门、限制和失败场景。
 - **发布：**只有 GUI 既有线程能力和持久事件/命令恢复验收全部通过，才能把“接续 PC 上已有 Codex 对话”标为可用；受限平台显示具体 unavailable 原因。
@@ -147,4 +148,4 @@ flowchart LR
 
 ## 最终验收记录
 
-CX-00 至 CX-06 的实现和静态复核完成；新增外部 GUI 活跃 turn 快照回传、T3 问题文本/授权来源兼容、iOS 权限撤销历史保留及命令重复边界修复。此前加入的 question 命令/事件、PC 一次性 RPC 回答、iOS 问题卡片和 00201 迁移源码仍在范围内。Go/TypeScript/Swift 测试、构建、数据库迁移验证及真实设备验收按用户安排由后续 CX-07 统一执行，本轮未运行。真实 GUI 外部更新、同线程写入与审批尚未实测；App Server 自建 thread、Mock、模拟器或普通 SSE 测试均不能替代此项。
+CX-00 至 CX-06 的实现和静态复核完成；本轮将最新 Portal 构建部署到独立本地 VM、迁移其空数据库至版本 206，并以原生 Morde PC 客户端验证本机服务版本探测与登录门禁。原有本机 PostgreSQL 数据未触碰。CX-07 仍未完成：管理员首次改密后才能完成 PC 登录，Codex Desktop 外部 GUI 更新、同线程写入/审批、iOS 跨端与恢复场景都未实测。Go/TypeScript/Swift 自动化测试、本轮 PC 客户端重建和真实设备验收未运行；Portal 已构建。App Server 自建 thread、Mock、模拟器或普通 SSE 测试均不能替代真实 GUI 线程验收。

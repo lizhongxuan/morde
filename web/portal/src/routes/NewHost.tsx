@@ -114,7 +114,10 @@ export function NewHost() {
 
   if (hosts.isPending) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
   if (hosts.isError) return <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>;
-  if (ownedHostCount >= (user?.quota.hosts ?? 0) && !recoveryIssue) return <FloatingError>已达到云端电脑数量上限</FloatingError>;
+  if (ownedHostCount >= (user?.quota.hosts ?? 0) && !recoveryPending && !recoveryIssue) return <section className="form-card">
+    <div className="design-panel-header"><div><h2>无法创建云端电脑</h2><p>已达到云端电脑数量上限。删除或释放现有电脑后，可以再次创建。</p></div>
+      <Link className="button button-secondary" to="/hosts">返回云端电脑</Link></div>
+  </section>;
   return <section>
     {recoveryIssue && <FloatingError>
       {recoveryIssue === 'legacy'

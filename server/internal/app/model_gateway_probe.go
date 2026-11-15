@@ -62,9 +62,10 @@ func (s *ModelGatewayService) CheckModelCapability(ctx context.Context, principa
 	const probeTool = "morde_capability_probe"
 	request := ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "Reply exactly OK."}}, MaxOutputTokens: 64, DisableThinking: true}
 	if capability == "tools" || capability == "all" {
+		// Probe ordinary function calling; strict mode can require provider-specific endpoint configuration.
 		request.Instructions = "Call the provided function with color set to red."
 		request.Tools = []ModelTool{{Name: probeTool, Description: "Report the requested color.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"color":{"type":"string","enum":["red","blue","green"]}},"required":["color"],"additionalProperties":false}`), Strict: true}}
+			Parameters: json.RawMessage(`{"type":"object","properties":{"color":{"type":"string","enum":["red","blue","green"]}},"required":["color"],"additionalProperties":false}`)}}
 		request.RequiredTool = probeTool
 	}
 	if capability == "vision" || capability == "all" {

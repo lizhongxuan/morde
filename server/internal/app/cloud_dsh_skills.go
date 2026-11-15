@@ -167,7 +167,7 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	if skill.requiresHost && current.HostID == "" {
 		_, target, routed, targetErr := b.refreshDeferredTask(ctx, claimed)
 		if targetErr != nil || !routed || target.Unavailable || !domain.ValidHostID(target.HostID) {
-			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "this Morde skill requires an explicitly selected Host")
+			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "this Morde skill requires a configured authorized Host")
 		}
 	}
 	if current.AgentSessionID == "" || current.Authorization.Version < 1 ||

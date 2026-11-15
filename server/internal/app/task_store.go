@@ -450,6 +450,10 @@ type TaskActionRequester interface {
 	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, *TaskActionRevisionFence, string) (TaskActionResult, error)
 }
 
+type TaskPriorityRequester interface {
+	SetTaskPriority(context.Context, IdempotencyRecord, string, task.QueuePriority, int64, string) (task.Task, error)
+}
+
 // TaskActionStore also owns recovery leases while confirming runtime operation
 // cancellation.
 type TaskActionStore interface {

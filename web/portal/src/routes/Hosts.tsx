@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useLocation, useSearchParams } from 'react-router';
+import { Link, useLocation } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, enterHostInNewTab, newIdempotencyKey, portalApi } from '../app/api';
 import type { HostMemberPermission } from '../app/api';
@@ -12,7 +12,6 @@ import { HostMemberManager } from '../components/HostMemberManager';
 import { ScreenPagination } from '../components/ScreenPagination';
 import './Hosts.css';
 import { FloatingError } from '../components/FloatingError';
-import { Workspaces } from './Workspaces';
 
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type ControlActionRequest = components['schemas']['ControlActionRequest'];
@@ -53,8 +52,6 @@ const hostReasonLabel: Record<string, string> = {
 export function Hosts() {
   const queryClient = useQueryClient();
   const location = useLocation();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const projectSyncSelected = searchParams.get('sync') === '1';
   const { user } = useAuth();
   const { notify } = useToast();
   const [listSelection, setListSelection] = useState<{ mode: 'owned' | 'shared'; hash: string } | null>(null);
@@ -141,11 +138,10 @@ export function Hosts() {
 
   return <section className="hosts-page">
     <nav className="inline-actions hosts-list-toggle" aria-label="云端电脑视图">
-      <button type="button" className={`button ${!projectSyncSelected && listMode === 'owned' ? 'button-primary' : 'button-secondary'}`} aria-pressed={!projectSyncSelected && listMode === 'owned'} onClick={() => { selectList('owned'); setSearchParams({}); }}>我的电脑</button>
-      <button type="button" className={`button ${!projectSyncSelected && listMode === 'shared' ? 'button-primary' : 'button-secondary'}`} aria-pressed={!projectSyncSelected && listMode === 'shared'} onClick={() => { selectList('shared'); setSearchParams({}); }}>共享给我的</button>
-      <Link className={`button ${projectSyncSelected ? 'button-primary' : 'button-secondary'}`} aria-current={projectSyncSelected ? 'page' : undefined} to="/hosts?sync=1">文件同步</Link>
+      <button type="button" className={`button ${listMode === 'owned' ? 'button-primary' : 'button-secondary'}`} aria-pressed={listMode === 'owned'} onClick={() => selectList('owned')}>我的电脑</button>
+      <button type="button" className={`button ${listMode === 'shared' ? 'button-primary' : 'button-secondary'}`} aria-pressed={listMode === 'shared'} onClick={() => selectList('shared')}>共享给我的</button>
     </nav>
-    {projectSyncSelected ? <Workspaces projectSyncOnly /> : listMode === 'owned' ? <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
+    {listMode === 'owned' ? <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
     <div className="design-panel-header"><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑、文件和运行状态。</p></div><div className="inline-actions">{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></div>
     {hosts.isSuccess && <div className="host-default-settings" aria-label="默认云端电脑设置">
       <label htmlFor="default-cloud-host">默认云端电脑

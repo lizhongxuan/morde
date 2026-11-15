@@ -12,6 +12,7 @@ import { Connections } from './routes/Connections';
 import { Clients } from './routes/Clients';
 import { Downloads } from './routes/Downloads';
 import { Hosts } from './routes/Hosts';
+import { Workspaces } from './routes/Workspaces';
 import { HostEntry } from './routes/HostEntry';
 import { Login } from './routes/Login';
 import { Register } from './routes/Register';
@@ -47,21 +48,40 @@ function AdminAccessDenied() {
   return <RecoverableError title="没有管理权限" message="此账号不能查看管理后台数据。" homePath="/" homeLabel="返回 PC 用户端" />;
 }
 
-function localProjectSearch(search: string) {
+function projectSyncSearch(search: string) {
   const host = new URLSearchParams(search).get('host') ?? '';
   const params = new URLSearchParams({ sync: '1' });
   if (/^h[a-z0-9]{7}$/.test(host)) params.set('host', host);
-  return `?${params.toString()}`;
+  const query = params.toString();
+  return query ? `?${query}` : '';
 }
 
 function LegacyLocalProjectsRedirect() {
   const location = useLocation();
-  return <Navigate to={{ pathname: '/hosts', search: localProjectSearch(location.search) }} replace />;
+  return <Navigate to={{ pathname: '/hosts', search: projectSyncSearch(location.search) }} replace />;
 }
 
 function LegacyWorkspaceRedirect() {
   const location = useLocation();
-  return <Navigate to={{ pathname: '/hosts', search: localProjectSearch(location.search) }} replace />;
+  return <Navigate to={{ pathname: '/hosts', search: projectSyncSearch(location.search) }} replace />;
+}
+
+function LegacySettingsSyncRedirect() {
+  const location = useLocation();
+  return <Navigate to={{ pathname: '/hosts', search: projectSyncSearch(location.search) }} replace />;
+}
+
+function HostsRoute() {
+  const location = useLocation();
+  if (new URLSearchParams(location.search).get('sync') === '1') {
+    return <Workspaces projectSyncOnly />;
+  }
+  return <Hosts />;
+}
+
+function LegacyHostSyncRedirect() {
+  const location = useLocation();
+  return <Navigate to={{ pathname: '/hosts', search: projectSyncSearch(location.search) }} replace />;
 }
 
 function UserRoutes() {
@@ -69,7 +89,7 @@ function UserRoutes() {
     <Route path="/login" element={<Login />} />
     <Route path="/register" element={<Register />} />
     <Route path="/download" element={<Downloads />} />
-    <Route path="/settings/password" element={<ChangePassword loginPath="/login" />} />
+    <Route path="/settings/password" element={<ChangePassword loginPath="/login" cancelPath="/settings" />} />
     <Route element={<RouteGuard />}>
       <Route path="host-entry/:id" element={<HostEntry />} />
       <Route element={<PortalLayout />}>
@@ -80,7 +100,8 @@ function UserRoutes() {
         <Route path="codex" element={<Codex />} />
         <Route path="personal" element={<PersonalData />} />
         <Route path="goals" element={<GoalsAndSchedules />} />
-        <Route path="hosts" element={<Hosts />} />
+        <Route path="hosts" element={<HostsRoute />} />
+        <Route path="hosts/sync" element={<LegacyHostSyncRedirect />} />
         <Route path="hosts/new" element={<NewHost />} />
         <Route path="notifications" element={<Notifications />} />
         <Route path="workspaces" element={<LegacyWorkspaceRedirect />} />
@@ -88,6 +109,7 @@ function UserRoutes() {
         <Route path="apikeys" element={<ApiKeys />} />
         <Route path="clients" element={<Clients />} />
         <Route path="settings" element={<AccountSettings />} />
+        <Route path="settings/sync" element={<LegacySettingsSyncRedirect />} />
       </Route>
     </Route>
     <Route path="*" element={<NotFound />} />

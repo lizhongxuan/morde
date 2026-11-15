@@ -206,6 +206,23 @@ type CodexEvent struct {
 	StoredAt        pgtype.Timestamptz `json:"stored_at"`
 }
 
+type CodexProfileConnection struct {
+	OwnerID                   string             `json:"owner_id"`
+	InstallationID            string             `json:"installation_id"`
+	ProfileKey                string             `json:"profile_key"`
+	Scopes                    []string           `json:"scopes"`
+	GrantVersion              int64              `json:"grant_version"`
+	RevokedAt                 pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	SessionDiscoveryState     pgtype.Text        `json:"session_discovery_state"`
+	SessionDiscoveryErrorCode pgtype.Text        `json:"session_discovery_error_code"`
+	HistoryDiscoveredSessions pgtype.Int8        `json:"history_discovered_sessions"`
+	HistoryCompleteSessions   pgtype.Int8        `json:"history_complete_sessions"`
+	PendingUploadEventCount   pgtype.Int8        `json:"pending_upload_event_count"`
+	SessionDiscoveryUpdatedAt pgtype.Timestamptz `json:"session_discovery_updated_at"`
+}
+
 type CodexSession struct {
 	ID                string             `json:"id"`
 	OwnerID           string             `json:"owner_id"`
@@ -334,6 +351,10 @@ type ConversationMessage struct {
 	OutputStatus              pgtype.Text        `json:"output_status"`
 	OutputTaskRevision        pgtype.Int8        `json:"output_task_revision"`
 	OutputResultEventSequence pgtype.Int8        `json:"output_result_event_sequence"`
+	VariantGroupID            pgtype.Text        `json:"variant_group_id"`
+	VariantVersion            pgtype.Int8        `json:"variant_version"`
+	VariantAction             pgtype.Text        `json:"variant_action"`
+	VariantOperationID        pgtype.Text        `json:"variant_operation_id"`
 }
 
 type ConversationMessageAttachment struct {
@@ -402,6 +423,30 @@ type ConversationMessageUploadChunk struct {
 	Sequence          int32       `json:"sequence"`
 	Content           []byte      `json:"content"`
 	ContentSha256     []byte      `json:"content_sha256"`
+}
+
+type ConversationMessageVariant struct {
+	OperationID               string             `json:"operation_id"`
+	ServiceInstanceID         pgtype.UUID        `json:"service_instance_id"`
+	OwnerID                   string             `json:"owner_id"`
+	ActorID                   string             `json:"actor_id"`
+	ProjectID                 pgtype.Text        `json:"project_id"`
+	ConversationID            string             `json:"conversation_id"`
+	SourceMessageID           string             `json:"source_message_id"`
+	InputSourceMessageID      string             `json:"input_source_message_id"`
+	AttachmentSourceMessageID pgtype.Text        `json:"attachment_source_message_id"`
+	VariantGroupID            string             `json:"variant_group_id"`
+	ExpectedVersion           int64              `json:"expected_version"`
+	VariantVersion            int64              `json:"variant_version"`
+	Action                    string             `json:"action"`
+	State                     string             `json:"state"`
+	IdempotencyKey            string             `json:"idempotency_key"`
+	RequestHash               []byte             `json:"request_hash"`
+	TaskID                    pgtype.Text        `json:"task_id"`
+	UserMessageID             pgtype.Text        `json:"user_message_id"`
+	AssistantMessageID        pgtype.Text        `json:"assistant_message_id"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 }
 
 type ConversationResultBatch struct {
@@ -1597,6 +1642,7 @@ type Task struct {
 	DesiredRevision                 int64              `json:"desired_revision"`
 	WorkspaceOwnerID                pgtype.Text        `json:"workspace_owner_id"`
 	WorkspaceProjectResourceVersion pgtype.Int8        `json:"workspace_project_resource_version"`
+	QueuePriority                   string             `json:"queue_priority"`
 }
 
 type TaskAgentCheckpoint struct {
@@ -2085,6 +2131,10 @@ type TaskStep struct {
 	RequestDigest  []byte             `json:"request_digest"`
 	Phase          pgtype.Text        `json:"phase"`
 	DetailState    string             `json:"detail_state"`
+	AttemptNo      int64              `json:"attempt_no"`
+	RetryOfStepID  pgtype.Text        `json:"retry_of_step_id"`
+	FailureReason  pgtype.Text        `json:"failure_reason"`
+	Retryable      bool               `json:"retryable"`
 }
 
 type TaskStepDetail struct {
@@ -2098,6 +2148,35 @@ type TaskStepDetail struct {
 	Truncated         bool               `json:"truncated"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TaskStepRetryIntent struct {
+	AttemptStepID               string             `json:"attempt_step_id"`
+	TaskID                      string             `json:"task_id"`
+	OwnerID                     string             `json:"owner_id"`
+	SourceStepID                string             `json:"source_step_id"`
+	AttemptNo                   int64              `json:"attempt_no"`
+	TaskRevision                int64              `json:"task_revision"`
+	AgentSessionID              string             `json:"agent_session_id"`
+	SourceCallID                string             `json:"source_call_id"`
+	RetryCallID                 string             `json:"retry_call_id"`
+	ToolName                    string             `json:"tool_name"`
+	RequestDigest               []byte             `json:"request_digest"`
+	AuthorizationVersion        int64              `json:"authorization_version"`
+	HostID                      string             `json:"host_id"`
+	HostRuntimeGeneration       int64              `json:"host_runtime_generation"`
+	WorkspaceID                 pgtype.Text        `json:"workspace_id"`
+	InputRevision               pgtype.Int8        `json:"input_revision"`
+	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
+	WorkspaceBindingVersion     int64              `json:"workspace_binding_version"`
+	WorkspaceRevision           pgtype.Int8        `json:"workspace_revision"`
+	CheckpointThroughSeq        int64              `json:"checkpoint_through_seq"`
+	CheckpointDigest            []byte             `json:"checkpoint_digest"`
+	State                       string             `json:"state"`
+	ExpiresAt                   pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt                  pgtype.Timestamptz `json:"consumed_at"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TaskStopRequest struct {

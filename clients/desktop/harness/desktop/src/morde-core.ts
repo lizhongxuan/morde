@@ -11,7 +11,7 @@ export type Credentials = {
   syncExpiresAt?: string;
 };
 
-export type WebSession = { credential: string; expiresAt: string };
+export type WebSession = { credential: string; expiresAt: string; hostFrameSource: string };
 export type ClientLoginAttempt = { clientInstanceID: string; attemptGeneration: string; idempotencyKey: string };
 export type ProjectSyncFolder = { folderID: string; workspaceID: string; folderKind: "workspace_root" | "project"; projectName?: string; relativePath: string; state: "pending_node" | "active" | "revoked"; syncAvailable: boolean };
 export type CodexScope = "read" | "live" | "send" | "interrupt" | "approval";
@@ -123,13 +123,24 @@ export function gatewayURL(value: unknown, serviceOrigin = ""): string {
   return url.href;
 }
 
+function validHostFrameSource(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = /^https?:\/\/\*\.([a-z0-9_.-]+)(?::(\d{1,5}))?$/i.exec(value);
+  const hostname = match?.[1] ?? "";
+  const port = match?.[2];
+  const labels = hostname.split(".");
+  return Boolean(match && hostname && hostname.length <= 253 && labels.every((label) => label.length > 0 && label.length <= 63 && !label.startsWith("-") && !label.endsWith("-")) &&
+    (!port || Number(port) >= 1 && Number(port) <= 65535));
+}
+
 function validSession(value: unknown): WebSession {
   const response = value as Record<string, unknown>;
   if (!response || typeof response.web_session_credential !== "string" || !response.web_session_credential ||
-    typeof response.web_session_expires_at !== "string" || credentialExpired(response.web_session_expires_at)) {
+    typeof response.web_session_expires_at !== "string" || credentialExpired(response.web_session_expires_at) ||
+    !validHostFrameSource(response.web_session_host_frame_source)) {
     throw new Error("Invalid Morde Web session response");
   }
-  return { credential: response.web_session_credential, expiresAt: response.web_session_expires_at };
+  return { credential: response.web_session_credential, expiresAt: response.web_session_expires_at, hostFrameSource: response.web_session_host_frame_source };
 }
 
 function validProjectFolderName(value: string): boolean {
@@ -278,7 +289,7 @@ export class MordeAPI {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json", "Idempotency-Key": attempt.idempotencyKey },
         body: (() => {
-          const body = JSON.stringify({ name: name.trim(), password, platform: "desktop", display_name: "Morde Desktop",
+          const body = JSON.stringify({ name: name.trim(), password, platform: "desktop", display_name: "morde-pc",
             client_instance_id: attempt.clientInstanceID,
             ...(renewalInstallationID ? { renewal_installation_id: renewalInstallationID } : {}) });
           return `${body.slice(0, -1)},"attempt_generation":${attempt.attemptGeneration}}`;

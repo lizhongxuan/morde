@@ -12,11 +12,11 @@ vi.mock('../app/api', async (importOriginal) => {
   return { ...original, portalApi: { ...original.portalApi, changePassword: vi.fn() } };
 });
 
-function renderPage(initialEntry = '/admin/change-password', loginPath = '/admin/login') {
+function renderPage(initialEntry = '/admin/change-password', loginPath = '/admin/login', cancelPath?: string) {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
   client.setQueryData(['auth', 'me'], { id: 'uadmin01', name: 'admin', role: 'super_admin' });
   render(<ToastProvider><QueryClientProvider client={client}><MemoryRouter initialEntries={[initialEntry]}><Routes>
-    <Route path={initialEntry} element={<ChangePassword loginPath={loginPath} />} />
+    <Route path={initialEntry} element={<ChangePassword loginPath={loginPath} cancelPath={cancelPath} />} />
   </Routes></MemoryRouter></QueryClientProvider></ToastProvider>);
   return client;
 }
@@ -62,6 +62,11 @@ describe('change password page', () => {
     await input.click(screen.getByRole('button', { name: '修改密码' }));
 
     expect(await screen.findByRole('link', { name: '前往登录' })).toHaveAttribute('href', '/login');
+  });
+
+  it('lets a PC user leave password change without submitting', () => {
+    renderPage('/settings/password', '/login', '/settings');
+    expect(screen.getByRole('link', { name: '取消并返回账户' })).toHaveAttribute('href', '/settings');
   });
 
   it('keeps the form and reports server errors', async () => {

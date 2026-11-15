@@ -33,7 +33,7 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
     desiredRevision: number, currentStep: string | null, stepCount: number, completedStepCount: number,
     result: string | null, finishedAt: string | null) => ({
     id, owner_id: ownerID, initiator_id: ownerID, execution_location: "server" as const,
-    conversation_id: conversation.id, model_id: modelID, objective, status, event_sequence: eventSequence,
+    conversation_id: conversation.id, model_id: modelID, objective, status, queue_priority: "normal" as const, event_sequence: eventSequence,
     current_revision: currentRevision, desired_revision: desiredRevision, current_step: currentStep,
     step_count: stepCount, completed_step_count: completedStepCount, budget, usage,
     created_at: timestamp, updated_at: timestamp, result, waiting_reason: null,

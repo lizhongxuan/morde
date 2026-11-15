@@ -22,9 +22,10 @@ func TestLifecycleAndPrivatePreviewTools(t *testing.T) {
 
 	for _, name := range []string{"host_list", "host_get", "host_delete", "host_renew"} {
 		args := map[string]any{"host_id": "h1234567"}
-		if name == "host_list" {
+		switch name {
+		case "host_list":
 			args = map[string]any{}
-		} else if name == "host_delete" {
+		case "host_delete":
 			args["confirm_workspace_deletion"] = true
 		}
 		value, err := service.lifecycle(ctx, principal, name, args)

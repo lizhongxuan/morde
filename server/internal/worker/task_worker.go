@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -44,6 +45,7 @@ type TaskWorkerOptions struct {
 	MaxConcurrentTasks         int
 	MaxConcurrentTasksPerOwner int
 	Logger                     *zap.Logger
+	Metrics                    prometheus.Registerer
 }
 
 type TaskWorker struct {
@@ -57,6 +59,7 @@ type TaskWorker struct {
 	maxConcurrentTasks         int
 	maxConcurrentTasksPerOwner int
 	logger                     *zap.Logger
+	metrics                    *taskClaimMetrics
 	runMu                      sync.Mutex
 	started                    bool
 }
@@ -92,11 +95,15 @@ func NewTaskWorker(options TaskWorkerOptions) (*TaskWorker, error) {
 	if renewInterval < time.Millisecond {
 		renewInterval = time.Millisecond
 	}
+	metrics, err := newTaskClaimMetrics(options.Metrics)
+	if err != nil {
+		return nil, err
+	}
 	return &TaskWorker{
 		store: options.Store, executor: options.Executor, lifecycle: options.Lifecycle, workerID: options.WorkerID,
 		leaseDuration: options.LeaseDuration, pollInterval: options.PollInterval,
 		renewInterval: renewInterval, maxConcurrentTasks: options.MaxConcurrentTasks,
-		maxConcurrentTasksPerOwner: options.MaxConcurrentTasksPerOwner, logger: logger,
+		maxConcurrentTasksPerOwner: options.MaxConcurrentTasksPerOwner, logger: logger, metrics: metrics,
 	}, nil
 }
 
@@ -243,6 +250,7 @@ func (w *TaskWorker) runClaimLoop(ctx context.Context) {
 			}
 			continue
 		}
+		w.metrics.observeClaim(claimed, time.Now())
 		if err := w.runClaimed(ctx, claimed); err != nil && ctx.Err() == nil {
 			if !errors.Is(err, errTaskExecutorPanicked) {
 				fields := []zap.Field{zap.String("task_id", claimed.ID), zap.String("error_type", fmt.Sprintf("%T", err))}

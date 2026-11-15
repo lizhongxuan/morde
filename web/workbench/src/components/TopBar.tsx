@@ -102,12 +102,9 @@ export default function TopBar({
             ? `操作租约${control.control_lease_held_by_me ? '由你持有' : '有效'} · ${formatRemaining(control.control_lease_expires_at, now)}`
             : '当前没有有效操作租约'}
         </span>}
-        {notice && noticeKind === 'success' && <FloatingError role="status" className="workbench-floating-success">{notice}</FloatingError>}
-        {notice && noticeKind === 'error' && <FloatingError>{notice}</FloatingError>}
       </div>
       <div className="top-actions">
         {!embedded && <button className="button button-secondary host-return-button" type="button" onClick={returnToPreviousPage}>返回云端电脑</button>}
-        {controlActionError && <FloatingError>{controlActionError}</FloatingError>}
         {controlError && <button className="button button-secondary" type="button" onClick={onRetryControl} disabled={controlLoading}>重试读取</button>}
         {controlActionLabel && (
           <button className={`button${controlActionLabel.includes('接管') ? '' : ' button-secondary'}`} type="button" onClick={onControlAction} disabled={controlActionPending}>
@@ -118,6 +115,11 @@ export default function TopBar({
           {renewing ? '续期中…' : '续期'}
         </button>}
       </div>
+      {(notice || controlActionError) && <div id="workbench-notice-region" className="workbench-notice-region" aria-label="桌面状态提示">
+        {notice && noticeKind === 'success' && <FloatingError role="status" className="workbench-floating-success">{notice}</FloatingError>}
+        {notice && noticeKind === 'error' && <FloatingError>{notice}</FloatingError>}
+        {controlActionError && <FloatingError>{controlActionError}</FloatingError>}
+      </div>}
     </header>
   );
 }

@@ -8,23 +8,25 @@ afterEach(() => {
 });
 
 describe('Workbench FloatingError', () => {
-  it('renders errors in a non-blocking overlay and keeps actions available', async () => {
+  it('renders errors in their content flow and keeps actions available', async () => {
     const user = userEvent.setup();
     render(<main data-testid="workbench"><p>桌面内容</p><FloatingError>连接失败<button type="button">重试</button></FloatingError></main>);
 
     const alert = await screen.findByRole('alert');
-    expect(alert.closest('[data-testid="workbench"]')).toBeNull();
-    expect(alert.closest('#workbench-notice-region')).toBeInTheDocument();
+    expect(alert.closest('[data-testid="workbench"]')).toBeInTheDocument();
+    expect(alert.parentElement).toHaveAttribute('data-testid', 'workbench');
+    expect(document.getElementById('workbench-notice-region')).toBeNull();
     expect(screen.getByTestId('workbench').textContent).toContain('桌面内容');
     await user.click(screen.getByRole('button', { name: '重试' }));
     await user.click(screen.getByRole('button', { name: '关闭错误提示' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('does not surface errors from a hidden workspace panel', () => {
+  it('keeps errors inside hidden workspace panels', () => {
     render(<section hidden><FloatingError>隐藏工作区错误</FloatingError></section>);
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(document.querySelector('[hidden] .workbench-floating-error')).toBeInTheDocument();
   });
 
   it('does not surface errors from an inactive tab', () => {

@@ -424,10 +424,14 @@ export const portalApi = {
     const text = unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
       params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { capability: 'text' },
     }));
-    const tools = unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
-      params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { capability: 'tools' },
-    }));
-    return { ...tools, text: text.text };
+    try {
+      const tools = unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
+        params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { capability: 'tools' },
+      }));
+      return { ...tools, text: text.text };
+    } catch {
+      return { ...text, tools: false };
+    }
   },
   checkModelTextStreaming: async (id: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { capability: 'text_stream' },

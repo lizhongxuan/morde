@@ -118866,6 +118866,34 @@
         }
       }
     },
+    "Queue priority" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Warteschlangenpriorität" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Queue priority" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Prioridad de cola" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Priorité de file d’attente" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "キューの優先度" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "대기열 우선순위" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Приоритет очереди" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "队列优先级" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "佇列優先順序" } }
+      }
+    },
+    "Queue priority updated" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Warteschlangenpriorität aktualisiert" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Queue priority updated" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Prioridad de cola actualizada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Priorité de file d’attente mise à jour" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "キューの優先度を更新しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "대기열 우선순위를 업데이트했습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Приоритет очереди обновлён" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "队列优先级已更新" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "佇列優先順序已更新" } }
+      }
+    },
     "Queued" : {
       "extractionState" : "manual",
       "localizations" : {

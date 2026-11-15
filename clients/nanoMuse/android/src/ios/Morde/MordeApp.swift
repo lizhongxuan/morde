@@ -787,6 +787,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
             ProcessInfo.processInfo.arguments.contains(resourceRefreshRecoveryFixtureLaunchArgument) {
             return ["id": "u0000001", "name": "Local resource user"]
         }
+        if ProcessInfo.processInfo.arguments.contains(workItemFixtureLaunchArgument) {
+            return ["id": "u0000001", "name": "Local fixture user"]
+        }
         return ["id": "u_localtest1", "name": "morde-test-user"]
     }
 
@@ -4798,7 +4801,7 @@ struct MordeTask: Decodable, Identifiable {
     }
     let owner_id: String?; let initiator_id: String?
     let id: String; let conversation_id: String; let host_id: String?; let execution_location: String?
-    let model_id: String?
+    let model_id: String?; let queue_priority: String?
     let workspace_id: String?; let input_revision: Int64?
     let objective: String; let status: String
     let event_sequence: Int64?
@@ -4993,6 +4996,7 @@ struct MordeTaskTimelineEvent: Decodable, Identifiable, Equatable {
         case "task.response": return AppLocalized("Task response updated")
         case "task.result": return AppLocalized("Task result updated")
         case "task.plan": return AppLocalized("Execution plan updated")
+        case "task.priority": return AppLocalized("Queue priority updated")
         default: return AppLocalized("Task activity")
         }
     }
@@ -5013,6 +5017,7 @@ enum MordeTaskPageAction {
     case pause(expectedStatus: String)
     case resume
     case cancel(expectedStatus: String)
+    case setPriority(String)
     case retryBatchItem(id: String)
 }
 
@@ -6384,6 +6389,7 @@ private struct MordeIndependentSendTarget {
     private var conversationMessagesRefreshGeneration = UUID()
     private var conversationLoadMoreGeneration = UUID()
     private var messageLoadMoreGeneration = UUID()
+    private var messageHistoryCursorState = MordeConversationHistoryCursorState()
     private var taskDetailLoadGenerations: [String: UUID] = [:]
     private var taskStepDetailLoadGenerations: [String: UUID] = [:]
     private var taskFileFetchLoadGenerations: [String: UUID] = [:]
@@ -6822,6 +6828,11 @@ private struct MordeIndependentSendTarget {
             guard task.status == expectedStatus,
                   ["queued", "running", "paused", "waiting_user"].contains(expectedStatus) else { return false }
             body = ["action": "cancel", "expected_status": expectedStatus]
+        case .setPriority(let priority):
+            guard task.status == "queued", task.queue_priority != priority,
+                  ["pinned", "normal", "background"].contains(priority),
+                  let sequence = task.event_sequence, sequence >= 0 else { return false }
+            body = ["action": "set_priority", "queue_priority": priority, "expected_event_sequence": sequence]
         case .retryBatchItem(let id):
             guard task.status == "failed",
                   let item = task.batch_items?.first(where: { $0.id == id }),
@@ -8662,6 +8673,7 @@ private struct MordeIndependentSendTarget {
         conversationLoadGeneration = UUID()
         conversationLoadMoreGeneration = UUID()
         messageLoadMoreGeneration = UUID()
+        messageHistoryCursorState.reset()
         taskDetailLoadGenerations = [:]
         taskStepDetailLoadGenerations = [:]
         taskFileFetchLoadGenerations = [:]
@@ -12440,6 +12452,7 @@ private struct MordeIndependentSendTarget {
         conversationMessagesRefreshGeneration = UUID()
         let refreshGeneration = conversationMessagesRefreshGeneration
         messageLoadMoreGeneration = UUID()
+        messageHistoryCursorState.reset()
         loadingEarlierMessages = false
         messageNextCursor = nil
         messageHistoryError = nil
@@ -12539,7 +12552,7 @@ private struct MordeIndependentSendTarget {
             guard scope == currentDataScope, conversationGeneration == conversationLoadGeneration,
                   generation == messageLoadMoreGeneration, currentConversation == id else { return }
             guard MordeConversationMessagePagePolicy.matches(page.items, conversationID: id),
-                  page.next_cursor != cursor else {
+                  messageHistoryCursorState.acceptPage(requestCursor: cursor, nextCursor: page.next_cursor) else {
                 throw URLError(.cannotParseResponse)
             }
             var existingIDs = Set(messages.map(\.id))
@@ -18497,7 +18510,7 @@ private struct MordeRoot: View {
             drawerPaginationPendingConversationID = nil
             Task { await conversationDrawer.loadMore() }
         }
-        .safeAreaInset(edge: .top) {
+        .safeAreaInset(edge: .top, spacing: 0) {
             TimelineView(.periodic(from: .now, by: 60)) { context in
                 if let notice = client.expiryNotice(at: context.date) {
                     Text(notice).font(.headline).frame(maxWidth: .infinity)
@@ -18774,14 +18787,6 @@ private struct MordeRoot: View {
                 }
             } else if layout == .conversation {
                 conversationContent
-                    .safeAreaInset(edge: .top) {
-                        TimelineView(.periodic(from: .now, by: 60)) { context in
-                            if let notice = client.expiryNotice(at: context.date) {
-                                Text(notice).font(.headline).frame(maxWidth: .infinity)
-                                    .padding().background(Color.orange.opacity(0.25))
-                            }
-                        }
-                    }
             } else {
                 designNavigation
             }

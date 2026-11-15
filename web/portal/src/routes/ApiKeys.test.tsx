@@ -16,6 +16,29 @@ const renderPage = () => {
 describe('ApiKeys', () => {
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
+  it('uses the Morde service origin for the MCP address in the desktop client', async () => {
+    vi.spyOn(portalApi, 'apiKeys').mockResolvedValue({ items: [] });
+    const user = userEvent.setup();
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const meta = document.createElement('meta');
+    meta.name = 'morde-service-origin';
+    meta.content = 'https://morde.example';
+    document.head.append(meta);
+
+    try {
+      renderPage();
+      expect(await screen.findByText('https://morde.example/mcp')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: '复制地址' }));
+      expect(writeText).toHaveBeenCalledWith('https://morde.example/mcp');
+    } finally {
+      meta.remove();
+      if (originalClipboard) Object.defineProperty(navigator, 'clipboard', originalClipboard);
+      else Reflect.deleteProperty(navigator, 'clipboard');
+    }
+  });
+
   it('creates a full-access key without host or permission selection', async () => {
     vi.spyOn(portalApi, 'apiKeys').mockResolvedValue({ items: [] });
     const create = vi.spyOn(portalApi, 'createApiKey').mockResolvedValue({ id: 't1234567', key: 'chk_one-time-secret', expires_at: new Date(Date.now() + 86400000).toISOString() });

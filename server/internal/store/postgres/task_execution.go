@@ -56,6 +56,16 @@ const taskHubWorkspaceSyncClaimPredicate = `(t.status='waiting_user' AND t.waiti
     AND active.sync_stage IN ('pending','local_applied','sync_pending')
 ))`
 
+const taskQueueClaimOrder = `ORDER BY
+  CASE WHEN t.created_at <= transaction_timestamp() - interval '15 minutes' THEN 0 ELSE 1 END,
+  CASE WHEN t.created_at <= transaction_timestamp() - interval '15 minutes' THEN 0
+       WHEN t.queue_priority='pinned' THEN 1
+       WHEN t.queue_priority='normal' THEN 2
+       ELSE 3 END,
+  t.created_at, t.id`
+
+// shortcut: the age band is calculated at claim time; profile the eligible-task scan before adding a persisted fairness bucket.
+
 func (s *Store) withTaskSnapshot(ctx context.Context, fn func(pgx.Tx) error) error {
 	return withTx(ctx, func(ctx context.Context) (pgx.Tx, error) {
 		return s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -779,7 +789,7 @@ WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_
     SELECT 1 FROM workspace_ownership_transfers transfer
     WHERE transfer.workspace_id=t.workspace_id AND transfer.state IN ('pending','accepting','unknown')
   ))
-ORDER BY t.created_at, t.id
+`+taskQueueClaimOrder+`
 LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&initiatorID, &taskEpoch)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -855,7 +865,7 @@ WHERE t.initiator_id=$1 AND t.execution_epoch=$2
     SELECT 1 FROM workspace_ownership_transfers transfer
     WHERE transfer.workspace_id=t.workspace_id AND transfer.state IN ('pending','accepting','unknown')
   ))
-ORDER BY t.created_at, t.id
+`+taskQueueClaimOrder+`
 LIMIT 1 FOR UPDATE SKIP LOCKED`, initiatorID, gate.epoch, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&id, &taskOwnerID, &hostID, &oldVersion, &projectCheckpointRecovery)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -886,6 +896,16 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: taskOwnerID})
 		if err != nil {
 			return fmt.Errorf("read task authorization before claim: %w", err)
+		}
+		var queueEnteredAt time.Time
+		if taskRow.Status == string(task.StatusQueued) {
+			if err := tx.QueryRow(ctx, `SELECT COALESCE((
+  SELECT created_at FROM task_events
+  WHERE task_id=$1 AND event_type='task.status' AND payload->>'status'='queued'
+  ORDER BY sequence DESC LIMIT 1
+), $2::timestamptz)`, id, taskRow.CreatedAt.Time).Scan(&queueEnteredAt); err != nil {
+				return fmt.Errorf("read latest queued task status event: %w", err)
+			}
 		}
 		if taskRow.WorkspaceID.Valid && !projectCheckpointRecovery {
 			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
@@ -1038,6 +1058,7 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 			return fmt.Errorf("read claimed task: %w", err)
 		}
 		claimed = rowTaskDomain(row)
+		claimed.QueueEnteredAt = queueEnteredAt
 		if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET state='running',updated_at=clock_timestamp()
 WHERE task_id=$1 AND state IN ('accepted','unknown')`, claimed.ID); err != nil {
 			return fmt.Errorf("start accepted conversation variant operation: %w", err)

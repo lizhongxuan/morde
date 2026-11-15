@@ -18,7 +18,7 @@ type CreateHostCommand struct {
 }
 
 type DeleteHostCommand struct {
-	HostID                    string
+	HostID                   string
 	ConfirmWorkspaceDeletion bool
 }
 

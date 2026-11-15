@@ -52,6 +52,18 @@ const (
 	ActionCancel Action = "cancel"
 )
 
+type QueuePriority string
+
+const (
+	QueuePriorityPinned     QueuePriority = "pinned"
+	QueuePriorityNormal     QueuePriority = "normal"
+	QueuePriorityBackground QueuePriority = "background"
+)
+
+func (priority QueuePriority) Valid() bool {
+	return priority == QueuePriorityPinned || priority == QueuePriorityNormal || priority == QueuePriorityBackground
+}
+
 type StopRequestStatus string
 
 const (
@@ -162,15 +174,19 @@ type Task struct {
 	CurrentRevision             *int64
 	DesiredRevision             *int64
 	Objective                   string
-	ConversationContext         *ConversationContext
-	DependencyResults           []DependencyResult
-	FileDeliveryIntent          FileDeliveryIntent
-	Status                      Status
-	Authorization               Authorization
-	Budget                      Budget
-	Usage                       Usage
-	Lease                       Lease
-	CurrentStep                 string
+	QueuePriority               QueuePriority
+	// QueueEnteredAt is the task's durable updated_at captured immediately
+	// before a worker claim. It is internal queue-wait telemetry only.
+	QueueEnteredAt      time.Time `json:"-"`
+	ConversationContext *ConversationContext
+	DependencyResults   []DependencyResult
+	FileDeliveryIntent  FileDeliveryIntent
+	Status              Status
+	Authorization       Authorization
+	Budget              Budget
+	Usage               Usage
+	Lease               Lease
+	CurrentStep         string
 	// StepCount and CompletedStepCount are read projections for list summaries.
 	// Budget steps are excluded; completed counts include only succeeded steps.
 	StepCount          int64

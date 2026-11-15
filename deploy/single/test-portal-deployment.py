@@ -236,7 +236,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("systemd-escape --path --suffix=mount", installer)
         self.assertIn('systemctl is-active --quiet "$mount_unit"', installer)
         self.assertIn("--check-workspace-sync-mount-bindings", installer)
-        self.assertIn('systemctl show --property=BindsTo --value morde-portal.service', installer)
+        self.assertIn('actual=$(systemctl show --property="$property" --value morde-portal.service) || return 1', installer)
+        self.assertIn('systemd_list_contains BindsTo "$mount_unit"', installer)
+        self.assertIn('systemd_list_contains After "$mount_unit"', installer)
         self.assertIn("ExecStartPre=/bin/bash $repo_root/deploy/single/install-portal-service.sh --check-workspace-sync-mount-bindings", installer)
         self.assertIn("ExecStartPre=/opt/cloudhost/network-policy.sh check", installer)
 
@@ -315,28 +317,31 @@ class DeploymentTests(unittest.TestCase):
             result = subprocess.run(["bash", "-n", str(ROOT / script)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_installer_requires_user_admin_mobile_and_workbench_entries(self):
+    def test_installer_requires_admin_and_workbench_entries(self):
         installer = (ROOT / "install-portal-service.sh").read_text()
         for entry in (
-            "$repo_root/web/portal/dist/index.html",
             "$repo_root/web/portal/dist/admin/index.html",
-            "$repo_root/web/portal/dist/app/index.html",
             "$repo_root/web/workbench/dist/index.html",
         ):
             self.assertIn(entry, installer)
 
-    def test_automated_portal_gate_builds_the_mobile_app(self):
+    def test_automated_portal_gate_builds_admin_ui_without_a_mobile_web_app(self):
         gates = (ROOT / "verify/05-automated.sh").read_text()
         package = json.loads((ROOT.parents[1] / "web/portal/package.json").read_text())
         self.assertIn("npm run build", gates)
-        self.assertIn("web/mobile run build", package["scripts"]["build"])
+        self.assertNotIn("web/mobile run build", package["scripts"]["build"])
 
-    def test_desktop_chat_uses_the_same_portal_artifact_as_web(self):
+    def test_desktop_bundles_user_portal_while_server_keeps_admin_routes(self):
         repository = ROOT.parents[1]
         desktop = (repository / "clients/desktop/harness/desktop/src/morde-main.ts").read_text()
+        desktop_config = (repository / "clients/desktop/harness/desktop/electron-builder.yml").read_text()
         server = (repository / "server/cmd/portal/main.go").read_text()
+        static = (repository / "server/internal/api/static.go").read_text()
         config = (ROOT / "portal.yaml").read_text()
-        self.assertIn("const assistantURL = `${auth.origin}/assistant`;", desktop)
+        self.assertIn('join(process.resourcesPath, "portal")', desktop)
+        self.assertIn("from: ../../../../web/portal/dist", desktop_config)
+        self.assertIn('if path == "/admin" || strings.HasPrefix(path, "/admin/")', static)
+        self.assertNotIn("servePortal(c)", static)
         self.assertIn("PortalFiles: os.DirFS(cfg.PortalWeb.Dir)", server)
         self.assertIn("dir: web/portal/dist", config)
 

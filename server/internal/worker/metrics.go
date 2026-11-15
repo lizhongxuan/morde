@@ -2,16 +2,28 @@ package worker
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/task"
 )
 
 type metrics struct {
 	hosts            *prometheus.GaugeVec
 	reconcileRuns    *prometheus.CounterVec
 	reconcileActions *prometheus.CounterVec
+}
+
+type taskClaimMetrics struct {
+	wait *prometheus.HistogramVec
+}
+
+type conversationRouteMetrics struct {
+	actions             *prometheus.CounterVec
+	aggregationStates   *prometheus.CounterVec
+	aggregationWaitTime prometheus.Histogram
 }
 
 func validHostState(state host.State) bool {
@@ -50,6 +62,57 @@ func newMetrics(registerer prometheus.Registerer) (*metrics, error) {
 	for _, collector := range []prometheus.Collector{result.hosts, result.reconcileRuns, result.reconcileActions} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("register worker metric: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func newTaskClaimMetrics(registerer prometheus.Registerer) (*taskClaimMetrics, error) {
+	if registerer == nil {
+		return nil, nil
+	}
+	result := &taskClaimMetrics{wait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "cloudhost_task_claim_wait_seconds",
+		Help: "Seconds since the task entered the queued state before claim; non-queued recovery is omitted.",
+	}, []string{"queue_priority"})}
+	if err := registerer.Register(result.wait); err != nil {
+		return nil, fmt.Errorf("register task claim metric: %w", err)
+	}
+	return result, nil
+}
+
+func (m *taskClaimMetrics) observeClaim(value task.Task, now time.Time) {
+	if m == nil || value.QueueEnteredAt.IsZero() || !value.QueueEnteredAt.Before(now) {
+		return
+	}
+	priority := value.QueuePriority
+	if !priority.Valid() {
+		priority = task.QueuePriorityNormal
+	}
+	m.wait.WithLabelValues(string(priority)).Observe(now.Sub(value.QueueEnteredAt).Seconds())
+}
+
+func newConversationRouteMetrics(registerer prometheus.Registerer) (*conversationRouteMetrics, error) {
+	if registerer == nil {
+		return nil, nil
+	}
+	result := &conversationRouteMetrics{
+		actions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudhost_conversation_route_actions_total",
+			Help: "Conversation routing decisions applied or rejected by the durable route store.",
+		}, []string{"action", "result"}),
+		aggregationStates: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudhost_conversation_aggregation_transitions_total",
+			Help: "Conversation aggregation and correction transitions observed by route workers.",
+		}, []string{"state"}),
+		aggregationWaitTime: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "cloudhost_conversation_aggregation_wait_seconds",
+			Help: "Seconds from aggregation start until a route decision is durably applied.",
+		}),
+	}
+	for _, collector := range []prometheus.Collector{result.actions, result.aggregationStates, result.aggregationWaitTime} {
+		if err := registerer.Register(collector); err != nil {
+			return nil, fmt.Errorf("register conversation route metric: %w", err)
 		}
 	}
 	return result, nil

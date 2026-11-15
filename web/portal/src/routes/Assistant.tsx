@@ -457,10 +457,6 @@ function latestConversationClientMessageID(messages: ConversationMessage[] | und
   }, undefined)?.client_message_id;
 }
 
-const controlStateLabels: Record<Host['control_state'], string> = {
-  ai: '云端 AI 控制', taking_over: '正在接管', user: '人工控制', returning: '正在交还 AI',
-};
-
 function taskTargetText(task: TaskSummary, hosts: Host[]): string {
   const host = task.host_id ? hosts.find((item) => item.id === task.host_id) : undefined;
   const computer = task.host_id ? host ? `${host.name || host.id}（${hostStateLabel[host.state] || host.state}）` : `云端电脑 ${task.host_id}（当前不可访问）` : '无电脑目标';
@@ -483,10 +479,10 @@ function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): s
     if (task.current_revision_started !== undefined) return '任务已保存，正在等待开始。';
     return 'AI 正在处理…';
   }
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_missing') return '尚未选择云端电脑，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_missing') return '尚未配置默认云端电脑，本次操作未执行。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_changed') return '任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_unavailable') return '所选云端电脑当前不可用或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '云端电脑文件当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_unavailable') return '目标云端电脑当前不可用或无法确认访问权限，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '目标电脑的 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_target_changed') return '任务已绑定其他云端电脑的文件，无法安全切换；请为新目标另发起任务。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'target_result_unknown') return '上次电脑操作的结果需要核对，暂不能重复执行。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步文件；确认版本已应用后才会完成。';
@@ -551,7 +547,7 @@ function isResourceNoLongerAccessible(error: unknown): boolean {
 
 const taskEventTypes = [
   'task.status', 'task.step', 'task.operation', 'task.message', 'task.batch_item',
-  'task.artifact', 'task.waiting_user', 'task.response', 'task.result', 'task.plan', 'task.snapshot_required',
+  'task.artifact', 'task.waiting_user', 'task.response', 'task.result', 'task.plan', 'task.priority', 'task.snapshot_required',
 ] as const;
 
 function stepTitle(step: Task['steps'][number]): string {
@@ -733,6 +729,10 @@ function taskActivityProgressText(summary: TaskSummary, task: Task | undefined, 
   return taskStatusText(task, cloudTasksAvailable);
 }
 
+function taskQueuePriorityText(priority: TaskSummary['queue_priority'] | undefined): string {
+  return priority === 'pinned' ? '置顶' : priority === 'background' ? '后台' : priority === 'normal' ? '普通' : '未知';
+}
+
 function taskFileFetchFailureText(reason: TaskFileFetch['failure_reason']): string {
   const labels: Record<NonNullable<TaskFileFetch['failure_reason']>, string> = {
     access_denied: '读取权限已变更', source_changed: '本机文件在读取期间发生变化', file_unavailable: '本机文件不可用',
@@ -861,8 +861,6 @@ export function Assistant() {
   const [conversationSelection, setConversationSelection] = useState<{ scope: string; id: string | null } | null>(null);
   const [composerDraftError, setComposerDraftError] = useState<string | null>(null);
   const [hydratedComposerDraftKey, setHydratedComposerDraftKey] = useState<string | null>(null);
-  const [hostSelection, setHostSelection] = useState<string | null>(null);
-  const [workspaceSelection, setWorkspaceSelection] = useState<string | null>(null);
   const [retryAcceptedMessageIDs, setRetryAcceptedMessageIDs] = useState<Set<string>>(() => new Set());
   const [retryAcceptedResultReviewTaskIDs, setRetryAcceptedResultReviewTaskIDs] = useState<Set<string>>(() => new Set());
   const [modelID, setModelID] = useState('');
@@ -883,6 +881,7 @@ export function Assistant() {
   const [taskPanelRecentOpen, setTaskPanelRecentOpen] = useState(false);
   const [taskPanelTab, setTaskPanelTab] = useState<'tasks' | 'files' | 'computer'>('tasks');
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
+  const [serviceStatusExpanded, setServiceStatusExpanded] = useState(false);
   const [computerHostID, setComputerHostID] = useState<string | null>(null);
   const [computerEmbed, setComputerEmbed] = useState<ComputerEmbedSession | null>(null);
   const [computerControlExpanded, setComputerControlExpanded] = useState(false);
@@ -972,7 +971,7 @@ export function Assistant() {
     initialData: () => mainConversationCacheKey ? readMainConversationCache(mainConversationCacheKey) : null,
     staleTime: Infinity,
   });
-  const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000 });
+  const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000, refetchOnMount: 'always' });
   const workspaces = useQuery({ queryKey: ['assistant-workspaces'], queryFn: portalApi.workspaces, staleTime: 30_000 });
   const mcpConnectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const availableModels = useQuery({ queryKey: ['available-models'], queryFn: portalApi.availableModels });
@@ -1096,7 +1095,7 @@ export function Assistant() {
   const draftSnapshot: AssistantComposerDraft | null = composerDraftScope && composerDraftID ? {
     id: composerDraftID,
     conversationID: selectedLocalDraftKey ? null : conversationID,
-    content, modelID, hostID: hostSelection ?? '', mcpConnectorIDs: [...mcpConnectorIDs],
+    content, modelID, hostID: '', mcpConnectorIDs: [...mcpConnectorIDs],
     attachments: composerAttachments.map((item) => {
       const preview = officePreviews[item.id];
       return {
@@ -1156,7 +1155,6 @@ export function Assistant() {
   const restoreComposerDraft = useCallback((draft: AssistantComposerDraft | null, scope: string, id: string) => {
     setContent(draft?.content ?? '');
     setModelID(draft?.modelID ?? '');
-    setHostSelection(draft?.hostID || null);
     setMcpConnectorIDs(draft?.mcpConnectorIDs ?? []);
     const attachments: ComposerAttachment[] = [];
     const previews: Record<string, OfficePreviewState> = {};
@@ -1195,8 +1193,6 @@ export function Assistant() {
     if (previousIdentity !== null) {
       setContent('');
       setModelID('');
-      setHostSelection(null);
-      setWorkspaceSelection(null);
       setMcpConnectorIDs([]);
       setComposerAttachments([]);
       setOfficePreviews({});
@@ -1208,13 +1204,16 @@ export function Assistant() {
         setComposerDraftError(null);
         return;
       }
-      if (draft) restoreComposerDraft(draft, composerDraftScope, composerDraftID);
+      if (draft) restoreComposerDraft(
+        preserveUnboundInput && composerInputSnapshot.current.content && !draft.content
+          ? { ...draft, content: composerInputSnapshot.current.content }
+          : draft,
+        composerDraftScope, composerDraftID,
+      );
       else {
         if (!preserveUnboundInput) {
           setContent('');
           setModelID('');
-          setHostSelection(null);
-          setWorkspaceSelection(null);
           setMcpConnectorIDs([]);
           setComposerAttachments([]);
           setOfficePreviews({});
@@ -1243,7 +1242,7 @@ export function Assistant() {
       void persistComposerDraft(snapshot.scope, snapshot.draft).catch(() => undefined);
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [composerDraftIdentity, composerDraftScope, content, modelID, hostSelection, mcpConnectorIDs, composerAttachments, officePreviews, hydratedComposerDraftKey, persistComposerDraft]);
+  }, [composerDraftIdentity, composerDraftScope, content, modelID, mcpConnectorIDs, composerAttachments, officePreviews, hydratedComposerDraftKey, persistComposerDraft]);
   const conversationDetail = useQuery({
     queryKey: ['conversation', conversationID],
     queryFn: () => portalApi.conversation(conversationID!),
@@ -1401,6 +1400,7 @@ export function Assistant() {
   }, [dismiss, notify, retryNetworkReads, showConsolidatedNetworkError]);
   const selected = conversationsData.find((item) => item.id === conversationID) ?? conversationDetail.data;
   const readyModels = models.data?.items.filter((item) => item.checked_at && item.capabilities.text) ?? [];
+  const unavailableModels = models.data?.items.filter((item) => !item.checked_at || !item.capabilities.text) ?? [];
   const modelConfigurationKnown = models.isSuccess && !models.isStale;
   const enabledMCPConnectors = mcpConnectors.data?.items.filter((item) => item.enabled) ?? [];
   const defaultModelID = availableModels.data?.default_model_id;
@@ -1416,18 +1416,16 @@ export function Assistant() {
   const conversationAutoRoutingAvailable = capabilities.isSuccess
     ? capabilities.data.supported_features.includes('conversation_auto_routing_v1')
     : undefined;
-  const preferredHostID = hostSelection ?? '';
   const hostItems = hosts.data?.items ?? [];
+  const preferredHostID = preferences.data?.default_host_id || (hostItems.length === 1 ? hostItems[0]?.id : '') || '';
   const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
-  const selectedHost = hostItems.find((host) => host.id === preferredHostID);
-  const hostIsReady = selectedHost?.state === 'running' && selectedHost.control_state === 'ai';
   const computerHostOptions: ComputerHostOption[] = [
     ...hostItems.map((host) => ({ id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: true, permissions: [] })),
     ...(sharedHosts.data?.items ?? []).map((host) => ({
       id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: false, permissions: host.permissions,
     })),
   ];
-  const computerHostSelection = computerHostID ?? hostSelection ?? preferences.data?.default_host_id ?? null;
+  const computerHostSelection = computerHostID ?? (preferredHostID || null);
   const selectedComputerHost = computerHostSelection === null ? computerHostOptions[0]
     : computerHostOptions.find((host) => host.id === computerHostSelection);
   const selectedComputerTargets = selectedComputerHost ? hostEmbedTargetPlan(selectedComputerHost) : [];
@@ -1473,9 +1471,9 @@ export function Assistant() {
   };
   async function openTaskObservation(task: Task, host: Host) {
     if (taskObservationRequest) return;
-    const popup = window.open('about:blank', '_blank');
+    const popup = window.open('about:blank', 'morde-task-observation');
     if (!popup) {
-      setTaskObservationError({ taskID: task.id, message: '浏览器阻止了新窗口；允许弹出窗口后重试。' });
+      setTaskObservationError({ taskID: task.id, message: '无法打开任务观察窗口，请重试。' });
       return;
     }
     popup.opener = null;
@@ -1915,6 +1913,31 @@ export function Assistant() {
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
+  const setTaskPriority = useMutation({
+    mutationFn: (request: { taskID: string; priority: TaskSummary['queue_priority']; expectedEventSequence: number; actionScope: string; key: string }) => {
+      if (!Number.isSafeInteger(request.expectedEventSequence) || request.expectedEventSequence < 0) {
+        throw new Error('任务事件版本无效，请刷新状态后重试。');
+      }
+      return portalApi.taskAction(request.taskID, {
+        action: 'set_priority', queue_priority: request.priority, expected_event_sequence: request.expectedEventSequence,
+      }, request.key);
+    },
+    onSuccess: async (_response, request) => {
+      clearTaskActionKey(request.actionScope, request.key);
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ['task', request.taskID] }),
+        client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+        client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
+      ]);
+      notify('任务优先级已更新。', 'success');
+    },
+    onError: async (error, request) => {
+      await handleTaskActionError(error, request.taskID);
+      if (errorDetails(error).code === 'conflict') {
+        await client.invalidateQueries({ queryKey: ['task', request.taskID] });
+      }
+    },
+  });
   const deleteTaskFileFetchContent = useMutation({
     mutationFn: ({ taskID, fetchID }: { taskID: string; fetchID: string }) => portalApi.deleteTaskFileFetchContent(taskID, fetchID),
     onSuccess: async (_response, request) => {
@@ -2098,7 +2121,7 @@ export function Assistant() {
       const active = latestComposerDraft.current;
       const base = targetIdentity && active?.identity === targetIdentity ? active.draft : {
         id: draftID, conversationID: draftID.startsWith('local:') ? null : draftID, content, modelID,
-        hostID: hostSelection ?? '', mcpConnectorIDs: [...mcpConnectorIDs],
+        hostID: '', mcpConnectorIDs: [...mcpConnectorIDs],
         attachments: composerAttachments.map((item) => ({ id: item.id, name: item.file.name, mediaType: assistantFileMediaType(item.file),
           blob: item.file, objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
           ...(item.attachmentID ? { attachmentID: item.attachmentID } : {}), ...(item.needsPreparation ? { needsPreparation: true } : {}),
@@ -2175,8 +2198,7 @@ export function Assistant() {
           client_message_id: id, content: effectiveText,
           ...(timeZone ? { time_zone: timeZone } : {}),
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
-          ...(hostSelection ? { host_id: hostSelection } : {}),
-          ...(workspaceSelection ? { workspace_id: workspaceSelection } : {}),
+          ...(preferredHostID ? { host_id: preferredHostID } : {}),
           ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
           ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
         },
@@ -2244,8 +2266,6 @@ export function Assistant() {
     localConversationKeyRef.current = key;
     setConversationID(id);
     setModelID('');
-    setHostSelection(null);
-    setWorkspaceSelection(null);
     setMcpConnectorIDs([]);
     setContent('');
     setComposerAttachments([]);
@@ -2512,8 +2532,11 @@ export function Assistant() {
 
   useEffect(() => {
     if (!hasNavigationIdea) return;
+    // A routed prompt can arrive after mount; preserve an existing user draft.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setContent((current) => current || ideaPrompt);
     navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
-  }, [hasNavigationIdea, location.hash, location.pathname, location.search, navigate]);
+  }, [hasNavigationIdea, ideaPrompt, location.hash, location.pathname, location.search, navigate]);
 
   const pendingMessages = outbox.entries.filter(({ message }) => !message.projectID && (conversationID
     ? message.conversationID === conversationID
@@ -2580,6 +2603,25 @@ export function Assistant() {
           <small>更新于 {formatDate(task.updated_at)}</small></div>
         <span className={`task-activity-status status-${task.status}`}>{taskActivityStatusText(summary, task)}</span>
       </header>
+      {task.status === 'queued' && task.queue_priority && <section className="task-activity-k2 task-queue-priority" aria-label="任务优先级">
+        <h3>排队优先级</h3>
+        <p>当前：{taskQueuePriorityText(task.queue_priority)}</p>
+        <div className="inline-actions">
+          {(['pinned', 'normal', 'background'] as const).map((priority) => <button key={priority} type="button"
+            className={`button ${priority === task.queue_priority ? 'button-primary' : 'button-secondary'}`}
+            aria-pressed={priority === task.queue_priority}
+            disabled={setTaskPriority.isPending || !Number.isSafeInteger(task.event_sequence) || task.event_sequence < 0}
+            onClick={() => {
+              if (priority === task.queue_priority) return;
+              const actionScope = `priority:${task.id}`;
+              const fingerprint = JSON.stringify({ priority, event_sequence: task.event_sequence });
+              const key = taskActionKey(actionScope, fingerprint);
+              setTaskPriority.mutate({ taskID: task.id, priority, expectedEventSequence: task.event_sequence,
+                actionScope, key });
+            }}>{taskQueuePriorityText(priority)}</button>)}
+        </div>
+        <small>等待 15 分钟仍未执行的任务会按等待时间进入公平排序。</small>
+      </section>}
       {task.pending_request && <section className="notice notice-warning task-detail-attention"
         aria-label={task.pending_request.status === 'expired' ? '审批已到期' : '需要批准的操作'}>
         <h3>{task.pending_request.title}</h3><p>{task.pending_request.object}</p><p>{task.pending_request.content}</p><p>可能影响：{task.pending_request.impact}</p>
@@ -2704,6 +2746,7 @@ export function Assistant() {
         onWorkspaceChange={(workspaceID) => setTaskWorkspaceSelections((current) => ({ ...current, [task.id]: workspaceID }))}
         onSubmit={submitTaskSupplement}
         onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))} />}
+      {busy && supplementTaskID === task.id && task.waiting_reason === 'workspace_unavailable' && !task.workspace_id && workspaces.isError && <FloatingError className="error-inline assistant-connector-error" role="alert">Workspace 列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
       {supplementEntries.map(({ message, scope }) => <div className="task-supplement-status" key={message.request.client_message_id}>
         <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
           : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{message.error ? `：${message.error}` : ''}</small>
@@ -2821,7 +2864,7 @@ export function Assistant() {
         onClick={() => { setTaskStepSelection(null); setTaskDetailTaskID(summary.id); }}>
         <span className="task-activity-card-title"><strong>{title}</strong>
           <span className={`task-activity-status status-${status}`}>{taskActivityStatusText(summary, task)}</span></span>
-        <span className="task-activity-card-subtitle">{taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
+        <span className="task-activity-card-subtitle">{status === 'queued' && summary.queue_priority ? `优先级：${taskQueuePriorityText(summary.queue_priority)} · ` : ''}{taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
         <span className="task-activity-card-footer"><small>更新于 {formatDate(updatedAt)}</small>
           <span>{waiting ? '查看并处理' : '查看详情'} <span aria-hidden="true">›</span></span></span>
       </button>
@@ -2836,20 +2879,17 @@ export function Assistant() {
   const conversationWelcome = <div className="assistant-welcome"><span className="assistant-mark assistant-logo" aria-hidden="true" />
     <h2>今天想聊些什么？</h2><p>告诉我你想完成的事情。</p>
   </div>;
+  const showDemoModeStatus = import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1';
+  const showMainConversationError = mainConversation.isError && !showConsolidatedNetworkError;
+  const showMainConversationUninitialized = mainConversation.data?.status === 'uninitialized';
+  const showCapabilitiesError = capabilities.isError && !showConsolidatedNetworkError;
+  const showAutoRoutingWarning = capabilities.isSuccess && conversationAutoRoutingAvailable === false;
+  const showCloudToolsWarning = capabilities.isSuccess && cloudTasksAvailable === false;
+  const serviceStatusCount = [showDemoModeStatus, mainConversation.isPending, showMainConversationError,
+    showMainConversationUninitialized, capabilities.isPending, showCapabilitiesError, showAutoRoutingWarning,
+    showCloudToolsWarning].filter(Boolean).length;
 
   return <section className="assistant-page">
-    {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <FloatingNotice className="notice-warning" data-notice-label="演示模式">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</FloatingNotice>}
-    {mainConversation.isPending && <FloatingNotice className="notice-info">正在读取服务端主会话…</FloatingNotice>}
-    {mainConversation.isError && !showConsolidatedNetworkError && <FloatingError role="alert">无法刷新服务端主会话{cachedMainConversationID ? '，已保留上次记录' : '，请重试'}。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></FloatingError>}
-    {mainConversation.data?.status === 'uninitialized' && <FloatingNotice className="notice-info">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</FloatingNotice>}
-    {capabilities.isPending && <FloatingNotice className="notice-info">正在检查服务能力…</FloatingNotice>}
-    {capabilities.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></FloatingError>}
-    {capabilities.isSuccess && conversationAutoRoutingAvailable === false && <FloatingNotice className="notice-warning">
-      服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。
-    </FloatingNotice>}
-    {capabilities.isSuccess && cloudTasksAvailable === false && <FloatingNotice className="notice-warning">
-      云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
-    </FloatingNotice>}
     <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' ? ' assistant-layout-with-computer-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' && computerControlExpanded ? ' assistant-layout-computer-expanded' : ''}`}>
       <aside id="context-sidebar" className="assistant-sidebar" aria-label="对话">
         <div className="assistant-sidebar-heading">
@@ -2898,6 +2938,15 @@ export function Assistant() {
             <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selectedConversationTitle}</h2>
             <p>{conversationID && conversationID === mainConversationID ? '你的 Morde' : '旁聊 · 你的 Morde'}</p>
           </div></div>
+          <div className="assistant-header-actions">
+          {serviceStatusCount > 0 && <div className="assistant-service-status">
+            <button type="button" className="button button-secondary assistant-service-status-toggle"
+              aria-label={`查看服务状态，${serviceStatusCount} 项`} aria-expanded={serviceStatusExpanded}
+              aria-controls="assistant-service-status-panel" data-state={showMainConversationError || showCapabilitiesError || showAutoRoutingWarning || showCloudToolsWarning || showDemoModeStatus ? 'warning' : 'checking'}
+              onClick={() => setServiceStatusExpanded((expanded) => !expanded)}>
+              <span className="assistant-service-status-label">服务状态</span><span className="assistant-service-status-count" aria-hidden="true">{serviceStatusCount}</span>
+            </button>
+          </div>}
           {!taskPanelOpen && <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
             aria-label="打开侧边栏" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
             aria-expanded="false" aria-controls="assistant-task-panel"
@@ -2906,7 +2955,18 @@ export function Assistant() {
             <MordeIcon name="panel" />{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
             {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
           </button>}
+          </div>
         </header>
+        {serviceStatusCount > 0 && <section id="assistant-service-status-panel" className="assistant-service-status-panel" aria-label="服务状态详情" aria-live="polite" hidden={!serviceStatusExpanded}>
+          {showDemoModeStatus && <p className="assistant-service-status-row" role="status">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</p>}
+          {mainConversation.isPending && <p className="assistant-service-status-row" role="status">正在读取服务端主会话…</p>}
+          {showMainConversationError && <p className="assistant-service-status-row" role="alert">无法刷新服务端主会话{cachedMainConversationID ? '，已保留上次记录' : '，请重试'}。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></p>}
+          {showMainConversationUninitialized && <p className="assistant-service-status-row" role="status">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</p>}
+          {capabilities.isPending && <p className="assistant-service-status-row" role="status">正在检查服务能力…</p>}
+          {showCapabilitiesError && <p className="assistant-service-status-row" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></p>}
+          {showAutoRoutingWarning && <p className="assistant-service-status-row" role="status">服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。</p>}
+          {showCloudToolsWarning && <p className="assistant-service-status-row" role="status">云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。</p>}
+        </section>}
         {streamedTasks.map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
         <div className={`conversation-view${!conversationID || showConversationWelcome ? ' conversation-view-welcome' : ''}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
           const view = event.currentTarget;
@@ -3022,9 +3082,7 @@ export function Assistant() {
           {variantOutbox.storageError && <FloatingError className="error-inline" role="alert">本地消息版本操作存储不可用：{variantOutbox.storageError}</FloatingError>}
           {execution.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></FloatingError>}
           {execution.data?.state === 'stopping' && <FloatingNotice className="notice-warning">AI 服务正在停止；消息仍可先发送。</FloatingNotice>}
-          {hosts.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取目标电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
-          {preferredHostID && !selectedHost && !hosts.isPending && !hosts.isError && <FloatingNotice className="notice-warning">所选电脑状态待核对；实际使用该目标时会检查权限和状态。</FloatingNotice>}
-          {selectedHost && !hostIsReady && <FloatingNotice className="notice-warning">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</FloatingNotice>}
+          {taskPanelOpen && taskPanelTab === 'computer' && hosts.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取云端电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
         </div>
         {showJumpToLatest && conversationID && <div className="assistant-jump-latest"><button type="button" className="button button-secondary"
           onClick={() => { followConversation.current = true; if (conversationView.current) conversationView.current.scrollTop = conversationView.current.scrollHeight; setShowJumpToLatest(false); }}>
@@ -3100,25 +3158,10 @@ export function Assistant() {
               <div className="assistant-selectors">
                 <label className="assistant-selector"><MordeIcon name="spark" /><span className="sr-only">AI 模型</span><select aria-label="选择 AI 模型"
                   value={composerDraftReady ? effectiveModelID : ''} onChange={(event) => { composerEditRevision.current += 1; updateComposerDraftSnapshot({ modelID: event.target.value }); setModelID(event.target.value); }} disabled={!composerDraftReady || models.isPending}>
-                  <option value="">自动选择模型</option>{effectiveModelID && !readyModels.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
+                  <option value="">自动选择模型</option>{effectiveModelID && !models.data?.items.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID} disabled>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
+                  {unavailableModels.map((item) => <option key={item.id} value={item.id} disabled>{item.name} · {item.checked_at ? '文字能力未验证或不可用' : '请先检查连接'}</option>)}
                 </select></label>
-                <div className="assistant-target-row">
-                  <label className="assistant-selector"><MordeIcon name="monitor" /><span className="sr-only">目标电脑</span><select aria-label="选择目标电脑" value={composerDraftReady ? selectedHost?.id ?? hostSelection ?? '' : ''}
-                    disabled={!composerDraftReady || hosts.isPending} onChange={(event) => { composerEditRevision.current += 1; updateComposerDraftSnapshot({ hostID: event.target.value }); setHostSelection(event.target.value); }}>
-                    <option value="">无电脑目标</option>
-                    {hostSelection && !selectedHost && <option value={hostSelection}>所选电脑状态待核验</option>}
-                    {hostItems.map((host) => <option key={host.id} value={host.id}>{host.name || host.id} · {hostStateLabel[host.state] || host.state} · {controlStateLabels[host.control_state]}</option>)}
-                  </select></label>
-                  <label className="assistant-selector"><MordeIcon name="folder" /><span className="sr-only">目标 Workspace</span><select aria-label="选择目标 Workspace"
-                    value={composerDraftReady ? workspaceSelection ?? '' : ''} disabled={!composerDraftReady || workspaces.isPending}
-                    onChange={(event) => { composerEditRevision.current += 1; setWorkspaceSelection(event.target.value || null); }}>
-                    <option value="">自动选择 Workspace</option>
-                    {workspaceSelection && !workspaceItems.some((workspace) => workspace.id === workspaceSelection) &&
-                      <option value={workspaceSelection}>所选 Workspace 状态待核对</option>}
-                    {workspaceItems.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · v{workspace.revision}</option>)}
-                  </select></label>
-                </div>
-                {workspaces.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline assistant-connector-error" role="alert">工作区列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
+                {unavailableModels.length > 0 && <Link to="/connections">查看模型连接</Link>}
                 {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
                     <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>

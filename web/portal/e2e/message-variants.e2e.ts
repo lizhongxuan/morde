@@ -10,7 +10,6 @@ test.describe('immutable message versions', () => {
     await page.getByRole('button', { name: '登录' }).click();
     await page.goto('/assistant');
     await page.getByRole('button', { name: '新建旁聊' }).click();
-    await page.getByRole('combobox', { name: '选择目标电脑' }).selectOption('');
 
     const sourceText = `原始版本 ${Date.now()}`;
     const editedText = `编辑版本 ${Date.now()}`;

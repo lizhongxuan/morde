@@ -377,6 +377,20 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertFalse(MordeConversationMessagePagePolicy.matches([missing], conversationID: "c1234567"))
     }
 
+    func testConversationHistoryCursorStateRejectsCyclesAndAllowsRetryAfterInvalidPage() {
+        var cursors = MordeConversationHistoryCursorState()
+        XCTAssertTrue(cursors.acceptPage(requestCursor: "page-1", nextCursor: "page-2"))
+        XCTAssertTrue(cursors.acceptPage(requestCursor: "page-2", nextCursor: "page-3"))
+        XCTAssertFalse(cursors.acceptPage(requestCursor: "page-3", nextCursor: "page-1"),
+                       "A multi-page cycle must stop before exposing a cursor already requested.")
+        XCTAssertFalse(cursors.acceptPage(requestCursor: "page-3", nextCursor: "page-3"),
+                       "A page cannot point back to itself.")
+        XCTAssertTrue(cursors.acceptPage(requestCursor: "page-3", nextCursor: nil),
+                      "A malformed response must not consume its request cursor, so the user can retry it.")
+        XCTAssertFalse(cursors.acceptPage(requestCursor: "page-3", nextCursor: nil))
+        XCTAssertFalse(cursors.acceptPage(requestCursor: "page-4", nextCursor: ""))
+    }
+
     func testAuthorizationLossDoesNotClaimAnUncertainSendFailed() {
         let rejected = MordeOutboxFailurePolicy.confirmsRejection(
             submissionBegan: true, firstSubmission: true, hadUncertainSubmission: false,

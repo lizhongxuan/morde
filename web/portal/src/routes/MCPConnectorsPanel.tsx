@@ -136,9 +136,9 @@ export function MCPConnectorsPanel() {
     finally { setSavingCredential(false); }
   };
   const startOAuth = async (connector: Connector, client?: { client_id?: string; client_secret?: string }) => {
-    const popup = window.open('about:blank', '_blank');
+    const popup = window.open('about:blank', 'morde-mcp-oauth');
     if (!popup) {
-      notify('浏览器拦截了 OAuth 授权窗口，请允许弹窗后重试。', 'error');
+      notify('无法打开 OAuth 授权窗口，请重试。', 'error');
       return;
     }
     popup.opener = null;

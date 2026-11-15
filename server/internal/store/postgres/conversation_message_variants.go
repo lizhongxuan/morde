@@ -273,9 +273,10 @@ LEFT JOIN LATERAL (
  WHERE user_message.conversation_id=m.conversation_id AND user_message.owner_id=m.owner_id AND user_message.actor_id=m.actor_id
   AND user_message.role='user' AND user_message.source_kind<>'conversation_variant_input'
   AND ((m.role='user' AND user_message.id=m.id) OR
-       (m.role='assistant' AND ((m.task_id<>'' AND user_message.task_id=m.task_id) OR (m.task_id='' AND user_message.sequence<m.sequence))))
- ORDER BY CASE WHEN m.task_id<>'' THEN user_message.sequence END ASC,
-          CASE WHEN m.task_id='' THEN user_message.sequence END DESC LIMIT 1
+       (m.role='assistant' AND ((COALESCE(m.task_id,'')<>'' AND user_message.task_id=m.task_id) OR
+        (COALESCE(m.task_id,'')='' AND user_message.sequence<m.sequence))))
+ ORDER BY CASE WHEN COALESCE(m.task_id,'')<>'' THEN user_message.sequence END ASC,
+          CASE WHEN COALESCE(m.task_id,'')='' THEN user_message.sequence END DESC LIMIT 1
 ) input ON true
 LEFT JOIN conversation_message_routes input_route ON input_route.message_id=input.id AND input_route.owner_id=m.owner_id
 WHERE m.id=$1 AND m.conversation_id=$2 AND m.owner_id=$3 AND c.project_id IS NOT DISTINCT FROM NULLIF($4,'')

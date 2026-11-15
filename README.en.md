@@ -12,7 +12,7 @@ Backend · iOS · PC · Administration Web
 
 </div>
 
-Morde is a cloud workspace built around AI agents, with four product endpoints: the backend, iOS, PC, and Administration Web. The user-facing web interface belongs to the PC endpoint and is hosted by the PC client; there is no separate web or mobile-web user client. Users work with AI on PC or iOS, while administrators use Administration Web.
+Morde is a cloud workspace built around AI agents, with four product endpoints: the backend, iOS, PC, and Administration Web. Users work with AI in `morde-pc` or the iOS client, while administrators use Administration Web. There is no separate web or mobile-web user client.
 
 Morde draws on Muse's interaction principles: **start with a conversation, use tools and computers when needed, and give work a visible process, a result, and clear authorization boundaries.** The project brings the user experience together with server, runtime, and administration infrastructure to build a complete product that can evolve over time.
 
@@ -22,7 +22,7 @@ Morde draws on Muse's interaction principles: **start with a conversation, use t
 
 | Component | Role and implementation |
 | --- | --- |
-| **PC** | The Electron desktop client hosts the user-facing workspace for conversations, tasks, cloud computers, and local folder synchronization. The user web interface is part of PC, not a separate product endpoint. |
+| **PC** | The `morde-pc` desktop client hosts the user-facing workspace for conversations, tasks, cloud computers, and local folder synchronization. |
 | **iOS** | A native client built on shared nanoMuse source for conversations, progress, results, and authorized capabilities. |
 | **Administration Web** | Manages users and registration reviews, cloud computers, workspaces, models, configuration, usage, and audit records through the shared backend and permission system. |
 | **Backend** | Go services handle accounts, APIs, tasks, data, authorization, gateways, and background work; PostgreSQL stores business data, DSH provides the cloud Agent Runtime, and Host Runtime and workspace synchronization support cloud computers and workspaces. |

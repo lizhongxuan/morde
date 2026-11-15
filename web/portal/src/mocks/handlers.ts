@@ -35,6 +35,7 @@ type MockVariantResponse = {
 };
 type Task = components["schemas"]["Task"];
 type TaskStep = components["schemas"]["TaskStep"];
+type TaskStepDetail = components["schemas"]["TaskStepDetail"];
 type TaskStepRetryRequest = components["schemas"]["TaskStepRetryRequest"];
 type TaskStepRetryResult = components["schemas"]["TaskStepRetryResult"];
 type Project = components["schemas"]["Project"];
@@ -131,6 +132,13 @@ const conversationMessageUploads = new Map<string, MockMessageUpload>();
 let conversationOwners = new Map<string, string>();
 let mainConversations = new Map<string, MainConversation>();
 let tasks = new Map<string, Task>();
+function mockTaskForClient(task: Task): Task {
+  return { ...task, steps: task.steps.map((step) => {
+    const clientStep = { ...step } as TaskStep & { mock_detail?: TaskStepDetail };
+    delete clientStep.mock_detail;
+    return clientStep;
+  }) };
+}
 let projects: Project[] = [];
 let projectMembers: ProjectMember[] = [];
 let projectInvitations: ProjectInvitation[] = [];
@@ -937,7 +945,7 @@ function createTaskMessage(user: User, conversation: Conversation, modelID: stri
     workspace_id: typeof request.workspace_id === "string" ? request.workspace_id : undefined,
     input_revision: typeof request.input_revision === "number" && Number.isSafeInteger(request.input_revision) ? request.input_revision : undefined,
     execution_location: "server", conversation_id: conversation.id, model_id: modelID, objective: content,
-    status: "queued", event_sequence: 0, current_revision: 0, desired_revision: 0, current_step: null, step_count: 0, completed_step_count: 0,
+    status: "queued", queue_priority: "normal", event_sequence: 0, current_revision: 0, desired_revision: 0, current_step: null, step_count: 0, completed_step_count: 0,
     budget: budget ?? { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
     usage: { active_seconds: 0, tool_calls: 0, model_tokens: null }, created_at: timestamp, updated_at: timestamp,
     dependencies: [], child_jobs: [], result_review: null,
@@ -1303,7 +1311,7 @@ export const handlers = [
       return failure("not_found", "项目共享对话不存在", 404);
     }
     return json({ items: Array.from(tasks.values()).filter((task) => task.conversation_id === conversationID
-      && !["completed", "failed", "cancelled"].includes(task.status)), next_cursor: null });
+      && !["completed", "failed", "cancelled"].includes(task.status)).map(mockTaskForClient), next_cursor: null });
   }),
   http.post("/api/projects/:projectID/conversations/:conversationID/messages", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2251,7 +2259,7 @@ export const handlers = [
     return json(host, 202);
   }),
   http.post("/api/hosts/:hostId/renew", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state === "deleting") return failure("invalid_state", "主机正在删除", 409, { state: host.state }); host.expires_at = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(); return json(host); }),
-  http.post("/api/hosts/:hostId/enter", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state === "deleting") return failure("invalid_state", "主机正在删除", 409, { state: host.state }); const url = new URL("/__ch/auth", host.url); url.searchParams.set("t", `mock-${host.id}-${Date.now()}`); return json({ url: url.href, expires_at: new Date(Date.now() + 60_000).toISOString() }); }),
+  http.post("/api/hosts/:hostId/enter", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state !== "running") return failure("invalid_state", "云端电脑尚未运行，暂时无法进入。", 409, { state: host.state }); if (!host.url) return failure("not_supported", "本地演示模式无法连接真实云端电脑。", 501); const url = new URL("/__ch/auth", host.url); url.searchParams.set("t", `mock-${host.id}-${Date.now()}`); return json({ url: url.href, expires_at: new Date(Date.now() + 60_000).toISOString() }); }),
   http.post("/api/hosts/:hostId/embed-tickets", ({ params, cookies }) => {
     const host = findHost(String(params.hostId), sessionUser(cookies)!);
     if (!host) return failure("not_found", "主机不存在", 404);
@@ -2691,7 +2699,7 @@ export const handlers = [
     const conversationID = String(params.conversationID);
     if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
     return json({ items: Array.from(tasks.values()).filter((task) => task.conversation_id === conversationID
-      && task.owner_id === user.id && !["completed", "failed", "cancelled"].includes(task.status)), next_cursor: null });
+      && task.owner_id === user.id && !["completed", "failed", "cancelled"].includes(task.status)).map(mockTaskForClient), next_cursor: null });
   }),
   http.post("/api/tasks", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2719,7 +2727,7 @@ export const handlers = [
     const { task } = createTaskMessage(user, conversation, body.model_id, body.objective.trim(), body);
     taskSubmitReplays.set(replayKey, { request: requestText, response: task });
     persistAssistantState();
-    return json(task, 202);
+    return json(mockTaskForClient(task), 202);
   }),
   http.post("/api/conversations/:conversationID/messages", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2805,7 +2813,7 @@ export const handlers = [
   }),
   http.get("/api/tasks", ({ cookies }) => {
     const user = sessionUser(cookies)!;
-    return json({ items: Array.from(tasks.values()).filter((task) => task.owner_id === user.id), next_cursor: null });
+    return json({ items: Array.from(tasks.values()).filter((task) => task.owner_id === user.id).map(mockTaskForClient), next_cursor: null });
   }),
   http.post("/api/tasks/:taskID/workbench-observation-ticket", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2820,7 +2828,19 @@ export const handlers = [
     const user = sessionUser(cookies)!;
     const task = tasks.get(String(params.taskID));
     if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
-    return json(task);
+    return json(mockTaskForClient(task));
+  }),
+  http.get("/api/tasks/:taskID/steps/:stepID", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const task = tasks.get(String(params.taskID));
+    const stepID = String(params.stepID);
+    if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
+    const step = task.steps.find((item) => item.id === stepID);
+    if (!step) return failure("not_found", "任务步骤不存在", 404);
+    const detail = (step as TaskStep & { mock_detail?: TaskStepDetail }).mock_detail;
+    if (detail && detail.task_id === task.id && detail.step_id === step.id) return json(detail);
+    return json({ task_id: task.id, step_id: step.id, event_sequence: task.event_sequence, tool_name: "",
+      detail_state: "not_recorded", object: null, input: null, result: null, truncated: false } satisfies TaskStepDetail);
   }),
   http.post("/api/tasks/:taskID/steps/:stepID/retries", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;

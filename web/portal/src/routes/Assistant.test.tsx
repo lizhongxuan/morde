@@ -7,7 +7,7 @@ import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
 import { webcrypto } from 'node:crypto';
 import { resolve } from 'node:path';
-import { MemoryRouter } from 'react-router';
+import { MemoryRouter, useNavigate } from 'react-router';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { portalApi } from '../app/api';
@@ -81,7 +81,7 @@ const message = { id: 'm1234567', conversation_id: conversation.id, sequence: 1,
 const reply = { id: 'm7654321', conversation_id: conversation.id, sequence: 2, role: 'assistant' as const, content: '你好！', task_id: 'q1234567', delivery_status: 'applied' as const, created_at: timestamp };
 const task = {
   id: 'q1234567', owner_id: 'u1234567', initiator_id: 'u1234567', execution_location: 'server' as const, conversation_id: conversation.id,
-  model_id: model.id, objective: message.content, status: 'completed' as const, event_sequence: 0, current_step: null,
+  model_id: model.id, objective: message.content, status: 'completed' as const, queue_priority: 'normal' as const, event_sequence: 0, current_step: null,
   step_count: 0, completed_step_count: 0,
   budget: { active_seconds: 600, tool_calls: 10, model_tokens: 1000 }, usage: { active_seconds: 2, tool_calls: 0, model_tokens: 12 },
   dependencies: [], child_jobs: [], result_review: null,
@@ -122,6 +122,11 @@ function renderPage(initialState: unknown = null) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   const view = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[{ pathname: '/assistant', state: initialState }]}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { ...view, client };
+}
+
+function NavigateToIdea() {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate('/assistant', { state: { ideaID: 'idea-1', ideaPrompt: 'Draft a project outline' } })}>带入灵感</button>;
 }
 
 async function findReadyComposer() {
@@ -237,10 +242,29 @@ describe('Assistant durable tasks', () => {
     expect(within(sidebar).getByRole('button', { name: '新建旁聊' })).toBeEnabled();
     expect(within(sidebar).queryByRole('button', { name: '＋ 新对话' })).not.toBeInTheDocument();
     const composer = screen.getByRole('region', { name: '发送对话消息' });
-    expect(within(composer).getByLabelText('选择目标电脑')).toBeInTheDocument();
+    expect(within(composer).queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
+    expect(within(composer).queryByLabelText('选择目标 Workspace')).not.toBeInTheDocument();
     expect(within(composer).getByLabelText('选择 AI 模型')).toBeInTheDocument();
     expect(within(composer).getByLabelText('消息内容')).toBeInTheDocument();
     expect(Array.from(composer.children, (child) => child.tagName)).toEqual(['FORM']);
+  });
+
+  it('updates a queued task priority with the observed event sequence', async () => {
+    const queuedTask = { ...task, status: 'queued' as const, queue_priority: 'normal' as const,
+      event_sequence: 4, result: null, finished_at: null };
+    mockCommon({ conversations: [conversation] });
+    vi.mocked(portalApi.conversationTasks).mockResolvedValue({ items: [queuedTask], next_cursor: null, pending_count: 0 });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(queuedTask);
+    const action = vi.spyOn(portalApi, 'taskAction').mockResolvedValue({ task_id: queuedTask.id, action: 'set_priority',
+      status: 'queued', unsettled_operation_ids: [], queue_priority: 'pinned', event_sequence: 5 });
+    renderPage();
+
+    const detail = await findTaskActivity(queuedTask.id);
+    expect(within(detail).getByText('当前：普通')).toBeInTheDocument();
+    await userEvent.setup().click(within(detail).getByRole('button', { name: '置顶' }));
+    await waitFor(() => expect(action).toHaveBeenCalledWith(queuedTask.id, {
+      action: 'set_priority', queue_priority: 'pinned', expected_event_sequence: 4,
+    }, expect.any(String)));
   });
 
   it('shows the welcome state when the persisted main conversation has no messages', async () => {
@@ -447,7 +471,7 @@ describe('Assistant durable tasks', () => {
       fields: { ticket: 'A'.repeat(43), embed_nonce: 'B'.repeat(32) },
     }]);
     expect(new URL(submissions[0]!.action).search).toBe('');
-    expect(screen.getByLabelText('选择目标电脑')).toHaveValue('');
+    expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
 
     const frame = within(sidebar).getByTitle('当前会话云端电脑工作台') as HTMLIFrameElement;
     const postMessage = vi.spyOn(frame.contentWindow!, 'postMessage');
@@ -489,7 +513,7 @@ describe('Assistant durable tasks', () => {
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
 
     expect(within(sidebar).getByRole('combobox', { name: '选择侧栏云端电脑' })).toHaveValue(targetHost.id);
-    expect(screen.getByLabelText('选择目标电脑')).toHaveValue('');
+    expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
   });
 
   it('only requests shared computer tabs allowed by current permissions', async () => {
@@ -516,7 +540,7 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(issueTicket).toHaveBeenCalledWith(sharedHost.id, {
       conversation_id: conversation.id, target: 'browser', targets: ['browser', 'workspace'],
     }));
-    expect(screen.getByLabelText('选择目标电脑')).toHaveValue('');
+    expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
   });
 
   it('renders newest-first API pages chronologically and keeps task activity out of the chat', async () => {
@@ -668,7 +692,7 @@ describe('Assistant durable tasks', () => {
     expect(view.parentElement).toContainElement(jumpRow);
   });
 
-  it('isolates composer text, model, and next-message host across side conversations', async () => {
+  it('isolates composer text and model across side conversations', async () => {
     mockCommon({ hosts: [targetHost] });
     const user = userEvent.setup();
     renderPage();
@@ -677,26 +701,24 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: '新建旁聊' }));
     await user.type(composer, '甲会话草稿');
     await user.selectOptions(screen.getByRole('combobox', { name: '选择 AI 模型' }), otherModel.id);
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择目标电脑' }), targetHost.id);
     await waitFor(() => expect([...assistantDraftRecords.values()].some((draft) => draft.content === '甲会话草稿')).toBe(true));
 
     await user.click(screen.getByRole('button', { name: '新建旁聊' }));
     await waitFor(() => expect(composer).toHaveValue(''));
     await user.type(composer, '乙会话草稿');
     await user.selectOptions(screen.getByRole('combobox', { name: '选择 AI 模型' }), model.id);
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择目标电脑' }), '');
     await waitFor(() => expect([...assistantDraftRecords.values()].some((draft) => draft.content === '乙会话草稿')).toBe(true));
 
     await user.click(screen.getByText('旁聊'));
     await user.click(await screen.findByRole('button', { name: '恢复草稿：甲会话草稿' }));
     await waitFor(() => expect(composer).toHaveValue('甲会话草稿'));
     expect(screen.getByRole('combobox', { name: '选择 AI 模型' })).toHaveValue(otherModel.id);
-    expect(screen.getByRole('combobox', { name: '选择目标电脑' })).toHaveValue(targetHost.id);
+    expect(screen.queryByRole('combobox', { name: '选择目标电脑' })).not.toBeInTheDocument();
 
     await user.click(await screen.findByRole('button', { name: '恢复草稿：乙会话草稿' }));
     await waitFor(() => expect(composer).toHaveValue('乙会话草稿'));
     expect(screen.getByRole('combobox', { name: '选择 AI 模型' })).toHaveValue(model.id);
-    expect(screen.getByRole('combobox', { name: '选择目标电脑' })).toHaveValue('');
+    expect(screen.queryByRole('combobox', { name: '选择目标电脑' })).not.toBeInTheDocument();
   });
 
   it('keeps the latest draft when switching conversations while its save is still pending', async () => {
@@ -934,7 +956,7 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(screen.queryByText(/无法读取模型：读取失败/)).not.toBeInTheDocument());
   });
 
-  it('shows one fixed retry notification when several assistant reads fail with network errors', async () => {
+  it('shows one consolidated retry notification when several assistant reads fail with network errors', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const networkFailure = () => Promise.reject(new SyntaxError('服务器响应格式异常'));
     vi.spyOn(portalApi, 'capabilities').mockImplementation(networkFailure);
@@ -954,7 +976,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText(/无法读取模型：/)).not.toBeInTheDocument();
   });
 
-  it('keeps a main-conversation API error out of the page layout and allows retry', async () => {
+  it('keeps a main-conversation API error collapsed out of the chat and allows retry', async () => {
     mockCommon();
     vi.spyOn(portalApi, 'mainConversation')
       .mockRejectedValueOnce(new Error('主会话接口暂不可用'))
@@ -962,10 +984,14 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     renderPage();
 
+    const status = await screen.findByRole('button', { name: /查看服务状态/ });
+    expect(status).toHaveAttribute('aria-expanded', 'false');
+    await user.click(status);
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('无法刷新服务端主会话');
-    expect(alert.closest('.notice-center-panel')).toBeInTheDocument();
-    expect(alert.closest('.assistant-page')).toBeNull();
+    const panel = alert.closest('.assistant-service-status-panel');
+    expect(panel?.parentElement).toBe(document.querySelector('.assistant-main'));
+    expect(panel?.previousElementSibling).toHaveClass('conversation-view-heading');
     await user.click(within(alert).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(screen.queryByText(/无法刷新服务端主会话/)).not.toBeInTheDocument());
   });
@@ -1144,11 +1170,42 @@ describe('Assistant durable tasks', () => {
   });
 
   it('prefills an explicitly selected Idea without putting its text in the URL or sending it', async () => {
-    mockCommon();
+    mockCommon({ conversations: [conversation], mainConversation: { status: 'ready', conversation_id: conversation.id, version: 1 } });
+    const draftScope = assistantComposerDraftScope(clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
+    assistantDraftRecords.set(`${draftScope}\u0000${conversation.id}`, {
+      id: conversation.id, conversationID: conversation.id, content: '', modelID: '', hostID: '', mcpConnectorIDs: [], attachments: [], updatedAt: 1,
+    });
     const submit = vi.spyOn(portalApi, 'submitTask');
     renderPage({ ideaID: 'idea-1', ideaPrompt: 'Draft a project outline' });
 
     expect(await findReadyComposer()).toHaveValue('Draft a project outline');
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it('prefills an Idea delivered after the assistant has mounted', async () => {
+    mockCommon({ conversations: [conversation], mainConversation: { status: 'ready', conversation_id: conversation.id, version: 1 } });
+    const submit = vi.spyOn(portalApi, 'submitTask');
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/assistant']}><NavigateToIdea /><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    await findReadyComposer();
+    await user.click(screen.getByRole('button', { name: '带入灵感' }));
+
+    expect(await findReadyComposer()).toHaveValue('Draft a project outline');
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it('keeps a non-empty saved draft when an Idea is selected', async () => {
+    mockCommon({ conversations: [conversation], mainConversation: { status: 'ready', conversation_id: conversation.id, version: 1 } });
+    const draftScope = assistantComposerDraftScope(clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
+    assistantDraftRecords.set(`${draftScope}\u0000${conversation.id}`, {
+      id: conversation.id, conversationID: conversation.id, content: 'My existing draft', modelID: '', hostID: '', mcpConnectorIDs: [], attachments: [], updatedAt: 1,
+    });
+    const submit = vi.spyOn(portalApi, 'submitTask');
+    renderPage({ ideaID: 'idea-1', ideaPrompt: 'Draft a project outline' });
+
+    expect(await findReadyComposer()).toHaveValue('My existing draft');
     expect(submit).not.toHaveBeenCalled();
   });
 
@@ -1431,9 +1488,14 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
     expect(legacy.supported_features).not.toContain('conversation_auto_routing_v1');
+    const serviceStatusButton = await screen.findByRole('button', { name: /查看服务状态/ });
+    expect(serviceStatusButton).toHaveAttribute('aria-expanded', 'false');
+    const collapsedNotice = screen.getByText(/服务端尚未确认支持对话自动处理/);
+    expect(collapsedNotice.closest('.assistant-service-status-panel')).toHaveAttribute('hidden');
+    await user.click(serviceStatusButton);
     const autoRoutingNotice = await screen.findByText(/服务端尚未确认支持对话自动处理/);
-    expect(autoRoutingNotice.closest('.notice-center-panel')).toBeInTheDocument();
-    expect(autoRoutingNotice.closest('.assistant-page')).toBeNull();
+    expect(autoRoutingNotice.closest('.assistant-page')).toBeInTheDocument();
+    expect(autoRoutingNotice.closest('.assistant-service-status-panel')).not.toHaveAttribute('hidden');
     await waitFor(() => expect(screen.getByRole('textbox', { name: '消息内容' })).toHaveValue(''));
     await user.type(await findReadyComposer(), '第二条待发送消息');
     expect(screen.getByRole('button', { name: '发送' })).toBeEnabled();
@@ -1464,16 +1526,15 @@ describe('Assistant durable tasks', () => {
     expect(accept.mock.calls[1]).toEqual(originalRequest);
   });
 
-  it('accepts a message with a selected computer and stable identity', async () => {
-    mockCommon({ conversations: [conversation], hosts: [targetHost] });
+  it('accepts a message with the configured default computer and stable identity', async () => {
+    mockCommon({ conversations: [conversation], hosts: [targetHost], defaultHostID: targetHost.id });
     vi.mocked(portalApi.mcpConnectors).mockResolvedValue({ items: [mcpConnector] });
     const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
     const user = userEvent.setup();
     renderPage();
     const composer = await findReadyComposer();
-    await screen.findByRole('option', { name: /测试电脑/ });
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择目标电脑' }), targetHost.id);
-    expect(screen.getByRole('combobox', { name: '选择目标 Workspace' })).toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: '选择目标电脑' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: '选择目标 Workspace' })).not.toBeInTheDocument();
     await user.click(screen.getByText('工具', { selector: 'summary' }));
     await user.click(await screen.findByRole('checkbox', { name: '日历工具' }));
     await user.type(composer, '检查云端电脑文件');
@@ -1490,35 +1551,30 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(screen.getByRole('textbox', { name: '消息内容' })).toHaveValue(''));
   });
 
-  it('sends an explicitly selected Workspace as a new-work target hint', async () => {
-    const workspace = { id: 'w7654321', name: '方案工作区', revision: 2, used_bytes: 0, quota_bytes: 1_000_000,
-      is_read_only: false, state: 'ready' as const, created_at: timestamp, updated_at: timestamp };
+  it('does not require a Workspace target in the composer', async () => {
     mockCommon({ conversations: [conversation] });
-    vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
     const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
     const user = userEvent.setup();
     renderPage();
     const composer = await findReadyComposer();
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择目标 Workspace' }), workspace.id);
+    expect(screen.queryByRole('combobox', { name: '选择目标 Workspace' })).not.toBeInTheDocument();
     await user.type(composer, '请生成设计方案文档');
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
-    expect(accept.mock.calls[0]![1]).toMatchObject({ content: '请生成设计方案文档', workspace_id: workspace.id });
+    expect(accept.mock.calls[0]![1]).toMatchObject({ content: '请生成设计方案文档' });
+    expect(accept.mock.calls[0]![1]).not.toHaveProperty('workspace_id');
     expect(accept.mock.calls[0]![1]).not.toHaveProperty('change_task_target');
   });
 
-  it('accepts a message when the explicitly selected host is stopped', async () => {
+  it('accepts a message when the configured default host is stopped', async () => {
     const stoppedHost = { ...targetHost, state: 'stopped' as const };
-    mockCommon({ conversations: [conversation], hosts: [stoppedHost] });
+    mockCommon({ conversations: [conversation], hosts: [stoppedHost], defaultHostID: stoppedHost.id });
     const accept = vi.spyOn(portalApi, 'acceptConversationMessage')
       .mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
     const user = userEvent.setup();
     renderPage();
 
-    const hostSelector = await screen.findByRole('combobox', { name: '选择目标电脑' });
     await findReadyComposer();
-    await user.selectOptions(hostSelector, stoppedHost.id);
-    expect(await screen.findByText(/目标电脑暂不可用：已停止/)).toBeInTheDocument();
     await user.type(await findReadyComposer(), '先受理这条对话');
     expect(screen.getByRole('button', { name: '发送' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '发送' }));
@@ -1537,14 +1593,14 @@ describe('Assistant durable tasks', () => {
     expect(voiceButton).toBeEnabled();
   });
 
-  it('keeps Workspace selection out of the composer contract', async () => {
-    mockCommon({ conversations: [conversation], hosts: [targetHost] });
+  it('uses the default computer without exposing computer or Workspace selectors', async () => {
+    mockCommon({ conversations: [conversation], hosts: [targetHost], defaultHostID: targetHost.id });
     const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
     const user = userEvent.setup();
     renderPage();
-    await screen.findByRole('option', { name: /测试电脑/ });
     await findReadyComposer();
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择目标电脑' }), targetHost.id);
+    expect(screen.queryByRole('combobox', { name: '选择目标电脑' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: '选择目标 Workspace' })).not.toBeInTheDocument();
     const composer = screen.getByRole('textbox', { name: '消息内容' });
     await user.type(composer, '查看项目文件');
     await user.click(screen.getByRole('button', { name: '发送' }));
@@ -1621,7 +1677,7 @@ describe('Assistant durable tasks', () => {
     const selector = await screen.findByRole('combobox', { name: '选择 AI 模型' });
     await waitFor(() => expect(selector).toHaveValue(unchecked.id));
     expect(selector).toHaveValue(unchecked.id);
-    expect(within(selector).getByRole('option', { name: '已选择模型，状态待核对' })).toBeInTheDocument();
+    expect(within(selector).getByRole('option', { name: '待核对模型 · 请先检查连接' })).toBeDisabled();
     expect(within(selector).getByRole('option', { name: /团队模型/ })).toBeInTheDocument();
 
     await user.type(await findReadyComposer(), '使用我选的模型');
@@ -3513,7 +3569,7 @@ describe('Assistant durable tasks', () => {
       waiting_reason: 'computer_unavailable', current_step: null, steps: [] });
     renderPage();
     await openTaskDynamics();
-    expect(await screen.findByText(/所选云端电脑当前不可用或无法确认访问权限/)).toBeInTheDocument();
+    expect(await screen.findByText(/目标云端电脑当前不可用或无法确认访问权限/)).toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
   });
 

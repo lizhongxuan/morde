@@ -1,4 +1,4 @@
-Morde Desktop
+morde-pc
 Copyright (C) 2026 Morde contributors
 
 This desktop application modifies the nanoMuse Electron desktop shell.

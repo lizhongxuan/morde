@@ -1739,6 +1739,7 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 		ProjectID: claim.Input.ProjectID, ConversationID: claim.Message.ConversationID, ModelID: modelID,
 		Objective: objective, Status: task.StatusQueued, Authorization: claim.Authorization, Budget: claim.Input.Budget,
 		ExecutionLocation: "server", FileDeliveryIntent: fileIntent, CheckpointThroughSequence: -1}
+	value = normalizeNewTask(value)
 	if err := validateTaskConversationScope(value, value.ProjectID); err != nil {
 		return err
 	}

@@ -376,7 +376,8 @@ func (s *accountRuntimeSupervisorStub) StartAccountRuntime(_ context.Context, fe
 				s.mu.Unlock()
 				started := map[string]any{"type": "task_started", "server_instance_id": fence.ServiceInstanceID,
 					"owner_id": fence.OwnerID, "runtime_id": fence.RuntimeID, "runtime_generation": fence.RuntimeGeneration,
-					"task_id": frame["task_id"], "agent_id": frame["agent_id"], "session_id": frame["session_id"],
+					"runtime_sequence": frame["runtime_sequence"],
+					"task_id":          frame["task_id"], "agent_id": frame["agent_id"], "session_id": frame["session_id"],
 					"generation": frame["generation"], "authorization_version": frame["authorization_version"]}
 				_ = json.NewEncoder(runtimeOutput).Encode(started)
 			}
@@ -1122,10 +1123,11 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 		t.Fatalf("Task proof confirm=%d DB ack=%d Guardian ack=%d, want 1/1/1", len(taskStopper.confirmed),
 			len(taskStopper.acknowledged), len(guardian.acked))
 	}
-	routeTaskFrame := func(kind string, target app.AgentInstanceFence) error {
+	routeTaskFrame := func(kind string, target app.AgentInstanceFence, sequence int64) error {
 		raw, err := json.Marshal(map[string]any{"type": kind, "server_instance_id": session.runtime.Fence.ServiceInstanceID,
 			"runtime_id": session.runtime.Fence.RuntimeID, "runtime_generation": session.runtime.Fence.RuntimeGeneration,
-			"task_id": target.TaskID, "owner_id": target.OwnerID, "agent_id": target.AgentInstanceID,
+			"runtime_sequence": sequence,
+			"task_id":          target.TaskID, "owner_id": target.OwnerID, "agent_id": target.AgentInstanceID,
 			"session_id": target.AgentSessionID, "generation": target.AgentGeneration,
 			"authorization_version": target.AuthorizationVersion})
 		if err != nil {
@@ -1135,21 +1137,54 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	}
 	wrongSession := fence
 	wrongSession.AgentSessionID = "other-session"
-	if err := routeTaskFrame("task_terminated", wrongSession); err == nil {
+	if err := routeTaskFrame("task_terminated", wrongSession, 1); err == nil {
 		t.Fatal("stopped Task frame with a different session was accepted")
-	}
-	if err := routeTaskFrame("task_terminated", fence); err != nil || session.closed() {
-		t.Fatalf("late stopped Task frame ended sibling Runtime: err=%v closed=%t", err, session.closed())
 	}
 	unknown := fence
 	unknown.TaskID = "q9999999"
-	if err := routeTaskFrame("task_terminated", unknown); err == nil {
+	if err := routeTaskFrame("task_terminated", unknown, 1); err == nil {
 		t.Fatal("unknown Task frame was accepted without a stop proof")
 	}
 	if err := session.routeFrame([]byte(`{"type":"failed","code":"runtime_unavailable"}`)); err == nil {
 		t.Fatal("unfenced Runtime failure was accepted as a Task failure")
 	}
-	for sequence := int64(2); sequence <= 8; sequence++ {
+	resumedCtx, cancelResumed := context.WithTimeout(context.Background(), 2*time.Second)
+	resumedLease := lease
+	resumedLease.RuntimeSequence = 2
+	resumedInput, resumedOutput, err := session.StartTask(resumedCtx, fence, nonce, resumedLease)
+	if err != nil {
+		cancelResumed()
+		t.Fatalf("resume stopped Task: %v", err)
+	}
+	if _, err := bufio.NewReader(resumedOutput).ReadBytes('\n'); err != nil {
+		cancelResumed()
+		t.Fatalf("read resumed Task ready frame: %v", err)
+	}
+	if err := writeCloudDSHFrame(resumedCtx, resumedInput, start); err != nil {
+		cancelResumed()
+		t.Fatalf("start resumed Task: %v", err)
+	}
+	if err := routeTaskFrame("task_terminated", fence, 1); err != nil || session.closed() {
+		cancelResumed()
+		t.Fatalf("late prior-attempt frame ended resumed Task: err=%v closed=%t", err, session.closed())
+	}
+	if err := routeTaskFrame("failed", fence, 2); err != nil || session.closed() {
+		cancelResumed()
+		t.Fatalf("resumed Task failure ended sibling Runtime: err=%v closed=%t", err, session.closed())
+	}
+	var resumedFailure cloudDSHFrame
+	if err := json.NewDecoder(resumedOutput).Decode(&resumedFailure); err != nil || resumedFailure.Type != "failed" {
+		cancelResumed()
+		t.Fatalf("resumed Task failure was not routed: type=%q err=%v", resumedFailure.Type, err)
+	}
+	if err := manager.StopTask(resumedCtx, session, fence); err != nil {
+		cancelResumed()
+		t.Fatalf("stop resumed Task: %v", err)
+	}
+	_ = resumedInput.Close()
+	_ = resumedOutput.Close()
+	cancelResumed()
+	for sequence := int64(3); sequence <= 8; sequence++ {
 		taskCtx, cancelTask := context.WithTimeout(context.Background(), 2*time.Second)
 		nextFence := fence
 		nextFence.TaskID = fmt.Sprintf("q%07d", sequence)
@@ -1171,17 +1206,6 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 			cancelTask()
 			t.Fatalf("start Task %d after initial Task stopped: %v", sequence, err)
 		}
-		if sequence == 2 {
-			if err := routeTaskFrame("failed", nextFence); err != nil || session.closed() {
-				cancelTask()
-				t.Fatalf("Task failure ended sibling Runtime: err=%v closed=%t", err, session.closed())
-			}
-			var failed cloudDSHFrame
-			if err := json.NewDecoder(output).Decode(&failed); err != nil || failed.Type != "failed" {
-				cancelTask()
-				t.Fatalf("Task failure was not routed to its Task: type=%q err=%v", failed.Type, err)
-			}
-		}
 		stopCtx := taskCtx
 		if sequence == 3 {
 			session.mu.Lock()
@@ -1191,7 +1215,7 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 				active.events <- cloudDSHRead{frame: []byte(`{}`)}
 			}
 			cancelTask()
-			if err := routeTaskFrame("checkpoint", nextFence); err != nil || session.closed() {
+			if err := routeTaskFrame("checkpoint", nextFence, sequence); err != nil || session.closed() {
 				t.Fatalf("canceled Task frame ended sibling Runtime: err=%v closed=%t", err, session.closed())
 			}
 			stopCtx = context.Background()
@@ -1555,11 +1579,12 @@ func TestAccountAgentRuntimeBackpressureDoesNotBlockSibling(t *testing.T) {
 	for len(stalledTask.events) < cap(stalledTask.events) {
 		stalledTask.events <- cloudDSHRead{frame: []byte(`{}`)}
 	}
-	frame := func(fence app.AgentInstanceFence) []byte {
+	frame := func(fence app.AgentInstanceFence, sequence int64) []byte {
 		t.Helper()
 		data, err := json.Marshal(map[string]any{"type": "checkpoint", "server_instance_id": runtime.Fence.ServiceInstanceID,
 			"runtime_id": runtime.Fence.RuntimeID, "runtime_generation": runtime.Fence.RuntimeGeneration,
-			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
+			"runtime_sequence": sequence,
+			"task_id":          fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
 			"session_id": fence.AgentSessionID, "generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion})
 		if err != nil {
 			t.Fatal(err)
@@ -1567,7 +1592,7 @@ func TestAccountAgentRuntimeBackpressureDoesNotBlockSibling(t *testing.T) {
 		return data
 	}
 	done := make(chan error, 1)
-	stalledFrame := frame(stalled)
+	stalledFrame := frame(stalled, 1)
 	go func() { done <- session.routeFrame(stalledFrame) }()
 	select {
 	case err := <-done:
@@ -1580,7 +1605,7 @@ func TestAccountAgentRuntimeBackpressureDoesNotBlockSibling(t *testing.T) {
 	if _, err := stalledOutput.Read(make([]byte, 64)); err == nil {
 		t.Fatal("the stalled Task did not report its event-queue failure")
 	}
-	if err := session.routeFrame(frame(sibling)); err != nil || session.closed() {
+	if err := session.routeFrame(frame(sibling, 2)); err != nil || session.closed() {
 		t.Fatalf("sibling Task could not receive its event: err=%v closed=%t", err, session.closed())
 	}
 	reader := bufio.NewReader(siblingOutput)

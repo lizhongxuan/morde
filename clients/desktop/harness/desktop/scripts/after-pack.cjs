@@ -7,7 +7,7 @@ module.exports = async ({ electronPlatformName, appOutDir, packager }) => {
     const executable = join(appOutDir, packager.appInfo.productFilename);
     renameSync(executable, `${executable}-bin`);
     // shortcut: block the observed Chromium GVT endpoints; audit again on Electron upgrades.
-    writeFileSync(executable, '#!/bin/sh\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/morde-client-bin" --disable-background-networking --disable-component-update --host-resolver-rules="MAP *.gvt1.com ~NOTFOUND,MAP *.gvt1-cn.com ~NOTFOUND" "$@"\n', { mode: 0o755 });
+    writeFileSync(executable, '#!/bin/sh\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/morde-pc-bin" --disable-background-networking --disable-component-update --host-resolver-rules="MAP *.gvt1.com ~NOTFOUND,MAP *.gvt1-cn.com ~NOTFOUND" "$@"\n', { mode: 0o755 });
     return;
   }
   if (electronPlatformName !== 'darwin') return;

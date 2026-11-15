@@ -24,14 +24,15 @@ type clientLoginRequest struct {
 }
 
 type clientLoginResponse struct {
-	InstallationID       string     `json:"installation_id"`
-	ClientCredential     string     `json:"client_credential"`
-	ClientExpiresAt      time.Time  `json:"client_expires_at"`
-	SyncCredential       string     `json:"sync_credential,omitempty"`
-	SyncExpiresAt        *time.Time `json:"sync_expires_at,omitempty"`
-	WebSessionCredential string     `json:"web_session_credential,omitempty"`
-	WebSessionExpiresAt  *time.Time `json:"web_session_expires_at,omitempty"`
-	User                 UserView   `json:"user"`
+	InstallationID            string     `json:"installation_id"`
+	ClientCredential          string     `json:"client_credential"`
+	ClientExpiresAt           time.Time  `json:"client_expires_at"`
+	SyncCredential            string     `json:"sync_credential,omitempty"`
+	SyncExpiresAt             *time.Time `json:"sync_expires_at,omitempty"`
+	WebSessionCredential      string     `json:"web_session_credential,omitempty"`
+	WebSessionExpiresAt       *time.Time `json:"web_session_expires_at,omitempty"`
+	WebSessionHostFrameSource string     `json:"web_session_host_frame_source,omitempty"`
+	User                      UserView   `json:"user"`
 }
 
 type clientInfoResponse struct {
@@ -127,6 +128,7 @@ func (h *api) clientLogin(c *gin.Context) {
 	}
 	if result.WebSessionCredential != "" {
 		response.WebSessionExpiresAt = &result.WebSessionExpiresAt
+		response.WebSessionHostFrameSource = hostFrameSource(h.options.HostScheme, h.options.HostSuffix)
 	}
 	c.JSON(http.StatusOK, response)
 }
@@ -146,7 +148,10 @@ func (h *api) clientWebSession(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"web_session_credential": result.Credential, "web_session_expires_at": result.ExpiresAt})
+	c.JSON(http.StatusOK, gin.H{
+		"web_session_credential": result.Credential, "web_session_expires_at": result.ExpiresAt,
+		"web_session_host_frame_source": hostFrameSource(h.options.HostScheme, h.options.HostSuffix),
+	})
 }
 
 func (h *api) clientLogout(c *gin.Context) {

@@ -21,7 +21,7 @@ const targets = [
 ];
 
 function expectedFilename(target, version) {
-  return `morde-desktop-${version}-${target.platform}-${target.architecture}${target.extension}`;
+  return `morde-pc-${version}-${target.platform}-${target.architecture}${target.extension}`;
 }
 
 function targetKeys(target) { return `${target.platform}:${target.architecture}`; }
@@ -164,7 +164,7 @@ function validateAcceptance(record, target, filename, bytes, sha256, version, tr
 }
 
 async function readVerifiedArtifacts(distDir, version) {
-  const distRoot = await requireDirectory(distDir, "Morde-client dist directory");
+  const distRoot = await requireDirectory(distDir, "morde-pc dist directory");
   const entries = await readdir(distRoot, { withFileTypes: true });
   const sidecars = entries.filter((entry) => entry.name.endsWith(sidecarSuffix));
   if (!sidecars.length) return [];
@@ -189,7 +189,7 @@ async function readVerifiedArtifacts(distDir, version) {
 
     const filename = expectedFilename(target, version);
     const sourcePath = path.join(distRoot, filename);
-    const sourceInfo = await requireRegularFile(sourcePath, "Morde-client installer");
+    const sourceInfo = await requireRegularFile(sourcePath, "morde-pc installer");
     const sha256 = await sha256File(sourcePath);
     const acceptance = validateAcceptance(record, target, filename, sourceInfo.size, sha256, version, trustedKeys);
     artifacts.push({
@@ -210,7 +210,7 @@ async function readVerifiedArtifacts(distDir, version) {
 }
 
 export async function stagePortalDownloads({ distDir, outputDir, version, portalURL }) {
-  if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error("Morde-client version is invalid");
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error("morde-pc version is invalid");
   const normalizedPortalURL = checkedPortalURL(portalURL);
   const artifacts = await readVerifiedArtifacts(distDir, version);
   const outputRoot = await requireDirectory(outputDir, "Portal download directory", { create: true });
@@ -256,7 +256,7 @@ async function main(args) {
     version: packageInfo.version,
     portalURL,
   });
-  console.log(`Staged ${manifest.artifacts.length} verified Morde-client installer(s) for ${manifest.portal_url}`);
+  console.log(`Staged ${manifest.artifacts.length} verified morde-pc installer(s) for ${manifest.portal_url}`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

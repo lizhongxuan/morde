@@ -1,44 +1,16 @@
-import { useLayoutEffect, useRef, useState, type HTMLAttributes, type ReactNode } from 'react';
-import { createPortal } from 'react-dom';
-import { useNoticeOverlayRegion } from '../app/toast';
+import { useState, type HTMLAttributes, type ReactNode } from 'react';
 
-type OverlayProps = HTMLAttributes<HTMLDivElement> & { children: ReactNode };
+type NoticeProps = HTMLAttributes<HTMLDivElement> & { children: ReactNode };
 
-function FloatingOverlay({ children, className = '', role, region, dismissible, ...props }: OverlayProps & { region: HTMLElement | null; dismissible: boolean }) {
+export function FloatingError({ children, className = '', role = 'alert', ...props }: NoticeProps) {
   const [dismissed, setDismissed] = useState(false);
-  const [sourceVisible, setSourceVisible] = useState(false);
-  const anchor = useRef<HTMLSpanElement>(null);
-  useLayoutEffect(() => {
-    if (!region) return;
-    const ancestors: HTMLElement[] = [];
-    for (let ancestor = anchor.current?.parentElement ?? null; ancestor; ancestor = ancestor.parentElement) ancestors.push(ancestor);
-    const updateVisibility = () => {
-      const visible = !ancestors.some((ancestor) => {
-        const style = getComputedStyle(ancestor);
-        return ancestor.hidden || ancestor.inert || ancestor.getAttribute('aria-hidden') === 'true'
-          || style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility);
-      });
-      setSourceVisible((current) => current === visible ? current : visible);
-    };
-    updateVisibility();
-    const observer = new MutationObserver(updateVisibility);
-    ancestors.forEach((ancestor) => observer.observe(ancestor, { attributes: true, attributeFilter: ['aria-hidden', 'class', 'hidden', 'inert', 'style'] }));
-    return () => observer.disconnect();
-  }, [region]);
   if (dismissed) return null;
-  const content = <div {...props} className={className} role={role}>
+  return <div {...props} className={`toast-error-notice ${className}`.trim()} role={role}>
     {children}
-    {dismissible && <button type="button" className="icon-button" aria-label="关闭错误提示" onClick={() => setDismissed(true)}>×</button>}
+    <button type="button" className="icon-button" aria-label="关闭错误提示" onClick={() => setDismissed(true)}>×</button>
   </div>;
-  return region ? <><span ref={anchor} hidden aria-hidden="true" />{sourceVisible ? createPortal(content, region) : null}</> : content;
 }
 
-export function FloatingError({ className = '', role = 'alert', ...props }: OverlayProps) {
-  const region = useNoticeOverlayRegion();
-  return <FloatingOverlay {...props} className={`toast-error-notice ${className}`.trim()} role={role} region={region} dismissible />;
-}
-
-export function FloatingNotice({ className = '', role = 'status', ...props }: OverlayProps) {
-  const region = useNoticeOverlayRegion();
-  return <FloatingOverlay {...props} className={`notice ${className}`.trim()} role={role} region={region} dismissible={false} />;
+export function FloatingNotice({ children, className = '', role = 'status', ...props }: NoticeProps) {
+  return <div {...props} className={`notice ${className}`.trim()} role={role}>{children}</div>;
 }

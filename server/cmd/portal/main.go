@@ -329,6 +329,11 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model gateway: %w", err)
 	}
+	modelUsageMetrics, err := newModelUsageMetrics(registry)
+	if err != nil {
+		return err
+	}
+	modelGateway.SetModelUsageObserver(modelUsageMetrics.observe)
 	modelGateway.SetGPT6LunaMaxReasoning(cfg.Models.GPT6LunaMaxReasoning)
 	if err := modelGateway.SetModelResponseSealer(sealer); err != nil {
 		return fmt.Errorf("initialize model response encryption: %w", err)
@@ -686,7 +691,7 @@ func serve(ctx context.Context, configPath string) error {
 		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
-			hubService, workerSuffix, serviceInstanceID, dataKey, logger)
+			hubService, workerSuffix, serviceInstanceID, dataKey, logger, registry)
 		if workerErr != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
 		}
@@ -706,7 +711,7 @@ func serve(ctx context.Context, configPath string) error {
 			Queue: store, Actions: store, Models: coordinator, WorkerID: workerSuffix + "-route",
 			SummaryStore: store, SummaryInputs: store, SummarySealer: sealer,
 			LeaseDuration: 2 * time.Minute, PollInterval: 500 * time.Millisecond,
-			MaxConcurrent: min(cfg.CloudDSH.MaxConcurrentTasks, 16), Logger: logger,
+			MaxConcurrent: min(cfg.CloudDSH.MaxConcurrentTasks, 16), Logger: logger, Metrics: registry,
 		})
 		if err != nil {
 			return fmt.Errorf("initialize conversation routing worker: %w", err)
@@ -918,7 +923,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
-	workerID, serviceInstanceID string, historyCursorKey []byte, logger *zap.Logger) (*cloudDSHTaskWorkerBundle, error) {
+	workerID, serviceInstanceID string, historyCursorKey []byte, logger *zap.Logger, metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -1022,7 +1027,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
 		Store: store, Executor: executor, Lifecycle: accountRuntimes.Run, WorkerID: workerID + "-task",
 		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond,
-		MaxConcurrentTasks: cfg.MaxConcurrentTasks, MaxConcurrentTasksPerOwner: cfg.MaxConcurrentPerOwner, Logger: logger,
+		MaxConcurrentTasks: cfg.MaxConcurrentTasks, MaxConcurrentTasksPerOwner: cfg.MaxConcurrentPerOwner, Logger: logger, Metrics: metrics,
 	})
 	if err != nil {
 		return nil, err
@@ -1400,6 +1405,59 @@ func registerCounter(reg prometheus.Registerer, opts prometheus.CounterOpts) (pr
 		return counter, nil
 	}
 	return collector, nil
+}
+
+type modelUsageMetrics struct {
+	calls  *prometheus.CounterVec
+	tokens *prometheus.CounterVec
+}
+
+func newModelUsageMetrics(registerer prometheus.Registerer) (*modelUsageMetrics, error) {
+	result := &modelUsageMetrics{
+		calls: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudhost_model_usage_calls_total", Help: "Successfully settled model calls by source and usage certainty.",
+		}, []string{"source", "usage_state"}),
+		tokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudhost_model_usage_tokens_total", Help: "Known settled model tokens by source and direction.",
+		}, []string{"source", "direction"}),
+	}
+	for _, collector := range []prometheus.Collector{result.calls, result.tokens} {
+		if err := registerer.Register(collector); err != nil {
+			return nil, fmt.Errorf("register model usage metric: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func (m *modelUsageMetrics) observe(value app.ModelUsageObservation) {
+	source := ""
+	switch value.Source {
+	case app.ModelCallClient:
+		source = "client"
+	case app.ModelCallChat:
+		source = "chat"
+	case app.ModelCallTask:
+		source = "task"
+	case app.ModelCallProbe:
+		source = "probe"
+	case app.ModelCallRoute:
+		source = "route"
+	case app.ModelCallCompaction:
+		source = "compaction"
+	default:
+		return
+	}
+	state := "unknown"
+	if value.Known {
+		state = "known"
+		if value.InputTokens > 0 {
+			m.tokens.WithLabelValues(source, "input").Add(float64(value.InputTokens))
+		}
+		if value.OutputTokens > 0 {
+			m.tokens.WithLabelValues(source, "output").Add(float64(value.OutputTokens))
+		}
+	}
+	m.calls.WithLabelValues(source, state).Inc()
 }
 
 func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts, labels ...string) (*prometheus.HistogramVec, error) {

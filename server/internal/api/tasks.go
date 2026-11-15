@@ -54,6 +54,10 @@ type TaskRevisionFencedActionService interface {
 	RequestActionWithRevisionFence(context.Context, identity.Principal, string, task.Action, task.Status, *app.TaskActionRevisionFence, string) (app.TaskActionResult, error)
 }
 
+type TaskPriorityService interface {
+	SetPriority(context.Context, identity.Principal, string, task.QueuePriority, int64, string) (task.Task, error)
+}
+
 type TaskWorkbenchObservationTicketService interface {
 	IssueWorkbenchObservationTicket(context.Context, identity.Principal, string) (app.TaskWorkbenchObservationTicket, error)
 }
@@ -88,6 +92,7 @@ type taskSummaryResponse struct {
 	ModelID                     string                    `json:"model_id"`
 	Objective                   string                    `json:"objective"`
 	Status                      task.Status               `json:"status"`
+	QueuePriority               task.QueuePriority        `json:"queue_priority"`
 	CurrentStep                 *string                   `json:"current_step"`
 	StepCount                   int64                     `json:"step_count"`
 	CompletedStepCount          int64                     `json:"completed_step_count"`
@@ -195,10 +200,12 @@ type taskAssistantMessageResponse struct {
 }
 
 type taskActionResponse struct {
-	TaskID                string      `json:"task_id"`
-	Action                string      `json:"action"`
-	Status                task.Status `json:"status"`
-	UnsettledOperationIDs []string    `json:"unsettled_operation_ids"`
+	TaskID                string             `json:"task_id"`
+	Action                string             `json:"action"`
+	Status                task.Status        `json:"status"`
+	UnsettledOperationIDs []string           `json:"unsettled_operation_ids"`
+	QueuePriority         task.QueuePriority `json:"queue_priority,omitempty"`
+	EventSequence         *int64             `json:"event_sequence,omitempty"`
 }
 
 type taskWorkspaceViewDeletionRequest struct {
@@ -479,11 +486,13 @@ type batchItemRequest struct {
 }
 
 type taskActionRequest struct {
-	Action                  string          `json:"action"`
-	ExpectedStatus          task.Status     `json:"expected_status"`
-	ExpectedCurrentRevision json.RawMessage `json:"expected_current_revision"`
-	ExpectedDesiredRevision json.RawMessage `json:"expected_desired_revision"`
-	BatchItemID             string          `json:"batch_item_id"`
+	Action                  string             `json:"action"`
+	ExpectedStatus          task.Status        `json:"expected_status"`
+	ExpectedCurrentRevision json.RawMessage    `json:"expected_current_revision"`
+	ExpectedDesiredRevision json.RawMessage    `json:"expected_desired_revision"`
+	ExpectedEventSequence   *int64             `json:"expected_event_sequence"`
+	QueuePriority           task.QueuePriority `json:"queue_priority"`
+	BatchItemID             string             `json:"batch_item_id"`
 }
 
 func parseOptionalTaskActionRevision(raw json.RawMessage) (*int64, bool) {
@@ -598,6 +607,7 @@ func (h *api) retryTaskStep(service TaskStepRetryService) gin.HandlerFunc {
 		}
 		result, err := service.RetryStep(c.Request.Context(), principal, taskID, stepID, request.ExpectedTaskRevision,
 			request.ExpectedAttempt, c.GetHeader("Idempotency-Key"))
+		h.workflow.observeTaskRetry("step", err)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -765,20 +775,46 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 		switch request.Action {
 		case "retry_batch_item":
 			if !domain.ValidBatchItemID(request.BatchItemID) || request.ExpectedStatus != "" ||
-				request.ExpectedCurrentRevision != nil || request.ExpectedDesiredRevision != nil {
+				request.ExpectedCurrentRevision != nil || request.ExpectedDesiredRevision != nil ||
+				request.ExpectedEventSequence != nil || request.QueuePriority != "" {
 				writeError(c, domain.InvalidArgument("action", "retry_batch_item requires only a valid batch_item_id"))
 				return
 			}
-			if err := service.RetryBatchItem(c.Request.Context(), principal, taskID, request.BatchItemID, c.GetHeader("Idempotency-Key")); err != nil {
+			err := service.RetryBatchItem(c.Request.Context(), principal, taskID, request.BatchItemID, c.GetHeader("Idempotency-Key"))
+			h.workflow.observeTaskRetry("batch_item", err)
+			if err != nil {
 				writeError(c, err)
 				return
 			}
 			c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: request.Action, Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
 			return
+		case "set_priority":
+			if request.ExpectedStatus != "" || request.BatchItemID != "" || request.ExpectedCurrentRevision != nil ||
+				request.ExpectedDesiredRevision != nil || request.ExpectedEventSequence == nil || *request.ExpectedEventSequence < 0 ||
+				!request.QueuePriority.Valid() {
+				writeError(c, domain.InvalidArgument("action", "set_priority requires queue_priority and expected_event_sequence only"))
+				return
+			}
+			priorityService, ok := service.(TaskPriorityService)
+			if !ok {
+				writeError(c, domain.NewError(domain.CodeUnsupported, "task priority updates are unavailable"))
+				return
+			}
+			updated, err := priorityService.SetPriority(c.Request.Context(), principal, taskID, request.QueuePriority,
+				*request.ExpectedEventSequence, c.GetHeader("Idempotency-Key"))
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			sequence := updated.EventSequence
+			c.JSON(http.StatusAccepted, taskActionResponse{TaskID: updated.ID, Action: request.Action, Status: updated.Status,
+				UnsettledOperationIDs: []string{}, QueuePriority: updated.QueuePriority, EventSequence: &sequence})
+			return
 		case "pause", "resume", "cancel":
 			action := task.Action(request.Action)
 			if request.BatchItemID != "" || !validTaskActionExpectedStatus(action, request.ExpectedStatus) ||
-				(request.ExpectedCurrentRevision == nil) != (request.ExpectedDesiredRevision == nil) {
+				(request.ExpectedCurrentRevision == nil) != (request.ExpectedDesiredRevision == nil) ||
+				request.ExpectedEventSequence != nil || request.QueuePriority != "" {
 				writeError(c, domain.InvalidArgument("action", "pause, resume, or cancel requires a valid expected_status and no batch_item_id"))
 				return
 			}
@@ -811,7 +847,7 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 			})
 			return
 		default:
-			writeError(c, domain.InvalidArgument("action", "supported task actions are retry_batch_item, pause, resume, and cancel"))
+			writeError(c, domain.InvalidArgument("action", "supported task actions are retry_batch_item, set_priority, pause, resume, and cancel"))
 			return
 		}
 	}
@@ -869,11 +905,21 @@ func (h *api) respondToTaskApproval(service TaskService) gin.HandlerFunc {
 			writeError(c, domain.InvalidArgument("approval", "a positive version and approve or reject decision are required"))
 			return
 		}
+		var approvalCreatedAt time.Time
+		if details, getErr := service.Get(c.Request.Context(), principal, taskID); getErr == nil && details.PendingRequest != nil &&
+			details.PendingRequest.ID == approvalID && details.PendingRequest.Version == request.Version && details.PendingRequest.Status == task.PendingRequestPending {
+			approvalCreatedAt = details.PendingRequest.CreatedAt
+		}
 		if err := service.RespondToPendingRequest(c.Request.Context(), principal, taskID, approvalID, request.Version,
 			request.Decision, c.GetHeader("Idempotency-Key")); err != nil {
 			writeError(c, err)
 			return
 		}
+		decision := "approve"
+		if request.Decision == task.PendingDecisionReject {
+			decision = "reject"
+		}
+		h.workflow.observeApprovalWait(decision, approvalCreatedAt)
 		c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: "respond", Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
 	}
 }
@@ -1062,18 +1108,23 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 		(value.InputRevision != nil && value.WorkspaceCheckpointRevision != nil && *value.WorkspaceCheckpointRevision < *value.InputRevision) ||
 		(value.ExecutionLocation != "server" && value.ExecutionLocation != "legacy") ||
 		!domain.ValidConversationID(value.ConversationID) || strings.TrimSpace(value.ModelID) == "" ||
+		(value.QueuePriority != "" && !value.QueuePriority.Valid()) ||
 		(value.ApplicationID != "" && !app.ValidHostApplicationID(value.ApplicationID)) || !validTaskStatusResponse(value.Status) ||
 		value.StepCount < 0 || value.CompletedStepCount < 0 || value.CompletedStepCount > value.StepCount ||
 		value.Budget.Validate() != nil || value.Usage.ActiveSeconds < 0 || value.Usage.ToolCalls < 0 || (value.Usage.ModelTokens != nil && *value.Usage.ModelTokens < 0) ||
 		value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
+	priority := value.QueuePriority
+	if priority == "" {
+		priority = task.QueuePriorityNormal
+	}
 	response := taskSummaryResponse{
 		ID: value.ID, OwnerID: value.OwnerID, InitiatorID: initiatorID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
 		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, CurrentRevision: value.CurrentRevision,
 		DesiredRevision: value.DesiredRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
-		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, CurrentStep: stringPointer(value.CurrentStep),
+		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, QueuePriority: priority, CurrentStep: stringPointer(value.CurrentStep),
 		StepCount: value.StepCount, CompletedStepCount: value.CompletedStepCount,
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,

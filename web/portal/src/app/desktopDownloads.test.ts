@@ -3,8 +3,8 @@ import { getDesktopDownloads, parseDesktopDownloads } from './desktopDownloads';
 
 const portalURL = 'https://morde.example/';
 const artifact = {
-  platform: 'macos', architecture: 'arm64', filename: 'morde-desktop-0.1.0-macos-arm64.dmg',
-  download_url: '/downloads/files/morde-desktop-0.1.0-macos-arm64.dmg', bytes: 42, sha256: 'a'.repeat(64),
+  platform: 'macos', architecture: 'arm64', filename: 'morde-pc-0.1.0-macos-arm64.dmg',
+  download_url: '/downloads/files/morde-pc-0.1.0-macos-arm64.dmg', bytes: 42, sha256: 'a'.repeat(64),
   acceptance: {
     status: 'verified', verified_at: '2026-10-26T00:00:00.000Z', evidence_ref: 'T22.10/macos-arm64/2026-10-26',
     signature_status: 'signed_and_notarized',
@@ -29,8 +29,15 @@ describe('desktop downloads manifest', () => {
     expect(() => parseDesktopDownloads(manifest([{ ...artifact, download_url: 'https://attacker.example/setup' }]), 'https://morde.example')).toThrow('无效条目');
   });
 
+  it('continues to accept a previously published desktop installer', () => {
+    const filename = 'morde-desktop-0.1.0-macos-arm64.dmg';
+    const previous = { ...artifact, filename, download_url: `/downloads/files/${filename}` };
+    expect(parseDesktopDownloads(manifest([previous]), 'https://morde.example').artifacts).toEqual([previous]);
+    expect(() => parseDesktopDownloads(manifest([{ ...previous, download_url: artifact.download_url }]), 'https://morde.example')).toThrow('无效条目');
+  });
+
   it('shows only verified artifacts and rejects incomplete acceptance evidence', () => {
-    const pending = { ...artifact, platform: 'windows', filename: 'morde-desktop-0.1.0-windows-x64.exe', download_url: '/downloads/files/morde-desktop-0.1.0-windows-x64.exe', acceptance: { status: 'pending' } };
+    const pending = { ...artifact, platform: 'windows', filename: 'morde-pc-0.1.0-windows-x64.exe', download_url: '/downloads/files/morde-pc-0.1.0-windows-x64.exe', acceptance: { status: 'pending' } };
     expect(parseDesktopDownloads(manifest([artifact, pending]), 'https://morde.example').artifacts).toEqual([artifact]);
     expect(parseDesktopDownloads(manifest([pending]), 'https://morde.example')).toEqual({ version: null, artifacts: [] });
     expect(() => parseDesktopDownloads(manifest([{ ...artifact, acceptance: { ...artifact.acceptance, capabilities: ['install'] } }]), 'https://morde.example')).toThrow('无效条目');
@@ -46,5 +53,16 @@ describe('desktop downloads manifest', () => {
   it('treats the local SPA fallback as an unpublished manifest', async () => {
     const fetcher = async () => new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
     await expect(getDesktopDownloads(fetcher, 'https://morde.example')).resolves.toEqual({ version: null, artifacts: [] });
+  });
+
+  it('uses the bundled PC client service origin supplied by the local Portal host', async () => {
+    const meta = document.createElement('meta');
+    meta.name = 'morde-service-origin';
+    meta.content = 'https://morde.example';
+    document.head.append(meta);
+    try {
+      const fetcher = async () => new Response(JSON.stringify(manifest([artifact])), { headers: { 'content-type': 'application/json' } });
+      await expect(getDesktopDownloads(fetcher)).resolves.toEqual({ version: '0.1.0', artifacts: [artifact] });
+    } finally { meta.remove(); }
   });
 });

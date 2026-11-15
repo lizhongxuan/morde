@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -757,6 +758,82 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, stale.OwnerID, stale.Source, st
 	var unknownTaskUsage *int64
 	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&unknownTaskUsage); err != nil || unknownTaskUsage != nil {
 		t.Fatalf("unknown Task model usage was reported as settled: usage=%v err=%v", unknownTaskUsage, err)
+	}
+
+	type billingFixture struct {
+		callID         string
+		modelState     string
+		personal       bool
+		inputTokens    *int64
+		outputTokens   *int64
+		projectState   string
+		rateVersion    int64
+		reservedMicros int64
+		actualMicros   *int64
+	}
+	tokens := func(value int64) *int64 { return &value }
+	billingFixtures := []billingFixture{
+		{callID: "billing-settled-02", modelState: "settled", inputTokens: tokens(40), outputTokens: tokens(10),
+			projectState: "settled", rateVersion: 10, reservedMicros: 200, actualMicros: tokens(60)},
+		{callID: "billing-estimated-01", modelState: "dispatched", projectState: "reserved", rateVersion: 8, reservedMicros: 250},
+		{callID: "billing-unknown-01", modelState: "unknown", projectState: "unknown", rateVersion: 9, reservedMicros: 300},
+		{callID: "billing-unknown-02", modelState: "unknown"},
+		{callID: "billing-byok-001", modelState: "settled", personal: true, inputTokens: tokens(2), outputTokens: tokens(1)},
+	}
+	for _, fixture := range billingFixtures {
+		digest := sha256.Sum256([]byte(fixture.callID))
+		if _, err := store.pool.Exec(ctx, `INSERT INTO model_call_ledger
+(owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,input_tokens,output_tokens,settled_at,personal_model)
+VALUES ($1,'task',$2,$3,'p1234567','test-model',$4,100,$5,$6,$7,
+ CASE WHEN $5='dispatched' THEN NULL ELSE clock_timestamp() END,$8)`, principal.UserID, fixture.callID, digest[:], taskID,
+			fixture.modelState, fixture.inputTokens, fixture.outputTokens, fixture.personal); err != nil {
+			t.Fatalf("insert %s model-call fixture: %v", fixture.callID, err)
+		}
+		if fixture.projectState == "" {
+			continue
+		}
+		var actualInput, actualOutput any
+		if fixture.projectState == "settled" {
+			actualInput, actualOutput = int64(40), int64(10)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO project_budget_ledger
+(project_id,source,call_id,actor_id,task_id,model_id,rate_provider,rate_model,rate_version,currency,
+ input_micros_per_million,output_micros_per_million,reserved_input_tokens,reserved_output_tokens,reserved_micros,
+ status,actual_input_tokens,actual_output_tokens,actual_micros,request_digest)
+VALUES ($1,'task',$2,$3,$4,'p1234567','test-provider','test-model',$5,'USD',1000000,1000000,40,10,$6,
+ $7,$8,$9,$10,$11)`, projectID, fixture.callID, principal.UserID, taskID, fixture.rateVersion, fixture.reservedMicros,
+			fixture.projectState, actualInput, actualOutput, fixture.actualMicros, digest[:]); err != nil {
+			t.Fatalf("insert %s project-ledger fixture: %v", fixture.callID, err)
+		}
+	}
+	details, err = store.GetTask(ctx, taskID, principal.UserID)
+	if err != nil || details.Billing == nil || details.Billing.ModelCalls != 11 {
+		t.Fatalf("mixed Task billing detail = %#v, %v", details.Billing, err)
+	}
+	costs := make(map[string]app.TaskCostSummary, len(details.Billing.Costs))
+	for _, cost := range details.Billing.Costs {
+		costs[cost.State+"/"+cost.Currency] = cost
+	}
+	settled := costs["settled/USD"]
+	if settled.Calls != 2 || settled.ReservedMicros != 300 || settled.ActualMicros == nil || *settled.ActualMicros != 108 ||
+		!reflect.DeepEqual(settled.RateVersions, []int64{7, 10}) {
+		t.Fatalf("settled multi-rate Task cost = %+v", settled)
+	}
+	estimated := costs["estimated/USD"]
+	if estimated.Calls != 1 || estimated.ReservedMicros != 250 || estimated.ActualMicros != nil ||
+		!reflect.DeepEqual(estimated.RateVersions, []int64{8}) {
+		t.Fatalf("estimated Task cost = %+v", estimated)
+	}
+	unknownUSD := costs["unknown/USD"]
+	if unknownUSD.Calls != 1 || unknownUSD.ReservedMicros != 300 || unknownUSD.ActualMicros != nil ||
+		!reflect.DeepEqual(unknownUSD.RateVersions, []int64{9}) {
+		t.Fatalf("unknown-rate Task cost = %+v", unknownUSD)
+	}
+	if unknown := costs["unknown/"]; unknown.Calls != 1 || unknown.ReservedMicros != 0 || len(unknown.RateVersions) != 0 || unknown.ActualMicros != nil {
+		t.Fatalf("unpriced Task cost = %+v", unknown)
+	}
+	if byok := costs["byok/"]; byok.Calls != 6 || byok.ReservedMicros != 0 || len(byok.RateVersions) != 0 || byok.ActualMicros != nil {
+		t.Fatalf("BYOK Task cost = %+v", byok)
 	}
 }
 

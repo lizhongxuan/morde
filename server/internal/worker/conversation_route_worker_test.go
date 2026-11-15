@@ -11,6 +11,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -113,6 +115,93 @@ func TestConversationRouteWorkerRoutesFirstMessageAfterModelClassification(t *te
 	}
 }
 
+func TestConversationRouteMetricsRecordAggregationWaitAndCorrection(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	stub := &routeWorkerStub{
+		claim: app.ConversationRouteClaim{
+			Message: appRouteMessageForMetrics(), LeaseExpiresAt: time.Now().Add(time.Minute),
+			AggregationStartedAt: time.Now().Add(-3 * time.Second),
+		},
+		snapshot: app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{
+			ActorID: "u1234567", Content: "补充任务要求", ReferenceTaskID: "q1234567",
+			Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 3}},
+		}},
+		decision: app.ConversationRouteDecision{Action: app.ConversationRouteUpdate, TaskID: "q1234567", ExpectedRevision: 3,
+			ModelOutput: `{"action":"update","task_id":"q1234567","question":"","reply":""}`},
+	}
+	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{
+		Queue: stub, Actions: stub, Models: stub, WorkerID: "route-metrics-test", LeaseDuration: time.Minute,
+		PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(), Metrics: registry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found, err := routeWorker.RunOnce(context.Background()); err != nil || !found || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteUpdate {
+		t.Fatalf("route update = %#v, found=%t, err=%v", stub.applied, found, err)
+	}
+	if got := gatheredWorkerCounter(t, routeWorker.metrics.actions.WithLabelValues("update", "applied")); got != 1 {
+		t.Fatalf("applied correction metric = %v, want 1", got)
+	}
+	if got := gatheredWorkerCounter(t, routeWorker.metrics.aggregationStates.WithLabelValues("corrected")); got != 1 {
+		t.Fatalf("aggregation correction metric = %v, want 1", got)
+	}
+	for _, family := range mustGatherWorkerMetrics(t, registry) {
+		if family.GetName() == "cloudhost_conversation_aggregation_wait_seconds" {
+			histogram := family.GetMetric()[0].GetHistogram()
+			if histogram.GetSampleCount() != 1 || histogram.GetSampleSum() < 2.9 {
+				t.Fatalf("aggregation wait metric = %#v, want one 3s sample", histogram)
+			}
+			return
+		}
+	}
+	t.Fatal("aggregation wait histogram was not gathered")
+}
+
+func TestConversationRouteMetricsRecordAggregationWaitState(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	base := &routeWorkerStub{
+		claim:    app.ConversationRouteClaim{Message: appRouteMessageForMetrics(), LeaseExpiresAt: time.Now().Add(time.Minute)},
+		snapshot: app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{ActorID: "u1234567", Content: "create a task"}},
+		decision: app.ConversationRouteDecision{Action: app.ConversationRouteNew},
+	}
+	stub := &routeAggregationWorkerStub{routeWorkerStub: base, started: true}
+	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{
+		Queue: stub, Actions: stub, Models: stub, WorkerID: "route-aggregation-metrics-test", LeaseDuration: time.Minute,
+		PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(), Metrics: registry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found, err := routeWorker.RunOnce(context.Background()); err != nil || !found || stub.beginCalls != 1 {
+		t.Fatalf("aggregation start = found:%t begin:%d err:%v", found, stub.beginCalls, err)
+	}
+	if got := gatheredWorkerCounter(t, routeWorker.metrics.aggregationStates.WithLabelValues("waiting")); got != 1 {
+		t.Fatalf("aggregation waiting metric = %v, want 1", got)
+	}
+}
+
+func mustGatherWorkerMetrics(t *testing.T, registry prometheus.Gatherer) []*dto.MetricFamily {
+	t.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return families
+}
+
+func gatheredWorkerCounter(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	if err := counter.Write(metric); err != nil {
+		t.Fatal(err)
+	}
+	return metric.GetCounter().GetValue()
+}
+
+func appRouteMessageForMetrics() conversation.Message {
+	return conversation.Message{ID: "m1234567", CreatedAt: time.Now().UTC()}
+}
+
 func TestConversationRouteWorkerWaitsOnlyAfterClassifiedNewAndNeverSlidesTheWindow(t *testing.T) {
 	for _, scenario := range []struct {
 		name      string
@@ -129,7 +218,7 @@ func TestConversationRouteWorkerWaitsOnlyAfterClassifiedNewAndNeverSlidesTheWind
 		{name: "unknown model call", modelErr: errors.New("route result or usage is unknown")},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			worker, stub := newRouteWorkerTest(t)
+			_, stub := newRouteWorkerTest(t)
 			stub.decision, stub.classifyErr = scenario.decision, scenario.modelErr
 			if scenario.name == "status" {
 				stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",

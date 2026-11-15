@@ -33,8 +33,8 @@ describe('TopBar countdown', () => {
     expect(screen.queryByRole('button', { name: '返回云端电脑' })).not.toBeInTheDocument();
   });
 
-  it('shows transient errors in the overlay without widening the header', () => {
-    const { container } = render(<TopBar
+  it('shows transient errors in the normal header layout flow', () => {
+    render(<TopBar
       host={null}
       renewing={false}
       onRenew={vi.fn()}
@@ -46,12 +46,13 @@ describe('TopBar countdown', () => {
     const message = screen.getByRole('alert');
     expect(message).toHaveTextContent('远程桌面连接失败');
     expect(message).toHaveClass('workbench-floating-error');
-    expect(message.closest('.top-bar')).toBeNull();
-    expect(container.querySelector('.top-bar')?.textContent).not.toContain('远程桌面连接失败');
+    expect(message.closest('.workbench-notice-region')).toBeInTheDocument();
+    expect(message.closest('.top-bar')).toBeInTheDocument();
+    expect(message.closest('.host-summary')).toBeNull();
   });
 
-  it('shows success notices in the overlay without widening the header', () => {
-    const { container } = render(<TopBar
+  it('shows success notices in the normal header layout flow', () => {
+    render(<TopBar
       host={null}
       renewing={false}
       onRenew={vi.fn()}
@@ -61,11 +62,12 @@ describe('TopBar countdown', () => {
     />);
 
     const message = screen.getByText('主机已续期').closest('[role="status"]');
-    if (!message) throw new Error('成功提示不在固定提示层中');
+    if (!message) throw new Error('成功提示缺少状态角色');
     expect(message).toHaveTextContent('主机已续期');
     expect(message).toHaveClass('workbench-floating-success');
-    expect(message.closest('.top-bar')).toBeNull();
-    expect(container.querySelector('.top-bar')?.textContent).not.toContain('主机已续期');
+    expect(message.closest('.workbench-notice-region')).toBeInTheDocument();
+    expect(message.closest('.top-bar')).toBeInTheDocument();
+    expect(message.closest('.host-summary')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '关闭状态提示' }));
     expect(screen.queryByText('主机已续期')).not.toBeInTheDocument();
   });

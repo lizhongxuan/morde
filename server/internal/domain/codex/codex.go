@@ -91,23 +91,23 @@ type ProfileConnectionRequest struct {
 
 func (value ProfileConnectionRequest) Validate() error {
 	if !ValidProfileKey(value.ProfileKey) || value.Scopes == nil || len(value.Scopes) < 2 || len(value.Scopes) > len(allScopes) {
-		return errors.New("Codex profile connection is invalid")
+		return errors.New("codex profile connection is invalid")
 	}
 	seen := make(map[Scope]struct{}, len(value.Scopes))
 	for _, scope := range value.Scopes {
 		if !ValidScope(scope) {
-			return errors.New("Codex profile connection scopes are invalid")
+			return errors.New("codex profile connection scopes are invalid")
 		}
 		if _, duplicate := seen[scope]; duplicate {
-			return errors.New("Codex profile connection scopes are invalid")
+			return errors.New("codex profile connection scopes are invalid")
 		}
 		seen[scope] = struct{}{}
 	}
 	if _, ok := seen[ScopeRead]; !ok {
-		return errors.New("Codex profile connection must include the read scope")
+		return errors.New("codex profile connection must include the read scope")
 	}
 	if _, ok := seen[ScopeLive]; !ok {
-		return errors.New("Codex profile connection must include the live scope")
+		return errors.New("codex profile connection must include the live scope")
 	}
 	return nil
 }
@@ -193,13 +193,13 @@ type HistorySyncProgressUpdate struct {
 func (value ProfileSessionDiscoveryUpdate) Validate() error {
 	if value.SessionDiscovery == nil || value.HistorySync == nil || value.HistorySync.DiscoveredSessions == nil ||
 		value.HistorySync.HistoryCompleteSessions == nil || value.HistorySync.PendingUploadEventCount == nil {
-		return errors.New("Codex profile session discovery and history sync fields are required")
+		return errors.New("codex profile session discovery and history sync fields are required")
 	}
 	if !value.SessionDiscovery.State.Valid() {
-		return errors.New("Codex session discovery state is invalid")
+		return errors.New("codex session discovery state is invalid")
 	}
 	if value.SessionDiscovery.ErrorCode != nil && !value.SessionDiscovery.ErrorCode.Valid() {
-		return errors.New("Codex session discovery error code is invalid")
+		return errors.New("codex session discovery error code is invalid")
 	}
 	if value.SessionDiscovery.State == DiscoverySynced && value.SessionDiscovery.ErrorCode != nil {
 		return errors.New("successful Codex session discovery cannot include an error code")
@@ -213,7 +213,7 @@ func (value ProfileSessionDiscoveryUpdate) Validate() error {
 	if *value.HistorySync.DiscoveredSessions < 0 || *value.HistorySync.HistoryCompleteSessions < 0 ||
 		*value.HistorySync.PendingUploadEventCount < 0 ||
 		*value.HistorySync.HistoryCompleteSessions > *value.HistorySync.DiscoveredSessions {
-		return errors.New("Codex history sync counts are invalid")
+		return errors.New("codex history sync counts are invalid")
 	}
 	return nil
 }
@@ -230,21 +230,21 @@ func (value Discover) Validate() error {
 	if !ValidProfileKey(value.ProfileKey) || !nativeIDPattern.MatchString(value.ThreadID) ||
 		!validVisibleString(value.Title, 0, 512) || !validVisibleString(value.CWDLabel, 0, 256) ||
 		strings.ContainsAny(value.CWDLabel, "/\\") || !value.Status.Valid() {
-		return errors.New("Codex thread metadata is invalid")
+		return errors.New("codex thread metadata is invalid")
 	}
 	if value.UpdatedAt != nil && (value.UpdatedAt.IsZero() || value.UpdatedAt.After(time.Now().UTC().Add(24*time.Hour))) {
-		return errors.New("Codex thread update time is invalid")
+		return errors.New("codex thread update time is invalid")
 	}
 	if len(value.Scopes) > len(allScopes) {
-		return errors.New("Codex grant scopes are invalid")
+		return errors.New("codex grant scopes are invalid")
 	}
 	seen := make(map[Scope]struct{}, len(value.Scopes))
 	for _, scope := range value.Scopes {
 		if !ValidScope(scope) {
-			return errors.New("Codex grant scopes are invalid")
+			return errors.New("codex grant scopes are invalid")
 		}
 		if _, duplicate := seen[scope]; duplicate {
-			return errors.New("Codex grant scopes are invalid")
+			return errors.New("codex grant scopes are invalid")
 		}
 		seen[scope] = struct{}{}
 	}
@@ -395,30 +395,30 @@ func (value EventInput) Validate() error {
 		!validOptionalNativeID(value.TurnID) || !validOptionalNativeID(value.ItemID) ||
 		!validOptionalNativeID(value.ParentItemID) || !validOptionalVisibleString(value.Status, 128) || value.Payload == nil ||
 		!value.validSourceForKind() {
-		return errors.New("Codex event fields are invalid")
+		return errors.New("codex event fields are invalid")
 	}
 	if value.Kind != EventCommandStatus && strings.HasPrefix(value.ProviderEventID, "morde:command:") {
-		return errors.New("Codex command event IDs are reserved")
+		return errors.New("codex command event IDs are reserved")
 	}
 	allowed := eventPayloadKeys[value.Kind]
 	if value.Kind == EventCommandStatus && (!validCommandStatusPayload(value.Payload) ||
 		value.Status != stringValue(value.Payload["status"])) {
-		return errors.New("Codex command status event is invalid")
+		return errors.New("codex command status event is invalid")
 	}
 	if value.Kind == EventQuestion && !validQuestionEvent(value.Payload) {
-		return errors.New("Codex question event is invalid")
+		return errors.New("codex question event is invalid")
 	}
 	if !validToolEventPayload(value.Kind, value.Payload) {
-		return errors.New("Codex tool event payload is invalid")
+		return errors.New("codex tool event payload is invalid")
 	}
 	for key, item := range value.Payload {
 		if _, ok := allowed[key]; !ok || !validEventPayloadValue(value.Kind, key, item) {
-			return errors.New("Codex event payload contains unsupported fields")
+			return errors.New("codex event payload contains unsupported fields")
 		}
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil || len(encoded) > MaxEventBytes {
-		return errors.New("Codex event exceeds the maximum size")
+		return errors.New("codex event exceeds the maximum size")
 	}
 	return nil
 }
@@ -743,7 +743,7 @@ func validPayloadValue(value any) bool {
 
 func (batch EventBatch) Validate() (int, error) {
 	if len(batch.Events) == 0 || len(batch.Events) > 256 {
-		return 0, errors.New("Codex event batch is invalid")
+		return 0, errors.New("codex event batch is invalid")
 	}
 	seen := make(map[string]struct{}, len(batch.Events))
 	total := 0
@@ -752,24 +752,24 @@ func (batch EventBatch) Validate() (int, error) {
 			return 0, err
 		}
 		if event.Kind == EventCommandStatus {
-			return 0, errors.New("Codex command status events are server-managed")
+			return 0, errors.New("codex command status events are server-managed")
 		}
 		if _, duplicate := seen[event.ProviderEventID]; duplicate {
-			return 0, errors.New("Codex event batch contains duplicate provider IDs")
+			return 0, errors.New("codex event batch contains duplicate provider IDs")
 		}
 		seen[event.ProviderEventID] = struct{}{}
 		encoded, err := json.Marshal(event)
 		if err != nil {
-			return 0, errors.New("Codex event batch is invalid")
+			return 0, errors.New("codex event batch is invalid")
 		}
 		total += len(encoded)
 		if total > MaxEventBatchBytes {
-			return 0, errors.New("Codex event batch exceeds the maximum size")
+			return 0, errors.New("codex event batch exceeds the maximum size")
 		}
 	}
 	encoded, err := json.Marshal(batch)
 	if err != nil || len(encoded) > MaxEventBatchBytes {
-		return 0, errors.New("Codex event batch exceeds the maximum size")
+		return 0, errors.New("codex event batch exceeds the maximum size")
 	}
 	return total, nil
 }
@@ -832,27 +832,27 @@ func (command CommandInput) Validate() error {
 	case CommandSend:
 		if !validCommandText(command.Text) || command.TurnID != "" || command.ApprovalID != "" || command.ApprovalVersion != "" ||
 			command.QuestionRequestID != "" || command.QuestionVersion != "" || command.Answers != nil || command.Decision != "" {
-			return errors.New("Codex send command is invalid")
+			return errors.New("codex send command is invalid")
 		}
 	case CommandInterrupt:
 		if !validVisibleString(command.TurnID, 1, 512) || command.Text != "" || command.ApprovalID != "" || command.ApprovalVersion != "" ||
 			command.QuestionRequestID != "" || command.QuestionVersion != "" || command.Answers != nil || command.Decision != "" {
-			return errors.New("Codex interrupt command is invalid")
+			return errors.New("codex interrupt command is invalid")
 		}
 	case CommandApproval:
 		if !validVisibleString(command.ApprovalID, 1, 512) || !validVisibleString(command.ApprovalVersion, 1, 256) ||
 			(command.Decision != "approve" && command.Decision != "reject") || command.Text != "" || command.TurnID != "" ||
 			command.QuestionRequestID != "" || command.QuestionVersion != "" || command.Answers != nil {
-			return errors.New("Codex approval command is invalid")
+			return errors.New("codex approval command is invalid")
 		}
 	case CommandAnswerQuestion:
 		if !validOpaqueQuestionID(command.QuestionRequestID) || !questionVersionPattern.MatchString(command.QuestionVersion) ||
 			!validQuestionAnswers(command.Answers) || command.Text != "" || command.TurnID != "" || command.ApprovalID != "" ||
 			command.ApprovalVersion != "" || command.Decision != "" {
-			return errors.New("Codex question answer command is invalid")
+			return errors.New("codex question answer command is invalid")
 		}
 	default:
-		return errors.New("Codex command type is invalid")
+		return errors.New("codex command type is invalid")
 	}
 	return nil
 }

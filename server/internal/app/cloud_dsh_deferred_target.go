@@ -12,9 +12,9 @@ import (
 	"morde/server/internal/runtimeclient"
 )
 
-// DeferredTaskTarget is the immutable user-selected target on the original
-// routed message. It is only an intent: looking it up must not probe the Host
-// or bind a Workspace snapshot.
+// DeferredTaskTarget is the immutable target intent on the original routed
+// message. It is only an intent: looking it up must not probe the Host or bind
+// a Workspace snapshot.
 type DeferredTaskTarget struct {
 	HostID                  string
 	WorkspaceID             string
@@ -33,7 +33,7 @@ type DeferredTaskTargetStore interface {
 }
 
 // DeferredTaskWorkspaceResolver derives the personal Workspace bound to the
-// selected Host only when a Workspace-scoped Host tool is actually invoked.
+// configured Host only when a Workspace-scoped Host tool is actually invoked.
 // The binding version is rechecked by BindDeferredTaskTarget.
 type DeferredTaskWorkspaceResolver interface {
 	ResolveDeferredTaskWorkspace(context.Context, task.Task, DeferredTaskTarget) (DeferredTaskTarget, bool, error)
@@ -65,7 +65,7 @@ func deferredWorkspaceToolDefinitions(authorization task.Authorization) []AgentT
 		if !principal.HasScope(definitions[i].RequiredScope) {
 			continue
 		}
-		definitions[i].Description = "Use the Workspace explicitly selected by the user. " +
+		definitions[i].Description = "Use only the Workspace selected for this Task. " +
 			"On the first call set expected_revision to -1; the server fixes the current authorized snapshot. " +
 			"Use the returned revision for later calls. Never invent an operation result. " + definitions[i].Description
 		var schema map[string]any
@@ -221,7 +221,15 @@ func deferredRuntimeToolDefinitions(target DeferredTaskTarget, authorization tas
 		if mapping.internal || !principal.HasScope(mapping.scope) {
 			continue
 		}
-		description := mapping.description + " The selected computer is checked only when this tool is called."
+		description := mapping.description + " Use only when the request requires the user's authorized cloud computer; ordinary text-only requests should not call this tool."
+		switch {
+		case target.Unavailable:
+			description += " The configured computer is unavailable or cannot be verified; do not switch to another computer."
+		case target.HostID == "":
+			description += " No default cloud computer is configured; ask the user to configure one before using this tool."
+		default:
+			description += " The configured computer and permissions are checked only when this tool is called."
+		}
 		parameters := append(json.RawMessage(nil), mapping.parameters...)
 		if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
 			parameters = deferredWorkspaceScopedToolParameters(parameters)
@@ -297,14 +305,14 @@ func (b *CloudDSHToolBroker) pauseDeferredTarget(ctx context.Context, claimed ta
 	if current.Status != task.StatusRunning || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "task is not running")
 	}
-	message := "所选云端电脑当前不可用或无法确认访问权限，本次操作未执行。"
+	message := "目标云端电脑当前不可用或无法确认访问权限，本次操作未执行。"
 	switch reason {
 	case "computer_target_missing":
-		message = "尚未选择云端电脑，本次操作未执行。"
+		message = "尚未配置默认云端电脑，本次操作未执行。"
 	case "computer_target_changed":
 		message = "任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。"
 	case "workspace_unavailable":
-		message = "所选 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。"
+		message = "目标电脑的 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。"
 	case "workspace_target_changed":
 		message = "任务已绑定其他 Workspace，无法安全切换；请为新目标另发起任务。"
 	case "target_result_unknown":

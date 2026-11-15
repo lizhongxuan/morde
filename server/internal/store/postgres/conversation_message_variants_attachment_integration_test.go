@@ -69,7 +69,7 @@ func TestConversationVariantsReuseOnlySourceAuthorizedAttachments(t *testing.T) 
 
 			first := createAttachmentVariantForTest(t, f, principal, source.ID, 1,
 				app.ConversationMessageVariantEditResend, "variant-edit-001", "Edited request")
-			variantSourceMessageID := first.UserMessageID
+			var variantSourceMessageID string
 			if action == app.ConversationMessageVariantRegenerateText {
 				assistantID := mustID(t, domain.NewMessageID)
 				if err := f.store.WithTx(ctx, func(tx pgx.Tx) error {
@@ -84,6 +84,17 @@ WHERE operation_id=$1`, first.OperationID, assistantID)
 					return err
 				}); err != nil {
 					t.Fatal(err)
+				}
+				var assistantSource conversationVariantSource
+				if err := f.store.WithTx(ctx, func(tx pgx.Tx) error {
+					var err error
+					assistantSource, err = loadConversationVariantSource(ctx, tx, "", f.ownerID, f.ownerID, f.conversation.ID, assistantID)
+					return err
+				}); err != nil || assistantSource.SourceUserMessageID != first.UserMessageID {
+					var messages string
+					_ = f.store.pool.QueryRow(ctx, `SELECT string_agg(id||':'||role||':'||sequence||':'||source_kind||':'||actor_id, ',' ORDER BY sequence)
+FROM conversation_messages WHERE conversation_id=$1`, f.conversation.ID).Scan(&messages)
+					t.Fatalf("assistant source request = %q, want %q (source=%+v, messages=%s, err=%v)", assistantSource.SourceUserMessageID, first.UserMessageID, assistantSource, messages, err)
 				}
 				second := createAttachmentVariantForTest(t, f, principal, assistantID, 2,
 					app.ConversationMessageVariantRegenerateText, "variant-regen-001", "")

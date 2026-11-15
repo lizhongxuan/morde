@@ -133,6 +133,7 @@ type api struct {
 	deps         Deps
 	options      Options
 	authFailures *prometheus.CounterVec
+	workflow     *workflowMetrics
 }
 
 func New(deps Deps, options Options) (*gin.Engine, error) {
@@ -165,11 +166,15 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	workflow, err := newWorkflowMetrics(options.Metrics)
+	if err != nil {
+		return nil, err
+	}
 	engine := gin.New()
 	if err := engine.SetTrustedProxies([]string{"127.0.0.1/32", "::1/128"}); err != nil {
 		return nil, fmt.Errorf("configure api trusted proxies: %w", err)
 	}
-	h := &api{deps: deps, options: options, authFailures: authFailures}
+	h := &api{deps: deps, options: options, authFailures: authFailures, workflow: workflow}
 	engine.Use(middleware...)
 	engine.Use(h.securityHeaders)
 	engine.GET("/healthz", h.healthz)

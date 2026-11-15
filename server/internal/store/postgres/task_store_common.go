@@ -166,7 +166,7 @@ func validateTask(value task.Task) error {
 		value.ModelID == "" || strings.TrimSpace(value.Objective) == "" || (!validInitialStatus && !validInitialClarification) ||
 		value.ExecutionLocation != "server" || value.Authorization.Version < 1 ||
 		(value.ApplicationID != "" && (value.HostID == "" || !app.ValidHostApplicationID(value.ApplicationID))) ||
-		!value.FileDeliveryIntent.Valid() ||
+		!value.FileDeliveryIntent.Valid() || !value.QueuePriority.Valid() ||
 		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
 		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
 		(value.InputRevision != nil && *value.InputRevision < 0) || (len(value.ContextDigest) != 0 && len(value.ContextDigest) != 32) ||
@@ -198,6 +198,9 @@ func normalizeNewTask(value task.Task) task.Task {
 	if value.Authorization.Version == 0 {
 		value.Authorization.Version = 1
 	}
+	if value.QueuePriority == "" {
+		value.QueuePriority = task.QueuePriorityNormal
+	}
 	if !value.FileDeliveryIntent.Valid() {
 		value.FileDeliveryIntent = app.ClassifyFileDeliveryIntent(value.Objective, value.WorkspaceID != "")
 	}
@@ -223,7 +226,7 @@ func validateInitialTaskEvent(eventType string, payload []byte) ([]byte, error) 
 
 func validTaskEventType(value string) bool {
 	switch value {
-	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan":
+	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan", "task.priority":
 		return true
 	default:
 		return false

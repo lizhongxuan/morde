@@ -475,35 +475,35 @@ struct AIChatView: View {
     @State private var missingMinisFileName: String?
 
     var body: some View {
-        ZStack {
-            // Messages — floating tool preview overlaid at bottom
-            messagesArea
-                .overlay(alignment: .top) {
-                    VStack(spacing: 0) {
-                        if let error = vm.errorMessage {
-                            errorBanner(error)
-                        }
-                        // Transient notice (e.g. request-level image budget
-                        // elision). Auto-dismisses after ~4s.
-                        if let notice = vm.transientNotice {
-                            Text(notice)
-                                .font(.system(size: 12))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 12).padding(.vertical, 8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color.black.opacity(0.75))
-                                .onAppear {
-                                    let captured = notice
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                                        if vm.transientNotice == captured {
-                                            vm.transientNotice = nil
-                                        }
+        VStack(spacing: 0) {
+            if vm.errorMessage != nil || vm.transientNotice != nil {
+                VStack(spacing: 0) {
+                    if let error = vm.errorMessage {
+                        errorBanner(error)
+                    }
+                    // Transient notice (e.g. request-level image budget
+                    // elision). Auto-dismisses after ~4s.
+                    if let notice = vm.transientNotice {
+                        Text(notice)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.black.opacity(0.75))
+                            .onAppear {
+                                let captured = notice
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                                    if vm.transientNotice == captured {
+                                        vm.transientNotice = nil
                                     }
                                 }
-                        }
+                            }
                     }
-                    .padding(.top, (nmTopOverlay > 0 ? topSafeAreaInset + nmTopOverlay : 0) + 8)
                 }
+                .padding(.top, (nmTopOverlay > 0 ? topSafeAreaInset + nmTopOverlay : 0) + 8)
+            }
+            // Contextual status takes its own row above the message list.
+            messagesArea
                 // nanoMuse: upstream's `.overlay(alignment: .bottom) { ZStack … }` is one link of the chain,
                 // NanoMuseComposerHost (NanoMuseChatModifiers.swift): the composer column lies over the
                 // list's bottom edge, above the shell's bottom bar (`nmBottomOverlay`), and the list's
@@ -2651,15 +2651,12 @@ struct AIChatView: View {
                 maxContentWidth: maxContentWidth ?? 0,
                 floatingBarHeight: 0, // nanoMuse: the tool strip is part of the composer column, measured with it (NanoMuseComposerHost)
                 inputBarHeight: nmColumnHeight + nmBottomOverlay, // nanoMuse: the column lies over the list's bottom edge and the shell's bottom bar under it; the rows scroll under both and the last one stops above the column
-                topOverlay: nmTopOverlay // nanoMuse: the shell's Muse header over the list's top edge; the rows scroll under it and start below it
+                topOverlay: vm.errorMessage == nil && vm.transientNotice == nil ? nmTopOverlay : 0 // nanoMuse: reserve the shell header only while the list runs beneath it
             )
-            // nanoMuse: with the shell's header over the chat, the list runs up under it (and the
-            // status bar, which UIKit's own safe area handles) and keeps its rows down by
-            // `topOverlay`, so they dissolve under the header's scrim instead of ending at a hard
-            // edge under the face. A `safeAreaInset` on a UIKit view shortens the view, unlike a
-            // SwiftUI ScrollView, which is why the list needs to ignore it. Error and transient
-            // notices overlay the list and never change message or composer layout.
-            .ignoresSafeArea(.container, edges: nmTopOverlay > 0 ? Edge.Set.top : [])
+            // nanoMuse: with no status row, the shell header overlaps the chat and the list keeps
+            // its rows down by `topOverlay`. A visible status row is laid out above this list, so
+            // it uses neither the header overlap nor an extra collection-view inset.
+            .ignoresSafeArea(.container, edges: nmTopOverlay > 0 && vm.errorMessage == nil && vm.transientNotice == nil ? Edge.Set.top : [])
             // Empty/loading overlay for tap-to-dismiss-keyboard.
             // Placed BEFORE the directory timeline in the ZStack so the
             // timeline can sit on top and receive its own taps (folder-card

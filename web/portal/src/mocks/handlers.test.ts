@@ -1631,6 +1631,7 @@ describe("portal mock quota and capacity", () => {
     await allowHosts(2);
     const created = await createHostRequest({ name: "entry ticket" });
     const host = await created.json() as { id: string; url: string; expires_at: string };
+    await waitForHostState(host.id, "running");
 
     const response = await api(`/api/hosts/${host.id}/enter`, { method: "POST" });
     const checkedAt = Date.now();
@@ -1643,6 +1644,16 @@ describe("portal mock quota and capacity", () => {
     expect(url.searchParams.get("t")).toMatch(/^mock-/);
     expect(Date.parse(entry.expires_at)).toBeGreaterThan(checkedAt);
     expect(Date.parse(entry.expires_at)).toBeLessThanOrEqual(checkedAt + 61_000);
+  });
+
+  it("reports an unavailable stopped demo Host instead of throwing while building its entry URL", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const { items } = await (await api("/api/hosts")).json() as { items: Array<{ id: string }> };
+
+    const response = await api(`/api/hosts/${items[0]!.id}/enter`, { method: "POST" });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_state", message: "云端电脑尚未运行，暂时无法进入。", details: { state: "stopped" } } });
   });
 
   it("deletes the Host while retaining its independent Workspace, then deletes the Workspace separately", async () => {

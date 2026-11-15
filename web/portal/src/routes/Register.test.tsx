@@ -47,6 +47,7 @@ describe('registration page', () => {
 
   it('asks only for a username and password', () => {
     renderRoute('/register');
+    expect(screen.getByText('提交注册申请后，管理员审核通过即可在 Morde PC 和 iOS 客户端登录。')).toBeInTheDocument();
     expect(screen.getByLabelText('用户名')).toBeInTheDocument();
     expect(screen.getByLabelText('密码', { exact: true })).toBeInTheDocument();
     expect(screen.getByLabelText('确认密码')).toBeInTheDocument();

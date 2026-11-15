@@ -32,7 +32,7 @@ export function Register() {
     <section className="login-card" aria-labelledby="register-heading">
       <div className="login-brand"><span className="morde-brand-mark" aria-hidden="true">M</span><span>Morde 云端电脑</span></div>
       <h1 id="register-heading">注册账号</h1>
-      <p className="muted">提交注册申请后，管理员审核通过即可登录用户 Web。</p>
+      <p className="muted">提交注册申请后，管理员审核通过即可在 Morde PC 和 iOS 客户端登录。</p>
       <form onSubmit={(event) => void submit(event)}>
         <label htmlFor="register-name">用户名</label>
         <input id="register-name" name="name" autoComplete="username" required minLength={3} maxLength={64} value={name} onChange={(event) => setName(event.target.value)} />

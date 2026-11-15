@@ -1,10 +1,8 @@
 /**
- * Words for what a Hands or Reach call is doing, and the toasts for what other
- * devices did here. The status itself lives in the header pinned over the
- * conversation (`MuseHeader`); this file keeps the frame-wide overlay entry
- * that shows the notices (`notify`, and each remote `call` that ran here).
+ * Words for Hands or Reach calls and the accessibility announcements for
+ * actions completed by other devices while this frame is open.
  */
-import { Button, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import { createElement as h, useEffect, useState, type ReactNode } from 'react'
 import type { Translate } from './api.ts'
 import { call } from './api.ts'
@@ -141,18 +139,19 @@ function AskCard({ t, ask }: { t: Translate; ask: LiveAsk }): ReactNode {
 function Notices({ t, notices }: { t: Translate; notices: LiveNotice[] }): ReactNode {
   const [seen, setSeen] = useState(0)
   const latest = notices[notices.length - 1]
+  const latestID = latest?.id
+  useEffect(() => {
+    if (latestID === undefined) return undefined
+    const timer = window.setTimeout(() => {
+      setSeen(latestID)
+      void call('notices/clear', {}).catch(() => undefined)
+    }, 6000)
+    return () => window.clearTimeout(timer)
+  }, [latestID])
   if (!latest || latest.id <= seen) return null
   const text =
     latest.kind === 'call'
       ? t(callKey(latest.action), { from: latest.from, what: latest.text })
       : `${latest.from}${latest.title ? ` · ${latest.title}` : ''}: ${latest.text}`
-  return h(Toast, {
-    key: latest.id,
-    text,
-    holdMs: 6000,
-    onDone: () => {
-      setSeen(latest.id)
-      if (latest.id === notices[notices.length - 1]?.id) void call('notices/clear', {}).catch(() => undefined)
-    },
-  })
+  return h('div', { key: latest.id, className: 'nm-hidden', role: 'status', 'aria-live': 'polite' }, text)
 }

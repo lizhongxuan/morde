@@ -13,7 +13,6 @@
 import { createElement as h, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Translate } from './api.ts'
 import { Avatar } from './Avatar.tsx'
-import { Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import { aboutBus } from './About.tsx'
 import { bridge, openLink } from './bridge.ts'
 import { IconBulb, IconCalendar, IconChat, IconClose, IconFeed, IconDoc, IconMenu, IconPanelLeft, IconPin, IconPlus, IconPuzzle, IconSearch, IconShapes, IconTarget, IconBug, IconDownload, IconInfo, IconKeyboard, IconSettings } from './icons.tsx'
@@ -292,8 +291,7 @@ export function MuseSidebar(props: MuseSidebarProps): ReactNode {
     chats,
     menuAnchor ? h(CornerMenu, { anchor: menuAnchor, items: menuItems, onClose: () => setMenuAnchor(null) }) : null,
     docMenu ? h(CornerMenu, { anchor: docMenu.anchor, items: docItems, onClose: () => setDocMenu(null) }) : null,
-    notice ? h('div', { style: { position: 'fixed', top: 10, left: '50%', transform: 'translateX(-50%)', zIndex: 60, pointerEvents: 'none' } },
-      h(Toast, { key: notice.id, text: notice.text, holdMs: 8000, onDone: () => setNotice(null) })) : null)
+    notice ? h('div', { key: notice.id, className: 'nm-hidden', role: 'status', 'aria-live': 'polite' }, notice.text) : null)
 }
 
 /** `⌘ ,` style hint from the catalog's key names; empty when unbound. */

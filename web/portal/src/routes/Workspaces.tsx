@@ -763,12 +763,12 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
   return <section className="workspace-route">
     {import.meta.env.VITE_MOCK_API === '1' && <FloatingNotice className="notice-info" data-notice-label="演示模式">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实云端文件。</FloatingNotice>}
     {legacyCreateRecovery.pending && <FloatingNotice className="notice-warning" role="status">
-      <p>发现旧版云端文件创建请求。当前服务不支持独立创建工作区，因此不会重放请求。请先检查云端文件列表，确认后再清除本机恢复记录。</p>
-      <Link className="button button-secondary button-small" to="/workspaces">检查云端文件列表</Link>
+      <p>发现旧版云端文件创建请求。当前服务不支持独立创建工作区，因此不会重放请求。请先检查云端电脑与文件状态，确认后再清除本机恢复记录。</p>
+      <Link className="button button-secondary button-small" to="/hosts">查看云端电脑</Link>
       <button type="button" className="button button-secondary button-small" onClick={abandonRecovery}>我已核对，清除本机记录</button>
     </FloatingNotice>}
     {legacyCreateRecovery.invalid && <FloatingError role="alert">无法读取旧版云端文件创建恢复记录。请先检查云端文件列表，再清除本机记录。
-      <Link className="button button-secondary button-small" to="/workspaces">检查云端文件列表</Link>
+      <Link className="button button-secondary button-small" to="/hosts">查看云端电脑</Link>
       <button type="button" className="button button-secondary button-small" onClick={abandonRecovery}>我已核对，清除本机记录</button>
     </FloatingError>}
     {computerID && hosts.isSuccess && !computer && <FloatingNotice className="notice-warning">无法确认这台云端电脑的文件访问权限。</FloatingNotice>}
@@ -838,7 +838,6 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
                       setSelectedProjectTargetKey(key);
                       setSearchParams((current) => {
                         const next = new URLSearchParams(current);
-                        next.set('sync', '1');
                         next.set('host', target.hostId);
                         return next;
                       }, { replace: true });

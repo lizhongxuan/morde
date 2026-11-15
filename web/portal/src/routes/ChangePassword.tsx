@@ -4,7 +4,7 @@ import { Link } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 
-export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: string }) {
+export function ChangePassword({ loginPath = '/admin/login', cancelPath }: { loginPath?: string; cancelPath?: string }) {
   const client = useQueryClient();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -46,6 +46,7 @@ export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: str
           <input id="confirm-password" name="confirm_password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="button button-primary button-wide" type="submit" disabled={change.isPending}>{change.isPending ? '正在保存…' : '修改密码'}</button>
+          {cancelPath && <Link className="button button-secondary button-wide" to={cancelPath}>取消并返回账户</Link>}
         </form>
       </>}
     </section>

@@ -357,7 +357,7 @@ export class AccountRuntime {
         await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'task_start_already_settled' })
         return
       }
-      await this.send({ type: 'task_started', ...runtimeFields(this.runtime), ...fence })
+      await this.send({ type: 'task_started', ...runtimeFields(this.runtime), runtime_sequence: frame.runtime_sequence, ...fence })
       return
     }
     if (this.activeTaskIDs.has(fence.task_id)) {
@@ -604,7 +604,7 @@ export class AccountRuntime {
         this.lastAcceptedStart = { kind: 'task', digest: task.startDigest, key: task.key, runtimeSequence: task.runtimeSequence }
       }
       task.accepted = true
-      await this.send({ type: 'task_started', ...runtimeFields(this.runtime), ...task.fence })
+      await this.send({ type: 'task_started', ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence })
       task.started.resolve()
     } catch {
       task.startFailed = !task.accepted
@@ -904,7 +904,7 @@ export class AccountRuntime {
           task.terminal = true
           return
         }
-        await this.send({ ...frame, ...runtimeFields(this.runtime), ...task.fence, session_id: frame.session_id })
+        await this.send({ ...frame, ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence, session_id: frame.session_id })
       }).catch(() => this.terminateTask(task, 'output_failed'))
     }
   }
@@ -919,13 +919,13 @@ export class AccountRuntime {
       this.finishShutdownIfIdle()
     } else if (task.terminalFrame) {
       this.finishTask(task, false)
-      await this.send({ ...task.terminalFrame, ...runtimeFields(this.runtime), ...task.fence }).catch(() => {})
+      await this.send({ ...task.terminalFrame, ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence }).catch(() => {})
       this.finishShutdownIfIdle()
     } else if (task.terminating || !task.terminal) {
       this.finishTask(task, false)
       // shortcut: direct child exit is not cgroup proof; Guardian must verify all descendants before production stop claims.
       await this.send({
-        type: 'task_terminated', ...runtimeFields(this.runtime), ...task.fence, state: 'unknown',
+        type: 'task_terminated', ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence, state: 'unknown',
         reason: task.terminateReason ?? 'child_exited_without_result', process_exited: true,
       }).catch(() => {})
       this.finishShutdownIfIdle()

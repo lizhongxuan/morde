@@ -352,7 +352,7 @@ export function makeCodingPanel(t: Translate) {
           : null,
 
         !hub.connected && live.cloud.signedIn ? h('p', { className: 'nm-fine' }, t('cdOffHub')) : null,
-        toast ? h('p', { className: 'nm-fine' }, toast) : null,
+        toast ? h('div', { className: 'nm-room-toast', role: 'status' }, toast) : null,
         h('div', null,
           h(Button, { variant: 'outline', size: 'sm', disabled: loading, onClick: () => void load() }, h(IconRefresh, { size: 14 }), ' ', t('refresh')))),
       fresh

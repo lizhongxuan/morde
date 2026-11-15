@@ -235,7 +235,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		if !goalFollowupReadOnly {
 			definitions = append(definitions, cloudDSHTaskPlanDefinition())
 		}
-		if b.workspaceTools != nil && routed && details.Task.HostID == "" {
+		if b.workspaceTools != nil && routed && details.Task.HostID == "" && target.WorkspaceID != "" {
 			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization)...)
 		} else if b.workspaceTools != nil && cloudDSHWorkspaceToolsEligible(details.Task) {
 			definitions = append(definitions, cloudDSHWorkspaceToolDefinitions(*details.Task.WorkspaceCheckpointRevision)...)

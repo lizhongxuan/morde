@@ -166,6 +166,27 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
         XCTAssertEqual(objects["memory"]?["global"]?.revision, 5)
     }
 
+    @MainActor func testRestoredCloudMemoryRevisionDoesNotReplacePendingLocalDraft() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scope = String(repeating: "d", count: 64)
+        let draft = mutation(scopeKey: scope, mutationID: "memory-local-draft-001", content: "未提交的本机草稿")
+        try NanoMuseMordePersonalDataOutbox.enqueue(draft, scopeKey: scope, root: root)
+
+        var objects = ["memory": ["global": MordePersonalSyncObject(
+            object_type: "memory", object_id: "global", revision: 2,
+            body: .object(["content": .string("当前云端记忆")]))]]
+        let restored = MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 3,
+            body: .object(["content": .string("恢复的旧版本")]))
+        try NanoMuseMordePersonalContentStore.apply(
+            MordePersonalChange(change_sequence: 8, object_type: "memory", object_id: "global",
+                revision: 3, operation: "upsert", mutation_id: "memory-restore-001"),
+            item: restored, to: &objects)
+
+        XCTAssertEqual(objects["memory"]?["global"], restored)
+        XCTAssertEqual(try NanoMuseMordePersonalDataOutbox.load(scopeKey: scope, root: root), draft)
+    }
+
     @MainActor func testDuplicateAndOutOfOrderIncrementalChangesAreIdempotent() throws {
         let previous = MordePersonalSyncObject(object_type: "memory", object_id: "global", revision: 4,
                                                  body: .object(["content": .string("previous")]))

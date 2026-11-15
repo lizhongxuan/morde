@@ -188,7 +188,7 @@ describe('Connections', () => {
     await user.click(within(card).getByRole('button', { name: 'OAuth 授权' }));
     await waitFor(() => expect(begin).toHaveBeenCalledWith(mcpConnector.id, { expected_revision: 1 }));
     await waitFor(() => expect(popup.location.href).toContain('https://auth.example.test/authorize?state=opaque'));
-    expect(open).toHaveBeenCalledWith('about:blank', '_blank');
+    expect(open).toHaveBeenCalledWith('about:blank', 'morde-mcp-oauth');
     expect(popup.opener).toBeNull();
     expect(await screen.findByText(/正在等待 日历工具 的 OAuth 授权/)).toBeInTheDocument();
 
@@ -468,7 +468,7 @@ describe('Connections', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('模型流式能力已验证');
   });
 
-  it('creates a private connection, clears the secret field and checks the saved model', async () => {
+  it('creates a private connection, clears the secret field and automatically checks the saved model', async () => {
     const user = userEvent.setup();
     const personal: ModelConnection = { ...model, id: 'p7654321', name: '我的模型', model_name: 'private-model', shared: false, checked_at: null, capabilities: { text: false, tools: false, vision: false, text_stream: false } };
     let rows: ModelConnection[] = [];
@@ -490,17 +490,15 @@ describe('Connections', () => {
     await user.type(screen.getByLabelText('模型名'), 'private-model');
     await user.type(screen.getByLabelText('服务地址'), 'https://api.example.test/v1');
     await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
-    await user.click(screen.getByRole('button', { name: '保存个人模型' }));
+    await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
     expect(create).toHaveBeenCalledWith({ name: '我的模型', base_url: 'https://api.example.test/v1', model_name: 'private-model', api_key: 'private-test-secret', shared: false });
     const card = (await screen.findByRole('heading', { name: '我的模型', level: 3 })).closest('article')!;
-    expect(within(card).getByText('尚未检查；检查通过后可在 Assistant 的模型选项中选择。')).toBeInTheDocument();
+    expect(check).toHaveBeenCalledWith(personal.id);
+    expect(await within(card).findByText('本次检查：文本可用 · 工具调用可用 · 视觉未验证')).toBeInTheDocument();
     expect(screen.queryByDisplayValue('private-test-secret')).not.toBeInTheDocument();
     expect(screen.queryByText('private-test-secret')).not.toBeInTheDocument();
 
-    await user.click(within(card).getByRole('button', { name: '检查连接' }));
-    expect(check).toHaveBeenCalledWith(personal.id);
-    expect(await screen.findByText('本次检查：文本可用 · 工具调用可用 · 视觉未验证')).toBeInTheDocument();
     expect(screen.queryByText('private-test-secret')).not.toBeInTheDocument();
   });
 
@@ -543,7 +541,7 @@ describe('Connections', () => {
     await user.type(screen.getByLabelText('模型名'), 'private-model');
     await user.type(screen.getByLabelText('服务地址'), 'http://not-allowed.example.test/v1');
     await user.type(screen.getByLabelText('API 密钥'), 'must-not-send-secret');
-    await user.click(screen.getByRole('button', { name: '保存个人模型' }));
+    await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
     expect(create).not.toHaveBeenCalled();
     expect(screen.getByLabelText('服务地址')).toBeInvalid();
@@ -560,7 +558,7 @@ describe('Connections', () => {
     await user.type(screen.getByLabelText('模型名'), 'private-model');
     await user.type(screen.getByLabelText('服务地址'), 'https://not-allowed.example.test/v1');
     await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
-    await user.click(screen.getByRole('button', { name: '保存个人模型' }));
+    await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
     expect(create).toHaveBeenCalledOnce();
     expect(await screen.findByRole('alert')).toHaveTextContent('服务地址不在当前域名 allowlist 中');

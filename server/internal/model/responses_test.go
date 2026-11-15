@@ -190,6 +190,30 @@ func TestEncodeRequestDisablesReasoningOnlyForVerifiedGPT6Luna(t *testing.T) {
 	}
 }
 
+func TestEncodeRequestDisablesDeepSeekThinkingForNamedToolProbe(t *testing.T) {
+	payload, err := encodeRequest(app.ModelRequest{
+		Endpoint:        app.ModelEndpoint{BaseURL: "https://api.deepseek.com/v1", ModelID: "deepseek-flash"},
+		Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "probe"}},
+		Tools:           []app.ModelTool{{Name: "probe", Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)}},
+		RequiredTool:    "probe",
+		MaxOutputTokens: 64,
+		DisableThinking: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Reasoning  responseReasoning `json:"reasoning"`
+		ToolChoice toolChoice        `json:"tool_choice"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Reasoning.Effort != "none" || got.ToolChoice.Type != "function" || got.ToolChoice.Name != "probe" {
+		t.Fatalf("probe request = %s", payload)
+	}
+}
+
 func TestEncodeRequestUsesMaxReasoningOnlyForFirstPartyGPT6Luna(t *testing.T) {
 	payload, err := encodeRequest(app.ModelRequest{
 		Endpoint: app.ModelEndpoint{BaseURL: "https://api.openai.com/v1", ModelID: "gpt-6-luna"},

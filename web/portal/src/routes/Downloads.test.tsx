@@ -31,7 +31,7 @@ describe('desktop downloads page', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: '重试' }));
 
     expect(await screen.findByRole('heading', { name: '当前还没有可下载版本' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: '下载 Morde Desktop' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '下载 morde-pc' })).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(getDesktopDownloads).toHaveBeenCalledTimes(2);
   });

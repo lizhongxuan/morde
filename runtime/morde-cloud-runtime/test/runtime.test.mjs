@@ -3856,6 +3856,7 @@ test('account runtime acknowledges an identical active start retry without launc
   const [code] = await closed
   assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
   assert.equal(frames.filter(frame => frame.type === 'task_started' && frame.task_id === 'task_A').length, 2)
+  assert.ok(frames.filter(frame => frame.type === 'task_started' && frame.task_id === 'task_A').every(frame => frame.runtime_sequence === original.runtime_sequence))
   assert.equal(frames.filter(frame => frame.type === 'model' && frame.task_id === 'task_A').length, 1)
   assert.equal(frames.filter(frame => frame.type === 'settled' && frame.task_id === 'task_A').length, 1)
   assert.deepEqual(errors, [])

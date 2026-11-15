@@ -155,6 +155,11 @@ func TestModelGatewayReservesSettlesAndReturnsToolCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var usageObservation ModelUsageObservation
+	service.SetModelUsageObserver(func(value ModelUsageObservation) {
+		usageObservation = value
+		panic("metrics must remain advisory")
+	})
 	var text string
 	call := ModelCall{Source: ModelCallClient, Principal: identity.Principal{UserID: "u1234567", Role: identity.RoleUser,
 		Kind: identity.KindClient, TokenID: "t1234567", ClientInstallationID: "i1234567"},
@@ -169,8 +174,9 @@ func TestModelGatewayReservesSettlesAndReturnsToolCalls(t *testing.T) {
 	if !store.dispatch || store.reservation.OwnerID != call.Principal.UserID || store.reservation.ProviderModel != "test-model" ||
 		hex.EncodeToString(store.reservation.RequestDigest) != hex.EncodeToString(digest[:]) || !resolver.tools || resolver.image ||
 		store.settlement.Unknown || store.settlement.Usage.InputTokens != 3 || store.settlement.Usage.OutputTokens != 4 ||
-		client.request.Endpoint.APIKey != "platform-key" || client.calls != 1 {
-		t.Fatalf("reservation/settlement mismatch: %#v %#v", store.reservation, store.settlement)
+		client.request.Endpoint.APIKey != "platform-key" || client.calls != 1 ||
+		usageObservation != (ModelUsageObservation{Source: ModelCallClient, Known: true, InputTokens: 3, OutputTokens: 4}) {
+		t.Fatalf("reservation/settlement/usage observation mismatch: %#v %#v observation=%#v", store.reservation, store.settlement, usageObservation)
 	}
 }
 
@@ -787,5 +793,21 @@ func TestModelCapabilityProbeDisablesThinkingOnlyForProbe(t *testing.T) {
 	}
 	if client.request.DisableThinking {
 		t.Fatal("normal model task unexpectedly disabled thinking")
+	}
+}
+
+func TestModelToolCapabilityProbeDoesNotRequireStrictMode(t *testing.T) {
+	client := &modelGatewayClientTest{response: ModelResponse{
+		ToolCalls: []ModelToolCall{{CallID: "probe-call-001", Name: "morde_capability_probe", Arguments: `{"color":"red"}`}},
+		Usage:     ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1},
+	}}
+	service, err := NewModelGatewayService(&modelGatewayStoreTest{}, &modelGatewayResolverTest{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	capabilities, err := service.CheckModelCapability(context.Background(), principal, "p1234567", "probe-tools-001", "tools")
+	if err != nil || !capabilities.Tools || len(client.request.Tools) != 1 || client.request.Tools[0].Strict {
+		t.Fatalf("tool capability probe required strict provider mode: capabilities=%+v request=%+v error=%v", capabilities, client.request, err)
 	}
 }

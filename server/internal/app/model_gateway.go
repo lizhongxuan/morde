@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -100,6 +101,12 @@ type ModelCallSettlement struct {
 	ResponseInvalid    bool
 }
 
+type ModelUsageObservation struct {
+	Source                    ModelCallSource
+	Known                     bool
+	InputTokens, OutputTokens int64
+}
+
 type ModelCallStore interface {
 	ReserveModelCall(context.Context, ModelCallReservation) error
 	BeginModelCallDispatch(context.Context, ModelCallReservation) error
@@ -126,6 +133,36 @@ type ModelGatewayService struct {
 	projectBudget        *ProjectBudgetService
 	responseSealer       *Sealer
 	gpt6LunaMaxReasoning bool
+	usageObserverMu      sync.RWMutex
+	usageObserver        func(ModelUsageObservation)
+}
+
+func (s *ModelGatewayService) SetModelUsageObserver(observer func(ModelUsageObservation)) {
+	if s == nil {
+		return
+	}
+	s.usageObserverMu.Lock()
+	s.usageObserver = observer
+	s.usageObserverMu.Unlock()
+}
+
+func (s *ModelGatewayService) observeModelUsage(settlement ModelCallSettlement) {
+	s.usageObserverMu.RLock()
+	observer := s.usageObserver
+	s.usageObserverMu.RUnlock()
+	if observer == nil {
+		return
+	}
+	value := ModelUsageObservation{Source: settlement.Source, Known: !settlement.Unknown && settlement.Usage.Known}
+	if value.Known {
+		value.InputTokens, value.OutputTokens = settlement.Usage.InputTokens, settlement.Usage.OutputTokens
+	}
+	// shortcut: Metrics are advisory; drop a panicking observer so it cannot
+	// change the result of an already-settled model call.
+	func() {
+		defer func() { _ = recover() }()
+		observer(value)
+	}()
 }
 
 const modelRequestItemTokenReserve int64 = 32
@@ -548,9 +585,11 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 				return ModelResponse{}, errors.Join(fmt.Errorf("settle model call: %w", settleErr),
 					fmt.Errorf("preserve unknown model usage: %w", unknownErr))
 			}
+			s.observeModelUsage(ModelCallSettlement{Source: call.Source, Unknown: true})
 		}
 		return ModelResponse{}, fmt.Errorf("settle model call: %w", settleErr)
 	}
+	s.observeModelUsage(settlement)
 	if err := ctx.Err(); err != nil {
 		return ModelResponse{}, err
 	}

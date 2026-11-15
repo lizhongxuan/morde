@@ -354,6 +354,7 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 			ID: taskID, OwnerID: principal.UserID, InitiatorID: principal.UserID, ConversationID: conversationID,
 			HostID: command.HostID, WorkspaceID: command.WorkspaceID, InputRevision: inputRevision, ContextDigest: contextDigest,
 			ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Objective,
+			QueuePriority:      task.QueuePriorityNormal,
 			FileDeliveryIntent: fileDeliveryIntent,
 			ExecutionLocation:  "server", Status: initialStatus, WaitingReason: initialWaitingReason, CurrentStep: initialCurrentStep,
 			Authorization: authorization, Budget: command.Budget,
@@ -1110,7 +1111,7 @@ func validTaskStatus(status task.Status) bool {
 
 func validTaskEventType(value string) bool {
 	switch value {
-	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan":
+	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.plan", "task.priority":
 		return true
 	default:
 		return false

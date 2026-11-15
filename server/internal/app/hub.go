@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	HubMaxConnections            = 2048
+	HubMaxConnections            = 10_000
 	HubMaxConnectionsPerAccount  = 32
 	HubMaxDevicesInPresence      = 256
 	HubMaxQueuedFrames           = 32

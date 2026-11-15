@@ -22,8 +22,8 @@ export function Downloads() {
       </header>
 
       <section aria-labelledby="download-heading">
-        <h1 id="download-heading">下载 Morde Desktop</h1>
-        <p className="download-intro">在 Morde PC 端选择本机项目文件夹，手动同步到指定云端电脑；你的 AI 工具仍可使用本地文件。</p>
+        <h1 id="download-heading">下载 morde-pc</h1>
+        <p className="download-intro">在 morde-pc 中选择本机项目文件夹，手动同步到指定云端电脑；你的 AI 工具仍可使用本地文件。</p>
         {downloads.isPending && <p className="loading-card" role="status">正在读取可用版本…</p>}
         {downloads.isError && <div className="error-card" role="alert"><span>{errorDetails(downloads.error).message}</span><button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button></div>}
         {downloads.isSuccess && downloads.data.artifacts.length === 0 && <section className="empty-card download-empty"><h2>当前还没有可下载版本</h2><p>管理员发布桌面安装包后，这里会显示对应电脑的下载入口。</p></section>}

@@ -5927,7 +5927,7 @@ paths:
     post:
       tags: [Tasks]
       operationId: actOnTask
-      summary: Pause, resume, cancel, or retry one batch item
+      summary: Set queued priority, pause, resume, cancel, or retry one batch item
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -11407,14 +11407,16 @@ components:
         sync_expires_at: { type: string, format: date-time, description: Desktop only }
         web_session_credential: { type: string, pattern: '^chs_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true, description: Desktop only; install-bound user Web Session }
         web_session_expires_at: { type: string, format: date-time, description: Desktop only }
+        web_session_host_frame_source: { type: string, pattern: '^https?://\*\.[A-Za-z0-9.-]+(:[0-9]{1,5})?$', description: Desktop only; Content Security Policy source for authorized Cloud Computer frames }
         user: { $ref: '#/components/schemas/User' }
     ClientWebSessionResponse:
       type: object
       additionalProperties: false
-      required: [web_session_credential, web_session_expires_at]
+      required: [web_session_credential, web_session_expires_at, web_session_host_frame_source]
       properties:
         web_session_credential: { type: string, pattern: '^chs_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true }
         web_session_expires_at: { type: string, format: date-time }
+        web_session_host_frame_source: { type: string, pattern: '^https?://\*\.[A-Za-z0-9.-]+(:[0-9]{1,5})?$' }
     ClientScheduleGrantResponse:
       type: object
       additionalProperties: false
@@ -12258,6 +12260,9 @@ components:
     TaskStatus:
       type: string
       enum: [queued, running, waiting_user, pausing, paused, cancelling, completed, failed, cancelled]
+    TaskQueuePriority:
+      type: string
+      enum: [pinned, normal, background]
     TaskStepStatus:
       type: string
       enum: [queued, running, waiting_user, succeeded, failed, unknown]
@@ -12328,7 +12333,7 @@ components:
         reply_message_id: { oneOf: [{ $ref: '#/components/schemas/MessageId' }, { type: 'null' }] }
     TaskSummary:
       type: object
-      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, current_step, step_count, completed_step_count, budget, usage, dependencies, child_jobs, result_review, created_at, updated_at]
+      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, queue_priority, current_step, step_count, completed_step_count, budget, usage, dependencies, child_jobs, result_review, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/TaskId' }
         owner_id: { $ref: '#/components/schemas/UserId' }
@@ -12345,6 +12350,7 @@ components:
         model_id: { type: string }
         objective: { type: string }
         status: { $ref: '#/components/schemas/TaskStatus' }
+        queue_priority: { $ref: '#/components/schemas/TaskQueuePriority', description: User priority for queued work; tasks waiting for 15 minutes or longer are promoted into an age-ordered fairness band. }
         current_step: { type: [string, 'null'] }
         step_count: { type: integer, format: int64, minimum: 0, description: Count of Task steps excluding budget steps. }
         completed_step_count: { type: integer, format: int64, minimum: 0, description: Count of succeeded Task steps excluding budget steps; never greater than step_count. }
@@ -12753,10 +12759,12 @@ components:
       additionalProperties: false
       required: [action]
       properties:
-        action: { type: string, enum: [retry_batch_item, pause, resume, cancel] }
+        action: { type: string, enum: [retry_batch_item, set_priority, pause, resume, cancel] }
         expected_status: { $ref: '#/components/schemas/TaskStatus' }
         expected_current_revision: { type: integer, format: int64, minimum: 0 }
         expected_desired_revision: { type: integer, format: int64, minimum: 0 }
+        expected_event_sequence: { type: integer, format: int64, minimum: 0 }
+        queue_priority: { $ref: '#/components/schemas/TaskQueuePriority' }
         batch_item_id: { $ref: '#/components/schemas/BatchItemId' }
       description: >-
         retry_batch_item requires batch_item_id only. Pause, resume and cancel
@@ -12764,6 +12772,10 @@ components:
         expected_desired_revision are optional together; when both are present,
         both task revisions are compared atomically before applying the action.
         Legacy clients may omit both revision fields. Supplying only one is invalid.
+        set_priority requires queue_priority and expected_event_sequence and is
+        accepted only while the task is queued. Priority changes are
+        idempotent and append a task.priority event. Supplying fields for a
+        different action is invalid.
     TaskWorkspaceViewDeletionRequest:
       type: object
       additionalProperties: false
@@ -12801,15 +12813,17 @@ components:
         action: { type: string }
         status: { $ref: '#/components/schemas/TaskStatus' }
         unsettled_operation_ids: { type: array, items: { $ref: '#/components/schemas/OperationId' } }
+        queue_priority: { $ref: '#/components/schemas/TaskQueuePriority' }
+        event_sequence: { type: integer, format: int64, minimum: 0 }
     TaskEvent:
       type: object
       description: >-
-        Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision; task.plan exposes step_id, sequence, task_revision, and plan_revision only, with the authorized Task snapshot carrying plan content. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication.
+        Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision; task.plan exposes step_id, sequence, task_revision, and plan_revision only, with the authorized Task snapshot carrying plan content; task.priority exposes priority and previous_priority only. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication.
       required: [task_id, sequence, type, created_at, payload]
       properties:
         task_id: { $ref: '#/components/schemas/TaskId' }
         sequence: { type: integer, minimum: 1 }
-        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan] }
+        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan, task.priority] }
         created_at: { type: string, format: date-time }
         payload: {}
     Notification:
@@ -13041,7 +13055,7 @@ components:
       type: object
       required: [type, count]
       properties:
-        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan] }
+        type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan, task.priority] }
         count: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
     AdminAuditEventCount:

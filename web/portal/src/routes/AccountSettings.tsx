@@ -213,6 +213,7 @@ type AccountSectionID = typeof accountSections[number]['id'];
 export function AccountSettings() {
   const { user } = useAuth();
   const [activeSection, setActiveSection] = useState<AccountSectionID>('account');
+  const [loadedSections, setLoadedSections] = useState<Set<AccountSectionID>>(() => new Set(['account']));
 
   return <section>
     <div className="page-heading">
@@ -221,10 +222,13 @@ export function AccountSettings() {
     <nav className="subnav account-settings-tabs" role="tablist" aria-label="账户设置分区">
       {accountSections.map((item) => <button key={item.id} type="button" role="tab" id={`account-settings-tab-${item.id}`}
         aria-selected={activeSection === item.id} aria-controls={`account-settings-panel-${item.id}`}
-        className={activeSection === item.id ? 'button button-primary' : 'button button-secondary'} onClick={() => setActiveSection(item.id)}>{item.title}</button>)}
+        className={activeSection === item.id ? 'button button-primary' : 'button button-secondary'} onClick={() => {
+          setActiveSection(item.id);
+          setLoadedSections((current) => current.has(item.id) ? current : new Set(current).add(item.id));
+        }}>{item.title}</button>)}
     </nav>
     <section role="tabpanel" id="account-settings-panel-account" aria-labelledby="account-settings-tab-account" hidden={activeSection !== 'account'}>
-      <section className="connection-section" aria-labelledby="account-info-title">
+      {loadedSections.has('account') && <section className="connection-section" aria-labelledby="account-info-title">
         <div className="connection-section-heading"><div><h2 id="account-info-title">当前账号</h2><p className="muted">账号权限由服务端管理。</p></div></div>
         <article className="model-connection-card">
           <div className="model-connection-main">
@@ -234,19 +238,19 @@ export function AccountSettings() {
           <Link className="button button-secondary" to="/settings/password">修改密码</Link>
         </article>
         <div className="connection-section-heading account-clients-link"><div><h2>已登录设备</h2><p className="muted">查看或撤销已登录的电脑和手机。</p></div><Link className="button button-secondary" to="/clients">管理客户端</Link></div>
-      </section>
+      </section>}
     </section>
     <section role="tabpanel" id="account-settings-panel-privacy" aria-labelledby="account-settings-tab-privacy" hidden={activeSection !== 'privacy'}>
-      <RecordConsentSettings />
+      {loadedSections.has('privacy') && <RecordConsentSettings />}
     </section>
     <section role="tabpanel" id="account-settings-panel-personal-data" aria-labelledby="account-settings-tab-personal-data" hidden={activeSection !== 'personal-data'}>
-      <PersonalSyncSettings />
+      {loadedSections.has('personal-data') && <PersonalSyncSettings />}
     </section>
     <section role="tabpanel" id="account-settings-panel-record-status" aria-labelledby="account-settings-tab-record-status" hidden={activeSection !== 'record-status'}>
-      <MyRecordCaptureStatuses />
+      {loadedSections.has('record-status') && <MyRecordCaptureStatuses />}
     </section>
     <section role="tabpanel" id="account-settings-panel-saved-records" aria-labelledby="account-settings-tab-saved-records" hidden={activeSection !== 'saved-records'}>
-      <MyRecordSettings />
+      {loadedSections.has('saved-records') && <MyRecordSettings />}
     </section>
   </section>;
 }

@@ -17,7 +17,7 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         XCTAssertFalse(retry.isEnabled, "Retry must stay disabled while the accepted request is in flight.")
 
         XCTAssertTrue(app.descendants(matching: .any)
-            .matching(identifier: "morde.task.step.s0000008").firstMatch.waitForExistence(timeout: 15),
+            .matching(identifier: "morde.task.step.details.s0000008").firstMatch.waitForExistence(timeout: 15),
             "The accepted response must be followed by a refreshed second attempt.")
         XCTAssertTrue(app.descendants(matching: .any)
             .matching(identifier: "morde.task.event.1").firstMatch.waitForExistence(timeout: 15),
@@ -61,13 +61,12 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         draft.tap()
         draft.typeText("Draft survives the task tab")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
-        element("morde.chat.transcript", in: app).tap()
-        let keyboard = app.keyboards.firstMatch
-        let keyboardDismissed = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
-        wait(for: [keyboardDismissed], timeout: 5)
+        let drawerTasks = app.buttons["morde.shell.drawer.tasks"]
+        if !drawerTasks.isHittable { app.buttons["morde.shell.drawer"].tap() }
+        XCTAssertTrue(drawerTasks.waitForExistence(timeout: 5))
+        drawerTasks.tap()
         XCTAssertTrue(tasksTab.waitForExistence(timeout: 5))
 
-        tasksTab.tap()
         XCTAssertTrue(tasksTab.isSelected)
         XCTAssertFalse(chatTab.isSelected)
         XCTAssertTrue(app.buttons["morde.tasks.row.q0000001"].waitForExistence(timeout: 15))
@@ -528,6 +527,8 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         let usernameField = app.textFields["morde.auth.username"]
         openMordeFromCurrentRoot(app)
         dismissLocalFixtureStartupError(in: app)
+        let expiredSignIn = app.buttons["morde.auth.expiredSignIn"]
+        if expiredSignIn.waitForExistence(timeout: 2), expiredSignIn.isHittable { expiredSignIn.tap() }
         if usernameField.waitForExistence(timeout: 10) {
             signInToFixtureAccount("mif-work-items-user", in: app)
         }
@@ -536,8 +537,8 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         let chatTab = app.buttons["morde.shell.tab.chat"]
         if chatTab.waitForExistence(timeout: 5), !chatTab.isSelected { chatTab.tap() }
         let mainChat = app.buttons["morde.shell.mainChat"]
-        if !mainChat.exists { drawer.tap() }
-        if mainChat.waitForExistence(timeout: 5) { mainChat.tap() }
+        if !mainChat.isHittable { drawer.tap() }
+        if mainChat.waitForExistence(timeout: 5), mainChat.isHittable { mainChat.tap() }
         if !extraArguments.contains("-morde.localConversationFailureFixture") {
             XCTAssertTrue(app.buttons["morde.shell.tab.tasks"].waitForExistence(timeout: 15))
         }
@@ -545,7 +546,7 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
     }
 
     private func openRetryableTaskStepFixture(extraArguments: [String]) -> XCUIApplication {
-        let app = launchFixture(extraArguments: ["-morde.localTaskPagesStatusFixture"] + extraArguments)
+        let app = launchExecutionFixture(extraArguments: ["-morde.localTaskPagesStatusFixture"] + extraArguments)
         let tasksTab = app.buttons["morde.shell.tab.tasks"]
         XCTAssertTrue(tasksTab.waitForExistence(timeout: 10))
         tasksTab.tap()
@@ -577,6 +578,8 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         let usernameField = app.textFields["morde.auth.username"]
         openMordeFromCurrentRoot(app)
         dismissLocalFixtureStartupError(in: app)
+        let expiredSignIn = app.buttons["morde.auth.expiredSignIn"]
+        if expiredSignIn.waitForExistence(timeout: 2), expiredSignIn.isHittable { expiredSignIn.tap() }
         if usernameField.waitForExistence(timeout: 10) {
             signInToFixtureAccount("mif-execution-user", in: app)
         }
@@ -668,9 +671,20 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         }
         usernameField.tap()
         usernameField.typeText(username)
-        app.secureTextFields["morde.auth.password"].tap()
-        app.secureTextFields["morde.auth.password"].typeText("LocalAccountFixture!2468")
-        app.buttons["morde.auth.submit"].tap()
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        passwordField.tap()
+        passwordField.typeText("fixturepassword2468")
+        let submitButton = app.buttons["morde.auth.submit"]
+        let submitReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"),
+                                                    object: submitButton)
+        XCTAssertEqual(XCTWaiter.wait(for: [submitReady], timeout: 5), .completed,
+                       "The local fixture password must reach the sign-in form before submitting.")
+        submitButton.tap()
+        let loginError = app.alerts["请求失败"]
+        if loginError.waitForExistence(timeout: 5) {
+            XCTFail("Local fixture login failed: \(loginError.debugDescription)")
+            return
+        }
         let signedIn = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
                                                  object: usernameField)
         XCTAssertEqual(XCTWaiter.wait(for: [signedIn], timeout: 15), .completed,

@@ -66,7 +66,7 @@ const workItem: ProjectWorkItem = {
 };
 const task = {
   id: 't0000001', owner_id: owner.user_id, initiator_id: owner.user_id, execution_location: 'server' as const, conversation_id: 'c0000001', model_id: 'model-test',
-  objective: '验证交付', status: 'completed' as const, current_step: null,
+  objective: '验证交付', status: 'completed' as const, queue_priority: 'normal' as const, current_step: null,
   step_count: 0, completed_step_count: 0,
   budget: { active_seconds: 0, tool_calls: 0, model_tokens: 0 }, usage: { active_seconds: 0, tool_calls: 0, model_tokens: 0 },
   dependencies: [], child_jobs: [], result_review: null,

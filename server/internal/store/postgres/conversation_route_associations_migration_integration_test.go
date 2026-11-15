@@ -119,13 +119,16 @@ WHERE table_schema=current_schema() AND table_name='conversation_message_routes'
 	if _, err := provider.UpTo(ctx, 193); err != nil {
 		t.Fatalf("reapply association migration: %v", err)
 	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("restore current schema for a new route: %v", err)
+	}
+	newMessage := accept(owner.ID, mustID(t, domain.NewMessageID), "route-association-new-001", conversationID)
 	var scopedUnique, unresolvedUnique bool
 	if err := pool.QueryRow(ctx, `SELECT
   EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversation_message_routes_scoped_message_unique'),
   to_regclass('conversation_route_model_calls_one_unresolved') IS NOT NULL`).Scan(&scopedUnique, &unresolvedUnique); err != nil || !scopedUnique || !unresolvedUnique {
 		t.Fatalf("migration constraints missing: scoped=%t unresolved=%t err=%v", scopedUnique, unresolvedUnique, err)
 	}
-	newMessage := accept(owner.ID, mustID(t, domain.NewMessageID), "route-association-new-001", conversationID)
 	var newAttempt int64
 	if err := pool.QueryRow(ctx, `SELECT route_attempt FROM conversation_message_routes WHERE message_id=$1`, newMessage.ID).Scan(&newAttempt); err != nil || newAttempt != 1 {
 		t.Fatalf("new route did not start at attempt 1: attempt=%d err=%v", newAttempt, err)

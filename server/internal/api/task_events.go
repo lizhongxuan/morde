@@ -33,6 +33,16 @@ func (h *api) streamTaskEvents(service TaskService) gin.HandlerFunc {
 			return
 		}
 		events, err := service.ListEvents(c.Request.Context(), principal, id, after, 100)
+		if after > 0 {
+			result := "resumed"
+			if err != nil {
+				result = "failed"
+				if domain.CodeOf(err) == domain.CodeEventCursorExpired && events.CurrentSequence > after {
+					result = "snapshot_required"
+				}
+			}
+			h.workflow.observeEventResume(result)
+		}
 		if err != nil {
 			if domain.CodeOf(err) == domain.CodeEventCursorExpired && events.CurrentSequence > after {
 				flusher, startErr := beginTaskEventStream(c)
@@ -277,6 +287,8 @@ func publicTaskEventFields(eventType string) ([]string, bool) {
 		return []string{"status", "reason", "task_revision"}, true
 	case "task.plan":
 		return []string{"step_id", "sequence", "task_revision", "plan_revision"}, true
+	case "task.priority":
+		return []string{"priority", "previous_priority"}, true
 	default:
 		return nil, false
 	}
@@ -322,6 +334,9 @@ func validPublicTaskEventField(field string, raw json.RawMessage) bool {
 		"pending_version", "clarification_version", "lease_version", "attempt":
 		var value int64
 		return json.Unmarshal(raw, &value) == nil && value >= 0
+	case "priority", "previous_priority":
+		var value task.QueuePriority
+		return json.Unmarshal(raw, &value) == nil && value.Valid()
 	default:
 		var value string
 		return json.Unmarshal(raw, &value) == nil && utf8.ValidString(value) && len(value) <= 8192 && !strings.ContainsRune(value, '\x00')
@@ -346,7 +361,7 @@ func validTaskEvent(event task.Event) bool {
 
 func validTaskEventName(value string) bool {
 	switch value {
-	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result":
+	case "task.status", "task.step", "task.operation", "task.message", "task.batch_item", "task.artifact", "task.waiting_user", "task.response", "task.result", "task.priority":
 		return true
 	default:
 		if len(value) > 128 || !strings.HasPrefix(value, "task.") {

@@ -337,7 +337,7 @@ describe('Workspaces', () => {
     expect(screen.getByText('docs/long-conflict-name-4.md')).toBeVisible();
   });
 
-  it('shows host-read failures outside the page and retries without leaving it', async () => {
+  it('shows host-read failures in the page flow and retries without leaving it', async () => {
     vi.mocked(portalApi.hosts).mockRejectedValueOnce(new Error('电脑列表暂不可用')).mockResolvedValue({ items: [] });
     const user = userEvent.setup();
     renderWorkspaces();
@@ -345,7 +345,7 @@ describe('Workspaces', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('无法读取云端电脑状态');
     expect(alert).toHaveTextContent('电脑列表暂不可用');
-    expect(alert.closest('.notice-center-panel')).toBeInTheDocument();
+    expect(alert.closest('.workspace-route')).toBeInTheDocument();
     await user.click(within(alert).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(screen.queryByText(/无法读取主机绑定状态/)).not.toBeInTheDocument());
   });
@@ -610,7 +610,7 @@ describe('Workspaces', () => {
     renderWorkspaces();
 
     expect(await screen.findByText(/当前服务不支持独立创建工作区，因此不会重放请求/)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '检查云端文件列表' })).toHaveAttribute('href', '/workspaces');
+    expect(screen.getByRole('link', { name: '查看云端电脑' })).toHaveAttribute('href', '/hosts');
     expect(screen.queryByRole('button', { name: '继续上次创建' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '＋ 创建云端电脑' })).not.toBeInTheDocument();
     const storageKey = 'morde.pending-workspace-create.u1234567';

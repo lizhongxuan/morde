@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url'
 // A Windows checkout may carry CRLF line endings (core.autocrlf); the tests look for
 // `\n<selector> {\n`, so the file is read with LF endings whatever the checkout did.
 const css = readFileSync(fileURLToPath(new URL('../src/client/styles.ts', import.meta.url)), 'utf8').replace(/\r\n/g, '\n')
+const capsule = readFileSync(fileURLToPath(new URL('../src/client/Capsule.tsx', import.meta.url)), 'utf8')
+const sidebar = readFileSync(fileURLToPath(new URL('../src/client/MuseSidebar.tsx', import.meta.url)), 'utf8')
 
 /** The declarations of the first rule whose selector list is exactly `selector`. */
 function rule(selector) {
@@ -29,6 +31,21 @@ test('the header block is centred without a transform and without pointer-events
   assert.match(header, /width:\s*fit-content/)
   // the old escape hatch is gone with the wrapper's pointer-events:none
   assert.doesNotMatch(css, /^\.nm-header > \* \{ pointer-events: auto; \}/m)
+})
+
+test('transient room notices occupy panel flow without covering content', () => {
+  const toast = rule('.nm-room-toast')
+  assert.match(rule('.nm-room'), /position:\s*relative/)
+  assert.doesNotMatch(toast, /position:\s*(?:absolute|fixed)/)
+  assert.match(toast, /width:\s*min\(420px, 100%\)/)
+  assert.match(toast, /overflow-wrap:\s*anywhere/)
+  assert.match(toast, /margin:\s*0 0 12px auto/)
+})
+
+test('frame notices do not render toast overlays', () => {
+  assert.doesNotMatch(capsule, /\bToast\b/)
+  assert.match(capsule, /className: 'nm-hidden', role: 'status', 'aria-live': 'polite'/)
+  assert.doesNotMatch(sidebar, /Toast|position: 'fixed'/)
 })
 
 test('the face, the header block and the rail face are no-drag islands on macOS and Windows', () => {

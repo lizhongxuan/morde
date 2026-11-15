@@ -12,7 +12,7 @@ import (
 
 var adminActivityTaskEventTypes = []string{
 	"task.status", "task.step", "task.operation", "task.message", "task.batch_item",
-	"task.artifact", "task.waiting_user", "task.response", "task.result",
+	"task.artifact", "task.waiting_user", "task.response", "task.result", "task.priority",
 }
 
 type adminHubOperationKey struct {

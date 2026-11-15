@@ -8,14 +8,14 @@ import afterPack from '../scripts/after-pack.cjs';
 
 test('Linux package launcher disables Chromium background networking and preserves arguments', async () => {
   const output = mkdtempSync(join(tmpdir(), 'morde-after-pack-'));
-  const executable = join(output, 'morde-client');
+  const executable = join(output, 'morde-pc');
   const received = join(output, 'arguments.txt');
   writeFileSync(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$MORDE_ARGS_OUT"\n');
   chmodSync(executable, 0o755);
 
   try {
-    await afterPack({ electronPlatformName: 'linux', appOutDir: output, packager: { appInfo: { productFilename: 'morde-client' } } });
-    assert.equal(existsSync(join(output, 'morde-client-bin')), true);
+    await afterPack({ electronPlatformName: 'linux', appOutDir: output, packager: { appInfo: { productFilename: 'morde-pc' } } });
+    assert.equal(existsSync(join(output, 'morde-pc-bin')), true);
     assert.match(readFileSync(executable, 'utf8'), /--disable-background-networking --disable-component-update --host-resolver-rules=/);
     const result = spawnSync(executable, ['--user-data-dir=/tmp/test', 'argument with spaces'], {
       encoding: 'utf8',

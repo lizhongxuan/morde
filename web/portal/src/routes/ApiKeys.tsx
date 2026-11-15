@@ -62,7 +62,7 @@ export function ApiKeys() {
     const seconds = ttl ? Number(ttl) * 86400 : undefined;
     create.mutate({ name: name.trim(), ...(seconds ? { ttl_seconds: seconds } : {}) });
   };
-  const mcpURL = `${window.location.origin}/mcp`;
+  const mcpURL = `${document.querySelector<HTMLMetaElement>('meta[name="morde-service-origin"]')?.content || window.location.origin}/mcp`;
   const copyEndpoint = async () => {
     try { await navigator.clipboard.writeText(mcpURL); notify('MCP 地址已复制。', 'success'); }
     catch { notify('浏览器未授予剪贴板权限，请手动复制地址。', 'error'); }

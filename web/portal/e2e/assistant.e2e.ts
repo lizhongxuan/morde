@@ -26,20 +26,19 @@ test.describe("Assistant durable tasks", () => {
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
 
-    const routes = ["/assistant", "/personal", "/goals", "/hosts", "/hosts?sync=1", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/projects", "/workspaces", "/local-projects"];
-    const routesWithContextSidebar = new Set(["/assistant", "/personal", "/goals", "/hosts", "/workspaces", "/local-projects"]);
+    const routes = ["/assistant", "/personal", "/goals", "/hosts", "/hosts?sync=1", "/hosts/sync", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/settings/sync", "/projects", "/workspaces", "/local-projects"];
     for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }, { width: 480, height: 720 }]) {
       await page.setViewportSize(viewport);
       for (const route of routes) {
         await page.goto(route);
         const routePath = new URL(route, "http://morde.test").pathname;
-        if (routePath === "/workspaces" || routePath === "/local-projects") await expect(page).toHaveURL(/\/hosts\?sync=1/);
+        if (routePath === "/workspaces" || routePath === "/local-projects" || route === "/hosts/sync" || route === "/settings/sync") await expect(page).toHaveURL(/\/hosts\?sync=1/);
         await expect(page.locator(".morde-shell"), `Portal shell for ${route} at ${viewport.width}px`).toBeVisible();
-        if (route === "/hosts?sync=1" || routePath === "/workspaces" || routePath === "/local-projects") {
+        if (new URL(page.url()).searchParams.get("sync") === "1" || routePath === "/workspaces" || routePath === "/local-projects" || route === "/settings/sync") {
           await expect(page.getByRole("heading", { name: "文件同步" })).toBeVisible();
         }
         const sidebarToggle = page.getByRole("button", { name: /折叠侧边栏|展开侧边栏/ });
-        if (routesWithContextSidebar.has(routePath)) {
+        if (["/assistant", "/personal", "/goals", "/hosts", "/settings", "/settings/sync", "/workspaces", "/local-projects"].includes(new URL(page.url()).pathname)) {
           await expect(sidebarToggle).toBeVisible();
           const expanded = await sidebarToggle.getAttribute("aria-expanded");
           await sidebarToggle.click();
@@ -60,7 +59,7 @@ test.describe("Assistant durable tasks", () => {
     }
   });
 
-  test("shows the quota error in a topbar popover without shifting the page", async ({ page }) => {
+  test("shows the quota error in the topbar flow without covering the page", async ({ page }) => {
     await page.goto("/");
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
@@ -77,33 +76,35 @@ test.describe("Assistant durable tasks", () => {
     }));
     await page.getByRole("button", { name: "＋ 创建电脑", exact: true }).click();
     const alert = page.getByRole("alert").filter({ hasText: "达到云端电脑上限,无法再创建" });
-    const noticeCenter = page.locator(".morde-topbar > .notice-center");
+    const noticeCenter = page.locator(".morde-top-actions > .notice-center");
     await expect(noticeCenter).toBeVisible();
-    await expect(noticeCenter).toHaveCSS("position", "static");
     await expect(noticeCenter.locator("details")).not.toHaveAttribute("open");
     await noticeCenter.locator("summary").click();
     await expect(alert).toBeVisible();
     expect(await alert.evaluate((node) => node.closest(".morde-topbar"))).not.toBeNull();
+    await expect(page.locator(".notice-center-panel")).toHaveCSS("position", "static");
     const layoutAfter = await page.evaluate(() => [".morde-topbar", ".morde-sidebar", ".morde-main"].map((selector) => {
       const { x, y, width, height } = document.querySelector(selector)!.getBoundingClientRect();
       return [x, y, width, height];
     }));
-    expect(layoutAfter).toEqual(layoutBefore);
-    await expect(page.locator(".notice-center-panel")).toHaveCSS("position", "absolute");
+    expect(layoutAfter[0][3]).toBeGreaterThan(layoutBefore[0][3]);
+    expect(layoutAfter[1][1]).toBeGreaterThan(layoutBefore[1][1]);
+    expect(layoutAfter[2][1]).toBeGreaterThan(layoutBefore[2][1]);
+    expect(layoutAfter[0][1] + layoutAfter[0][3]).toBeLessThanOrEqual(layoutAfter[2][1] + 1);
   });
 
-  test("opens assistant notifications without shifting or covering the composer", async ({ page }) => {
+  test("opens assistant notifications in layout flow without covering the composer", async ({ page }) => {
     await page.goto("/");
     await page.getByLabel("用户名").fill("demo");
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
 
-    for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }]) {
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }, { width: 480, height: 720 }]) {
       await page.setViewportSize(viewport);
       await page.goto("/assistant");
       const composer = page.locator(".assistant-composer");
       const noticeCenter = page.locator(".notice-center");
-      const region = page.locator(".notice-center-panel > div");
+      const region = page.locator(".notice-center-panel");
       await expect(composer).toBeVisible();
       let previousComposerTop = await composer.evaluate((element) => element.getBoundingClientRect().top);
       let stableReads = 0;
@@ -114,13 +115,12 @@ test.describe("Assistant durable tasks", () => {
         previousComposerTop = currentComposerTop;
       }
       expect(stableReads).toBeGreaterThanOrEqual(2);
-      const layoutBefore = await page.evaluate(() => ({
-        topbar: document.querySelector(".morde-topbar")!.getBoundingClientRect().toJSON(),
-        main: document.querySelector(".morde-main")!.getBoundingClientRect().toJSON(),
-        composer: document.querySelector(".assistant-composer")!.getBoundingClientRect().toJSON(),
-      }));
-      await region.evaluate((element) => {
-        for (const message of ["网络异常，部分对话数据暂时无法读取。", "模型连接暂不可用。"]) {
+      const topbarBefore = await page.locator(".morde-topbar").evaluate((element) => element.getBoundingClientRect().height);
+      await page.evaluate(() => {
+        const center = document.querySelector(".notice-center")!;
+        center.removeAttribute("hidden");
+        const element = center.querySelector(".notice-center-panel")!;
+        for (const message of ["网络异常，部分对话数据暂时无法读取。", "模型连接暂不可用。", "A".repeat(600)]) {
           const error = document.createElement("div");
           error.className = "toast-notice toast-error toast-error-notice";
           error.setAttribute("role", "alert");
@@ -129,11 +129,20 @@ test.describe("Assistant durable tasks", () => {
         }
       });
       await expect(noticeCenter).toBeVisible();
-      await expect(noticeCenter).toHaveCSS("position", "static");
       await noticeCenter.locator("summary").click();
       const errors = region.getByRole("alert");
-      await expect(errors).toHaveCount(2);
+      await expect(errors).toHaveCount(3);
       await expect(errors.first()).toBeVisible();
+      const longError = errors.nth(2);
+      const longErrorBounds = await longError.evaluate((element) => ({
+        width: element.getBoundingClientRect().width,
+        right: element.getBoundingClientRect().right,
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth,
+      }));
+      expect(longErrorBounds.width).toBeLessThanOrEqual(viewport.width - 32);
+      expect(longErrorBounds.right).toBeLessThanOrEqual(viewport.width);
+      expect(longErrorBounds.scrollWidth).toBeLessThanOrEqual(longErrorBounds.clientWidth + 1);
       const geometry = await page.evaluate(() => ({
         panel: document.querySelector(".notice-center-panel")!.getBoundingClientRect().toJSON(),
         topbar: document.querySelector(".morde-topbar")!.getBoundingClientRect().toJSON(),
@@ -141,11 +150,11 @@ test.describe("Assistant durable tasks", () => {
         composerTop: document.querySelector(".assistant-composer")!.getBoundingClientRect().top,
         regionPosition: getComputedStyle(document.querySelector(".notice-center-panel")!).position,
       }));
-      expect(geometry.regionPosition).toBe("absolute");
-      expect(geometry.topbar.height).toBe(layoutBefore.topbar.height);
-      expect(geometry.main).toEqual(layoutBefore.main);
-      expect(geometry.composerTop).toBe(layoutBefore.composer.top);
-      expect(geometry.panel.bottom, `${viewport.width}x${viewport.height}`).toBeLessThan(geometry.composerTop - 8);
+      expect(geometry.regionPosition).toBe("static");
+      expect(geometry.topbar.height).toBeGreaterThan(topbarBefore);
+      expect(geometry.topbar.bottom, `${viewport.width}x${viewport.height}`).toBeLessThanOrEqual(geometry.main.top + 1);
+      expect(geometry.panel.bottom, `${viewport.width}x${viewport.height}`).toBeLessThanOrEqual(geometry.topbar.bottom);
+      expect(geometry.topbar.bottom).toBeLessThan(geometry.composerTop - 8);
       expect(geometry.panel.right).toBeLessThanOrEqual(viewport.width);
       expect(geometry.panel.left).toBeGreaterThanOrEqual(0);
     }
@@ -216,7 +225,6 @@ test.describe("Assistant durable tasks", () => {
     await expect(page.getByRole("link", { name: "任务与计划", exact: true })).toHaveCount(0);
 
     await page.getByRole("button", { name: "新建旁聊" }).click();
-    await page.getByRole("combobox", { name: "选择目标电脑" }).selectOption("");
     const firstPrompt = `普通文字问题一 ${Date.now()}`;
     const secondPrompt = `普通文字问题二 ${Date.now()}`;
     const sendButton = page.getByRole("button", { name: "发送", exact: true });
@@ -357,7 +365,6 @@ test.describe("Assistant durable tasks", () => {
     await expect(page.getByRole("button", { name: /主会话/ })).toBeVisible();
     await page.getByRole("button", { name: "新建旁聊" }).click();
     await expect(page.getByRole("heading", { name: "新旁聊" })).toBeVisible();
-    await page.getByRole("combobox", { name: "选择目标电脑" }).selectOption("");
     const prompt = `会话文件分页隔离 ${Date.now()}`;
     await page.getByRole("textbox", { name: "消息内容" }).fill(prompt);
     await page.getByRole("button", { name: "发送", exact: true }).click();
@@ -574,7 +581,6 @@ test.describe("Assistant durable tasks", () => {
     await page.getByRole("button", { name: "登录" }).click();
     await page.goto("/assistant");
     await page.getByRole("button", { name: "新建旁聊" }).click();
-    await page.getByRole("combobox", { name: "选择目标电脑" }).selectOption("");
 
     const prompt = "长消息中文🙂".repeat(4_500);
     expect(new TextEncoder().encode(prompt).length).toBeGreaterThan(32 * 1024);

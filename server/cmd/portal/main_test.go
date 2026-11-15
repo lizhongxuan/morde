@@ -463,6 +463,33 @@ func TestMetricsHandlerOnlyExposesMetrics(t *testing.T) {
 	}
 }
 
+func TestModelUsageMetricsUseBoundedLabelsAndCountSettledUsage(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := newModelUsageMetrics(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.observe(app.ModelUsageObservation{Source: app.ModelCallTask, Known: true, InputTokens: 9, OutputTokens: 4})
+	metrics.observe(app.ModelUsageObservation{Source: app.ModelCallRoute, Known: false})
+	metrics.observe(app.ModelUsageObservation{Source: "untrusted-model-name", Known: true, InputTokens: 999})
+	response := httptest.NewRecorder()
+	metricsHandler(registry).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, expected := range []string{
+		`cloudhost_model_usage_calls_total{source="task",usage_state="known"} 1`,
+		`cloudhost_model_usage_calls_total{source="route",usage_state="unknown"} 1`,
+		`cloudhost_model_usage_tokens_total{direction="input",source="task"} 9`,
+		`cloudhost_model_usage_tokens_total{direction="output",source="task"} 4`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("model metrics missing %q:\n%s", expected, body)
+		}
+	}
+	if strings.Contains(body, "untrusted-model-name") || strings.Contains(body, "999") {
+		t.Fatalf("unbounded model label escaped into metrics:\n%s", body)
+	}
+}
+
 func TestPortalCommandUsageErrors(t *testing.T) {
 	for _, args := range [][]string{nil, {"unknown"}, {"migrate"}, {"user"}, {"user", "add"}} {
 		var stdout, stderr bytes.Buffer

@@ -25,6 +25,8 @@
 		8B886DA8A270E8FB58A9A1FA /* SpeechPlayerControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A302B074A0BE0AFED8EC7E9 /* SpeechPlayerControl.swift */; };
 		A1B2C3D4E5F60718293A4B5C /* SystemVoiceCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* SystemVoiceCatalog.swift */; };
 		A31D0F030000000000000001 /* MordeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F030000000000000002 /* MordeApp.swift */; };
+		F3A000000000000000000001 /* MordeCodexSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3A000000000000000000003 /* MordeCodexSessionPolicy.swift */; };
+		F3A000000000000000000002 /* MordeCodexSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3A000000000000000000004 /* MordeCodexSessionsView.swift */; };
 		A31D0F030000000000000003 /* MordeCredentialExpiry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F030000000000000004 /* MordeCredentialExpiry.swift */; };
 		A31D0F040000000000000002 /* MordeWorkspaceTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F040000000000000001 /* MordeWorkspaceTransfer.swift */; };
 		A31D0F040000000000000004 /* MordePortalNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31D0F040000000000000003 /* MordePortalNavigation.swift */; };
@@ -494,6 +496,8 @@
 		A11Y0002 /* ChatAccessibilityAnnouncer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatAccessibilityAnnouncer.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4B5D /* SystemVoiceCatalog.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SystemVoiceCatalog.swift; sourceTree = "<group>"; };
 		A31D0F030000000000000002 /* MordeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeApp.swift; sourceTree = "<group>"; };
+		F3A000000000000000000003 /* MordeCodexSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeCodexSessionPolicy.swift; sourceTree = "<group>"; };
+		F3A000000000000000000004 /* MordeCodexSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeCodexSessionsView.swift; sourceTree = "<group>"; };
 		A31D0F030000000000000004 /* MordeCredentialExpiry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeCredentialExpiry.swift; sourceTree = "<group>"; };
 		A31D0F040000000000000001 /* MordeWorkspaceTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordeWorkspaceTransfer.swift; sourceTree = "<group>"; };
 		A31D0F040000000000000003 /* MordePortalNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MordePortalNavigation.swift; sourceTree = "<group>"; };
@@ -1183,6 +1187,8 @@
 			isa = PBXGroup;
 			children = (
 				A31D0F030000000000000002 /* MordeApp.swift */,
+				F3A000000000000000000003 /* MordeCodexSessionPolicy.swift */,
+				F3A000000000000000000004 /* MordeCodexSessionsView.swift */,
 				A31D0F060000000000000002 /* MordeDesignNavigation.swift */,
 				A31D0F030000000000000004 /* MordeCredentialExpiry.swift */,
 				A31D0F070000000000000002 /* MordeHostStatusProjection.swift */,
@@ -2546,6 +2552,8 @@
 				AA26CCBE2F31080100AECF2D /* RootfsManager.swift in Sources */,
 				E51000001 /* MinisApp.swift in Sources */,
 				A31D0F030000000000000001 /* MordeApp.swift in Sources */,
+				F3A000000000000000000001 /* MordeCodexSessionPolicy.swift in Sources */,
+				F3A000000000000000000002 /* MordeCodexSessionsView.swift in Sources */,
 				A31D0F060000000000000001 /* MordeDesignNavigation.swift in Sources */,
 				A31D0F030000000000000003 /* MordeCredentialExpiry.swift in Sources */,
 				A31D0F070000000000000001 /* MordeHostStatusProjection.swift in Sources */,

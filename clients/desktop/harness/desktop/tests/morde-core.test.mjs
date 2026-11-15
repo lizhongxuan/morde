@@ -6,8 +6,8 @@ const future = '2099-01-01T00:00:00Z';
 const serviceInstanceID = '12345678-1234-4234-8234-123456789abc';
 const capabilities = { service_instance_id: serviceInstanceID, api_version: '1', hub_version: null, event_version: null, minimum_client_version: null, supported_features: ['password_login', 'client_installations', 'ordered_client_login'], default_max_request_bytes: 1048576 };
 const credentials = { origin: 'https://portal.example', serviceInstanceID, installationId: 'i1234567', clientCredential: 'client-secret', clientExpiresAt: future, syncCredential: 'sync-secret', syncExpiresAt: future };
-const loginBody = { installation_id: 'i1234567', client_credential: 'client-secret', client_expires_at: future, sync_credential: 'sync-secret', sync_expires_at: future, web_session_credential: 'web-secret', web_session_expires_at: future };
-const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+const loginBody = { installation_id: 'i1234567', client_credential: 'client-secret', client_expires_at: future, sync_credential: 'sync-secret', sync_expires_at: future, web_session_credential: 'web-secret', web_session_expires_at: future, web_session_host_frame_source: 'https://*.hosts.example.test' };
+const json = (value, status = 200) => new Response(JSON.stringify(value && typeof value === 'object' && 'web_session_credential' in value && !('web_session_host_frame_source' in value) ? { ...value, web_session_host_frame_source: 'https://*.hosts.example.test' } : value), { status, headers: { 'content-type': 'application/json' } });
 const attempt = (attemptGeneration = 1, idempotencyKey = `retry-${attemptGeneration}`) => ({ clientInstanceID: '123e4567-e89b-42d3-a456-426614174000', attemptGeneration: String(attemptGeneration), idempotencyKey });
 const syncDeviceID = 'AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA';
 const syncServerDeviceID = 'BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB';
@@ -59,7 +59,7 @@ test('account login sends one password request and receives separate Client, Syn
     assert.equal(calls[0].options.body, undefined);
     assert.equal(calls[1].url, 'https://portal.example/api/auth/client-login');
     assert.equal(calls[1].options.headers['Idempotency-Key'], 'retry-1');
-    assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'user', password: 'password', platform: 'desktop', display_name: 'Morde Desktop', client_instance_id: attempt().clientInstanceID, attempt_generation: 1 });
+    assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'user', password: 'password', platform: 'desktop', display_name: 'morde-pc', client_instance_id: attempt().clientInstanceID, attempt_generation: 1 });
     assert.equal(result.credentials.clientCredential, 'client-secret');
     assert.equal(result.credentials.serviceInstanceID, serviceInstanceID);
     assert.equal(result.credentials.syncCredential, 'sync-secret');
@@ -156,7 +156,7 @@ test('web renewal and logout only use the fixed Client bearer routes', async () 
   const calls = [];
   globalThis.fetch = async (url, options) => {
     calls.push({ url, options });
-    return url.endsWith('client-logout') ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ web_session_credential: 'new-web-secret', web_session_expires_at: future }), { headers: { 'content-type': 'application/json' } });
+    return url.endsWith('client-logout') ? new Response(null, { status: 204 }) : json({ web_session_credential: 'new-web-secret', web_session_expires_at: future });
   };
   try {
     const api = new MordeAPI(() => credentials);
@@ -253,6 +253,16 @@ test('invalid login responses and expired Client credentials fail closed', async
     await assert.rejects(() => new MordeAPI(() => null).login('https://portal.example', 'u', 'p', attempt()), /Invalid Morde client login response/);
     await assert.rejects(() => new MordeAPI(() => ({ ...credentials, clientExpiresAt: 'invalid' })).workspaces(), /Log in to Morde again/);
     assert.equal(calls, 2);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('login rejects unsafe Host frame sources from the service', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const hostFrameSource of ['https://*.hosts.example; script-src *', 'https://*..hosts.example', 'https://*.hosts.example:99999']) {
+      globalThis.fetch = async (url) => json(String(url).endsWith('/api/capabilities') ? capabilities : { ...loginBody, web_session_host_frame_source: hostFrameSource });
+      await assert.rejects(() => new MordeAPI(() => null).login('https://portal.example', 'u', 'p', attempt()), /Invalid Morde Web session response/);
+    }
   } finally { globalThis.fetch = originalFetch; }
 });
 

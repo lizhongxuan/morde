@@ -238,6 +238,8 @@
   - 追加 iOS 复验（2026-11-13）：以签名允许的模拟器构建运行 `testMordeDesignNavigationRoutes`，1/1 通过；在全新 iPhone 模拟器运行 `testMordeDrawerGeometrySearchAndConversationPagination`，1/1 通过，修正此前未签名构建触发的合成登录 `-3003` 记录。相同抽屉分页用例在复用模拟器仍于 XCTest 元素查询超时，日志已确认第二页 API 返回且对应行触发 `onAppear`，故记录为复用模拟器上的测试稳定性问题，尚未宣称通过。已移除临时诊断日志；未访问真实服务或传输文件，P19 保持进行中。
   - 追加静态检查（2026-11-13）：Portal、Workbench、Desktop typecheck，Workbench lint 与 Server `make lint`（0 issues）通过；Portal 全量 lint 仍失败于 `Assistant.tsx` 中 15 条 `react-hooks/refs`、`react-hooks/purity`、`react-hooks/set-state-in-effect` 诊断。此为已记录的 Assistant 存量诊断，未为通过全量 lint 而禁用规则或改写会话／草稿逻辑。当前反馈的 Assistant E2E 2/2 通过；完整全仓 lint／测试矩阵和其他平台实机仍未通过，P19 保持进行中。
 
+  - 追加 PC 页面核对（2026-11-15）：依据当前 `App.tsx` 在独立 Vite/MSW 和合成账号逐页检查登录、注册、下载、密码页、Assistant、电脑/创建/同步、Host 入口失败页、Codex、项目、个人数据七类页、目标/计划、连接、API Key、客户端、设置、通知及兼容跳转；Admin 因独立管理端未纳入本轮。修复电脑额度页空白（QA-026）与停止演示电脑进入时 Mock 500（QA-027），对应 `NewHost.test.tsx` 6/6、`handlers.test.ts` 63/63 通过，Portal typecheck、目标 ESLint、`git diff --check` 通过。单独 Electron 登录壳已实机显示；出现非主动本机登录请求（QA-028）后停止测试，未继续到认证页面。Mock UI 不作为真实服务证据，设计稿截图对照、原生认证后页面、真实 Host/Gateway、文件同步及 Codex 桥接仍待验收；P19、T22.14.2 和 G1 保持进行中。
+
 ## 最终验收记录
 
   - 追加复验（2026-11-12）：错误通知改为顶栏下固定覆盖层，Assistant 输入区不再遮挡提示；定向 Vitest 129/129、Playwright 多窗口用例 1/1、Portal typecheck、E2E ESLint 与 `git diff --check` 通过。Chrome localhost 页面处于认证恢复状态，因此此项实际浏览器检查使用本地 MSW；P19 继续待真实服务、Electron 与 Windows 验收。
