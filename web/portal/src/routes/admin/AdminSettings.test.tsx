@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
 import { portalApi } from '../../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminSettings } from './AdminSettings';
 
 type Settings = Awaited<ReturnType<typeof portalApi.adminSettings>>;
@@ -28,7 +29,7 @@ const sharedModel: ModelConnection = {
 function renderPage(modelItems: ModelConnection[] = []) {
   vi.spyOn(portalApi, 'adminModelConnections').mockResolvedValue({ items: modelItems, configuration_status: modelItems.length ? 'configured' : 'not_configured' });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><MemoryRouter><AdminSettings /></MemoryRouter></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><AdminSettings /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin settings', () => {

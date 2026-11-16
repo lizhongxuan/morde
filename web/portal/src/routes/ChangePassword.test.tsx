@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { portalApi } from '../app/api';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { ChangePassword } from './ChangePassword';
 
 vi.mock('../app/api', async (importOriginal) => {
@@ -15,7 +15,7 @@ vi.mock('../app/api', async (importOriginal) => {
 function renderPage(initialEntry = '/admin/change-password', loginPath = '/admin/login', cancelPath?: string) {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
   client.setQueryData(['auth', 'me'], { id: 'uadmin01', name: 'admin', role: 'super_admin' });
-  render(<ToastProvider><QueryClientProvider client={client}><MemoryRouter initialEntries={[initialEntry]}><Routes>
+  render(<ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><QueryClientProvider client={client}><MemoryRouter initialEntries={[initialEntry]}><Routes>
     <Route path={initialEntry} element={<ChangePassword loginPath={loginPath} cancelPath={cancelPath} />} />
   </Routes></MemoryRouter></QueryClientProvider></ToastProvider>);
   return client;
@@ -35,6 +35,27 @@ describe('change password page', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('两次输入的新密码不一致');
     expect(changePassword).not.toHaveBeenCalled();
+  });
+
+  it('shows an uncertain network result in a popup and keeps the password form', async () => {
+    vi.spyOn(portalApi, 'changePassword').mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    renderPage();
+    const input = userEvent.setup();
+    const currentPassword = screen.getByLabelText('当前密码');
+    const newPassword = screen.getByLabelText('新密码');
+    const confirmation = screen.getByLabelText('确认新密码');
+    await input.type(currentPassword, 'old-password');
+    await input.type(newPassword, 'new-password-1');
+    await input.type(confirmation, 'new-password-1');
+    await input.click(screen.getByRole('button', { name: '修改密码' }));
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('网络异常，密码修改结果暂时无法确认。');
+    expect(notice.closest('.login-card')).toBeNull();
+    expect(currentPassword).toHaveValue('old-password');
+    expect(newPassword).toHaveValue('new-password-1');
+    expect(confirmation).toHaveValue('new-password-1');
+    expect(portalApi.changePassword).toHaveBeenCalledOnce();
   });
 
   it('changes the password, then directs the administrator to log in again', async () => {

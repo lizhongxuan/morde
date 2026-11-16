@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router';
 import { errorDetails, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
 
 type EntryTarget = 'desktop' | 'terminal' | 'workspace' | null;
 
@@ -62,23 +64,30 @@ export function HostEntry() {
   const { id = '' } = useParams();
   const { search } = useLocation();
   const [error, setError] = useState('');
+  const [networkError, setNetworkError] = useState<unknown>(null);
+  const [retryNumber, setRetryNumber] = useState(0);
   const activeAttempt = useRef<{ key: string; active: boolean } | null>(null);
+  const retry = () => { setNetworkError(null); setRetryNumber((value) => value + 1); };
+  useNetworkReadNotice([{ failed: networkError !== null, error: networkError, retry }], '网络异常，暂时无法进入云端电脑。');
 
   useEffect(() => {
-    const key = `${id}${search}`;
+    const key = `${id}${search}#${retryNumber}`;
     let attempt = activeAttempt.current;
     if (!attempt || attempt.key !== key) {
       const nextAttempt = { key, active: true };
       attempt = nextAttempt;
       activeAttempt.current = nextAttempt;
       setError('');
+      setNetworkError(null);
       void Promise.resolve()
         .then(() => fetchEntryURL(id, parseEntryTarget(search)))
         .then((destination) => {
           if (activeAttempt.current === nextAttempt && nextAttempt.active) window.location.replace(destination);
         })
         .catch((reason: unknown) => {
-          if (activeAttempt.current === nextAttempt && nextAttempt.active) setError(errorDetails(reason).message);
+          if (activeAttempt.current !== nextAttempt || !nextAttempt.active) return;
+          if (isTransientNetworkError(reason)) setNetworkError(reason);
+          else setError(errorDetails(reason).message);
         });
     } else {
       attempt.active = true;
@@ -86,7 +95,7 @@ export function HostEntry() {
     return () => {
       if (attempt && activeAttempt.current === attempt) attempt.active = false;
     };
-  }, [id, search]);
+  }, [id, retryNumber, search]);
 
   return <main className="loading-page" aria-live="polite">
     {error

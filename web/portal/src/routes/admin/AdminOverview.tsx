@@ -1,12 +1,15 @@
 import { useQuery } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../../app/format';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 export function AdminOverview() {
   const query = useQuery({ queryKey: ['admin', 'overview'], queryFn: portalApi.adminOverview, refetchInterval: 30000 });
-  if (query.isPending) return <div className="loading-card" role="status">正在加载管理总览…</div>;
-  if (query.isError) return <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>;
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，管理总览暂时无法读取。');
+  if (query.isPending || (networkError && !query.data)) return <div className="loading-card" role="status">正在加载管理总览…</div>;
+  if (query.isError && !networkError) return <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>;
+  if (!query.data) return <div className="loading-card" role="status">正在加载管理总览…</div>;
 
   const { health, hosts_by_state: hosts, agents_by_state: agents } = query.data;
   const hostStates = Object.entries(hosts);

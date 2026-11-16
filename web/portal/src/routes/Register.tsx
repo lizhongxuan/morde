@@ -2,10 +2,13 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, Navigate, useNavigate } from 'react-router';
 import { errorDetails, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
+import { useToast } from '../app/toast';
 
 export function Register() {
   const { user, loading } = useAuth();
+  const { notify } = useToast();
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
@@ -23,6 +26,10 @@ export function Register() {
       await portalApi.register(name.trim(), password);
       navigate('/login', { replace: true, state: { registered: true } });
     } catch (reason) {
+      if (isTransientNetworkError(reason)) {
+        notify('网络异常，注册结果暂时无法确认。', 'error');
+        return;
+      }
       const details = errorDetails(reason);
       setValidationError(details.code === 'conflict' ? '用户名已被使用，请更换用户名。' : details.message);
     } finally { setBusy(false); }

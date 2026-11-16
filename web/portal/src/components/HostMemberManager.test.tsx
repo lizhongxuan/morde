@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
@@ -15,7 +15,7 @@ const member: HostMember = {
 
 function renderManager(hostId: string) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><HostMemberManager hostId={hostId} /></ToastProvider></QueryClientProvider>);
+  return { queryClient, ...render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><HostMemberManager hostId={hostId} /></ToastProvider></QueryClientProvider>) };
 }
 
 async function loginOwner() {
@@ -63,6 +63,31 @@ describe('HostMemberManager', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('成员列表暂不可用');
     await user.click(screen.getByRole('button', { name: '重试' }));
     expect(await screen.findByText('还没有共享成员。')).toBeInTheDocument();
+  });
+
+  it('keeps confirmed members visible and reports a transient refresh failure in a popup', async () => {
+    const read = vi.spyOn(portalApi, 'hostMembers')
+      .mockResolvedValueOnce({ items: [member] })
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [member] });
+    const user = userEvent.setup();
+    const { queryClient } = renderManager(hostId);
+
+    await expandManager(user);
+    expect(await screen.findByText(member.user_id)).toBeInTheDocument();
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: ['host-members', hostId] }); });
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('共享成员读取失败');
+    expect(notice.closest('.notice-center')).toHaveClass('notice-center-overlay');
+    expect(notice.closest('.host-member-manager')).not.toBeInTheDocument();
+    expect(screen.getByText(member.user_id)).toBeInTheDocument();
+    expect(document.querySelector('.host-member-manager .error-card')).not.toBeInTheDocument();
+
+    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(screen.getByText(member.user_id)).toBeInTheDocument();
   });
 
   it('does not open confirmation or call the API without at least one permission', async () => {

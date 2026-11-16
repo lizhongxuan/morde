@@ -2,10 +2,12 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'react-router';
+import { isTransientNetworkError } from '../../api/errors';
 import { useAuth } from '../../app/auth';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes, formatDate } from '../../app/format';
 import { useToast } from '../../app/toast';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 type Purpose = 'full_record' | 'training_contribution';
@@ -140,6 +142,18 @@ export function AdminRecords() {
     queryFn: () => portalApi.adminRecordAttachments(id, selected!.id),
     enabled: !!selected && hasCapability('attachment'),
   });
+  useNetworkReadNotice([
+    { failed: accessQuery.isError, error: accessQuery.error, retry: accessQuery.refetch },
+    { failed: settingsQuery.isError, error: settingsQuery.error, retry: settingsQuery.refetch },
+    { failed: recordsQuery.isError, error: recordsQuery.error, retry: recordsQuery.refetch },
+    { failed: detailQuery.isError, error: detailQuery.error, retry: detailQuery.refetch },
+    { failed: attachmentsQuery.isError, error: attachmentsQuery.error, retry: attachmentsQuery.refetch },
+  ], '网络异常，记录页面的部分数据暂时无法读取。');
+  const accessNetworkError = accessQuery.isError && isTransientNetworkError(accessQuery.error);
+  const settingsNetworkError = settingsQuery.isError && isTransientNetworkError(settingsQuery.error);
+  const recordsNetworkError = recordsQuery.isError && isTransientNetworkError(recordsQuery.error);
+  const detailNetworkError = detailQuery.isError && isTransientNetworkError(detailQuery.error);
+  const attachmentsNetworkError = attachmentsQuery.isError && isTransientNetworkError(attachmentsQuery.error);
   const refresh = () => {
     void client.invalidateQueries({ queryKey: ['admin', 'record-settings', id] });
     void client.invalidateQueries({ queryKey: ['admin', 'record-access', id] });
@@ -173,8 +187,8 @@ export function AdminRecords() {
 
   return <section className="admin-content">
     <div className="page-heading"><div><p className="eyebrow">账号记录</p><h1>记录与样本</h1><p className="muted">完整记录和训练样本使用独立同意；当前页面只显示获授权的元数据和操作。</p></div></div>
-    {accessQuery.isPending ? <div className="loading-card" role="status">正在读取记录权限…</div>
-      : accessQuery.isError ? <RecordsError error={accessQuery.error} retry={() => void accessQuery.refetch()} />
+    {accessQuery.isPending || (accessNetworkError && !accessQuery.data) ? <div className="loading-card" role="status">正在读取记录权限…</div>
+      : accessQuery.isError && !accessNetworkError ? <RecordsError error={accessQuery.error} retry={() => void accessQuery.refetch()} />
         : <>
           <section className="admin-detail-section" aria-labelledby="record-consent-heading">
             <h2 id="record-consent-heading">用户同意状态</h2>
@@ -182,8 +196,8 @@ export function AdminRecords() {
             <p className="muted">同意由用户本人管理。撤回或关闭同意后，页面不会显示相应正文。</p>
             <div className="admin-detail-facts" aria-label="当前管理员权限">{capabilities.map((item) => <article key={item}><span>{capabilityLabels[item]}</span><strong>{hasCapability(item) ? '已授权' : '无权限'}</strong></article>)}</div>
           </section>
-          {isSuperAdmin && settingsQuery.isPending ? <div className="loading-card" role="status">正在读取记录设置…</div>
-            : isSuperAdmin && settingsQuery.isError ? <RecordsError error={settingsQuery.error} retry={() => void settingsQuery.refetch()} />
+          {isSuperAdmin && (settingsQuery.isPending || (settingsNetworkError && !settingsQuery.data)) ? <div className="loading-card" role="status">正在读取记录设置…</div>
+            : isSuperAdmin && settingsQuery.isError && !settingsNetworkError ? <RecordsError error={settingsQuery.error} retry={() => void settingsQuery.refetch()} />
               : isSuperAdmin && settingsQuery.data ? <SuperAdminSettings ownerID={id} settings={settingsQuery.data} refresh={refresh} /> : null}
           <section className="admin-detail-section" aria-labelledby="admin-record-list-heading">
             <div className="page-heading"><div><h2 id="admin-record-list-heading">记录列表</h2><p className="muted">仅元数据列表；正文须单独点击并经过 view 授权。</p></div>
@@ -191,8 +205,9 @@ export function AdminRecords() {
             </div>
             {!hasCapability('view') ? <div className="empty-card compact" role="status"><p>当前管理员没有查看记录的授权。</p></div>
               : !enabledConsent ? <div className="empty-card compact" role="status"><p>此类别的记录同意默认关闭，当前没有可访问的记录。</p></div>
-                : recordsQuery.isPending ? <div className="loading-card" role="status">正在加载记录元数据…</div>
-                  : recordsQuery.isError ? <RecordsError error={recordsQuery.error} retry={() => void recordsQuery.refetch()} />
+                : recordsQuery.isPending || (recordsNetworkError && !recordsQuery.data) ? <div className="loading-card" role="status">正在加载记录元数据…</div>
+                  : recordsQuery.isError && !recordsNetworkError ? <RecordsError error={recordsQuery.error} retry={() => void recordsQuery.refetch()} />
+                    : !recordsQuery.data ? <div className="loading-card" role="status">正在加载记录元数据…</div>
                     : <>
                       <RecordList items={recordsQuery.data.items} selectedID={selected?.id ?? null} select={setSelected} />
                       {(beforeIDs.length > 0 || recordsQuery.data.next_before) && <nav className="admin-pagination" aria-label="记录分页">
@@ -204,8 +219,9 @@ export function AdminRecords() {
           </section>
           {selected && <section className="admin-detail-section" aria-labelledby="admin-record-detail-heading">
             <div className="page-heading"><div><h2 id="admin-record-detail-heading">记录详情</h2><p className="muted">{selected.id} · {purposeLabels[selected.purpose as Purpose] ?? selected.purpose}</p></div></div>
-            {detailQuery.isPending ? <div className="loading-card" role="status">正在读取正文…</div>
-              : detailQuery.isError ? <RecordsError error={detailQuery.error} retry={() => void detailQuery.refetch()} />
+            {detailQuery.isPending || (detailNetworkError && !detailQuery.data) ? <div className="loading-card" role="status">正在读取正文…</div>
+              : detailQuery.isError && !detailNetworkError ? <RecordsError error={detailQuery.error} retry={() => void detailQuery.refetch()} />
+                : !detailQuery.data ? <div className="loading-card" role="status">正在读取正文…</div>
                 : <pre className="audit-detail">{typeof detailQuery.data.payload === 'string' ? detailQuery.data.payload : JSON.stringify(detailQuery.data.payload, null, 2)}</pre>}
             <div className="inline-actions">
               {hasCapability('attachment') && selected.attachment_count > 0 && <span className="muted">附件列表在授权后显示。</span>}
@@ -216,9 +232,10 @@ export function AdminRecords() {
               {!hasCapability('delete') && <span className="muted">当前管理员没有删除权限。</span>}
             </div>
             {hasCapability('attachment') && selected.attachment_count > 0 && <section className="admin-detail-section" aria-labelledby="record-attachments-heading"><h3 id="record-attachments-heading">附件</h3>
-              {attachmentsQuery.isPending ? <div className="loading-card" role="status">正在读取附件…</div>
-                : attachmentsQuery.isError ? <RecordsError error={attachmentsQuery.error} retry={() => void attachmentsQuery.refetch()} />
-                  : attachmentsQuery.data.items.length ? <ul>{attachmentsQuery.data.items.map((item) => <li key={item.id}>{item.file_name} · {formatBytes(item.size_bytes)} <button type="button" className="button button-secondary button-small" disabled={downloadAttachment.isPending} onClick={() => downloadAttachment.mutate({ recordID: selected.id, attachmentID: item.id, fileName: item.file_name })}>下载到本机</button></li>)}</ul>
+              {attachmentsQuery.isPending || (attachmentsNetworkError && !attachmentsQuery.data) ? <div className="loading-card" role="status">正在读取附件…</div>
+                : attachmentsQuery.isError && !attachmentsNetworkError ? <RecordsError error={attachmentsQuery.error} retry={() => void attachmentsQuery.refetch()} />
+                  : !attachmentsQuery.data ? <div className="loading-card" role="status">正在读取附件…</div>
+                    : attachmentsQuery.data.items.length ? <ul>{attachmentsQuery.data.items.map((item) => <li key={item.id}>{item.file_name} · {formatBytes(item.size_bytes)} <button type="button" className="button button-secondary button-small" disabled={downloadAttachment.isPending} onClick={() => downloadAttachment.mutate({ recordID: selected.id, attachmentID: item.id, fileName: item.file_name })}>下载到本机</button></li>)}</ul>
                     : <div className="empty-card compact" role="status"><p>此记录没有可访问的附件。</p></div>}
             </section>}
             {confirmDelete && <div className="notice notice-warning" role="group" aria-label="确认删除记录"><p>删除后正文和专用附件会进入后台清理队列，不能撤销。</p><div className="inline-actions"><button type="button" className="button button-secondary" disabled={remove.isPending} onClick={() => setConfirmDelete(false)}>取消</button><button type="button" className="button button-danger-quiet" disabled={remove.isPending} onClick={() => remove.mutate()}>{remove.isPending ? '提交中…' : '确认删除记录'}</button></div></div>}

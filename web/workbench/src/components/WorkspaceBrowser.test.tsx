@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayWorkspaceBinding, type GatewayWorkspaceManifest } from '../api/gateway';
+import { WorkbenchNoticeProvider } from '../app/notice';
 import WorkspaceBrowser from './WorkspaceBrowser';
 
 const workspaceID = 'w1234567';
@@ -57,6 +58,42 @@ describe('WorkspaceBrowser', () => {
     fireEvent.click(screen.getByRole('button', { name: '下载' }));
 
     await waitFor(() => expect(gatewayApi.downloadWorkspaceFile).toHaveBeenCalledWith(workspaceID, 4, 'src/main.go'));
+  });
+
+  it('keeps the current manifest after a transient refresh failure and reports it in the fixed notice', async () => {
+    vi.mocked(gatewayApi.workspaceManifest).mockResolvedValueOnce(page([file('README.md', 1536)]))
+      .mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValue(page([file('README.md', 1536)]));
+    render(<WorkbenchNoticeProvider><WorkspaceBrowser active /></WorkbenchNoticeProvider>);
+
+    expect(await screen.findByText('README.md')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+    expect(await screen.findByLabelText('网络错误提示')).toHaveTextContent('Workspace 文件列表连接失败');
+    expect(screen.getByText('README.md')).toBeVisible();
+    expect(document.querySelector('.workspace-browser .workbench-floating-error')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(gatewayApi.workspaceManifest).toHaveBeenCalledTimes(3));
+    expect(screen.queryByLabelText('网络错误提示')).not.toBeInTheDocument();
+    expect(screen.getByText('README.md')).toBeVisible();
+  });
+
+  it('retains read-only data but disables Workspace actions while binding authorization is unknown', async () => {
+    const bindings = vi.mocked(gatewayApi.workspaces);
+    bindings.mockResolvedValueOnce({ items: [binding] }).mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [binding] });
+    const { rerender } = render(<WorkbenchNoticeProvider><WorkspaceBrowser active /></WorkbenchNoticeProvider>);
+    expect(await screen.findByText('README.md')).toBeVisible();
+
+    rerender(<WorkbenchNoticeProvider><WorkspaceBrowser active={false} /></WorkbenchNoticeProvider>);
+    rerender(<WorkbenchNoticeProvider><WorkspaceBrowser active /></WorkbenchNoticeProvider>);
+    expect(await screen.findByLabelText('网络错误提示')).toHaveTextContent('工作区状态连接失败');
+    expect(screen.getByText('README.md')).toBeVisible();
+    expect(screen.getAllByRole('button', { name: '下载' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    expect(screen.queryByText(/工作区状态连接中断/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(bindings).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: '下载' }).every((button) => !(button as HTMLButtonElement).disabled)).toBe(true));
   });
 
   it('loads a real read-only revision diff and safely renders bounded text', async () => {

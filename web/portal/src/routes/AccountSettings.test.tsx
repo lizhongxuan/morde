@@ -58,7 +58,7 @@ describe('AccountSettings', () => {
     results.slice(0, -1).forEach((result) => { setResult(result, true); });
     setResult(results[results.length - 1]!, false);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    const view = render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter><AccountSettings /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    const view = render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><AccountSettings /></MemoryRouter></ToastProvider></QueryClientProvider>);
     return { ...view, captureStatuses };
   }
 
@@ -109,6 +109,19 @@ describe('AccountSettings', () => {
     await waitFor(() => expect(captureStatuses).toHaveBeenCalledOnce());
     await user.click(screen.getByRole('tab', { name: '已保存记录' }));
     await waitFor(() => expect(records).toHaveBeenCalledOnce());
+  });
+
+  it('keeps the consent placeholder and reports transient read failures in an overlay', async () => {
+    vi.spyOn(portalApi, 'recordConsents').mockRejectedValue(new TypeError('Failed to fetch'));
+    const user = userEvent.setup();
+    renderSettings();
+
+    await user.click(screen.getByRole('tab', { name: '隐私与同意' }));
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('网络异常，记录同意设置暂时无法读取。');
+    expect(notice.closest('.notice-center-overlay')).toBeInTheDocument();
+    expect(notice.closest('.connection-section')).toBeNull();
+    expect(screen.getByRole('status')).toHaveTextContent('正在读取记录同意设置…');
   });
 
   it('updates one independent consent and reloads its server state', async () => {

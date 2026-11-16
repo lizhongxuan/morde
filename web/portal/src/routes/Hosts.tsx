@@ -7,6 +7,8 @@ import type { components } from '../api/schema';
 import { useAuth } from '../app/auth';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
+import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { HostMemberManager } from '../components/HostMemberManager';
 import { ScreenPagination } from '../components/ScreenPagination';
@@ -130,6 +132,11 @@ export function Hosts() {
     : hashHostID && sharedHosts.data?.items.some((host) => host.id === hashHostID) ? 'shared'
       : hashHostID && ownedHosts.some((host) => host.id === hashHostID) ? 'owned'
       : hosts.isSuccess && !ownedHosts.length && sharedHosts.data?.items.length ? 'shared' : 'owned';
+  useNetworkReadNotice([
+    { failed: listMode === 'owned' && hosts.isError, error: hosts.error, retry: hosts.refetch },
+    { failed: listMode === 'owned' && preferences.isError, error: preferences.error, retry: preferences.refetch },
+    { failed: listMode === 'shared' && sharedHosts.isError, error: sharedHosts.error, retry: sharedHosts.refetch },
+  ], '云端电脑信息读取失败，已保留当前内容。');
   const selectList = (mode: 'owned' | 'shared') => setListSelection({ mode, hash: location.hash });
   const enterShared = async (host: Awaited<ReturnType<typeof portalApi.sharedHosts>>['items'][number], entryTarget: 'desktop' | 'terminal' | 'workspace') => {
     try { enterHostInNewTab(host.id, entryTarget); }
@@ -159,11 +166,11 @@ export function Hosts() {
         <strong>{defaultHost ? '~/workspace/（随电脑持久保存）' : '选择电脑后显示'}</strong>
         {defaultHost && <Link to="/hosts?sync=1">文件同步</Link>}
       </div>
-      {preferences.isError && <FloatingError className="error-inline" role="alert">默认设置暂不可用。
+      {preferences.isError && !isTransientNetworkError(preferences.error) && <FloatingError className="error-inline" role="alert">默认设置暂不可用。
         <button type="button" className="button button-small button-secondary" onClick={() => void preferences.refetch()}>重试</button>
       </FloatingError>}
     </div>}
-    {hosts.isPending ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError ? <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError> : !ownedHosts.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <ScreenPagination
+    {hosts.isPending || (!hosts.data && hosts.isError && isTransientNetworkError(hosts.error)) ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError && !isTransientNetworkError(hosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError> : !ownedHosts.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <ScreenPagination
       items={displayedHosts}
       getKey={(host) => host.id}
       estimatedItemHeight={72}
@@ -198,9 +205,9 @@ export function Hosts() {
     />}
     </section> : <section className="shared-hosts-section design-panel">
       <div className="design-panel-header"><h2>共享给我的电脑</h2></div>
-      {sharedHosts.isPending ? <div className="loading-card" role="status">正在加载共享电脑…</div>
-        : sharedHosts.isError ? <FloatingError className="error-card" role="alert">{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>
-          : !sharedHosts.data.items.length ? <div className="empty-card compact"><p>还没有人与你共享云端电脑。</p></div>
+      {sharedHosts.isPending || (!sharedHosts.data && sharedHosts.isError && isTransientNetworkError(sharedHosts.error)) ? <div className="loading-card" role="status">正在加载共享电脑…</div>
+        : sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>
+          : !sharedHosts.data?.items.length ? <div className="empty-card compact"><p>还没有人与你共享云端电脑。</p></div>
             : <ScreenPagination
               items={displayedSharedHosts}
               getKey={(host) => host.id}
@@ -369,6 +376,7 @@ function HostControlPanel({ host, canControl, canReleaseAnyLease }: {
       return value && (value.active_transition || value.control_state === 'taking_over' || value.control_state === 'returning') ? 1500 : false;
     },
   });
+  useNetworkReadNotice([{ failed: control.isError, error: control.error, retry: control.refetch }], '电脑控制状态读取失败，已保留当前内容。');
   const updateControl = useMutation({
     mutationFn: (body: ControlActionRequest) => portalApi.hostControlAction(host.id, body),
     onSuccess: async (result, body) => {
@@ -468,7 +476,7 @@ function HostControlPanel({ host, canControl, canReleaseAnyLease }: {
       {canControl && !control.isPending && !control.isError && status && !transitioning && state === 'ai' && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('take_over')}>接管操作</button>}
       {canRelease && !transitioning && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('release')}>交还 AI</button>}
       {canControl && transition && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={resumeTransition}>{transition.action === 'take_over' ? '继续接管确认' : '继续交还确认'}</button>}
-      {control.isError && <button type="button" className="button button-secondary" onClick={() => void control.refetch()}>重试读取控制状态</button>}
+      {control.isError && !isTransientNetworkError(control.error) && <button type="button" className="button button-secondary" onClick={() => void control.refetch()}>重试读取控制状态</button>}
       {control.isPending && <span className="muted" role="status">正在读取控制状态…</span>}
     </div>
     {transition && <p className="host-control-transition" role="status">
@@ -478,7 +486,7 @@ function HostControlPanel({ host, canControl, canReleaseAnyLease }: {
       {transition.failure_reason === 'operations_pending' && pendingOperationCount === 0 && (transition.action === 'take_over' ? ' 云端仍有未完成操作，继续等待停止回执后再接管。' : ' 云端仍有未完成操作，继续等待工具结束后再交还。')}
     </p>}
     {transitioning && !transition && <p className="host-control-transition" role="status">控制状态正在切换，尚未收到最终确认；请等待刷新。</p>}
-    {control.isError && <FloatingError className="error-inline" role="alert">{errorDetails(control.error).message}</FloatingError>}
+    {control.isError && !isTransientNetworkError(control.error) && <FloatingError className="error-inline" role="alert">{errorDetails(control.error).message}</FloatingError>}
     {confirmAction && <ConfirmDialog
       title={confirmAction.action === 'take_over' ? `接管主机 ${host.name || host.id}` : `交还主机 ${host.name || host.id} 给 AI`}
       description={confirmAction.action === 'take_over'

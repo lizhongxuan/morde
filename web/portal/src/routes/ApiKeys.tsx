@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
+import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { OnceSecretDialog } from '../components/OnceSecretDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
@@ -27,6 +29,7 @@ export function ApiKeys() {
     queryKey: ['apikeys'],
     queryFn: async () => await portalApi.apiKeys() as unknown as { items: ApiKey[] },
   });
+  useNetworkReadNotice([{ failed: keys.isError, error: keys.error, retry: keys.refetch }], 'API Key 列表连接失败，已保留当前内容。');
   const [name, setName] = useState('');
   const [ttl, setTtl] = useState('');
   const [showCreate, setShowCreate] = useState(false);
@@ -87,7 +90,9 @@ export function ApiKeys() {
       </button>
     </form>}
 
-    {keys.isPending ? <div className="loading-card">正在加载…</div> : keys.isError ? <FloatingError className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError> : !keys.data?.items.length ? <div className="empty-card compact"><p>尚未创建 API Key。</p></div> : <div className="table-wrap" style={{ padding: '0 10px' }}>
+    {keys.isPending || (!keys.data && isTransientNetworkError(keys.error)) ? <div className="loading-card" role="status">正在加载…</div>
+      : keys.isError && !isTransientNetworkError(keys.error) ? <FloatingError className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError>
+        : keys.data && !keys.data.items.length ? <div className="empty-card compact"><p>尚未创建 API Key。</p></div> : keys.data ? <div className="table-wrap" style={{ padding: '0 10px' }}>
       <div aria-hidden="true" style={{ display: 'grid', gridTemplateColumns: apiKeyGridColumns, gap: 12, minWidth: 850, padding: '10px 8px', borderBottom: '1px solid #e9edf2', color: '#8793a4', background: '#fafbfc', fontSize: 10, fontWeight: 700 }}>
         <span>名称</span><span>权限</span><span>创建时间</span><span>最近使用</span><span>过期时间</span><span>状态</span><span>操作</span>
       </div>
@@ -111,7 +116,7 @@ export function ApiKeys() {
           </article>;
         }}
       />
-    </div>}
+    </div> : <div className="loading-card" role="status">正在加载…</div>}
     </section>
     {removing && <ConfirmDialog title="吊销 API Key" description={`“${removing.name || removing.id}”吊销后，后续请求会被拒绝；已经发出的外部操作仍可能完成。此操作不可撤销。`} confirmLabel="吊销 Key" danger busy={remove.isPending} onClose={() => setRemoving(null)} onConfirm={() => remove.mutate(removing.id)} />}
     {secret && <OnceSecretDialog title="API Key 已创建" secret={secret.key} expiresAt={formatDate(secret.expires_at)} onClose={() => { setSecret(null); create.reset(); }} />}

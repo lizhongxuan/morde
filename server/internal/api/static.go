@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 )
 
 const portalCSP = "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'; object-src 'none'"
+
+var portalInstallerFilename = regexp.MustCompile(`^morde-(?:pc|desktop)-\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?-(?:macos-(?:arm64|x64)\.dmg|windows-x64\.exe|linux-x64\.AppImage)$`)
 
 func (h *api) securityHeaders(c *gin.Context) {
 	c.Header("X-Content-Type-Options", "nosniff")
@@ -38,11 +41,56 @@ func (h *api) noRoute(c *gin.Context) {
 		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
 		return
 	}
+	if name, installer, ok := portalDownloadAsset(path); ok {
+		h.servePortalDownload(c, name, installer)
+		return
+	}
 	if h.options.LegacyPCPortalEnabled {
 		h.servePortal(c)
 		return
 	}
 	httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
+}
+
+func portalDownloadAsset(requestPath string) (string, bool, bool) {
+	if requestPath == "/downloads/manifest.json" {
+		return "downloads/manifest.json", false, true
+	}
+	const prefix = "/downloads/files/"
+	if !strings.HasPrefix(requestPath, prefix) {
+		return "", false, false
+	}
+	filename := strings.TrimPrefix(requestPath, prefix)
+	if !portalInstallerFilename.MatchString(filename) {
+		return "", false, false
+	}
+	return strings.TrimPrefix(requestPath, "/"), true, true
+}
+
+func (h *api) servePortalDownload(c *gin.Context, name string, installer bool) {
+	httpserver.SetRoute(c, "portal_download")
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		c.Header("Allow", "GET, HEAD")
+		c.Status(http.StatusMethodNotAllowed)
+		return
+	}
+	if h.options.PortalFiles == nil {
+		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
+		return
+	}
+	info, err := fs.Stat(h.options.PortalFiles, name)
+	if err != nil || info.IsDir() {
+		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
+		return
+	}
+	c.Header("Cache-Control", "no-cache")
+	if installer {
+		c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": path.Base(name)}))
+	}
+	request := c.Request.Clone(c.Request.Context())
+	request.URL.Path = "/" + name
+	request.URL.RawPath = ""
+	http.FileServer(http.FS(h.options.PortalFiles)).ServeHTTP(c.Writer, request)
 }
 
 func (h *api) serveAdmin(c *gin.Context) {

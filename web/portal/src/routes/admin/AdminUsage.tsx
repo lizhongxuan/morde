@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { isTransientNetworkError } from '../../api/errors';
 import { errorDetails, portalApi } from '../../app/api';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 type UsageDays = 7 | 30 | 90;
@@ -108,6 +110,12 @@ export function AdminUsage() {
   const [days, setDays] = useState<UsageDays>(7);
   const usage = useQuery({ queryKey: ['admin', 'usage', days], queryFn: () => portalApi.adminUsage(days) });
   const stats = useQuery({ queryKey: ['admin', 'stats'], queryFn: portalApi.adminStats });
+  useNetworkReadNotice([
+    { failed: usage.isError, error: usage.error, retry: usage.refetch },
+    { failed: stats.isError, error: stats.error, retry: stats.refetch },
+  ], '网络异常，平台统计暂时无法完整读取。');
+  const usageNetworkError = usage.isError && isTransientNetworkError(usage.error);
+  const statsNetworkError = stats.isError && isTransientNetworkError(stats.error);
 
   return <section className="admin-content">
     <section className="admin-detail-section" aria-labelledby="admin-model-usage-heading">
@@ -118,8 +126,8 @@ export function AdminUsage() {
       </select>
     </div></div>
       {usage.data && <p className="muted">统计区间：{usage.data.from} 至 {usage.data.to}</p>}
-      {usage.isPending ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
-        : usage.isError ? <UsageError error={usage.error} retry={() => void usage.refetch()} />
+      {usage.isPending || (usageNetworkError && !usage.data) ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
+        : usage.isError && !usageNetworkError ? <UsageError error={usage.error} retry={() => void usage.refetch()} />
           : <>
             <UsageMetrics data={usage.data} />
             <UsageByDay data={usage.data} />
@@ -128,8 +136,8 @@ export function AdminUsage() {
     </section>
     <section className="admin-detail-section" aria-labelledby="admin-platform-stats-heading">
       <h2 id="admin-platform-stats-heading">平台统计</h2>
-      {stats.isPending ? <div className="loading-card" role="status">正在加载平台统计…</div>
-        : stats.isError ? <UsageError error={stats.error} retry={() => void stats.refetch()} />
+      {stats.isPending || (statsNetworkError && !stats.data) ? <div className="loading-card" role="status">正在加载平台统计…</div>
+        : stats.isError && !statsNetworkError ? <UsageError error={stats.error} retry={() => void stats.refetch()} />
           : <PlatformStats data={stats.data} />}
     </section>
   </section>;

@@ -50,7 +50,7 @@ export function AdminLayout() {
     </aside>
     <main className="morde-main">
       <header className="morde-topbar"><div className="morde-crumb"><span>管理后台</span><span aria-hidden="true">/</span><h1 className="morde-crumb-title">{title}</h1></div><div className="morde-top-actions"><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></div></header>
-      <ToastNoticeCenter />
+      <ToastNoticeCenter autoOpenErrors overlay />
       <div id="admin-content" className="morde-page admin-page" tabIndex={-1}><Outlet /></div>
     </main>
   </div>;

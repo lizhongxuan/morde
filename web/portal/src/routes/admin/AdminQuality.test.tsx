@@ -3,13 +3,14 @@ import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminQuality } from './AdminQuality';
 
 type QualityData = Awaited<ReturnType<typeof portalApi.adminQuality>>;
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><AdminQuality /></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><AdminQuality /></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin quality and risk', () => {

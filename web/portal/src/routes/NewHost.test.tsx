@@ -19,7 +19,7 @@ const createdHost: Awaited<ReturnType<typeof portalApi.createHost>> = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return { client, ...render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>) };
 }
 
 describe('NewHost', () => {
@@ -38,6 +38,23 @@ describe('NewHost', () => {
     expect(screen.getByText(/已达到云端电脑数量上限/)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '返回云端电脑' })).toHaveAttribute('href', '/hosts');
     expect(screen.queryByRole('textbox', { name: /云端电脑名称/ })).not.toBeInTheDocument();
+  });
+
+  it('keeps the normal loading placeholder and shows a popup when the host list read fails', async () => {
+    vi.mocked(portalApi.hosts).mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValue({ items: [] });
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByRole('status')).toHaveTextContent('正在检查云端电脑数量');
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('云端电脑列表连接失败');
+    expect(notice.closest('.notice-center')).toHaveClass('notice-center-overlay');
+    expect(document.querySelector('.error-card')).not.toBeInTheDocument();
+
+    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    expect(await screen.findByRole('button', { name: '创建云端电脑' })).toBeEnabled();
+    expect(portalApi.hosts).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('allows an uncertain create to reconcile with its original idempotency key at quota', async () => {

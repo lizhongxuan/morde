@@ -3,6 +3,7 @@ import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminUsage } from './AdminUsage';
 
 type UsageData = Awaited<ReturnType<typeof portalApi.adminUsage>>;
@@ -26,7 +27,7 @@ const statsData: StatsData = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><AdminUsage /></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><AdminUsage /></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin usage and platform statistics', () => {

@@ -135,7 +135,7 @@ function harness({ checkpoint } = {}) {
       },
       events: new Map(), on(event, fn) { this.events.set(event, fn); },
       setPermissionRequestHandler(fn) { this.permissionRequest = fn; },
-      async clearStorageData() { this.cleared = true; },
+      async clearStorageData() { this.cleared = true; this.clearCount = (this.clearCount ?? 0) + 1; this.cookies.values = []; },
     };
     partitions.push(partition);
     return partition;
@@ -331,6 +331,43 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     portal.webContents.url = `${new URL(h.views[0].webContents.url).origin}/assistant`;
     await assert.rejects(h.invoke('morde:portal-project-stop', portal.webContents, [selection.selectionID]), /Invalid Portal window or route/);
     assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync/')), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+    rmSync(selectedRoot, { recursive: true, force: true });
+  }
+});
+
+test('cancelling the native project upload confirmation never registers or starts a sync session', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls);
+  const h = harness();
+  const selectedRoot = mkdtempSync(join(process.cwd(), '.morde-u13-cancel-project-'));
+  const selectedDirectory = join(selectedRoot, 'empty-project');
+  mkdirSync(selectedDirectory);
+  try {
+    await h.ready();
+    const portal = h.views[0];
+    portal.webContents.url = appURL(h, '/hosts/sync?host=h1234567');
+    h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] });
+    const selection = await h.invoke('morde:portal-project-select-directory', portal.webContents, ['h1234567', 'w1234567']);
+
+    let confirmation;
+    h.dialog.showMessageBox = async (_window, options) => { confirmation = options; return { response: 1 }; };
+    const result = await h.invoke('morde:portal-project-upload', portal.webContents, [selection.selectionID, 'empty-project']);
+
+    assert.deepEqual(result, { cancelled: true });
+    assert.equal(confirmation.title, '单向上传项目文件夹');
+    assert.deepEqual(confirmation.buttons, ['上传项目', '取消']);
+    assert.match(confirmation.message, /Local test computer.*empty-project/);
+    assert.match(confirmation.detail, /目标路径：~\/workspace\/project\/empty-project/);
+    assert.match(confirmation.detail, /云端变化不会下载到本机/);
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.endsWith('/sync-folders')), false);
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync-sessions')), false);
+    const state = await h.invoke('morde:portal-state', portal.webContents);
+    assert.equal(state.projectMappings.length, 1, 'cancellation keeps the local selection for a later explicit attempt');
+    assert.equal(state.syncCheckpoint, null, 'cancellation does not create a recovery point');
   } finally {
     globalThis.fetch = originalFetch;
     h.cleanup();
@@ -589,6 +626,42 @@ test('native Workbench exchange keeps the ticket and strict cookie in an isolate
     assert.equal(h.windows[0].contentView.attached.includes(workbench), false);
     assert.equal(workbench.webContents.isDestroyed(), true);
     assert.equal(partition.cleared, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('native Workbench setup failure removes its cookie and closes the partial view', async () => {
+  const originalFetch = globalThis.fetch;
+  const nonce = 'B'.repeat(32);
+  const ticket = 'A'.repeat(43);
+  const exchangeTarget = `https://host.example/__ch/wb/?embed=1&embed_nonce=${nonce}&tab=browser`;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/api/auth/client-web-session') return json({ web_session_credential: 'local-web-session', web_session_expires_at: future });
+    if (url.pathname === '/api/hosts/h1234567') return json(host);
+    if (url.pathname === '/api/hosts/h1234567/embed-tickets') return json({ exchange_url: 'https://host.example/__ch/embed-auth',
+      ticket, embed_nonce: nonce, targets: ['browser'], expires_at: future }, 201);
+    if (url.pathname === '/__ch/embed-auth') return new Response(null, { status: 303,
+      headers: { location: exchangeTarget, 'set-cookie': 'ch_embed=opaque.signed; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Strict' } });
+    return json({ error: { code: 'not_found', message: 'local mock route missing' } }, 404);
+  };
+  const h = harness();
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/assistant');
+    h.windows[0].contentView.addChildView = () => { throw new Error('view attachment failed'); };
+
+    await assert.rejects(h.invoke('morde:portal-workbench-open', portal, [{ hostID: 'h1234567', conversationID: 'c1234567',
+      initialTarget: 'browser', targets: ['browser'], shared: false }]), /view attachment failed/);
+
+    const workbench = h.views[1];
+    const partition = h.partitions.at(-1);
+    assert.equal(partition.clearCount, 2, 'the isolated session is cleared again after setup fails');
+    assert.deepEqual(partition.cookies.values, []);
+    assert.equal(workbench.webContents.isDestroyed(), true);
   } finally {
     globalThis.fetch = originalFetch;
     h.cleanup();

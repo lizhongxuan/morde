@@ -39,9 +39,10 @@ test('Portal preload exposes project and restricted local recovery operations', 
   const bridge = loadBridge('portal');
   assert.equal(bridge.exposed.name, 'morde');
   assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
-    'codexAddProfile', 'codexAuthorizeProfile', 'codexAuthorizeThread', 'codexListThreads', 'codexRevoke', 'codexRevokeProfile', 'codexSelectProfile', 'codexState', 'codexUpdateScopes',
+    'closeHostWorkbenchEmbed', 'codexAddProfile', 'codexAuthorizeProfile', 'codexAuthorizeThread', 'codexListThreads', 'codexRevoke', 'codexRevokeProfile', 'codexSelectProfile', 'codexState', 'codexUpdateScopes',
     'deletePreserved', 'legacyDiscardSync', 'legacyPauseSync', 'legacyResumeSync', 'legacyStopLiveSync', 'legacyStopSync', 'legacySyncState',
-    'onCodexState', 'onState', 'onSync', 'preserved', 'projectUploadTargets', 'restorePreserved', 'selectProjectDirectory', 'state', 'stopProjectSync', 'uploadProject',
+    'onCodexState', 'onHostWorkbenchMessage', 'onState', 'onSync', 'openHostWorkbenchEmbed', 'preserved', 'projectUploadTargets',
+    'restorePreserved', 'selectProjectDirectory', 'sendHostWorkbenchCommand', 'setHostWorkbenchBounds', 'state', 'stopProjectSync', 'uploadProject',
   ]);
   await bridge.exposed.value.projectUploadTargets();
   await bridge.exposed.value.selectProjectDirectory('h1234567', 'w1234567');
@@ -52,6 +53,13 @@ test('Portal preload exposes project and restricted local recovery operations', 
   await bridge.exposed.value.restorePreserved('w1234567', 'a'.repeat(32));
   await bridge.exposed.value.codexAuthorizeProfile('profile-a', ['read', 'live']);
   await bridge.exposed.value.codexRevokeProfile('profile-a');
+  const embedRequest = { hostID: 'h1234567', conversationID: 'c1234567', initialTarget: 'browser', targets: ['browser'], shared: false };
+  const bounds = { x: 10, y: 20, width: 640, height: 480 };
+  const command = { type: 'visibility', conversation_id: 'c1234567', visible: true };
+  await bridge.exposed.value.openHostWorkbenchEmbed(embedRequest);
+  await bridge.exposed.value.setHostWorkbenchBounds('nonce-1', bounds);
+  await bridge.exposed.value.sendHostWorkbenchCommand('nonce-1', command);
+  await bridge.exposed.value.closeHostWorkbenchEmbed('nonce-1');
   assert.deepEqual(bridge.calls, [
     ['morde:portal-project-upload-targets'],
     ['morde:portal-project-select-directory', 'h1234567', 'w1234567'],
@@ -62,6 +70,10 @@ test('Portal preload exposes project and restricted local recovery operations', 
     ['morde:portal-preserved-restore', 'w1234567', 'a'.repeat(32)],
     ['morde:codex-authorize-profile', 'profile-a', ['read', 'live']],
     ['morde:codex-revoke-profile', 'profile-a'],
+    ['morde:portal-workbench-open', embedRequest],
+    ['morde:portal-workbench-bounds', 'nonce-1', bounds],
+    ['morde:portal-workbench-command', 'nonce-1', command],
+    ['morde:portal-workbench-close', 'nonce-1'],
   ]);
 
   const received = [];
@@ -74,6 +86,14 @@ test('Portal preload exposes project and restricted local recovery operations', 
   }
   unsubscribe();
   assert.equal(bridge.removed[0][0], 'morde:portal-state');
+
+  const workbenchMessages = [];
+  const unsubscribeWorkbench = bridge.exposed.value.onHostWorkbenchMessage((value) => workbenchMessages.push(value));
+  const workbenchMessage = { type: 'ready', nonce: 'nonce-1' };
+  bridge.listeners.get('morde:portal-workbench-message')({}, workbenchMessage);
+  assert.deepEqual(workbenchMessages, [workbenchMessage]);
+  unsubscribeWorkbench();
+  assert.equal(bridge.removed.at(-1)[0], 'morde:portal-workbench-message');
 });
 
 test('Codex settings preload exposes profile connection consent and revocation', async () => {
@@ -89,11 +109,27 @@ test('Codex settings preload exposes profile connection consent and revocation',
   ]);
 });
 
-test('Host Workbench preload exposes only the validated return action', async () => {
+test('Host Workbench preload exposes return and bounded state signaling methods', async () => {
   const bridge = loadBridge('host-workbench');
-  assert.deepEqual(Object.keys(bridge.exposed.value), ['returnToPortalHosts']);
+  assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
+    'hostWorkbenchReady', 'onHostWorkbenchMessage', 'returnToPortalHosts', 'sendHostWorkbenchState',
+  ]);
+  const state = { control_state: 'ai', control_lease_active: false };
   await bridge.exposed.value.returnToPortalHosts();
-  assert.deepEqual(bridge.calls, [['morde:return-to-portal-hosts']]);
+  await bridge.exposed.value.hostWorkbenchReady('nonce-1');
+  await bridge.exposed.value.sendHostWorkbenchState(state);
+  assert.deepEqual(bridge.calls, [
+    ['morde:return-to-portal-hosts'],
+    ['morde:host-workbench-ready', 'nonce-1'],
+    ['morde:host-workbench-state', state],
+  ]);
+  const messages = [];
+  const unsubscribe = bridge.exposed.value.onHostWorkbenchMessage((value) => messages.push(value));
+  const message = { type: 'init', nonce: 'nonce-1' };
+  bridge.listeners.get('morde:host-workbench-message')({}, message);
+  assert.deepEqual(messages, [message]);
+  unsubscribe();
+  assert.deepEqual(bridge.removed.map(([channel]) => channel), ['morde:host-workbench-message']);
 });
 
 test('main window preload retains its existing desktop API', () => {

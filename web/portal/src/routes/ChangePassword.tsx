@@ -3,9 +3,12 @@ import type { FormEvent } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
+import { useToast } from '../app/toast';
 
 export function ChangePassword({ loginPath = '/admin/login', cancelPath }: { loginPath?: string; cancelPath?: string }) {
   const client = useQueryClient();
+  const { notify } = useToast();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
@@ -18,7 +21,10 @@ export function ChangePassword({ loginPath = '/admin/login', cancelPath }: { log
       client.setQueryData(['auth', 'me'], null);
       setChanged(true);
     },
-    onError: (reason) => setError(errorDetails(reason).message),
+    onError: (reason) => {
+      if (isTransientNetworkError(reason)) notify('网络异常，密码修改结果暂时无法确认。', 'error');
+      else setError(errorDetails(reason).message);
+    },
   });
 
   const submit = (event: FormEvent<HTMLFormElement>) => {

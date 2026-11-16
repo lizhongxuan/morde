@@ -97,8 +97,9 @@ button, a, input, textarea { accent-color: var(--primary); }
 .panel-error { height: 100%; display: grid; place-content: center; justify-items: center; gap: 14px; text-align: center; }
 .notice { width: fit-content; max-width: 100%; margin: 8px 0; padding: 9px 13px; border: 1px solid #b7e3c7; border-radius: 10px; color: var(--success); background: #eaf7ef; overflow-wrap: anywhere; }
 .workbench-notice-region { min-width: 0; width: 100%; flex: 1 0 100%; display: grid; align-content: start; gap: 8px; }
+.workbench-network-notice-region { position: fixed; z-index: 10000; top: max(16px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); width: min(560px, calc(100vw - 32px)); pointer-events: none; }
 .workbench-floating-error { width: 100%; min-width: 0; margin: 8px 0; padding: 10px 12px; display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 8px; border: 1px solid #f0c1bd; border-radius: 10px; color: var(--danger); background: var(--danger-bg); font-size: .86rem; line-height: 1.45; overflow-wrap: anywhere; }
-.workbench-notice-region .workbench-floating-error { margin: 0; box-shadow: 0 8px 24px rgb(24 37 61 / 14%); pointer-events: auto; }
+.workbench-network-notice-region .workbench-floating-error { margin: 0; box-shadow: 0 8px 24px rgb(24 37 61 / 14%); pointer-events: auto; }
 .workbench-floating-success { border-color: #a6f4c5; color: var(--success); background: #f2fbf6; }
 .workbench-floating-error > span { flex: 1 1 220px; min-width: 0; white-space: pre-line; }
 .workbench-floating-error .icon-button { flex: 0 0 auto; color: var(--danger); font-size: 1.1rem; }

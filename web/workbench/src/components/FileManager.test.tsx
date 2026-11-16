@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runShell } from "../app/aio";
 import { listFiles, MAX_UPLOAD_BYTES, readFile, uploadFile, writeFile } from "../app/fileApi";
+import { WorkbenchNoticeProvider } from "../app/notice";
 import FileManager from "./FileManager";
 
 vi.mock("../app/fileApi", () => ({
@@ -13,7 +14,7 @@ vi.mock("../app/fileApi", () => ({
   uploadFile: vi.fn(),
   writeFile: vi.fn(),
 }));
-vi.mock("../app/aio", () => ({ runShell: vi.fn() }));
+vi.mock("../app/aio", async (importOriginal) => ({ ...await importOriginal(), runShell: vi.fn() }));
 
 afterEach(() => {
   cleanup();
@@ -266,6 +267,25 @@ describe("FileManager directory requests", () => {
     expect(listFiles).toHaveBeenCalledTimes(2);
   });
 
+  it("preserves the directory listing and uses a fixed notice after a transient refresh failure", async () => {
+    const existingFile = { name: "README.md", path: "/home/gem/workspace/README.md", is_directory: false };
+    vi.mocked(listFiles).mockResolvedValueOnce([existingFile])
+      .mockRejectedValueOnce(new TypeError("Failed to fetch")).mockResolvedValue([existingFile]);
+    render(<WorkbenchNoticeProvider><FileManager /></WorkbenchNoticeProvider>);
+
+    expect(await screen.findByRole("button", { name: "README.md" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "刷新" }));
+    expect(await screen.findByLabelText("网络错误提示")).toHaveTextContent("主机目录连接失败");
+    expect(screen.getByRole("button", { name: "README.md" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "刷新" })).toBeVisible();
+    expect(document.querySelector(".file-manager .workbench-floating-error")).toBeNull();
+
+    fireEvent.click(document.querySelector(".workbench-notice-region .button-small")!);
+    await waitFor(() => expect(listFiles).toHaveBeenCalledTimes(3));
+    expect(screen.queryByLabelText("网络错误提示")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "README.md" })).toBeVisible();
+  });
+
   it("keeps the editor disabled until the selected file finishes loading", async () => {
     let finishRead!: (contents: string) => void;
     vi.mocked(listFiles).mockResolvedValue([{
@@ -303,6 +323,28 @@ describe("FileManager directory requests", () => {
     expect(screen.getByLabelText("文件内容")).toBeDisabled();
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
     expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it("preserves unsaved editor content when reopening the selected file fails on the network", async () => {
+    vi.mocked(listFiles).mockResolvedValue([{
+      name: "README.md",
+      path: "/home/gem/workspace/README.md",
+      is_directory: false,
+    }]);
+    vi.mocked(readFile).mockResolvedValueOnce("saved contents")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    render(<WorkbenchNoticeProvider><FileManager /></WorkbenchNoticeProvider>);
+
+    const entry = await screen.findByRole("button", { name: "README.md" });
+    fireEvent.click(entry);
+    const editor = await screen.findByLabelText("文件内容");
+    await waitFor(() => expect(editor).toBeEnabled());
+    fireEvent.change(editor, { target: { value: "unsaved edits" } });
+
+    fireEvent.click(entry);
+    expect(await screen.findByLabelText("网络错误提示")).toHaveTextContent("已保留当前编辑内容");
+    expect(screen.getByLabelText("文件内容")).toHaveValue("unsaved edits");
+    expect(document.querySelector(".file-manager .workbench-floating-error")).toBeNull();
   });
 
   it("prevents edits while the selected file is being saved", async () => {

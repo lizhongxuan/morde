@@ -5,6 +5,7 @@ import { errorDetails, portalApi } from '../../app/api';
 import { formatCpu, formatDate, formatMemory } from '../../app/format';
 import { useAuth } from '../../app/auth';
 import { useToast } from '../../app/toast';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 type AccountStatus = 'pending' | 'rejected' | 'approved' | 'disabled';
@@ -36,6 +37,7 @@ export function AdminUsers() {
     queryKey: ['admin', 'users', filter, offset],
     queryFn: () => portalApi.adminUsers(filter === 'all' ? undefined : filter, offset),
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，用户列表暂时无法读取。');
   const update = useMutation({
     mutationFn: ({ id, body }: { id: string; body: { expected_status: AccountStatus; status?: AccountStatus; role?: 'user' | 'admin' } }) => portalApi.updateUser(id, body),
     onSuccess: () => {
@@ -90,7 +92,7 @@ export function AdminUsers() {
       <div className="inline-actions"><button className="button button-secondary button-small" type="button" disabled={offset === 0 || query.isFetching} onClick={() => setOffset(Math.max(0, offset - query.data.limit))}>上一页</button>
         <button className="button button-secondary button-small" type="button" disabled={offset + query.data.items.length >= query.data.total || query.isFetching} onClick={() => setOffset(offset + query.data.limit)}>下一页</button></div>
     </nav>}
-    {query.isPending && <div className="loading-card">正在加载用户…</div>}
-    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在加载用户…</div>}
+    {query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
   </section>;
 }

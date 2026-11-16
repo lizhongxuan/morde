@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayControl, type GatewayHost } from '../api/gateway';
+import { WorkbenchNoticeProvider } from './notice';
 import Workbench from './Workbench';
 
 const host: GatewayHost = {
@@ -276,6 +277,51 @@ describe('Workbench MVP navigation', () => {
     expect(gatewayApi.workspaces).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: /暂停|继续|停止任务|接管电脑/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /下载|打开/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('Workbench network notifications', () => {
+  beforeEach(mockWorkbenchApi);
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('keeps the workbench visible after a transient host read failure and retries from the fixed notice', async () => {
+    vi.spyOn(gatewayApi, 'host').mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValue(host);
+    render(<WorkbenchNoticeProvider><Workbench /></WorkbenchNoticeProvider>);
+
+    expect(await screen.findByLabelText('网络错误提示')).toHaveTextContent('工作台主机状态连接失败');
+    expect(screen.queryByRole('heading', { name: '工作台暂时无法加载' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '浏览器' })).toBeVisible();
+    expect(screen.getByLabelText('网络错误提示')).toHaveClass('workbench-notice-region');
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(gatewayApi.host).toHaveBeenCalledTimes(2));
+    expect(screen.queryByLabelText('网络错误提示')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '浏览器' })).toBeVisible();
+  });
+
+  it('keeps control access fail-closed on a transient status read error without rendering an inline network error', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(gatewayApi, 'control').mockResolvedValueOnce(userControl)
+      .mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValue(userControl);
+    render(<WorkbenchNoticeProvider><Workbench /></WorkbenchNoticeProvider>);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(screen.getByLabelText('网络错误提示')).toHaveTextContent('电脑控制状态连接失败');
+    expect(screen.queryByText(/控制状态暂不可用：/)).not.toBeInTheDocument();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=true');
+    expect(screen.queryByRole('button', { name: '交回 AI' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByText('你持有电脑操作权')).toBeVisible();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
   });
 });
 

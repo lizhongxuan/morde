@@ -3,6 +3,8 @@ import { useState } from 'react';
 import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
+import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { Link } from 'react-router';
@@ -31,19 +33,20 @@ function ClientCard({ client, refresh }: { client: Client; refresh: () => void }
 export function Clients() {
   const queryClient = useQueryClient();
   const clients = useQuery({ queryKey: ['clients'], queryFn: portalApi.clients });
+  useNetworkReadNotice([{ failed: clients.isError, error: clients.error, retry: clients.refetch }], '客户端列表连接失败，已保留当前内容。');
   const refresh = () => { void queryClient.invalidateQueries({ queryKey: ['clients'] }); };
   return <section className="design-panel">
     <div className="design-panel-header"><div><h2>已登录设备</h2><p>管理已登录的电脑和手机。</p></div><Link className="button button-secondary" to="/download">下载客户端</Link></div>
-    {clients.isPending ? <div className="loading-card" role="status">正在加载客户端…</div>
-      : clients.isError ? <FloatingError className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></FloatingError>
-        : !clients.data.items.length ? <div className="empty-card compact"><p>还没有已登录的客户端。请在 Morde 电脑或手机应用使用账号密码登录。</p></div>
-          : <ScreenPagination
+    {clients.isPending || (!clients.data && isTransientNetworkError(clients.error)) ? <div className="loading-card" role="status">正在加载客户端…</div>
+      : clients.isError && !isTransientNetworkError(clients.error) ? <FloatingError className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></FloatingError>
+        : clients.data && !clients.data.items.length ? <div className="empty-card compact"><p>还没有已登录的客户端。请在 Morde 电脑或手机应用使用账号密码登录。</p></div>
+          : clients.data ? <ScreenPagination
             items={clients.data.items}
             getKey={(client) => client.id}
             estimatedItemHeight={148}
             height="min(56dvh, 560px)"
             ariaLabel="已登录客户端"
             renderItem={(client) => <ClientCard client={client} refresh={refresh} />}
-          />}
+          /> : <div className="loading-card" role="status">正在加载客户端…</div>}
   </section>;
 }

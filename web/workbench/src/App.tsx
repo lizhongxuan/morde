@@ -1,5 +1,6 @@
 import Workbench from './app/Workbench';
+import { WorkbenchNoticeProvider } from './app/notice';
 
 export default function App() {
-  return <Workbench />;
+  return <WorkbenchNoticeProvider><Workbench /></WorkbenchNoticeProvider>;
 }

@@ -14,7 +14,7 @@ it('lists an installation and revokes its linked access', async () => {
   vi.spyOn(portalApi, 'clients').mockResolvedValue({ items: [item as Awaited<ReturnType<typeof portalApi.clients>>['items'][number]] });
   const revoke = vi.spyOn(portalApi, 'revokeClient').mockResolvedValue(undefined);
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
   expect(await screen.findByText('Morde 笔记本')).toBeInTheDocument();
   expect(screen.getByRole('link', { name: '下载客户端' })).toHaveAttribute('href', '/download');
   await userEvent.setup().click(screen.getByRole('button', { name: '撤销客户端' }));
@@ -27,7 +27,7 @@ it('warns when a client authorization expires within seven days', async () => {
   const item = { id: 'cli_87654321', platform: 'ios' as const, display_name: 'iPhone', expires_at: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString(), revoked: false, created_at: new Date().toISOString(), last_used_at: null };
   vi.spyOn(portalApi, 'clients').mockResolvedValue({ items: [item as Awaited<ReturnType<typeof portalApi.clients>>['items'][number]] });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
   expect(await screen.findByText('即将到期')).toBeInTheDocument();
   expect(screen.getByText('登录状态将在 7 天内到期，届时请在此客户端重新登录。')).toBeInTheDocument();
 });
@@ -39,7 +39,7 @@ it('keeps client details hidden after an authorization failure and retries the l
     .mockResolvedValue({ items: [item as Awaited<ReturnType<typeof portalApi.clients>>['items'][number]] });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const user = userEvent.setup();
-  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
   expect(await screen.findByRole('alert')).toHaveTextContent('当前账号无权读取客户端');
   expect(screen.queryByText('受限电脑')).not.toBeInTheDocument();
@@ -56,7 +56,7 @@ it('paginates logged-in clients and keeps revoke available on later pages', asyn
   vi.spyOn(portalApi, 'clients').mockResolvedValue({ items: clients as unknown as Awaited<ReturnType<typeof portalApi.clients>>['items'] });
   const revoke = vi.spyOn(portalApi, 'revokeClient').mockResolvedValue(undefined);
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
   expect(await screen.findByText('工作电脑')).toBeVisible();
   expect(screen.getByText('个人手机')).not.toBeVisible();
@@ -67,4 +67,25 @@ it('paginates logged-in clients and keeps revoke available on later pages', asyn
   await userEvent.setup().click(screen.getByRole('button', { name: '撤销客户端' }));
   await userEvent.setup().click(within(screen.getByRole('dialog')).getByRole('button', { name: '撤销客户端' }));
   await waitFor(() => expect(revoke.mock.calls[0]?.[0]).toBe(clients[1].id));
+});
+
+it('keeps the confirmed client list visible and reports a transient refresh failure in a popup', async () => {
+  const item = { id: 'cli_12345678', platform: 'desktop', display_name: '工作电脑', expires_at: '2027-10-22T08:00:00Z', revoked: false, created_at: '2026-10-22T08:00:00Z', last_used_at: null };
+  const list = vi.spyOn(portalApi, 'clients')
+    .mockResolvedValueOnce({ items: [item] as Awaited<ReturnType<typeof portalApi.clients>>['items'] })
+    .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    .mockResolvedValue({ items: [item] as Awaited<ReturnType<typeof portalApi.clients>>['items'] });
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  expect(await screen.findByText('工作电脑')).toBeInTheDocument();
+
+  await queryClient.invalidateQueries({ queryKey: ['clients'] });
+
+  const notice = await screen.findByRole('alert');
+  expect(notice).toHaveTextContent('客户端列表连接失败');
+  expect(notice.closest('.design-panel')).toBeNull();
+  expect(screen.getByText('工作电脑')).toBeInTheDocument();
+  await userEvent.setup().click(within(notice).getByRole('button', { name: '重试' }));
+  await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+  await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
 });

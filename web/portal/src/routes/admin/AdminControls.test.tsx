@@ -3,6 +3,7 @@ import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminControls } from './AdminControls';
 
 type ControlsData = Awaited<ReturnType<typeof portalApi.adminControls>>;
@@ -26,7 +27,7 @@ const initialData: ControlsData = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><AdminControls /></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><AdminControls /></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin notify-only controls', () => {

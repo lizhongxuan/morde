@@ -3,6 +3,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../../app/api';
 import { getDesktopDownloads, type DesktopDownloads } from '../../app/desktopDownloads';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminAudit } from './AdminAudit';
 
 vi.mock('../../app/desktopDownloads', () => ({
@@ -24,7 +25,7 @@ describe('admin desktop release downloads', () => {
     vi.spyOn(portalApi, 'audit').mockResolvedValue({ items: [] });
     vi.mocked(getDesktopDownloads).mockResolvedValue(downloads);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={client}><AdminAudit /></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><AdminAudit /></ToastProvider></QueryClientProvider>);
 
     const link = await screen.findByRole('link', { name: '下载 morde-pc-0.1.0-macos-arm64.dmg' });
     expect(link).toHaveAttribute('href', '/downloads/files/morde-pc-0.1.0-macos-arm64.dmg');

@@ -2293,41 +2293,58 @@ async function openNativeWorkbenchEmbed(input: unknown): Promise<{ hostID: strin
     initialTarget as HostEmbedTarget, ticket.targets);
   if (credentials !== auth || !webView || !mainWindow || mainWindow.isDestroyed()) throw new Error("Morde authorization changed; reconnect the computer");
   const partition = session.fromPartition(`morde-workbench-${profileID(auth)}`);
-  await partition.clearStorageData();
-  await partition.cookies.set({ url: host, name: "ch_embed", value: exchanged.cookie.value, path: "/", httpOnly: true,
-    secure: exchanged.cookie.secure, sameSite: "strict", expirationDate: exchanged.cookie.expirationDate });
-  if (credentials !== auth) { void partition.clearStorageData().catch(() => undefined); throw new Error("Morde authorization changed; reconnect the computer"); }
-  const content = new WebContentsView({ webPreferences: {
-    session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
-    preload: join(__dirname, "morde-preload.js"), additionalArguments: preloadArguments("host-workbench"),
-  } });
-  content.setBorderRadius(12);
-  const embed: NativeWorkbenchEmbed = { auth, hostID, hostOrigin: host, conversationID, nonce: ticket.embedNonce,
-    targets: ticket.targets, initialTarget: initialTarget as HostEmbedTarget, parent: webView.webContents, view: content,
-    partition, attached: true, initialized: false, visible: false };
-  nativeWorkbenchEmbed = embed;
-  installDownloadAndClipboard(partition, auth.origin);
-  mainWindow.contentView.addChildView(content);
-  content.setBounds({ x: 0, y: 0, width: 0, height: 0 });
-  content.setVisible(false);
-  hostWorkbenchReturnHandlers.set(content.webContents, () => {
-    if (nativeWorkbenchEmbed !== embed || credentials !== auth || !trustedNativeWorkbenchPage(content.webContents.getURL(), embed)) return false;
-    void closeNativeWorkbenchEmbed(embed.nonce).catch(() => undefined);
-    return true;
-  });
-  content.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  content.webContents.on("will-navigate", (event, url) => { if (!trustedNativeWorkbenchPage(url, embed)) event.preventDefault(); });
-  content.webContents.on("will-redirect", (event, url) => { if (!trustedNativeWorkbenchPage(url, embed)) event.preventDefault(); });
-  content.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
-    if (isMainFrame && errorCode !== -3 && nativeWorkbenchEmbed === embed) embed.parent.send("morde:portal-workbench-message", { type: "error", nonce: embed.nonce, error: "工作台页面加载失败，请重试。" });
-  });
-  content.webContents.on("render-process-gone", () => {
-    if (nativeWorkbenchEmbed === embed) embed.parent.send("morde:portal-workbench-message", { type: "error", nonce: embed.nonce, error: "工作台进程已停止，请重新连接。" });
-  });
-  void content.webContents.loadURL(exchanged.url, documentLoadOptions).catch(() => {
-    if (nativeWorkbenchEmbed === embed) embed.parent.send("morde:portal-workbench-message", { type: "error", nonce: embed.nonce, error: "无法打开工作台，请重试。" });
-  });
-  return { hostID, hostOrigin: host, conversationID, nonce: embed.nonce, targets: embed.targets };
+  let content: WebContentsView | undefined;
+  let embed: NativeWorkbenchEmbed | undefined;
+  try {
+    await partition.clearStorageData();
+    await partition.cookies.set({ url: host, name: "ch_embed", value: exchanged.cookie.value, path: "/", httpOnly: true,
+      secure: exchanged.cookie.secure, sameSite: "strict", expirationDate: exchanged.cookie.expirationDate });
+    if (credentials !== auth) throw new Error("Morde authorization changed; reconnect the computer");
+    const workbenchView = new WebContentsView({ webPreferences: {
+      session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true,
+      preload: join(__dirname, "morde-preload.js"), additionalArguments: preloadArguments("host-workbench"),
+    } });
+    content = workbenchView;
+    workbenchView.setBorderRadius(12);
+    const nextEmbed: NativeWorkbenchEmbed = { auth, hostID, hostOrigin: host, conversationID, nonce: ticket.embedNonce,
+      targets: ticket.targets, initialTarget: initialTarget as HostEmbedTarget, parent: webView.webContents, view: workbenchView,
+      partition, attached: false, initialized: false, visible: false };
+    embed = nextEmbed;
+    installDownloadAndClipboard(partition, auth.origin);
+    mainWindow.contentView.addChildView(workbenchView);
+    nextEmbed.attached = true;
+    nativeWorkbenchEmbed = nextEmbed;
+    workbenchView.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    workbenchView.setVisible(false);
+    hostWorkbenchReturnHandlers.set(workbenchView.webContents, () => {
+      if (nativeWorkbenchEmbed !== nextEmbed || credentials !== auth || !trustedNativeWorkbenchPage(workbenchView.webContents.getURL(), nextEmbed)) return false;
+      void closeNativeWorkbenchEmbed(nextEmbed.nonce).catch(() => undefined);
+      return true;
+    });
+    workbenchView.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    workbenchView.webContents.on("will-navigate", (event, url) => { if (!trustedNativeWorkbenchPage(url, nextEmbed)) event.preventDefault(); });
+    workbenchView.webContents.on("will-redirect", (event, url) => { if (!trustedNativeWorkbenchPage(url, nextEmbed)) event.preventDefault(); });
+    workbenchView.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+      if (isMainFrame && errorCode !== -3 && nativeWorkbenchEmbed === nextEmbed) nextEmbed.parent.send("morde:portal-workbench-message", { type: "error", nonce: nextEmbed.nonce, error: "工作台页面加载失败，请重试。" });
+    });
+    workbenchView.webContents.on("render-process-gone", () => {
+      if (nativeWorkbenchEmbed === nextEmbed) nextEmbed.parent.send("morde:portal-workbench-message", { type: "error", nonce: nextEmbed.nonce, error: "工作台进程已停止，请重新连接。" });
+    });
+    void workbenchView.webContents.loadURL(exchanged.url, documentLoadOptions).catch(() => {
+      if (nativeWorkbenchEmbed === nextEmbed) nextEmbed.parent.send("morde:portal-workbench-message", { type: "error", nonce: nextEmbed.nonce, error: "无法打开工作台，请重试。" });
+    });
+    return { hostID, hostOrigin: host, conversationID, nonce: nextEmbed.nonce, targets: nextEmbed.targets };
+  } catch (error) {
+    if (embed && nativeWorkbenchEmbed === embed) nativeWorkbenchEmbed = null;
+    if (content) {
+      hostWorkbenchReturnHandlers.delete(content.webContents);
+      try { mainWindow.contentView.removeChildView(content); } catch { /* setup may have failed before attachment */ }
+      try { content.setVisible(false); } catch { /* preserve the setup error */ }
+      try { if (!content.webContents.isDestroyed()) content.webContents.close(); } catch { /* preserve the setup error */ }
+    }
+    await partition.clearStorageData().catch(() => undefined);
+    throw error;
+  }
 }
 
 function setNativeWorkbenchBounds(nonce: unknown, value: unknown): { updated: boolean } {

@@ -9,7 +9,7 @@ import { ApiKeys } from './ApiKeys';
 
 const renderPage = () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const rendered = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><ApiKeys /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  const rendered = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><ApiKeys /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { client, ...rendered };
 };
 
@@ -119,5 +119,25 @@ describe('ApiKeys', () => {
     await user.click(screen.getByRole('button', { name: '重试' }));
     expect(await screen.findByRole('article', { name: 'API Key 私密密钥' })).toBeInTheDocument();
     expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps confirmed key metadata visible after a transient refresh failure', async () => {
+    const key = { id: 't1234567', name: '我的密钥', expires_at: '2027-10-22T08:00:00Z', last_used_at: null, revoked: false, created_at: '2026-10-22T08:00:00Z' };
+    const list = vi.spyOn(portalApi, 'apiKeys')
+      .mockResolvedValueOnce({ items: [key] } as Awaited<ReturnType<typeof portalApi.apiKeys>>)
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [key] } as Awaited<ReturnType<typeof portalApi.apiKeys>>);
+    const { client } = renderPage();
+    expect(await screen.findByRole('article', { name: 'API Key 我的密钥' })).toBeInTheDocument();
+
+    await client.invalidateQueries({ queryKey: ['apikeys'] });
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('API Key 列表连接失败');
+    expect(notice.closest('.design-panel')).toBeNull();
+    expect(screen.getByRole('article', { name: 'API Key 我的密钥' })).toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });
 });

@@ -2,9 +2,11 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useParams } from 'react-router';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { isTransientNetworkError } from '../../api/errors';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes, formatCpu, formatDate, formatMemory, hostStateLabel } from '../../app/format';
 import { useToast } from '../../app/toast';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 type AdminUser = Awaited<ReturnType<typeof portalApi.adminUsers>>['items'][number];
@@ -123,12 +125,13 @@ function ModelAccountBudgetEditor({ ownerID }: { ownerID: string }) {
     queryFn: () => portalApi.adminModelAccountBudget(ownerID),
     retry: false,
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，模型预算暂时无法读取。');
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>平台模型预算</h2><p>设置此账号的平台模型调用额度和并发数。个人模型使用自己的 API 密钥，不占用此额度。</p></div>
       {!query.isPending && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
-    {query.isPending && <div className="loading-card" role="status">正在读取模型预算…</div>}
-    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取模型预算…</div>}
+    {query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.data && <ModelAccountBudgetForm key={`${query.data.configured}:${query.data.token_limit}:${query.data.max_concurrent}`} ownerID={ownerID} budget={query.data} />}
   </section>;
 }
@@ -180,12 +183,13 @@ function PersonalDataQuotaEditor({ ownerID }: { ownerID: string }) {
     queryFn: () => portalApi.adminPersonalDataQuota(ownerID),
     retry: false,
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，个人数据额度暂时无法读取。');
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>个人数据额度</h2><p>查看个人附件的已用与预留空间，并按版本调整额度。</p></div>
       {!query.isPending && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
-    {query.isPending && <div className="loading-card" role="status">正在读取个人数据额度…</div>}
-    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取个人数据额度…</div>}
+    {query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.data && <PersonalDataQuotaForm key={`${query.data.version}:${query.data.quota_bytes}:${query.data.max_attachment_bytes}`} ownerID={ownerID} quota={query.data} />}
   </section>;
 }
@@ -198,13 +202,14 @@ function ModelUsageReconciliation({ ownerID }: { ownerID: string }) {
     enabled: opened,
     retry: false,
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，待核对模型用量暂时无法读取。');
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>未知模型用量核对</h2><p>仅处理已确认结束、但供应商没有返回用量的调用。</p></div>
       {!opened && <button className="button button-secondary" type="button" onClick={() => setOpened(true)}>查看待核对记录</button>}
       {opened && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
-    {opened && query.isPending && <div className="loading-card" role="status">正在读取待核对记录…</div>}
-    {opened && query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {opened && (query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取待核对记录…</div>}
+    {opened && query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {opened && query.data && (query.data.items.length === 0
       ? <div className="empty-card compact"><p>没有待核对的模型用量。</p></div>
       : <div className="form-stack">{query.data.items.map((item) => <UnknownModelCallEditor key={`${item.owner_id}:${item.source}:${item.call_id}`} item={item} ownerID={ownerID} />)}</div>)}
@@ -219,17 +224,18 @@ function InstallationHistory({ ownerID }: { ownerID: string }) {
     initialPageParam: 0,
     getNextPageParam: (page) => page.offset + page.items.length < page.total ? page.offset + page.limit : undefined,
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError || query.isFetchNextPageError, error: query.error, retry: () => query.isFetchNextPageError ? query.fetchNextPage() : query.refetch() }], '网络异常，安装记录暂时无法完整读取。');
   const items = query.data?.pages.flatMap((page) => page.items) ?? [];
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>Client 安装</h2><p>安装元数据与当前 Portal 进程内的 Hub 在线状态，不含凭证。</p></div></div>
-    {query.isPending && <div className="loading-card" role="status">正在读取安装记录…</div>}
-    {query.isError && !query.data && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取安装记录…</div>}
+    {query.isError && !query.data && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !items.length && <div className="empty-card compact"><p>该用户没有 Client 安装记录。</p></div>}
     {!!items.length && <div className="table-wrap"><table><thead><tr><th>安装</th><th>平台</th><th>在线</th><th>创建时间</th><th>最近使用</th><th>撤权时间</th></tr></thead><tbody>
       {items.map((item: Installation) => <tr key={item.id}><td><strong>{item.display_name}</strong><small className="table-sub mono">{item.id}</small></td><td>{item.platform}</td><td>{item.online ? '当前进程在线' : '离线'}</td><td>{formatDate(item.created_at)}</td><td>{item.last_used_at ? formatDate(item.last_used_at) : '无记录'}</td><td>{item.revoked_at ? formatDate(item.revoked_at) : '未撤权'}</td></tr>)}
     </tbody></table></div>}
-    {query.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
-    {query.hasNextPage && !query.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多安装'}</button>}
+    {query.isFetchNextPageError && !networkError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
+    {query.hasNextPage && (!query.isFetchNextPageError || networkError) && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多安装'}</button>}
   </section>;
 }
 
@@ -240,17 +246,18 @@ function AuthorizationHistory({ ownerID }: { ownerID: string }) {
     initialPageParam: 0,
     getNextPageParam: (page) => page.offset + page.items.length < page.total ? page.offset + page.limit : undefined,
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError || query.isFetchNextPageError, error: query.error, retry: () => query.isFetchNextPageError ? query.fetchNextPage() : query.refetch() }], '网络异常，客户端授权记录暂时无法完整读取。');
   const items = query.data?.pages.flatMap((page) => page.items) ?? [];
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>客户端授权</h2><p>仅显示已关联到此用户的授权记录；用户码和凭证不会展示。</p></div></div>
-    {query.isPending && <div className="loading-card" role="status">正在读取授权记录…</div>}
-    {query.isError && !query.data && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取授权记录…</div>}
+    {query.isError && !query.data && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !items.length && <div className="empty-card compact"><p>没有可归属到该用户的客户端授权记录。</p></div>}
     {!!items.length && <div className="table-wrap"><table><thead><tr><th>授权</th><th>平台</th><th>状态</th><th>创建时间</th><th>到期时间</th><th>认领时间</th></tr></thead><tbody>
       {items.map((item: Authorization) => <tr key={item.id}><td><strong>{item.display_name}</strong><small className="table-sub mono">{item.id}</small></td><td>{item.platform}</td><td>{item.state}</td><td>{formatDate(item.created_at)}</td><td>{formatDate(item.expires_at)}</td><td>{item.claimed_at ? formatDate(item.claimed_at) : '未认领'}</td></tr>)}
     </tbody></table></div>}
-    {query.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
-    {query.hasNextPage && !query.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多授权'}</button>}
+    {query.isFetchNextPageError && !networkError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
+    {query.hasNextPage && (!query.isFetchNextPageError || networkError) && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多授权'}</button>}
   </section>;
 }
 
@@ -261,27 +268,29 @@ function ModelLedgerHistory({ ownerID }: { ownerID: string }) {
     initialPageParam: 0,
     getNextPageParam: (page) => page.offset + page.items.length < page.total ? page.offset + page.limit : undefined,
   });
+  const networkError = useNetworkReadNotice([{ failed: query.isError || query.isFetchNextPageError, error: query.error, retry: () => query.isFetchNextPageError ? query.fetchNextPage() : query.refetch() }], '网络异常，模型账本暂时无法完整读取。');
   const items = query.data?.pages.flatMap((page) => page.items) ?? [];
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>模型用量账本</h2><p>读取既有 model_call_ledger；只展示模型和计量元数据，不打开请求或响应正文。</p></div></div>
-    {query.isPending && <div className="loading-card" role="status">正在读取模型账本…</div>}
-    {query.isError && !query.data && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取模型账本…</div>}
+    {query.isError && !query.data && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !items.length && <div className="empty-card compact"><p>该用户没有模型账本记录。</p></div>}
     {!!items.length && <div className="table-wrap"><table><thead><tr><th>时间</th><th>来源</th><th>模型</th><th>状态</th><th>计量</th></tr></thead><tbody>
       {items.map((item: ModelCall) => <tr key={`${item.source}:${item.call_id}`}><td>{formatDate(item.created_at)}</td><td>{item.source}</td><td><strong>{item.model_id}</strong><small className="table-sub">{item.provider_model}</small></td><td>{item.state}</td><td>{item.input_tokens !== null && item.output_tokens !== null ? `${item.input_tokens} 输入 / ${item.output_tokens} 输出 tokens` : `预留 ${item.reserved_tokens} tokens`}</td></tr>)}
     </tbody></table></div>}
-    {query.isFetchNextPageError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
-    {query.hasNextPage && !query.isFetchNextPageError && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多账本记录'}</button>}
+    {query.isFetchNextPageError && !networkError && <FloatingError className="error-card admin-pagination-error" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.fetchNextPage()}>重试</button></FloatingError>}
+    {query.hasNextPage && (!query.isFetchNextPageError || networkError) && <button className="button button-secondary admin-load-more" type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多账本记录'}</button>}
   </section>;
 }
 
 function UserEvents({ ownerID }: { ownerID: string }) {
   const params = new URLSearchParams({ target: ownerID, limit: '100' });
   const query = useQuery({ queryKey: ['admin', 'user-events', ownerID], queryFn: () => portalApi.audit(params) });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，账号事件暂时无法读取。');
   return <section className="admin-detail-section">
     <div className="dashboard-section-heading"><div><h2>账号事件</h2><p>最近 100 条以用户 ID 为目标的审计记录；不展示事件正文。</p></div></div>
-    {query.isPending && <div className="loading-card" role="status">正在读取账号事件…</div>}
-    {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在读取账号事件…</div>}
+    {query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     {query.isSuccess && !query.data.items.length && <div className="empty-card compact"><p>暂无账号审计事件。</p></div>}
     {!!query.data?.items.length && <div className="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>操作者</th></tr></thead><tbody>
       {query.data.items.map((item) => <tr key={item.id}><td>{formatDate(item.at)}</td><td>{item.action}</td><td className="mono">{item.actor_id || item.actor_kind}</td></tr>)}
@@ -293,9 +302,15 @@ export function AdminUserDetail() {
   const { id = '' } = useParams();
   const userQuery = useQuery({ queryKey: ['admin', 'user', id], queryFn: () => portalApi.adminUser(id), enabled: !!id });
   const hosts = useQuery({ queryKey: ['admin', 'hosts'], queryFn: portalApi.adminHosts });
-  if (userQuery.isPending || hosts.isPending) return <div className="loading-card" role="status">正在读取用户信息…</div>;
-  if (userQuery.isError || hosts.isError) {
-    const error = userQuery.isError ? userQuery.error : hosts.error;
+  const networkError = useNetworkReadNotice([
+    { failed: userQuery.isError, error: userQuery.error, retry: userQuery.refetch },
+    { failed: hosts.isError, error: hosts.error, retry: hosts.refetch },
+  ], '网络异常，用户详情暂时无法完整读取。');
+  const hardError = userQuery.isError && !isTransientNetworkError(userQuery.error) ? userQuery.error
+    : hosts.isError && !isTransientNetworkError(hosts.error) ? hosts.error : null;
+  if (userQuery.isPending || hosts.isPending || (networkError && (!userQuery.data || !hosts.data))) return <div className="loading-card" role="status">正在读取用户信息…</div>;
+  if (hardError) {
+    const error = hardError;
     return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void userQuery.refetch(); void hosts.refetch(); }}>重试</button></FloatingError>;
   }
   const user = userQuery.data;

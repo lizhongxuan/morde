@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* Morde/MordeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* Morde/MordeApp.swift */; };
+		B10000000000000000000001 /* IOS03SimulatorAcceptanceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* IOS03SimulatorAcceptanceUITests.swift */; };
 		A10000000000000000000017 /* Morde/MordeCredentialExpiry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* Morde/MordeCredentialExpiry.swift */; };
 		A10000000000000000000019 /* ../../../LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* ../../../LICENSE */; };
 		A1000000000000000000001A /* ../../../NOTICE in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000024 /* ../../../NOTICE */; };
@@ -43,6 +44,7 @@
 /* Begin PBXFileReference section */
 		A10000000000000000000002 /* Morde/MordeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Morde/MordeApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* Morde.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Morde.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10000000000000000000003 /* MordeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MordeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000018 /* Morde/MordeCredentialExpiry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Morde/MordeCredentialExpiry.swift; sourceTree = "<group>"; };
 		A10000000000000000000023 /* ../../../LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../../../LICENSE; sourceTree = "<group>"; };
 		A10000000000000000000024 /* ../../../NOTICE */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../../../NOTICE; sourceTree = "<group>"; };
@@ -79,6 +81,13 @@
 
 /* Begin PBXFrameworksBuildPhase section */
 		A10000000000000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B10000000000000000000007 /* MordeUITests Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -132,6 +141,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000003 /* Morde.app */,
+				B10000000000000000000003 /* MordeUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -164,6 +174,24 @@
 			productReference = A10000000000000000000003 /* Morde.app */;
 			productType = "com.apple.product-type.application";
 		};
+		B1000000000000000000000A /* MordeUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B1000000000000000000000D /* Build configuration list for PBXNativeTarget "MordeUITests" */;
+			buildPhases = (
+				B10000000000000000000009 /* MordeUITests Sources */,
+				B10000000000000000000007 /* MordeUITests Frameworks */,
+				B10000000000000000000008 /* MordeUITests Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B10000000000000000000006 /* MordeUITests target dependency */,
+			);
+			name = MordeUITests;
+			productName = MordeUITests;
+			productReference = B10000000000000000000003 /* MordeUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -174,6 +202,10 @@
 				TargetAttributes = {
 					A10000000000000000000009 = {
 						CreatedOnToolsVersion = 16.0;
+					};
+					B1000000000000000000000A = {
+						CreatedOnToolsVersion = 16.0;
+						TestTargetID = A10000000000000000000009;
 					};
 				};
 			};
@@ -199,6 +231,7 @@
 			projectRoot = "";
 			targets = (
 				A10000000000000000000009 /* Morde */,
+				B1000000000000000000000A /* MordeUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -214,6 +247,13 @@
 				A1000000000000000000001B /* ../../../THIRD_PARTY_NOTICES.md in Resources */,
 				A1000000000000000000001C /* ../../MORDE_THIRD_PARTY_LICENSES.md in Resources */,
 				A10000000000000000000029 /* Localizable.xcstrings in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B10000000000000000000008 /* MordeUITests Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -252,7 +292,33 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B10000000000000000000009 /* MordeUITests Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000001 /* IOS03SimulatorAcceptanceUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXContainerItemProxy section */
+		B10000000000000000000005 /* Morde app target proxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000010 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000000000000000000009;
+			remoteInfo = Morde;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		B10000000000000000000006 /* MordeUITests target dependency */ = {
+			isa = PBXTargetDependency;
+			target = A10000000000000000000009 /* Morde */;
+			targetProxy = B10000000000000000000005 /* Morde app target proxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A10000000000000000000013 /* Debug */ = {
@@ -319,6 +385,40 @@
 			};
 			name = Release;
 		};
+		B1000000000000000000000B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.morde.app.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = Morde;
+			};
+			name = Debug;
+		};
+		B1000000000000000000000C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.morde.app.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = Morde;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -336,6 +436,15 @@
 			buildConfigurations = (
 				A10000000000000000000015 /* Debug */,
 				A10000000000000000000016 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B1000000000000000000000D /* Build configuration list for PBXNativeTarget "MordeUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B1000000000000000000000B /* Debug */,
+				B1000000000000000000000C /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

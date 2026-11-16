@@ -3,7 +3,10 @@ import type { FormEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router';
 import { newIdempotencyKey, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
+import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { ScreenPagination } from '../components/ScreenPagination';
 import './PersonalData.css';
 import { ideasFromFeedPreferences, personalIdeas } from '../data/ideas';
@@ -152,9 +155,11 @@ function downloadBlob(blob: Blob, name: string): void {
 
 export function PersonalData() {
   const { user } = useAuth();
+  const { notify } = useToast();
   const location = useLocation();
   const userID = user?.id;
   const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
+  useNetworkReadNotice([{ failed: capabilities.isError, error: capabilities.error, retry: () => capabilities.refetch() }], '网络异常，服务状态暂时无法读取。');
   const serviceInstanceID = capabilities.data?.service_instance_id;
   const personalAPI = useMemo(() => personalAPIFor(serviceInstanceID, userID), [serviceInstanceID, userID]);
   const store = useMemo(() => userID ? new PersonalDataStore(userID, window.location.origin, undefined, serviceInstanceID) : null, [userID, serviceInstanceID]);
@@ -434,7 +439,8 @@ export function PersonalData() {
       await store.cacheAttachment({ attachmentID, name: item.body.name, mediaType: item.body.mime ?? blob.type, blob });
       downloadBlob(blob, item.body.name);
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : '无法读取附件。');
+      if (isTransientNetworkError(error)) notify('网络异常，附件暂时无法读取。', 'error');
+      else setActionError(error instanceof Error ? error.message : '无法读取附件。');
     }
   };
 
@@ -761,6 +767,7 @@ function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
   onRestore: (body: MemoryBody) => Promise<boolean>;
   onDelete: () => void;
 }) {
+  const { notify } = useToast();
   const [content, setContent] = useState(asString(item.body.content));
   const [category, setCategory] = useState(asString(item.body.category));
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -781,7 +788,10 @@ function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
       setHistory((current) => cursor && current ? [...current, ...page.items] : page.items);
       setHistoryCursor(page.next_cursor);
     } catch (error) {
-      if (requestVersion.current === request) setHistoryError(error instanceof Error ? error.message : '无法读取记忆历史。');
+      if (requestVersion.current === request) {
+        if (isTransientNetworkError(error)) notify('网络异常，记忆历史暂时无法读取。', 'error');
+        else setHistoryError(error instanceof Error ? error.message : '无法读取记忆历史。');
+      }
     } finally {
       if (requestVersion.current === request) setHistoryLoading(false);
     }

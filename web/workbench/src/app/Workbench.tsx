@@ -14,6 +14,8 @@ import TaskObservation from '../components/TaskObservation';
 import WorkspaceBrowser from '../components/WorkspaceBrowser';
 import FloatingError from '../components/FloatingError';
 import { returnToPreviousPage } from './navigation';
+import { isTransientNetworkError } from './aio';
+import { useWorkbenchNotice } from './notice';
 
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
 type MobileMenu = 'browser' | 'terminal' | 'files' | null;
@@ -108,7 +110,10 @@ export default function Workbench() {
   const [control, setControl] = useState<GatewayControl | null>(null);
   const [controlLoading, setControlLoading] = useState(!hostSessionOnly && !embedded);
   const [controlError, setControlError] = useState('');
+  const [controlNetworkUnavailable, setControlNetworkUnavailable] = useState(false);
+  const [controlRetry, setControlRetry] = useState(0);
   const [controlActionError, setControlActionError] = useState('');
+  const [controlActionNetworkUnavailable, setControlActionNetworkUnavailable] = useState(false);
   const [controlActionPending, setControlActionPending] = useState(false);
   const [controlRequest, setControlRequest] = useState<GatewayControlRequest | null>(null);
   const [pageError, setPageError] = useState('');
@@ -125,10 +130,13 @@ export default function Workbench() {
   const [mobileMenu, setMobileMenu] = useState<MobileMenu>(null);
   const [terminalSession, setTerminalSession] = useState<GatewayTerminalSession | null>(null);
   const [terminalError, setTerminalError] = useState('');
+  const [terminalRetry, setTerminalRetry] = useState(0);
+  const [terminalCreationUncertain, setTerminalCreationUncertain] = useState(false);
   const [terminalRequestPending, setTerminalRequestPending] = useState(false);
   const [renewing, setRenewing] = useState(false);
   const [notice, setNotice] = useState('');
   const [noticeKind, setNoticeKind] = useState<'success' | 'error'>('success');
+  const notifyNetwork = useWorkbenchNotice();
   const browserFrameRef = useRef<HTMLIFrameElement>(null);
   const browserPanelRef = useRef<HTMLDivElement>(null);
   const workbenchTabsRef = useRef<HTMLElement>(null);
@@ -148,6 +156,8 @@ export default function Workbench() {
   const applyControl = useCallback((value: GatewayControl) => {
     setControl(value);
     setControlError('');
+    setControlNetworkUnavailable(false);
+    setControlActionNetworkUnavailable(false);
     if (value.control_state !== 'user') {
       setTerminalSession(null);
       setTerminalError('');
@@ -160,17 +170,26 @@ export default function Workbench() {
     }
   }, []);
 
+  const handleControlReadFailure = useCallback((error: unknown) => {
+    setControlError(messageOf(error));
+    const transient = isTransientNetworkError(error);
+    setControlNetworkUnavailable(transient);
+    if (transient) notifyNetwork('电脑控制状态连接失败，操作已暂停。', {
+      label: '重试', onClick: () => setControlRetry((value) => value + 1),
+    });
+  }, [notifyNetwork]);
+
   const reloadControl = useCallback(async () => {
     if (embedded && !hasEmbedControlTarget(embedTargets)) return;
     setControlLoading(true);
     try {
       applyControl(await gatewayApi.control());
     } catch (error) {
-      setControlError(messageOf(error));
+      handleControlReadFailure(error);
     } finally {
       setControlLoading(false);
     }
-  }, [applyControl, embedTargets, embedded]);
+  }, [applyControl, embedTargets, embedded, handleControlReadFailure]);
 
   useEffect(() => {
     if (!embedContext) return;
@@ -216,16 +235,16 @@ export default function Workbench() {
       nonce: embedContext.nonce,
       conversation_id: embedConversationID,
       host_id: hostID,
-      workbench_ready: !pageError && (hostSessionOnly || (hostID !== null && !controlLoading && (!embedded || initialTab !== null))),
+      workbench_ready: !pageError && !controlError && (hostSessionOnly || (hostID !== null && !controlLoading && (!embedded || initialTab !== null))),
       remote_desktop: browserStatus,
-      control_state: control?.control_state ?? 'unknown',
-      control_lease_active: control?.control_lease_active ?? false,
-      control_lease_held_by_me: control?.control_lease_held_by_me ?? false,
+      control_state: controlError ? 'unknown' : control?.control_state ?? 'unknown',
+      control_lease_active: controlError ? false : control?.control_lease_active ?? false,
+      control_lease_held_by_me: controlError ? false : control?.control_lease_held_by_me ?? false,
     };
     if (nativeBridge) void Promise.resolve(nativeBridge.sendHostWorkbenchState?.(message)).catch(() => undefined);
     else window.parent.postMessage(message, embedContext.origin);
   }, [browserStatus, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_state,
-    controlLoading, embedContext, embedConversationID, embedded, hostID, hostSessionOnly, initialTab, nativeBridge, pageError]);
+    controlError, controlLoading, embedContext, embedConversationID, embedded, hostID, hostSessionOnly, initialTab, nativeBridge, pageError]);
 
   useEffect(() => {
     if (hostSessionOnly) return;
@@ -234,7 +253,7 @@ export default function Workbench() {
       setControlLoading(true);
       void gatewayApi.control()
         .then((value) => current && applyControl(value))
-        .catch((error: unknown) => current && setControlError(messageOf(error)))
+        .catch((error: unknown) => current && handleControlReadFailure(error))
         .finally(() => current && setControlLoading(false));
     };
     if (!embedded) loadControl();
@@ -252,11 +271,18 @@ export default function Workbench() {
           }
         }
       })
-      .catch((error: unknown) => current && setPageError(messageOf(error)));
+      .catch((error: unknown) => {
+        if (!current) return;
+        if (isTransientNetworkError(error)) {
+          notifyNetwork('工作台主机状态连接失败，正在保留当前页面。', {
+            label: '重试', onClick: () => setPageRetry((attempt) => attempt + 1),
+          });
+        } else setPageError(messageOf(error));
+      });
     return () => {
       current = false;
     };
-  }, [applyControl, embedded, hostSessionOnly, pageRetry]);
+  }, [applyControl, embedded, handleControlReadFailure, hostSessionOnly, notifyNetwork, pageRetry, controlRetry]);
 
   const controlSessionOnly = hostSessionOnly || (embedded && !hasEmbedControlTarget(embedTargets));
 
@@ -270,7 +296,7 @@ export default function Workbench() {
         const value = await gatewayApi.control();
         if (current) applyControl(value);
       } catch (error) {
-        if (current) setControlError(messageOf(error));
+        if (current) handleControlReadFailure(error);
       }
     };
     const timer = window.setInterval(() => void refresh(), interval);
@@ -278,7 +304,7 @@ export default function Workbench() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, controlSessionOnly]);
+  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, controlSessionOnly, handleControlReadFailure]);
 
   useEffect(() => {
     if (controlSessionOnly || !control?.control_lease_active || !control.control_lease_held_by_me) return;
@@ -288,14 +314,17 @@ export default function Workbench() {
       void gatewayApi.renewControlLease(control.control_version)
         .then(applyControl)
         .catch(async (error: unknown) => {
-          setControlActionError(`操作租约续期失败：${messageOf(error)}`);
+          if (isTransientNetworkError(error)) {
+            setControlActionNetworkUnavailable(true);
+            notifyNetwork('操作租约续期失败，正在确认电脑控制状态。');
+          } else setControlActionError(`操作租约续期失败：${messageOf(error)}`);
           try { applyControl(await gatewayApi.control()); }
-          catch (statusError) { setControlError(messageOf(statusError)); }
+          catch (statusError) { handleControlReadFailure(statusError); }
         })
         .finally(() => { leaseRenewalRef.current = false; });
     }, 10_000);
     return () => window.clearInterval(timer);
-  }, [applyControl, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_version, controlSessionOnly]);
+  }, [applyControl, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_version, controlSessionOnly, handleControlReadFailure, notifyNetwork]);
 
   const stopBrowserWatch = useCallback(() => {
     browserObserverRef.current?.disconnect();
@@ -331,7 +360,7 @@ export default function Workbench() {
   const terminalAvailable = !controlLoading && !controlError && !controlActionPending && leaseHeldByMe;
 
   useEffect(() => {
-    if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalRequestRef.current || terminalReplacementRef.current) return;
+    if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalCreationUncertain || terminalRequestRef.current || terminalReplacementRef.current) return;
     let current = true;
     terminalRequestRef.current = true;
     setTerminalRequestPending(true);
@@ -347,7 +376,12 @@ export default function Workbench() {
         setTerminalSession(session);
       })
       .catch((error: unknown) => {
-        if (current) setTerminalError(messageOf(error));
+        if (!current) return;
+        if (isTransientNetworkError(error)) {
+          notifyNetwork('终端状态读取失败，当前页面状态已保留。', {
+            label: '重试', onClick: () => setTerminalRetry((value) => value + 1),
+          });
+        } else setTerminalError(messageOf(error));
       })
       .finally(() => {
         if (current) {
@@ -359,7 +393,7 @@ export default function Workbench() {
       current = false;
       terminalRequestRef.current = false;
     };
-  }, [active, terminalAvailable, terminalSession, terminalError]);
+  }, [active, terminalAvailable, terminalSession, terminalError, terminalCreationUncertain, terminalRetry, notifyNetwork]);
 
   useEffect(() => {
     if (active !== 'terminal' || !terminalAvailable || terminalSession?.state !== 'creating' || terminalError) return;
@@ -385,7 +419,12 @@ export default function Workbench() {
         stillCreating = session.state === 'creating';
         setTerminalSession(session);
       } catch (error) {
-        if (current) setTerminalError(messageOf(error));
+        if (!current) return;
+        if (isTransientNetworkError(error)) {
+          notifyNetwork('终端状态读取失败，保留当前终端状态。', {
+            label: '重试', onClick: () => setTerminalRetry((value) => value + 1),
+          });
+        } else setTerminalError(messageOf(error));
       } finally {
         terminalRequestRef.current = false;
         if (current && stillCreating) timer = window.setTimeout(() => void poll(), 2000);
@@ -396,13 +435,12 @@ export default function Workbench() {
       current = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [active, terminalAvailable, terminalError, terminalSession?.state]);
+  }, [active, terminalAvailable, terminalError, terminalSession?.state, terminalRetry, notifyNetwork]);
 
   async function createNewTerminalSession() {
     if (terminalRequestRef.current || !window.confirm('新终端不会停止原终端中的命令。请先保存工作；原会话可能继续运行并占用资源。确定新建吗？')) return;
     terminalReplacementRef.current = true;
     terminalRequestRef.current = true;
-    setTerminalSession(null);
     setTerminalError('');
     setTerminalRequestPending(true);
     try {
@@ -415,7 +453,10 @@ export default function Workbench() {
       }
       setTerminalSession(session);
     } catch (error) {
-      setTerminalError(messageOf(error));
+      if (isTransientNetworkError(error)) {
+        setTerminalCreationUncertain(true);
+        notifyNetwork('新建终端请求未确认，可能已创建。为避免重复创建，暂时保留原终端并暂停新建。');
+      } else setTerminalError(messageOf(error));
     } finally {
       terminalReplacementRef.current = false;
       terminalRequestRef.current = false;
@@ -621,8 +662,12 @@ export default function Workbench() {
       setHost(await gatewayApi.renew());
       setNotice('主机已续期');
     } catch (error) {
-      setNoticeKind('error');
-      setNotice(messageOf(error));
+      if (isTransientNetworkError(error)) {
+        notifyNetwork('主机续期结果未确认，请稍后核对主机状态。');
+      } else {
+        setNoticeKind('error');
+        setNotice(messageOf(error));
+      }
     } finally {
       setRenewing(false);
     }
@@ -649,10 +694,14 @@ export default function Workbench() {
     setControlRequest(request);
     setControlActionPending(true);
     setControlActionError('');
+    setControlActionNetworkUnavailable(false);
     try {
       applyControl(await gatewayApi.controlAction(request));
     } catch (error) {
-      setControlActionError(messageOf(error));
+      if (isTransientNetworkError(error)) {
+        setControlActionNetworkUnavailable(true);
+        notifyNetwork('电脑控制请求未确认，当前操作已暂停。', { label: '重试', onClick: () => void controlComputer() });
+      } else setControlActionError(messageOf(error));
       try {
         const latest = await gatewayApi.control();
         applyControl(latest);
@@ -662,7 +711,7 @@ export default function Workbench() {
           setControlRequest(null);
         }
       } catch (statusError) {
-        setControlError(messageOf(statusError));
+        handleControlReadFailure(statusError);
       }
     } finally {
       setControlActionPending(false);
@@ -683,8 +732,8 @@ export default function Workbench() {
       ? retryControlRequest.action === 'take_over' ? '重试接管' : '重试交回 AI'
       : control?.control_state === 'ai' ? '接管电脑'
         : leaseHeldByMe ? '交回 AI' : '';
-  const mobileControlStatus = controlError ? '控制不可用'
-    : controlLoading && !control ? '正在连接'
+  const mobileControlStatus = controlError && !controlNetworkUnavailable ? '控制不可用'
+    : controlNetworkUnavailable || (controlLoading && !control) ? '正在连接'
       : control?.control_state === 'ai' ? 'AI 控制中'
         : leaseHeldByMe ? '你正在操作'
           : control?.control_state === 'user' ? '他人正在操作'
@@ -706,10 +755,10 @@ export default function Workbench() {
         host={host}
         renewing={renewing}
         onRenew={renew}
-        control={control}
-        controlLoading={controlLoading}
-        controlError={controlError}
-        controlActionError={controlActionError}
+        control={controlNetworkUnavailable ? null : control}
+        controlLoading={controlLoading || controlNetworkUnavailable}
+        controlError={controlNetworkUnavailable ? '' : controlError}
+        controlActionError={controlActionNetworkUnavailable ? '' : controlActionError}
         controlActionLabel={controlActionLabel}
         controlActionPending={controlActionPending}
         notice={notice}
@@ -881,7 +930,7 @@ export default function Workbench() {
                   <>
                     {visibleActive === 'terminal' && (
                       <div className="terminal-actions">
-                        <button className="button button-secondary" type="button" disabled={terminalRequestPending} onClick={() => void createNewTerminalSession()}>
+                        <button className="button button-secondary" type="button" disabled={terminalRequestPending || terminalCreationUncertain} onClick={() => void createNewTerminalSession()}>
                           新建终端
                         </button>
                       </div>
@@ -900,7 +949,9 @@ export default function Workbench() {
                 ) : terminalAvailable && terminalSession?.state === 'creating' ? (
                   <p className="panel-loading" role="status">终端正在创建，确认就绪后会自动连接…</p>
                 ) : controlError ? (
-                  <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
+                  controlNetworkUnavailable
+                    ? <p className="panel-loading" role="status">正在重新确认电脑控制状态…</p>
+                    : <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
                 ) : terminalAvailable ? (
                   <p className="panel-loading" role="status">正在连接终端…</p>
                 ) : (
@@ -913,7 +964,9 @@ export default function Workbench() {
                 {vscodeAvailable
                   ? <FileManager />
                   : controlError
-                    ? <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
+                    ? controlNetworkUnavailable
+                      ? <p className="panel-loading" role="status">正在重新确认电脑控制状态…</p>
+                      : <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
                     : <p className="panel-loading" role="status">请先接管电脑后使用文件。</p>}
               </div>
             )}
@@ -927,7 +980,9 @@ export default function Workbench() {
                 {vscodeAvailable
                   ? <iframe title="VSCode" src="/code-server/" />
                   : controlError
-                    ? <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
+                    ? controlNetworkUnavailable
+                      ? <p className="panel-loading" role="status">正在重新确认电脑控制状态…</p>
+                      : <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
                     : <p className="panel-loading" role="status">请先接管电脑后使用 VSCode。</p>}
               </div>
             )}
@@ -935,7 +990,7 @@ export default function Workbench() {
           </div>
           {!workspaceOnly && (
             <div className="mobile-control-footer" aria-label="电脑控制权">
-              {controlError && <button className="button button-secondary mobile-control-retry" type="button" onClick={reloadControl} disabled={controlLoading}>重试</button>}
+              {controlError && !controlNetworkUnavailable && <button className="button button-secondary mobile-control-retry" type="button" onClick={reloadControl} disabled={controlLoading}>重试</button>}
               {controlActionLabel && <button
                 className="button mobile-control-action"
                 type="button"

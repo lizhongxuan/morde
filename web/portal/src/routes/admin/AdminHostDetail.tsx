@@ -2,15 +2,18 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { isTransientNetworkError } from '../../api/errors';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../../app/format';
 import { useToast } from '../../app/toast';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 function HostResourceEditor({ id }: { id: string }) {
   const client = useQueryClient();
   const { notify } = useToast();
   const query = useQuery({ queryKey: ['admin', 'host-resources', id], queryFn: () => portalApi.adminHostResources(id) });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，电脑规格暂时无法读取。');
   const current = query.data;
   const [cpu, setCPU] = useState<string | null>(null);
   const [memory, setMemory] = useState<string | null>(null);
@@ -23,11 +26,11 @@ function HostResourceEditor({ id }: { id: string }) {
   });
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); save.mutate(); };
   return <section className="admin-detail-section"><h2>电脑规格</h2>
-    {query.isPending ? <div className="loading-card" role="status">正在读取规格…</div> : query.isError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError> : current?.update_state !== 'idle' ? <div className="notice notice-warning">上次规格调整仍在核验中，请联系运维核对运行时资源后再调整。</div> : current?.state !== 'stopped' && current?.state !== 'running' ? <div className="notice notice-warning">当前电脑状态不能调整规格。</div> : <form className="form-card form-stack" onSubmit={submit}>
+    {query.isPending || (networkError && !current) ? <div className="loading-card" role="status">正在读取规格…</div> : query.isError && !networkError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError> : current && current.update_state !== 'idle' ? <div className="notice notice-warning">上次规格调整仍在核验中，请联系运维核对运行时资源后再调整。</div> : current && current.state !== 'stopped' && current.state !== 'running' ? <div className="notice notice-warning">当前电脑状态不能调整规格。</div> : current ? <form className="form-card form-stack" onSubmit={submit}>
       <label htmlFor="host-resource-cpu">CPU（毫核）</label><input id="host-resource-cpu" type="number" min="1" required value={cpu ?? String(current.resources.cpu_milli)} onChange={(event) => setCPU(event.target.value)} />
       <label htmlFor="host-resource-memory">内存（MiB）</label><input id="host-resource-memory" type="number" min="1" required value={memory ?? String(current.resources.mem_mib)} onChange={(event) => setMemory(event.target.value)} />
       <div className="form-actions"><button className="button button-primary" disabled={save.isPending} type="submit">{save.isPending ? '保存中…' : '保存规格'}</button></div>
-    </form>}
+    </form> : <div className="loading-card" role="status">正在读取规格…</div>}
   </section>;
 }
 
@@ -56,9 +59,15 @@ export function AdminHostDetail() {
   const { id = '' } = useParams();
   const hosts = useQuery({ queryKey: ['admin', 'hosts'], queryFn: portalApi.adminHosts });
   const users = useQuery({ queryKey: ['admin', 'users'], queryFn: () => portalApi.adminUsers() });
-  if (hosts.isPending || users.isPending) return <div className="loading-card" role="status">正在读取电脑信息…</div>;
-  if (hosts.isError || users.isError) {
-    const error = hosts.isError ? hosts.error : users.error;
+  const networkError = useNetworkReadNotice([
+    { failed: hosts.isError, error: hosts.error, retry: hosts.refetch },
+    { failed: users.isError, error: users.error, retry: users.refetch },
+  ], '网络异常，电脑详情暂时无法读取。');
+  const hardError = hosts.isError && !isTransientNetworkError(hosts.error) ? hosts.error
+    : users.isError && !isTransientNetworkError(users.error) ? users.error : null;
+  if (hosts.isPending || users.isPending || (networkError && (!hosts.data || !users.data))) return <div className="loading-card" role="status">正在读取电脑信息…</div>;
+  if (hardError) {
+    const error = hardError;
     return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void hosts.refetch(); void users.refetch(); }}>重试</button></FloatingError>;
   }
   const host = hosts.data.items.find((item) => item.id === id);

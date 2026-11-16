@@ -111,7 +111,7 @@
     .message-body { min-width: 0; font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; white-space: pre-wrap; }
     .message-avatar { display: grid; place-items: center; width: 25px; height: 25px; flex: none; margin-top: 2px; border-radius: 9px; }
     .message-name { display: block; margin-bottom: 5px; color: #747981; font-size: 11px; font-weight: 700; }
-    .message-reaction { position: absolute; left: 7px; bottom: 4px; display: grid; place-items: center; width: 28px; height: 25px; border: 2px solid #fff; border-radius: 14px; background: #f2f3f5; font-size: 14px; line-height: 1; }
+    .message-reaction { position: absolute; right: 7px; bottom: -12px; display: grid; place-items: center; width: 28px; height: 25px; border: 2px solid #fff; border-radius: 14px; background: #f2f3f5; font-size: 14px; line-height: 1; }
     .thinking-dots { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 9px 12px; border-radius: 15px; background: #f1f2f4; }
     .thinking-dots span { width: 6px; height: 6px; border-radius: 50%; background: #8b9199; animation: thinking-bounce 1.1s ease-in-out infinite; }
     .thinking-dots span:nth-child(2) { animation-delay: .15s; }
@@ -268,6 +268,35 @@
     .settings-form input, .settings-form select, .settings-form textarea, .profile-form input, .profile-form select, .profile-form textarea { width: 100%; min-height: 39px; padding: 9px 10px; border: 1px solid #dfe5ed; border-radius: 8px; color: #303b4c; background: #fff; font: inherit; font-weight: 400; }
     .settings-form small, .profile-form small { color: #8c96a4; font-size: 11px; line-height: 1.6; font-weight: 400; }
     .settings-form .settings-actions { grid-column: 1 / -1; }
+    .model-page-intro { margin: 22px 0 14px; }
+    .model-page-intro h2 { margin: 0; color: #293445; font-size: 20px; letter-spacing: -.02em; }
+    .model-page-intro p { margin: 6px 0 0; color: #8490a0; font-size: 12px; }
+    .model-area-tabs { display: flex; gap: 4px; padding: 4px; width: fit-content; max-width: 100%; border: 1px solid #e8edf5; border-radius: 10px; background: #f1f4f9; }
+    .model-area-tabs button { min-height: 31px; padding: 6px 13px; border: 0; border-radius: 7px; color: #6f7d90; background: transparent; font-size: 12px; font-weight: 600; }
+    .model-area-tabs button[aria-pressed="true"] { color: #365bcf; background: #fff; box-shadow: 0 1px 5px #263a6020; }
+    #settingsView .model-section { margin-top: 22px; }
+    .model-section .settings-section-head { margin-bottom: 12px !important; }
+    #settingsView .model-card { padding: 18px; border-color: #e4eaf3; }
+    .model-card .feature-icon { color: #fff; background: #456be8; }
+    .model-card .feature-card-title h3 { font-size: 14px; }
+    .model-card .model-status { display: inline-flex; align-items: center; gap: 5px; color: #a3722f; font-size: 11px; }
+    .model-card .model-status::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #e3a84c; }
+    .model-card .model-status.good { color: #35825b; }
+    .model-card .model-status.good::before { background: #4aa775; }
+    .model-card .feature-actions { margin-top: 14px !important; }
+    .model-details { margin: 12px 0 0 42px; color: #8490a0; font-size: 11px; }
+    .model-details summary { width: fit-content; color: #68788e; cursor: pointer; }
+    .model-details p { margin-top: 7px; }
+    #modelForm { gap: 14px; padding: 20px; border-color: #e3e9f4; box-shadow: 0 5px 22px #25365a0a; }
+    .model-form-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .model-form-heading h3 { margin: 0; color: #293445; font-size: 15px; }
+    .model-form-heading span { color: #96a1af; font-size: 11px; }
+    .model-advanced { padding: 12px 0 0; border-top: 1px solid #edf0f5; }
+    .model-advanced summary { color: #536882; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .model-advanced .profile-form { margin-top: 12px; }
+    #modelForm [aria-invalid="true"] { border-color: #d96962; box-shadow: 0 0 0 2px #d969621a; }
+    .model-form-error { padding: 10px 12px; border: 1px solid #f1c8c3; border-radius: 8px; color: #9e3d36; background: #fff7f6; font-size: 12px; line-height: 1.5; }
+    #modelCheckNote { color: #8490a0; }
     .feature-empty { display: grid; justify-items: center; gap: 8px; min-height: 150px; padding: 28px 18px; color: #9aa4b0; text-align: center; font-size: 12px; }
     .feature-empty .icon { width: 28px; height: 28px; color: #b7c4d8; }
     .feature-empty strong { color: #586678; font-size: 13px; }
@@ -621,25 +650,37 @@
       <section class="settings-view" id="settingsView" aria-label="设置与授权" hidden>
         <div class="settings-inner">
           <div id="settings-models" role="tabpanel" aria-labelledby="tab-settings-models" data-settings-panel="models">
-            <section class="settings-section">
-              <div class="settings-section-head"><div><h3>我的模型</h3><p>个人模型只对当前账号可用。</p></div><button class="primary-button" type="button" data-model-edit="add">＋ 添加个人模型</button></div>
-              <form class="settings-form" id="modelForm" hidden>
-                <h3 class="form-wide" id="modelFormTitle">添加个人模型</h3>
-                <label class="form-wide">选择服务和模型<select id="modelPreset"><option value="custom">自定义</option><option value="deepseek">DeepSeek Flash</option></select></label>
-                <label>显示名称<input id="modelName" type="text" placeholder="例如 DeepSeek Flash" required></label>
-                <label>模型名<input id="modelID" type="text" placeholder="例如 deepseek-flash" required></label>
-                <label class="form-wide">上下文窗口（tokens）<input id="modelContext" type="number" min="4096" max="1000000" placeholder="未配置"><small>留空时不启用自动压缩。</small></label>
-                <label class="form-wide">服务地址<input id="modelURL" type="url" pattern="https://.*" placeholder="https://" required><small>使用 HTTPS，连接须符合服务端配置。</small></label>
-                <label class="form-wide">API 密钥<input id="modelKey" type="password" autocomplete="off" placeholder="粘贴 API 密钥"><small id="modelKeyHelp">密钥将加密保存，保存后不会回显。</small></label>
-                <small class="form-wide" id="modelCheckNote" hidden>检查会调用模型，可能产生少量服务商用量。</small>
-                <div class="settings-actions"><button class="secondary-button" id="cancelModel" type="button">取消</button><button class="primary-button" id="saveModel" type="submit">保存</button></div>
+            <header class="model-page-intro"><h2>模型与工具</h2><p>管理你的模型连接与可用工具。</p></header>
+            <div class="model-area-tabs" role="group" aria-label="模型与工具分类">
+              <button type="button" aria-pressed="true" data-model-area="personal">个人模型</button><button type="button" aria-pressed="false" data-model-area="team">团队模型</button><button type="button" aria-pressed="false" data-model-area="mcp">MCP 工具</button>
+            </div>
+            <section class="settings-section model-section" data-model-area-panel="personal">
+              <div class="settings-section-head"><div><h3>个人模型</h3><p>使用自己的 API 密钥，仅当前账号可见。</p></div><button class="primary-button" type="button" data-model-edit="add">＋ 添加模型</button></div>
+              <form class="settings-form" id="modelForm" novalidate hidden>
+                <div class="form-wide model-form-heading"><h3 id="modelFormTitle">添加个人模型</h3><span>仅对你可见</span></div>
+                <label class="form-wide">选择模型<select id="modelPreset" required>
+                  <option value="">选择模型或自定义</option>
+                  <optgroup label="DeepSeek"><option value="deepseek" data-name="DeepSeek Flash" data-model="deepseek-flash" data-url="https://api.deepseek.com">DeepSeek Flash</option></optgroup>
+                  <optgroup label="OpenAI"><option value="gpt-6-luna" data-name="OpenAI GPT-6 Luna" data-model="gpt-6-luna" data-url="https://api.openai.com/v1">GPT-6 Luna</option><option value="gpt-6.1-sol" data-name="OpenAI GPT-6.1 Sol" data-model="gpt-6.1-sol" data-url="https://api.openai.com/v1">GPT-6.1 Sol</option><option value="gpt-6-astra" data-name="OpenAI GPT-6 Astra" data-model="gpt-6-astra" data-url="https://api.openai.com/v1">GPT-6 Astra</option></optgroup>
+                  <optgroup label="Z.ai"><option value="glm-5.1" data-name="GLM-5.1" data-model="glm-5.1" data-url="https://api.z.ai/api/paas/v4">GLM-5.1</option></optgroup><option value="custom">自定义兼容模型</option>
+                </select></label>
+                <label class="form-wide">API 密钥<input id="modelKey" type="password" autocomplete="new-password" placeholder="粘贴 API 密钥"><small id="modelKeyHelp">密钥加密保存，保存后不可查看。</small></label>
+                <details class="form-wide model-advanced" id="modelAdvanced"><summary>高级设置</summary><div class="profile-form">
+                  <label>显示名称<input id="modelName" type="text" maxlength="80" placeholder="例如 DeepSeek Flash" required></label>
+                  <label>模型名<input id="modelID" type="text" maxlength="256" placeholder="例如 deepseek-flash" required></label>
+                  <label class="form-wide">服务地址<input id="modelURL" type="url" pattern="https://.*" placeholder="https://" required><small>使用 HTTPS，连接需符合服务端配置。</small></label>
+                  <label class="form-wide">上下文窗口（tokens，可选）<input id="modelContext" type="number" min="4096" max="1000000" step="1" placeholder="未知"><small>未配置时不启用自动压缩。</small></label>
+                </div></details>
+                <div class="form-wide model-form-error" id="modelFormError" role="alert" hidden></div>
+                <small class="form-wide" id="modelCheckNote">保存后会检查连接，可能产生少量服务商用量。</small>
+                <div class="settings-actions"><button class="secondary-button" id="cancelModel" type="button">取消</button><button class="primary-button" id="saveModel" type="submit">保存并检查连接</button></div>
               </form>
-              <article class="feature-card compact-item"><div class="feature-card-header"><span class="feature-icon">D</span><div class="feature-card-main"><div class="feature-card-title"><h3>DeepSeek Flash</h3><span class="feature-badge">个人</span><span class="feature-badge waiting">尚未检查</span></div><p>deepseek-flash · api.deepseek.com</p><div class="feature-badges"><span class="feature-badge">密钥已保存</span><span class="feature-badge">上下文窗口未配置</span><span class="feature-badge">能力待检查</span></div></div></div><div class="feature-actions"><button class="quiet-button" type="button" data-model-edit="edit">编辑</button><button class="quiet-button" type="button" data-demo-action>检查连接</button><button class="quiet-button" type="button" disabled title="先检查文本能力">检查流式回复</button></div><p class="settings-note">检查连接可能产生少量服务商用量。</p></article>
+              <article class="feature-card model-card" id="personalModelList"><div class="feature-card-header"><span class="feature-icon">D</span><div class="feature-card-main"><div class="feature-card-title"><h3>DeepSeek Flash</h3><span class="model-status">尚未检查</span></div><p>deepseek-flash · api.deepseek.com · 示例</p></div></div><div class="feature-actions"><button class="quiet-button" type="button" data-model-edit="edit">编辑</button><button class="quiet-button" type="button" data-demo-action>检查连接</button><button class="quiet-button" type="button" disabled title="先检查文本能力">检查流式回复</button></div><details class="model-details"><summary>查看连接详情</summary><p>密钥已保存 · 上下文窗口未配置 · 能力待检查</p><p>检查连接可能产生少量服务商用量。</p></details></article>
             </section>
-            <section class="settings-section"><div class="settings-section-head"><div><h3>团队模型</h3><p>由管理员配置，通过检查后可在对话中选择。</p></div></div>
-              <article class="feature-card"><div class="feature-card-header"><span class="feature-icon"><svg class="icon"><use href="#i-globe"/></svg></span><div class="feature-card-main"><div class="feature-card-title"><h3>团队通用模型</h3><span class="feature-badge good">团队共享</span></div><p>gpt-4o · api.openai.com</p><div class="feature-badges"><span class="feature-badge">密钥已保存</span><span class="feature-badge good">✓ 文本</span><span class="feature-badge good">✓ 工具调用</span><span class="feature-badge good">✓ 视觉</span><span class="feature-badge">流式能力待检查</span><span class="feature-badge">上下文窗口未配置</span></div></div></div></article>
+            <section class="settings-section model-section" data-model-area-panel="team" hidden><div class="settings-section-head"><div><h3>团队模型</h3><p>由管理员配置，通过检查后可在对话中选择。</p></div></div>
+              <article class="feature-card model-card"><div class="feature-card-header"><span class="feature-icon"><svg class="icon"><use href="#i-globe"/></svg></span><div class="feature-card-main"><div class="feature-card-title"><h3>团队通用模型</h3><span class="model-status good">检查通过</span></div><p>gpt-4o · api.openai.com · 示例</p></div></div><details class="model-details"><summary>查看连接详情</summary><p>文本、工具调用和视觉已验证 · 流式能力待检查</p><p>上下文窗口未配置。</p></details></article>
             </section>
-            <section class="settings-section"><div class="settings-section-head"><div><h3>MCP 工具连接</h3><p>启用后供之后新建的任务使用。</p></div><button class="quiet-button" type="button" id="toggleMcpForm">＋ 添加工具连接</button></div>
+            <section class="settings-section model-section" data-model-area-panel="mcp" hidden><div class="settings-section-head"><div><h3>MCP 工具连接</h3><p>启用后供之后新建的任务使用。</p></div><button class="quiet-button" type="button" id="toggleMcpForm">＋ 添加工具连接</button></div>
               <form class="settings-form" id="mcpForm" data-preview-form hidden>
                 <h3 class="form-wide">添加工具连接</h3>
                 <label class="form-wide">连接模板<select id="mcpPreset"><option value="custom">自定义</option><option value="github" data-name="GitHub" data-url="https://api.githubcopilot.com/mcp/">GitHub</option><optgroup label="Google Workspace"><option value="google" data-name="Gmail" data-url="https://gmailmcp.googleapis.com/mcp/v1">Gmail</option><option value="google" data-name="Google Calendar" data-url="https://calendarmcp.googleapis.com/mcp/v1">Google Calendar</option><option value="google" data-name="Google Drive" data-url="https://drivemcp.googleapis.com/mcp/v1">Google Drive</option><option value="google" data-name="Google Docs" data-url="https://docsmcp.googleapis.com/mcp/v1">Google Docs</option><option value="google" data-name="Google Sheets" data-url="https://sheetsmcp.googleapis.com/mcp/v1">Google Sheets</option><option value="google" data-name="Google Slides" data-url="https://slidesmcp.googleapis.com/mcp/v1">Google Slides</option><option value="google" data-name="Google Chat" data-url="https://chatmcp.googleapis.com/mcp/v1">Google Chat</option><option value="google" data-name="Google People" data-url="https://people.googleapis.com/mcp/v1">Google People</option><option value="google" data-name="Google Classroom" data-url="https://classroommcp.googleapis.com/mcp/v1">Google Classroom</option></optgroup></select></label>
@@ -1375,34 +1416,61 @@
       });
     });
     const modelForm = document.getElementById('modelForm');
+    const modelFormError = document.getElementById('modelFormError');
+    const modelAdvanced = document.getElementById('modelAdvanced');
+    const modelList = document.getElementById('personalModelList');
+    const addModelButton = document.querySelector('[data-model-edit="add"]');
+    document.querySelectorAll('[data-model-area]').forEach(function (button) { button.addEventListener('click', function () {
+      document.querySelectorAll('[data-model-area]').forEach(function (item) { item.setAttribute('aria-pressed', String(item === button)); });
+      document.querySelectorAll('[data-model-area-panel]').forEach(function (panel) { panel.hidden = panel.dataset.modelAreaPanel !== button.dataset.modelArea; });
+    }); });
     document.querySelectorAll('[data-model-edit]').forEach(function (button) { button.addEventListener('click', function () {
       const editing = button.dataset.modelEdit === 'edit';
       modelForm.reset();
       modelForm.hidden = false;
+      modelList.hidden = true;
+      addModelButton.hidden = true;
+      modelFormError.hidden = true;
+      modelForm.querySelectorAll('[aria-invalid]').forEach(function (input) { input.removeAttribute('aria-invalid'); });
+      modelAdvanced.open = false;
       modelForm.dataset.editing = String(editing);
       document.getElementById('modelFormTitle').textContent = editing ? '编辑个人模型' : '添加个人模型';
+      document.getElementById('modelPreset').value = editing ? 'deepseek' : '';
       document.getElementById('modelName').value = editing ? 'DeepSeek Flash' : '';
       document.getElementById('modelID').value = editing ? 'deepseek-flash' : '';
       document.getElementById('modelURL').value = editing ? 'https://api.deepseek.com' : '';
       document.getElementById('modelKey').required = !editing;
-      document.getElementById('modelKeyHelp').textContent = editing ? '留空保留已保存密钥，输入新值才会替换。' : '密钥将加密保存，保存后不会回显。';
-      document.getElementById('saveModel').textContent = '保存';
-      document.getElementById('modelCheckNote').hidden = true;
-      document.getElementById('modelName').focus();
+      document.getElementById('modelKeyHelp').textContent = editing ? '留空保留已保存的密钥。' : '密钥加密保存，保存后不可查看。';
+      document.getElementById('saveModel').textContent = editing ? '保存修改' : '保存并检查连接';
+      document.getElementById('modelCheckNote').hidden = editing;
+      document.getElementById('modelPreset').focus();
     }); });
     document.getElementById('modelPreset').addEventListener('change', function (event) {
-      const preset = event.target.value === 'deepseek';
-      const editing = modelForm.dataset.editing === 'true';
-      document.getElementById('saveModel').textContent = editing ? '保存' : preset ? '保存并检查连接' : '保存';
-      document.getElementById('modelCheckNote').hidden = editing || !preset;
-      if (preset) {
-        document.getElementById('modelName').value = 'DeepSeek Flash';
-        document.getElementById('modelID').value = 'deepseek-flash';
-        document.getElementById('modelURL').value = 'https://api.deepseek.com';
-      }
+      const option = event.target.selectedOptions[0];
+      document.getElementById('modelName').value = option.dataset.name || '';
+      document.getElementById('modelID').value = option.dataset.model || '';
+      document.getElementById('modelURL').value = option.dataset.url || '';
+      modelAdvanced.open = option.value === 'custom';
     });
-    document.getElementById('cancelModel').addEventListener('click', function () { modelForm.hidden = true; modelForm.reset(); });
-    modelForm.addEventListener('submit', function (event) { event.preventDefault(); document.getElementById('modelKey').value = ''; showToast('设计预览不会保存或连接模型。'); });
+    document.getElementById('cancelModel').addEventListener('click', function () { modelForm.hidden = true; modelForm.reset(); modelList.hidden = false; addModelButton.hidden = false; });
+    modelForm.addEventListener('input', function (event) { event.target.removeAttribute('aria-invalid'); modelFormError.hidden = true; });
+    modelForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      const key = document.getElementById('modelKey');
+      const fields = Array.from(modelForm.querySelectorAll('input, select'));
+      const invalid = fields.find(function (field) { return !field.validity.valid || (field === key && key.value && !key.value.trim()); });
+      if (invalid) {
+        const messages = { modelPreset: '请选择模型。', modelKey: '请输入 API 密钥。', modelName: '请填写显示名称。', modelID: '请填写模型名。', modelURL: '请填写有效的 HTTPS 服务地址。', modelContext: '上下文窗口需为 4096 到 1000000 的整数。' };
+        if (modelAdvanced.contains(invalid)) modelAdvanced.open = true;
+        invalid.setAttribute('aria-invalid', 'true');
+        modelFormError.textContent = messages[invalid.id];
+        modelFormError.hidden = false;
+        invalid.focus();
+        return;
+      }
+      key.value = '';
+      showToast('设计预览不会保存或连接模型。');
+    });
     document.getElementById('toggleMcpForm').addEventListener('click', function () { document.getElementById('mcpForm').hidden = !document.getElementById('mcpForm').hidden; });
     document.getElementById('mcpPreset').addEventListener('change', function (event) {
       const option = event.target.selectedOptions[0];

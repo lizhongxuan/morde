@@ -14,7 +14,7 @@ import { portalApi } from '../app/api';
 import type { components } from '../api/schema';
 import { messageOutbox } from '../app/message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
-import { messageVariantOutbox, messageVariantOutboxScope } from '../app/message-variant-outbox';
+import { messageVariantOutbox } from '../app/message-variant-outbox';
 import type { PendingMessageVariantOperation } from '../app/message-variant-outbox';
 import * as messageVariantAPI from '../app/message-variants';
 import type { MainConversation } from '../app/api';
@@ -119,9 +119,9 @@ function acceptedReceipt(conversationID: string, body: AcceptConversationMessage
   return { message: submitted, replayed: false };
 }
 
-function renderPage(initialState: unknown = null) {
+function renderPage(initialState: unknown = null, autoOpenErrors = true) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  const view = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[{ pathname: '/assistant', state: initialState }]}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  const view = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors={autoOpenErrors} /><MemoryRouter initialEntries={[{ pathname: '/assistant', state: initialState }]}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { ...view, client };
 }
 
@@ -310,43 +310,7 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(readContents()).toEqual(['二版提示', '二版回复', '后续提示']));
   });
 
-  it('persists an edit operation before posting it with the group high-water version', async () => {
-    const source = { ...message, id: 'mroot002', sequence: 1, content: '待编辑消息' } as ConversationMessage;
-    mockCommon({ conversations: [conversation], messages: [source] });
-    const operationServiceID = (await portalApi.capabilities()).service_instance_id;
-    const scope = messageVariantOutboxScope('u1234567', operationServiceID);
-    const stored = new Map<string, PendingMessageVariantOperation[]>();
-    vi.mocked(messageVariantOutbox.read).mockImplementation(async (key) => stored.get(key) ?? []);
-    vi.mocked(messageVariantOutbox.update).mockImplementation(async (key, change) => {
-      const next = change(stored.get(key) ?? []);
-      stored.set(key, next);
-      return next;
-    });
-    vi.spyOn(messageVariantAPI, 'createMessageVariant').mockImplementation(async (input) => {
-      const pending = await messageVariantOutbox.read(scope);
-      expect(pending).toHaveLength(1);
-      expect(pending[0]?.input.idempotencyKey).toBe(input.idempotencyKey);
-      return { operation_id: 'op000001', variant_group_id: source.id, variant_version: 2, action: 'edit_resend', state: 'accepted', user_message_id: 'medit002' };
-    });
-    const user = userEvent.setup();
-    renderPage();
-
-    await user.click(await screen.findByRole('button', { name: '编辑并重发' }));
-    const edit = screen.getByRole('textbox', { name: '编辑消息并创建新版本' });
-    await user.clear(edit);
-    await user.type(edit, '修改后的消息');
-    await user.click(screen.getByRole('button', { name: '创建新版本' }));
-
-    await waitFor(() => expect(messageVariantAPI.createMessageVariant).toHaveBeenCalledOnce());
-    expect(messageVariantAPI.createMessageVariant).toHaveBeenCalledWith(expect.objectContaining({
-      conversationID: conversation.id, messageID: source.id, action: 'edit_resend', expectedVersion: 1,
-      content: '修改后的消息', actorID: 'u1234567', serviceInstanceID: operationServiceID,
-      idempotencyKey: expect.any(String),
-    }));
-    expect(stored.get(scope)).toEqual([]);
-  });
-
-  it('offers text regeneration only from assistant output and continuation only for interrupted output', async () => {
+  it('hides edit and regeneration actions while keeping interrupted continuation', async () => {
     const source = { ...message, id: 'mroot003', sequence: 1, content: '源消息' } as ConversationMessage;
     const sourceRow = { user_message_id: source.id, task_id: task.id, task_revision: 1, event_sequence: 1, content: '结果' };
     const complete = { ...reply, id: 'mcomplete', sequence: 2, content: '完整结果', output_status: 'completed', sources: [sourceRow] } as ConversationMessage;
@@ -354,25 +318,25 @@ describe('Assistant durable tasks', () => {
     const streaming = { ...reply, id: 'mstream01', sequence: 4, content: '生成中', output_status: 'streaming', sources: [sourceRow] } as ConversationMessage;
     mockCommon({ conversations: [conversation], messages: [source, complete, interrupted, streaming] });
     const createVariant = vi.spyOn(messageVariantAPI, 'createMessageVariant').mockResolvedValue({
-      operation_id: 'opregen01', variant_group_id: source.id, variant_version: 2, action: 'regenerate_text', state: 'accepted', assistant_message_id: 'mregen01',
+      operation_id: 'opcontinue01', variant_group_id: source.id, variant_version: 2, action: 'continue_generation', state: 'accepted', assistant_message_id: 'mcontinue1',
     });
     const user = userEvent.setup();
     renderPage();
 
     const userArticle = await screen.findByRole('article', { name: '你的消息' });
-    expect(within(userArticle).getByRole('button', { name: '编辑并重发' })).toBeInTheDocument();
+    expect(within(userArticle).queryByRole('button', { name: '编辑并重发' })).not.toBeInTheDocument();
     expect(within(userArticle).queryByRole('button', { name: '重新生成文字' })).not.toBeInTheDocument();
     const completeArticle = document.querySelector<HTMLElement>('#conversation-message-mcomplete')!;
     const interruptedArticle = document.querySelector<HTMLElement>('#conversation-message-minterrupt')!;
     const streamingArticle = document.querySelector<HTMLElement>('#conversation-message-mstream01')!;
-    expect(within(completeArticle).getByRole('button', { name: '重新生成文字' })).toBeInTheDocument();
+    expect(within(completeArticle).queryByRole('button', { name: '重新生成文字' })).not.toBeInTheDocument();
     expect(within(completeArticle).queryByRole('button', { name: '继续生成' })).not.toBeInTheDocument();
     expect(within(interruptedArticle).getByRole('button', { name: '继续生成' })).toBeInTheDocument();
     expect(within(streamingArticle).queryByRole('button', { name: '继续生成' })).not.toBeInTheDocument();
     expect(within(streamingArticle).queryByRole('button', { name: '重新生成文字' })).not.toBeInTheDocument();
-    await user.click(within(completeArticle).getByRole('button', { name: '重新生成文字' }));
+    await user.click(within(interruptedArticle).getByRole('button', { name: '继续生成' }));
     await waitFor(() => expect(createVariant).toHaveBeenCalledWith(expect.objectContaining({
-      messageID: complete.id, action: 'regenerate_text', expectedVersion: 1, conversationID: conversation.id,
+      messageID: interrupted.id, action: 'continue_generation', expectedVersion: 1, conversationID: conversation.id,
     })));
   });
 
@@ -1052,6 +1016,38 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText(/无法读取模型：/)).not.toBeInTheDocument();
   });
 
+  it('keeps the assistant page intact and opens a popup for one network read failure', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'mcpConnectors').mockRejectedValue(new TypeError('Failed to fetch'));
+    renderPage(null, true);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('网络异常，部分对话数据暂时无法读取。');
+    expect(alert.closest('.notice-center-panel')?.closest('.assistant-page')).toBeNull();
+    expect(alert.closest('details')).toHaveAttribute('open');
+    expect(screen.queryByText('工具连接暂不可用')).not.toBeInTheDocument();
+    expect(screen.getByText('你好')).toBeInTheDocument();
+    expect(await findReadyComposer()).toHaveValue('');
+  });
+
+  it('shows main conversation initialization failures in a popup and retries with the same key', async () => {
+    mockCommon({ mainConversation: { status: 'uninitialized', conversation_id: null, version: 0 } });
+    const ensure = vi.mocked(portalApi.ensureMainConversation);
+    ensure.mockRejectedValueOnce(new ApiError({ message: '服务暂不可用', code: 'service_unavailable', status: 503 }))
+      .mockResolvedValue({ status: 'ready', conversation_id: conversation.id, version: 1 });
+    const user = userEvent.setup();
+    renderPage(null, true);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('服务暂不可用');
+    expect(screen.getByText('正在初始化主会话…')).toBeInTheDocument();
+    expect(screen.queryByText('初始化失败 · 可重试')).not.toBeInTheDocument();
+    await user.click(within(alert).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(ensure).toHaveBeenCalledTimes(2));
+    expect(ensure.mock.calls[0]?.[0]).toBe(ensure.mock.calls[1]?.[0]);
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  });
+
   it('keeps a main-conversation API error collapsed out of the chat and allows retry', async () => {
     mockCommon();
     vi.spyOn(portalApi, 'mainConversation')
@@ -1139,7 +1135,8 @@ describe('Assistant durable tasks', () => {
     const sidebar = screen.getByRole('complementary', { name: '对话' });
     const main = await within(sidebar).findByRole('button', { name: /^主会话/ });
     expect(main).toHaveClass('is-selected');
-    expect(within(sidebar).getByText('旁聊历史暂不可用')).toBeInTheDocument();
+    expect(within(sidebar).getByText('正在读取旁聊…')).toBeInTheDocument();
+    expect(await screen.findByText('网络异常，部分对话数据暂时无法读取。')).toBeInTheDocument();
     expect(within(sidebar).queryByText('对话列表暂不可用')).not.toBeInTheDocument();
     expect(within(sidebar).getByRole('button', { name: '新建旁聊' })).toBeEnabled();
   });
@@ -1155,10 +1152,10 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const sidebar = screen.getByRole('complementary', { name: '对话' });
-    expect(await within(sidebar).findByText('旁聊历史暂不可用')).toBeInTheDocument();
-    const unavailable = await within(sidebar).findByRole('button', { name: '重试读取主会话' });
-    expect(unavailable).not.toHaveClass('is-selected');
-    expect(within(sidebar).getByText('暂时无法读取 · 点击重试')).toBeInTheDocument();
+    expect(await within(sidebar).findByText('正在读取旁聊…')).toBeInTheDocument();
+    expect(within(sidebar).getByText('正在读取主会话…')).toBeInTheDocument();
+    expect(within(sidebar).queryByRole('button', { name: '重试读取主会话' })).not.toBeInTheDocument();
+    expect(await screen.findByText('网络异常，部分对话数据暂时无法读取。')).toBeInTheDocument();
   });
 
   it('pins the main conversation and reveals side conversations five at a time in latest activity order', async () => {
@@ -1315,6 +1312,7 @@ describe('Assistant durable tasks', () => {
     await screen.findByRole('heading', { name: '主会话' });
     await user.click(screen.getByRole('button', { name: '新建旁聊' }));
     expect(screen.getByRole('heading', { name: '今天想聊些什么？' })).toBeInTheDocument();
+    expect(within(screen.getByRole('complementary', { name: '对话' })).getByRole('button', { name: /主会话/ })).toBeInTheDocument();
     expect(localStorage.getItem(key)).toBeNull();
 
     view.unmount();
@@ -1332,7 +1330,7 @@ describe('Assistant durable tasks', () => {
     expect(ensure.mock.calls[0]?.[0]).toMatch(/[A-Za-z0-9._~-]{8,128}/);
   });
 
-  it('keeps the main conversation visible and retryable while a side chat is selected', async () => {
+  it('keeps the main conversation placeholder and retries initialization from the popup while a side chat is selected', async () => {
     mockCommon({ mainConversation: { status: 'uninitialized', conversation_id: null, version: 0 } });
     const ensure = vi.mocked(portalApi.ensureMainConversation);
     ensure.mockRejectedValueOnce(new Error('offline'))
@@ -1341,12 +1339,13 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const sidebar = screen.getByRole('complementary', { name: '对话' });
-    const retry = await within(sidebar).findByRole('button', { name: '重试初始化主会话' });
+    const retry = await screen.findByRole('alert');
+    expect(within(sidebar).getByText('正在初始化…')).toBeInTheDocument();
     expect(within(sidebar).getByText('主会话')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '新建旁聊' }));
     expect(await screen.findByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
 
-    await user.click(retry);
+    await user.click(within(retry).getByRole('button', { name: '重试' }));
     expect(await within(sidebar).findByRole('button', { name: /主会话/ })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
     expect(ensure).toHaveBeenCalledTimes(2);
@@ -1384,6 +1383,27 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(setMain).toHaveBeenCalledWith(second.id, 0, expect.any(String)));
     expect(await screen.findByRole('heading', { name: '主会话' })).toBeInTheDocument();
     expect(await screen.findByText('已恢复主会话；其他对话和消息未更改。')).toBeInTheDocument();
+  });
+
+  it('opens legacy conversations for recovery while a new side chat is selected', async () => {
+    const second = { ...conversation, id: 'c7654321', is_main: false, title: '另一个会话' };
+    mockCommon({ conversations: [conversation, second], mainConversation: { status: 'selection_required', conversation_id: null, version: 0 } });
+    const submit = vi.spyOn(portalApi, 'submitTask');
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('button', { name: '新建旁聊' }));
+    expect(await screen.findByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '选择一条旧对话' })).toBeInTheDocument();
+    await user.type(await findReadyComposer(), '暂未发送的旁聊草稿');
+    const sidebar = screen.getByRole('complementary', { name: '对话' });
+
+    const sideGroup = within(sidebar).getByText('旁聊').closest('details')!;
+    expect(sideGroup).toHaveAttribute('open');
+    expect(await within(sideGroup).findByRole('button', { name: '将 另一个会话 设为主会话' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
+    expect(await findReadyComposer()).toHaveValue('暂未发送的旁聊草稿');
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it('creates a new conversation using the outbox account and service identities', async () => {
@@ -3301,12 +3321,16 @@ describe('Assistant durable tasks', () => {
     expect(retry).toHaveBeenCalledOnce();
 
     await act(async () => { rejectRequest(new Error('连接中断')); await pending.catch(() => undefined); });
-    expect(await within(activity).findByText('步骤重试失败：连接中断')).toBeInTheDocument();
+    const firstNotice = await screen.findByText('连接中断');
+    expect(firstNotice.closest('.toast-notice')).toBeInTheDocument();
+    expect(within(activity).queryByText('步骤重试失败：连接中断')).not.toBeInTheDocument();
     await user.click(button);
 
     await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
     expect(retry.mock.calls[1]?.[3]).toBe(retry.mock.calls[0]?.[3]);
-    expect(await within(activity).findByText('步骤重试失败：Host 已确认这次调用没有发出')).toBeInTheDocument();
+    const secondNotice = await screen.findByText('Host 已确认这次调用没有发出');
+    expect(secondNotice.closest('.toast-notice')).toBeInTheDocument();
+    expect(within(activity).queryByText(/步骤重试失败/)).not.toBeInTheDocument();
   });
 
   it('renders long Agent activity in chunks and labels a prepared call honestly', async () => {
@@ -3499,6 +3523,33 @@ describe('Assistant durable tasks', () => {
     read.mockResolvedValue({ ...running, event_sequence: 4 });
     await waitFor(() => expect(sources).toHaveLength(2), { timeout: 3000 });
     expect(sources[1]!.url).toBe(`/api/tasks/${task.id}/events?after=4`);
+  });
+
+  it('backs off an event stream reconnect when the task snapshot remains available', async () => {
+    const running = { ...task, status: 'running' as const, result: null, finished_at: null, event_sequence: 3 };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const read = vi.spyOn(portalApi, 'task').mockResolvedValue(running);
+    const sources: Array<{ url: string; onerror: ((event: Event) => void) | null; closed: boolean }> = [];
+    class TestEventSource {
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      closed = false;
+      constructor(public url: string) { sources.push(this); }
+      addEventListener() {}
+      close() { this.closed = true; }
+    }
+    vi.stubGlobal('EventSource', TestEventSource);
+    renderPage();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    const readCount = read.mock.calls.length;
+    await act(async () => sources[0]!.onerror?.(new Event('error')));
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(readCount));
+    expect(sources[0]!.closed).toBe(true);
+    expect(sources).toHaveLength(1);
+
+    await waitFor(() => expect(sources).toHaveLength(2), { timeout: 3000 });
+    expect(sources[1]!.url).toBe(`/api/tasks/${task.id}/events?after=${running.event_sequence}`);
   });
 
   it('keeps two task workchains and each stop action isolated in its own panel', async () => {
@@ -3769,7 +3820,7 @@ describe('Assistant durable tasks', () => {
     expect(sourceURLs[1]).toBe(`/api/tasks/${task.id}/events?after=3`);
     await act(async () => sourceError?.(new Event('error')));
     expect(screen.getByText('连接中断，正在重连…')).toBeInTheDocument();
-    await waitFor(() => expect(sourceURLs).toHaveLength(3));
+    await waitFor(() => expect(sourceURLs).toHaveLength(3), { timeout: 3000 });
     await act(async () => sourceOpen?.(new Event('open')));
     expect(screen.queryByText('连接中断，正在重连…')).not.toBeInTheDocument();
     expect(screen.queryByText('任务步骤已更新')).not.toBeInTheDocument();

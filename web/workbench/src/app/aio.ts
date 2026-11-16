@@ -1,10 +1,25 @@
+import { ApiError } from '../api/client';
+
 export type AioEnvelope<T> = {
   success: boolean;
   message: string;
   data: T;
 };
 
-export class AioError extends Error {}
+export class AioError extends Error {
+  constructor(message: string, readonly status?: number, readonly networkFailure = false, readonly responseParseFailure = false) {
+    super(message);
+    this.name = 'AioError';
+  }
+}
+
+export function isTransientNetworkError(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  if (error instanceof TypeError && /failed to fetch|networkerror|load failed|network request failed|fetch failed|connection lost/i.test(error.message)) return true;
+  if (error instanceof ApiError) return error.status >= 500;
+  return error instanceof AioError && (error.networkFailure || (error.status !== undefined && error.status >= 500) ||
+    error.responseParseFailure && error.status !== undefined && error.status >= 200 && error.status < 300);
+}
 
 export async function aioRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -15,10 +30,10 @@ export async function aioRequest<T>(path: string, init?: RequestInit): Promise<T
   try {
     envelope = (await response.json()) as AioEnvelope<T>;
   } catch {
-    throw new AioError(`AIO 返回了无效响应（HTTP ${response.status}）`);
+    throw new AioError(`AIO 返回了无效响应（HTTP ${response.status}）`, response.status, false, true);
   }
   if (!response.ok || envelope?.success !== true) {
-    throw new AioError(envelope?.message || `请求失败（HTTP ${response.status}）`);
+    throw new AioError(envelope?.message || `请求失败（HTTP ${response.status}）`, response.status);
   }
   return envelope.data;
 }

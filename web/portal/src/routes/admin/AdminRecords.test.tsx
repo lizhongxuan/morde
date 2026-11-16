@@ -6,7 +6,7 @@ import { MemoryRouter, Route, Routes } from 'react-router';
 import { AuthProvider } from '../../app/auth';
 import type { PortalUser } from '../../app/types';
 import { portalApi } from '../../app/api';
-import { ToastProvider } from '../../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminRecords } from './AdminRecords';
 
 type Access = Awaited<ReturnType<typeof portalApi.adminRecordAccess>>;
@@ -32,7 +32,7 @@ const oneRecord: RecordItem = {
 function renderPage(role: PortalUser['role']) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   vi.spyOn(portalApi, 'me').mockResolvedValue({ id: 'uadmin01', name: 'admin', role, must_change_password: false } as never);
-  return render(<QueryClientProvider client={client}><AuthProvider><ToastProvider><MemoryRouter initialEntries={['/admin/users/uowner01/records']}><Routes>
+  return render(<QueryClientProvider client={client}><AuthProvider><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/admin/users/uowner01/records']}><Routes>
     <Route path="/admin/users/:id/records" element={<AdminRecords />} />
   </Routes></MemoryRouter></ToastProvider></AuthProvider></QueryClientProvider>);
 }

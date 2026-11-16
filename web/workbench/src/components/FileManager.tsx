@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { downloadFile, listFiles, MAX_UPLOAD_BYTES, readFile, uploadFile, writeFile, type AioFile } from '../app/fileApi';
-import { runShell } from '../app/aio';
+import { isTransientNetworkError, runShell } from '../app/aio';
+import { useWorkbenchNotice } from '../app/notice';
 import { shellQuote } from '../util/shellQuote';
 import FloatingError from './FloatingError';
 
@@ -32,6 +33,7 @@ export default function FileManager() {
   const [pathInput, setPathInput] = useState(INITIAL_PATH);
   const [showHidden, setShowHidden] = useState(false);
   const [files, setFiles] = useState<AioFile[]>([]);
+  const filesKeyRef = useRef('');
   const [selected, setSelected] = useState<AioFile | null>(null);
   const [content, setContent] = useState('');
   const [fileReady, setFileReady] = useState(false);
@@ -39,6 +41,7 @@ export default function FileManager() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [directoryLoadFailed, setDirectoryLoadFailed] = useState(false);
+  const [directoryRetry, setDirectoryRetry] = useState(0);
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [directoryName, setDirectoryName] = useState('');
@@ -49,6 +52,7 @@ export default function FileManager() {
   const uploadLock = useRef(false);
   const pathRef = useRef(path);
   const showHiddenRef = useRef(showHidden);
+  const notifyNetwork = useWorkbenchNotice();
   useLayoutEffect(() => {
     pathRef.current = path;
     showHiddenRef.current = showHidden;
@@ -56,6 +60,8 @@ export default function FileManager() {
 
   const loadDirectory = useCallback(async (directory: string, includeHidden: boolean): Promise<string | null> => {
     const requestId = ++listRequestId.current;
+    const key = `${directory}\u0000${includeHidden}`;
+    let keepLoading = false;
     setLoading(true);
     setDirectoryLoadFailed(false);
     setError('');
@@ -63,22 +69,33 @@ export default function FileManager() {
       const entries = await listFiles(directory, includeHidden);
       if (requestId === listRequestId.current) {
         setFiles([...entries].sort((a, b) => Number(b.is_directory) - Number(a.is_directory) || a.name.localeCompare(b.name)));
+        filesKeyRef.current = key;
         setDirectoryLoadFailed(false);
       }
       return null;
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : '读取目录失败';
       if (requestId === listRequestId.current) {
-        setFiles([]);
+        if (filesKeyRef.current !== key) setFiles([]);
+        if (isTransientNetworkError(reason)) {
+          keepLoading = filesKeyRef.current !== key;
+          setDirectoryLoadFailed(false);
+          notifyNetwork('主机目录连接失败，已保留当前目录内容。', {
+            label: '重试', onClick: () => setDirectoryRetry((value) => value + 1),
+          });
+          return null;
+        }
         setDirectoryLoadFailed(true);
+        setFiles([]);
+        filesKeyRef.current = '';
         setError(message);
         return message;
       }
       return null;
     } finally {
-      if (requestId === listRequestId.current) setLoading(false);
+      if (requestId === listRequestId.current) setLoading(keepLoading);
     }
-  }, []);
+  }, [notifyNetwork]);
 
   async function refreshCurrentDirectory(directory: string, includeHidden: boolean) {
     if (pathRef.current !== directory || showHiddenRef.current !== includeHidden) return null;
@@ -86,48 +103,56 @@ export default function FileManager() {
   }
 
   useEffect(() => {
-    let current = true;
-    const requestId = ++listRequestId.current;
-    listFiles(path, showHidden)
-      .then((entries) => {
-        if (!current || requestId !== listRequestId.current) return;
-        setFiles([...entries].sort((a, b) => Number(b.is_directory) - Number(a.is_directory) || a.name.localeCompare(b.name)));
-        setDirectoryLoadFailed(false);
-        setError('');
-      })
-      .catch((reason: unknown) => {
-        if (!current || requestId !== listRequestId.current) return;
-        setFiles([]);
-        setDirectoryLoadFailed(true);
-        setError(reason instanceof Error ? reason.message : '读取目录失败');
-      })
-      .finally(() => {
-        if (current && requestId === listRequestId.current) setLoading(false);
-      });
-    return () => {
-      current = false;
-    };
-  }, [path, showHidden]);
+    void Promise.resolve().then(() => loadDirectory(path, showHidden));
+    return () => { listRequestId.current += 1; };
+  }, [directoryRetry, loadDirectory, path, showHidden]);
 
   const selectedPath = useMemo(() => selected?.path || '', [selected]);
 
   async function selectEntry(entry: AioFile) {
     const requestId = ++readRequestId.current;
+    const previous = { selected, content, fileReady, renameName, message, error };
+    if (entry.is_directory) {
+      setSelected(entry);
+      setRenameName(entry.name);
+      setMessage('');
+      setContent('');
+      setFileReady(false);
+      return;
+    }
     setSelected(entry);
     setRenameName(entry.name);
     setMessage('');
     setContent('');
     setFileReady(false);
-    if (entry.is_directory) return;
     setError('');
     try {
       const nextContent = await readFile(entry.path);
       if (requestId === readRequestId.current) {
+        setSelected(entry);
+        setRenameName(entry.name);
         setContent(nextContent);
         setFileReady(true);
       }
     } catch (reason) {
-      if (requestId === readRequestId.current) setError(reason instanceof Error ? reason.message : '读取文件失败');
+      if (requestId !== readRequestId.current) return;
+      if (isTransientNetworkError(reason)) {
+        setSelected(previous.selected);
+        setRenameName(previous.renameName);
+        setMessage(previous.message);
+        setContent(previous.content);
+        setFileReady(previous.fileReady);
+        setError(previous.error);
+        notifyNetwork('读取文件时连接失败，已保留当前编辑内容。', {
+          label: '重试', onClick: () => void selectEntry(entry),
+        });
+      } else {
+        setSelected(entry);
+        setRenameName(entry.name);
+        setContent('');
+        setFileReady(false);
+        setError(reason instanceof Error ? reason.message : '读取文件失败');
+      }
     }
   }
 
@@ -139,7 +164,8 @@ export default function FileManager() {
       await writeFile(selected.path, content);
       setMessage('文件已保存');
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '保存文件失败');
+      if (isTransientNetworkError(reason)) notifyNetwork('保存请求未确认，已保留编辑内容；请核对文件后再决定是否重试。');
+      else setError(reason instanceof Error ? reason.message : '保存文件失败');
     } finally {
       setSaving(false);
     }
@@ -151,7 +177,9 @@ export default function FileManager() {
       await downloadFile(entry.path, entry.name);
       setMessage(`${entry.name} 下载已开始`);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '下载失败');
+      if (isTransientNetworkError(reason)) {
+        notifyNetwork('下载连接失败，请重试。', { label: '重试', onClick: () => void download(entry) });
+      } else setError(reason instanceof Error ? reason.message : '下载失败');
     }
   }
 
@@ -169,7 +197,9 @@ export default function FileManager() {
       setDirectoryName('');
       await refreshCurrentDirectory(path, showHidden);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '创建目录失败');
+      if (isTransientNetworkError(reason)) {
+        notifyNetwork('新建目录请求结果未确认，已保留当前内容。', { label: '刷新目录', onClick: () => void refreshCurrentDirectory(path, showHidden) });
+      } else setError(reason instanceof Error ? reason.message : '创建目录失败');
     }
   }
 
@@ -194,7 +224,9 @@ export default function FileManager() {
       setContent('');
       await refreshCurrentDirectory(path, showHidden);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '重命名失败');
+      if (isTransientNetworkError(reason)) {
+        notifyNetwork('重命名请求结果未确认，已保留当前内容。', { label: '刷新目录', onClick: () => void refreshCurrentDirectory(path, showHidden) });
+      } else setError(reason instanceof Error ? reason.message : '重命名失败');
     }
   }
 
@@ -209,7 +241,9 @@ export default function FileManager() {
       setContent('');
       await refreshCurrentDirectory(path, showHidden);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '删除失败');
+      if (isTransientNetworkError(reason)) {
+        notifyNetwork('删除请求结果未确认，已保留当前内容。', { label: '刷新目录', onClick: () => void refreshCurrentDirectory(path, showHidden) });
+      } else setError(reason instanceof Error ? reason.message : '删除失败');
     }
   }
 
@@ -233,7 +267,11 @@ export default function FileManager() {
             (await listFiles(path, true)).forEach((entry) => existingPaths.set(entry.path, entry.is_directory));
           } catch (reason) {
             const details = reason instanceof Error ? reason.message : '读取目录失败';
-            errors.push(`${file.name}：无法确认目标文件是否已存在，未上传（${details}）`);
+            if (isTransientNetworkError(reason)) {
+              notifyNetwork('无法确认上传目标状态，上传尚未开始。', {
+                label: '重试', onClick: () => setDirectoryRetry((value) => value + 1),
+              });
+            } else errors.push(`${file.name}：无法确认目标文件是否已存在，未上传（${details}）`);
             break;
           }
         }
@@ -259,6 +297,12 @@ export default function FileManager() {
           }
           setMessage(`${file.name} 上传完成`);
         } catch (reason) {
+          if (isTransientNetworkError(reason)) {
+            notifyNetwork(`${file.name} 上传结果未确认，系统没有自动重试。`, {
+              label: '刷新目录', onClick: () => void refreshCurrentDirectory(path, showHidden),
+            });
+            break;
+          }
           errors.push(reason instanceof Error ? reason.message : `${file.name} 上传失败`);
         } finally {
           setUploadProgress(null);

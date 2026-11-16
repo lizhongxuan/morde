@@ -5,7 +5,7 @@ import { MemoryRouter, Route, Routes } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
 import { AuthProvider } from '../app/auth';
-import { ToastProvider } from '../app/toast';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Login } from './Login';
 import { Register } from './Register';
 
@@ -17,7 +17,7 @@ vi.mock('../app/api', () => ({
 function renderRoute(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData(['auth', 'me'], null);
-  render(<ToastProvider><QueryClientProvider client={client}><AuthProvider><MemoryRouter initialEntries={[path]}><Routes>
+  render(<ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><QueryClientProvider client={client}><AuthProvider><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/register" element={<Register />} />
     <Route path="/login" element={<Login />} />
     <Route path="/assistant" element={<p>助手页面</p>} />
@@ -43,6 +43,43 @@ describe('registration page', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('申请已提交，等待管理员审核通过后才能登录。');
     expect(portalApi.login).not.toHaveBeenCalled();
     expect(client.getQueryData(['auth', 'me'])).toBeNull();
+  });
+
+  it('shows a network error after registration is submitted and keeps the form values', async () => {
+    vi.mocked(portalApi.register).mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    renderRoute('/register');
+    const user = userEvent.setup();
+    const name = screen.getByRole('textbox', { name: '用户名' });
+    const password = screen.getByLabelText('密码', { exact: true });
+    const confirmation = screen.getByLabelText('确认密码');
+    await user.type(name, 'new-user');
+    await user.type(password, 'secret-pass');
+    await user.type(confirmation, 'secret-pass');
+    await user.click(screen.getByRole('button', { name: '注册' }));
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('网络异常，注册结果暂时无法确认。');
+    expect(notice.closest('.login-card')).toBeNull();
+    expect(name).toHaveValue('new-user');
+    expect(password).toHaveValue('secret-pass');
+    expect(confirmation).toHaveValue('secret-pass');
+  });
+
+  it('shows a login network error only after submit and preserves credentials', async () => {
+    vi.mocked(portalApi.login).mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    renderRoute('/login');
+    const user = userEvent.setup();
+    const name = screen.getByRole('textbox', { name: '用户名' });
+    const password = screen.getByLabelText('密码');
+    await user.type(name, 'local-user');
+    await user.type(password, 'secret-pass');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('网络异常，登录状态暂时无法确认。');
+    expect(notice.closest('.login-card')).toBeNull();
+    expect(name).toHaveValue('local-user');
+    expect(password).toHaveValue('secret-pass');
   });
 
   it('asks only for a username and password', () => {

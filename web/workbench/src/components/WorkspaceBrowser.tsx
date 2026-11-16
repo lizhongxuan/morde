@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { gatewayApi, type GatewayWorkspaceBinding, type GatewayWorkspaceDiff, type GatewayWorkspaceManifest } from '../api/gateway';
 import FloatingError from './FloatingError';
+import { isTransientNetworkError } from '../app/aio';
+import { useWorkbenchNotice } from '../app/notice';
 
 const REFRESH_INTERVAL_MS = 5000;
 const MANIFEST_PAGE_SIZE = 500;
@@ -356,6 +358,7 @@ function mergeEntries(existing: Entry[], incoming: Entry[]): Entry[] {
 
 export default function WorkspaceBrowser({ active }: { active: boolean }) {
   const [bindingState, setBindingState] = useState<{ items: GatewayWorkspaceBinding[]; error?: string } | null>(null);
+  const [bindingReadUnavailable, setBindingReadUnavailable] = useState(false);
   const [selectedID, setSelectedID] = useState('');
   const [diffFromInput, setDiffFromInput] = useState<string | null>(null);
   const [diffToInput, setDiffToInput] = useState<string | null>(null);
@@ -374,6 +377,8 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
   const [notice, setNotice] = useState('');
   const [diffState, setDiffState] = useState<WorkspaceDiffState | null>(null);
   const [mockPreviewState, setMockPreviewState] = useState<MockPreviewState | null>(null);
+  const notifyNetwork = useWorkbenchNotice();
+  const bindingNetworkNoticeRef = useRef(false);
   const listRequestID = useRef(0);
   const diffRequestID = useRef(0);
   const mockPreviewRequestID = useRef(0);
@@ -385,9 +390,25 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
       try {
         const response = await gatewayApi.workspaces();
         if (!Array.isArray(response.items) || !response.items.every(isWorkspaceBinding)) throw new Error('Workspace binding 响应无效');
-        if (current) setBindingState({ items: response.items });
+        if (current) {
+          setBindingState({ items: response.items });
+          setBindingReadUnavailable(false);
+          bindingNetworkNoticeRef.current = false;
+        }
       } catch (error) {
         if (!current) return;
+        if (isTransientNetworkError(error)) {
+          setBindingReadUnavailable(true);
+          if (!bindingNetworkNoticeRef.current) {
+            notifyNetwork('工作区状态连接失败，已保留当前内容并暂停相关操作。', {
+              label: '重试', onClick: () => setRefreshNumber((value) => value + 1),
+            });
+          }
+          bindingNetworkNoticeRef.current = true;
+          return;
+        }
+        setBindingReadUnavailable(false);
+        bindingNetworkNoticeRef.current = false;
         setBindingState({ items: [], error: error instanceof Error ? error.message : '无法读取 Workspace 状态' });
         setFileState(null);
       }
@@ -398,7 +419,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
       current = false;
       window.clearInterval(timer);
     };
-  }, [active, refreshNumber]);
+  }, [active, notifyNetwork, refreshNumber]);
 
   const bindings = bindingState?.items ?? [];
   const binding = bindings.find((item) => item.workspace.id === selectedID) ?? bindings[0];
@@ -426,7 +447,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
     binding.workspace.state, binding.workspace.revision, binding.desired_revision, binding.applied_revision,
     binding.sync_state, binding.sync_conflicts, fromRevisionText, toRevisionText]) : '';
   const workspaceDiff = diffState?.key === diffKey ? diffState : null;
-  const mayListFiles = Boolean(active && !bindingState?.error && binding && bindingReady);
+  const mayListFiles = Boolean(active && !bindingReadUnavailable && !bindingState?.error && binding && bindingReady);
   const fileList = fileState?.key === fileKey ? fileState : null;
   const loading = mayListFiles && !fileList;
   const fileError = fileList?.error ?? '';
@@ -442,16 +463,24 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
         if (requestID === listRequestID.current) setFileState({ key: fileKey, entries, nextCursor: page.next_cursor, seenCursors: [] });
       })
       .catch((error: unknown) => {
-        if (requestID === listRequestID.current) setFileState({ key: fileKey, error: error instanceof Error ? error.message : '读取 Workspace manifest 失败', nextCursor: null, seenCursors: [] });
+        if (requestID !== listRequestID.current) return;
+        if (isTransientNetworkError(error)) {
+          notifyNetwork('Workspace 文件列表连接失败，已保留当前显示内容。', {
+            label: '重试', onClick: () => setRefreshNumber((value) => value + 1),
+          });
+          return;
+        }
+        setFileState({ key: fileKey, error: error instanceof Error ? error.message : '读取 Workspace manifest 失败', nextCursor: null, seenCursors: [] });
       });
-  }, [appliedRevision, currentPath, fileKey, mayListFiles, refreshNumber, workspaceID]);
+  }, [appliedRevision, currentPath, fileKey, mayListFiles, notifyNetwork, refreshNumber, workspaceID]);
 
   async function runMockRevisionPreview() {
-    if (!mockPreviewEnabled || !binding || !bindingReady || !active) return;
+    if (!mockPreviewEnabled || !binding || !bindingReady || !active || bindingReadUnavailable) return;
     const requestID = ++mockPreviewRequestID.current;
     const fence = mockPreviewFence;
     const previewBinding = binding;
-    setMockPreviewState({ key: fence, loading: true });
+    const previous = mockPreview?.key === fence ? mockPreview : null;
+    setMockPreviewState(previous ? { ...previous, loading: true, error: undefined } : { key: fence, loading: true });
     try {
       const current = await readWorkspaceManifestMetadata(previewBinding.workspace.id, previewBinding.applied_revision);
       if (requestID !== mockPreviewRequestID.current) return;
@@ -463,21 +492,34 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
         result: createMockRevisionPreview(previewBinding.applied_revision, current),
       });
     } catch (error) {
-      if (requestID === mockPreviewRequestID.current) setMockPreviewState({ key: fence, error: mockPreviewError(error) });
+      if (requestID !== mockPreviewRequestID.current) return;
+      if (isTransientNetworkError(error)) {
+        setMockPreviewState(previous);
+        notifyNetwork('读取 revision 清单时连接失败，已保留当前预演内容。', {
+          label: '重试', onClick: () => void runMockRevisionPreview(),
+        });
+      } else setMockPreviewState({ key: fence, error: mockPreviewError(error) });
     }
   }
 
   async function runWorkspaceDiff() {
-    if (!active || !binding || !bindingReady || !diffSelectionValid) return;
+    if (!active || !binding || !bindingReady || !diffSelectionValid || bindingReadUnavailable) return;
     const requestID = ++diffRequestID.current;
     const key = diffKey;
-    setDiffState({ key, loading: true });
+    const previous = workspaceDiff?.key === key ? workspaceDiff : null;
+    setDiffState(previous ? { ...previous, loading: true, error: undefined } : { key, loading: true });
     try {
       const result = await gatewayApi.workspaceDiff(binding.workspace.id, fromRevision, toRevision);
       validateWorkspaceDiff(result, binding.workspace.id, fromRevision, toRevision);
       if (requestID === diffRequestID.current) setDiffState({ key, result });
     } catch (error) {
-      if (requestID === diffRequestID.current) setDiffState({ key, error: workspaceDiffError(error) });
+      if (requestID !== diffRequestID.current) return;
+      if (isTransientNetworkError(error)) {
+        setDiffState(previous);
+        notifyNetwork('Workspace 历史差异连接失败，已保留当前结果。', {
+          label: '重试', onClick: () => void runWorkspaceDiff(),
+        });
+      } else setDiffState({ key, error: workspaceDiffError(error) });
     }
   }
 
@@ -487,7 +529,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
   }
 
   function confirmMockRestore(result: 'success' | 'conflict') {
-    if (!mockPreviewEnabled || !active || !bindingReady || !mockPreview?.result) return;
+    if (!mockPreviewEnabled || !active || !bindingReady || bindingReadUnavailable || !mockPreview?.result) return;
     if (mockPreviewFence !== mockPreview.key || mockPreviewFenceRef.current !== mockPreview.key) {
       setMockPreviewState({ key: mockPreviewFence, error: '版本冲突：Workspace revision 已变化；本机预演已停止。' });
       return;
@@ -523,9 +565,13 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
         });
       }
     } catch (error) {
-      if (requestID === listRequestID.current) {
-        setFileState({ ...fileList, entries: [], nextCursor: null, loadingNext: false, error: error instanceof Error ? error.message : '读取 Workspace manifest 失败' });
-      }
+      if (requestID !== listRequestID.current) return;
+      if (isTransientNetworkError(error)) {
+        setFileState({ ...fileList, loadingNext: false });
+        notifyNetwork('加载更多 Workspace 文件时连接失败，已保留现有列表。', {
+          label: '重试', onClick: () => setRefreshNumber((value) => value + 1),
+        });
+      } else setFileState({ ...fileList, entries: [], nextCursor: null, loadingNext: false, error: error instanceof Error ? error.message : '读取 Workspace manifest 失败' });
     }
   }
 
@@ -549,7 +595,9 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
       await gatewayApi.downloadWorkspaceFile(binding.workspace.id, binding.applied_revision, entry.path);
       setNotice(`${entry.name} 下载已开始`);
     } catch (error) {
-      setDownloadError(error instanceof Error ? error.message : '下载 Workspace 文件失败');
+      if (isTransientNetworkError(error)) {
+        notifyNetwork('下载 Workspace 文件失败，请重试。', { label: '重试', onClick: () => void openEntry(entry) });
+      } else setDownloadError(error instanceof Error ? error.message : '下载 Workspace 文件失败');
     } finally {
       setDownloading('');
     }
@@ -606,7 +654,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                     <input id="workspace-diff-to" aria-label="目标 revision" type="number" min={0} max={binding.applied_revision}
                       step={1} value={toRevisionText} onChange={(event) => setDiffToInput(event.target.value)} />
                     <button className="button button-secondary" type="button" onClick={() => void runWorkspaceDiff()}
-                      disabled={!active || !bindingReady || !diffSelectionValid || Boolean(workspaceDiff?.loading)}>
+                      disabled={!active || !bindingReady || bindingReadUnavailable || !diffSelectionValid || Boolean(workspaceDiff?.loading)}>
                       {workspaceDiff?.loading ? '正在读取差异…' : '查看历史差异'}
                     </button>
                   </div>
@@ -639,7 +687,7 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                   </>}
                 </section>
                 {mockPreviewEnabled && active && bindingReady && <section className="workspace-sync-status" aria-label="本机 Mock revision 预演">
-                  <button className="button button-secondary" type="button" onClick={() => void runMockRevisionPreview()} disabled={mockPreview?.loading}>
+                  <button className="button button-secondary" type="button" onClick={() => void runMockRevisionPreview()} disabled={mockPreview?.loading || bindingReadUnavailable}>
                     {mockPreview?.loading ? '正在读取 manifest 元数据…' : '生成本机 Mock 差异与回滚预演'}
                   </button>
                   {mockPreview?.error && <FloatingError>{mockPreview.error}</FloatingError>}
@@ -695,15 +743,15 @@ export default function WorkspaceBrowser({ active }: { active: boolean }) {
                                 {!loading && files.map((entry) => (
                                   <tr key={entry.path}>
                                     <td>{entry.isDirectory
-                                      ? <button className="file-entry" type="button" onClick={() => void openEntry(entry)}>{entry.name}/</button>
+                                ? <button className="file-entry" type="button" onClick={() => void openEntry(entry)} disabled={!mayListFiles}>{entry.name}/</button>
                                       : <>{entry.name}{entry.isSymlink && <small className="muted"> 符号链接</small>}</>}</td>
                                     <td>{entry.isDirectory || entry.size === undefined ? '—' : formatBytes(entry.size)}</td>
-                                    <td>{entry.isSymlink ? '不跟随链接' : !entry.isDirectory && <button className="button button-secondary" type="button" onClick={() => void openEntry(entry)} disabled={downloading === entry.path}>{downloading === entry.path ? '下载中…' : '下载'}</button>}</td>
+                                      <td>{entry.isSymlink ? '不跟随链接' : !entry.isDirectory && <button className="button button-secondary" type="button" onClick={() => void openEntry(entry)} disabled={!mayListFiles || downloading === entry.path}>{downloading === entry.path ? '下载中…' : '下载'}</button>}</td>
                                   </tr>
                                 ))}
                                 {!loading && !fileError && fileList && !files.length && !fileList.nextCursor && <tr><td colSpan={3}>此目录为空。</td></tr>}
                                 {!loading && fileList?.nextCursor && <tr><td colSpan={3}>
-                                  <button className="button button-secondary" type="button" onClick={() => void loadMore()} disabled={fileList.loadingNext}>
+                                  <button className="button button-secondary" type="button" onClick={() => void loadMore()} disabled={!mayListFiles || fileList.loadingNext}>
                                     {fileList.loadingNext ? '加载中…' : '加载更多文件'}
                                   </button>
                                 </td></tr>}

@@ -38,6 +38,25 @@ export function errorMessage(error: unknown): string {
   return error.retryAfter && error.retryAfter > 0 ? `${message}（${error.retryAfter} 秒后可重试）` : message;
 }
 
+export function isTransientNetworkError(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  if (error instanceof TypeError && /failed to fetch|networkerror|load failed|network request failed/i.test(error.message)) return true;
+  return error instanceof ApiError && error.status >= 500;
+}
+
+export function modelConnectionSaveErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.code === "invalid_argument") {
+    switch (error.details?.field) {
+      case "base_url": return "服务地址无效或未获服务端允许，请检查 HTTPS 地址并联系管理员核对允许的域名。";
+      case "api_key": return "API 密钥不能为空，且首尾不能有空格。";
+      case "name": return "请检查显示名称和模型名是否为空或超出长度限制。";
+      case "model_connection": return "上下文窗口需为 4096 到 1000000 的整数。";
+      case "body": return "服务端无法识别提交内容，请检查 PC 客户端与服务端的版本是否匹配。";
+    }
+  }
+  return errorMessage(error);
+}
+
 export function modelCheckErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === "quota_exceeded") return "模型调用额度不足或尚未配置，请在管理后台检查账号的模型预算。";

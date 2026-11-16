@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router';
+import type { ReactNode } from 'react';
 import { AuthProvider } from './app/auth';
 import { AdminGuard, RouteGuard } from './app/RouteGuard';
-import { ToastProvider } from './app/toast';
+import { ToastNoticeCenter, ToastProvider } from './app/toast';
 import { PortalLayout, PortalNavigationHistoryProvider } from './components/PortalLayout';
 import { AccountSettings } from './routes/AccountSettings';
 import { GoalsAndSchedules } from './routes/GoalsAndSchedules';
@@ -85,14 +86,18 @@ function LegacyHostSyncRedirect() {
   return <Navigate to={{ pathname: '/hosts', search: projectSyncSearch(location.search) }} replace />;
 }
 
+function StandaloneToastPage({ children }: { children: ReactNode }) {
+  return <><ToastNoticeCenter autoOpenErrors overlay />{children}</>;
+}
+
 function UserRoutes() {
   return <Routes>
-    <Route path="/login" element={<Login />} />
-    <Route path="/register" element={<Register />} />
-    <Route path="/download" element={<Downloads />} />
-    <Route path="/settings/password" element={<ChangePassword loginPath="/login" cancelPath="/settings" />} />
+    <Route path="/login" element={<StandaloneToastPage><Login /></StandaloneToastPage>} />
+    <Route path="/register" element={<StandaloneToastPage><Register /></StandaloneToastPage>} />
+    <Route path="/download" element={<StandaloneToastPage><Downloads /></StandaloneToastPage>} />
+    <Route path="/settings/password" element={<StandaloneToastPage><ChangePassword loginPath="/login" cancelPath="/settings" /></StandaloneToastPage>} />
     <Route element={<RouteGuard />}>
-      <Route path="host-entry/:id" element={<HostEntry />} />
+      <Route path="host-entry/:id" element={<StandaloneToastPage><HostEntry /></StandaloneToastPage>} />
       <Route element={<PortalLayout />}>
         <Route index element={<Navigate to="/assistant" replace />} />
         <Route path="assistant" element={<Assistant />} />
@@ -120,8 +125,8 @@ function UserRoutes() {
 
 function AdminRoutes() {
   return <Routes>
-    <Route path="/admin/login" element={<Login defaultTo="/admin/" allowRegister={false} />} />
-    <Route path="/admin/change-password" element={<ChangePassword loginPath="/admin/login" />} />
+    <Route path="/admin/login" element={<StandaloneToastPage><Login defaultTo="/admin/" allowRegister={false} /></StandaloneToastPage>} />
+    <Route path="/admin/change-password" element={<StandaloneToastPage><ChangePassword loginPath="/admin/login" /></StandaloneToastPage>} />
     <Route element={<RouteGuard loginPath="/admin/login" />}>
       <Route path="/admin/access-denied" element={<AdminAccessDenied />} />
       <Route element={<AdminGuard deniedTo="/admin/access-denied" />}>

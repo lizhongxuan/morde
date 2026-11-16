@@ -1,8 +1,10 @@
 import { Fragment, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { isTransientNetworkError } from '../../api/errors';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatDate } from '../../app/format';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError, FloatingNotice } from '../../components/FloatingError';
 
 type ControlsData = Awaited<ReturnType<typeof portalApi.adminControls>>;
@@ -86,6 +88,7 @@ export function AdminControls() {
   const client = useQueryClient();
   const queryKey = ['admin', 'controls'];
   const query = useQuery({ queryKey, queryFn: portalApi.adminControls });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，通知规则暂时无法读取。');
   const [createDraft, setCreateDraft] = useState({ threshold: '', note: '' });
   const [createConfirmation, setCreateConfirmation] = useState<CreateBody | null>(null);
   const [createError, setCreateError] = useState('');
@@ -205,8 +208,8 @@ export function AdminControls() {
     {versionConflict && <FloatingError className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></FloatingError>}
     {notice && <FloatingNotice className="notice-info">{notice}</FloatingNotice>}
 
-    {query.isPending ? <div className="loading-card" role="status">正在加载通知规则…</div>
-      : query.isError ? <ErrorCard error={query.error} retry={() => void query.refetch()} />
+    {query.isPending || (networkError && !data) ? <div className="loading-card" role="status">正在加载通知规则…</div>
+      : query.isError && !isTransientNetworkError(query.error) ? <ErrorCard error={query.error} retry={() => void query.refetch()} />
         : data && <>
           <section className="admin-detail-section" aria-labelledby="admin-controls-summary-heading">
             <div className="design-panel-header"><div><h2 id="admin-controls-summary-heading">阈值通知概览</h2><p>所有通知只写入 Morde 本地接收箱，不会发送到外部服务。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>{query.isFetching ? '正在刷新…' : '刷新数据'}</button></div>

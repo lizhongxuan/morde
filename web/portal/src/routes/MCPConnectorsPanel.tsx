@@ -3,6 +3,8 @@ import type { FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
+import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { FloatingError } from '../components/FloatingError';
@@ -62,6 +64,7 @@ export function MCPConnectorsPanel() {
   const client = useQueryClient();
   const { notify } = useToast();
   const connectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
+  useNetworkReadNotice([{ failed: connectors.isError, error: connectors.error, retry: connectors.refetch }], 'MCP 工具连接状态读取失败，已保留当前内容。');
   const [showCreate, setShowCreate] = useState(false);
   const [draft, setDraft] = useState<ConnectorDraft>(blankDraft);
   const [presetID, setPresetID] = useState<keyof typeof connectorPresets>('custom');
@@ -273,8 +276,9 @@ export function MCPConnectorsPanel() {
       </div>
       <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={() => { setShowCreate(false); setDraft(blankDraft); setPresetID('custom'); setGithubToken(''); }}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
     </form>}
-    {connectors.isPending ? <div className="loading-card" role="status">正在读取工具连接…</div>
-      : connectors.isError ? <FloatingError className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>
+    {connectors.isPending || (!connectors.data && isTransientNetworkError(connectors.error)) ? <div className="loading-card" role="status">正在读取工具连接…</div>
+      : connectors.isError && !isTransientNetworkError(connectors.error) ? <FloatingError className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>
+        : !connectors.data ? <div className="loading-card" role="status">正在读取工具连接…</div>
         : !connectors.data.items.length ? <div className="empty-card connection-empty"><h3>尚未添加 MCP 工具</h3><p>连接器可在发送任务时按需授权，未选择的连接不会提供给任务。</p></div>
         : connectors.data.items.length === 1 ? <div className="model-connection-list">{renderConnector(connectors.data.items[0]!)}</div>
           : <ScreenPagination

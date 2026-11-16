@@ -2,6 +2,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { afterEach, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { fetchEntryURL, HostEntry, resolveHostEntryURL } from './HostEntry';
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
@@ -80,7 +81,7 @@ it('allows the local development Host only from the local Portal', () => {
 
 it('shows an error for an unsupported handoff target', async () => {
   const shared = vi.spyOn(portalApi, 'sharedHosts');
-  render(<MemoryRouter initialEntries={['/host-entry/h1234567?target=admin']}><Routes><Route path="/host-entry/:id" element={<HostEntry />} /></Routes></MemoryRouter>);
+  render(<ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/host-entry/h1234567?target=admin']}><Routes><Route path="/host-entry/:id" element={<HostEntry />} /></Routes></MemoryRouter></ToastProvider>);
   expect(await screen.findByRole('alert')).toHaveTextContent('云端电脑入口参数无效');
   expect(shared).not.toHaveBeenCalled();
 });

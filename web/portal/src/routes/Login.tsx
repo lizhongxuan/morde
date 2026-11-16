@@ -2,10 +2,13 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router';
 import { errorDetails } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
+import { useToast } from '../app/toast';
 
 export function Login({ defaultTo = '/assistant', allowRegister = true }: { defaultTo?: string; allowRegister?: boolean }) {
   const { user, loading, signIn } = useAuth();
+  const { notify } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
   const [name, setName] = useState('');
@@ -26,6 +29,10 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
     setBusy(true);
     try { await signIn(name.trim(), password); navigate(from, { replace: true }); }
     catch (reason) {
+      if (isTransientNetworkError(reason)) {
+        notify('网络异常，登录状态暂时无法确认。', 'error');
+        return;
+      }
       const details = errorDetails(reason);
       const message = details.code === 'rate_limited' ? `登录尝试过于频繁。${details.retryAfter ? `请在 ${details.retryAfter} 秒后重试。` : '请稍后重试。'}`
         : details.code === 'unauthenticated' ? '用户名或密码错误，请重试。'

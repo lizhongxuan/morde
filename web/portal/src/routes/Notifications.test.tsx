@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { components } from '../api/schema';
 import { portalApi } from '../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Notifications } from './Notifications';
 
 const timestamp = '2026-10-22T08:00:00.000Z';
@@ -14,7 +15,7 @@ const secondPageRead: components['schemas']['Notification'] = { ...read, id: 'n7
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><MemoryRouter><Notifications /></MemoryRouter></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Notifications /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('Notifications', () => {
@@ -110,5 +111,25 @@ describe('Notifications', () => {
     expect(screen.getByText('需要补充任务信息。')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '重试' }));
     expect(await screen.findByText('已读')).toBeInTheDocument();
+  });
+
+  it('keeps loaded notifications and reports transient pagination failures in an overlay', async () => {
+    vi.spyOn(portalApi, 'notifications')
+      .mockResolvedValueOnce({ items: [unread], next_cursor: 'next' })
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce({ items: [secondPageRead], next_cursor: null });
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByText(unread.summary!)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '加载更多通知' }));
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('网络异常，通知暂时无法读取。');
+    expect(notice.closest('.notice-center-overlay')).toBeInTheDocument();
+    expect(notice.closest('.design-panel')).toBeNull();
+    expect(screen.getByText(unread.summary!)).toBeInTheDocument();
+
+    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    expect(await screen.findByText('第二页通知。')).toBeInTheDocument();
   });
 });

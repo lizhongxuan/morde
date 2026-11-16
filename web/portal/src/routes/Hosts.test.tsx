@@ -64,11 +64,63 @@ describe('Hosts', () => {
   it('keeps file synchronization in Settings instead of the cloud-computer view', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
     expect(screen.queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: '云端电脑视图' })).toHaveTextContent('我的电脑共享给我的');
+  });
+
+  it('keeps the confirmed host list visible and reports a transient refresh failure in a popup', async () => {
+    const read = vi.spyOn(portalApi, 'hosts')
+      .mockResolvedValueOnce({ items: [ownedHost] })
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [ownedHost] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeInTheDocument();
+    await act(async () => { await client.invalidateQueries({ queryKey: ['hosts'] }); });
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('云端电脑信息读取失败');
+    expect(notice.closest('.notice-center')).toHaveClass('notice-center-overlay');
+    expect(screen.getByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeInTheDocument();
+    expect(document.querySelector('.hosts-panel .error-card')).not.toBeInTheDocument();
+
+    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeInTheDocument();
+  });
+
+  it('keeps the host control status and offers read retry in a popup after a transient failure', async () => {
+    const read = vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    vi.spyOn(portalApi, 'hostControl')
+      .mockResolvedValueOnce(aiControl(1))
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue(aiControl(1));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    await read.mock.results[0]?.value;
+    await openHostDetails(user, ownedHost.id);
+    expect(await screen.findByText(/电脑控制：云端 AI 控制/)).toBeInTheDocument();
+    await act(async () => { await client.invalidateQueries({ queryKey: ['host-control', ownedHost.id] }); });
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('电脑控制状态读取失败');
+    const panel = document.querySelector('.host-control');
+    expect(panel).toBeInTheDocument();
+    expect(panel).not.toHaveClass('error-inline');
+    expect(panel?.querySelector('.error-inline')).not.toBeInTheDocument();
+    expect(within(notice).getByRole('button', { name: '重试' })).toBeInTheDocument();
+
+    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(screen.getByText(/电脑控制：云端 AI 控制/)).toBeInTheDocument();
   });
 
   it('links only the configured default Host to the account project sync entry', async () => {
@@ -77,7 +129,7 @@ describe('Hosts', () => {
     vi.mocked(portalApi.preferences).mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null, default_host_id: ownedHost.id, updated_at: null });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openMoreActions(user, ownedHost);
     const defaultCard = document.getElementById(`host-${ownedHost.id}`);
@@ -112,7 +164,7 @@ describe('Hosts', () => {
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const selector = await screen.findByRole('combobox', { name: '默认云端电脑' });
     expect(selector).toHaveValue(ownedHost.id);
@@ -131,7 +183,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'ensureDefaultHost').mockRejectedValue(new Error('保存默认失败'));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const selector = await screen.findByRole('combobox', { name: '默认云端电脑' });
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
@@ -145,7 +197,7 @@ describe('Hosts', () => {
   it('shows the requested owner host on the first page after loading a browser handoff link', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeEnabled();
     expect(document.getElementById(`host-${ownedHost.id}`)).toBeInTheDocument();
@@ -156,7 +208,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: ownedHost.id, name: '共享电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:view'] }] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: '查看桌面' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '共享给我的' })).toHaveAttribute('aria-pressed', 'true');
@@ -180,7 +232,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: sharedItems });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const ownerPagination = await screen.findByRole('navigation', { name: '我的电脑分页' });
     expect(screen.getByRole('button', { name: '查看云端电脑 我的电脑 1' })).toBeDisabled();
@@ -201,7 +253,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const viewButton = await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
     const card = document.getElementById(`host-${ownedHost.id}`)!;
@@ -233,7 +285,7 @@ describe('Hosts', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
 
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: '查看云端电脑 测试主机' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: /暂停主机|恢复云端电脑|管理主机令牌/ })).not.toBeInTheDocument();
@@ -264,7 +316,7 @@ describe('Hosts', () => {
     }] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText('还没有主机')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /他人主机/ })).not.toBeInTheDocument();
@@ -283,7 +335,7 @@ describe('Hosts', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
 
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: '查看云端电脑 未绑定运行中主机' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '查看云端电脑 多绑定运行中主机' })).toBeDisabled();
@@ -307,7 +359,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const card = await waitFor(() => {
       const item = document.getElementById(`host-${host.id}`);
@@ -326,7 +378,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const card = await waitFor(() => {
       const item = document.getElementById(`host-${ownedHost.id}`);
@@ -344,7 +396,7 @@ describe('Hosts', () => {
     const restore = vi.spyOn(portalApi, 'restoreHost').mockResolvedValue({ ...stoppedHost, state: 'creating' });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${stoppedHost.name}` });
     await openHostDetails(user, stoppedHost.id);
@@ -368,7 +420,7 @@ describe('Hosts', () => {
     const release = vi.spyOn(portalApi, 'releaseHost').mockResolvedValue(host);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${host.name}` });
     await openMoreActions(user, { id: host.id, name: host.name });
@@ -395,7 +447,7 @@ describe('Hosts', () => {
     const restore = vi.spyOn(portalApi, 'restoreHost').mockResolvedValue({ ...host, state: 'creating', runtime_generation: 2 });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${host.name}` });
     await openMoreActions(user, { id: host.id, name: host.name });
@@ -423,7 +475,7 @@ describe('Hosts', () => {
       .mockResolvedValue(copyResult);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${host.name}` });
     await openMoreActions(user, host);
@@ -454,7 +506,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost, stale, userControlled] });
     vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     const user = userEvent.setup();
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
@@ -481,7 +533,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'templates').mockResolvedValue({ items: [] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText(label)).toBeInTheDocument();
     expect(hosts).toHaveBeenCalledTimes(1);
@@ -498,7 +550,7 @@ describe('Hosts', () => {
     const host: Host = { ...ownedHost, workspace_runtime_online: true };
     const hosts = vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     try {
       expect(await screen.findByRole('button', { name: `查看云端电脑 ${host.name}` })).toBeEnabled();
@@ -527,7 +579,7 @@ describe('Hosts', () => {
     const revoke = vi.spyOn(portalApi, 'revokeHostMember');
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: '查看云端电脑 测试主机' })).toBeEnabled();
     await openHostDetails(user, ownedHost.id);
@@ -548,7 +600,7 @@ describe('Hosts', () => {
     const open = vi.spyOn(window, 'open').mockReturnValue(popup);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await user.click(await screen.findByRole('button', { name: '查看桌面' }));
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${ownedHost.id}?target=desktop`, '_blank');
@@ -563,7 +615,7 @@ describe('Hosts', () => {
     const open = vi.spyOn(window, 'open').mockReturnValue({ opener: window } as Window);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: '打开终端' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: '查看桌面' })).not.toBeInTheDocument();
@@ -579,7 +631,7 @@ describe('Hosts', () => {
     const open = vi.spyOn(window, 'open').mockReturnValue({ opener: window } as Window);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText('权限：读取云端电脑文件')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '查看电脑文件' })).toBeEnabled();
@@ -614,7 +666,7 @@ describe('Hosts', () => {
       .mockResolvedValue({ ...userControl(6), pending_operation_ids: [] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openHostDetails(user, ownedHost.id);
     expect(await screen.findByText('电脑控制：云端 AI 控制')).toBeInTheDocument();
@@ -642,7 +694,7 @@ describe('Hosts', () => {
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openHostDetails(user, ownedHost.id);
     expect(await screen.findByText('电脑控制：人工控制')).toBeInTheDocument();
@@ -666,7 +718,7 @@ describe('Hosts', () => {
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: '查看桌面' });
     await openHostDetails(user, ownedHost.id);
@@ -685,7 +737,7 @@ describe('Hosts', () => {
     vi.spyOn(portalApi, 'hostControl').mockResolvedValue(aiControl(8));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openHostDetails(user, ownedHost.id);
     expect(await screen.findByText('控制版本：v8')).toBeInTheDocument();
@@ -703,7 +755,7 @@ describe('Hosts', () => {
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: '查看桌面' });
     await openHostDetails(user, ownedHost.id);
@@ -720,7 +772,7 @@ describe('Hosts', () => {
     const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockRejectedValue(staleVersion);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await openHostDetails(user, ownedHost.id);
     expect(await screen.findByText('控制版本：v9')).toBeInTheDocument();
@@ -740,7 +792,7 @@ describe('Hosts', () => {
     const renew = vi.spyOn(portalApi, 'renewHostControlLease').mockResolvedValue(userControl(7));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
     await openHostDetails(user, ownedHost.id);

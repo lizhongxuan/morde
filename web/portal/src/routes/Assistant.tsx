@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router';
+import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { enterHostInNewTab, errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission } from '../app/api';
@@ -10,8 +10,8 @@ import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import { useMessageOutbox } from '../app/use-message-outbox';
 import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
 import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
-import { buildMessageVariantTimeline, createMessageVariant, maxMessageVariantScalars, messageVariantActionLabel, messageVariantContentTooLong } from '../app/message-variants';
-import type { MessageVariantAction, VersionableMessage } from '../app/message-variants';
+import { buildMessageVariantTimeline, createMessageVariant, messageVariantActionLabel } from '../app/message-variants';
+import type { VersionableMessage } from '../app/message-variants';
 import { deliveryStatusText, userVisibleRoutingStatusText } from '../app/message-status';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
@@ -20,6 +20,7 @@ import { MessageReceiptOrder } from '../app/message-receipt-order';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
 import type { components } from '../api/schema';
 import { ApiError } from '../api/client';
+import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
 import { formatBytes, formatDate, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
@@ -49,6 +50,14 @@ type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskCostSummary = NonNullable<Task['billing']>['costs'][number];
 type TaskArtifact = Task['artifacts'][number];
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
+type AssistantPanelTab = 'tasks' | 'files' | 'computer';
+type AssistantOutletContext = {
+  panelOpen: boolean;
+  panelTab: AssistantPanelTab;
+  setPanelOpen: (open: boolean) => void;
+  setPanelTab: (tab: AssistantPanelTab) => void;
+  newChatRequest: number;
+};
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type ComputerHostOption = { id: string; name: string; url: string; state: string; owned: boolean; permissions: HostMemberPermission[] };
 type ComputerEmbedSession = {
@@ -527,12 +536,6 @@ function recoveryHint(step: Task['steps'][number] | undefined): string | null {
   }
 }
 
-function isTransientNetworkError(error: unknown): boolean {
-  if (error instanceof SyntaxError) return true;
-  if (error instanceof TypeError && /failed to fetch|networkerror|load failed|network request failed/i.test(error.message)) return true;
-  return error instanceof ApiError && error.status >= 500;
-}
-
 function isResourceNoLongerAccessible(error: unknown): boolean {
   return error instanceof ApiError && [401, 403, 404].includes(error.status);
 }
@@ -632,6 +635,7 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   task: Task; step: TaskStep; conversationID: string; actorID: string; serviceInstanceID: string;
 }) {
   const client = useQueryClient();
+  const { notify, dismiss } = useToast();
   const [accessRevoked, setAccessRevoked] = useState(false);
   const queryKey = ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id] as const;
   const detail = useQuery({
@@ -654,13 +658,24 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
     refetchInterval: (query) => !terminalTaskStatuses.has(task.status) ||
       (query.state.data && query.state.data.event_sequence < task.event_sequence) ? 1500 : false,
   });
+  const refetchDetail = detail.refetch;
   const inaccessible = isResourceNoLongerAccessible(detail.error);
   if (inaccessible && !accessRevoked) setAccessRevoked(true);
   useEffect(() => {
     if (!accessRevoked) return;
     client.removeQueries({ queryKey: ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id], exact: true });
   }, [accessRevoked, actorID, client, conversationID, serviceInstanceID, step.id, task.id]);
+  useEffect(() => {
+    if (!detail.isError || !isTransientNetworkError(detail.error)) return;
+    let toastID = 0;
+    toastID = notify('网络异常，步骤详情暂时无法读取。', 'error', {
+      label: '重试',
+      onClick: () => { void refetchDetail().then((result) => { if (!result.isError) dismiss(toastID); }); },
+    });
+    return () => dismiss(toastID);
+  }, [detail.error, detail.isError, dismiss, notify, refetchDetail]);
   if (accessRevoked || inaccessible) return <p className="task-step-detail-message" role="status">详情不可访问或已删除。</p>;
+  if (detail.isError && isTransientNetworkError(detail.error)) return <p className="task-step-detail-message" role="status">正在读取详情…</p>;
   if (detail.isError) return <p className="task-step-detail-message" role="alert">详情暂不可用。
     <button type="button" className="button button-small button-secondary" onClick={() => void detail.refetch()}>重试</button></p>;
   if (!actorID || !serviceInstanceID) return <p className="task-step-detail-message" role="status">账号或服务身份暂不可确认。</p>;
@@ -778,7 +793,7 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
     let disposed = false;
     let resyncing = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
-    const resync = () => {
+    const resync = (reconnectDelay = 0) => {
       if (disposed || resyncing) return;
       resyncing = true;
       source.close();
@@ -794,7 +809,9 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
           void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
           void client.invalidateQueries({ queryKey: ['task-file-fetches', task.id] });
           void client.invalidateQueries({ queryKey: ['task-step-detail'], predicate: (query) => query.queryKey[4] === task.id });
-          setGeneration((value) => value + 1);
+          const reconnect = () => setGeneration((value) => value + 1);
+          if (reconnectDelay) retry = setTimeout(reconnect, reconnectDelay);
+          else reconnect();
         }
       }).catch((error: unknown) => {
         if (!disposed) {
@@ -804,7 +821,7 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
       });
     };
     source.onopen = () => { if (!disposed && !resyncing) onState(task.id, 'connected'); };
-    source.onerror = () => resync();
+    source.onerror = () => resync(1500);
     for (const type of taskEventTypes) {
       source.addEventListener(type, (event) => {
         if (disposed || resyncing) return;
@@ -840,6 +857,7 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
 }
 
 export function Assistant() {
+  const outletContext = useOutletContext<AssistantOutletContext | null>();
   const client = useQueryClient();
   const { notify, dismiss } = useToast();
   const { user } = useAuth();
@@ -873,8 +891,14 @@ export function Assistant() {
   const [taskStepSelection, setTaskStepSelection] = useState<{ taskID: string; stepID: string } | null>(null);
   const [visibleActivitySteps, setVisibleActivitySteps] = useState<Record<string, number>>({});
   const [taskPanelRecentOpen, setTaskPanelRecentOpen] = useState(false);
-  const [taskPanelTab, setTaskPanelTab] = useState<'tasks' | 'files' | 'computer'>('tasks');
-  const [taskPanelOpen, setTaskPanelOpen] = useState(false);
+  const [standaloneTaskPanelTab, setStandaloneTaskPanelTab] = useState<AssistantPanelTab>('tasks');
+  const [standaloneTaskPanelOpen, setStandaloneTaskPanelOpen] = useState(false);
+  const taskPanelTab = outletContext?.panelTab ?? standaloneTaskPanelTab;
+  const taskPanelOpen = outletContext?.panelOpen ?? standaloneTaskPanelOpen;
+  const setTaskPanelTab = outletContext?.setPanelTab ?? setStandaloneTaskPanelTab;
+  const setTaskPanelOpen = outletContext?.setPanelOpen ?? setStandaloneTaskPanelOpen;
+  const [conversationSearchVisible, setConversationSearchVisible] = useState(false);
+  const lastNewChatRequest = useRef(outletContext?.newChatRequest ?? 0);
   const [serviceStatusExpanded, setServiceStatusExpanded] = useState(false);
   const [computerHostID, setComputerHostID] = useState<string | null>(null);
   const [computerEmbed, setComputerEmbed] = useState<ComputerEmbedSession | null>(null);
@@ -904,10 +928,8 @@ export function Assistant() {
   const [conversationSearch, setConversationSearch] = useState('');
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [selectedMessageVariantVersions, setSelectedMessageVariantVersions] = useState<Record<string, number>>({});
-  const [editingMessageVariant, setEditingMessageVariant] = useState<{ groupID: string; messageID: string; content: string } | null>(null);
   const [historyPageLoadVersion, setHistoryPageLoadVersion] = useState(0);
   const [openingTaskID, setOpeningTaskID] = useState('');
-  const [taskObservationError, setTaskObservationError] = useState<{ taskID: string; message: string } | null>(null);
   const [taskObservationRequest, setTaskObservationRequest] = useState(false);
   const pendingMessageSave = useRef<Promise<void>>(Promise.resolve());
   const savingMessageRef = useRef(false);
@@ -921,11 +943,11 @@ export function Assistant() {
   const receiptOrder = useRef(new MessageReceiptOrder());
   const newConversationKey = useRef<string | null>(null);
   const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
-  const [taskStepRetryErrors, setTaskStepRetryErrors] = useState<Record<string, string>>({});
   const [pendingTaskStepRetries, setPendingTaskStepRetries] = useState<Set<string>>(() => new Set());
   const pendingTaskStepRetriesRef = useRef(new Set<string>());
   const ensureMainKey = useRef<{ userID: string; key: string } | null>(null);
   const ensureAttemptedUserID = useRef<string | null>(null);
+  const ensureMainErrorToastID = useRef<number | null>(null);
   const conversationView = useRef<HTMLDivElement>(null);
   const olderMessagesAnchor = useRef<{ conversationID: string; height: number; top: number } | null>(null);
   const conversationScrollPositions = useRef(new Map<string, number>());
@@ -1011,8 +1033,21 @@ export function Assistant() {
     .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at) || right.id.localeCompare(left.id));
   const ensureMainConversation = useMutation({
     mutationFn: portalApi.ensureMainConversation,
-    onSuccess: (state) => client.setQueryData(['main-conversation', user?.id], state),
-    onError: (error) => notify(errorDetails(error).message, 'error'),
+    onSuccess: (state) => {
+      client.setQueryData(['main-conversation', user?.id], state);
+      if (ensureMainErrorToastID.current !== null) dismiss(ensureMainErrorToastID.current);
+      ensureMainErrorToastID.current = null;
+    },
+    onError: (error) => {
+      if (ensureMainErrorToastID.current !== null) dismiss(ensureMainErrorToastID.current);
+      ensureMainErrorToastID.current = notify(errorDetails(error).message, 'error', {
+        label: '重试',
+        onClick: () => {
+          const attempt = ensureMainKey.current;
+          if (attempt && attempt.userID === user?.id) ensureMainConversation.mutate(attempt.key);
+        },
+      });
+    },
   });
   const ensureMain = useCallback(() => {
     if (!user) return;
@@ -1365,6 +1400,8 @@ export function Assistant() {
   }).sort((left, right) => Date.parse(allTasksByID.get(right.id)?.updated_at ?? right.updated_at) -
     Date.parse(allTasksByID.get(left.id)?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id));
   const taskProgressReadError = taskQueries.some((query, index) => query.isError && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
+  const taskProgressNetworkReadError = taskQueries.some((query, index) => query.isError &&
+    isTransientNetworkError(query.error) && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
   const visibleTaskPanelTasks = taskPanelTasks.filter((item) => item.conversation_id === conversationID);
   const taskPanelGroups: TaskPanelGroup[] = [
     { id: 'attention', title: '待你处理', tasks: visibleTaskPanelTasks.filter((item) => (allTasksByID.get(item.id)?.status ?? item.status) === 'waiting_user') },
@@ -1411,17 +1448,24 @@ export function Assistant() {
     { failed: conversations.isError, error: conversations.error, retry: () => conversations.refetch() },
     { failed: Boolean(user) && mainConversation.isError, error: mainConversation.error, retry: () => mainConversation.refetch() },
     { failed: models.isError, error: models.error, retry: () => models.refetch() },
+    { failed: availableModels.isError, error: availableModels.error, retry: () => availableModels.refetch() },
     { failed: mcpConnectors.isError, error: mcpConnectors.error, retry: () => mcpConnectors.refetch() },
+    { failed: workspaces.isError, error: workspaces.error, retry: () => workspaces.refetch() },
     { failed: preferences.isError, error: preferences.error, retry: () => preferences.refetch() },
     { failed: hosts.isError, error: hosts.error, retry: () => hosts.refetch() },
+    { failed: sharedHosts.isError, error: sharedHosts.error, retry: () => sharedHosts.refetch() },
     { failed: execution.isError, error: execution.error, retry: () => execution.refetch() },
     { failed: Boolean(conversationID) && conversationDetail.isError, error: conversationDetail.error, retry: () => conversationDetail.refetch() },
+    { failed: Boolean(mainConversationID) && mainConversationDetail.isError, error: mainConversationDetail.error, retry: () => mainConversationDetail.refetch() },
     { failed: Boolean(conversationID) && messages.isError, error: messages.error, retry: () => messages.refetch() },
     { failed: Boolean(conversationID) && conversationTasks.isError, error: conversationTasks.error, retry: () => conversationTasks.refetch() },
+    { failed: Boolean(conversationID) && taskPanelOpen && recentConversationTasks.isError, error: recentConversationTasks.error, retry: () => recentConversationTasks.refetch() },
     { failed: Boolean(conversationID) && conversationApprovals.isError, error: conversationApprovals.error, retry: () => conversationApprovals.refetch() },
+    ...conversationPreviewQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
     ...taskQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
+    ...taskFileFetchQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
   ].filter((item) => item.failed && isTransientNetworkError(item.error));
-  const showConsolidatedNetworkError = networkReadFailures.length > 1;
+  const showConsolidatedNetworkError = networkReadFailures.length > 0;
   const networkReadFailuresRef = useRef(networkReadFailures);
   useEffect(() => { networkReadFailuresRef.current = networkReadFailures; }, [networkReadFailures]);
   const retryNetworkReads = useCallback(() => { void Promise.all(networkReadFailuresRef.current.map((item) => item.retry())); }, []);
@@ -1523,7 +1567,7 @@ export function Assistant() {
         targets: issued.targets, status: 'submitting', native: false,
       });
     } catch (error) {
-      if (generation === computerRequestGeneration.current) setComputerPanelError(errorDetails(error).message || '连接云端电脑失败，请重试。');
+      if (generation === computerRequestGeneration.current) notify(errorDetails(error).message || '连接云端电脑失败，请重试。', 'error');
     } finally {
       if (generation === computerRequestGeneration.current) setComputerConnecting(false);
     }
@@ -1532,13 +1576,12 @@ export function Assistant() {
     if (taskObservationRequest) return;
     const popup = window.open('about:blank', 'morde-task-observation');
     if (!popup) {
-      setTaskObservationError({ taskID: task.id, message: '无法打开任务观察窗口，请重试。' });
+      notify('无法打开任务观察窗口，请重试。', 'error');
       return;
     }
     popup.opener = null;
     setTaskObservationRequest(true);
     setOpeningTaskID(task.id);
-    setTaskObservationError(null);
     try {
       const grant = await portalApi.taskWorkbenchObservationTicket(task.id);
       if (grant.task_id !== task.id || grant.host_id !== task.host_id || grant.host_id !== host.id) {
@@ -1547,7 +1590,7 @@ export function Assistant() {
       popup.location.replace(resolveTaskObservationURL(grant.ticket, host.url, host.id));
     } catch (error) {
       popup.close();
-      setTaskObservationError({ taskID: task.id, message: errorDetails(error).message });
+      notify(errorDetails(error).message, 'error');
     } finally {
       setTaskObservationRequest(false);
       setOpeningTaskID('');
@@ -1686,7 +1729,6 @@ export function Assistant() {
       await variantOutbox.remove(entry.scope, key);
       if (result.state !== 'failed') {
         setSelectedMessageVariantVersions((current) => ({ ...current, [result.variant_group_id]: result.variant_version }));
-        setEditingMessageVariant((current) => current?.groupID === result.variant_group_id ? null : current);
       }
       void client.invalidateQueries({ queryKey: ['conversation-messages', entry.operation.input.conversationID] });
       void client.invalidateQueries({ queryKey: ['conversation-tasks', entry.operation.input.conversationID] });
@@ -1714,7 +1756,7 @@ export function Assistant() {
     }
   };
 
-  const startVariantOperation = async (groupID: string, messageID: string, action: MessageVariantAction, contentValue?: string) => {
+  const startVariantOperation = async (groupID: string, messageID: string) => {
     const group = variantTimeline.groups.get(groupID);
     const serviceInstanceID = capabilities.data?.service_instance_id;
     if (!group || !user?.id || !serviceInstanceID) {
@@ -1723,8 +1765,8 @@ export function Assistant() {
     }
     try {
       const operation = await variantOutbox.enqueue({
-        conversationID: conversationID!, messageID, action, expectedVersion: group.latestVersion,
-        ...(contentValue !== undefined ? { content: contentValue } : {}), serviceInstanceID, actorID: user.id,
+        conversationID: conversationID!, messageID, action: 'continue_generation', expectedVersion: group.latestVersion,
+        serviceInstanceID, actorID: user.id,
       });
       return sendVariantOperation(operation);
     } catch (error) {
@@ -1962,12 +2004,6 @@ export function Assistant() {
       portalApi.retryTaskStep(request.taskID, request.stepID, request.body, request.key),
     onSuccess: async (_response, request) => {
       clearTaskActionKey(request.actionScope, request.key);
-      setTaskStepRetryErrors((current) => {
-        if (!(request.errorKey in current)) return current;
-        const next = { ...current };
-        delete next[request.errorKey];
-        return next;
-      });
       await Promise.all([
         client.invalidateQueries({ queryKey: ['task', request.taskID] }),
         client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
@@ -1976,7 +2012,7 @@ export function Assistant() {
       ]);
     },
     onError: async (error, request) => {
-      setTaskStepRetryErrors((current) => ({ ...current, [request.errorKey]: errorDetails(error).message }));
+      notify(errorDetails(error).message, 'error');
       if (errorDetails(error).code === 'conflict') await client.invalidateQueries({ queryKey: ['task', request.taskID] });
     },
     onSettled: (_response, _error, request) => {
@@ -2390,6 +2426,11 @@ export function Assistant() {
       client.setQueryData(['assistant-recent-conversation', recentConversationKey], null);
     }
   };
+  useEffect(() => {
+    if (outletContext?.newChatRequest === undefined || outletContext.newChatRequest === lastNewChatRequest.current) return;
+    lastNewChatRequest.current = outletContext.newChatRequest;
+    void startNew();
+  }, [outletContext?.newChatRequest, startNew]);
 
   const selectConversationID = async (id: string) => {
     const generation = ++composerSwitchGeneration.current;
@@ -2771,9 +2812,9 @@ export function Assistant() {
       : message.status === 'sending' ? '正在发送' : message.status === 'unknown' ? '发送结果待确认'
         : message.status === 'failed' ? '发送失败' : '已保存在本机，等待发送';
     return <div className="chat-message-row chat-message-row-user chat-message-row-pending" key={`outbox:${message.request.client_message_id}`}>
+      <article className="chat-message chat-message-user chat-message-pending" aria-label="你的消息">
       {failed && <button type="button" className="message-retry" aria-label="重试发送这条消息" title="重试发送"
         onClick={() => void sendMessage(entry, true)}>!</button>}
-      <article className="chat-message chat-message-user chat-message-pending" aria-label="你的消息">
       {!alreadyVisible && <><strong className="chat-message-author">你</strong><p>{message.request.content}</p></>}
       {!failed && <small role="status">{status}{message.error ? `：${message.error}` : ''}</small>}
       {message.attachments.length > 0 && <small>附件 · {message.attachments.length}</small>}
@@ -2786,7 +2827,7 @@ export function Assistant() {
     const task = allTasksByID.get(summary.id);
     const taskQuery = taskQueries[taskIDs.indexOf(summary.id)];
     const taskFileFetchQuery = taskFileFetchQueries[taskIDs.indexOf(summary.id)];
-    if (!task) return taskQuery?.isError
+    if (!task) return taskQuery?.isError && !isTransientNetworkError(taskQuery.error)
       ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
         <button type="button" className="button button-small button-secondary" onClick={() => void taskQuery.refetch()}>重试</button></FloatingError>
       : <p className="muted" role="status">正在读取任务详情…</p>;
@@ -2898,7 +2939,7 @@ export function Assistant() {
         <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
       </div>}
       {taskFileFetchQuery?.isPending && !taskFileFetchQuery.data && <p className="muted" role="status">正在核对本机文件读取记录…</p>}
-      {taskFileFetchQuery?.isError && <FloatingError className="error-inline task-file-fetch-error" role="alert">
+      {taskFileFetchQuery?.isError && !isTransientNetworkError(taskFileFetchQuery.error) && <FloatingError className="error-inline task-file-fetch-error" role="alert">
         {fileFetches.length ? '读取记录暂不可用，以下为最近一次已确认状态。' : '部分任务记录暂不可用，无法确认任务是否读取了本机文件。'}
         <button type="button" className="button button-small button-secondary" onClick={() => void taskFileFetchQuery.refetch()}>重试</button>
       </FloatingError>}
@@ -2947,7 +2988,7 @@ export function Assistant() {
         onWorkspaceChange={(workspaceID) => setTaskWorkspaceSelections((current) => ({ ...current, [task.id]: workspaceID }))}
         onSubmit={submitTaskSupplement}
         onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))} />}
-      {busy && supplementTaskID === task.id && task.waiting_reason === 'workspace_unavailable' && !task.workspace_id && workspaces.isError && <FloatingError className="error-inline assistant-connector-error" role="alert">Workspace 列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
+      {busy && supplementTaskID === task.id && task.waiting_reason === 'workspace_unavailable' && !task.workspace_id && workspaces.isError && !isTransientNetworkError(workspaces.error) && <FloatingError className="error-inline assistant-connector-error" role="alert">Workspace 列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
       {supplementEntries.map(({ message, scope }) => <div className="task-supplement-status" key={message.request.client_message_id}>
         <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
           : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{message.error ? `：${message.error}` : ''}</small>
@@ -2979,9 +3020,6 @@ export function Assistant() {
                 {pendingTaskStepRetries.has(retryKey) ? '正在重试…' : '重试步骤'}
               </button>}
               {retryBlockedReason && <small className="task-step-retry-blocked-reason">{retryBlockedReason}</small>}
-              {taskStepRetryErrors[retryKey] && <p className="error-inline task-step-retry-error" role="alert">
-                步骤重试失败：{taskStepRetryErrors[retryKey]}
-              </p>}
               {expanded && <section id={`task-step-detail-${step.id}`} aria-label={`动作详情：${stepTitle(step)}`}>
                 <TaskStepDetails key={`${user?.id ?? ''}:${capabilities.data?.service_instance_id ?? ''}:${task.conversation_id}:${task.id}:${step.id}`}
                   task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
@@ -3029,7 +3067,6 @@ export function Assistant() {
             onClick={openTaskObservation.bind(undefined, task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…'
               : task.artifacts.some(hasCompleteVerifiedArtifactProof) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
           : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
-        {taskObservationError?.taskID === task.id && <FloatingError>{taskObservationError.message}</FloatingError>}
       </div>}
       <details className="task-detail-diagnostics"><summary>更多信息</summary>
         <p>任务 ID：{task.id}{task.current_revision !== undefined || task.desired_revision !== undefined
@@ -3077,20 +3114,20 @@ export function Assistant() {
   const selectedConversationTitle = selected && !isPlaceholderConversationTitle(selected.title) ? selected.title
     : conversationTitleFromMessages(conversationMessageItems) ?? (conversationID ? conversationPreviewTitles.get(conversationID) : null)
       ?? (conversationID ? '对话' : selectedLocalDraftKey ? '新旁聊' : mainConversationNeedsSelection ? '选择主会话'
-        : mainConversation.isError ? '主会话暂不可用' : '主会话');
+        : mainConversation.isError && !isTransientNetworkError(mainConversation.error) ? '主会话暂不可用' : '主会话');
   const showConversationWelcome = Boolean(conversationID && messages.isSuccess && displayMessages.length === 0 && pendingMessages.length === 0);
   const conversationWelcome = <div className="assistant-welcome"><span className="assistant-mark assistant-logo" aria-hidden="true" />
-    {selectedLocalDraftKey || mainConversation.data?.status === 'ready' ? <><h2>今天想聊些什么？</h2><p>告诉我你想完成的事情。</p></>
-      : mainConversationNeedsSelection ? <><h2>选择一条旧对话</h2><p>检测到多条旧个人对话。请从左侧旁聊中选择一条设为主会话；其他记录不会被合并或删除。</p></>
-        : mainConversation.isError ? <><h2>暂时无法连接</h2><p>暂时无法确认主会话状态。重试读取不会删除已有对话。</p>
+    {mainConversationNeedsSelection ? <><h2>选择一条旧对话</h2><p>检测到多条旧个人对话。请从左侧旁聊中选择一条设为主会话；其他记录不会被合并或删除。</p></>
+      : selectedLocalDraftKey || mainConversation.data?.status === 'ready' ? <><h2>今天想聊些什么？</h2><p>告诉我你想完成的事情。</p></>
+        : mainConversation.isError && !isTransientNetworkError(mainConversation.error) ? <><h2>暂时无法连接</h2><p>暂时无法确认主会话状态。重试读取不会删除已有对话。</p>
           <button type="button" className="button button-small button-secondary" aria-label="重试读取主会话" onClick={() => void mainConversation.refetch()}>重试</button></>
           : mainConversation.data?.status === 'uninitialized' ? <><h2>正在初始化主会话…</h2><p>正在确认会话状态，已有对话会保留。</p></>
             : <><h2>正在读取主会话…</h2><p>正在读取服务端会话状态。</p></>}
   </div>;
   const showDemoModeStatus = import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1';
-  const showMainConversationError = mainConversation.isError && !showConsolidatedNetworkError;
+  const showMainConversationError = mainConversation.isError && !isTransientNetworkError(mainConversation.error);
   const showMainConversationUninitialized = mainConversation.data?.status === 'uninitialized';
-  const showCapabilitiesError = capabilities.isError && !showConsolidatedNetworkError;
+  const showCapabilitiesError = capabilities.isError && !isTransientNetworkError(capabilities.error);
   const showAutoRoutingWarning = capabilities.isSuccess && conversationAutoRoutingAvailable === false;
   const showCloudToolsWarning = capabilities.isSuccess && cloudTasksAvailable === false;
   const serviceStatusCount = [showDemoModeStatus, mainConversation.isPending, showMainConversationError,
@@ -3101,37 +3138,40 @@ export function Assistant() {
     <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' ? ' assistant-layout-with-computer-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' && computerControlExpanded ? ' assistant-layout-computer-expanded' : ''}`}>
       <aside id="context-sidebar" className="assistant-sidebar" aria-label="对话">
         <div className="assistant-sidebar-heading">
-          <button type="button" className="icon-button" aria-label="刷新对话" title="刷新会话列表和当前消息" onClick={() => { void conversations.refetch(); void mainConversation.refetch(); void messages.refetch(); }}><MordeIcon name="refresh" /></button>
+          <h2>Morde</h2>
+          <button type="button" className="icon-button" aria-label="搜索会话" title="搜索会话" aria-expanded={conversationSearchVisible}
+            onClick={() => { setConversationSearchVisible((visible) => !visible); if (conversationSearchVisible) setConversationSearch(''); }}><MordeIcon name="search" /></button>
         </div>
         <div id="conversation-history" className="assistant-history-content">
           {mainConversationID && (mainConversationItem ? <AssistantConversationRow item={mainConversationItem} isMain selected={conversationID === mainConversationItem.id}
             recent={false} onSelect={selectConversationID} />
             : renderCachedMainConversation())}
-          {!mainConversationID && mainConversation.isPending && <p className="muted" role="status">正在读取主会话…</p>}
-          {!mainConversationID && mainConversation.isError && <div className="conversation-row conversation-row-main">
+          {!mainConversationID && (mainConversation.isPending || isTransientNetworkError(mainConversation.error)) && <p className="muted" role="status">正在读取主会话…</p>}
+          {!mainConversationID && mainConversation.isError && !isTransientNetworkError(mainConversation.error) && <div className="conversation-row conversation-row-main">
             <button type="button" className="conversation-item" aria-label="重试读取主会话" onClick={() => void mainConversation.refetch()}>
               <strong>主会话</strong><small>暂时无法读取 · 点击重试</small>
             </button>
           </div>}
           {!mainConversationID && mainConversation.data?.status === 'uninitialized' && <div className="conversation-row conversation-row-main" role="status">
             <div className="conversation-item"><strong>主会话</strong>
-              <small>{ensureMainConversation.isError ? '初始化失败 · 可重试' : '正在初始化…'}</small></div>
-            {ensureMainConversation.isError && <button type="button" className="button button-small button-secondary"
-              aria-label="重试初始化主会话" onClick={ensureMain}>重试</button>}
+              <small>正在初始化…</small></div>
           </div>}
-          {mainConversationNeedsSelection && <p className="muted assistant-sidebar-empty" role="status">
-            发现多条旧个人对话。选择一条设为主会话；其他记录不会被合并或删除。
-          </p>}
-          {conversations.isPending && !conversations.data && <p className="muted" role="status">正在读取旁聊…</p>}
-          {conversations.isError && !conversations.data && <p className="muted" role="status">旁聊历史暂不可用</p>}
-          <label className="conversation-search">
+          {mainConversationNeedsSelection && <div className="conversation-row conversation-row-main conversation-row-main-recovery">
+            <div className="conversation-item" role="status"><strong>主会话待恢复</strong>
+              <small>选择旧对话设为主会话，其余记录保留。</small></div>
+            <button type="button" className="button button-small button-secondary" aria-label="查看可设为主会话的旧对话"
+              onClick={() => setSideConversationsOpen(true)}>查看旧对话</button>
+          </div>}
+          {(conversations.isPending || isTransientNetworkError(conversations.error)) && !conversations.data && <p className="muted" role="status">正在读取旁聊…</p>}
+          {conversations.isError && !conversations.data && !isTransientNetworkError(conversations.error) && <p className="muted" role="status">旁聊历史暂不可用</p>}
+          {conversationSearchVisible && <label className="conversation-search">
             <span className="sr-only">搜索旁聊标题</span>
             <input type="search" aria-label="搜索旁聊标题" placeholder="搜索旁聊标题" value={conversationSearch}
               onChange={(event) => { setConversationSearch(event.currentTarget.value); setVisibleSideConversationCount(5);
                 if (event.currentTarget.value.trim()) setSideConversationsOpen(true); }} />
-          </label>
+          </label>}
           <div className="conversation-group">
-            <details className="conversation-group-details" open={sideConversationsOpen} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
+            <details className="conversation-group-details" open={sideConversationsOpen || mainConversationNeedsSelection} onToggle={(event) => setSideConversationsOpen(event.currentTarget.open)}>
               <summary>旁聊</summary>
               <div className="conversation-list">
                 {localComposerDrafts.slice(0, visibleSideConversationCount).map(renderLocalDraftItem)}
@@ -3142,7 +3182,7 @@ export function Assistant() {
               {composerDrafts.isError && <FloatingError className="error-inline" role="alert">未发送草稿暂不可用：{errorDetails(composerDrafts.error).message}
                 <button type="button" className="button button-small button-secondary" onClick={() => void composerDrafts.refetch()}>重试</button></FloatingError>}
               {composerDraftError && <FloatingError className="error-inline" role="alert">草稿保存状态：{composerDraftError}</FloatingError>}
-              {conversations.isFetchNextPageError && <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></FloatingError>}
+              {conversations.isFetchNextPageError && !isTransientNetworkError(conversations.error) && <FloatingError className="error-inline" role="alert">{errorDetails(conversations.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void conversations.fetchNextPage()}>重试</button></FloatingError>}
               {(sideConversations.length > visibleSideConversationCount || localComposerDrafts.length > visibleSideConversationCount || conversations.hasNextPage) && <button type="button" className="button button-secondary button-small conversation-more"
                 disabled={conversations.isFetchingNextPage} onClick={() => void showMoreSideConversations()}>
                 {conversations.isFetchingNextPage ? '正在加载…' : '更多'}
@@ -3157,7 +3197,7 @@ export function Assistant() {
       </aside>
       <div className="assistant-main">
         <header className="conversation-view-heading">
-          <div className="assistant-chat-title"><span className="assistant-logo assistant-logo-header" aria-hidden="true" /><div>
+          <div className="assistant-chat-title"><div>
             <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selectedConversationTitle}</h2>
             <p>{conversationID && conversationID === mainConversationID ? '你的 Morde' : selectedLocalDraftKey ? '旁聊 · 你的 Morde' : conversationID ? '旁聊 · 你的 Morde' : '主会话'}</p>
           </div></div>
@@ -3184,7 +3224,7 @@ export function Assistant() {
           {showDemoModeStatus && <p className="assistant-service-status-row" role="status">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</p>}
           {mainConversation.isPending && <p className="assistant-service-status-row" role="status">正在读取服务端主会话…</p>}
           {showMainConversationError && <p className="assistant-service-status-row" role="alert">无法刷新服务端主会话{cachedMainConversationID ? '，已保留上次记录' : '，请重试'}。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></p>}
-          {showMainConversationUninitialized && <p className="assistant-service-status-row" role="status">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</p>}
+          {showMainConversationUninitialized && <p className="assistant-service-status-row" role="status">正在初始化你的主会话…</p>}
           {capabilities.isPending && <p className="assistant-service-status-row" role="status">正在检查服务能力…</p>}
           {showCapabilitiesError && <p className="assistant-service-status-row" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></p>}
           {showAutoRoutingWarning && <p className="assistant-service-status-row" role="status">服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。</p>}
@@ -3204,13 +3244,13 @@ export function Assistant() {
             <strong>当前对话内容暂不可访问。</strong><p className="muted">可以重试，或从左侧切换其他会话。</p>
             <button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试读取对话</button>
           </div> : messages.isPending && displayMessages.length === 0 ? <div className="loading-card" role="status">正在加载消息…</div>
-            : messages.isError && displayMessages.length === 0 ? showConsolidatedNetworkError ? <div className="loading-card">消息暂不可用</div>
+            : messages.isError && displayMessages.length === 0 ? isTransientNetworkError(messages.error) ? <div className="loading-card" role="status">正在加载消息…</div>
               : <FloatingError className="error-card" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>
               : <div className="message-list">
                 {showConversationWelcome && conversationWelcome}
-                {messages.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>}
+                {messages.isError && !isTransientNetworkError(messages.error) && <FloatingError className="error-inline" role="alert">{errorDetails(messages.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void messages.refetch()}>重试</button></FloatingError>}
                 {messages.hasNextPage && <div className="conversation-history-load">
-                  {messages.isFetchNextPageError && <FloatingError className="error-inline" role="alert">更早的消息暂不可用：{errorDetails(messages.error).message}</FloatingError>}
+                  {messages.isFetchNextPageError && !isTransientNetworkError(messages.error) && <FloatingError className="error-inline" role="alert">更早的消息暂不可用：{errorDetails(messages.error).message}</FloatingError>}
                   <button type="button" className="button button-small button-secondary" disabled={messages.isFetchingNextPage}
                     onClick={() => void loadOlderMessages()}>{messages.isFetchingNextPage ? '正在加载更早消息…' : messages.isFetchNextPageError ? '重试加载更早消息' : '加载更早消息'}</button>
                 </div>}
@@ -3221,7 +3261,6 @@ export function Assistant() {
                   const selectedVariantVersion = variantGroup ? selectedMessageVariantVersions[variantGroup.id] ?? variantGroup.latestVersion : 1;
                   const groupOperations = variantGroup ? variantOutbox.entries.filter((entry) => entry.operation.input.conversationID === conversationID &&
                     (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
-                  const editingThisMessage = editingMessageVariant?.messageID === message.id;
                   const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
                     ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
                   const routingStatus = message.role === 'user' ? acceptedRetryStatus ?? conversationMessageStatus(message, messageTask) : null;
@@ -3232,27 +3271,15 @@ export function Assistant() {
                     {showDate && <div className="conversation-time-divider"><time dateTime={message.created_at}>{messageDate}</time></div>}
                     <div className={`chat-message-row chat-message-row-${message.role}`}>
                     {message.role === 'assistant' && <span className="assistant-logo assistant-logo-message" aria-hidden="true" />}
-                    {message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
-                      && !message.related_task_id && !retryAcceptedMessageIDs.has(message.id) && <button type="button" className="message-retry"
-                      aria-label="重新处理这条消息" title="重新处理" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
-                      onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>!</button>}
                     <div className="chat-message-body">
                     {message.role === 'assistant' && <strong className="chat-message-author">Morde</strong>}
                     <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}${message.role === 'user' ? ' chat-message-user-received' : ''}`}
                       aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
-                      {editingThisMessage ? <form className="message-variant-edit" onSubmit={(event) => {
-                        event.preventDefault();
-                        if (variantGroupID && editingMessageVariant) void startVariantOperation(variantGroupID, message.id, 'edit_resend', editingMessageVariant.content);
-                      }}>
-                        <label className="sr-only" htmlFor={`message-version-edit-${encodeURIComponent(message.id)}`}>编辑消息并创建新版本</label>
-                        <textarea id={`message-version-edit-${encodeURIComponent(message.id)}`} value={editingMessageVariant.content} maxLength={maxMessageVariantScalars * 2}
-                          onChange={(event) => setEditingMessageVariant((current) => current?.messageID === message.id ? { ...current, content: event.target.value } : current)} />
-                        {messageVariantContentTooLong(editingMessageVariant.content) && <small role="alert">编辑后的消息不能超过 {maxMessageVariantScalars} 个字符。</small>}
-                        <div className="message-variant-control-actions">
-                          <button type="submit" className="button button-small button-primary" disabled={!editingMessageVariant.content.trim() || messageVariantContentTooLong(editingMessageVariant.content) || groupOperations.some((entry) => entry.operation.status === 'sending')}>创建新版本</button>
-                          <button type="button" className="button button-small button-secondary" onClick={() => setEditingMessageVariant(null)}>取消</button>
-                        </div>
-                      </form> : message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
+                      {message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
+                        && !message.related_task_id && !retryAcceptedMessageIDs.has(message.id) && <button type="button" className="message-retry"
+                        aria-label="重新处理这条消息" title="重新处理" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
+                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>!</button>}
+                      {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
                         {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
                           href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {index + 1}</a></span>)}
@@ -3268,15 +3295,9 @@ export function Assistant() {
                             </option>)}
                           </select>
                         </label>}
-                        {message.role === 'user' && !editingThisMessage && <button type="button" className="button button-small button-secondary"
-                          disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
-                          onClick={() => setEditingMessageVariant({ groupID: variantGroup.id, messageID: message.id, content: message.content })}>编辑并重发</button>}
-                        {message.role === 'assistant' && message.content.trim() && message.snapshotStatus !== 'streaming' && message.output_status !== 'streaming' && <button type="button"
-                          className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
-                          onClick={() => void startVariantOperation(variantGroup.id, message.id, 'regenerate_text')}>重新生成文字</button>}
                         {message.role === 'assistant' && message.output_status === 'interrupted' && <button type="button"
                           className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
-                          onClick={() => void startVariantOperation(variantGroup.id, message.id, 'continue_generation')}>继续生成</button>}
+                          onClick={() => void startVariantOperation(variantGroup.id, message.id)}>继续生成</button>}
                       </div>}
                       {message.role === 'user' && groupOperations.map((entry) => <div className="message-variant-operation" role="status" key={entry.operation.input.idempotencyKey}>
                         <span>{entry.operation.status === 'sending' ? '正在创建消息版本…' : entry.operation.status === 'unknown'
@@ -3303,11 +3324,11 @@ export function Assistant() {
                   </Fragment>;
                 })}
                 {unattachedApprovalCards.map(renderApprovalCard)}
-                {conversationApprovals.isError && <FloatingError className="error-inline" role="alert">审核事项暂不可用，当前状态未确认。
+                {conversationApprovals.isError && !isTransientNetworkError(conversationApprovals.error) && <FloatingError className="error-inline" role="alert">审核事项暂不可用，当前状态未确认。
                   <button type="button" className="button button-small button-secondary" onClick={() => void conversationApprovals.refetch()}>重试</button></FloatingError>}
                 {approvalCursorLoop && <FloatingError className="error-inline" role="alert">审核列表分页游标异常，尚未加载的事项状态未确认。</FloatingError>}
                 {conversationApprovals.hasNextPage && <div className="conversation-history-load">
-                  {conversationApprovals.isFetchNextPageError && <FloatingError className="error-inline" role="alert">更早的审核事项暂不可用。</FloatingError>}
+                  {conversationApprovals.isFetchNextPageError && !isTransientNetworkError(conversationApprovals.error) && <FloatingError className="error-inline" role="alert">更早的审核事项暂不可用。</FloatingError>}
                   <button type="button" className="button button-small button-secondary" disabled={conversationApprovals.isFetchingNextPage}
                     onClick={() => void conversationApprovals.fetchNextPage()}>{conversationApprovals.isFetchingNextPage ? '正在加载更早审核事项…'
                       : conversationApprovals.isFetchNextPageError ? '重试加载更早审核事项' : '加载更早审核事项'}</button>
@@ -3315,14 +3336,14 @@ export function Assistant() {
               </div>}
           {pendingMessages.map(renderPendingMessage)}
           </>}
-          {models.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取模型：{errorDetails(models.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void models.refetch()}>重试</button></FloatingError>}
+          {models.isError && !isTransientNetworkError(models.error) && <FloatingError className="error-inline" role="alert">无法读取模型：{errorDetails(models.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void models.refetch()}>重试</button></FloatingError>}
           {modelConfigurationKnown && models.data?.configuration_status === 'not_configured' && <FloatingNotice className="notice-warning">还没有配置云端模型。<Link to="/connections">配置模型</Link></FloatingNotice>}
           {modelConfigurationKnown && models.data?.configuration_status === 'configured' && !readyModels.length && <FloatingNotice className="notice-warning">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></FloatingNotice>}
           {outbox.storageError && <FloatingError className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</FloatingError>}
           {variantOutbox.storageError && <FloatingError className="error-inline" role="alert">本地消息版本操作存储不可用：{variantOutbox.storageError}</FloatingError>}
-          {execution.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></FloatingError>}
+          {execution.isError && !isTransientNetworkError(execution.error) && <FloatingError className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></FloatingError>}
           {execution.data?.state === 'stopping' && <FloatingNotice className="notice-warning">AI 服务正在停止；消息仍可先发送。</FloatingNotice>}
-          {taskPanelOpen && taskPanelTab === 'computer' && hosts.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline" role="alert">无法读取云端电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
+          {taskPanelOpen && taskPanelTab === 'computer' && hosts.isError && !isTransientNetworkError(hosts.error) && <FloatingError className="error-inline" role="alert">无法读取云端电脑：{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
         </div>
         {showJumpToLatest && conversationID && <div className="assistant-jump-latest"><button type="button" className="button button-secondary"
           onClick={() => { followConversation.current = true; if (conversationView.current) conversationView.current.scrollTop = conversationView.current.scrollHeight; setShowJumpToLatest(false); }}>
@@ -3418,7 +3439,7 @@ export function Assistant() {
                     </label>)}</div>
                   </fieldset>
                 </details>}
-                {mcpConnectors.isError && !showConsolidatedNetworkError && <FloatingError className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></FloatingError>}
+                {mcpConnectors.isError && !isTransientNetworkError(mcpConnectors.error) && <FloatingError className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></FloatingError>}
               </div>
               <div className="assistant-task-actions" role="group" aria-label="发送操作">
                 {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
@@ -3471,18 +3492,19 @@ export function Assistant() {
               window.requestAnimationFrame(() => taskCardButtons.current.get(taskDetailTaskID)?.focus());
             }}>‹ 返回任务列表</button></div>
           {selectedTaskSummary ? renderTaskDetail(selectedTaskSummary)
-            : selectedTaskQuery?.isError ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
+            : selectedTaskQuery?.isError && !isTransientNetworkError(selectedTaskQuery.error) ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
               <button type="button" className="button button-small button-secondary" onClick={() => void selectedTaskQuery.refetch()}>重试</button></FloatingError>
-              : <p className="muted" role="status">此任务已不在当前可见列表中，请刷新任务动态。</p>}
+              : selectedTaskQuery?.isError ? <p className="muted" role="status">正在读取任务详情…</p>
+                : <p className="muted" role="status">此任务已不在当前可见列表中，请刷新任务动态。</p>}
         </div>}
         {!conversationContentAccessRevoked && taskPanelTab === 'tasks' && <div className="task-panel-list" hidden={Boolean(taskDetailTaskID)}>
           {capabilities.isPending && <p className="muted" role="status">正在确认账号与服务身份…</p>}
           {conversationID && conversationTasks.isPending && !conversationTasks.data && <p className="muted" role="status">正在读取任务…</p>}
-          {conversationTasks.isError && <FloatingError className="error-inline" role="alert">任务状态暂不可用。
+          {conversationTasks.isError && !isTransientNetworkError(conversationTasks.error) && <FloatingError className="error-inline" role="alert">任务状态暂不可用。
             <button type="button" className="button button-small button-secondary" onClick={() => void conversationTasks.refetch()}>重试</button></FloatingError>}
-          {recentConversationTasks.isError && <FloatingError className="error-inline" role="alert">已结束任务暂不可用。
+          {recentConversationTasks.isError && !isTransientNetworkError(recentConversationTasks.error) && <FloatingError className="error-inline" role="alert">已结束任务暂不可用。
             <button type="button" className="button button-small button-secondary" onClick={() => void recentConversationTasks.refetch()}>重试</button></FloatingError>}
-          {taskProgressReadError && <FloatingError className="error-inline" role="alert">
+          {taskProgressReadError && !taskProgressNetworkReadError && <FloatingError className="error-inline" role="alert">
             部分任务进展暂不可用，显示最近一次已确认状态。<button type="button" className="button button-small button-secondary"
               onClick={() => void client.invalidateQueries({ queryKey: ['task'] })}>重试</button></FloatingError>}
           {!conversationID && <p className="muted">开始对话后，这里会显示相关任务。</p>}
@@ -3547,7 +3569,7 @@ export function Assistant() {
                 : computerEmbed?.status === 'error' ? '重试连接' : '连接到此会话'}
             </button>
           </div>
-          {sharedHosts.isError && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
+          {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
             <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
           {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
           {!conversationID && <p className="muted">新旁聊创建后，才能把电脑连接到该会话。</p>}
@@ -3569,7 +3591,7 @@ export function Assistant() {
                         : selectedComputerInitialTarget === 'terminal' || selectedComputerInitialTarget === 'workspace'
                           ? selectedComputerInitialTarget : undefined;
                     enterHostInNewTab(selectedComputerHost.id, fallbackTarget);
-                  } catch (error) { setComputerPanelError(errorDetails(error).message); }
+                  } catch (error) { notify(errorDetails(error).message, 'error'); }
                 }}>在新窗口打开工作台</button>}
             </div>
             <div ref={computerFrameBounds} className="computer-panel-frame">

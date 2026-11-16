@@ -2,9 +2,11 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router';
 import { errorDetails, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
 import { formatBytes, formatDate } from '../app/format';
 import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import type { components } from '../api/schema';
 import {
   subscribePersonalDataSyncStatus,
@@ -35,6 +37,8 @@ function RecordConsentSettings() {
   const client = useQueryClient();
   const { notify } = useToast();
   const query = useQuery({ queryKey: ['me', 'record-consents'], queryFn: portalApi.recordConsents });
+  const networkError = query.isError && isTransientNetworkError(query.error);
+  useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: () => query.refetch() }], '网络异常，记录同意设置暂时无法读取。');
   const update = useMutation({
     mutationFn: portalApi.setRecordConsent,
     onSuccess: async () => {
@@ -46,9 +50,9 @@ function RecordConsentSettings() {
 
   return <section className="connection-section" aria-labelledby="record-consent-settings-title">
     <div className="connection-section-heading"><div><h2 id="record-consent-settings-title">记录与样本同意</h2><p className="muted">两类记录分别控制，默认关闭。关闭后会清理待处理内容，已保存的记录仍可由你申请删除。</p></div></div>
-    {query.isPending ? <div className="loading-card" role="status">正在读取记录同意设置…</div>
-      : query.isError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>
-        : <fieldset className="form-card form-stack" disabled={update.isPending}>
+    {query.isPending || (networkError && !query.data) ? <div className="loading-card" role="status">正在读取记录同意设置…</div>
+      : query.isError && !networkError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>
+        : query.data && <fieldset className="form-card form-stack" disabled={update.isPending}>
           <legend className="sr-only">选择记录保存方式</legend>
           {query.data.items.map((consent) => <label className="checkbox-row" key={consent.purpose}>
             <input type="checkbox" checked={consent.enabled} onChange={(event) => update.mutate({ purpose: consent.purpose, enabled: event.target.checked })} />
@@ -68,6 +72,8 @@ function MyRecordCaptureStatuses() {
     getNextPageParam: (page) => page.next_before || undefined,
     refetchInterval: (current) => current.state.data?.pages.some((page) => page.items.some((item) => item.state === 'queued' || item.state === 'leased')) ? 3000 : false,
   });
+  const networkError = query.isError && isTransientNetworkError(query.error);
+  useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: () => query.isFetchNextPageError ? query.fetchNextPage() : query.refetch() }], '网络异常，任务记录状态暂时无法读取。');
   const items = query.data?.pages[pageIndex]?.items ?? [];
   const nextPage = async () => {
     const targetPage = pageIndex + 1;
@@ -81,10 +87,10 @@ function MyRecordCaptureStatuses() {
 
   return <section className="connection-section" aria-labelledby="record-capture-status-title">
     <div className="connection-section-heading"><div><h2 id="record-capture-status-title">任务记录采集状态</h2><p className="muted">这里只显示任务记录的状态和时间等元数据，不显示记录正文或附件信息。</p></div></div>
-    {query.isPending ? <div className="loading-card" role="status">正在读取任务记录状态…</div>
-      : query.isError && !query.data ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>
+    {query.isPending || (networkError && !query.data) ? <div className="loading-card" role="status">正在读取任务记录状态…</div>
+      : query.isError && !networkError && !query.data ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>
         : <>
-          {query.isError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+          {query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
           {items.length === 0 ? <div className="empty-card"><h3>没有任务记录状态</h3><p className="muted">任务记录只会在你单独同意后提交。</p></div>
             : <div className="form-stack">{items.map((item) => {
               const failed = item.state === 'failed' || item.state === 'rejected';
@@ -119,6 +125,8 @@ function MyRecordSettings() {
     queryFn: ({ pageParam }) => portalApi.myRecords({ limit: 4, ...(pageParam ? { before_id: pageParam } : {}) }),
     getNextPageParam: (page) => page.next_before || undefined,
   });
+  const networkError = records.isError && isTransientNetworkError(records.error);
+  useNetworkReadNotice([{ failed: records.isError, error: records.error, retry: () => records.isFetchNextPageError ? records.fetchNextPage() : records.refetch() }], '网络异常，已保存记录暂时无法读取。');
   const remove = useMutation({
     mutationFn: portalApi.deleteMyRecord,
     onSuccess: async (tombstone) => {
@@ -142,8 +150,8 @@ function MyRecordSettings() {
 
   return <section className="connection-section" aria-labelledby="my-records-title">
     <div className="connection-section-heading"><div><h2 id="my-records-title">已保存记录</h2><p className="muted">这里只列出记录元数据。撤回同意不会删除已保存内容；你可以逐条请求清理正文与记录专用附件。</p></div></div>
-    {records.isPending ? <div className="loading-card" role="status">正在读取已保存记录…</div>
-      : records.isError ? <FloatingError className="error-card" role="alert">{errorDetails(records.error).message}<button type="button" className="button button-secondary" onClick={() => void records.refetch()}>重试</button></FloatingError>
+    {records.isPending || (networkError && !records.data) ? <div className="loading-card" role="status">正在读取已保存记录…</div>
+      : records.isError && !networkError ? <FloatingError className="error-card" role="alert">{errorDetails(records.error).message}<button type="button" className="button button-secondary" onClick={() => void records.refetch()}>重试</button></FloatingError>
         : items.length === 0 ? <div className="empty-card"><h3>没有已保存记录</h3><p className="muted">新的记录仅在你单独同意后保存。</p></div>
           : <div className="form-stack">{items.map((item) => <article className="model-connection-card" key={item.id}>
             <div className="model-connection-main"><div className="model-connection-title"><h3>{item.purpose === 'full_record' ? '完整会话记录' : '训练样本'}</h3><span className={`status ${deleting[item.id] && deleting[item.id] !== 'completed' ? 'status-deleting' : 'status-ready'}`}>{deleting[item.id] === 'completed' ? '已清理' : deleting[item.id] ? '清理中' : '已保存'}</span></div>
@@ -166,6 +174,7 @@ function PersonalSyncSettings() {
   const { user } = useAuth();
   const userID = user?.id ?? null;
   const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
+  useNetworkReadNotice([{ failed: capabilities.isError, error: capabilities.error, retry: () => capabilities.refetch() }], '网络异常，服务状态暂时无法读取。');
   const serviceInstanceID = capabilities.data?.service_instance_id;
   const [storedStatus, setStoredStatus] = useState<PersonalDataSyncStatus & { userID: string | null }>(() => ({
     userID, pendingCount: null, conflictCount: null,
@@ -175,6 +184,8 @@ function PersonalSyncSettings() {
   };
   const quota = useQuery({ queryKey: ['personal-data-quota', serviceInstanceID], queryFn: portalApi.personalDataQuota,
     enabled: Boolean(serviceInstanceID), refetchInterval: serviceInstanceID ? 30000 : false });
+  const quotaNetworkError = quota.isError && isTransientNetworkError(quota.error);
+  useNetworkReadNotice([{ failed: quota.isError, error: quota.error, retry: () => quota.refetch() }], '网络异常，个人数据额度暂时无法读取。');
 
   useEffect(() => {
     if (!userID || !serviceInstanceID) return;
@@ -191,9 +202,9 @@ function PersonalSyncSettings() {
       {status.conflictCount !== null && status.conflictCount > 0 && <p className="notice notice-warning">存在未解决冲突；本地草稿已保留，请到<Link to="/personal">个人数据</Link>查看并处理。</p>}
     </div>
     <div className="connection-section-heading"><div><h3>个人数据额度</h3><p className="muted">包括个人对象、计划和个人附件，不包括聊天、云端电脑文件和完整记录。</p></div></div>
-    {quota.isPending ? <div className="loading-card" role="status">正在读取个人数据额度…</div>
-      : quota.isError ? <FloatingError className="error-card" role="alert">{errorDetails(quota.error).message}<button type="button" className="button button-secondary" onClick={() => void quota.refetch()}>重试</button></FloatingError>
-        : <p className="notice notice-info" role="status">已用 {formatBytes(quota.data.used_bytes)}，待上传预留 {formatBytes(quota.data.reserved_bytes)}，总额度 {formatBytes(quota.data.quota_bytes)}，可用 {formatBytes(quota.data.remaining_bytes)}；单附件上限 {formatBytes(quota.data.max_attachment_bytes)}。</p>}
+    {quota.isPending || (quotaNetworkError && !quota.data) ? <div className="loading-card" role="status">正在读取个人数据额度…</div>
+      : quota.isError && !quotaNetworkError ? <FloatingError className="error-card" role="alert">{errorDetails(quota.error).message}<button type="button" className="button button-secondary" onClick={() => void quota.refetch()}>重试</button></FloatingError>
+        : quota.data && <p className="notice notice-info" role="status">已用 {formatBytes(quota.data.used_bytes)}，待上传预留 {formatBytes(quota.data.reserved_bytes)}，总额度 {formatBytes(quota.data.quota_bytes)}，可用 {formatBytes(quota.data.remaining_bytes)}；单附件上限 {formatBytes(quota.data.max_attachment_bytes)}。</p>}
   </section>;
 }
 

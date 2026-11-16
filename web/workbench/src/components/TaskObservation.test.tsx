@@ -1,6 +1,8 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayTaskObservationSnapshot } from '../api/gateway';
+import { WorkbenchNoticeProvider } from '../app/notice';
 import TaskObservation from './TaskObservation';
 
 class TestEventSource {
@@ -59,5 +61,28 @@ describe('TaskObservation', () => {
     expect(screen.queryByText('private task content')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /暂停|继续|停止|下载|终端/ })).not.toBeInTheDocument();
     expect(screen.queryByText(/绝对路径|文件正文/)).not.toBeInTheDocument();
+  });
+
+  it('retains the task snapshot and events after a transient snapshot failure', async () => {
+    vi.spyOn(gatewayApi, 'taskObservation').mockResolvedValueOnce(snapshot(4))
+      .mockRejectedValueOnce(new ApiError({ message: 'unavailable', code: 'internal', status: 503 }))
+      .mockResolvedValue(snapshot(6));
+    vi.stubGlobal('EventSource', TestEventSource);
+    render(<WorkbenchNoticeProvider><TaskObservation taskID={taskID} /></WorkbenchNoticeProvider>);
+
+    expect(await screen.findByText(`Task ${taskID}`)).toBeVisible();
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+    TestEventSource.instances[0]!.emit('task.event', JSON.stringify({ sequence: 5, type: 'task.step',
+      created_at: '2026-11-03T12:00:10Z', payload: 'private task content' }), '5');
+
+    expect(await screen.findByLabelText('网络错误提示')).toHaveTextContent('读取任务状态时连接失败');
+    expect(screen.getByText(`Task ${taskID}`)).toBeVisible();
+    expect(screen.getByText('#5 · 执行步骤已更新')).toBeVisible();
+    expect(screen.queryByRole('alert', { name: /Task 只读观察/ })).not.toBeInTheDocument();
+
+    screen.getByRole('button', { name: '重试' }).click();
+    await waitFor(() => expect(gatewayApi.taskObservation).toHaveBeenCalledTimes(3));
+    expect(screen.getByText(`Task ${taskID}`)).toBeVisible();
+    expect(screen.getByText('#5 · 执行步骤已更新')).toBeVisible();
   });
 });

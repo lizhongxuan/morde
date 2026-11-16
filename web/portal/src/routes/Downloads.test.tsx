@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
 import { getDesktopDownloads } from '../app/desktopDownloads';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Downloads } from './Downloads';
 
 vi.mock('../app/desktopDownloads', () => ({
@@ -13,7 +14,7 @@ vi.mock('../app/desktopDownloads', () => ({
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><MemoryRouter><Downloads /></MemoryRouter></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Downloads /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('desktop downloads page', () => {
@@ -25,9 +26,11 @@ describe('desktop downloads page', () => {
       .mockResolvedValueOnce({ version: null, artifacts: [] });
     renderPage();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('网络连接失败，请检查网络后重试');
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('网络异常，可用版本暂时无法读取。');
+    expect(notice.closest('.download-page')).toBeNull();
+    expect(screen.getByRole('heading', { name: '下载 morde-pc' })).toBeInTheDocument();
     expect(document.querySelector('.download-topbar .morde-brand-mark')).toBeInTheDocument();
-    expect(document.querySelector('.morde-shell')).not.toBeInTheDocument();
     await userEvent.setup().click(screen.getByRole('button', { name: '重试' }));
 
     expect(await screen.findByRole('heading', { name: '当前还没有可下载版本' })).toBeInTheDocument();

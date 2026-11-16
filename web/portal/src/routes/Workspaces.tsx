@@ -411,7 +411,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
   const selectedProjectTarget = projectTargetRouteMismatch ? undefined : configuredDefaultProjectTarget;
   const selectedProjectTargetUnavailable = !selectedProjectTarget || selectedProjectTarget.hostState !== 'running'
     || configuredDefaultHost?.workspace_runtime_online !== true || !configuredDefaultWorkspaceReady
-    || projectPreferences.isFetching || projectTargets.isFetching || Boolean(selectedProjectTarget.blockedMessage);
+    || projectPreferences.isFetching || projectTargets.isFetching || projectTargets.isError || Boolean(selectedProjectTarget.blockedMessage);
   const scopedProjectState = localProjectState;
   const scopedProjectSelection = projectDirectorySelection;
   const savedProjectSelection = scopedProjectState?.projectMappings.find((item) => item.hostId === selectedProjectTarget?.hostId

@@ -1065,6 +1065,53 @@ func TestLegacyPCPortalRoutesCanRemainEnabledDuringClientMigration(t *testing.T)
 	}
 }
 
+func TestDisabledLegacyPCStillServesOnlyDesktopDownloads(t *testing.T) {
+	services := newServices()
+	options := validOptions()
+	options.LegacyPCPortalEnabled = false
+	options.PortalFiles = fstest.MapFS{
+		"index.html":              &fstest.MapFile{Data: []byte("<!doctype html><title>portal</title>")},
+		"admin/index.html":        &fstest.MapFile{Data: []byte("<!doctype html><title>admin</title>")},
+		"downloads/manifest.json": &fstest.MapFile{Data: []byte(`{"schema_version":3,"version":"1.2.3","artifacts":[]}`)},
+		"downloads/files/morde-pc-1.2.3-windows-x64.exe": &fstest.MapFile{Data: []byte("0123456789")},
+		"downloads/files/readme.txt":                     &fstest.MapFile{Data: []byte("private")},
+	}
+	router, err := New(services.deps(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := request(router, http.MethodGet, "/downloads/manifest.json", "", "", "")
+	if manifest.Code != http.StatusOK || manifest.Body.String() != `{"schema_version":3,"version":"1.2.3","artifacts":[]}` ||
+		manifest.Header().Get("Content-Type") != "application/json" || manifest.Header().Get("Cache-Control") != "no-cache" {
+		t.Fatalf("manifest = %d headers=%v body=%q", manifest.Code, manifest.Header(), manifest.Body)
+	}
+	filename := "/downloads/files/morde-pc-1.2.3-windows-x64.exe"
+	installer := request(router, http.MethodGet, filename, "", "", "")
+	if installer.Code != http.StatusOK || installer.Body.String() != "0123456789" ||
+		!strings.Contains(installer.Header().Get("Content-Disposition"), "filename=morde-pc-1.2.3-windows-x64.exe") {
+		t.Fatalf("installer = %d headers=%v body=%q", installer.Code, installer.Header(), installer.Body)
+	}
+	ranged := requestWithHeader(router, http.MethodGet, filename, "", "", "", "Range", "bytes=2-4")
+	if ranged.Code != http.StatusPartialContent || ranged.Body.String() != "234" || ranged.Header().Get("Content-Range") != "bytes 2-4/10" {
+		t.Fatalf("ranged installer = %d headers=%v body=%q", ranged.Code, ranged.Header(), ranged.Body)
+	}
+	if head := request(router, http.MethodHead, filename, "", "", ""); head.Code != http.StatusOK || head.Body.Len() != 0 {
+		t.Fatalf("installer HEAD = %d body=%q", head.Code, head.Body)
+	}
+	if method := request(router, http.MethodPost, filename, "", "", ""); method.Code != http.StatusMethodNotAllowed || method.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("installer POST = %d headers=%v", method.Code, method.Header())
+	}
+	for _, route := range []string{"/", "/assistant", "/download", "/assets/app.js", "/downloads/", "/downloads/files/readme.txt"} {
+		if response := requestHTML(router, route); response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), "<title>portal</title>") {
+			t.Errorf("disabled user route %s = %d %s", route, response.Code, response.Body)
+		}
+	}
+	if admin := requestHTML(router, "/admin/login"); admin.Code != http.StatusOK || !strings.Contains(admin.Body.String(), "<title>admin</title>") {
+		t.Fatalf("admin route = %d %s", admin.Code, admin.Body)
+	}
+}
+
 func TestDisabledMCPReturnsNotFoundWithoutAuthentication(t *testing.T) {
 	services := newServices()
 	deps := services.deps()

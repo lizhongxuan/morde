@@ -20,7 +20,7 @@ const state = {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter><Codex /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Codex /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('Codex', () => {
@@ -29,6 +29,31 @@ describe('Codex', () => {
   it('reports that the Codex bridge is unavailable outside the PC client', () => {
     renderPage();
     expect(screen.getByRole('status')).toHaveTextContent('Codex 会话同步需要 morde-pc');
+  });
+
+  it('shows a popup for network event-read failures and preserves the Codex page', async () => {
+    Object.defineProperty(window, 'morde', { configurable: true, value: {
+      codexState: vi.fn().mockResolvedValue(state),
+      codexListThreads: vi.fn().mockResolvedValue({ items: [{ id: 'thread-1', title: '本机对话', cwdLabel: '~/repo',
+        updatedAt: '2026-11-14T10:00:00Z', status: 'completed', authorized: true, archived: false }], nextCursor: null }),
+    } });
+    vi.spyOn(portalApi, 'codexSessionEvents')
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [], next_cursor: null, current_sequence: 0 });
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /本机对话/ }));
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent('Codex 会话事件暂时无法读取。');
+    expect(notice.closest('.codex-route')).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Codex 会话' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /本机对话/ })).toBeInTheDocument();
+    expect(screen.queryByText(/无法读取会话事件：/)).not.toBeInTheDocument();
+
+    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    expect(await screen.findByText('该会话当前没有可显示的同步事件。')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('lists local conversations and displays synced reasoning and tool events from the server', async () => {

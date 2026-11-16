@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 type QualityDays = 7 | 30 | 90;
@@ -32,6 +33,7 @@ function QualityAvailability({ data }: { data: QualityData }) {
 export function AdminQuality() {
   const [days, setDays] = useState<QualityDays>(7);
   const query = useQuery({ queryKey: ['admin', 'quality', days], queryFn: () => portalApi.adminQuality(days) });
+  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，质量与风险数据暂时无法读取。');
 
   return <section className="admin-content">
     <section className="admin-detail-section" aria-labelledby="admin-quality-heading">
@@ -42,9 +44,9 @@ export function AdminQuality() {
       </select>
     </div></div>
       {query.data && <p className="muted">统计区间：近 {query.data.days} 天</p>}
-      {query.isPending ? <div className="loading-card" role="status">正在加载质量与风险数据…</div>
-        : query.isError ? <QualityError error={query.error} retry={() => void query.refetch()} />
-          : <QualityAvailability data={query.data} />}
+      {query.isPending || (networkError && !query.data) ? <div className="loading-card" role="status">正在加载质量与风险数据…</div>
+        : query.isError && !networkError ? <QualityError error={query.error} retry={() => void query.refetch()} />
+          : query.data ? <QualityAvailability data={query.data} /> : <div className="loading-card" role="status">正在加载质量与风险数据…</div>}
     </section>
   </section>;
 }

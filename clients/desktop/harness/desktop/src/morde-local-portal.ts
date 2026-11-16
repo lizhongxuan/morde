@@ -76,7 +76,9 @@ function proxyRequest(request: IncomingMessage, response: ServerResponse, servic
       if (!hopHeaders.has(name.toLowerCase())) responseHeaders[name] = value;
     }
     response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
-    upstreamResponse.pipe(response);
+    void pipeline(upstreamResponse, response).catch(() => {
+      if (!response.destroyed) response.destroy();
+    });
   });
   upstream.on("error", () => {
     if (!response.headersSent) writeError(response, 502, "Morde service is unavailable");
@@ -92,7 +94,7 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
   if ((service.protocol !== "https:" && !(service.protocol === "http:" && ["localhost", "portal.localhost", "127.0.0.1", "[::1]"].includes(service.hostname))) ||
     service.username || service.password || service.pathname !== "/" || service.search || service.hash) throw new Error("Invalid Morde service origin");
   let allowedFrameSource = hostFrameSource ? frameSource(hostFrameSource) : "";
-  const root = resolve(directory);
+  const root = await fs.realpath(resolve(directory));
   if (!(await fs.stat(root)).isDirectory()) throw new Error("Portal assets are unavailable");
   let origin = "";
   const server: Server = createServer((request, response) => {
@@ -119,10 +121,17 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
     const route = pathname === "/" || !extname(pathname);
     if (!route && !pathname.startsWith("/assets/") && !pathname.startsWith("/ocr/")) { writeError(response, 404, "Not found"); return; }
     const relativePath = route ? "index.html" : pathname.slice(1);
-    const filePath = resolve(root, relativePath);
-    const fileRelative = relative(root, filePath);
-    if (!fileRelative || fileRelative.startsWith(`..${sep}`) || isAbsolute(fileRelative)) { writeError(response, 404, "Not found"); return; }
-    void fs.stat(filePath).then(async (info) => {
+    const candidatePath = resolve(root, relativePath);
+    void fs.realpath(candidatePath).then((filePath) => {
+      const fileRelative = relative(root, filePath);
+      if (!fileRelative || fileRelative === ".." || fileRelative.startsWith(`..${sep}`) || isAbsolute(fileRelative)) {
+        writeError(response, 404, "Not found");
+        return null;
+      }
+      return fs.stat(filePath).then((info) => ({ filePath, info }));
+    }).then(async (resolved) => {
+      if (!resolved) return;
+      const { filePath, info } = resolved;
       if (!info.isFile()) { writeError(response, 404, "Not found"); return; }
       response.setHeader("content-type", contentType(filePath));
       response.setHeader("content-length", info.size);

@@ -1,6 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
 import { errorDetails } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { formatBytes, formatDate } from '../app/format';
 import { desktopCapabilityNames, getDesktopDownloads } from '../app/desktopDownloads';
 
@@ -13,6 +15,8 @@ const platformNames = {
 
 export function Downloads() {
   const downloads = useQuery({ queryKey: ['desktopDownloads'], queryFn: () => getDesktopDownloads() });
+  const networkError = downloads.isError && isTransientNetworkError(downloads.error);
+  useNetworkReadNotice([{ failed: downloads.isError, error: downloads.error, retry: downloads.refetch }], '网络异常，可用版本暂时无法读取。');
 
   return <main className="download-page">
     <div className="download-container">
@@ -24,10 +28,10 @@ export function Downloads() {
       <section aria-labelledby="download-heading">
         <h1 id="download-heading">下载 morde-pc</h1>
         <p className="download-intro">在 morde-pc 中选择本机项目文件夹，手动同步到指定云端电脑；你的 AI 工具仍可使用本地文件。</p>
-        {downloads.isPending && <p className="loading-card" role="status">正在读取可用版本…</p>}
-        {downloads.isError && <div className="error-card" role="alert"><span>{errorDetails(downloads.error).message}</span><button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button></div>}
-        {downloads.isSuccess && downloads.data.artifacts.length === 0 && <section className="empty-card download-empty"><h2>当前还没有可下载版本</h2><p>管理员发布桌面安装包后，这里会显示对应电脑的下载入口。</p></section>}
-        {downloads.isSuccess && downloads.data.artifacts.length > 0 && <>
+        {(downloads.isPending || (networkError && !downloads.data)) && <p className="loading-card" role="status">正在读取可用版本…</p>}
+        {downloads.isError && !networkError && <div className="error-card" role="alert"><span>{errorDetails(downloads.error).message}</span><button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button></div>}
+        {downloads.data && downloads.data.artifacts.length === 0 && <section className="empty-card download-empty"><h2>当前还没有可下载版本</h2><p>管理员发布桌面安装包后，这里会显示对应电脑的下载入口。</p></section>}
+        {downloads.data && downloads.data.artifacts.length > 0 && <>
           <p className="download-version">版本 {downloads.data.version}</p>
           <div className="download-list">
             {downloads.data.artifacts.map((artifact) => {

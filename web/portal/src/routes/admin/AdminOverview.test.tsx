@@ -4,13 +4,14 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { portalApi } from '../../app/api';
+import { ToastNoticeCenter, ToastProvider } from '../../app/toast';
 import { AdminOverview } from './AdminOverview';
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/admin']}><Routes>
+  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/admin']}><Routes>
     <Route path="/admin" element={<AdminOverview />} />
-  </Routes></MemoryRouter></QueryClientProvider>);
+  </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin overview', () => {
@@ -83,6 +84,23 @@ describe('admin overview', () => {
       hosts_by_state: {}, agents_by_state: {},
     });
     expect(await screen.findByText('1')).toBeInTheDocument();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the loading placeholder and reports transient read failures in the notice overlay', async () => {
+    const user = userEvent.setup();
+    const request = vi.spyOn(portalApi, 'adminOverview').mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValueOnce({
+      checked_at: '2026-11-02T00:00:00Z', health: { ready: true }, online_installations: 2,
+      limit: { hosts: 0, cpu_milli: 0, mem_mib: 0 }, allocated: { hosts: 0, cpu_milli: 0, mem_mib: 0 },
+      hosts_by_state: {}, agents_by_state: {},
+    });
+    renderPage();
+
+    expect(await screen.findByRole('status')).toHaveTextContent('正在加载管理总览');
+    expect(await screen.findByRole('alert')).toHaveTextContent('网络异常，管理总览暂时无法读取。');
+    expect(screen.queryByText('网络连接失败，请检查网络后重试')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重试' }));
+    expect(await screen.findByText('2')).toBeInTheDocument();
     expect(request).toHaveBeenCalledTimes(2);
   });
 });

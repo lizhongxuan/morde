@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayTaskObservationSnapshot } from '../api/gateway';
 import FloatingError from './FloatingError';
+import { isTransientNetworkError } from '../app/aio';
+import { useWorkbenchNotice } from '../app/notice';
 
 type ObservationEvent = { sequence: number; type: string; created_at: string };
 
@@ -57,15 +59,14 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
   const [connection, setConnection] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const [error, setError] = useState('');
   const [retry, setRetry] = useState(0);
+  const notifyNetwork = useWorkbenchNotice();
   const invalidTaskID = !taskID || taskID.length > 128;
 
-  const retryRead = () => {
-    setSnapshot(null);
-    setEvents([]);
+  const retryRead = useCallback(() => {
     setError('');
     setConnection('connecting');
     setRetry((value) => value + 1);
-  };
+  }, []);
 
   useEffect(() => {
     let current = true;
@@ -104,6 +105,13 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
           if (terminalTaskStatuses.has(value.status)) closeSource();
         }).catch((reason: unknown) => {
           if (!current) return;
+          if (isTransientNetworkError(reason)) {
+            setConnection('disconnected');
+            notifyNetwork('读取任务状态时连接失败，已保留现有进度。', {
+              label: '重试', onClick: retryRead,
+            });
+            return;
+          }
           revoked = true;
           closeSource();
           setSnapshot(null);
@@ -121,6 +129,14 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
           }
         }).catch((reason: unknown) => {
           if (!current) return;
+          if (isTransientNetworkError(reason)) {
+            setConnection('disconnected');
+            notifyNetwork('读取任务状态时连接失败，已保留现有进度。', {
+              label: '重试', onClick: retryRead,
+            });
+            retryTimer = window.setTimeout(connect, 1000);
+            return;
+          }
           revoked = true;
           setSnapshot(null);
           setEvents([]);
@@ -138,6 +154,14 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
           }
         }).catch((reason: unknown) => {
           if (!current) return;
+          if (isTransientNetworkError(reason)) {
+            setConnection('disconnected');
+            notifyNetwork('任务事件连接中断，已保留现有进度。', {
+              label: '重试', onClick: retryRead,
+            });
+            retryTimer = window.setTimeout(connect, 1000);
+            return;
+          }
           revoked = true;
           setSnapshot(null);
           setEvents([]);
@@ -151,7 +175,12 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
         if (terminalTaskStatuses.has(value.status)) setConnection('connected');
         else connect();
       }).catch((reason: unknown) => {
-        if (current) setError(observationError(reason));
+        if (!current) return;
+        if (isTransientNetworkError(reason)) {
+          notifyNetwork('读取任务状态时连接失败，保留任务观察占位状态。', {
+            label: '重试', onClick: retryRead,
+          });
+        } else setError(observationError(reason));
       });
     }
     return () => {
@@ -159,7 +188,7 @@ export default function TaskObservation({ taskID }: { taskID: string }) {
       closeSource();
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [invalidTaskID, retry, taskID]);
+  }, [invalidTaskID, notifyNetwork, retry, retryRead, taskID]);
 
   const visibleError = invalidTaskID ? 'Task ID 无效，请从 Portal Assistant 重新打开。' : error;
 

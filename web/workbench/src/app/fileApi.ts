@@ -64,18 +64,18 @@ export function uploadFile(
     request.upload.onprogress = (event) => {
       if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
     };
-    request.onerror = () => reject(new AioError('上传连接失败'));
+    request.onerror = () => reject(new AioError('上传连接失败', request.status || undefined, true));
     request.onabort = () => reject(new AioError('上传已取消'));
     request.onload = () => {
       let envelope: { success?: boolean; message?: string } | null;
       try {
         envelope = JSON.parse(request.responseText) as { success?: boolean; message?: string } | null;
       } catch {
-        reject(new AioError('上传响应格式无效'));
+        reject(new AioError('上传响应格式无效', request.status, false, true));
         return;
       }
       if (request.status < 200 || request.status >= 300 || envelope?.success !== true) {
-        reject(new AioError(envelope?.message || `上传失败（HTTP ${request.status}）`));
+        reject(new AioError(envelope?.message || `上传失败（HTTP ${request.status}）`, request.status));
         return;
       }
       resolve();
@@ -90,7 +90,7 @@ export function downloadHref(path: string): string {
 
 export async function downloadFile(path: string, filename: string): Promise<void> {
   const response = await fetch(downloadHref(path), { credentials: 'same-origin' });
-  if (!response.ok) throw new AioError(`下载失败（HTTP ${response.status}）`);
+  if (!response.ok) throw new AioError(`下载失败（HTTP ${response.status}）`, response.status);
 
   const objectUrl = URL.createObjectURL(await response.blob());
   const link = document.createElement('a');

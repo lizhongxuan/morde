@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
 import type { components } from '../api/schema';
+import { ApiError } from '../api/client';
 import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Reviews } from './Reviews';
 
@@ -31,9 +32,10 @@ function item(id: string, status: components['schemas']['TaskApprovalSnapshot'][
 
 function renderReviews() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter />
+  const rendered = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors />
     <MemoryRouter initialEntries={['/reviews']}><Reviews /></MemoryRouter>
   </ToastProvider></QueryClientProvider>);
+  return { ...rendered, client };
 }
 
 describe('Reviews', () => {
@@ -61,12 +63,103 @@ describe('Reviews', () => {
   });
 
   it('does not show an empty or zero state when the approval list fails', async () => {
-    vi.spyOn(portalApi, 'taskApprovals').mockRejectedValue(new Error('offline'));
-    renderReviews();
+    vi.spyOn(portalApi, 'taskApprovals').mockRejectedValue(new TypeError('Failed to fetch'));
+    const { container } = renderReviews();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('审核事项暂不可用，待处理数量和结果均未确认。');
+    expect(await screen.findByRole('alert')).toHaveTextContent('网络异常，审核事项暂时无法读取。');
+    expect(screen.getByRole('status')).toHaveTextContent('正在读取审核事项…');
+    expect(container.querySelector('.reviews-page [role="alert"]')).toBeNull();
     expect(screen.queryByText('当前没有待处理审核。')).not.toBeInTheDocument();
     expect(screen.queryByText('0 项待处理')).not.toBeInTheDocument();
+  });
+
+  it('keeps the last confirmed review cards visible when a refresh fails transiently', async () => {
+    const list = vi.spyOn(portalApi, 'taskApprovals')
+      .mockResolvedValueOnce({ items: [item('k1234567', 'pending')], next_cursor: null, pending_count: 1 })
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const { client, container } = renderReviews();
+    expect(await screen.findByRole('heading', { name: '待处理 · 1' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '需要批准的操作' })).toBeInTheDocument();
+
+    await client.invalidateQueries({ queryKey: ['task-approvals', 'all'] });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('网络异常，审核事项暂时无法读取。');
+    expect(screen.getByRole('heading', { name: '审批 k1234567' })).toBeInTheDocument();
+    expect(container.querySelector('.reviews-page [role="alert"]')).toBeNull();
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps non-network access errors in the review component', async () => {
+    vi.spyOn(portalApi, 'taskApprovals').mockRejectedValue(new ApiError({ message: 'forbidden', code: 'forbidden', status: 403 }));
+    const { container } = renderReviews();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('审核事项暂不可用，待处理数量和结果均未确认。');
+    expect(container.querySelector('.reviews-page [role="alert"]')).not.toBeNull();
+    expect(screen.queryByText('网络异常，审核事项暂时无法读取。')).not.toBeInTheDocument();
+  });
+
+  it('refreshes after a stale approval response and reflects the decision made elsewhere', async () => {
+    const list = vi.spyOn(portalApi, 'taskApprovals')
+      .mockResolvedValueOnce({ items: [item('k1234567', 'pending')], next_cursor: null, pending_count: 1 })
+      .mockResolvedValueOnce({ items: [item('k1234567', 'expired')], next_cursor: null, pending_count: 0 });
+    vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(new ApiError({
+      message: 'approval version is stale', code: 'conflict', status: 409,
+    }));
+    const user = userEvent.setup();
+    renderReviews();
+
+    const pending = await screen.findByRole('region', { name: '待处理审核' });
+    await user.click(within(pending).getByRole('button', { name: '允许' }));
+
+    expect(await screen.findByRole('region', { name: '已处理审核' })).toHaveTextContent('已过期');
+    expect(await screen.findByRole('heading', { name: '待处理 · 0' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('审核未确认：当前状态已变化，请刷新后核对');
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
+  });
+
+  it('removes review actions after access is revoked and the authorized list refreshes', async () => {
+    const list = vi.spyOn(portalApi, 'taskApprovals')
+      .mockResolvedValueOnce({ items: [item('k1234567', 'pending')], next_cursor: null, pending_count: 1 })
+      .mockResolvedValueOnce({ items: [], next_cursor: null, pending_count: 0 });
+    vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(new ApiError({
+      message: 'approval permission was revoked', code: 'forbidden', status: 403,
+    }));
+    const user = userEvent.setup();
+    renderReviews();
+
+    const pending = await screen.findByRole('region', { name: '待处理审核' });
+    await user.click(within(pending).getByRole('button', { name: '允许' }));
+
+    expect(await screen.findByRole('heading', { name: '待处理 · 0' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('审核未确认');
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText('审批 k1234567')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
+  });
+
+  it('reuses the approval idempotency key when a lost response leaves the approval pending', async () => {
+    const list = vi.spyOn(portalApi, 'taskApprovals')
+      .mockResolvedValue({ items: [item('k1234567', 'pending')], next_cursor: null, pending_count: 1 });
+    const respond = vi.spyOn(portalApi, 'respondToTaskApproval')
+      .mockRejectedValueOnce(new Error('connection interrupted'))
+      .mockResolvedValueOnce({ task_id: 'q1234567', action: 'respond', status: 'queued', unsettled_operation_ids: [] });
+    const user = userEvent.setup();
+    renderReviews();
+
+    const pending = await screen.findByRole('region', { name: '待处理审核' });
+    const card = within(pending).getByRole('region', { name: '需要批准的操作' });
+    await user.click(within(card).getByRole('button', { name: '允许' }));
+    await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole('button', { name: '允许' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '允许' }));
+    await waitFor(() => expect(respond).toHaveBeenCalledTimes(2));
+
+    expect(respond.mock.calls[1]?.[3]).toBe(respond.mock.calls[0]?.[3]);
+    expect(await screen.findByText('审核已受理，任务后续状态等待更新。')).toBeInTheDocument();
   });
 
   it('loads later pages and reports a repeated cursor instead of looping', async () => {

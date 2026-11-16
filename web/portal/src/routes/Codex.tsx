@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useInfiniteQuery } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
+import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type CodexScope = 'read' | 'live' | 'send' | 'interrupt' | 'approval';
@@ -176,6 +179,7 @@ function toolEventDetails(kind: string, payload: unknown, eventStatus?: string):
 
 export function Codex() {
   const codexBridge = useMemo(() => getBridge(), []);
+  const { notify } = useToast();
   const [state, setState] = useState<CodexState | null>(null);
   const [stateError, setStateError] = useState(() => codexBridge?.codexState ? '' : '当前 PC 客户端未提供 Codex 会话桥接。');
   const [message, setMessage] = useState('');
@@ -195,11 +199,14 @@ export function Codex() {
     || ['in_progress', 'waiting_approval', 'running'].includes(selectedMirror.status)
     || ['pending', 'in_progress', 'running', 'scanning', 'partial'].includes(selectedMirror.snapshotState ?? '')));
 
-  const refreshState = async () => {
+  const refreshState = useCallback(async () => {
     if (!codexBridge?.codexState) return;
     try { setState(parseCodexState(await codexBridge.codexState())); setStateError(''); }
-    catch (error) { setStateError(errorDetails(error).message); }
-  };
+    catch (error) {
+      if (isTransientNetworkError(error)) notify('Codex 状态连接失败，已保留当前内容。', 'error', { label: '重试', onClick: () => void refreshState() });
+      else setStateError(errorDetails(error).message);
+    }
+  }, [codexBridge, notify]);
 
   const loadThreads = async (cursor: string | null) => {
     if (!codexBridge?.codexListThreads || !state?.authenticated || !profileKey || loadingProfileRef.current === profileKey) return;
@@ -216,7 +223,10 @@ export function Codex() {
       setNextCursor(page.nextCursor);
       setMessage('已读取 ' + (cursor ? '更多' : '本机') + ' Codex 会话。');
     } catch (error) {
-      if (selectedProfileRef.current === requestedProfile) setThreadError(errorDetails(error).message);
+      if (selectedProfileRef.current === requestedProfile) {
+        if (isTransientNetworkError(error)) notify('读取 Codex 会话失败，已保留当前列表。', 'error', { label: '重试', onClick: () => void loadThreads(cursor) });
+        else setThreadError(errorDetails(error).message);
+      }
     } finally {
       if (threadRequestSequenceRef.current === requestSequence) {
         loadingProfileRef.current = '';
@@ -233,9 +243,13 @@ export function Codex() {
       catch (error) { setStateError(errorDetails(error).message); }
     };
     const stop = codexBridge?.onCodexState?.(apply);
-    if (codexBridge?.codexState) void codexBridge.codexState().then(apply).catch((error: unknown) => { if (active) setStateError(errorDetails(error).message); });
+    if (codexBridge?.codexState) void codexBridge.codexState().then(apply).catch((error: unknown) => {
+      if (!active) return;
+      if (isTransientNetworkError(error)) notify('Codex 状态连接失败，已保留当前内容。', 'error', { label: '重试', onClick: () => void refreshState() });
+      else setStateError(errorDetails(error).message);
+    });
     return () => { active = false; stop?.(); };
-  }, [codexBridge]);
+  }, [codexBridge, notify, refreshState]);
 
   useEffect(() => {
     selectedProfileRef.current = profileKey;
@@ -267,37 +281,55 @@ export function Codex() {
     refetchInterval: eventSyncActive ? 2500 : false,
     retry: false,
   });
+  const selectedEventsNetworkError = selectedEvents.isError && isTransientNetworkError(selectedEvents.error);
+  useNetworkReadNotice([{ failed: selectedEvents.isError, error: selectedEvents.error, retry: selectedEvents.refetch }], 'Codex 会话事件暂时无法读取。');
   const events = selectedEvents.data?.pages.flatMap((page) => page.items).sort((left, right) => left.sequence - right.sequence) ?? [];
   const visibleEvents = visibleCodexEvents(events);
   const eventSequence = selectedEvents.data?.pages.at(-1)?.current_sequence ?? 0;
 
   const addProfile = async () => {
     if (!codexBridge?.codexAddProfile) return;
+    const previousMessage = message;
     setMessage('选择本机 Codex 配置…');
     try { await codexBridge.codexAddProfile(); await refreshState(); setMessage('Codex 配置已添加。'); }
-    catch (error) { setMessage('添加 Codex 配置失败：' + errorDetails(error).message); }
+    catch (error) {
+      if (isTransientNetworkError(error)) { setMessage(previousMessage); notify('添加 Codex 配置请求结果暂时无法确认。', 'error'); }
+      else setMessage('添加 Codex 配置失败：' + errorDetails(error).message);
+    }
   };
   const chooseProfile = async (value: string) => {
     if (!codexBridge?.codexSelectProfile || !value || value === profileKey) return;
+    const previousMessage = message;
     try { await codexBridge.codexSelectProfile(value); await refreshState(); }
-    catch (error) { setMessage('切换 Codex 配置失败：' + errorDetails(error).message); }
+    catch (error) {
+      if (isTransientNetworkError(error)) { setMessage(previousMessage); notify('切换 Codex 配置请求结果暂时无法确认。', 'error'); }
+      else setMessage('切换 Codex 配置失败：' + errorDetails(error).message);
+    }
   };
   const authorizeProfile = async () => {
     if (!codexBridge?.codexAuthorizeProfile || !profileKey || !selectedProfile || !scopes.includes('read')) return;
+    const previousMessage = message;
     setThreadLoading(true); setMessage('等待确认并开始同步全部会话…');
     try {
       await codexBridge.codexAuthorizeProfile(profileKey, scopes);
       await refreshState();
       await loadThreads(null);
       setMessage('已提交连接授权；本机正在同步该配置下的普通与归档会话。');
-    } catch (error) { setMessage('Codex 连接授权未确认：' + errorDetails(error).message); }
+    } catch (error) {
+      if (isTransientNetworkError(error)) { setMessage(previousMessage); notify('Codex 授权请求结果暂时无法确认。', 'error'); }
+      else setMessage('Codex 连接授权未确认：' + errorDetails(error).message);
+    }
     finally { setThreadLoading(false); }
   };
   const revokeProfile = async () => {
     if (!codexBridge?.codexRevokeProfile || !profileKey) return;
+    const previousMessage = message;
     setThreadLoading(true);
     try { await codexBridge.codexRevokeProfile(profileKey); await refreshState(); await loadThreads(null); setMessage('该 Codex 配置的同步授权已撤销。'); }
-    catch (error) { setMessage('撤销授权未确认：' + errorDetails(error).message); }
+    catch (error) {
+      if (isTransientNetworkError(error)) { setMessage(previousMessage); notify('Codex 授权撤销结果暂时无法确认。', 'error'); }
+      else setMessage('撤销授权未确认：' + errorDetails(error).message);
+    }
     finally { setThreadLoading(false); }
   };
 
@@ -363,9 +395,9 @@ export function Codex() {
           <p className="codex-sync-progress" role="status">{selectedMirror.historyComplete ? '历史已同步' : '历史回填中'} · {statusLabel(selectedMirror.snapshotState ?? selectedMirror.status)} · 已载入 {events.length} 项{eventSequence ? ' / ' + eventSequence : ''}
             {selectedMirror.pendingEvents ? ' · ' + selectedMirror.pendingEvents + ' 项待上传' : ''}{selectedMirror.blockedEvents ? ' · ' + selectedMirror.blockedEvents + ' 项受授权范围限制' : ''}</p>
           {selectedMirror.snapshotMessage && <FloatingNotice className="notice-warning">{selectedMirror.snapshotMessage}</FloatingNotice>}
-          {selectedEvents.isError && <FloatingError role="alert">无法读取会话事件：{errorDetails(selectedEvents.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void selectedEvents.refetch()}>重试</button></FloatingError>}
-          {selectedEvents.isPending && <FloatingNotice className="notice-info">正在读取同步的 Codex 会话内容…</FloatingNotice>}
-          {!selectedEvents.isPending && !events.length && <div className="empty-card compact"><p>该会话当前没有可显示的同步事件。</p></div>}
+          {selectedEvents.isError && !selectedEventsNetworkError && <FloatingError role="alert">无法读取会话事件：{errorDetails(selectedEvents.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void selectedEvents.refetch()}>重试</button></FloatingError>}
+          {(selectedEvents.isPending || (selectedEventsNetworkError && !selectedEvents.data)) && <FloatingNotice className="notice-info">正在读取同步的 Codex 会话内容…</FloatingNotice>}
+          {selectedEvents.data && !events.length && <div className="empty-card compact"><p>该会话当前没有可显示的同步事件。</p></div>}
           {!!visibleEvents.length && <div className="codex-event-list">
             {visibleEvents.map((event) => {
               const tool = toolEventDetails(event.kind, event.payload, event.status);

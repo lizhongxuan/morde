@@ -2,8 +2,10 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { isTransientNetworkError } from '../../api/errors';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatBytes } from '../../app/format';
+import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
 
 const formatPolicyState = (enabled: boolean) => enabled ? '已开启' : '已关闭';
@@ -13,6 +15,12 @@ export function AdminSettings() {
   const client = useQueryClient();
   const query = useQuery({ queryKey: ['admin', 'settings'], queryFn: portalApi.adminSettings });
   const modelsQuery = useQuery({ queryKey: ['admin', 'model-connections'], queryFn: portalApi.adminModelConnections });
+  useNetworkReadNotice([
+    { failed: query.isError, error: query.error, retry: query.refetch },
+    { failed: modelsQuery.isError, error: modelsQuery.error, retry: modelsQuery.refetch },
+  ], '网络异常，后台配置暂时无法完整读取。');
+  const settingsReadNetworkError = query.isError && isTransientNetworkError(query.error);
+  const modelsReadNetworkError = modelsQuery.isError && isTransientNetworkError(modelsQuery.error);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [modelDefaultDraft, setModelDefaultDraft] = useState<string | null>(null);
   const [saveError, setSaveError] = useState('');
@@ -108,8 +116,8 @@ export function AdminSettings() {
   };
 
   return <section className="admin-content">
-    {query.isPending ? <div className="loading-card" role="status">正在加载平台设置…</div>
-      : query.isError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={refresh}>重试</button></FloatingError>
+    {query.isPending || (settingsReadNetworkError && !data) ? <div className="loading-card" role="status">正在加载平台设置…</div>
+      : query.isError && !settingsReadNetworkError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={refresh}>重试</button></FloatingError>
         : data && budget && <>
           <section className="admin-detail-section" aria-labelledby="admin-settings-policy-heading">
             <div className="design-panel-header"><h2 id="admin-settings-policy-heading">账户规则</h2><button type="button" className="button button-secondary" disabled={query.isFetching || modelsQuery.isFetching} onClick={refresh}>{query.isFetching || modelsQuery.isFetching ? '正在刷新…' : '刷新数据'}</button></div>
@@ -147,7 +155,7 @@ export function AdminSettings() {
               ? <p className="notice notice-info" role="status">当前默认模型：{modelCandidates.find((model) => model.id === modelDefaultValue)?.name} · 版本 v{modelDefault.version}</p>
               : <FloatingError>{modelDefault?.model_id ? `默认模型 ${modelDefault.model_id} 尚不可用或未通过检查。` : '尚未配置默认模型。'}用户仍可选择已检查的个人模型或共享模型。</FloatingError>}
             <p className="muted">默认项只能指向管理员共享连接；用户也可以自行选择其他可用模型。</p>
-            {modelsQuery.isError && <FloatingError className="error-inline" role="alert">{errorDetails(modelsQuery.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void modelsQuery.refetch()}>重试读取模型</button></FloatingError>}
+            {modelsQuery.isError && !modelsReadNetworkError && <FloatingError className="error-inline" role="alert">{errorDetails(modelsQuery.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void modelsQuery.refetch()}>重试读取模型</button></FloatingError>}
             <form className="form-card form-stack" onSubmit={submitModelDefault}>
               <label htmlFor="admin-default-model-connection">默认模型连接</label>
               <select id="admin-default-model-connection" value={modelDefaultValue} disabled={modelsQuery.isPending || modelDefaultConflicted} onChange={(event) => { setModelDefaultDraft(event.target.value); setModelDefaultError(''); setModelDefaultSaved(false); }}>

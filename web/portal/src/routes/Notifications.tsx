@@ -2,6 +2,9 @@ import { useState } from 'react';
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { components } from '../api/schema';
 import { errorDetails, portalApi } from '../app/api';
+import { isTransientNetworkError } from '../api/errors';
+import { useToast } from '../app/toast';
+import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { formatDate } from '../app/format';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { FloatingError } from '../components/FloatingError';
@@ -14,15 +17,20 @@ const kindLabel: Record<Notification['kind'], string> = {
 
 export function Notifications() {
   const client = useQueryClient();
+  const { notify } = useToast();
   const [unreadOnly, setUnreadOnly] = useState(false);
   const notifications = useInfiniteQuery({
     queryKey: ['notifications', unreadOnly], queryFn: ({ pageParam }) => portalApi.notifications(pageParam, unreadOnly),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => page.next_cursor ?? undefined,
   });
+  const networkError = notifications.isError && isTransientNetworkError(notifications.error);
+  useNetworkReadNotice([{ failed: notifications.isError, error: notifications.error,
+    retry: () => notifications.isFetchNextPageError ? notifications.fetchNextPage() : notifications.refetch() }], '网络异常，通知暂时无法读取。');
   const markRead = useMutation({
     mutationFn: (id: string) => portalApi.markNotificationRead(id),
     onSuccess: async () => { await client.invalidateQueries({ queryKey: ['notifications'] }); },
+    onError: (error) => { if (isTransientNetworkError(error)) notify('网络异常，标记通知已读失败。', 'error'); },
   });
   const items = notifications.data?.pages.flatMap((page) => page.items) ?? [];
   const unreadCount = items.filter((item) => item.read_at === null).length;
@@ -33,9 +41,10 @@ export function Notifications() {
       <button type="button" className={`button button-small ${unreadOnly ? 'button-secondary' : 'button-primary'}`} aria-pressed={!unreadOnly} onClick={() => setUnreadOnly(false)}>全部</button>
       <button type="button" className={`button button-small ${unreadOnly ? 'button-primary' : 'button-secondary'}`} aria-pressed={unreadOnly} onClick={() => setUnreadOnly(true)}>未读</button>
     </div>
-    {markRead.isError && <FloatingError className="error-inline notification-error" role="alert">标记已读失败：{errorDetails(markRead.error).message}</FloatingError>}
+    {markRead.isError && !isTransientNetworkError(markRead.error) && <FloatingError className="error-inline notification-error" role="alert">标记已读失败：{errorDetails(markRead.error).message}</FloatingError>}
     {notifications.isPending ? <div className="loading-card" role="status">正在加载通知…</div>
-      : notifications.isError && !notifications.data ? <FloatingError className="error-card" role="alert">无法读取通知：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.refetch()}>重试</button></FloatingError>
+      : notifications.isError && !networkError && !notifications.data ? <FloatingError className="error-card" role="alert">无法读取通知：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.refetch()}>重试</button></FloatingError>
+        : networkError && !notifications.data ? <div className="loading-card" role="status">正在加载通知…</div>
         : !items.length ? <div className="empty-card"><h2>{unreadOnly ? '没有未读通知' : '还没有通知'}</h2><p>目前没有可查看的历史消息。</p></div>
           : <>
             <p className="muted notification-count">{unreadOnly ? `当前已加载 ${items.length} 条未读通知。` : `当前已加载 ${items.length} 条通知，未读 ${unreadCount} 条。`}</p>
@@ -52,8 +61,8 @@ export function Notifications() {
               ariaLabel="通知列表"
               className="notification-list"
             />
-            {notifications.isFetchNextPageError && <FloatingError className="error-card notification-pagination-error" role="alert">加载更多通知失败：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.fetchNextPage()}>重试</button></FloatingError>}
-            {notifications.hasNextPage && !notifications.isFetchNextPageError && <button type="button" className="button button-secondary notification-load-more" disabled={notifications.isFetchingNextPage} onClick={() => void notifications.fetchNextPage()}>{notifications.isFetchingNextPage ? '正在加载…' : '加载更多通知'}</button>}
+            {notifications.isFetchNextPageError && !networkError && <FloatingError className="error-card notification-pagination-error" role="alert">加载更多通知失败：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.fetchNextPage()}>重试</button></FloatingError>}
+            {notifications.hasNextPage && (!notifications.isFetchNextPageError || networkError) && <button type="button" className="button button-secondary notification-load-more" disabled={notifications.isFetchingNextPage} onClick={() => void notifications.fetchNextPage()}>{notifications.isFetchingNextPage ? '正在加载…' : '加载更多通知'}</button>}
           </>}
   </section>;
 }
