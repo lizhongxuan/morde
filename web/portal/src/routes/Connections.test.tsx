@@ -526,6 +526,8 @@ describe('Connections', () => {
 
     expect(await screen.findByText('尚未添加个人模型')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /添加个人模型/ }));
+    const dialog = screen.getByRole('dialog', { name: '添加个人模型' });
+    expect(dialog.querySelector('form.connection-form')).not.toBeNull();
     await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'custom');
     await user.type(screen.getByLabelText('显示名称'), '我的模型');
     await user.type(screen.getByLabelText('模型名'), 'private-model');
@@ -557,6 +559,7 @@ describe('Connections', () => {
 
     const card = (await screen.findByRole('heading', { name: '我的模型', level: 3 })).closest('article')!;
     await user.click(within(card).getByRole('button', { name: '编辑' }));
+    expect(screen.getByRole('dialog', { name: '编辑个人模型' })).toBeInTheDocument();
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
     expect(screen.getByLabelText('API 密钥')).not.toBeRequired();
     await user.clear(screen.getByLabelText('显示名称'));

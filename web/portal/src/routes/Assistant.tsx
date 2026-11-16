@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { ChangeEvent, FormEvent } from 'react';
+import type { ChangeEvent, CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { enterHostInNewTab, errorDetails, newIdempotencyKey, portalApi } from '../app/api';
@@ -45,7 +45,6 @@ type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskStep = Task['steps'][number];
 type TaskAgent = NonNullable<Task['agents']>[number];
-type TaskApprovalItem = components['schemas']['TaskApprovalItem'];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskCostSummary = NonNullable<Task['billing']>['costs'][number];
 type TaskArtifact = Task['artifacts'][number];
@@ -54,9 +53,11 @@ type AssistantPanelTab = 'tasks' | 'files' | 'computer';
 type AssistantOutletContext = {
   panelOpen: boolean;
   panelTab: AssistantPanelTab;
+  workspaceWidth: number | null;
+  setWorkspaceWidth: (width: number) => void;
   setPanelOpen: (open: boolean) => void;
   setPanelTab: (tab: AssistantPanelTab) => void;
-  newChatRequest: number;
+  focusPanelToggle?: () => void;
 };
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type ComputerHostOption = { id: string; name: string; url: string; state: string; owned: boolean; permissions: HostMemberPermission[] };
@@ -129,6 +130,7 @@ function AssistantConversationRow({ item, isMain, selected, recent, previewTitle
   const title = isMain ? '主会话' : isPlaceholderConversationTitle(item.title) ? previewTitle || item.title || '新对话' : item.title;
   return <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`}>
     <button type="button" className={`conversation-item ${selected ? 'is-selected' : ''}`} onClick={() => onSelect(item.id)}>
+      {isMain && <span className="assistant-logo conversation-main-logo" aria-hidden="true" />}
       <strong>{title}</strong>
       {recent && !isMain && <small>本机最近查看</small>}
       <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
@@ -893,14 +895,17 @@ export function Assistant() {
   const [taskPanelRecentOpen, setTaskPanelRecentOpen] = useState(false);
   const [standaloneTaskPanelTab, setStandaloneTaskPanelTab] = useState<AssistantPanelTab>('tasks');
   const [standaloneTaskPanelOpen, setStandaloneTaskPanelOpen] = useState(false);
+  const [standaloneWorkspaceWidth, setStandaloneWorkspaceWidth] = useState<number | null>(null);
   const taskPanelTab = outletContext?.panelTab ?? standaloneTaskPanelTab;
   const taskPanelOpen = outletContext?.panelOpen ?? standaloneTaskPanelOpen;
+  const workspacePanelWidth = outletContext?.workspaceWidth ?? standaloneWorkspaceWidth;
   const setTaskPanelTab = outletContext?.setPanelTab ?? setStandaloneTaskPanelTab;
   const setTaskPanelOpen = outletContext?.setPanelOpen ?? setStandaloneTaskPanelOpen;
+  const setWorkspacePanelWidth = outletContext?.setWorkspaceWidth ?? setStandaloneWorkspaceWidth;
   const [conversationSearchVisible, setConversationSearchVisible] = useState(false);
-  const lastNewChatRequest = useRef(outletContext?.newChatRequest ?? 0);
-  const [serviceStatusExpanded, setServiceStatusExpanded] = useState(false);
-  const [computerHostID, setComputerHostID] = useState<string | null>(null);
+  const [contextSidebarWidth, setContextSidebarWidth] = useState(210);
+  const assistantLayoutRef = useRef<HTMLDivElement>(null);
+  const assistantDividerDrag = useRef<{ side: 'sidebar' | 'workspace'; pointerID: number; x: number; width: number } | null>(null);
   const [computerEmbed, setComputerEmbed] = useState<ComputerEmbedSession | null>(null);
   const [computerControlExpanded, setComputerControlExpanded] = useState(false);
   const [computerConnecting, setComputerConnecting] = useState(false);
@@ -1107,7 +1112,6 @@ export function Assistant() {
     setComputerConnecting(false);
     setComputerEmbed(null);
     setComputerControlExpanded(false);
-    setComputerHostID(null);
     setComputerPanelError('');
   }
   const setConversationID = (id: string | null) => setConversationSelection({ scope: conversationScope, id });
@@ -1126,7 +1130,8 @@ export function Assistant() {
     queryFn: () => assistantDraftStorage.list(composerDraftScope!),
     enabled: Boolean(composerDraftScope), retry: false, staleTime: 30_000,
   });
-  const localComposerDrafts = (composerDrafts.data ?? []).filter((draft) => draft.conversationID === null && draft.id.startsWith('local:'))
+  const localComposerDrafts = (composerDrafts.data ?? []).filter((draft) => draft.conversationID === null && draft.id.startsWith('local:') &&
+    (draft.content.trim() || draft.attachments.length > 0))
     .sort((left, right) => right.updatedAt - left.updatedAt);
   const latestComposerDraft = useRef<{ scope: string; identity: string; draft: AssistantComposerDraft } | null>(null);
   const composerDraftSnapshots = useRef(new Map<string, { scope: string; draft: AssistantComposerDraft }>());
@@ -1342,15 +1347,6 @@ export function Assistant() {
     enabled: Boolean(conversationID),
     refetchInterval: 5000,
   });
-  const conversationApprovals = useInfiniteQuery({
-    queryKey: ['task-approvals', 'conversation', conversationID],
-    initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => portalApi.taskApprovals({ conversationID: conversationID!, cursor: pageParam }),
-    getNextPageParam: (page, pages) => page.next_cursor && !pages.slice(0, -1).some((item) => item.next_cursor === page.next_cursor)
-      ? page.next_cursor : undefined,
-    enabled: Boolean(conversationID) && !conversationContentAccessRevoked,
-    refetchInterval: (query) => query.state.data?.pages.some((page) => page.items.some((item) => item.approval.status === 'pending')) ? 5000 : 30000,
-  });
   const recentConversationTasks = useQuery({
     queryKey: ['conversation-tasks', conversationID, 'recent'],
     queryFn: () => portalApi.conversationTasks(conversationID!, { view: 'recent' }),
@@ -1432,11 +1428,6 @@ export function Assistant() {
     return () => window.clearInterval(timer);
   }, [client, conversationID, resultsAwaitingMessages]);
   const tasksByID = new Map(tasks.map((task) => [task.id, task]));
-  const conversationApprovalItems = conversationContentAccessRevoked ? []
-    : conversationApprovals.data?.pages.flatMap((page) => page.items) ?? [];
-  const approvalPages = conversationApprovals.data?.pages ?? [];
-  const lastApprovalCursor = approvalPages.at(-1)?.next_cursor;
-  const approvalCursorLoop = Boolean(lastApprovalCursor && approvalPages.slice(0, -1).some((page) => page.next_cursor === lastApprovalCursor));
   const activePanelTasks = tasks.filter((task) => !terminalTaskStatuses.has(task.status));
   const selectedActiveTask = activePanelTasks.find((task) => task.id === taskDetailTaskID);
   const streamedTasks = [
@@ -1460,7 +1451,6 @@ export function Assistant() {
     { failed: Boolean(conversationID) && messages.isError, error: messages.error, retry: () => messages.refetch() },
     { failed: Boolean(conversationID) && conversationTasks.isError, error: conversationTasks.error, retry: () => conversationTasks.refetch() },
     { failed: Boolean(conversationID) && taskPanelOpen && recentConversationTasks.isError, error: recentConversationTasks.error, retry: () => recentConversationTasks.refetch() },
-    { failed: Boolean(conversationID) && conversationApprovals.isError, error: conversationApprovals.error, retry: () => conversationApprovals.refetch() },
     ...conversationPreviewQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
     ...taskQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
     ...taskFileFetchQueries.map((query) => ({ failed: query.isError, error: query.error, retry: () => query.refetch() })),
@@ -1507,15 +1497,13 @@ export function Assistant() {
       id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: false, permissions: host.permissions,
     })),
   ];
-  const computerHostSelection = computerHostID ?? (preferredHostID || null);
-  const selectedComputerHost = computerHostSelection === null ? computerHostOptions[0]
-    : computerHostOptions.find((host) => host.id === computerHostSelection);
+  const selectedComputerHost = preferredHostID ? computerHostOptions.find((host) => host.id === preferredHostID) : undefined;
   const selectedComputerTargets = selectedComputerHost ? hostEmbedTargetPlan(selectedComputerHost) : [];
   const selectedComputerInitialTarget = hostEmbedInitialTarget(selectedComputerTargets);
   const requestComputerEmbed = async () => {
     if (!selectedComputerHost || !conversationID || !selectedComputerInitialTarget || computerConnecting) {
       if (!conversationID) setComputerPanelError('先发送一条消息创建当前旁聊，再连接云端电脑。');
-      else if (!selectedComputerHost) setComputerPanelError('请选择一台有权限访问的云端电脑。');
+      else if (!selectedComputerHost) setComputerPanelError('请先在云端电脑设置中配置默认电脑。');
       else if (!selectedComputerInitialTarget) setComputerPanelError('当前账号没有此电脑的可用工作台权限。');
       return;
     }
@@ -1541,7 +1529,6 @@ export function Assistant() {
           !opened.targets.length || !opened.targets.every((item) => selectedComputerTargets.includes(item as HostEmbedTicket['targets'][number]))) {
           throw new Error('桌面客户端返回了无效的工作台状态。');
         }
-        setComputerHostID(selectedComputerHost.id);
         setComputerEmbed({ conversationID, hostID: selectedComputerHost.id, hostOrigin: opened.hostOrigin, nonce: opened.nonce,
           targets: opened.targets as HostEmbedTicket['targets'], native: true, status: 'loading' });
         return;
@@ -1560,7 +1547,6 @@ export function Assistant() {
         !/^[\w-]{32}$/.test(issued.embed_nonce) || !validTargets || !issued.targets.includes(selectedComputerInitialTarget)) {
         throw new Error('电脑连接凭据或授权范围无效，请刷新后重试。');
       }
-      setComputerHostID(selectedComputerHost.id);
       setComputerEmbed({
         conversationID, hostID: selectedComputerHost.id, hostOrigin: hostURL.origin,
         exchangeURL: exchangeURL.toString(), nonce: issued.embed_nonce, ticket: issued.ticket,
@@ -1600,34 +1586,6 @@ export function Assistant() {
   const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
   const variantTimeline = buildMessageVariantTimeline(mergedDisplayMessages, selectedVariantMap);
   const displayMessages = variantTimeline.items;
-  const userMessageIDByTaskID = new Map<string, string>();
-  for (const message of displayMessages) {
-    const taskID = message.role === 'user' && !message.duplicate_of_message_id ? message.task_id ?? message.related_task_id : null;
-    if (taskID) userMessageIDByTaskID.set(taskID, message.id);
-  }
-  const approvalCardsByMessageID = new Map<string, TaskApprovalItem[]>();
-  const unattachedApprovalCards: TaskApprovalItem[] = [];
-  for (const item of [...conversationApprovalItems].sort((left, right) =>
-    Date.parse(left.approval.created_at) - Date.parse(right.approval.created_at) || left.approval.id.localeCompare(right.approval.id))) {
-    const messageID = userMessageIDByTaskID.get(item.task_id);
-    if (!messageID) {
-      unattachedApprovalCards.push(item);
-      continue;
-    }
-    const cards = approvalCardsByMessageID.get(messageID) ?? [];
-    cards.push(item);
-    approvalCardsByMessageID.set(messageID, cards);
-  }
-  const renderApprovalCard = (item: TaskApprovalItem) => <div className="chat-approval-row" key={item.approval.id}>
-    <TaskApprovalCard approval={item.approval} submitting={respondToApproval.isPending}
-      onDecision={(decision) => {
-        const actionScope = `approval:${item.task_id}:${item.approval.id}`;
-        const fingerprint = JSON.stringify({ version: item.approval.version, decision });
-        const key = taskActionKey(actionScope, fingerprint);
-        respondToApproval.mutate({ taskID: item.task_id, approvalID: item.approval.id, version: item.approval.version,
-          decision, actionScope, key });
-      }} />
-  </div>;
   const variantSelectionSignature = JSON.stringify(Object.entries(selectedMessageVariantVersions).sort(([left], [right]) => left.localeCompare(right)));
   const thinkingMessageIDs = new Set<string>();
   const checkedTaskIDs = new Set<string>();
@@ -1808,7 +1766,8 @@ export function Assistant() {
       let targetID = message.conversationID;
       if (!targetID) {
         if (!message.conversationCreateKey) throw new Error('缺少会话编号，请重新核对。');
-        const created = await portalApi.createConversation({}, message.conversationCreateKey, message.serviceInstanceID!, message.actorID);
+        const title = conversationTitleFromText(message.request.content);
+        const created = await portalApi.createConversation(title ? { title } : {}, message.conversationCreateKey, message.serviceInstanceID!, message.actorID);
         targetID = created.id;
         await outbox.bindConversation(scope, message.actorID, message.conversationCreateKey, targetID);
         checkScope();
@@ -2426,12 +2385,6 @@ export function Assistant() {
       client.setQueryData(['assistant-recent-conversation', recentConversationKey], null);
     }
   };
-  useEffect(() => {
-    if (outletContext?.newChatRequest === undefined || outletContext.newChatRequest === lastNewChatRequest.current) return;
-    lastNewChatRequest.current = outletContext.newChatRequest;
-    void startNew();
-  }, [outletContext?.newChatRequest, startNew]);
-
   const selectConversationID = async (id: string) => {
     const generation = ++composerSwitchGeneration.current;
     if (!composerDraftScope && (content || composerAttachments.length)) {
@@ -2555,6 +2508,7 @@ export function Assistant() {
   const renderCachedMainConversation = () => mainConversationID ? <div className="conversation-row conversation-row-main" key={mainConversationID}>
     <button type="button" className={`conversation-item ${conversationID === mainConversationID ? 'is-selected' : ''}`}
       onClick={() => selectConversationID(mainConversationID)}>
+      <span className="assistant-logo conversation-main-logo" aria-hidden="true" />
       <strong>主会话</strong><small>最近记录</small>
     </button>
   </div> : null;
@@ -2725,11 +2679,14 @@ export function Assistant() {
       setComputerControlExpanded(false);
       setTaskPanelOpen(false);
       setTaskDetailTaskID(null);
-      window.requestAnimationFrame(() => taskPanelToggle.current?.focus());
+      window.requestAnimationFrame(() => {
+        if (outletContext?.focusPanelToggle) outletContext.focusPanelToggle();
+        else taskPanelToggle.current?.focus();
+      });
     };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [postComputerVisibility, taskPanelOpen]);
+  }, [outletContext?.focusPanelToggle, postComputerVisibility, taskPanelOpen]);
   useLayoutEffect(() => {
     const view = conversationView.current;
     if (previousScrollPositionKey.current !== conversationScrollPositionKey) {
@@ -2805,7 +2762,7 @@ export function Assistant() {
     void prepareComposerAttachmentItems(composerAttachments.filter((item) => item.needsPreparation && !item.preparationCancelled), composerDraftScope, composerDraftID);
   }, [composerAttachments, composerDraftID, composerDraftIdentity, composerDraftReady, composerDraftScope, incompleteAttachmentPreparationKey, prepareComposerAttachmentItems]);
   const renderPendingMessage = (entry: MessageOutboxEntry) => {
-    const { message, scope } = entry;
+    const { message } = entry;
     const alreadyVisible = displayMessages.some((item) => item.client_message_id === message.request.client_message_id);
     const failed = message.status === 'failed';
     const status = message.status === 'accepted' ? (message.attachments.length ? '消息已发送，附件等待处理' : '消息已发送')
@@ -2818,8 +2775,6 @@ export function Assistant() {
       {!alreadyVisible && <><strong className="chat-message-author">你</strong><p>{message.request.content}</p></>}
       {!failed && <small role="status">{status}{message.error ? `：${message.error}` : ''}</small>}
       {message.attachments.length > 0 && <small>附件 · {message.attachments.length}</small>}
-      {message.status !== 'sending' && !failed && <AssistantOutboxRetryButton entry={{ scope, message }} sendMessage={sendMessage}
-        label={message.status === 'accepted' && message.attachments.length ? '重试附件' : '核对并重试'} />}
       </article>
     </div>;
   };
@@ -3124,18 +3079,77 @@ export function Assistant() {
           : mainConversation.data?.status === 'uninitialized' ? <><h2>正在初始化主会话…</h2><p>正在确认会话状态，已有对话会保留。</p></>
             : <><h2>正在读取主会话…</h2><p>正在读取服务端会话状态。</p></>}
   </div>;
-  const showDemoModeStatus = import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1';
-  const showMainConversationError = mainConversation.isError && !isTransientNetworkError(mainConversation.error);
-  const showMainConversationUninitialized = mainConversation.data?.status === 'uninitialized';
-  const showCapabilitiesError = capabilities.isError && !isTransientNetworkError(capabilities.error);
-  const showAutoRoutingWarning = capabilities.isSuccess && conversationAutoRoutingAvailable === false;
-  const showCloudToolsWarning = capabilities.isSuccess && cloudTasksAvailable === false;
-  const serviceStatusCount = [showDemoModeStatus, mainConversation.isPending, showMainConversationError,
-    showMainConversationUninitialized, capabilities.isPending, showCapabilitiesError, showAutoRoutingWarning,
-    showCloudToolsWarning].filter(Boolean).length;
+  const contextSidebarWidthLimits = () => {
+    const layout = assistantLayoutRef.current;
+    const columns = layout ? getComputedStyle(layout).gridTemplateColumns.trim().split(/\s+/) : [];
+    const panel = layout?.querySelector<HTMLElement>('.assistant-task-panel');
+    const panelWidth = columns.length > 2 ? Number.parseFloat(columns[columns.length - 1] ?? '') || 0
+      : panel && getComputedStyle(panel).position !== 'absolute' ? panel.getBoundingClientRect().width : 0;
+    const maximum = Math.min(420, (layout?.getBoundingClientRect().width ?? 900) - panelWidth - 320);
+    return { minimum: 170, maximum: Math.max(170, maximum) };
+  };
+  const resizeContextSidebar = (width: number) => {
+    const { minimum, maximum } = contextSidebarWidthLimits();
+    setContextSidebarWidth(Math.round(Math.min(maximum, Math.max(minimum, width))));
+  };
+  const workspacePanelWidthLimits = () => {
+    const layout = assistantLayoutRef.current;
+    const sidebarWidth = layout?.querySelector<HTMLElement>('.assistant-sidebar')?.getBoundingClientRect().width ?? contextSidebarWidth;
+    const layoutWidth = layout?.getBoundingClientRect().width ?? 1200;
+    const panelColumnReserved = Boolean(layout && getComputedStyle(layout).gridTemplateColumns.trim().split(/\s+/).length > 2);
+    const maximum = window.innerWidth <= 1100
+      ? Math.min(380, layoutWidth - sidebarWidth)
+      : Math.min(900, layoutWidth - (panelColumnReserved ? sidebarWidth + 320 : 12));
+    return { minimum: 350, maximum: Math.max(350, maximum) };
+  };
+  const currentWorkspacePanelWidth = () => {
+    if (workspacePanelWidth !== null) return Math.round(workspacePanelWidth);
+    const layout = assistantLayoutRef.current;
+    const columns = layout ? getComputedStyle(layout).gridTemplateColumns.trim().split(/\s+/) : [];
+    if (columns.length > 2) return Math.round(Number.parseFloat(columns[columns.length - 1] ?? '') || 560);
+    const panel = layout?.querySelector<HTMLElement>('.assistant-task-panel');
+    return Math.round(panel?.getBoundingClientRect().width || workspacePanelWidth || 560);
+  };
+  const resizeWorkspacePanel = (width: number) => {
+    const { minimum, maximum } = workspacePanelWidthLimits();
+    setWorkspacePanelWidth(Math.round(Math.min(maximum, Math.max(minimum, width))));
+  };
+  const dividerWidth = (side: 'sidebar' | 'workspace') => side === 'sidebar' ? contextSidebarWidth : currentWorkspacePanelWidth();
+  const resizeDivider = (side: 'sidebar' | 'workspace', width: number) => {
+    if (side === 'sidebar') resizeContextSidebar(width);
+    else resizeWorkspacePanel(width);
+  };
+  const beginDividerDrag = (side: 'sidebar' | 'workspace', pointerID: number, x: number) => {
+    assistantDividerDrag.current = { side, pointerID, x, width: dividerWidth(side) };
+  };
+  const moveDividerDrag = (pointerID: number, x: number, finish = false) => {
+    const drag = assistantDividerDrag.current;
+    if (drag?.pointerID !== pointerID) return;
+    const delta = x - drag.x;
+    resizeDivider(drag.side, drag.width + (drag.side === 'sidebar' ? delta : -delta));
+    if (finish) assistantDividerDrag.current = null;
+  };
+  const handleDividerKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, side: 'sidebar' | 'workspace') => {
+    const current = dividerWidth(side);
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      const delta = event.key === 'ArrowRight' ? 16 : -16;
+      resizeDivider(side, current + (side === 'sidebar' ? delta : -delta));
+      event.preventDefault();
+    } else if (event.key === 'Home' || event.key === 'End') {
+      const { minimum, maximum } = side === 'sidebar' ? contextSidebarWidthLimits() : workspacePanelWidthLimits();
+      resizeDivider(side, event.key === 'Home' ? minimum : maximum);
+      event.preventDefault();
+    }
+  };
 
   return <section className="assistant-page">
-    <div className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' ? ' assistant-layout-with-computer-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' && computerControlExpanded ? ' assistant-layout-computer-expanded' : ''}`}>
+    <div ref={assistantLayoutRef} style={{ '--pc-context-sidebar-width': `${contextSidebarWidth}px`,
+      ...(!outletContext ? { '--pc-workspace-panel-width': `${workspacePanelWidth ?? currentWorkspacePanelWidth()}px` } : {}) } as CSSProperties}
+      onPointerMove={(event) => moveDividerDrag(event.pointerId, event.clientX)}
+      onPointerUp={(event) => moveDividerDrag(event.pointerId, event.clientX, true)}
+      onMouseMove={(event) => moveDividerDrag(-1, event.clientX)}
+      onMouseUp={(event) => moveDividerDrag(-1, event.clientX, true)}
+      className={`assistant-layout${taskPanelOpen ? ' assistant-layout-with-task-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' ? ' assistant-layout-with-computer-panel' : ''}${taskPanelOpen && taskPanelTab === 'computer' && computerControlExpanded ? ' assistant-layout-computer-expanded' : ''}`}>
       <aside id="context-sidebar" className="assistant-sidebar" aria-label="对话">
         <div className="assistant-sidebar-heading">
           <h2>Morde</h2>
@@ -3190,46 +3204,56 @@ export function Assistant() {
               {!conversations.isError && conversations.isSuccess && !sideConversations.length && !localComposerDrafts.length && !conversations.hasNextPage && !composerDrafts.isPending && <p className="muted assistant-sidebar-empty">{conversationSearch.trim() ? '没有找到匹配标题的旁聊。' : '还没有旁聊。'}</p>}
               {composerDrafts.isPending && !localComposerDrafts.length && <p className="muted assistant-sidebar-empty" role="status">正在读取未发送草稿…</p>}
             </details>
-            <button type="button" className="button button-secondary conversation-new" aria-label="新建旁聊" title="新建旁聊" onClick={startNew}>+</button>
+            <button type="button" className="icon-button conversation-new" aria-label="新建旁聊" title="新建旁聊" onClick={startNew}><MordeIcon name="plus" /></button>
           </div>
           <p className="assistant-sidebar-hint">主会话保留日常交流，旁聊可用于单独讨论。</p>
         </div>
       </aside>
+      <button type="button" className="assistant-context-resizer" role="separator" aria-orientation="vertical"
+        aria-label="调整对话侧栏宽度" aria-valuemin={170} aria-valuemax={contextSidebarWidthLimits().maximum} aria-valuenow={contextSidebarWidth}
+        aria-valuetext={`${contextSidebarWidth} 像素`} title="拖动调整对话侧栏宽度"
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          beginDividerDrag('sidebar', event.pointerId, event.clientX);
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => { assistantDividerDrag.current = null; }}
+        onMouseDown={(event) => {
+          if (event.button !== 0 || assistantDividerDrag.current) return;
+          event.preventDefault();
+          beginDividerDrag('sidebar', -1, event.clientX);
+        }}
+        onKeyDown={(event) => handleDividerKeyDown(event, 'sidebar')} />
+      {taskPanelOpen && <button type="button" className="assistant-workspace-resizer" role="separator" aria-orientation="vertical"
+        aria-label="调整右侧工作区宽度" aria-valuemin={350} aria-valuemax={workspacePanelWidthLimits().maximum} aria-valuenow={currentWorkspacePanelWidth()}
+        aria-valuetext={`${currentWorkspacePanelWidth()} 像素`} title="拖动调整右侧工作区宽度"
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          beginDividerDrag('workspace', event.pointerId, event.clientX);
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => { assistantDividerDrag.current = null; }}
+        onMouseDown={(event) => {
+          if (event.button !== 0 || assistantDividerDrag.current) return;
+          event.preventDefault();
+          beginDividerDrag('workspace', -1, event.clientX);
+        }}
+        onKeyDown={(event) => handleDividerKeyDown(event, 'workspace')} />}
       <div className="assistant-main">
-        <header className="conversation-view-heading">
-          <div className="assistant-chat-title"><div>
-            <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selectedConversationTitle}</h2>
-            <p>{conversationID && conversationID === mainConversationID ? '你的 Morde' : selectedLocalDraftKey ? '旁聊 · 你的 Morde' : conversationID ? '旁聊 · 你的 Morde' : '主会话'}</p>
-          </div></div>
-          <div className="assistant-header-actions">
-          {serviceStatusCount > 0 && <div className="assistant-service-status">
-            <button type="button" className="button button-secondary assistant-service-status-toggle"
-              aria-label={`查看服务状态，${serviceStatusCount} 项`} aria-expanded={serviceStatusExpanded}
-              aria-controls="assistant-service-status-panel" data-state={showMainConversationError || showCapabilitiesError || showAutoRoutingWarning || showCloudToolsWarning || showDemoModeStatus ? 'warning' : 'checking'}
-              onClick={() => setServiceStatusExpanded((expanded) => !expanded)}>
-              <span className="assistant-service-status-label">服务状态</span><span className="assistant-service-status-count" aria-hidden="true">{serviceStatusCount}</span>
-            </button>
-          </div>}
-          {!taskPanelOpen && <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
-            aria-label="打开侧边栏" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
-            aria-expanded="false" aria-controls="assistant-task-panel"
-            title={pendingTaskCount === null ? '打开侧边栏' : `打开侧边栏，${pendingTaskCount} 项待处理`}
-            onClick={() => setTaskPanelOpen(true)}>
-            <MordeIcon name="panel" />{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
-            {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
-          </button>}
-          </div>
+        {!taskPanelOpen && !outletContext?.focusPanelToggle && <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
+          aria-label="打开侧边栏" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
+          aria-expanded="false" aria-controls="assistant-task-panel"
+          title={pendingTaskCount === null ? '打开侧边栏' : `打开侧边栏，${pendingTaskCount} 项待处理`}
+          onClick={() => setTaskPanelOpen(true)}>
+          <MordeIcon name="panel" />{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
+          {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
+        </button>}
+        <header className="conversation-view-heading assistant-chat-heading-accessible sr-only">
+          <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selectedConversationTitle}</h2>
+          <p>{conversationID && conversationID === mainConversationID ? '与 Morde 对话' : selectedLocalDraftKey || conversationID ? '旁聊' : '与 Morde 对话'}</p>
         </header>
-        {serviceStatusCount > 0 && <section id="assistant-service-status-panel" className="assistant-service-status-panel" aria-label="服务状态详情" aria-live="polite" hidden={!serviceStatusExpanded}>
-          {showDemoModeStatus && <p className="assistant-service-status-row" role="status">当前为演示模式，尚未连接真实 AI 服务。这里的消息不会由 AI 执行。</p>}
-          {mainConversation.isPending && <p className="assistant-service-status-row" role="status">正在读取服务端主会话…</p>}
-          {showMainConversationError && <p className="assistant-service-status-row" role="alert">无法刷新服务端主会话{cachedMainConversationID ? '，已保留上次记录' : '，请重试'}。<button type="button" className="button button-small button-secondary" onClick={() => void mainConversation.refetch()}>重试</button></p>}
-          {showMainConversationUninitialized && <p className="assistant-service-status-row" role="status">正在初始化你的主会话…</p>}
-          {capabilities.isPending && <p className="assistant-service-status-row" role="status">正在检查服务能力…</p>}
-          {showCapabilitiesError && <p className="assistant-service-status-row" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></p>}
-          {showAutoRoutingWarning && <p className="assistant-service-status-row" role="status">服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。</p>}
-          {showCloudToolsWarning && <p className="assistant-service-status-row" role="status">云端工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。</p>}
-        </section>}
         {streamedTasks.map((task) => <TaskStream key={task.id} task={task} conversationID={task.conversation_id} onState={setTaskEventFeed} />)}
         <div className={`conversation-view${!conversationID || showConversationWelcome ? ' conversation-view-welcome' : ''}`} aria-live="polite" ref={conversationView} onScroll={(event) => {
           const view = event.currentTarget;
@@ -3316,23 +3340,12 @@ export function Assistant() {
                       </div>}
                     {message.role === 'assistant' && <time className="assistant-reply-time" dateTime={message.created_at} aria-label={`回复时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>}
                     </div></div>
-                    {approvalCardsByMessageID.get(message.id)?.map(renderApprovalCard)}
                     {thinkingMessageIDs.has(message.id) && <div className="chat-message-row chat-message-row-assistant chat-thinking-row" role="status" aria-label="Morde 正在思考">
                       <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
                       <div className="chat-message-body"><div className="thinking-dots" aria-hidden="true"><span /><span /><span /></div></div>
                     </div>}
                   </Fragment>;
                 })}
-                {unattachedApprovalCards.map(renderApprovalCard)}
-                {conversationApprovals.isError && !isTransientNetworkError(conversationApprovals.error) && <FloatingError className="error-inline" role="alert">审核事项暂不可用，当前状态未确认。
-                  <button type="button" className="button button-small button-secondary" onClick={() => void conversationApprovals.refetch()}>重试</button></FloatingError>}
-                {approvalCursorLoop && <FloatingError className="error-inline" role="alert">审核列表分页游标异常，尚未加载的事项状态未确认。</FloatingError>}
-                {conversationApprovals.hasNextPage && <div className="conversation-history-load">
-                  {conversationApprovals.isFetchNextPageError && !isTransientNetworkError(conversationApprovals.error) && <FloatingError className="error-inline" role="alert">更早的审核事项暂不可用。</FloatingError>}
-                  <button type="button" className="button button-small button-secondary" disabled={conversationApprovals.isFetchingNextPage}
-                    onClick={() => void conversationApprovals.fetchNextPage()}>{conversationApprovals.isFetchingNextPage ? '正在加载更早审核事项…'
-                      : conversationApprovals.isFetchNextPageError ? '重试加载更早审核事项' : '加载更早审核事项'}</button>
-                </div>}
               </div>}
           {pendingMessages.map(renderPendingMessage)}
           </>}
@@ -3363,7 +3376,7 @@ export function Assistant() {
               if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
-            }} disabled={!composerDraftReady} placeholder="告诉我你想完成什么…" />
+            }} disabled={!composerDraftReady} placeholder="和 Morde 聊聊，或告诉我你想完成什么…" />
             {composerDraftReady && composerAttachments.length > 0 && <div className="assistant-attachment-list" aria-label="待发送附件">
               {composerAttachments.map((item) => {
                 const mediaType = assistantFileMediaType(item.file);
@@ -3406,18 +3419,9 @@ export function Assistant() {
                   <input type="file" aria-label="添加附件" accept=".txt,.jpg,.jpeg,.png,.docx,.xlsx,.pptx,.pdf,text/plain,image/jpeg,image/png,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     multiple onChange={(event) => { if (!conversationID) ensureLocalConversationKey(); void addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
                 </label>
-                <AssistantVoiceInput compact onTranscript={(transcript) => {
-                  composerEditRevision.current += 1;
-                  if (!conversationID) ensureLocalConversationKey();
-                  const snapshot = latestComposerDraft.current;
-                  const current = snapshot?.identity === composerDraftIdentity ? snapshot.draft.content : content;
-                  const value = current.trim() ? `${current.trimEnd()} ${transcript}` : transcript;
-                  updateComposerDraftSnapshot({ content: value });
-                  setContent(value);
-                }} />
               </div>
               <div className="assistant-selectors">
-                <label className="assistant-selector"><MordeIcon name="spark" /><span className="sr-only">AI 模型</span><select aria-label="选择 AI 模型"
+                <label className="assistant-selector"><span className="sr-only">AI 模型</span><select aria-label="选择 AI 模型"
                   value={composerDraftReady ? effectiveModelID : ''} onChange={(event) => { composerEditRevision.current += 1; updateComposerDraftSnapshot({ modelID: event.target.value }); setModelID(event.target.value); }} disabled={!composerDraftReady || models.isPending}>
                   <option value="">自动选择模型</option>{effectiveModelID && !models.data?.items.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID} disabled>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
                   {unavailableModels.map((item) => <option key={item.id} value={item.id} disabled>{item.name} · {item.checked_at ? '文字能力未验证或不可用' : '请先检查连接'}</option>)}
@@ -3442,6 +3446,15 @@ export function Assistant() {
                 {mcpConnectors.isError && !isTransientNetworkError(mcpConnectors.error) && <FloatingError className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></FloatingError>}
               </div>
               <div className="assistant-task-actions" role="group" aria-label="发送操作">
+                <AssistantVoiceInput compact onTranscript={(transcript) => {
+                  composerEditRevision.current += 1;
+                  if (!conversationID) ensureLocalConversationKey();
+                  const snapshot = latestComposerDraft.current;
+                  const current = snapshot?.identity === composerDraftIdentity ? snapshot.draft.content : content;
+                  const value = current.trim() ? `${current.trimEnd()} ${transcript}` : transcript;
+                  updateComposerDraftSnapshot({ content: value });
+                  setContent(value);
+                }} />
                 {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
                 <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length)}>
                   {preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
@@ -3449,6 +3462,7 @@ export function Assistant() {
               </div>
             </div>
           </form>
+          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行</p>
         </section>
       </div>
       {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="当前会话侧边栏">
@@ -3477,7 +3491,10 @@ export function Assistant() {
               setTaskPanelOpen(false);
               setTaskDetailTaskID(null);
               setTaskPanelTab('tasks');
-              window.requestAnimationFrame(() => taskPanelToggle.current?.focus());
+              window.requestAnimationFrame(() => {
+                if (outletContext?.focusPanelToggle) outletContext.focusPanelToggle();
+                else taskPanelToggle.current?.focus();
+              });
             }}>×</button>
           </div>
         </header>
@@ -3544,24 +3561,17 @@ export function Assistant() {
               </article>} />}
         </div>}
         <section className="task-panel-list task-panel-computer" aria-label="当前会话云端电脑" hidden={taskPanelTab !== 'computer'}>
-          <div className="computer-panel-toolbar">
-            <label>云端电脑
-              <select aria-label="选择侧栏云端电脑" value={selectedComputerHost?.id ?? ''} disabled={sharedHosts.isPending || hosts.isPending}
-                onChange={(event) => {
-                  postComputerVisibility(false);
-                  computerRequestGeneration.current += 1;
-                  setComputerConnecting(false);
-                  setComputerEmbed(null);
-                  setComputerControlExpanded(false);
-                  setComputerPanelError('');
-                  setComputerHostID(event.target.value);
-                }}>
-                <option value="">选择有权限访问的电脑</option>
-                {computerHostOptions.map((host) => <option key={host.id} value={host.id}>
-                  {host.name} · {host.owned ? '我的电脑' : '共享电脑'}
-                </option>)}
-              </select>
-            </label>
+          <div className={`computer-panel-toolbar${computerEmbed?.conversationID === conversationID ? ' has-workbench' : ''}${computerEmbed?.conversationID === conversationID && computerEmbed.status === 'ready' ? ' is-workbench-ready' : ''}`}>
+            <div className="computer-panel-availability" role="status" aria-live="polite">
+              <span className={`computer-panel-availability-dot${selectedComputerHost?.state === 'running' ? ' is-ready' : ''}`} aria-hidden="true" />
+              <strong>{selectedComputerHost?.state === 'running' ? '已连接'
+                : !preferredHostID && preferences.isPending ? '正在读取设置…'
+                  : preferredHostID && hosts.isPending ? '正在检查云端电脑…'
+                    : preferredHostID && !selectedComputerHost ? '云端电脑暂不可用'
+                    : selectedComputerHost ? hostStateLabel[selectedComputerHost.state] || '暂不可用' : '未配置云端电脑'}</strong>
+              {selectedComputerHost && <small>{selectedComputerHost.name}</small>}
+              {!selectedComputerHost && <Link to="/hosts">设置默认电脑</Link>}
+            </div>
             <button type="button" className="button button-primary" disabled={computerConnecting || !selectedComputerHost ||
               selectedComputerHost.state !== 'running' || !selectedComputerInitialTarget}
               onClick={() => void requestComputerEmbed()}>
@@ -3572,11 +3582,11 @@ export function Assistant() {
           {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
             <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
           {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
-          {!conversationID && <p className="muted">新旁聊创建后，才能把电脑连接到该会话。</p>}
+          {!conversationID && <p className="muted">发送第一条消息后，才能把电脑连接到该会话。</p>}
           {selectedComputerHost && selectedComputerHost.state !== 'running' && <p className="muted">此电脑当前未运行，启动后才能连接。</p>}
           {selectedComputerHost && !selectedComputerTargets.length && <p className="muted">此电脑没有可嵌入的授权功能。</p>}
           {computerEmbed?.conversationID === conversationID && <>
-            <div className="computer-panel-status" role="status" aria-live="polite">
+            <div className={`computer-panel-status computer-panel-status-${computerEmbed.status}`} role="status" aria-live="polite">
               {computerEmbed.status === 'ready' ? '工作台已就绪' : computerEmbed.status === 'error'
                 ? computerEmbed.error || '工作台连接失败。' : computerEmbed.status === 'submitting' ? '正在安全连接…' : '正在等待工作台就绪…'}
               {computerEmbed.status === 'ready' && <small>远程桌面连接和控制状态以工作台内的实时提示为准。</small>}

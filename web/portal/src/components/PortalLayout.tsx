@@ -1,9 +1,7 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate, useNavigationType } from 'react-router';
 import { useAuth } from '../app/auth';
-import { errorDetails, portalApi } from '../app/api';
-import { isTransientNetworkError } from '../api/errors';
+import { errorDetails } from '../app/api';
 import { ToastNoticeCenter, useToast } from '../app/toast';
 import { ConfirmDialog } from './ConfirmDialog';
 import { MordeIcon, type MordeIconName } from './MordeIcon';
@@ -29,6 +27,11 @@ type PageNavigation = { title: string; items: PageNavigationItem[]; queryDefault
 type RouteHistoryEntry = { key: string; url: string };
 type RouteHistoryState = { canGoBack: boolean; canGoForward: boolean; goBack: () => void; goForward: () => void };
 type AssistantPanelTab = 'tasks' | 'files' | 'computer';
+const assistantPanelTabs: { id: AssistantPanelTab; label: string; icon: MordeIconName }[] = [
+  { id: 'computer', label: '云端电脑', icon: 'monitor' },
+  { id: 'tasks', label: '任务动态', icon: 'tasks' },
+  { id: 'files', label: '文件', icon: 'folder' },
+];
 
 const RouteHistoryContext = createContext<RouteHistoryState>({ canGoBack: false, canGoForward: false, goBack: () => {}, goForward: () => {} });
 
@@ -74,6 +77,11 @@ const personalSections: Array<[string, string, MordeIconName]> = [
 ];
 
 const pageNavigationFor = (pathname: string): PageNavigation | null => {
+  if (pathname === '/hosts') return {
+    title: '设置与授权', queryDefault: ['sync', '0'],
+    items: [...settingLinks.map((item) => item.to === '/hosts' ? { ...item, query: ['sync', '0'] as [string, string] } : item),
+      { label: '文件同步', icon: 'folder', to: '/hosts?sync=1', query: ['sync', '1'] }],
+  };
   if (settingLinks.some(({ to }) => to === pathname)) return { title: '设置与授权', items: settingLinks };
   if (pathname === '/reviews') return { title: '审核', items: [{ label: '审核事项', icon: 'shield', to: '/reviews' }] };
   if (pathname === '/personal') return {
@@ -106,45 +114,45 @@ function matchesPageItem(item: PageNavigationItem, pathname: string, search: str
 
 export function PortalLayout() {
   const { user, signOut } = useAuth();
-  const { notify, dismiss, closeNotices } = useToast();
+  const { notify, closeNotices } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
   const { canGoBack, canGoForward, goBack, goForward } = useContext(RouteHistoryContext);
-  const approvalCount = useQuery({
-    queryKey: ['task-approvals', 'count', user?.id],
-    queryFn: () => portalApi.taskApprovals(),
-    enabled: Boolean(user), staleTime: 15_000, refetchInterval: 30_000,
-  });
-  const refetchApprovalCount = approvalCount.refetch;
-  const approvalCountErrorToast = useRef<number | null>(null);
   const [contextSidebarCollapsed, setContextSidebarCollapsed] = useState(readContextSidebarCollapsed);
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
-  const [assistantPanelOpen, setAssistantPanelOpen] = useState(false);
+  const [assistantPanelOpen, setAssistantPanelOpen] = useState(true);
+  const [assistantWorkspaceWidth, setAssistantWorkspaceWidth] = useState<number | null>(null);
   const [assistantPanelTab, setAssistantPanelTab] = useState<AssistantPanelTab>('computer');
-  const [assistantNewChatRequest, setAssistantNewChatRequest] = useState(0);
+  const [assistantOpenPanelTabs, setAssistantOpenPanelTabs] = useState<AssistantPanelTab[]>(['computer', 'tasks', 'files']);
+  const assistantPanelToggle = useRef<HTMLButtonElement>(null);
+  const focusAssistantPanelToggle = useCallback(() => assistantPanelToggle.current?.focus(), []);
+  const assistantWorkspaceAddMenu = useRef<HTMLDetailsElement>(null);
   const pageNavigation = pageNavigationFor(location.pathname);
   const hasCollapsibleSidebar = Boolean(pageNavigation) || location.pathname === '/assistant';
   const isAssistantPage = location.pathname === '/assistant';
 
   useEffect(() => { closeNotices(); }, [closeNotices, location.pathname, location.search]);
-
-  const approvalCountNetworkError = approvalCount.isError && isTransientNetworkError(approvalCount.error);
   useEffect(() => {
-    if (!approvalCountNetworkError || location.pathname === '/assistant' || location.pathname === '/reviews') {
-      if (approvalCountErrorToast.current !== null) dismiss(approvalCountErrorToast.current);
-      approvalCountErrorToast.current = null;
-      return;
-    }
-    if (approvalCountErrorToast.current === null) {
-      approvalCountErrorToast.current = notify('审核状态暂时无法更新。', 'error', {
-        label: '重试', onClick: () => { void refetchApprovalCount(); },
-      });
-    }
-  }, [approvalCountNetworkError, dismiss, location.pathname, notify, refetchApprovalCount]);
-
-  useEffect(() => () => {
-    if (approvalCountErrorToast.current !== null) dismiss(approvalCountErrorToast.current);
-  }, [dismiss]);
+    if (!isAssistantPage) return;
+    const closeOutside = (event: PointerEvent) => {
+      const menu = assistantWorkspaceAddMenu.current;
+      if (menu?.open && !menu.contains(event.target as Node)) menu.open = false;
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      const menu = assistantWorkspaceAddMenu.current;
+      if (event.key !== 'Escape' || !menu?.open) return;
+      event.preventDefault();
+      event.stopPropagation();
+      menu.open = false;
+      menu.querySelector('summary')?.focus();
+    };
+    document.addEventListener('pointerdown', closeOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [isAssistantPage]);
 
   useEffect(() => {
     try { localStorage.setItem('morde:pc-context-sidebar-collapsed', contextSidebarCollapsed ? 'true' : 'false'); }
@@ -163,38 +171,59 @@ export function PortalLayout() {
     } catch { notify('当前窗口不支持全屏操作。', 'error'); }
   };
 
-  return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}`}>
+  const openAssistantPanel = (tab: AssistantPanelTab) => {
+    setAssistantOpenPanelTabs((openTabs) => openTabs.includes(tab) ? openTabs : [...openTabs, tab]);
+    setAssistantPanelTab(tab);
+    setAssistantPanelOpen(true);
+  };
+  const closeAssistantPanelTab = (tab: AssistantPanelTab) => {
+    const remaining = assistantPanelTabs.filter((item) => assistantOpenPanelTabs.includes(item.id) && item.id !== tab).map((item) => item.id);
+    setAssistantOpenPanelTabs(remaining);
+    if (assistantPanelTab === tab) {
+      if (remaining.length) setAssistantPanelTab(remaining[remaining.length - 1] ?? 'computer');
+      else setAssistantPanelOpen(false);
+    }
+  };
+
+  return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}${isAssistantPage ? ` morde-shell-assistant-workspace${assistantPanelOpen ? '' : ' morde-shell-assistant-workspace-collapsed'}` : ''}`}
+    style={isAssistantPage && assistantWorkspaceWidth !== null ? { '--pc-workspace-panel-user-width': `${assistantWorkspaceWidth}px` } as CSSProperties : undefined}>
     <a className="skip-link" href="#main-content">跳到主要内容</a>
     <header className="morde-topbar"><div className="morde-top-navigation">
       <button type="button" className="morde-top-control" aria-label="返回上一页" title="返回上一页" disabled={!canGoBack} onClick={goBack}><MordeIcon name="back" /></button>
       <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={goForward}><MordeIcon name="forward" /></button>
       <span className="morde-top-divider" aria-hidden="true" />
       {hasCollapsibleSidebar && <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>}
-    </div><div className="morde-top-actions"><ToastNoticeCenter autoOpenErrors />{isAssistantPage ? <nav className="morde-workspace-tabs" aria-label="对话工作区">
-      {([
-        ['computer', '云端电脑', 'monitor'], ['tasks', '任务动态', 'tasks'], ['files', '文件', 'folder'],
-      ] as const).map(([tab, label, icon]) => <button key={tab} type="button" className={`morde-workspace-tab${assistantPanelOpen && assistantPanelTab === tab ? ' active' : ''}`}
-        aria-pressed={assistantPanelOpen && assistantPanelTab === tab} onClick={() => { setAssistantPanelTab(tab); setAssistantPanelOpen(true); }}>
-        <MordeIcon name={icon} />{label}{tab === 'computer' && assistantPanelOpen && assistantPanelTab === tab && <span className="morde-workspace-tab-close" aria-hidden="true">×</span>}
-      </button>)}
-      <button type="button" className="morde-workspace-icon" aria-label="新建旁聊" title="新建旁聊" onClick={() => setAssistantNewChatRequest((request) => request + 1)}><MordeIcon name="plus" /></button>
+      {isAssistantPage && <div className="morde-top-navigation-status"><ToastNoticeCenter autoOpenErrors /></div>}
+    </div><div className={`morde-top-actions${isAssistantPage ? ' morde-top-actions-assistant' : ''}`}>{!isAssistantPage && <ToastNoticeCenter autoOpenErrors />}{isAssistantPage ? <>
+      {assistantPanelOpen && <nav className="morde-workspace-tabs" aria-label="对话工作区">
+      <div className="morde-workspace-tab-list">{assistantPanelTabs.filter(({ id }) => assistantOpenPanelTabs.includes(id)).map(({ id: tab, label, icon }) => {
+        const active = assistantPanelTab === tab;
+        return <div key={tab} className={`morde-workspace-tab-wrap${active ? ' active' : ''}`}>
+          <button type="button" aria-pressed={active} className="morde-workspace-tab"
+            onClick={() => openAssistantPanel(tab)}><MordeIcon name={icon} /><span>{label}</span></button>
+          <button type="button" className="morde-workspace-tab-close" aria-label={`关闭${label}标签`} title="关闭标签"
+            onClick={() => closeAssistantPanelTab(tab)}>×</button>
+        </div>;
+      })}</div>
+      <details ref={assistantWorkspaceAddMenu} className="morde-workspace-add">
+        <summary className="morde-workspace-icon" aria-label="添加工作区标签" title="添加标签"><MordeIcon name="plus" /></summary>
+        <div className="morde-workspace-add-menu">{assistantPanelTabs.map(({ id, label }) => <button key={id} type="button"
+          onClick={(event) => { const menu = event.currentTarget.closest('details'); if (menu) menu.open = false; openAssistantPanel(id); }}>{id === 'files' ? '文件与产物' : label}</button>)}</div>
+      </details>
       <button type="button" className="morde-workspace-icon" aria-label="切换全屏" title="切换全屏" onClick={() => void toggleFullscreen()}><MordeIcon name="fullscreen" /></button>
-      <button type="button" className="morde-workspace-icon" aria-label={assistantPanelOpen ? '隐藏工作区侧栏' : '显示工作区侧栏'} title={assistantPanelOpen ? '隐藏工作区侧栏' : '显示工作区侧栏'}
+      </nav>}
+      <button ref={assistantPanelToggle} type="button" className="morde-workspace-icon"
+        aria-label={assistantPanelOpen ? '隐藏工作区侧栏' : '显示工作区侧栏'} title={assistantPanelOpen ? '隐藏工作区侧栏' : '显示工作区侧栏'}
         aria-expanded={assistantPanelOpen} onClick={() => setAssistantPanelOpen((open) => !open)}><MordeIcon name="panel" /></button>
-    </nav> : <><Link className="morde-notification-link" to="/clients" aria-label="查看客户端与设备"><MordeIcon name="monitor" /></Link><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></>}</div></header>
+    </> : <><Link className="morde-notification-link" to="/clients" aria-label="查看客户端与设备"><MordeIcon name="monitor" /></Link><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></>}</div></header>
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">
         <span className="morde-nav-heading">工作</span>
         {primaryLinks.map(({ to, label, icon, end }) => {
-          const count = approvalCount.data?.pending_count;
-          const accessibleLabel = to !== '/reviews' ? label : approvalCount.isError && !approvalCountNetworkError ? '审核状态暂不可用'
-            : count === undefined ? '审核' : count > 0 ? `审核，有 ${count} 项待处理` : '审核';
           return <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to}
-            aria-label={accessibleLabel} title={accessibleLabel}>
+            aria-label={label} title={label}>
             <MordeIcon name={icon} /><span>{label}</span>
-            {to === '/reviews' && count !== undefined && count > 0 && <span className="morde-nav-count" aria-hidden="true">{count > 99 ? '99+' : count}</span>}
-            {to === '/reviews' && approvalCount.isError && !approvalCountNetworkError && <span className="morde-nav-count morde-nav-count-error" aria-hidden="true">!</span>}
           </NavLink>;
         })}
       </nav>
@@ -228,7 +257,9 @@ export function PortalLayout() {
     </aside>}
     <main className="morde-main">
       <div id="main-content" className="morde-page" tabIndex={-1}><Outlet context={{ panelOpen: assistantPanelOpen, panelTab: assistantPanelTab,
-        setPanelOpen: setAssistantPanelOpen, setPanelTab: setAssistantPanelTab, newChatRequest: assistantNewChatRequest }} /></div>
+        workspaceWidth: assistantWorkspaceWidth, setWorkspaceWidth: setAssistantWorkspaceWidth,
+        setPanelOpen: setAssistantPanelOpen, setPanelTab: setAssistantPanelTab,
+        focusPanelToggle: focusAssistantPanelToggle }} /></div>
     </main>
     {logoutConfirmationOpen && <ConfirmDialog title="退出登录" description="确定要退出 Morde 吗？退出后需要重新登录才能继续使用。" confirmLabel="退出登录" danger onClose={() => setLogoutConfirmationOpen(false)} onConfirm={() => { setLogoutConfirmationOpen(false); void logout(); }} />}
   </div>;

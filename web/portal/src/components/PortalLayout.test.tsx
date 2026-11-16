@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PortalLayout } from './PortalLayout';
 import { ToastProvider } from '../app/toast';
 import { portalApi } from '../app/api';
-import { ApiError } from '../api/client';
 
 const portalLayoutAuthState = vi.hoisted(() => ({ role: 'user' as string, signOut: vi.fn() }));
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: portalLayoutAuthState.role }, signOut: portalLayoutAuthState.signOut }) }));
@@ -47,33 +46,11 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 
-  it('preserves the review navigation during a network failure and offers retry in a popup', async () => {
-    vi.mocked(portalApi.taskApprovals).mockResolvedValue({ items: [], next_cursor: null, pending_count: 3 });
-    renderPortalLayout('/clients');
-    expect(await screen.findByRole('link', { name: '审核，有 3 项待处理' })).toBeInTheDocument();
-
-    cleanup();
-    vi.mocked(portalApi.taskApprovals)
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
-      .mockResolvedValueOnce({ items: [], next_cursor: null, pending_count: 2 });
-    renderPortalLayout('/clients');
-    const reviewLink = await screen.findByRole('link', { name: '审核' });
-    expect(reviewLink.querySelector('.morde-nav-count-error')).toBeNull();
-    expect(await screen.findByRole('alert')).toHaveTextContent('审核状态暂时无法更新。');
-
-    fireEvent.click(screen.getByRole('button', { name: '重试' }));
-    expect(await screen.findByRole('link', { name: '审核，有 2 项待处理' })).toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-  });
-
-  it('keeps the existing inline indicator for a non-network approval error', async () => {
-    vi.mocked(portalApi.taskApprovals).mockRejectedValue(new ApiError({
-      message: 'forbidden', code: 'forbidden', status: 403,
-    }));
+  it('does not fetch approval items or surface approval errors outside the review page', () => {
     renderPortalLayout('/assistant');
-    const reviewLink = await screen.findByRole('link', { name: '审核状态暂不可用' });
 
-    expect(reviewLink.querySelector('.morde-nav-count-error')).toHaveTextContent('!');
+    expect(screen.getByRole('link', { name: '审核' })).toHaveAttribute('href', '/reviews');
+    expect(portalApi.taskApprovals).not.toHaveBeenCalled();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 

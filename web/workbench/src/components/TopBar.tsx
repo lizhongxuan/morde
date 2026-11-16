@@ -65,9 +65,9 @@ export default function TopBar({
   const controlLabel = controlError ? '控制状态暂时不可用'
     : controlLoading && !control ? '正在读取控制状态…'
       : transitionFailure ? control?.active_transition?.action === 'take_over' ? '接管未完成，可重试' : '交回未完成，可重试'
-        : control?.control_state === 'ai' ? '当前控制者：AI · 桌面只读'
+        : control?.control_state === 'ai' ? embedded ? 'Morde 拥有控制权' : '当前控制者：AI · 桌面只读'
           : control?.control_state === 'user' ? control.control_lease_active
-            ? control.control_lease_held_by_me ? '你持有电脑操作权' : control.control_actor_user_id ? `当前操作账号：${control.control_actor_user_id}` : '其他用户持有电脑操作权'
+            ? control.control_lease_held_by_me ? embedded ? '你拥有控制权' : '你持有电脑操作权' : control.control_actor_user_id ? `当前操作账号：${control.control_actor_user_id}` : '其他用户持有电脑操作权'
             : '操作租约已失效 · 桌面只读'
             : control?.control_state === 'taking_over' ? '正在接管电脑，请稍候…'
               : control?.control_state === 'returning' ? '正在交回 AI，请稍候…' : '控制状态未知';
@@ -80,9 +80,11 @@ export default function TopBar({
             : '租约已失效'
             : control?.control_state === 'taking_over' ? '接管中'
               : control?.control_state === 'returning' ? '交还中' : '状态未知';
+  const embeddedActionLabel = embedded && controlActionLabel === '交回 AI' ? '交还控制权' : controlActionLabel;
+  const embeddedControlOwned = control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
 
   return (
-    <header className={`top-bar${embedded ? ' top-bar-embedded' : ''}`}>
+    <header className={`top-bar${embedded ? ` top-bar-embedded${embeddedControlOwned ? ' is-human' : ''}` : ''}`}>
       <div className="host-summary">
         {!embedded && <>
           <strong className="host-name">{host?.name || (host ? host.id : '正在读取主机…')}</strong>
@@ -106,9 +108,9 @@ export default function TopBar({
       <div className="top-actions">
         {!embedded && <button className="button button-secondary host-return-button" type="button" onClick={returnToPreviousPage}>返回云端电脑</button>}
         {controlError && <button className="button button-secondary" type="button" onClick={onRetryControl} disabled={controlLoading}>重试读取</button>}
-        {controlActionLabel && (
-          <button className={`button${controlActionLabel.includes('接管') ? '' : ' button-secondary'}`} type="button" onClick={onControlAction} disabled={controlActionPending}>
-            {controlActionLabel}
+          {embeddedActionLabel && (
+          <button className={`button${embeddedActionLabel.includes('接管') ? '' : ' button-secondary'}`} type="button" onClick={onControlAction} disabled={controlActionPending}>
+            {embeddedActionLabel}
           </button>
         )}
         {!embedded && <button className="button host-renew-button" type="button" onClick={onRenew} disabled={!host || renewing}>

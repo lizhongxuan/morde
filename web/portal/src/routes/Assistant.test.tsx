@@ -36,7 +36,6 @@ type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items']
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskFileFetch = Awaited<ReturnType<typeof portalApi.taskFileFetches>>['items'][number];
 type TaskSummary = components['schemas']['TaskSummary'];
-type TaskApprovalItem = components['schemas']['TaskApprovalItem'];
 type AcceptConversationMessageRequest = components['schemas']['AcceptConversationMessageRequest'];
 const unknownApprovalDisclosures: components['schemas']['TaskApprovalDisclosures'] = {
   risk: { state: 'unknown', summary: null },
@@ -515,7 +514,7 @@ describe('Assistant durable tasks', () => {
     expect(closeHostWorkbenchEmbed).toHaveBeenCalledWith(nonce);
   });
 
-  it('uses the configured default in the computer sidebar without binding ordinary chat messages to it', async () => {
+  it('shows availability for the configured default without a computer selector', async () => {
     mockCommon({ conversations: [conversation], hosts: [targetHost], defaultHostID: targetHost.id });
     const user = userEvent.setup();
     renderPage();
@@ -524,35 +523,30 @@ describe('Assistant durable tasks', () => {
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
 
-    expect(within(sidebar).getByRole('combobox', { name: '选择侧栏云端电脑' })).toHaveValue(targetHost.id);
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('已连接');
+    expect(within(sidebar).queryByRole('combobox')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
   });
 
-  it('only requests shared computer tabs allowed by current permissions', async () => {
+  it('does not silently select a shared computer when no default computer is configured', async () => {
     const sharedHost = {
       id: 'h7654321', name: '共享电脑', state: 'running', url: 'https://h7654321.hosts.test',
       permissions: ['desktop:view', 'terminal:control', 'workspace:file:read'],
     } satisfies Awaited<ReturnType<typeof portalApi.sharedHosts>>['items'][number];
     mockCommon({ conversations: [conversation] });
     vi.mocked(portalApi.sharedHosts).mockResolvedValue({ items: [sharedHost] });
-    const issueTicket = vi.spyOn(portalApi, 'issueHostEmbedTicket').mockResolvedValue({
-      exchange_url: `${sharedHost.url}/__ch/embed-auth`, ticket: 'C'.repeat(43), embed_nonce: 'D'.repeat(32),
-      targets: ['browser', 'workspace'], expires_at: '2026-11-12T03:00:00.000Z',
-    });
-    vi.spyOn(HTMLFormElement.prototype, 'submit').mockImplementation(() => undefined);
+    const issueTicket = vi.spyOn(portalApi, 'issueHostEmbedTicket');
     const user = userEvent.setup();
     renderPage();
 
     await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
-    await user.selectOptions(within(sidebar).getByRole('combobox', { name: '选择侧栏云端电脑' }), sharedHost.id);
-    await user.click(within(sidebar).getByRole('button', { name: '连接到此会话' }));
 
-    await waitFor(() => expect(issueTicket).toHaveBeenCalledWith(sharedHost.id, {
-      conversation_id: conversation.id, target: 'browser', targets: ['browser', 'workspace'],
-    }));
-    expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('未配置云端电脑');
+    expect(within(sidebar).getByRole('link', { name: '设置默认电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(sidebar).queryByRole('combobox')).not.toBeInTheDocument();
+    expect(issueTicket).not.toHaveBeenCalled();
   });
 
   it('renders newest-first API pages chronologically and keeps task activity out of the chat', async () => {
@@ -1048,25 +1042,19 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });
 
-  it('keeps a main-conversation API error collapsed out of the chat and allows retry', async () => {
+  it('keeps a main-conversation API error in the welcome state without service-status UI', async () => {
     mockCommon();
-    vi.spyOn(portalApi, 'mainConversation')
+    const mainConversation = vi.spyOn(portalApi, 'mainConversation')
       .mockRejectedValueOnce(new Error('主会话接口暂不可用'))
       .mockResolvedValue({ status: 'selection_required', conversation_id: null, version: 0 });
     const user = userEvent.setup();
     renderPage();
 
     expect(await screen.findByRole('heading', { name: '主会话暂不可用' })).toBeInTheDocument();
-    const status = await screen.findByRole('button', { name: /查看服务状态/ });
-    expect(status).toHaveAttribute('aria-expanded', 'false');
-    await user.click(status);
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('无法刷新服务端主会话');
-    const panel = alert.closest('.assistant-service-status-panel');
-    expect(panel?.parentElement).toBe(document.querySelector('.assistant-main'));
-    expect(panel?.previousElementSibling).toHaveClass('conversation-view-heading');
-    await user.click(within(alert).getByRole('button', { name: '重试' }));
-    await waitFor(() => expect(screen.queryByText(/无法刷新服务端主会话/)).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /查看服务状态/ })).not.toBeInTheDocument();
+    expect(document.querySelector('.assistant-service-status-panel')).toBeNull();
+    await user.click(screen.getByRole('button', { name: '重试读取主会话' }));
+    await waitFor(() => expect(mainConversation).toHaveBeenCalledTimes(2));
     expect(await screen.findByRole('heading', { name: '选择主会话' })).toBeInTheDocument();
   });
 
@@ -1312,7 +1300,9 @@ describe('Assistant durable tasks', () => {
     await screen.findByRole('heading', { name: '主会话' });
     await user.click(screen.getByRole('button', { name: '新建旁聊' }));
     expect(screen.getByRole('heading', { name: '今天想聊些什么？' })).toBeInTheDocument();
-    expect(within(screen.getByRole('complementary', { name: '对话' })).getByRole('button', { name: /主会话/ })).toBeInTheDocument();
+    const sidebar = within(screen.getByRole('complementary', { name: '对话' }));
+    expect(sidebar.getByRole('button', { name: /主会话/ })).toBeInTheDocument();
+    expect(sidebar.queryByRole('button', { name: /恢复草稿：新旁聊草稿/ })).not.toBeInTheDocument();
     expect(localStorage.getItem(key)).toBeNull();
 
     view.unmount();
@@ -1415,7 +1405,7 @@ describe('Assistant durable tasks', () => {
     await user.type(await findReadyComposer(), '新会话');
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
-    expect(create).toHaveBeenCalledWith({}, expect.any(String), clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
+    expect(create).toHaveBeenCalledWith({ title: '新会话' }, expect.any(String), clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
     expect(accept.mock.calls[0]?.[1].time_zone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
   });
 
@@ -1625,14 +1615,8 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
     expect(legacy.supported_features).not.toContain('conversation_auto_routing_v1');
-    const serviceStatusButton = await screen.findByRole('button', { name: /查看服务状态/ });
-    expect(serviceStatusButton).toHaveAttribute('aria-expanded', 'false');
-    const collapsedNotice = screen.getByText(/服务端尚未确认支持对话自动处理/);
-    expect(collapsedNotice.closest('.assistant-service-status-panel')).toHaveAttribute('hidden');
-    await user.click(serviceStatusButton);
-    const autoRoutingNotice = await screen.findByText(/服务端尚未确认支持对话自动处理/);
-    expect(autoRoutingNotice.closest('.assistant-page')).toBeInTheDocument();
-    expect(autoRoutingNotice.closest('.assistant-service-status-panel')).not.toHaveAttribute('hidden');
+    expect(screen.queryByRole('button', { name: /查看服务状态/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/服务端尚未确认支持对话自动处理/)).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole('textbox', { name: '消息内容' })).toHaveValue(''));
     await user.type(await findReadyComposer(), '第二条待发送消息');
     expect(screen.getByRole('button', { name: '发送' })).toBeEnabled();
@@ -3859,49 +3843,13 @@ describe('Assistant durable tasks', () => {
       { version: approval.version, decision }, expect.any(String)));
   });
 
-  it('restores an actionable approval snapshot inline after its user message', async () => {
+  it('does not load approval-list items or show approval-list errors in a conversation', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = {
-      id: 'k1234567', version: 4, status: 'pending', decision: '', kind: 'approval',
-      title: '确认读取工作资料', object: '工作资料', content: '读取授权目录中的文件。', impact: '会读取文件内容。',
-      disclosures: unknownApprovalDisclosures, expires_at: null, responded_at: null, created_at: timestamp,
-    } satisfies components['schemas']['TaskApprovalSnapshot'];
-    const item = { task_id: task.id, conversation_id: conversation.id, project_id: null, host_id: 'h1234567',
-      task_status: 'waiting_user', task_event_sequence: 8, task_updated_at: timestamp, approval } satisfies TaskApprovalItem;
-    vi.mocked(portalApi.taskApprovals).mockResolvedValue({ items: [item], next_cursor: null, pending_count: 1 });
-    const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockResolvedValue({
-      task_id: task.id, action: 'respond', status: 'queued', unsettled_operation_ids: [],
-    });
-    const user = userEvent.setup();
     renderPage();
 
-    const card = await screen.findByRole('region', { name: '需要批准的操作' });
-    expect(card).toHaveTextContent('读取授权目录中的文件。');
-    expect(card).toHaveTextContent('风险未知');
-    expect(screen.getAllByRole('article', { name: '你的消息' })).toHaveLength(1);
-    await user.click(within(card).getByRole('button', { name: '允许' }));
-    await waitFor(() => expect(respond).toHaveBeenCalledWith(task.id, approval.id,
-      { version: approval.version, decision: 'approve' }, expect.any(String)));
-    expect(await screen.findByText('审核已受理，任务后续状态等待更新。')).toBeInTheDocument();
-  });
-
-  it('restores handled approval snapshots inline as read-only cards', async () => {
-    mockCommon({ conversations: [conversation], messages: [message] });
-    const approval = {
-      id: 'k1234567', version: 4, status: 'approved', decision: 'approve', kind: 'approval',
-      title: '确认读取工作资料', object: '工作资料', content: '读取授权目录中的文件。', impact: '会读取文件内容。',
-      disclosures: unknownApprovalDisclosures, expires_at: null, responded_at: timestamp, created_at: timestamp,
-    } satisfies components['schemas']['TaskApprovalSnapshot'];
-    vi.mocked(portalApi.taskApprovals).mockResolvedValue({ items: [{ task_id: task.id, conversation_id: conversation.id,
-      project_id: null, host_id: null, task_status: 'queued', task_event_sequence: 9, task_updated_at: timestamp, approval }],
-      next_cursor: null, pending_count: 0 });
-    renderPage();
-
-    const card = await screen.findByRole('region', { name: '已处理的审批' });
-    expect(card).toHaveTextContent('已允许');
-    expect(card).toHaveTextContent('审批已处理；任务后续状态等待更新。');
-    expect(within(card).queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
-    expect(within(card).queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
+    expect(await screen.findByRole('article', { name: '你的消息' })).toBeInTheDocument();
+    expect(portalApi.taskApprovals).not.toHaveBeenCalled();
+    expect(screen.queryByText(/审核事项暂不可用/u)).not.toBeInTheDocument();
   });
 
   it('shows a server-confirmed expired approval and hides both decision actions', async () => {

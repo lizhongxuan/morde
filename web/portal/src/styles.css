@@ -339,8 +339,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .conversation-group { position: relative; margin-top: 8px; }
 .conversation-group-details > summary { padding: 9px 42px 9px 10px; border-radius: 8px; color: var(--muted); cursor: pointer; font-size: .88rem; }
 .conversation-group-details > summary:hover { background: #f5f8fc; }
-.morde-page .assistant-sidebar .conversation-new { position: absolute; top: 3px; right: 5px; width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; color: #7b899e; background: radial-gradient(circle, #fff 0 5px, #e2e8f1 5px 6px, transparent 6.5px); font-size: 10px; font-weight: 600; line-height: 1; }
-.morde-page .assistant-sidebar .conversation-new:hover:not(:disabled) { color: #0969e6; background: radial-gradient(circle, #f4f7ff 0 5px, #cbd8f3 5px 6px, transparent 6.5px); }
+.morde-page .assistant-sidebar .conversation-new { position: absolute; top: 3px; right: 5px; width: 28px; min-width: 28px; height: 28px; min-height: 28px; padding: 0; display: grid; place-items: center; border: 1px solid #e1e4e7; border-radius: 50%; color: #858c96; background: #fff; }
+.assistant-sidebar .conversation-new .morde-icon { width: 16px; height: 16px; }
+.morde-page .assistant-sidebar .conversation-new:hover:not(:disabled) { color: #4267e9; background: #f0f3ff; }
 .conversation-more { width: 100%; margin-top: 8px; }
 .conversation-row { display: grid; grid-template-columns: minmax(0, 1fr); }
 .conversation-item { width: 100%; padding: 11px 10px; display: grid; gap: 6px; border: 1px solid transparent; border-radius: 8px; color: var(--ink); background: transparent; cursor: pointer; text-align: left; }
@@ -1057,14 +1058,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .conversation-view-heading { flex: 0 0 76px; min-width: 0; margin: 0; padding: 13px 30px; align-items: center; border-bottom: 1px solid #eff1f5; }
 .assistant-chat-title { display: flex; align-items: center; gap: 11px; min-width: 0; }
 .assistant-header-actions { min-width: 0; display: flex; align-items: center; gap: 8px; }
-.assistant-service-status-toggle { min-height: 30px; padding: 5px 9px; display: inline-flex; align-items: center; gap: 6px; border-color: #e9ecf3; border-radius: 8px; color: #68778d; font-size: 11px; white-space: nowrap; }
-.assistant-service-status-toggle[data-state="warning"] { color: #80601d; border-color: #ead9ad; background: #fffaf0; }
-.assistant-service-status-count { min-width: 17px; height: 17px; display: inline-grid; place-items: center; border-radius: 6px; background: #eef2f6; font-size: 10px; }
-.assistant-service-status-toggle[data-state="warning"] .assistant-service-status-count { background: #f4e8c8; }
-.assistant-service-status-panel { box-sizing: border-box; width: 100%; max-height: min(30dvh, 180px); flex: none; margin: 0; padding: 9px clamp(12px, 2vw, 30px); display: grid; gap: 8px; overflow-y: auto; border-bottom: 1px solid #eff1f5; background: #fff; }
-.assistant-service-status-panel[hidden] { display: none; }
-.assistant-service-status-row { min-width: 0; margin: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; color: #68778d; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
-.assistant-service-status-row[role="alert"] { color: #8b211a; }
 .assistant-chat-title h2 { overflow: hidden; color: #27354c; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .assistant-chat-title p { margin: 4px 0 0; color: #a0acbc; font-size: 11px; }
 .assistant-logo { display: block; }
@@ -1400,7 +1393,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 
 /* Keep the Codex-style app rail narrow; the collapsible context sidebar sits beside it. */
-.morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 54px; --pc-page-sidebar-width: 0px; --pc-context-sidebar-width: 248px; }
+.morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 54px; --pc-page-sidebar-width: 0px; --pc-context-sidebar-width: 244px; }
 .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-page-sidebar-width: 0px; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed { --pc-page-sidebar-width: 0px; }
@@ -1430,15 +1423,15 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed .morde-top-control[aria-controls="context-sidebar"] .morde-icon { transform: scaleX(-1); }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed .page-navigation { display: none; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed > .morde-main { grid-column: 2 / -1; }
-.morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-context-sidebar-width: 248px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-context-sidebar-width: 210px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout { grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr); }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr) clamp(320px, 25vw, 360px); }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout { grid-template-columns: minmax(0, 1fr); }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-sidebar { display: none; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr) clamp(320px, 25vw, 360px); }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel > .assistant-task-panel { grid-column: 2; }
-@media (min-width: 621px) and (max-width: 1000px) {
-  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 52px; --pc-context-sidebar-width: 220px; }
+@media (min-width: 621px) and (max-width: 1100px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 52px; --pc-context-sidebar-width: 210px; }
   .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: var(--pc-context-sidebar-width); }
   .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr); }
 }
@@ -1457,14 +1450,18 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 
 @media (min-width: 901px) {
-  .morde-shell:not(.morde-admin-shell):has(.assistant-page) > .morde-main > .morde-page { padding: 14px clamp(14px, 1.5vw, 24px) 18px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) > .morde-main > .morde-page { padding: 14px 0 18px; }
 }
 
 .assistant-page .task-panel-computer[hidden] { display: none; }
 .assistant-page .task-panel-computer { overflow: hidden; padding: 12px; gap: 10px; }
-.assistant-page .computer-panel-toolbar { display: flex; align-items: end; gap: 8px; }
-.assistant-page .computer-panel-toolbar label { min-width: 0; flex: 1; display: grid; gap: 4px; color: var(--muted); font-size: 11px; font-weight: 650; }
-.assistant-page .computer-panel-toolbar select { width: 100%; min-width: 0; }
+.assistant-page .computer-panel-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.assistant-page .computer-panel-availability { min-width: 0; display: grid; grid-template-columns: 8px minmax(0, 1fr); align-items: center; gap: 3px 8px; color: var(--muted); font-size: 12px; }
+.assistant-page .computer-panel-availability strong { color: #56657a; font-size: 13px; font-weight: 650; }
+.assistant-page .computer-panel-availability small,
+.assistant-page .computer-panel-availability a { grid-column: 2; min-width: 0; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assistant-page .computer-panel-availability-dot { width: 8px; height: 8px; border-radius: 50%; background: #d78938; }
+.assistant-page .computer-panel-availability-dot.is-ready { background: #40a978; }
 .assistant-page .computer-panel-toolbar .button { flex: 0 0 auto; white-space: nowrap; }
 .assistant-page .computer-panel-status { display: grid; gap: 3px; color: #56657a; font-size: 12px; }
 .assistant-page .computer-panel-status small { color: var(--muted); font-size: 10px; }
@@ -1508,6 +1505,371 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .workspace-list .workspace-bind-actions select { min-height: 24px; padding-block: 3px; font-size: 10px; }
 }
 
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout { position: relative; }
+.assistant-context-resizer,
+.assistant-workspace-resizer {
+  position: absolute;
+  z-index: 12;
+  top: 0;
+  bottom: 0;
+  width: 12px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.assistant-context-resizer { left: calc(var(--pc-context-sidebar-width) - 6px); }
+.assistant-workspace-resizer { z-index: 31; display: none; right: calc(var(--pc-workspace-panel-width) - 6px); }
+.assistant-context-resizer::after,
+.assistant-workspace-resizer::after {
+  position: absolute;
+  inset: 0 auto 0 6px;
+  width: 1px;
+  background: var(--line);
+  content: '';
+}
+.assistant-context-resizer:hover::after,
+.assistant-context-resizer:focus-visible::after,
+.assistant-workspace-resizer:hover::after,
+.assistant-workspace-resizer:focus-visible::after { left: 5px; width: 2px; background: #4c77eb; }
+.assistant-context-resizer:focus-visible,
+.assistant-workspace-resizer:focus-visible { outline: 0; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed .assistant-context-resizer { display: none; }
+
+.assistant-page .task-panel-computer { position: relative; display: flex; flex-direction: column; align-items: stretch; padding: 18px; }
+.assistant-page .computer-panel-toolbar { position: relative; min-height: 42px; flex: 0 0 auto; justify-content: center; }
+.assistant-page .computer-panel-availability { display: flex; justify-content: center; gap: 8px; color: #80909a; font-size: 14px; }
+.assistant-page .computer-panel-availability strong { color: #80909a; font-size: 14px; font-weight: 500; }
+.assistant-page .computer-panel-availability small { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
+.assistant-page .computer-panel-toolbar .button { position: absolute; top: 0; right: 0; }
+.assistant-page .computer-panel-toolbar.is-workbench-ready .button { display: none; }
+.assistant-page .computer-panel-status { flex: 0 0 auto; text-align: center; }
+.assistant-page .computer-panel-status-ready { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
+.assistant-page .computer-panel-frame { display: flex; flex: 1 1 auto; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
+.assistant-page .computer-panel-frame iframe { min-height: 0; flex: 1 1 auto; background: #fff; }
+@media (max-width: 620px) {
+  .assistant-context-resizer,
+  .assistant-workspace-resizer { display: none; }
+  .assistant-page .computer-panel-toolbar { min-height: 38px; }
+  .assistant-page .computer-panel-toolbar .button { min-height: 30px; padding: 5px 8px; font-size: 11px; }
+}
+
+/* PC client shell and chat canvas aligned to the local conversation design. */
+.morde-shell:not(.morde-admin-shell) {
+  --pc-app-rail-width: 54px;
+  --pc-context-sidebar-width: 244px;
+  --pc-page-sidebar-width: 0px;
+  grid-template-columns: var(--pc-app-rail-width) var(--pc-page-sidebar-width) minmax(0, 1fr);
+  grid-template-rows: 44px minmax(0, 1fr);
+  min-height: 460px;
+  background: var(--surface, #fff);
+}
+.morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: 244px; }
+.morde-shell:not(.morde-admin-shell) > .morde-topbar {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  height: 44px;
+  min-height: 44px;
+  padding: 0 12px;
+  background: var(--surface, #fff);
+}
+.morde-shell:not(.morde-admin-shell) > .morde-sidebar {
+  grid-column: 1;
+  grid-row: 2;
+  align-items: center;
+  gap: 0;
+  padding: 12px 6px 10px;
+  overflow: visible;
+  background: #f5f5f3;
+}
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand { justify-content: center; padding: 0; margin: 0 0 18px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand > span:last-child,
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-heading { display: none; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-brand-mark { width: 38px; height: 38px; border-radius: 11px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-navigation { width: 100%; justify-items: center; gap: 8px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link {
+  width: 38px;
+  min-height: 38px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+}
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link > span:first-of-type { display: none; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link .morde-icon { width: 19px; height: 19px; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link.active { color: #252b34; background: #e6e7e5; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-nav-link.active::after { display: none; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-sidebar-bottom { width: 100%; padding: 10px 0 0; border: 0; border-top: 1px solid var(--line); }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-sidebar-bottom > .morde-navigation { padding-bottom: 0; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-profile { justify-content: center; padding: 10px 0 0; }
+.morde-shell:not(.morde-admin-shell) .morde-sidebar .morde-account-menu > summary { width: 38px; height: 38px; border-radius: 50%; color: #fff; background: #4169e8; font-size: 14px; }
+.morde-shell:not(.morde-admin-shell) > .morde-main { grid-column: 3; grid-row: 2; min-height: 0; }
+.morde-shell:not(.morde-admin-shell) > .page-navigation { grid-column: 2; grid-row: 2; padding: 12px; background: #fafaf9; }
+.morde-shell:not(.morde-admin-shell) .page-navigation nav { gap: 4px; }
+.morde-shell:not(.morde-admin-shell) .page-navigation-link { min-height: 42px; padding: 8px 10px; border-radius: 8px; color: #606978; font-size: 13px; }
+.morde-shell:not(.morde-admin-shell) .page-navigation-link.active { color: #252b34; background: #e6e7e5; }
+.morde-shell:not(.morde-admin-shell) .page-navigation-link.active .morde-icon { color: #68717e; }
+.morde-shell:not(.morde-admin-shell) .morde-account-menu-popover { background: var(--surface, #fff); }
+.morde-shell:not(.morde-admin-shell) .morde-top-navigation { gap: 2px; }
+.morde-shell:not(.morde-admin-shell) .morde-top-control { width: 30px; height: 30px; padding: 0; border: 0; border-radius: 7px; color: #737983; background: transparent; }
+.morde-shell:not(.morde-admin-shell) .morde-top-control:hover:not(:disabled) { background: #ededeb; }
+.morde-shell:not(.morde-admin-shell) .morde-top-control:disabled { color: #b6bac0; background: transparent; }
+.morde-shell:not(.morde-admin-shell) .morde-top-divider { height: 24px; margin: 0 8px; border-left: 1px solid #dfe1e2; }
+.morde-shell:not(.morde-admin-shell) .morde-top-actions { min-width: 0; gap: 7px; }
+.morde-shell:not(.morde-admin-shell) .morde-top-actions > .notice-center { margin-right: 8px; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tabs { display: flex; align-items: center; gap: 4px; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab,
+.morde-shell:not(.morde-admin-shell) .morde-workspace-icon {
+  min-height: 32px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #7c828b;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab:hover,
+.morde-shell:not(.morde-admin-shell) .morde-workspace-icon:hover,
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab-close:hover { background: #efefed; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab-wrap { display: inline-flex; align-items: center; border-radius: 8px; color: #7c828b; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab-wrap.active { color: #252b34; background: #fff; box-shadow: 0 2px 8px rgb(24 31 44 / 6%); }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab { border-radius: 8px 0 0 8px; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab .morde-icon,
+.morde-shell:not(.morde-admin-shell) .morde-workspace-icon .morde-icon { width: 16px; height: 16px; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-tab-close { width: 24px; height: 30px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 0 8px 8px 0; color: #9298a1; background: transparent; font: inherit; font-size: 16px; line-height: 1; cursor: pointer; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-add { position: relative; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-add > summary { list-style: none; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-add > summary::-webkit-details-marker { display: none; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-add-menu { position: absolute; z-index: 40; top: calc(100% + 5px); right: 0; min-width: 154px; padding: 5px; display: grid; gap: 2px; border: 1px solid #e6e8eb; border-radius: 10px; background: #fff; box-shadow: 0 10px 28px rgb(24 31 44 / 12%); }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-add-menu button { padding: 8px 10px; border: 0; border-radius: 6px; color: #4b5563; background: transparent; font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.morde-shell:not(.morde-admin-shell) .morde-workspace-add-menu button:hover { background: #f2f4f7; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace { --pc-workspace-panel-width: clamp(350px, 36vw, 660px); }
+@media (min-width: 621px) {
+  .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace {
+    --pc-workspace-panel-width: max(350px, min(var(--pc-workspace-panel-user-width, clamp(350px, 36vw, 660px)), 900px, calc(100vw - var(--pc-app-rail-width) - var(--pc-context-sidebar-width) - 320px)));
+  }
+}
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace > .morde-topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) calc(var(--pc-workspace-panel-width) - 12px);
+  gap: 0;
+  padding-right: 0;
+  padding-left: 12px;
+}
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-navigation { grid-column: 1; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-navigation-status { min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 9px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-actions-assistant {
+  grid-column: 2;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  margin-left: 0;
+  padding-left: 8px;
+  justify-content: flex-end;
+  gap: 4px;
+  border-left: 1px solid var(--line);
+}
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-workspace-tabs { min-width: 0; flex: 1 1 0; justify-content: flex-end; overflow: visible; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-workspace-tab-list { min-width: 0; flex: 1 1 0; display: flex; align-items: center; gap: 4px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-workspace-tab-list::-webkit-scrollbar { display: none; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-workspace-tab-wrap,
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-workspace-tabs > .morde-workspace-add,
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-workspace-tabs > .morde-workspace-icon,
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-actions-assistant > .morde-workspace-icon { flex: 0 0 auto; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace-collapsed > .morde-topbar { grid-template-columns: minmax(0, 1fr) 44px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace-collapsed .morde-top-actions-assistant { width: 44px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .assistant-page .conversation-view-heading.assistant-chat-heading-accessible {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  min-height: 0;
+  flex: none;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed { --pc-page-sidebar-width: 0px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed > .morde-main { grid-column: 2 / -1; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed .page-navigation { display: none; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) > .morde-main > .morde-page { height: 100%; padding: 0; overflow: hidden; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page { height: 100%; min-height: 0; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout {
+  height: 100%;
+  min-height: 0;
+  gap: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr);
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel {
+  grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr) var(--pc-workspace-panel-width);
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar,
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-main,
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel {
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface, #fff);
+  box-shadow: none;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar {
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  border-right: 0 !important;
+  background: #fafaf9;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar-heading {
+  position: static;
+  min-height: 76px;
+  margin: 0;
+  padding: 0 10px;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar-heading h2 { margin: 0; color: var(--ink); font-size: 16px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar-heading .icon-button { width: 30px; height: 30px; border: 0; color: #777d86; background: transparent; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-history-content { min-height: 0; overflow-y: auto; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-row-main .conversation-item { min-height: 48px; padding: 9px 10px; border-radius: 10px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-row-main .conversation-item { grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 8px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-main-logo { width: 26px; height: 26px; border-radius: 8px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar .conversation-item small { display: none; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar .conversation-item strong { font-size: 13px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-item.is-selected { border-color: transparent; color: var(--ink); background: #e6e7e5; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-group { margin-top: 34px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .conversation-group-details > summary { padding: 9px 42px 9px 10px; color: #777e88; font-size: 13px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .conversation-list { gap: 3px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .conversation-item { padding: 10px; border-radius: 8px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar-hint { display: none; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-main { overflow: hidden; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-view-heading {
+  min-height: 58px;
+  margin: 0;
+  padding: 0 24px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .task-panel-toggle { display: none; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .conversation-view { min-height: 0; padding: 0 24px 10px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .message-list {
+  width: min(100%, 760px);
+  padding: 28px 0 24px;
+  gap: 23px;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row { gap: 10px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row-user .chat-message-body { max-width: min(82%, 520px); }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .chat-message-user {
+  padding: 11px 15px 30px;
+  border-radius: 16px 16px 5px 16px;
+  background: #eef1f7;
+  color: #313944;
+  overflow: visible;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .chat-message-assistant { padding: 2px 0; background: transparent; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .chat-message-received { right: 7px; bottom: -12px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer {
+  flex: none;
+  padding: 6px 24px 0;
+  border: 0;
+  background: transparent;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer form {
+  width: min(100%, 760px);
+  margin: 0 auto;
+  padding: 12px 13px 10px;
+  border: 1px solid #dedfe2;
+  border-radius: 17px;
+  background: var(--surface, #fff);
+  box-shadow: 0 4px 20px rgb(31 41 55 / 5%);
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer textarea {
+  min-height: 52px;
+  max-height: 130px;
+  padding: 2px 3px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer-footer { align-items: center; flex-wrap: nowrap; gap: 8px; margin-top: 5px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer-actions { display: flex; align-items: center; gap: 6px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-attach-control,
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-voice-input { width: 30px; height: 30px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-selectors { flex: 1 1 auto; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-send {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 0;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-send span { font-size: 20px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer-hint {
+  width: min(100%, 760px);
+  margin: 7px auto 0;
+  color: #8d9198;
+  font-size: 10px;
+  text-align: center;
+}
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel { border-left: 1px solid var(--line); }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .task-panel-heading { display: none; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .task-panel-list { padding: 12px; background: var(--surface, #fff); }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .task-panel-computer { padding: 12px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .computer-panel-frame { min-height: 0; flex: 1 1 auto; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout { grid-template-columns: minmax(0, 1fr); }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-sidebar { display: none; }
+.morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr) var(--pc-workspace-panel-width); }
+@media (max-width: 1100px) and (min-width: 621px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 50px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: 210px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) { --pc-context-sidebar-width: 210px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace { --pc-workspace-panel-width: min(var(--pc-workspace-panel-user-width, 380px), 380px, calc(100vw - var(--pc-app-rail-width) - var(--pc-context-sidebar-width))); }
+  .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace-collapsed { --pc-workspace-panel-width: 44px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: var(--pc-context-sidebar-width) minmax(0, 1fr); }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-task-panel { position: absolute; z-index: 30; inset: 0 0 0 auto; width: min(var(--pc-workspace-panel-width), calc(100% - 210px)); border-left: 1px solid var(--line); box-shadow: 0 12px 36px rgb(20 40 65 / 18%); }
+}
+@media (max-width: 620px) {
+  .morde-shell:not(.morde-admin-shell) { --pc-app-rail-width: 48px; }
+  .morde-shell:not(.morde-admin-shell).morde-shell-with-page-navigation { --pc-page-sidebar-width: 176px; }
+  .morde-shell:not(.morde-admin-shell) > .morde-sidebar { padding-inline: 4px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout,
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-sidebar { max-height: min(160px, 24dvh); padding: 0 10px 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar-heading { min-height: 48px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-task-panel .assistant-task-panel { position: absolute; z-index: 30; inset: 0 0 0 auto; width: min(380px, calc(100% - 8px)); border: 1px solid var(--line); box-shadow: 0 12px 36px rgb(20 40 65 / 18%); }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .morde-workspace-tab { min-width: 30px; padding-inline: 5px; font-size: 0; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .morde-workspace-tab .morde-icon { width: 17px; height: 17px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .morde-workspace-tab-close { width: 18px; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer { padding-inline: 10px; }
+}
+
+@media (min-width: 621px) {
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-workspace-resizer { display: block; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel { border-left: 0; }
+}
+@media (min-width: 1101px) and (max-width: 1280px) {
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-layout-with-computer-panel > .assistant-workspace-resizer { right: calc(var(--pc-workspace-panel-width) - 18px); }
+}
+@media (min-width: 1281px) and (max-width: 1440px) {
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-layout-with-task-panel:not(.assistant-layout-with-computer-panel) > .assistant-task-panel { width: calc(var(--pc-workspace-panel-width) - 12px); }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-layout-with-task-panel:not(.assistant-layout-with-computer-panel) > .assistant-workspace-resizer { right: calc(var(--pc-workspace-panel-width) - 18px); }
+}
+
 .morde-shell:not(.morde-admin-shell) .morde-page .connections-page { width: min(100%, 980px); margin-inline: auto; display: flex; flex-direction: column; }
 .connections-page .model-page-intro { margin: 0 0 18px; }
 .connections-page .model-page-intro h1 { margin: 0 0 5px; font-size: 1.6rem; }
@@ -1520,10 +1882,8 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .connections-page .connection-section-heading { align-items: center; margin: 0 0 16px; padding: 0; border: 0; }
 .connections-page .connection-section-heading h2 { margin: 0 0 4px; font-size: 1.15rem; }
 .connections-page .connection-section-heading p { margin: 0; }
-.connections-page .connection-form { gap: 14px; padding: 16px; border-radius: 12px; box-shadow: none; }
-.connections-page .connection-form-heading { display: flex; align-items: baseline; gap: 10px; }
-.connections-page .connection-form-heading h3 { margin: 0; font-size: 1rem; }
-.connections-page .connection-form-heading span { color: var(--muted); font-size: .8rem; }
+.connections-page .connection-form { gap: 14px; }
+.connections-page .connection-form-modal { padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .connections-page .connection-form-grid { gap: 12px; }
 .connections-page .connection-form-grid > div { gap: 6px; }
 .connections-page .connection-form small { font-size: .78rem; line-height: 1.4; }
@@ -1533,7 +1893,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .connections-page .connection-form-advanced-grid { margin-top: 12px; }
 .connections-page .form-actions { align-items: center; justify-content: space-between; flex-wrap: wrap; }
 .connections-page .form-actions > span { display: flex; flex-wrap: wrap; gap: 8px; }
-.connections-page .form-actions > small { max-width: 360px; }
 .connections-page .connection-empty { min-height: 0; padding: 18px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; text-align: left; }
 .connections-page .connection-empty h3, .connections-page .connection-empty p { margin: 0; }
 .connections-page .model-connection-list { gap: 10px; }
@@ -1559,6 +1918,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .connections-page .model-check-result { margin: 10px 0 0 !important; }
 .morde-shell:not(.morde-admin-shell) .morde-page .connections-page > .connection-section { background: transparent; border: 0; box-shadow: none; }
 .morde-shell:not(.morde-admin-shell) .morde-page .connections-page .connection-form { background: var(--surface); box-shadow: none; }
+.morde-shell:not(.morde-admin-shell) .morde-page .connections-page .connection-form-modal { background: transparent; }
 .morde-shell:not(.morde-admin-shell) .morde-page .connections-page .model-connection-card { background: var(--surface); box-shadow: 0 5px 18px rgb(26 44 80 / 4%); }
 .morde-shell:not(.morde-admin-shell) .morde-page .connections-page .connection-area-tabs .button-secondary { color: #6d7b92; background: transparent; }
 .morde-shell:not(.morde-admin-shell) .morde-page .connections-page .connection-area-tabs .button-primary { color: #315fe0; background: #fff; }
@@ -1727,7 +2087,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:not(.morde-admin-shell) .morde-page .host-control,
   .morde-shell:not(.morde-admin-shell) .morde-page .host-secondary-content,
   .morde-shell:not(.morde-admin-shell) .morde-page .conversation-item,
-  .morde-shell:not(.morde-admin-shell) .morde-page .assistant-service-status-panel,
   .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-card,
   .morde-shell:not(.morde-admin-shell) .morde-page .task-file-card,
   .morde-shell:not(.morde-admin-shell) .morde-page .config-snippet,
@@ -1804,8 +2163,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:not(.morde-admin-shell) .morde-page .status-pausing,
   .morde-shell:not(.morde-admin-shell) .morde-page .status-paused,
   .morde-shell:not(.morde-admin-shell) .morde-page .status-waiting_user,
-  .morde-shell:not(.morde-admin-shell) .morde-page .notice-warning,
-  .morde-shell:not(.morde-admin-shell) .morde-page .assistant-service-status-toggle[data-state="warning"] { color: var(--pc-yellow-text); border-color: #66532a; background: var(--pc-yellow-bg); }
+  .morde-shell:not(.morde-admin-shell) .morde-page .notice-warning { color: var(--pc-yellow-text); border-color: #66532a; background: var(--pc-yellow-bg); }
   .morde-shell:not(.morde-admin-shell) .morde-page .status-failed,
   .morde-shell:not(.morde-admin-shell) .morde-page .error-card,
   .morde-shell:not(.morde-admin-shell) .morde-page .error-inline,
@@ -1815,8 +2173,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:not(.morde-admin-shell) .morde-page .status-stopping,
   .morde-shell:not(.morde-admin-shell) .morde-page .status-deleting,
   .morde-shell:not(.morde-admin-shell) .morde-page .status-cancelling,
-  .morde-shell:not(.morde-admin-shell) .morde-page .notice-info,
-  .morde-shell:not(.morde-admin-shell) .morde-page .assistant-service-status-toggle { color: var(--pc-blue-text); border-color: #3a5272; background: var(--pc-blue-bg); }
+  .morde-shell:not(.morde-admin-shell) .morde-page .notice-info { color: var(--pc-blue-text); border-color: #3a5272; background: var(--pc-blue-bg); }
   .morde-shell:not(.morde-admin-shell) .morde-page :focus-visible { outline-color: var(--focus); }
 }
 

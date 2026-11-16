@@ -7,6 +7,7 @@ import { errorDetails, portalApi as api } from '../app/api';
 import { modelConnectionPresets } from '../app/model-presets';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
+import { Modal } from '../components/Modal';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { MCPConnectorsPanel } from './MCPConnectorsPanel';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
@@ -41,7 +42,6 @@ export function Connections() {
   const [presetID, setPresetID] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<{ error: Error; clearedKey: boolean } | null>(null);
   const [checked, setChecked] = useState<{ id: string; capabilities: ModelConnection['capabilities'] } | null>(null);
   const sharedModels = models.data?.items.filter((model) => model.shared) ?? [];
   const personalModels = models.data?.items.filter((model) => !model.shared) ?? [];
@@ -81,12 +81,11 @@ export function Connections() {
     const submittedDraft = draft;
     const apiKey = submittedDraft.apiKey.trim();
     if (submittedDraft.apiKey && !apiKey) {
-      setSaveError({ error: new Error('API 密钥不能为空。'), clearedKey: false });
+      notify('API 密钥不能为空。', 'error');
       return;
     }
     setSaving(true);
     setDraft((current) => ({ ...current, apiKey: '' }));
-    setSaveError(null);
     try {
       const connection = {
         name: submittedDraft.name.trim(), base_url: submittedDraft.baseURL.trim(), model_name: submittedDraft.modelName.trim(),
@@ -100,7 +99,6 @@ export function Connections() {
       setAdvancedOpen(false);
       setFormOpen(false);
       setEditingID(null);
-      setSaveError(null);
       setChecked(null);
       await refreshModels();
       if (!editingID) {
@@ -114,7 +112,7 @@ export function Connections() {
       }
     } catch (error) {
       setAdvancedOpen(true);
-      setSaveError({ error: error instanceof Error ? error : new Error('保存个人模型失败。'), clearedKey: Boolean(apiKey) });
+      notify(`${modelConnectionSaveErrorMessage(error)}${apiKey ? ' 密钥已清除，请重新输入后重试。' : ''}`, 'error');
     } finally {
       setSaving(false);
     }
@@ -126,7 +124,6 @@ export function Connections() {
     setPresetID('');
     setAdvancedOpen(false);
     setEditingID(null);
-    setSaveError(null);
     setFormOpen(false);
   };
 
@@ -136,7 +133,6 @@ export function Connections() {
     setDraft({ name: model.name, baseURL: model.base_url, modelName: model.model_name, contextWindowTokens: model.context_window_tokens ? String(model.context_window_tokens) : '', apiKey: '' });
     setPresetID('custom');
     setAdvancedOpen(true);
-    setSaveError(null);
     check.reset();
     setFormOpen(true);
   }} />;
@@ -151,10 +147,9 @@ export function Connections() {
     </div>
     <section className="connection-section" aria-labelledby="personal-models-title" hidden={activeArea !== 'personal'}>
       <div className="connection-section-heading"><div><h2 id="personal-models-title">个人模型</h2><p className="muted">使用自己的 API 密钥，仅当前账号可见。</p></div>
-        <button type="button" aria-label="添加个人模型" className="button button-primary" onClick={() => { setDraft(emptyDraft); setPresetID(''); setAdvancedOpen(false); setEditingID(null); setFormOpen(true); setSaveError(null); check.reset(); }}>＋ 添加模型</button>
+        <button type="button" aria-label="添加个人模型" className="button button-primary" onClick={() => { setDraft(emptyDraft); setPresetID(''); setAdvancedOpen(false); setEditingID(null); setFormOpen(true); check.reset(); }}>＋ 添加模型</button>
       </div>
-      {formOpen && <form className="connection-form form-card" onSubmit={submit}>
-        <div className="connection-form-heading"><h3>{editingID ? '编辑个人模型' : '添加个人模型'}</h3><span>仅当前账号可见</span></div>
+      {formOpen && <Modal title={editingID ? '编辑个人模型' : '添加个人模型'} onClose={cancelForm}><form className="connection-form connection-form-modal" onSubmit={submit}>
         <div className="connection-form-grid">
           <div className="connection-form-wide"><label htmlFor="personal-model-preset">选择服务和模型</label><select id="personal-model-preset" value={presetID} required onChange={(event) => {
             const preset = modelConnectionPresets.find((item) => item.id === event.target.value);
@@ -173,8 +168,8 @@ export function Connections() {
             <optgroup label="Z.ai / GLM">
               {modelConnectionPresets.filter((preset) => preset.id.startsWith('glm-')).map((preset) => <option key={preset.id} value={preset.id}>{preset.modelName}</option>)}
             </optgroup>
-          </select><small className="muted">预设会自动填写名称、模型名和服务地址。</small></div>
-          <div className="connection-form-wide"><label htmlFor="personal-model-api-key">API 密钥</label><input id="personal-model-api-key" type="password" autoComplete="new-password" value={draft.apiKey} maxLength={4096} required={!editingID} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} /><small className="muted">{editingID ? '留空保留已保存的密钥；输入新值才会替换。' : '密钥会加密保存，保存后不会显示。'}</small></div>
+          </select></div>
+          <div className="connection-form-wide"><label htmlFor="personal-model-api-key">API 密钥</label><input id="personal-model-api-key" type="password" autoComplete="new-password" value={draft.apiKey} maxLength={4096} required={!editingID} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} /></div>
           <details className="connection-form-advanced connection-form-wide" open={advancedOpen} onToggle={(event) => {
             const details = event.currentTarget;
             if (!details.open && details.querySelector(':invalid')) details.open = true;
@@ -189,9 +184,8 @@ export function Connections() {
             </div>
           </details>
         </div>
-        {saveError && <FloatingError className="error-inline" role="alert">{modelConnectionSaveErrorMessage(saveError.error)}{saveError.clearedKey && ' 密钥已清除，请重新输入后重试。'}</FloatingError>}
-        <div className="form-actions"><small className="muted">保存后会检查连接，可能产生少量服务商费用。</small><span><button type="button" className="button button-secondary" disabled={saving} onClick={cancelForm}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? '正在保存…' : editingID ? '保存修改' : '保存并检查连接'}</button></span></div>
-      </form>}
+        <div className="form-actions"><span><button type="button" className="button button-secondary" disabled={saving} onClick={cancelForm}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? '正在保存…' : editingID ? '保存修改' : '保存并检查连接'}</button></span></div>
+      </form></Modal>}
       {models.isPending || (!models.data && isTransientNetworkError(models.error)) ? <div className="loading-card" role="status">正在读取模型连接…</div>
         : models.isError && !isTransientNetworkError(models.error) ? <FloatingError className="error-card" role="alert">{errorDetails(models.error).message}<button className="button button-secondary" type="button" onClick={() => void models.refetch()}>重试</button></FloatingError>
           : !models.data ? <div className="loading-card" role="status">正在读取模型连接…</div>

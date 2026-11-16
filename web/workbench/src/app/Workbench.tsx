@@ -783,6 +783,7 @@ export default function Workbench() {
         </section>
       ) : (
         <>
+          <div className="workbench-content">
           {(!embedded || host) && <nav ref={workbenchTabsRef} className="workbench-tabs" aria-label="工作台功能">
             <div className="primary-tabs">
               {visibleTabs.map((tab) => {
@@ -878,7 +879,6 @@ export default function Workbench() {
               </div>
             )}
           </nav>}
-          <div className="workbench-content">
             {loadedTabs.has('browser') && (
               <div ref={browserPanelRef} className="tab-panel tab-panel-browser" aria-hidden={visibleActive !== 'browser'} inert={visibleActive !== 'browser'}>
                 {browserStatus !== 'connected' && (
