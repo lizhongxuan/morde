@@ -39,11 +39,6 @@ const sections: Array<{ id: Section; title: string }> = [
   { id: 'ideas', title: '灵感' }, { id: 'library', title: '资源库' }, { id: 'preferences', title: '偏好' },
 ];
 
-const profileStyles = [
-  ['', '默认'], ['muse', 'Muse'], ['flat', '扁平'], ['clay', '黏土'],
-  ['watercolor', '水彩'], ['pixel', '像素'], ['line', '线稿'], ['sticker', '贴纸'],
-] as const;
-
 function personalAPIFor(serviceInstanceID: string | undefined, actorID: string | undefined): PersonalDataAPI {
   const base = portalApi as unknown as PersonalDataAPI;
   if (!serviceInstanceID || !actorID) return base;
@@ -497,9 +492,7 @@ export function PersonalData() {
     <div className="design-panel-header">
       <div><h2>我的数据</h2><p>管理个人资料、AI 个性、记忆、动态、灵感和资源库。</p></div>
     </div>
-    <div className="connection-section-heading personal-sync-status" aria-live="polite">
-      <p className="muted">{syncing ? '正在更新云端数据…' : state?.syncError ? '云端更新待重试' : '保存后自动更新云端'} · {pendingCount} 项待提交 · {conflicts.length} 条冲突草稿</p>
-    </div>
+    <p className="sr-only" aria-live="polite">{syncing ? '正在更新云端数据…' : state?.syncError ? '云端更新待重试' : '保存后自动更新云端'} · {pendingCount} 项待提交 · {conflicts.length} 条冲突草稿</p>
 
     {!serviceInstanceID && <FloatingNotice className="notice-warning">正在确认服务实例；此期间新保存内容只会保存在本机，不会提交到未确认的服务。</FloatingNotice>}
 
@@ -565,7 +558,6 @@ export function PersonalData() {
 
     {state && !remoteLoading && activeSection === 'profile' && <section className="connection-section" aria-labelledby="personal-profile-title">
       <div className="connection-section-heading"><div><h2 id="personal-profile-title" className="sr-only">个人资料</h2><p className="muted">这里只保存服务端允许的资料字段。</p></div></div>
-      {!profileObject && <p className="empty-card">还没有个人资料。保存后会创建默认资料。</p>}
       <ProfileEditor key={`${profileObject?.revision ?? 0}:${JSON.stringify(profileObject?.body ?? null)}`} value={profileObject} fallbackName={user?.name ?? ''}
         hasConflict={conflicts.some((item) => item.objectType === 'profile' && item.objectID === 'default')}
         onSave={(body) => void saveObject('profile', 'default', body as unknown as PersonalObjectBody)} onInvalid={setActionError} />
@@ -710,13 +702,7 @@ function ProfileEditor({ value, fallbackName, hasConflict, onSave, onInvalid }: 
   };
   return <form className="form-card form-stack" onSubmit={save}>
     <label>名称<input value={profile.name} maxLength={60} required onChange={(event) => setProfile({ ...profile, name: event.target.value })} /></label>
-    <label>头像<select value={profile.avatar} onChange={(event) => setProfile({ ...profile, avatar: event.target.value as ProfileBody['avatar'], emoji: '', color: '#E8B85A' })}><option value="dragon">龙</option><option value="emoji">表情</option></select></label>
-    {profile.avatar === 'emoji' && <>
-      <label>表情<input value={profile.emoji ?? ''} maxLength={16} required onChange={(event) => setProfile({ ...profile, emoji: event.target.value })} /></label>
-      <label>颜色<input type="color" value={profile.color ?? '#E8B85A'} onChange={(event) => setProfile({ ...profile, color: event.target.value })} /></label>
-    </>}
     <label>简介<textarea value={profile.description ?? ''} maxLength={200} onChange={(event) => setProfile({ ...profile, description: event.target.value })} /></label>
-    <label>风格<select value={profile.style ?? ''} onChange={(event) => setProfile({ ...profile, style: event.target.value })}>{profileStyles.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
     <button type="submit" className="button button-primary">{hasConflict ? '基于远端版本保存草稿' : '保存个人资料'}</button>
   </form>;
 }

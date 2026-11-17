@@ -199,7 +199,7 @@ describe('PersonalData', () => {
     expect(screen.queryByLabelText('选择旧版 profile.json')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('选择旧版 rooms.json')).not.toBeInTheDocument();
     await waitFor(() => expect(apiMocks.snapshot).toHaveBeenCalledWith(undefined, 100));
-    expect(screen.getByText('还没有个人资料。保存后会创建默认资料。')).toBeInTheDocument();
+    expect(screen.queryByText('还没有个人资料。保存后会创建默认资料。')).not.toBeInTheDocument();
 
     await user.clear(screen.getByLabelText('名称'));
     await user.type(screen.getByLabelText('名称'), 'Alice Morde');

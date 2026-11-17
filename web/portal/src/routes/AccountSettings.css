@@ -1,0 +1,31 @@
+.account-settings-page { width: min(734px, 100%); margin: 40px auto 48px; }
+.account-settings-heading h1 { margin: 0; color: var(--ink); font-size: 27px; line-height: 1.28; }
+.account-settings-heading p { margin: 9px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.account-settings-tabs { margin: 34px 0 31px; display: flex; gap: 24px; border-bottom: 1px solid var(--line); }
+.account-settings-page .account-settings-tab { position: relative; min-height: 0; padding: 0 1px 13px; border: 0; border-radius: 0; color: var(--muted); background: transparent; cursor: pointer; font-size: 13px; font-weight: 600; }
+.account-settings-page .account-settings-tab[aria-selected="true"] { color: var(--ink); }
+.account-settings-page .account-settings-tab[aria-selected="true"]::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; border-radius: 2px; background: #4263d6; content: ''; }
+.account-settings-page .account-settings-tab:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.account-settings-panel { min-width: 0; }
+.account-settings-card-heading { margin: 0 0 15px; }
+.account-settings-page .account-settings-card-heading h2 { margin: 0; color: var(--ink); font-size: 15px; font-weight: 650; }
+.account-settings-card-heading p { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.account-settings-card-body { padding: 0 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 2px 10px rgb(52 75 86 / 3%); }
+.account-settings-account-row { min-height: 84px; padding: 18px 0; display: flex; align-items: center; gap: 15px; }
+.account-settings-avatar { width: 40px; height: 40px; flex: none; display: grid; place-items: center; border-radius: 12px; color: #4b65b0; background: #e9eefb; font-size: 16px; font-weight: 700; }
+.account-settings-account-copy { min-width: 0; }
+.account-settings-name { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.account-settings-page .account-settings-name h3, .account-settings-page .account-settings-action-row h3 { margin: 0; color: var(--ink); font-size: 14px; font-weight: 600; }
+.account-settings-account-copy p, .account-settings-action-row p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.account-settings-page .account-settings-name .status { padding: 3px 7px; border-radius: 6px; font-size: 11px; font-weight: 500; }
+.account-settings-action-row { min-height: 84px; padding: 18px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid var(--line); }
+.account-settings-page .account-settings-action-row .button { min-height: 32px; padding: 7px 11px; border-radius: 7px; font-size: 12px; }
+.account-settings-info-block { padding: 18px 0; display: grid; gap: 10px; }
+.account-settings-info-block + .account-settings-info-block { border-top: 1px solid var(--line); }
+.account-settings-page .account-settings-info-block h3 { margin: 0; color: var(--ink); font-size: 13px; font-weight: 600; }
+.account-settings-info-block > div > p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.account-settings-page .account-settings-info-block > .notice { width: 100%; max-width: none; margin: 0; }
+.account-settings-page .account-settings-info-block > .error-inline { margin: 0; }
+@media (max-width: 900px) { .account-settings-page { margin-top: 28px; } }
+@media (max-width: 600px) { .account-settings-action-row { align-items: flex-start; flex-direction: column; gap: 10px; } }
+@media (prefers-color-scheme: dark) { .account-settings-avatar { color: var(--pc-blue-text); background: var(--pc-blue-bg); } }

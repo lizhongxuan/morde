@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
-import type { FormEvent } from 'react';
+import type { FormEvent, ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Modal } from '../components/Modal';
 import { ScreenPagination } from '../components/ScreenPagination';
+import { MordeIcon } from '../components/MordeIcon';
 import { FloatingError } from '../components/FloatingError';
 
 type Connector = Awaited<ReturnType<typeof portalApi.mcpConnectors>>['items'][number];
@@ -60,7 +62,7 @@ function parseCredential(text: string): Record<string, unknown> | undefined {
   return parsed as Record<string, unknown>;
 }
 
-export function MCPConnectorsPanel() {
+export function MCPConnectorsPanel({ areaTabs }: { areaTabs: ReactNode }) {
   const client = useQueryClient();
   const { notify } = useToast();
   const connectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
@@ -96,6 +98,13 @@ export function MCPConnectorsPanel() {
     onError: (error) => notify(errorDetails(error).message, 'error'),
   });
 
+  const cancelCreate = () => {
+    if (creating) return;
+    setShowCreate(false);
+    setDraft(blankDraft);
+    setPresetID('custom');
+    setGithubToken('');
+  };
   const submitCreate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const submittedGitHubToken = githubToken.trim();
@@ -251,11 +260,13 @@ export function MCPConnectorsPanel() {
     </div>
   </article>;
 
-  return <section className="connection-section" aria-labelledby="mcp-connectors-title">
+  return <section className="connection-section mcp-connection-section" aria-labelledby="mcp-connectors-title">
     <div className="connection-section-heading"><div><h2 id="mcp-connectors-title">MCP 工具连接</h2><p className="muted">连接你信任的 MCP 服务；启用的连接只会授权给你之后新建的任务。地址仅支持 HTTPS 公网服务。</p></div>
-      <button type="button" className="button button-primary" aria-expanded={showCreate} disabled={creating} onClick={() => setShowCreate((open) => !open)}>{showCreate ? '收起' : '＋ 添加工具连接'}</button>
+      <button type="button" className="button button-primary" aria-haspopup="dialog" onClick={() => setShowCreate(true)}>＋ 添加工具连接</button>
     </div>
-    {showCreate && <form className="connection-form form-card" onSubmit={submitCreate}>
+    {areaTabs}
+    <h3 className="connections-list-title">工具连接</h3>
+    {showCreate && <Modal title="添加工具连接" onClose={cancelCreate}><form className="connection-form connection-form-modal" onSubmit={submitCreate}>
       <div className="connection-form-grid">
         <div className="connection-form-wide"><label htmlFor="mcp-connector-preset">连接模板</label><select id="mcp-connector-preset" value={presetID} onChange={(event) => {
           const selected = event.target.value as keyof typeof connectorPresets;
@@ -274,12 +285,12 @@ export function MCPConnectorsPanel() {
           : connectorPresets[presetID].kind === 'google_workspace' ? <p className="connection-form-wide muted">此服务使用 Google OAuth。连接保存后，在连接卡片中启动授权；Morde 不要求你粘贴 Google 访问令牌。</p>
             : <div className="connection-form-wide"><label htmlFor="mcp-connector-credential">认证凭据 JSON（可选）</label><textarea id="mcp-connector-credential" rows={3} maxLength={32768} autoComplete="off" spellCheck={false} value={draft.credentialJSON} onChange={(event) => setDraft((current) => ({ ...current, credentialJSON: event.target.value }))} placeholder={'{"kind":"headers","headers":{"Authorization":"Bearer …"}}'} /><small className="muted">仅接受服务端支持的请求头凭据格式。提交后立即清空并由 Morde 加密保存；不要粘贴共享账号的密钥。</small></div>}
       </div>
-      <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={() => { setShowCreate(false); setDraft(blankDraft); setPresetID('custom'); setGithubToken(''); }}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
-    </form>}
+      <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={cancelCreate}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
+    </form></Modal>}
     {connectors.isPending || (!connectors.data && isTransientNetworkError(connectors.error)) ? <div className="loading-card" role="status">正在读取工具连接…</div>
       : connectors.isError && !isTransientNetworkError(connectors.error) ? <FloatingError className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>
         : !connectors.data ? <div className="loading-card" role="status">正在读取工具连接…</div>
-        : !connectors.data.items.length ? <div className="empty-card connection-empty"><h3>尚未添加 MCP 工具</h3><p>连接器可在发送任务时按需授权，未选择的连接不会提供给任务。</p></div>
+        : !connectors.data.items.length ? <><div className="connection-empty"><span className="connection-empty-icon" aria-hidden="true"><MordeIcon name="link" /></span><h3>尚未添加工具连接</h3><p>启用的连接可用于之后新建的任务。</p></div><p className="connection-empty-note"><MordeIcon name="info" />连接地址仅支持 HTTPS 公网服务。</p></>
         : connectors.data.items.length === 1 ? <div className="model-connection-list">{renderConnector(connectors.data.items[0]!)}</div>
           : <ScreenPagination
             items={connectors.data.items}

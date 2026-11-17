@@ -7,6 +7,7 @@ import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Modal } from '../components/Modal';
 import { OnceSecretDialog } from '../components/OnceSecretDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { FloatingError } from '../components/FloatingError';
@@ -45,12 +46,12 @@ export function ApiKeys() {
   const create = useMutation({
     mutationFn: async (body: Parameters<typeof portalApi.createApiKey>[0]) => {
       const result = await portalApi.createApiKey(body);
+      setShowCreate(false);
       setSecret({ key: result.key, expires_at: result.expires_at });
     },
     onSuccess: () => {
       setName('');
       setTtl('');
-      setShowCreate(false);
       void client.invalidateQueries({ queryKey: ['apikeys'] });
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
@@ -65,6 +66,13 @@ export function ApiKeys() {
     const seconds = ttl ? Number(ttl) * 86400 : undefined;
     create.mutate({ name: name.trim(), ...(seconds ? { ttl_seconds: seconds } : {}) });
   };
+  const cancelCreate = () => {
+    if (create.isPending) return;
+    setShowCreate(false);
+    setName('');
+    setTtl('');
+    create.reset();
+  };
   const mcpURL = `${document.querySelector<HTMLMetaElement>('meta[name="morde-service-origin"]')?.content || window.location.origin}/mcp`;
   const copyEndpoint = async () => {
     try { await navigator.clipboard.writeText(mcpURL); notify('MCP 地址已复制。', 'success'); }
@@ -78,17 +86,19 @@ export function ApiKeys() {
       <p className="mcp-setup-summary">创建 API Key 后，在 AI 客户端配置地址和密钥。权限随账号授权变化；密钥仅创建时显示，吊销后后续请求会被拒绝。</p>
     </section>
     <section className="design-panel" aria-labelledby="api-key-list-title">
-    <div className="design-panel-header"><div><h2 id="api-key-list-title">我的密钥</h2><p>创建后自动获得当前账号可用的权限。</p></div><button type="button" className="button button-primary" aria-expanded={showCreate} disabled={create.isPending} onClick={() => setShowCreate((open) => !open)}>{showCreate ? '收起' : '＋ 创建 API Key'}</button></div>
-    {showCreate && <form className="form-card apikey-form" onSubmit={(event) => void submit(event)}>
-      <h2>创建 API Key</h2>
+    <div className="design-panel-header"><div><h2 id="api-key-list-title">我的密钥</h2><p>创建后自动获得当前账号可用的权限。</p></div><button type="button" className="button button-primary" aria-haspopup="dialog" onClick={() => setShowCreate(true)}>＋ 创建 API Key</button></div>
+    {showCreate && <Modal title="创建 API Key" onClose={cancelCreate}><form className="apikey-form" onSubmit={submit}>
       <div className="inline-form">
         <div><label htmlFor="apikey-name">名称</label><input id="apikey-name" required maxLength={100} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：个人自动化" /></div>
         <div><label htmlFor="apikey-ttl">有效期（天，可选）</label><input id="apikey-ttl" type="number" min={1} max={365} value={ttl} onChange={(event) => setTtl(event.target.value)} placeholder="最长 365 天" /></div>
       </div>
-      <button className="button button-primary" type="submit" disabled={!name.trim() || create.isPending}>
-        {create.isPending ? '创建中…' : '创建 API Key'}
-      </button>
-    </form>}
+      <div className="form-actions">
+        <button type="button" className="button button-secondary" disabled={create.isPending} onClick={cancelCreate}>取消</button>
+        <button className="button button-primary" type="submit" disabled={!name.trim() || create.isPending}>
+          {create.isPending ? '创建中…' : '创建 API Key'}
+        </button>
+      </div>
+    </form></Modal>}
 
     {keys.isPending || (!keys.data && isTransientNetworkError(keys.error)) ? <div className="loading-card" role="status">正在加载…</div>
       : keys.isError && !isTransientNetworkError(keys.error) ? <FloatingError className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError>

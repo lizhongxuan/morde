@@ -139,10 +139,8 @@ describe('Workbench MVP navigation', () => {
     })));
     await waitFor(() => expect(app!).not.toHaveAttribute('inert'));
     expect(controlQuery).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
-    expect(screen.queryByRole('button', { name: 'Workspace' })).not.toBeInTheDocument();
-    expect([...container.querySelectorAll<HTMLButtonElement>('.tab-button')].map((button) => button.dataset.tab))
-      .toEqual(['browser', 'terminal', 'files', 'vscode']);
+    expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
+    expect(screen.getByTitle('远程桌面')).toBeVisible();
   });
 
   it('uses the native nonce bridge for a top-level Workbench and reports its authorized state', async () => {
@@ -170,36 +168,29 @@ describe('Workbench MVP navigation', () => {
     })));
   });
 
-  it('shows only server-authorized embed targets and falls back when the requested tab is not authorized', async () => {
+  it('hides embedded navigation and falls back to the first authorized target', async () => {
     Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
     vi.mocked(gatewayApi.host).mockResolvedValue({ ...host, embed_targets: ['browser', 'terminal'] });
     window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'a'.repeat(32)}&tab=workspace`);
-    render(<Workbench />);
+    const { container } = render(<Workbench />);
     showEmbeddedWorkbench('a'.repeat(32));
 
-    const browser = await screen.findByRole('button', { name: '浏览器' });
-    expect(browser).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByRole('button', { name: '终端' })).toBeVisible();
-    expect(screen.queryByRole('button', { name: '文件' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Workspace' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'VS Code' })).not.toBeInTheDocument();
+    expect(await screen.findByTitle('远程桌面')).toBeVisible();
+    expect(container.querySelector('.tab-panel-terminal')).toBeNull();
+    expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
     expect(gatewayApi.control).toHaveBeenCalled();
     expect(gatewayApi.workspaces).not.toHaveBeenCalled();
   });
 
-  it('keeps the complete authorized tab bar when Workspace is the requested embedded tab', async () => {
+  it('opens the requested Workspace directly without embedded navigation', async () => {
     Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
     vi.mocked(gatewayApi.host).mockResolvedValue({ ...host, embed_targets: ['browser', 'workspace', 'files'] });
     window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'w'.repeat(32)}&tab=workspace`);
     render(<Workbench />);
     showEmbeddedWorkbench('w'.repeat(32));
 
-    expect(await screen.findByRole('button', { name: '浏览器' })).toBeVisible();
-    const files = screen.getByRole('button', { name: '文件' });
-    expect(files).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByRole('button', { name: '浏览器' })).toBeVisible();
-    expect(screen.queryByRole('button', { name: '终端' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'VS Code' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
+    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
     await waitFor(() => expect(gatewayApi.workspaces).toHaveBeenCalledOnce());
     expect(gatewayApi.control).toHaveBeenCalled();
   });
@@ -211,8 +202,8 @@ describe('Workbench MVP navigation', () => {
     render(<Workbench />);
     showEmbeddedWorkbench('s'.repeat(32));
 
-    expect(await screen.findByRole('button', { name: '文件' })).toBeVisible();
-    expect(screen.getByRole('button', { name: '文件' })).toHaveAttribute('aria-current', 'page');
+    expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
+    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
     expect(gatewayApi.control).not.toHaveBeenCalled();
     await waitFor(() => expect(gatewayApi.workspaces).toHaveBeenCalledOnce());
   });

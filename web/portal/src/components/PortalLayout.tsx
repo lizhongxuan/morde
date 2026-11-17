@@ -6,21 +6,20 @@ import { ToastNoticeCenter, useToast } from '../app/toast';
 import { ConfirmDialog } from './ConfirmDialog';
 import { MordeIcon, type MordeIconName } from './MordeIcon';
 
-const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean }[] = [
+const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: boolean; view?: 'goals' | 'schedules' }[] = [
   { to: '/assistant', label: '对话', icon: 'chat' },
   { to: '/reviews', label: '审核', icon: 'shield' },
-  { to: '/personal', label: '个人数据', icon: 'user' },
-  { to: '/goals', label: '目标与计划', icon: 'target' },
+  { to: '/goals?view=goals', label: '目标', icon: 'target', view: 'goals' },
+  { to: '/goals?view=schedules', label: '定时计划', icon: 'refresh', view: 'schedules' },
 ];
 
 const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
   { to: '/connections', label: '模型与工具', icon: 'link' },
   { to: '/hosts', label: '云端电脑', icon: 'monitor' },
-  { to: '/clients', label: '客户端', icon: 'panel' },
   { to: '/apikeys', label: 'API Key', icon: 'key' },
   { to: '/settings', label: '账户', icon: 'user' },
 ];
-const settingsEntry = { to: '/connections', label: '设置与授权', icon: 'settings' as const };
+const settingsEntry = { to: '/connections', label: '设置', icon: 'settings' as const };
 
 type PageNavigationItem = { label: string; to: string; icon: MordeIconName; query?: [string, string] };
 type PageNavigation = { title: string; items: PageNavigationItem[]; queryDefault?: [string, string] };
@@ -73,28 +72,28 @@ export function PortalNavigationHistoryProvider({ children }: { children: ReactN
 
 const personalSections: Array<[string, string, MordeIconName]> = [
   ['profile', '个人资料', 'user'], ['soul', 'AI 个性', 'spark'], ['memory', '记忆', 'file'],
-  ['feed', '动态', 'file'], ['ideas', '灵感', 'target'], ['library', '资源库', 'folder'], ['preferences', '偏好', 'settings'],
+  ['library', '资源库', 'folder'],
+];
+const connectionNavigationLinks: PageNavigationItem[] = [
+  ...settingLinks.slice(0, 2),
+  { label: '文件同步', icon: 'folder', to: '/hosts?sync=1', query: ['sync', '1'] },
+  ...settingLinks.slice(2, 3),
+];
+const settingsNavigationLinks: PageNavigationItem[] = [
+  ...connectionNavigationLinks,
+  ...settingLinks.slice(3),
+  ...personalSections.map(([section, label, icon]) => ({ label, icon, to: `/personal?section=${section}`, query: ['section', section] as [string, string] })),
 ];
 
 const pageNavigationFor = (pathname: string): PageNavigation | null => {
-  if (pathname === '/hosts') return {
+  if (pathname === '/hosts' || pathname === '/hosts/new') return {
     title: '设置与授权', queryDefault: ['sync', '0'],
-    items: [...settingLinks.map((item) => item.to === '/hosts' ? { ...item, query: ['sync', '0'] as [string, string] } : item),
-      { label: '文件同步', icon: 'folder', to: '/hosts?sync=1', query: ['sync', '1'] }],
+    items: settingsNavigationLinks.map((item) => item.to === '/hosts' ? { ...item, query: ['sync', '0'] as [string, string] } : item),
   };
-  if (settingLinks.some(({ to }) => to === pathname)) return { title: '设置与授权', items: settingLinks };
-  if (pathname === '/reviews') return { title: '审核', items: [{ label: '审核事项', icon: 'shield', to: '/reviews' }] };
   if (pathname === '/personal') return {
-    title: '个人数据', queryDefault: ['section', 'profile'],
-    items: personalSections.map(([value, label, icon]) => ({ label, icon, to: `/personal?section=${value}`, query: ['section', value] })),
+    title: '设置与授权', queryDefault: ['section', 'profile'], items: settingsNavigationLinks,
   };
-  if (pathname === '/goals') return {
-    title: '目标与计划', queryDefault: ['view', 'goals'],
-    items: [
-      { label: '目标', icon: 'target', to: '/goals?view=goals', query: ['view', 'goals'] },
-      { label: '定时计划', icon: 'refresh', to: '/goals?view=schedules', query: ['view', 'schedules'] },
-    ],
-  };
+  if (pathname === '/clients' || settingLinks.some(({ to }) => to === pathname)) return { title: '设置与授权', items: settingsNavigationLinks };
   return null;
 };
 
@@ -105,7 +104,7 @@ function readContextSidebarCollapsed() {
 
 function matchesPageItem(item: PageNavigationItem, pathname: string, search: string, fallback?: [string, string]) {
   const target = new URL(item.to, window.location.origin);
-  if (target.pathname !== pathname) return false;
+  if (target.pathname !== pathname && !(target.pathname === '/hosts' && pathname === '/hosts/new')) return false;
   if (!item.query) return true;
   const params = new URLSearchParams(search);
   const fallbackValue = fallback?.[0] === item.query[0] ? fallback[1] : undefined;
@@ -127,14 +126,24 @@ export function PortalLayout() {
   const assistantPanelToggle = useRef<HTMLButtonElement>(null);
   const focusAssistantPanelToggle = useCallback(() => assistantPanelToggle.current?.focus(), []);
   const assistantWorkspaceAddMenu = useRef<HTMLDetailsElement>(null);
+  const accountMenu = useRef<HTMLDetailsElement>(null);
   const pageNavigation = pageNavigationFor(location.pathname);
-  const hasCollapsibleSidebar = Boolean(pageNavigation) || location.pathname === '/assistant';
   const isAssistantPage = location.pathname === '/assistant';
+  const isSettingsNavigation = pageNavigation?.title === '设置与授权';
+  const hasCollapsibleSidebar = Boolean(pageNavigation) || isAssistantPage;
+  const navigationItems = pageNavigation ? pageNavigation.items.map((item) => {
+    const active = matchesPageItem(item, location.pathname, location.search, pageNavigation.queryDefault);
+    return <Link key={item.to} className={`page-navigation-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} to={item.to} title={item.label}>
+      <MordeIcon name={item.icon} /><span>{item.label}</span>
+    </Link>;
+  }) : null;
 
   useEffect(() => { closeNotices(); }, [closeNotices, location.pathname, location.search]);
   useEffect(() => {
-    if (!isAssistantPage) return;
     const closeOutside = (event: PointerEvent) => {
+      const accountMenuElement = accountMenu.current;
+      if (accountMenuElement?.open && !accountMenuElement.contains(event.target as Node)) accountMenuElement.open = false;
+      if (!isAssistantPage) return;
       const menu = assistantWorkspaceAddMenu.current;
       if (menu?.open && !menu.contains(event.target as Node)) menu.open = false;
     };
@@ -147,10 +156,10 @@ export function PortalLayout() {
       menu.querySelector('summary')?.focus();
     };
     document.addEventListener('pointerdown', closeOutside);
-    document.addEventListener('keydown', closeOnEscape);
+    if (isAssistantPage) document.addEventListener('keydown', closeOnEscape);
     return () => {
       document.removeEventListener('pointerdown', closeOutside);
-      document.removeEventListener('keydown', closeOnEscape);
+      if (isAssistantPage) document.removeEventListener('keydown', closeOnEscape);
     };
   }, [isAssistantPage]);
 
@@ -185,7 +194,7 @@ export function PortalLayout() {
     }
   };
 
-  return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}${isAssistantPage ? ` morde-shell-assistant-workspace${assistantPanelOpen ? '' : ' morde-shell-assistant-workspace-collapsed'}` : ''}`}
+  return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}${isSettingsNavigation ? ' morde-shell-settings-navigation' : ''}${isAssistantPage ? ` morde-shell-assistant-workspace${assistantPanelOpen ? '' : ' morde-shell-assistant-workspace-collapsed'}` : ''}`}
     style={isAssistantPage && assistantWorkspaceWidth !== null ? { '--pc-workspace-panel-user-width': `${assistantWorkspaceWidth}px` } as CSSProperties : undefined}>
     <a className="skip-link" href="#main-content">跳到主要内容</a>
     <header className="morde-topbar"><div className="morde-top-navigation">
@@ -220,7 +229,15 @@ export function PortalLayout() {
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav id="primary-navigation" className="morde-navigation" aria-label="工作导航">
         <span className="morde-nav-heading">工作</span>
-        {primaryLinks.map(({ to, label, icon, end }) => {
+        {primaryLinks.map(({ to, label, icon, end, view }) => {
+          if (view) {
+            const activeView = new URLSearchParams(location.search).get('view') === 'schedules' ? 'schedules' : 'goals';
+            const active = location.pathname === '/goals' && activeView === view;
+            return <Link className={`morde-nav-link${active ? ' active' : ''}`} to={to} key={to}
+              aria-label={label} aria-current={active ? 'page' : undefined} title={label}>
+              <MordeIcon name={icon} /><span>{label}</span>
+            </Link>;
+          }
           return <NavLink className={({ isActive }) => `morde-nav-link${isActive ? ' active' : ''}`} to={to} end={end} key={to}
             aria-label={label} title={label}>
             <MordeIcon name={icon} /><span>{label}</span>
@@ -228,15 +245,12 @@ export function PortalLayout() {
         })}
       </nav>
       <div className="morde-sidebar-bottom">
-        <nav className="morde-navigation" aria-label="设置导航">
-          <NavLink className={`morde-nav-link${settingLinks.some(({ to }) => to === location.pathname) ? ' active' : ''}`} to={settingsEntry.to} aria-label={settingsEntry.label} title={settingsEntry.label}><MordeIcon name={settingsEntry.icon} /><span>{settingsEntry.label}</span></NavLink>
-        </nav>
         <div className="morde-profile">
-          <details className="morde-account-menu">
+          <details ref={accountMenu} className="morde-account-menu">
             <summary className="morde-avatar" aria-label="账号菜单" title="账号菜单">{user?.name.slice(0, 1) || 'M'}</summary>
             <div className="morde-account-menu-popover">
               <strong>{user?.name}</strong><small>PC 用户端</small>
-              <NavLink to="/settings" className="morde-account-menu-action" aria-label="账户设置" title="账户设置"><MordeIcon name="settings" />账户设置</NavLink>
+              <NavLink to={settingsEntry.to} className="morde-account-menu-action" aria-label={settingsEntry.label} title={settingsEntry.label}><MordeIcon name={settingsEntry.icon} />{settingsEntry.label}</NavLink>
               <NavLink to="/notifications" className="morde-account-menu-action" aria-label="查看通知" title="查看通知"><MordeIcon name="bell" />通知</NavLink>
               <NavLink to="/codex" className="morde-account-menu-action" aria-label="Codex 会话" title="Codex 会话"><MordeIcon name="spark" />Codex 会话</NavLink>
               {user?.role === 'user' && <NavLink to="/projects" className="morde-account-menu-action" aria-label="项目" title="项目"><MordeIcon name="folder" />项目</NavLink>}
@@ -247,12 +261,10 @@ export function PortalLayout() {
         </div>
       </div>
     </aside>
-    {pageNavigation && <aside id="context-sidebar" className="page-navigation" aria-label={`${pageNavigation.title}子菜单`}>
+    {pageNavigation && <aside id="context-sidebar" className={`page-navigation${isSettingsNavigation ? ' settings-page-navigation' : ''}`} aria-label={`${pageNavigation.title}子菜单`}>
+      {isSettingsNavigation && <h2>设置</h2>}
       <nav aria-label={`${pageNavigation.title}分类`}>
-        {pageNavigation.items.map((item) => {
-          const active = matchesPageItem(item, location.pathname, location.search, pageNavigation.queryDefault);
-          return <Link key={item.to} className={`page-navigation-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} to={item.to} title={item.label}><MordeIcon name={item.icon} /><span>{item.label}</span></Link>;
-        })}
+        {isSettingsNavigation ? <><p className="page-navigation-group">连接与设备</p>{navigationItems?.slice(0, connectionNavigationLinks.length)}<p className="page-navigation-group">个人设置</p>{navigationItems?.slice(connectionNavigationLinks.length)}</> : navigationItems}
       </nav>
     </aside>}
     <main className="morde-main">

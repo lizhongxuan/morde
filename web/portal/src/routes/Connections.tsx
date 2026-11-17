@@ -8,13 +8,14 @@ import { modelConnectionPresets } from '../app/model-presets';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { Modal } from '../components/Modal';
+import { MordeIcon } from '../components/MordeIcon';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { MCPConnectorsPanel } from './MCPConnectorsPanel';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type ModelConnection = Awaited<ReturnType<typeof api.modelConnections>>['items'][number];
 type PersonalModelDraft = { name: string; baseURL: string; modelName: string; contextWindowTokens: string; apiKey: string };
-type ConnectionArea = 'personal' | 'team' | 'mcp';
+type ConnectionArea = 'personal' | 'mcp';
 const emptyDraft: PersonalModelDraft = { name: '', baseURL: '', modelName: '', contextWindowTokens: '', apiKey: '' };
 
 function modelHostLabel(value: string) {
@@ -43,7 +44,6 @@ export function Connections() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [checked, setChecked] = useState<{ id: string; capabilities: ModelConnection['capabilities'] } | null>(null);
-  const sharedModels = models.data?.items.filter((model) => model.shared) ?? [];
   const personalModels = models.data?.items.filter((model) => !model.shared) ?? [];
   const check = useMutation({
     mutationFn: (id: string) => api.checkModelConnection(id),
@@ -111,7 +111,6 @@ export function Connections() {
         notify('个人模型已更新。', 'success');
       }
     } catch (error) {
-      setAdvancedOpen(true);
       notify(`${modelConnectionSaveErrorMessage(error)}${apiKey ? ' 密钥已清除，请重新输入后重试。' : ''}`, 'error');
     } finally {
       setSaving(false);
@@ -127,7 +126,6 @@ export function Connections() {
     setFormOpen(false);
   };
 
-  const renderTeamModel = (model: ModelConnection) => <ModelCard model={model} shared />;
   const renderPersonalModel = (model: ModelConnection) => <ModelCard model={model} checked={checked} check={check} streamCheck={streamCheck} onEdit={() => {
     setEditingID(model.id);
     setDraft({ name: model.name, baseURL: model.base_url, modelName: model.model_name, contextWindowTokens: model.context_window_tokens ? String(model.context_window_tokens) : '', apiKey: '' });
@@ -137,18 +135,19 @@ export function Connections() {
     setFormOpen(true);
   }} />;
 
+  const areaTabs = <div className="connection-area-tabs" role="group" aria-label="模型与工具分类">
+    <button type="button" className={`button button-small ${activeArea === 'personal' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'personal'} onClick={() => setActiveArea('personal')}>个人模型</button>
+    <button type="button" className={`button button-small ${activeArea === 'mcp' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'mcp'} onClick={() => setActiveArea('mcp')}>MCP 工具</button>
+  </div>;
+
   return <section className="connections-page">
-    <header className="model-page-intro"><h1>模型与工具</h1><p>管理你的模型连接与可用工具。</p></header>
     {import.meta.env.DEV && import.meta.env.VITE_MOCK_API === '1' && <FloatingNotice className="notice-warning" data-notice-label="演示模式">当前为演示模式，没有连接真实服务。模型密钥不会保存到数据库，请勿输入真实 API 密钥。</FloatingNotice>}
-    <div className="connection-area-tabs" role="group" aria-label="模型与工具分类">
-      <button type="button" className={`button button-small ${activeArea === 'personal' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'personal'} onClick={() => setActiveArea('personal')}>个人模型</button>
-      <button type="button" className={`button button-small ${activeArea === 'team' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'team'} onClick={() => setActiveArea('team')}>团队模型</button>
-      <button type="button" className={`button button-small ${activeArea === 'mcp' ? 'button-primary' : 'button-secondary'}`} aria-pressed={activeArea === 'mcp'} onClick={() => setActiveArea('mcp')}>MCP 工具</button>
-    </div>
     <section className="connection-section" aria-labelledby="personal-models-title" hidden={activeArea !== 'personal'}>
       <div className="connection-section-heading"><div><h2 id="personal-models-title">个人模型</h2><p className="muted">使用自己的 API 密钥，仅当前账号可见。</p></div>
         <button type="button" aria-label="添加个人模型" className="button button-primary" onClick={() => { setDraft(emptyDraft); setPresetID(''); setAdvancedOpen(false); setEditingID(null); setFormOpen(true); check.reset(); }}>＋ 添加模型</button>
       </div>
+      {areaTabs}
+      <h3 className="connections-list-title">模型连接</h3>
       {formOpen && <Modal title={editingID ? '编辑个人模型' : '添加个人模型'} onClose={cancelForm}><form className="connection-form connection-form-modal" onSubmit={submit}>
         <div className="connection-form-grid">
           <div className="connection-form-wide"><label htmlFor="personal-model-preset">选择服务和模型</label><select id="personal-model-preset" value={presetID} required onChange={(event) => {
@@ -189,7 +188,7 @@ export function Connections() {
       {models.isPending || (!models.data && isTransientNetworkError(models.error)) ? <div className="loading-card" role="status">正在读取模型连接…</div>
         : models.isError && !isTransientNetworkError(models.error) ? <FloatingError className="error-card" role="alert">{errorDetails(models.error).message}<button className="button button-secondary" type="button" onClick={() => void models.refetch()}>重试</button></FloatingError>
           : !models.data ? <div className="loading-card" role="status">正在读取模型连接…</div>
-          : !personalModels.length ? <div className="empty-card connection-empty"><h3>尚未添加个人模型</h3><p>添加后即可在对话中选择。</p></div>
+          : !personalModels.length ? <><div className="connection-empty"><span className="connection-empty-icon" aria-hidden="true"><MordeIcon name="link" /></span><h3>尚未添加个人模型</h3><p>添加模型后，即可在对话中选择使用。</p></div><p className="connection-empty-note"><MordeIcon name="info" />模型配置和密钥仅对当前账号可见。</p></>
         : personalModels.length === 1 ? <div className="model-connection-list">{renderPersonalModel(personalModels[0]!)}</div>
         : <ScreenPagination
           items={personalModels}
@@ -201,24 +200,7 @@ export function Connections() {
           className="model-connection-list"
         />}
     </section>
-    <section className="connection-section" aria-labelledby="model-connections-title" hidden={activeArea !== 'team'}>
-      <div className="connection-section-heading"><div><h2 id="model-connections-title">团队模型</h2><p className="muted">由管理员配置，通过检查后可在对话中选择。</p></div></div>
-      {models.isPending || (!models.data && isTransientNetworkError(models.error)) ? <div className="loading-card" role="status">正在读取模型连接…</div>
-        : models.isError && !isTransientNetworkError(models.error) ? <FloatingError className="error-card" role="alert">{errorDetails(models.error).message}<button type="button" className="button button-secondary" onClick={() => void models.refetch()}>重试</button></FloatingError>
-          : !models.data ? <div className="loading-card" role="status">正在读取模型连接…</div>
-          : !sharedModels.length ? <div className="empty-card connection-empty"><h3>暂无团队模型</h3><p>管理员配置共享模型后会显示在这里。</p></div>
-          : sharedModels.length === 1 ? <div className="model-connection-list">{renderTeamModel(sharedModels[0]!)}</div>
-          : <ScreenPagination
-            items={sharedModels}
-            getKey={(model) => model.id}
-            renderItem={renderTeamModel}
-            estimatedItemHeight={160}
-            height={connectionListHeight(sharedModels.length)}
-            ariaLabel="团队模型"
-            className="model-connection-list"
-          />}
-    </section>
-    <div hidden={activeArea !== 'mcp'}><MCPConnectorsPanel /></div>
+    <div hidden={activeArea !== 'mcp'}><MCPConnectorsPanel areaTabs={areaTabs} /></div>
   </section>;
 }
 

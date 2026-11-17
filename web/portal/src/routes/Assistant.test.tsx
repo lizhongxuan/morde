@@ -193,6 +193,8 @@ function mockCommon(options: { conversations?: Conversation[]; messages?: Conver
   vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
   vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: model.id, default_host_id: options.defaultHostID ?? null, updated_at: timestamp });
   vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: options.hosts ?? [] });
+  vi.spyOn(portalApi, 'hostControl').mockResolvedValue({ host_id: targetHost.id, control_state: 'ai', control_version: 2,
+    control_actor_user_id: '', control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null });
   vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
   vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [] });
   vi.spyOn(portalApi, 'execution').mockResolvedValue({ owner_id: 'u1234567', state: 'enabled', epoch: 1, pending_task_count: 0,
@@ -425,7 +427,7 @@ describe('Assistant durable tasks', () => {
     await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
-    await user.click(within(sidebar).getByRole('button', { name: '连接到此会话' }));
+    await user.click(within(sidebar).getByRole('button', { name: '打开云端电脑浏览器' }));
 
     await waitFor(() => expect(submit).toHaveBeenCalledOnce());
     expect(portalApi.issueHostEmbedTicket).toHaveBeenCalledWith(targetHost.id, {
@@ -451,7 +453,8 @@ describe('Assistant durable tasks', () => {
       data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
         control_state: 'user', control_lease_active: true, control_lease_held_by_me: true },
     })));
-    expect(await within(sidebar).findByText('工作台已就绪')).toBeInTheDocument();
+    expect(within(sidebar).queryByText('工作台已就绪')).not.toBeInTheDocument();
+    expect(within(sidebar).getByTitle('当前会话云端电脑工作台')).toBeInTheDocument();
     expect(document.querySelector('.assistant-layout')).toHaveClass('assistant-layout-computer-expanded');
 
     await user.click(within(sidebar).getByRole('button', { name: '文件' }));
@@ -492,11 +495,12 @@ describe('Assistant durable tasks', () => {
     await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
-    await user.click(within(sidebar).getByRole('button', { name: '连接到此会话' }));
+    await user.click(within(sidebar).getByRole('button', { name: '打开云端电脑浏览器' }));
 
     await waitFor(() => expect(openHostWorkbenchEmbed).toHaveBeenCalledWith({ hostID: targetHost.id, conversationID: conversation.id,
       initialTarget: 'browser', targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'], shared: false }));
-    expect(await within(sidebar).findByText('正在等待工作台就绪…')).toBeInTheDocument();
+    expect(within(sidebar).queryByText('正在等待工作台就绪…')).not.toBeInTheDocument();
+    expect(sidebar.querySelector('.computer-panel-frame')).not.toBeNull();
     expect(within(sidebar).queryByTitle('当前会话云端电脑工作台')).not.toBeInTheDocument();
     await waitFor(() => expect(setHostWorkbenchBounds).toHaveBeenCalledWith(nonce, expect.objectContaining({
       x: expect.any(Number), y: expect.any(Number), width: expect.any(Number), height: expect.any(Number),
@@ -506,7 +510,7 @@ describe('Assistant durable tasks', () => {
     act(() => receive?.({ type: 'ready', nonce }));
     act(() => receive?.({ type: 'state', nonce, conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
       control_state: 'user', control_lease_active: true, control_lease_held_by_me: true }));
-    expect(await within(sidebar).findByText('工作台已就绪')).toBeInTheDocument();
+    expect(within(sidebar).queryByText('工作台已就绪')).not.toBeInTheDocument();
     await user.click(within(sidebar).getByRole('button', { name: '文件' }));
     expect(sendHostWorkbenchCommand).toHaveBeenLastCalledWith(nonce, { type: 'visibility', conversation_id: conversation.id, visible: false });
     await waitFor(() => expect(setHostWorkbenchBounds).toHaveBeenLastCalledWith(nonce, { x: 0, y: 0, width: 0, height: 0 }));

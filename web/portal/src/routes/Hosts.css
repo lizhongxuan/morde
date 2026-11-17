@@ -1,69 +1,82 @@
 .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .hosts-page) {
   min-height: 0;
   height: 100%;
-  padding: 10px clamp(10px, 1.5vw, 22px);
+  padding: 18px 24px 24px;
   display: flex;
-  overflow: hidden;
+  overflow: auto;
 }
 
 .hosts-page {
-  width: 100%;
+  width: min(100%, 734px);
   min-width: 0;
-  min-height: 0;
-  flex: 1 1 0;
+  height: calc(100% - 40px);
+  min-height: 460px;
+  margin: 40px auto 0;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  overflow: hidden;
 }
+
+.hosts-page-heading { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 10px 14px; }
+.morde-page .hosts-page-heading h2 { margin: 0 0 9px; font-size: 27px; line-height: 1.28; }
+.hosts-page-heading p { margin: 0; color: var(--muted); font-size: 11px; }
+.morde-shell:not(.morde-admin-shell) .morde-page .hosts-page-heading .button-primary { color: #fff; }
 
 .hosts-list-toggle {
-  min-height: 30px;
   flex: 0 0 auto;
-  gap: 6px;
-  margin: 0;
+  width: 100%;
+  gap: 24px;
+  margin: 34px 0 0;
+  border-bottom: 1px solid var(--line);
 }
 
-.hosts-list-toggle .button { min-height: 30px; padding: 4px 10px; }
+.morde-shell:not(.morde-admin-shell) .morde-page .hosts-page .hosts-list-toggle .button {
+  position: relative;
+  min-height: 0;
+  padding: 0 1px 13px;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
+  background: transparent;
+  box-shadow: none;
+  font-size: 13px;
+  font-weight: 600;
+}
+.morde-shell:not(.morde-admin-shell) .morde-page .hosts-page .hosts-list-toggle .button-primary { color: var(--ink); }
+.hosts-list-toggle .button-primary::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; border-radius: 2px; background: #4263d6; content: ''; }
+.morde-page .hosts-list-title { flex: 0 0 auto; margin: 31px 0 13px; font-size: 15px; font-weight: 650; }
 
 .hosts-page > .design-panel {
   min-width: 0;
   min-height: 0;
   flex: 1 1 0;
   margin: 0;
-  padding: 10px 12px;
+  padding: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
-.hosts-page > .workspace-route { min-width: 0; min-height: 0; flex: 1 1 0; overflow-y: auto; }
-
-.hosts-page .design-panel-header {
-  min-height: 32px;
-  flex: 0 0 auto;
-  margin-bottom: 8px;
-  padding-bottom: 8px;
-  gap: 6px 10px;
-}
-
-.hosts-page .design-panel-header h2 { font-size: 13px; }
-.hosts-page .design-panel-header p { font-size: 10px; line-height: 1.35; }
-.hosts-page .design-panel-header .button { min-height: 29px; padding: 4px 9px; }
+.morde-shell:not(.morde-admin-shell) .morde-page .hosts-page > .design-panel { border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.morde-page .hosts-page .hosts-empty { min-height: 206px; flex: 0 0 auto; padding: 28px; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 12px; text-align: center; }
+.hosts-empty-icon { width: 46px; height: 46px; margin-bottom: 15px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 14px; color: #7399ac; background: #f1f6f8; }
+.hosts-empty-icon .morde-icon { width: 21px; height: 21px; }
+.morde-page .hosts-empty h3 { margin: 0; font-size: 14px; }
+.hosts-empty p { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
 
 .hosts-page .host-default-settings {
   flex: 0 0 auto;
-  grid-template-columns: minmax(110px, .45fr) minmax(0, 1fr);
-  gap: 4px 10px;
-  margin: 0 0 8px;
-  padding: 6px 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
 }
 
-.hosts-page .host-default-settings > label { grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-size: 10px; }
-.hosts-page .host-default-settings select { min-height: 29px; padding-block: 4px; font-size: 11px; }
+.hosts-page .host-default-settings > label { grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-size: 11px; }
+.hosts-page .host-default-settings select { min-height: 32px; padding-block: 4px; font-size: 12px; }
 .hosts-page .host-default-workspace { gap: 4px 7px; }
-.hosts-page .host-default-workspace span, .hosts-page .host-default-workspace a { font-size: 10px; }
-.hosts-page .host-default-workspace strong { font-size: 11px; }
+.hosts-page .host-default-workspace span, .hosts-page .host-default-workspace a { font-size: 11px; }
+.hosts-page .host-default-workspace strong { font-size: 12px; }
 
 .hosts-page .screen-pagination {
   width: 100%;
@@ -93,7 +106,20 @@
 .hosts-page .host-actions .button { min-height: 27px; padding: 4px 8px; font-size: 10px; white-space: nowrap; }
 .hosts-page .host-more-actions > summary { min-height: 27px; padding: 4px 8px; font-size: 10px; }
 .hosts-page .host-more-actions[open] > summary { width: fit-content; margin-left: auto; }
-.hosts-page .host-more-actions[open] > div { justify-content: flex-end; gap: 5px; padding: 7px; }
+.hosts-page .host-more-actions[open] { flex-basis: auto; z-index: 2; }
+.hosts-page .host-more-actions[open] > div {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  z-index: 2;
+  width: max-content;
+  min-width: 190px;
+  max-width: min(320px, calc(100vw - 32px));
+  display: grid;
+  gap: 5px;
+  padding: 7px;
+}
+.hosts-page .host-more-actions[open] > div > .button { width: 100%; justify-content: flex-start; }
 
 .hosts-page .host-action-reason,
 .hosts-page .host-secondary-details {
@@ -121,7 +147,7 @@
 
 .hosts-page .host-secondary-details > summary::-webkit-details-marker { display: none; }
 .hosts-page .host-secondary-details > summary::after { margin-left: 7px; content: '⌄'; }
-.hosts-page .host-action-reason { flex: 1 1 280px; margin: 0; color: #65738a; line-height: 1.45; overflow-wrap: anywhere; }
+.hosts-page .host-action-reason { margin: 0; color: #65738a; line-height: 1.45; overflow-wrap: anywhere; }
 .hosts-page .host-secondary-content { min-width: 0; display: grid; gap: 8px; padding: 8px 0 0; }
 .hosts-page .host-secondary-content .host-facts { margin: 0; gap: 7px 12px; }
 .hosts-page .host-secondary-content .host-facts span { font-size: 10px; }
@@ -132,11 +158,12 @@
 .hosts-page .host-shared-control { margin-top: 0; }
 .hosts-page .host-shared-control > .host-control { margin-top: 6px; }
 
+@media (max-width: 900px) {
+  .hosts-page { height: calc(100% - 28px); margin-top: 28px; }
+}
+
 @media (max-width: 620px) {
   .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .hosts-page) { padding: 8px 7px; }
-  .hosts-page { gap: 6px; }
-  .hosts-page > .design-panel { padding: 8px; }
-  .hosts-page .design-panel-header { min-height: 28px; margin-bottom: 6px; padding-bottom: 6px; }
   .hosts-page .host-default-settings { grid-template-columns: minmax(0, 1fr); gap: 3px; margin-bottom: 6px; padding: 5px 6px; }
   .hosts-page .host-default-settings > label { grid-template-columns: 88px minmax(0, 1fr); }
   .hosts-page .host-default-workspace { display: flex; flex-wrap: nowrap; overflow: hidden; }
@@ -148,10 +175,9 @@
 }
 
 @media (max-height: 650px) {
-  .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .hosts-page) { padding-block: 7px; }
-  .hosts-page { gap: 5px; }
-  .hosts-page > .design-panel { padding-block: 7px; }
-  .hosts-page .design-panel-header { min-height: 27px; margin-bottom: 5px; padding-bottom: 5px; }
-  .hosts-page .host-default-settings { margin-bottom: 5px; padding-block: 4px; }
   .hosts-page .host-card-compact { gap: 4px; padding-block: 7px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  .hosts-empty-icon { color: var(--pc-blue-text); background: var(--pc-surface-soft); }
 }

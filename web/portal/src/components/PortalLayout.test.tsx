@@ -21,7 +21,7 @@ describe('PortalLayout', () => {
   it('exposes work and settings pages from the primary navigation', () => {
     renderPortalLayout('/assistant');
 
-    expect(screen.getByRole('link', { name: '查看客户端与设备' })).toHaveAttribute('href', '/clients');
+    expect(screen.queryByRole('link', { name: '查看客户端与设备' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '打开手机端' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '返回上一页' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '前进' })).toBeDisabled();
@@ -29,17 +29,15 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '工作台' })).not.toBeInTheDocument();
     const workNavigation = screen.getByRole('navigation', { name: '工作导航' });
     expect(within(workNavigation).getByRole('link', { name: /审核/ })).toHaveAttribute('href', '/reviews');
-    expect(within(workNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(workNavigation).queryByRole('link', { name: '云端电脑' })).not.toBeInTheDocument();
     expect(within(workNavigation).queryByRole('link', { name: '本机项目' })).not.toBeInTheDocument();
-    expect(within(workNavigation).getByRole('link', { name: 'Codex 会话' })).toHaveAttribute('href', '/codex');
+    expect(within(workNavigation).queryByRole('link', { name: 'Codex 会话' })).not.toBeInTheDocument();
     expect(within(workNavigation).getByRole('link', { name: '对话' })).toHaveAttribute('href', '/assistant');
-    expect(within(workNavigation).getByRole('link', { name: '项目' })).toHaveAttribute('href', '/projects');
-    expect(within(workNavigation).getByRole('link', { name: '个人数据' })).toHaveAttribute('href', '/personal');
-    expect(within(workNavigation).getByRole('link', { name: '目标与计划' })).toHaveAttribute('href', '/goals');
-    expect(within(workNavigation).getAllByRole('link', { name: '云端电脑' })).toHaveLength(1);
-    const settingsNavigation = screen.getByRole('navigation', { name: '设置导航' });
-    expect(within(settingsNavigation).getByRole('link', { name: '设置与授权' })).toHaveAttribute('href', '/connections');
-    expect(within(settingsNavigation).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
+    expect(within(workNavigation).queryByRole('link', { name: '项目' })).not.toBeInTheDocument();
+    expect(within(workNavigation).queryByRole('link', { name: '个人数据' })).not.toBeInTheDocument();
+    expect(within(workNavigation).getByRole('link', { name: '目标' })).toHaveAttribute('href', '/goals?view=goals');
+    expect(within(workNavigation).getByRole('link', { name: '定时计划' })).toHaveAttribute('href', '/goals?view=schedules');
+    expect(screen.queryByRole('navigation', { name: '设置导航' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '模型与工具' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'API Key' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '工作区' })).not.toBeInTheDocument();
@@ -54,24 +52,34 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('groups setting pages under the categorized sidebar', () => {
+  it('groups setting pages in the settings sidebar', () => {
     renderPortalLayout('/apikeys');
-    const settingsNavigation = screen.getByRole('complementary', { name: '设置与授权子菜单' });
+    const settingsNavigation = screen.getByRole('navigation', { name: '设置与授权分类' });
+    expect(screen.getByRole('complementary', { name: '设置与授权子菜单' })).toContainElement(settingsNavigation);
+    expect(within(settingsNavigation).getByText('连接与设备')).toBeInTheDocument();
+    expect(within(settingsNavigation).getByText('个人设置')).toBeInTheDocument();
     expect(within(settingsNavigation).getByRole('link', { name: '模型与工具' })).toHaveAttribute('href', '/connections');
-    expect(within(settingsNavigation).getByRole('link', { name: '客户端' })).toHaveAttribute('href', '/clients');
+    expect(within(settingsNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/hosts?sync=1');
+    expect(within(settingsNavigation).queryByRole('link', { name: '客户端' })).not.toBeInTheDocument();
     expect(within(settingsNavigation).getByRole('link', { name: 'API Key' })).toHaveAttribute('aria-current', 'page');
     expect(within(settingsNavigation).getByRole('link', { name: '账户' })).toHaveAttribute('href', '/settings');
-    expect(within(screen.getByRole('navigation', { name: '设置导航' })).getByRole('link', { name: '设置与授权' })).toHaveAttribute('href', '/connections');
+    for (const [section, label] of [['profile', '个人资料'], ['soul', 'AI 个性'], ['memory', '记忆'], ['library', '资源库']]) {
+      expect(within(settingsNavigation).getByRole('link', { name: label })).toHaveAttribute('href', `/personal?section=${section}`);
+    }
+    for (const label of ['动态', '灵感', '偏好']) expect(within(settingsNavigation).queryByRole('link', { name: label })).not.toBeInTheDocument();
+    expect(within(settingsNavigation).queryByRole('link', { name: '个人数据' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: '设置导航' })).not.toBeInTheDocument();
   });
 
   it('places project sync under Cloud Computers in the PC navigation', () => {
     const { container } = renderPortalLayout('/hosts?sync=1');
-    const contextNavigation = screen.getByRole('complementary', { name: '云端电脑子菜单' });
+    const contextNavigation = screen.getByRole('navigation', { name: '设置与授权分类' });
+    expect(screen.getByRole('complementary', { name: '设置与授权子菜单' })).toContainElement(contextNavigation);
     expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('aria-current', 'page');
     expect(within(contextNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/hosts?sync=1');
-    expect(within(contextNavigation).getByRole('link', { name: '我的电脑' })).toHaveAttribute('href', '/hosts');
-    expect(within(contextNavigation).getByRole('link', { name: '我的电脑' })).not.toHaveAttribute('aria-current', 'page');
-    expect(within(screen.getByRole('navigation', { name: '设置导航' })).queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
+    expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(contextNavigation).getByRole('link', { name: '云端电脑' })).not.toHaveAttribute('aria-current', 'page');
+    expect(screen.queryByRole('navigation', { name: '设置导航' })).not.toBeInTheDocument();
     expect(container.querySelector('.morde-top-actions > .notice-center')).toBeInTheDocument();
     expect(container.querySelector('.morde-main > .notice-center')).toBeNull();
   });
@@ -83,17 +91,44 @@ describe('PortalLayout', () => {
     expect(container.querySelector('.assistant-page')).toBeNull();
   });
 
+  it.each([
+    ['/goals', '目标', '定时计划'],
+    ['/goals?view=goals', '目标', '定时计划'],
+    ['/goals?view=schedules', '定时计划', '目标'],
+    ['/goals?view=unknown', '目标', '定时计划'],
+  ])('selects %s in the main navigation without a context sidebar', (path, activeLabel, inactiveLabel) => {
+    const { container } = renderPortalLayout(path);
+    const workNavigation = screen.getByRole('navigation', { name: '工作导航' });
+    expect(within(workNavigation).getByRole('link', { name: '目标' })).toHaveAttribute('href', '/goals?view=goals');
+    expect(within(workNavigation).getByRole('link', { name: '定时计划' })).toHaveAttribute('href', '/goals?view=schedules');
+    expect(within(workNavigation).queryByRole('link', { name: '目标与计划' })).not.toBeInTheDocument();
+    expect(within(workNavigation).getByRole('link', { name: activeLabel })).toHaveAttribute('aria-current', 'page');
+    expect(within(workNavigation).getByRole('link', { name: activeLabel })).toHaveClass('active');
+    expect(within(workNavigation).getByRole('link', { name: inactiveLabel })).not.toHaveAttribute('aria-current');
+    expect(within(workNavigation).getByRole('link', { name: inactiveLabel })).not.toHaveClass('active');
+    expect(container.querySelector('#context-sidebar')).toBeNull();
+    expect(screen.queryByRole('button', { name: /侧边栏/ })).not.toBeInTheDocument();
+  });
+
   it('keeps settings and logout inside the account menu and confirms before signing out', () => {
     const { container } = renderPortalLayout('/assistant');
     const accountMenu = container.querySelector('details.morde-account-menu') as HTMLDetailsElement;
-    expect(container.querySelector('.morde-sidebar-bottom .morde-nav-link[aria-label="设置与授权"]')).toBeInTheDocument();
-    expect(accountMenu.querySelector('a[href="/settings"]')).toBeInTheDocument();
+    expect(container.querySelector('.morde-sidebar-bottom .morde-nav-link')).not.toBeInTheDocument();
+    expect(accountMenu.querySelector('.morde-account-menu-action[href="/connections"]')).toHaveTextContent('设置');
+    expect(accountMenu.querySelector('a[href="/settings"]')).not.toBeInTheDocument();
     expect(accountMenu.querySelector('.morde-profile-logout')).toBeInTheDocument();
     expect(accountMenu.open).toBe(false);
 
     fireEvent.click(accountMenu.querySelector('summary')!);
     expect(accountMenu.open).toBe(true);
-    expect(screen.getByRole('link', { name: '账户设置' })).toHaveAttribute('href', '/settings');
+    expect(screen.getByRole('link', { name: '设置' })).toHaveAttribute('href', '/connections');
+    expect(screen.queryByRole('link', { name: '账户设置' })).not.toBeInTheDocument();
+    fireEvent.pointerDown(accountMenu.querySelector('strong')!);
+    expect(accountMenu.open).toBe(true);
+    fireEvent.pointerDown(document.body);
+    expect(accountMenu.open).toBe(false);
+    fireEvent.click(accountMenu.querySelector('summary')!);
+    expect(accountMenu.open).toBe(true);
     fireEvent.click(accountMenu.querySelector('.morde-profile-logout')!);
     const dialog = screen.getByRole('dialog', { name: '退出登录' });
     expect(portalLayoutAuthState.signOut).not.toHaveBeenCalled();
@@ -111,8 +146,13 @@ describe('PortalLayout', () => {
 
   it('aligns page categories below the top bar and selects personal-data sections', () => {
     renderPortalLayout('/personal?section=soul');
-    expect(screen.getByRole('complementary', { name: '个人数据子菜单' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'AI 个性' })).toHaveAttribute('aria-current', 'page');
+    const settingsNavigation = screen.getByRole('navigation', { name: '设置与授权分类' });
+    expect(screen.getByRole('complementary', { name: '设置与授权子菜单' })).toContainElement(settingsNavigation);
+    expect(within(settingsNavigation).getByRole('link', { name: 'AI 个性' })).toHaveAttribute('aria-current', 'page');
+    expect(within(settingsNavigation).getByRole('link', { name: '个人资料' })).toHaveAttribute('href', '/personal?section=profile');
+    for (const label of ['动态', '灵感', '偏好']) expect(within(settingsNavigation).queryByRole('link', { name: label })).not.toBeInTheDocument();
+    expect(within(settingsNavigation).queryByRole('link', { name: '个人数据' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: '设置导航' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { level: 1 })).not.toBeInTheDocument();
   });
 
@@ -122,6 +162,7 @@ describe('PortalLayout', () => {
     const shell = container.querySelector('.morde-shell');
     expect(shell?.firstElementChild?.nextElementSibling).toHaveClass('morde-topbar');
     expect(shell?.querySelector(':scope > .page-navigation')).toBeInTheDocument();
+    expect(shell?.querySelector(':scope > .morde-main > .settings-navigation')).not.toBeInTheDocument();
   });
 
   it('collapses and expands the context sidebar from the top bar', () => {

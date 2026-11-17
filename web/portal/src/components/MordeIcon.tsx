@@ -26,6 +26,7 @@ const paths = {
   paperclip: 'm9 12 5-5a3 3 0 0 1 4 4l-7 7a5 5 0 0 1-7-7l8-8',
   microphone: 'M9 6a3 3 0 0 1 6 0v6a3 3 0 0 1-6 0ZM6 11a6 6 0 0 0 12 0m-6 6v4m-3 0h6',
   sliders: 'M4 7h16M4 17h16M9 4v6m6 4v6',
+  info: 'M20.5 12a8.5 8.5 0 1 1-17 0 8.5 8.5 0 0 1 17 0ZM12 11v5m0-8h.01',
 } as const;
 
 export type MordeIconName = keyof typeof paths;

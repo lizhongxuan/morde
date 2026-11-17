@@ -318,9 +318,11 @@ body { font-size: 13px; line-height: 1.55; -webkit-font-smoothing: antialiased; 
 .workbench-app.is-embedded {
   overflow: hidden;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
   background: #fff;
 }
+.workbench-app.is-embedded .top-bar,
+.workbench-app.is-embedded .workbench-tabs { display: none; }
 .workbench-app.is-embedded .workbench-content {
   position: relative;
   grid-column: 1;
@@ -330,28 +332,29 @@ body { font-size: 13px; line-height: 1.55; -webkit-font-smoothing: antialiased; 
   place-items: center;
   background: transparent;
 }
-.workbench-app.is-embedded .workbench-content::after {
+.workbench-app.is-embedded .tab-panel::before {
   position: absolute;
   z-index: 2;
-  top: 36px;
-  right: 38px;
+  top: 25px;
+  right: 30px;
   color: rgb(255 255 255 / 82%);
   content: 'MORDE CLOUD';
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: .04em;
+  letter-spacing: .08em;
   pointer-events: none;
 }
 .workbench-app.is-embedded .tab-panel {
-  width: min(100%, 1240px);
+  position: relative;
+  width: min(100%, 684px);
   height: auto;
-  max-height: 100%;
+  max-height: min(100%, 430px);
   align-self: center;
   aspect-ratio: 16 / 10;
-  border: 2px solid #4b6bf2;
-  border-radius: 22px;
-  background: linear-gradient(135deg, #55b9ed 0%, #0870dc 54%, #104fc1 100%);
-  box-shadow: 0 14px 34px rgb(23 65 132 / 25%);
+  border: 1px solid rgb(255 255 255 / 72%);
+  border-radius: 15px;
+  background: linear-gradient(123deg, #4bb5eb 0%, #2082e1 52%, #0e56ca 100%);
+  box-shadow: 0 16px 35px rgb(29 65 112 / 20%);
 }
 .workbench-app.is-embedded .tab-panel-browser { background: transparent; }
 .workbench-app.is-embedded .connection-overlay {
@@ -434,9 +437,9 @@ body { font-size: 13px; line-height: 1.55; -webkit-font-smoothing: antialiased; 
 .workbench-app.is-embedded.workbench-error-app .page-message { grid-row: 1 / -1; }
 
 @media (max-width: 760px) {
-  .workbench-app.is-embedded { grid-template-rows: minmax(0, 1fr) auto; }
+  .workbench-app.is-embedded { grid-template-rows: minmax(0, 1fr); }
   .workbench-app.is-embedded .workbench-content { grid-column: 1; grid-row: 1; padding: 8px; }
-  .workbench-app.is-embedded .workbench-content::after { top: 18px; right: 20px; font-size: 10px; }
+  .workbench-app.is-embedded .tab-panel::before { top: 20px; right: 24px; font-size: 10px; }
   .workbench-app.is-embedded .tab-panel { border-radius: 14px; }
   .workbench-app.is-embedded .workbench-tabs { bottom: 14px; padding: 4px; }
   .workbench-app.is-embedded .tab-button { width: 36px; min-height: 36px; }

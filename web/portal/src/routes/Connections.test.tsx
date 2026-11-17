@@ -26,7 +26,7 @@ function renderPage() {
   return { client, ...render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Connections /></MemoryRouter></ToastProvider></QueryClientProvider>) };
 }
 
-async function selectArea(user: ReturnType<typeof userEvent.setup>, name: '个人模型' | '团队模型' | 'MCP 工具') {
+async function selectArea(user: ReturnType<typeof userEvent.setup>, name: '个人模型' | 'MCP 工具') {
   await user.click(screen.getByRole('button', { name: new RegExp(`^${name}`) }));
 }
 
@@ -75,6 +75,46 @@ describe('Connections', () => {
     expect(screen.getByRole('status')).toHaveTextContent('正在读取工具连接…');
     expect(screen.queryByText('Failed to fetch')).not.toBeInTheDocument();
     expect(connectors).toHaveBeenCalled();
+  });
+
+  it('opens the MCP form in a dialog and clears a cancelled draft', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [], configuration_status: 'not_configured' });
+    vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
+    renderPage();
+    await selectArea(user, 'MCP 工具');
+
+    const open = await screen.findByRole('button', { name: '＋ 添加工具连接' });
+    await user.click(open);
+    const dialog = screen.getByRole('dialog', { name: '添加工具连接' });
+    await user.type(within(dialog).getByLabelText('连接名称'), '待取消的工具');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: '添加工具连接' })).not.toBeInTheDocument();
+    expect(open).toHaveFocus();
+
+    await user.click(open);
+    expect(within(screen.getByRole('dialog', { name: '添加工具连接' })).getByLabelText('连接名称')).toHaveValue('');
+  });
+
+  it('keeps the MCP dialog open while a save is in progress', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [], configuration_status: 'not_configured' });
+    vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
+    let finishCreate!: (connector: MCPConnector) => void;
+    vi.spyOn(portalApi, 'createMCPConnector').mockReturnValue(new Promise((resolve) => { finishCreate = resolve; }));
+    renderPage();
+    await selectArea(user, 'MCP 工具');
+    await user.click(await screen.findByRole('button', { name: '＋ 添加工具连接' }));
+    const dialog = screen.getByRole('dialog', { name: '添加工具连接' });
+    await user.type(within(dialog).getByLabelText('连接名称'), '本地测试');
+    await user.type(within(dialog).getByLabelText('MCP 服务地址'), 'https://mcp.example.test/mcp');
+    await user.click(within(dialog).getByRole('button', { name: '保存连接' }));
+    expect(within(dialog).getByRole('button', { name: '正在保存…' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    expect(screen.getByRole('dialog', { name: '添加工具连接' })).toBeInTheDocument();
+
+    finishCreate(mcpConnector);
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '添加工具连接' })).not.toBeInTheDocument());
   });
 
   it('creates and enables an owner-scoped MCP connector without keeping its credential in the form', async () => {
@@ -333,41 +373,17 @@ describe('Connections', () => {
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
   });
 
-  it('lists shared and personal models returned by the owner-scoped API', async () => {
-    const user = userEvent.setup();
+  it('omits the page title and shared models while listing personal models', async () => {
     vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [model, { ...model, id: 'p7654321', name: '我的私有模型', shared: false }], configuration_status: 'configured' });
     renderPage();
 
-    await selectArea(user, '团队模型');
-    expect(await screen.findByRole('heading', { name: '团队模型', level: 2 })).toBeInTheDocument();
-    const teamCard = (await screen.findByRole('heading', { name: '团队模型', level: 3 })).closest('article')!;
-    expect(within(teamCard).getByText('检查通过')).toBeInTheDocument();
-    expect(within(teamCard).queryByRole('button', { name: '编辑' })).not.toBeInTheDocument();
-    await selectArea(user, '个人模型');
+    expect(screen.queryByRole('heading', { name: '模型与工具', level: 1 })).not.toBeInTheDocument();
+    expect(screen.queryByText('管理你的模型连接与可用工具。')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '团队模型' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '团队模型', level: 3 })).not.toBeInTheDocument();
     const personal = (await screen.findByText('我的私有模型')).closest('article')!;
     expect(within(personal).getByText('检查通过')).toBeInTheDocument();
     expect(within(personal).getByRole('button', { name: '检查连接' })).toBeInTheDocument();
-  });
-
-  it('paginates team models without exposing rows from another page', async () => {
-    const user = userEvent.setup();
-    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [
-      model,
-      { ...model, id: 'p2234567', name: '团队模型二' },
-      { ...model, id: 'p3234567', name: '团队模型三' },
-    ], configuration_status: 'configured' });
-    renderPage();
-    await selectArea(user, '团队模型');
-
-    expect(await screen.findByRole('heading', { name: '团队模型', level: 3 })).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: '团队模型二', level: 3 })).not.toBeInTheDocument();
-    const pagination = screen.getByRole('navigation', { name: '团队模型分页' });
-    await user.click(within(pagination).getByRole('button', { name: '下一页' }));
-
-    expect(await screen.findByRole('heading', { name: '团队模型二', level: 3 })).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: '团队模型', level: 3 })).not.toBeInTheDocument();
-    await user.click(within(pagination).getByRole('button', { name: '下一页' }));
-    expect(await screen.findByRole('heading', { name: '团队模型三', level: 3 })).toBeInTheDocument();
   });
 
   it('paginates MCP connectors while retaining their accessible actions', async () => {
@@ -416,16 +432,13 @@ describe('Connections', () => {
     await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'custom');
     await user.type(screen.getByLabelText('显示名称'), '待保存模型');
     await user.type(screen.getByLabelText('服务地址'), 'https://draft.example.test/v1');
-    await selectArea(user, '团队模型');
-    await selectArea(user, '个人模型');
-    expect(screen.getByLabelText('显示名称')).toHaveValue('待保存模型');
-    expect(screen.getByLabelText('服务地址')).toHaveValue('https://draft.example.test/v1');
-
     await selectArea(user, 'MCP 工具');
     await user.click(await screen.findByRole('button', { name: '＋ 添加工具连接' }));
     await user.type(screen.getByLabelText('连接名称'), '待保存工具');
     await user.type(screen.getByLabelText('MCP 服务地址'), 'https://draft.example.test/mcp');
     await selectArea(user, '个人模型');
+    expect(screen.getByLabelText('显示名称')).toHaveValue('待保存模型');
+    expect(screen.getByLabelText('服务地址')).toHaveValue('https://draft.example.test/v1');
     await selectArea(user, 'MCP 工具');
     expect(screen.getByLabelText('连接名称')).toHaveValue('待保存工具');
     expect(screen.getByLabelText('MCP 服务地址')).toHaveValue('https://draft.example.test/mcp');
@@ -443,8 +456,8 @@ describe('Connections', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('模型服务暂时不可用');
     await user.click(screen.getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
     expect(await screen.findByText('尚未添加个人模型')).toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(attempts).toBe(2);
   });
 
@@ -524,7 +537,8 @@ describe('Connections', () => {
     });
     renderPage();
 
-    expect(await screen.findByText('尚未添加个人模型')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('正在读取模型连接…')).not.toBeInTheDocument());
+    expect(screen.getByText('尚未添加个人模型')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /添加个人模型/ }));
     const dialog = screen.getByRole('dialog', { name: '添加个人模型' });
     expect(dialog.querySelector('form.connection-form')).not.toBeNull();
@@ -629,8 +643,15 @@ describe('Connections', () => {
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ api_key: 'local-test-secret' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
     expect(screen.getByRole('alert')).toHaveTextContent('密钥已清除，请重新输入后重试');
+    const dialog = screen.getByRole('dialog', { name: '添加个人模型' });
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
+    expect(screen.getByText('高级设置').closest('details')).not.toHaveAttribute('open');
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
     expect(screen.getByLabelText('显示名称')).toHaveValue('DeepSeek Flash');
+    await user.click(within(dialog).getByRole('button', { name: '取消' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
+    await user.click(screen.getByRole('button', { name: '关闭通知' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('does not submit a key containing only whitespace', async () => {

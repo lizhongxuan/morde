@@ -24,9 +24,6 @@
 }
 
 .personal-data-page > .design-panel-header { display: none; }
-.morde-page .personal-data-page .personal-sync-status { flex: 0 0 auto; margin: 0; padding: 0 2px 4px; }
-.personal-data-page .personal-sync-status p { margin: 0; font-size: 10px; line-height: 1.35; }
-
 .personal-data-page > .connection-section {
   min-height: 0;
   margin: 0;
@@ -92,7 +89,6 @@
 @media (max-width: 620px) {
   .morde-shell:not(.morde-admin-shell) > .morde-main > .morde-page:has(> .personal-data-page) { padding: 4px 6px; }
   .personal-data-page { gap: 4px; }
-  .personal-data-page .personal-sync-status { padding-bottom: 2px; }
   .personal-data-page > .connection-section { gap: 5px; }
   .personal-data-page .form-card { padding: 8px; }
   .personal-data-page .form-stack { gap: 4px; }

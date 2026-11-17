@@ -26,7 +26,7 @@ test.describe("Assistant durable tasks", () => {
     await page.getByLabel("密码").fill("demo");
     await page.getByRole("button", { name: "登录" }).click();
 
-    const routes = ["/assistant", "/personal", "/goals", "/hosts", "/hosts?sync=1", "/hosts/sync", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/settings/sync", "/projects", "/workspaces", "/local-projects"];
+    const routes = ["/assistant", "/personal", "/goals", "/goals?view=schedules", "/hosts", "/hosts?sync=1", "/hosts/sync", "/clients", "/apikeys", "/notifications", "/connections", "/settings", "/settings/sync", "/projects", "/workspaces", "/local-projects"];
     for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 800, height: 600 }, { width: 480, height: 720 }]) {
       await page.setViewportSize(viewport);
       for (const route of routes) {
@@ -38,7 +38,7 @@ test.describe("Assistant durable tasks", () => {
           await expect(page.getByRole("heading", { name: "文件同步" })).toBeVisible();
         }
         const sidebarToggle = page.getByRole("button", { name: /折叠侧边栏|展开侧边栏/ });
-        if (["/assistant", "/personal", "/goals", "/hosts", "/settings", "/settings/sync", "/workspaces", "/local-projects"].includes(new URL(page.url()).pathname)) {
+        if (["/assistant", "/personal", "/hosts", "/clients", "/apikeys", "/connections", "/settings"].includes(new URL(page.url()).pathname)) {
           await expect(sidebarToggle).toBeVisible();
           const expanded = await sidebarToggle.getAttribute("aria-expanded");
           await sidebarToggle.click();

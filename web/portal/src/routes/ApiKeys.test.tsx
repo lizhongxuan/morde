@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -46,23 +46,65 @@ describe('ApiKeys', () => {
     const { client } = renderPage();
 
     const open = await screen.findByRole('button', { name: '＋ 创建 API Key' });
-    expect(open).toHaveAttribute('aria-expanded', 'false');
+    expect(open).toHaveAttribute('aria-haspopup', 'dialog');
     await user.click(open);
-    expect(screen.getByRole('button', { name: '收起' })).toHaveAttribute('aria-expanded', 'true');
-    const submit = screen.getByRole('button', { name: '创建 API Key' });
+    const dialog = screen.getByRole('dialog', { name: '创建 API Key' });
+    const submit = within(dialog).getByRole('button', { name: '创建 API Key' });
     expect(submit).toBeDisabled();
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText('名称'), '我的 MCP');
+    await user.type(within(dialog).getByLabelText('名称'), '我的 MCP');
     expect(submit).toBeEnabled();
     await user.click(submit);
 
     await waitFor(() => expect(create.mock.calls[0]?.[0]).toEqual({ name: '我的 MCP' }));
+    expect(await screen.findByRole('dialog', { name: 'API Key 已创建' })).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: '创建 API Key' })).not.toBeInTheDocument();
     expect(await screen.findByText('chk_one-time-secret')).toBeInTheDocument();
     expect(screen.getByLabelText('凭证')).toHaveValue('chk_one-time-secret');
     expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state))).not.toContain('chk_one-time-secret');
     await user.click(screen.getByRole('button', { name: '关闭并清除' }));
     expect(screen.queryByLabelText('凭证')).not.toBeInTheDocument();
     expect(screen.queryByText('chk_one-time-secret')).not.toBeInTheDocument();
+  });
+
+  it('clears a cancelled API Key draft and returns focus to the create button', async () => {
+    vi.spyOn(portalApi, 'apiKeys').mockResolvedValue({ items: [] });
+    const user = userEvent.setup();
+    renderPage();
+
+    const open = await screen.findByRole('button', { name: '＋ 创建 API Key' });
+    await user.click(open);
+    const dialog = screen.getByRole('dialog', { name: '创建 API Key' });
+    await user.type(within(dialog).getByLabelText('名称'), '待取消的密钥');
+    await user.type(within(dialog).getByLabelText('有效期（天，可选）'), '30');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: '创建 API Key' })).not.toBeInTheDocument();
+    expect(open).toHaveFocus();
+    await user.click(open);
+    expect(screen.getByLabelText('名称')).toHaveValue('');
+    expect(screen.getByLabelText('有效期（天，可选）')).toHaveValue(null);
+  });
+
+  it('keeps the creation dialog open until the one-time key is returned', async () => {
+    vi.spyOn(portalApi, 'apiKeys').mockResolvedValue({ items: [] });
+    let finishCreate!: (result: Awaited<ReturnType<typeof portalApi.createApiKey>>) => void;
+    const create = vi.spyOn(portalApi, 'createApiKey').mockReturnValue(new Promise((resolve) => { finishCreate = resolve; }));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '＋ 创建 API Key' }));
+    const dialog = screen.getByRole('dialog', { name: '创建 API Key' });
+    await user.type(within(dialog).getByLabelText('名称'), '本地测试');
+    await user.type(within(dialog).getByLabelText('有效期（天，可选）'), '30');
+    await user.click(within(dialog).getByRole('button', { name: '创建 API Key' }));
+    expect(create).toHaveBeenCalledWith({ name: '本地测试', ttl_seconds: 30 * 86400 });
+    expect(within(dialog).getByRole('button', { name: '创建中…' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    expect(screen.getByRole('dialog', { name: '创建 API Key' })).toBeInTheDocument();
+
+    finishCreate({ id: 't1234567', key: 'chk_synthetic', expires_at: new Date(Date.now() + 86400000).toISOString() });
+    expect(await screen.findByRole('dialog', { name: 'API Key 已创建' })).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: '创建 API Key' })).not.toBeInTheDocument();
   });
 
   it('shows revoked state and explains that already-issued external actions may finish', async () => {

@@ -64,11 +64,19 @@ describe('Hosts', () => {
   it('keeps file synchronization in Settings instead of the cloud-computer view', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/hosts']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
     expect(screen.queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: '云端电脑视图' })).toHaveTextContent('我的电脑共享给我的');
+    expect(screen.getByRole('heading', { name: '我的电脑', level: 2 })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '＋ 创建电脑' })).toHaveAttribute('href', '/hosts/new');
+
+    await user.click(screen.getByRole('button', { name: '共享给我的' }));
+    expect(screen.getByRole('heading', { name: '共享给我的电脑', level: 2 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '共享给我的' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByRole('link', { name: '＋ 创建电脑' })).not.toBeInTheDocument();
   });
 
   it('keeps the confirmed host list visible and reports a transient refresh failure in a popup', async () => {

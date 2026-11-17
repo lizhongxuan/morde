@@ -66,9 +66,8 @@ describe('Reviews', () => {
     vi.spyOn(portalApi, 'taskApprovals').mockRejectedValue(new TypeError('Failed to fetch'));
     const { container } = renderReviews();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('网络异常，审核事项暂时无法读取。');
-    expect(screen.getByRole('status')).toHaveTextContent('正在读取审核事项…');
-    expect(container.querySelector('.reviews-page [role="alert"]')).toBeNull();
+    expect(await screen.findByRole('alert')).toHaveTextContent('审核事项暂时无法读取');
+    expect(container.querySelector('.reviews-page [role="alert"]')).not.toBeNull();
     expect(screen.queryByText('当前没有待处理审核。')).not.toBeInTheDocument();
     expect(screen.queryByText('0 项待处理')).not.toBeInTheDocument();
   });
@@ -83,9 +82,9 @@ describe('Reviews', () => {
 
     await client.invalidateQueries({ queryKey: ['task-approvals', 'all'] });
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('网络异常，审核事项暂时无法读取。');
+    expect(await screen.findByRole('alert')).toHaveTextContent('连接中断，已加载内容仍保留');
     expect(screen.getByRole('heading', { name: '审批 k1234567' })).toBeInTheDocument();
-    expect(container.querySelector('.reviews-page [role="alert"]')).toBeNull();
+    expect(container.querySelector('.reviews-page [role="alert"]')).not.toBeNull();
     expect(list).toHaveBeenCalledTimes(2);
   });
 
@@ -93,9 +92,8 @@ describe('Reviews', () => {
     vi.spyOn(portalApi, 'taskApprovals').mockRejectedValue(new ApiError({ message: 'forbidden', code: 'forbidden', status: 403 }));
     const { container } = renderReviews();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('审核事项暂不可用，待处理数量和结果均未确认。');
+    expect(await screen.findByRole('alert')).toHaveTextContent('请联系管理员确认审核权限。待处理数量和审核结果尚未确认。');
     expect(container.querySelector('.reviews-page [role="alert"]')).not.toBeNull();
-    expect(screen.queryByText('网络异常，审核事项暂时无法读取。')).not.toBeInTheDocument();
   });
 
   it('refreshes after a stale approval response and reflects the decision made elsewhere', async () => {

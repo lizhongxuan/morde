@@ -50,6 +50,7 @@ FORCE=0
 
 # ---------------- state ----------------
 SWAPPED=0
+CONFIG_SYNCED=0
 BACKUP_DIR=""
 NEW_BIN=""
 NEW_HEAD=""
@@ -69,6 +70,9 @@ log() {
 
 die() {
   log "FATAL: $*"
+  if [[ "$SWAPPED" == "1" ]]; then
+    on_error 1
+  fi
   exit 1
 }
 
@@ -120,9 +124,24 @@ wait_healthy() {
   return 1
 }
 
+restore_model_config() {
+  [[ -n "$BACKUP_DIR" && -f "$BACKUP_DIR/portal.yaml" ]] || return 1
+  local restore_tmp
+  restore_tmp="$(mktemp "$(dirname "$CONFIG")/.$(basename "$CONFIG").restore.XXXXXX")" || return 1
+  if ! cp -a "$BACKUP_DIR/portal.yaml" "$restore_tmp" || ! mv -f "$restore_tmp" "$CONFIG"; then
+    rm -f "$restore_tmp"
+    return 1
+  fi
+  CONFIG_SYNCED=0
+  log "restored portal config from $BACKUP_DIR/portal.yaml"
+}
+
 rollback() {
   trap - ERR
   log "ERROR: update failed after swap, rolling back to backup binary"
+  if [[ "$CONFIG_SYNCED" == "1" ]]; then
+    restore_model_config || log "ROLLBACK WARNING: could not restore portal config; backup: $BACKUP_DIR/portal.yaml"
+  fi
   if [[ -n "$BACKUP_DIR" && -f "$BACKUP_DIR/portal" ]]; then
     install -m 0755 "$BACKUP_DIR/portal" "$BIN.new"
     mv -f "$BIN.new" "$BIN"
@@ -144,6 +163,9 @@ on_error() {
   if [[ "$SWAPPED" == "1" ]]; then
     rollback
   else
+    if [[ "$CONFIG_SYNCED" == "1" ]]; then
+      restore_model_config || log "ERROR: could not restore portal config; backup: $BACKUP_DIR/portal.yaml"
+    fi
     log "ERROR: update aborted before swap (rc=$rc); running binary untouched"
   fi
   exit "$rc"
@@ -284,10 +306,22 @@ NEW_HEAD="$(git -C "$SRC_DIR" rev-parse HEAD)"
 log "source: ${OLD_SRC_HEAD:-<fresh clone>} -> $NEW_HEAD"
 git -C "$SRC_DIR" log --oneline -5 | while IFS= read -r line; do log "  commit: $line"; done
 
+MODEL_ALLOWLIST_SYNC="$SRC_DIR/deploy/single/sync-model-allowlist.py"
+[[ -f "$MODEL_ALLOWLIST_SYNC" ]] || die "missing model allowlist sync helper: $MODEL_ALLOWLIST_SYNC"
+CONFIG_SYNC_NEEDED=0
+if python3 "$MODEL_ALLOWLIST_SYNC" --check "$SRC_DIR/deploy/single/portal.yaml" "$CONFIG"; then
+  log "active model host allowlist matches repository defaults"
+else
+  check_rc=$?
+  [[ "$check_rc" == "1" ]] || die "could not validate active model allowlist (helper exit $check_rc)"
+  CONFIG_SYNC_NEEDED=1
+  log "active model host allowlist is missing repository defaults; it will be updated while deploying"
+fi
+
 # idempotency: already on this HEAD and binary matches the recorded deploy
 if [[ "$FORCE" == "0" && -f "$MORDE_DIR/.deployed-head" ]]; then
   read -r deployed_head deployed_sha <"$MORDE_DIR/.deployed-head" || true
-  if [[ "$deployed_head" == "$NEW_HEAD" && "$deployed_sha" == "$CURRENT_SHA" ]]; then
+  if [[ "$deployed_head" == "$NEW_HEAD" && "$deployed_sha" == "$CURRENT_SHA" && "$CONFIG_SYNC_NEEDED" == "0" ]]; then
     log "already up to date at $NEW_HEAD (use --force to rebuild anyway)"
     exit 0
   fi
@@ -326,6 +360,9 @@ run_migrate "$NEW_BIN" status
 
 if [[ "$DRY_RUN" == "1" ]]; then
   log "=== DRY RUN OK: checkout + build + validation + migrate status all passed ==="
+  if [[ "$CONFIG_SYNC_NEEDED" == "1" ]]; then
+    log "=== DRY RUN: active model host allowlist would be updated; no config was changed ==="
+  fi
   log "=== DRY RUN: stopping here — no backup, no swap, no migrate up, no restart ==="
   log "=== DRY RUN: built binary kept at $NEW_BIN (release dir will be pruned on the next real run) ==="
   exit 0
@@ -354,6 +391,16 @@ else
   run_migrate "$NEW_BIN" up
   log "migrate status after up:"
   run_migrate "$NEW_BIN" status
+fi
+
+# Keep operator-added hosts and all unrelated runtime settings; only merge
+# repository-declared model host defaults into the active config.
+if [[ "$CONFIG_SYNC_NEEDED" == "1" ]]; then
+  cp -a "$CONFIG" "$BACKUP_DIR/portal.yaml"
+  echo "active_config_backup=portal.yaml" >>"$BACKUP_DIR/MANIFEST"
+  log "backed up active portal config to $BACKUP_DIR/portal.yaml"
+  CONFIG_SYNCED=1
+  python3 "$MODEL_ALLOWLIST_SYNC" --sync "$SRC_DIR/deploy/single/portal.yaml" "$CONFIG"
 fi
 
 # ---------------- swap + restart ----------------

@@ -59,4 +59,20 @@ describe('RecoverableError', () => {
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
     expect(screen.getByText('页面已恢复')).toBeInTheDocument();
   });
+
+  it('recovers when navigating back between goal views after a render failure', () => {
+    function GoalPage() {
+      if (useLocation().search.includes('schedules')) throw new Error('schedule render failed');
+      return <p>目标页面已恢复</p>;
+    }
+    window.history.replaceState({ idx: 1 }, '', '/');
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    render(<MemoryRouter initialEntries={['/goals?view=goals', '/goals?view=schedules']} initialIndex={1}>
+      <RecoverablePageBoundary homePath="/assistant" homeLabel="返回助手"><GoalPage /></RecoverablePageBoundary>
+    </MemoryRouter>);
+
+    expect(screen.getByRole('heading', { name: '页面暂时无法显示' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '返回上一页' }));
+    expect(screen.getByText('目标页面已恢复')).toBeInTheDocument();
+  });
 });

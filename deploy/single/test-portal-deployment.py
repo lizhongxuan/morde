@@ -21,9 +21,81 @@ binary_spec = importlib.util.spec_from_file_location("validate_portal_binary", R
 assert binary_spec and binary_spec.loader
 binary_validator = importlib.util.module_from_spec(binary_spec)
 binary_spec.loader.exec_module(binary_validator)
+allowlist_spec = importlib.util.spec_from_file_location(
+    "sync_model_allowlist", ROOT / "sync-model-allowlist.py"
+)
+assert allowlist_spec and allowlist_spec.loader
+allowlist_sync = importlib.util.module_from_spec(allowlist_spec)
+allowlist_spec.loader.exec_module(allowlist_sync)
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_model_allowlist_sync_adds_defaults_and_preserves_operator_config(self):
+        source = "models:\n  allowed_hosts: [api.openai.com, api.deepseek.com, api.z.ai]\n"
+        target = (
+            "instance: cloudhost\n"
+            "models:\n  allowed_hosts: [api.openai.com, private.example.test] # operator host\n"
+            "  project_rates: []\n"
+        )
+
+        updated, added = allowlist_sync.merge_model_hosts(source, target)
+
+        self.assertEqual(added, ["api.deepseek.com", "api.z.ai"])
+        self.assertIn(
+            "allowed_hosts: [api.openai.com, private.example.test, api.deepseek.com, api.z.ai] # operator host",
+            updated,
+        )
+        self.assertIn("project_rates: []", updated)
+        self.assertEqual(allowlist_sync.merge_model_hosts(source, updated), (updated, []))
+
+    def test_model_allowlist_sync_rejects_ambiguous_or_invalid_hosts(self):
+        valid = "models:\n  allowed_hosts: [api.openai.com]\n"
+        for target in (
+            "models:\n  allowed_hosts: [api.openai.com]\nmodels:\n  allowed_hosts: [api.deepseek.com]\n",
+            "models:\n  allowed_hosts: [127.0.0.1]\n",
+            "models:\n  allowed_hosts: [api.openai.com, api.openai.com]\n",
+            "models:\n  allowed_hosts:\n    - api.openai.com\n",
+        ):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                allowlist_sync.merge_model_hosts(valid, target)
+
+    def test_model_allowlist_sync_command_writes_atomically_and_checks_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "source.yaml"
+            target = pathlib.Path(directory) / "active.yaml"
+            source.write_text("models:\n  allowed_hosts: [api.openai.com, api.deepseek.com]\n")
+            target.write_text("models:\n  allowed_hosts: [api.openai.com]\n")
+            target.chmod(0o640)
+
+            sync = subprocess.run(
+                ["python3", str(ROOT / "sync-model-allowlist.py"), "--sync", str(source), str(target)],
+                capture_output=True,
+                text=True,
+            )
+            check = subprocess.run(
+                ["python3", str(ROOT / "sync-model-allowlist.py"), "--check", str(source), str(target)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertEqual(check.returncode, 0, check.stderr)
+            self.assertIn("api.deepseek.com", target.read_text())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+
+    def test_updater_repairs_config_drift_even_when_binary_is_current(self):
+        updater = (ROOT / "update.sh").read_text()
+        check = updater.index('python3 "$MODEL_ALLOWLIST_SYNC" --check')
+        idempotency = updater.index("# idempotency:")
+        sync = updater.index('python3 "$MODEL_ALLOWLIST_SYNC" --sync')
+        swap = updater.index("# ---------------- swap + restart")
+        restart = updater.index('systemctl restart "$SERVICE"', swap)
+
+        self.assertLess(check, idempotency)
+        self.assertLess(sync, restart)
+        self.assertIn('"$CONFIG_SYNC_NEEDED" == "0"', updater[idempotency:])
+        self.assertIn("restore_model_config", updater)
+
     def test_environment_reader_never_executes_other_lines(self):
         source = io.StringIO(
             "CH_DATA_KEY_FILE='/etc/cloudhost/data.key'\n"

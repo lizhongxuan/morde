@@ -3,12 +3,17 @@ import { useLocation } from 'react-router';
 import { RecoverableError } from '../components/RecoverableError';
 
 type BoundaryProps = { children: ReactNode; homePath: string; homeLabel: string };
+type PageBoundaryProps = BoundaryProps & { navigationKey: string };
 type BoundaryState = { failed: boolean };
 
-class PageErrorBoundary extends Component<BoundaryProps, BoundaryState> {
+class PageErrorBoundary extends Component<PageBoundaryProps, BoundaryState> {
   state: BoundaryState = { failed: false };
 
   static getDerivedStateFromError(): BoundaryState { return { failed: true }; }
+
+  componentDidUpdate(previous: PageBoundaryProps) {
+    if (this.state.failed && previous.navigationKey !== this.props.navigationKey) this.setState({ failed: false });
+  }
 
   render() {
     if (!this.state.failed) return this.props.children;
@@ -24,5 +29,5 @@ class PageErrorBoundary extends Component<BoundaryProps, BoundaryState> {
 
 export function RecoverablePageBoundary({ children, homePath, homeLabel }: BoundaryProps) {
   const location = useLocation();
-  return <PageErrorBoundary key={location.key} homePath={homePath} homeLabel={homeLabel}>{children}</PageErrorBoundary>;
+  return <PageErrorBoundary key={location.pathname === '/goals' ? location.pathname : location.key} navigationKey={location.key} homePath={homePath} homeLabel={homeLabel}>{children}</PageErrorBoundary>;
 }

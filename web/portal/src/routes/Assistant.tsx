@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } f
 import type { ChangeEvent, CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { enterHostInNewTab, errorDetails, newIdempotencyKey, portalApi } from '../app/api';
+import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission } from '../app/api';
 import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview, K2TaskDependency } from '../app/k2-task-projection';
@@ -26,6 +26,7 @@ import { formatBytes, formatDate, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
 import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { ChatMarkdown } from '../components/ChatMarkdown';
+import { HostControlPanel } from '../components/HostControlPanel';
 import { MordeIcon } from '../components/MordeIcon';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { TaskApprovalCard } from '../components/TaskApprovalCard';
@@ -60,7 +61,7 @@ type AssistantOutletContext = {
   focusPanelToggle?: () => void;
 };
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
-type ComputerHostOption = { id: string; name: string; url: string; state: string; owned: boolean; permissions: HostMemberPermission[] };
+type ComputerHostOption = { id: string; name: string; url: string; state: string; owned: boolean; permissions: HostMemberPermission[]; control_state?: Host['control_state'] };
 type ComputerEmbedSession = {
   conversationID: string;
   hostID: string;
@@ -234,6 +235,20 @@ function hostEmbedTargetPlan(host: ComputerHostOption): HostEmbedTicketRequest['
 function hostEmbedInitialTarget(targets: HostEmbedTicketRequest['targets']): HostEmbedTicketRequest['target'] | null {
   return targets.includes('browser') ? 'browser' : targets.includes('terminal') ? 'terminal'
     : targets.includes('workspace') ? 'workspace' : null;
+}
+
+const computerQuickActions: { target: HostEmbedTicketRequest['target']; label: string; icon: 'browser' | 'terminal' | 'files' | 'vscode' }[] = [
+  { target: 'browser', label: '浏览器', icon: 'browser' },
+  { target: 'terminal', label: '终端', icon: 'terminal' },
+  { target: 'files', label: '文件', icon: 'files' },
+  { target: 'vscode', label: 'VS Code', icon: 'vscode' },
+];
+
+function ComputerActionIcon({ icon }: { icon: 'browser' | 'terminal' | 'files' | 'vscode' }) {
+  if (icon === 'browser') return <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17M12 3.5c2.4 2.3 3.6 5.2 3.6 8.5s-1.2 6.2-3.6 8.5c-2.4-2.3-3.6-5.2-3.6-8.5S9.6 5.8 12 3.5Z" /></svg>;
+  if (icon === 'terminal') return <svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.5" /><path d="m7 9.5 3 2.5-3 2.5M12.5 15.5H17" /></svg>;
+  if (icon === 'files') return <svg viewBox="0 0 24 24"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9v8.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5Z" /></svg>;
+  return <svg viewBox="0 0 24 24"><path d="m8.5 8.5-4 3.5 4 3.5m7-7 4 3.5-4 3.5m-2-10-3 13" /></svg>;
 }
 
 const assistantAttachmentTypes = new Set([
@@ -1492,7 +1507,7 @@ export function Assistant() {
   const preferredHostID = preferences.data?.default_host_id || (hostItems.length === 1 ? hostItems[0]?.id : '') || '';
   const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
   const computerHostOptions: ComputerHostOption[] = [
-    ...hostItems.map((host) => ({ id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: true, permissions: [] })),
+    ...hostItems.map((host) => ({ id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: true, permissions: [], control_state: host.control_state })),
     ...(sharedHosts.data?.items ?? []).map((host) => ({
       id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: false, permissions: host.permissions,
     })),
@@ -1500,11 +1515,14 @@ export function Assistant() {
   const selectedComputerHost = preferredHostID ? computerHostOptions.find((host) => host.id === preferredHostID) : undefined;
   const selectedComputerTargets = selectedComputerHost ? hostEmbedTargetPlan(selectedComputerHost) : [];
   const selectedComputerInitialTarget = hostEmbedInitialTarget(selectedComputerTargets);
-  const requestComputerEmbed = async () => {
-    if (!selectedComputerHost || !conversationID || !selectedComputerInitialTarget || computerConnecting) {
+  const computerEmbedFailed = computerEmbed?.status === 'error' && computerEmbed.conversationID === conversationID
+    && computerEmbed.hostID === selectedComputerHost?.id;
+  const requestComputerEmbed = async (requestedTarget?: HostEmbedTicketRequest['target']) => {
+    const target = requestedTarget ?? selectedComputerInitialTarget;
+    if (!selectedComputerHost || !conversationID || !target || !selectedComputerTargets.includes(target) || computerConnecting) {
       if (!conversationID) setComputerPanelError('先发送一条消息创建当前旁聊，再连接云端电脑。');
       else if (!selectedComputerHost) setComputerPanelError('请先在云端电脑设置中配置默认电脑。');
-      else if (!selectedComputerInitialTarget) setComputerPanelError('当前账号没有此电脑的可用工作台权限。');
+      else if (!target || !selectedComputerTargets.includes(target)) setComputerPanelError('当前账号没有此电脑的可用工作台权限。');
       return;
     }
     const generation = ++computerRequestGeneration.current;
@@ -1517,7 +1535,7 @@ export function Assistant() {
       if (desktopBridge?.openHostWorkbenchEmbed) {
         const opened = await desktopBridge.openHostWorkbenchEmbed({
           hostID: selectedComputerHost.id, conversationID,
-          initialTarget: selectedComputerInitialTarget, targets: selectedComputerTargets,
+          initialTarget: target, targets: selectedComputerTargets,
           shared: !selectedComputerHost.owned,
         }) as { hostID?: unknown; hostOrigin?: unknown; conversationID?: unknown; nonce?: unknown; targets?: unknown };
         if (generation !== computerRequestGeneration.current) {
@@ -1534,7 +1552,7 @@ export function Assistant() {
         return;
       }
       const issued = await portalApi.issueHostEmbedTicket(selectedComputerHost.id, {
-        conversation_id: conversationID, target: selectedComputerInitialTarget, targets: selectedComputerTargets,
+        conversation_id: conversationID, target, targets: selectedComputerTargets,
       });
       if (generation !== computerRequestGeneration.current) return;
       const hostURL = new URL(selectedComputerHost.url);
@@ -1544,7 +1562,7 @@ export function Assistant() {
       if (hostURL.username || hostURL.password || exchangeURL.origin !== hostURL.origin ||
         exchangeURL.pathname !== '/__ch/embed-auth' || exchangeURL.search || exchangeURL.hash ||
         exchangeURL.username || exchangeURL.password || !/^[\w-]{43}$/.test(issued.ticket) ||
-        !/^[\w-]{32}$/.test(issued.embed_nonce) || !validTargets || !issued.targets.includes(selectedComputerInitialTarget)) {
+        !/^[\w-]{32}$/.test(issued.embed_nonce) || !validTargets || !issued.targets.includes(target)) {
         throw new Error('电脑连接凭据或授权范围无效，请刷新后重试。');
       }
       setComputerEmbed({
@@ -3561,54 +3579,68 @@ export function Assistant() {
               </article>} />}
         </div>}
         <section className="task-panel-list task-panel-computer" aria-label="当前会话云端电脑" hidden={taskPanelTab !== 'computer'}>
-          <div className={`computer-panel-toolbar${computerEmbed?.conversationID === conversationID ? ' has-workbench' : ''}${computerEmbed?.conversationID === conversationID && computerEmbed.status === 'ready' ? ' is-workbench-ready' : ''}`}>
-            <div className="computer-panel-availability" role="status" aria-live="polite">
-              <span className={`computer-panel-availability-dot${selectedComputerHost?.state === 'running' ? ' is-ready' : ''}`} aria-hidden="true" />
-              <strong>{selectedComputerHost?.state === 'running' ? '已连接'
-                : !preferredHostID && preferences.isPending ? '正在读取设置…'
-                  : preferredHostID && hosts.isPending ? '正在检查云端电脑…'
-                    : preferredHostID && !selectedComputerHost ? '云端电脑暂不可用'
-                    : selectedComputerHost ? hostStateLabel[selectedComputerHost.state] || '暂不可用' : '未配置云端电脑'}</strong>
-              {selectedComputerHost && <small>{selectedComputerHost.name}</small>}
-              {!selectedComputerHost && <Link to="/hosts">设置默认电脑</Link>}
+          {(!computerEmbed || computerEmbed.conversationID !== conversationID || computerEmbed.status === 'error') ? <div className="computer-panel-welcome">
+            <div className="computer-panel-toolbar">
+              <div className="computer-panel-availability" role="status" aria-live="polite">
+                <span className={`computer-panel-availability-dot${computerEmbedFailed ? ' is-error' : selectedComputerHost?.state === 'running' ? ' is-ready' : ''}`} aria-hidden="true" />
+                <strong>{computerEmbedFailed ? '工作台未就绪'
+                  : selectedComputerHost?.state === 'running' ? '云端电脑运行中'
+                  : !preferredHostID && preferences.isPending ? '正在读取设置…'
+                    : preferredHostID && hosts.isPending ? '正在检查云端电脑…'
+                      : preferredHostID && !selectedComputerHost ? '云端电脑暂不可用'
+                        : selectedComputerHost ? hostStateLabel[selectedComputerHost.state] || '暂不可用' : '未配置云端电脑'}</strong>
+                {selectedComputerHost && <small>{selectedComputerHost.name}</small>}
+                {!selectedComputerHost && <Link to="/hosts">设置默认电脑</Link>}
+              </div>
             </div>
-            <button type="button" className="button button-primary" disabled={computerConnecting || !selectedComputerHost ||
-              selectedComputerHost.state !== 'running' || !selectedComputerInitialTarget}
-              onClick={() => void requestComputerEmbed()}>
-              {computerConnecting ? '正在连接…' : computerEmbed?.status === 'ready' ? '重新连接'
-                : computerEmbed?.status === 'error' ? '重试连接' : '连接到此会话'}
-            </button>
-          </div>
-          {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
-            <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
-          {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
-          {!conversationID && <p className="muted">发送第一条消息后，才能把电脑连接到该会话。</p>}
-          {selectedComputerHost && selectedComputerHost.state !== 'running' && <p className="muted">此电脑当前未运行，启动后才能连接。</p>}
-          {selectedComputerHost && !selectedComputerTargets.length && <p className="muted">此电脑没有可嵌入的授权功能。</p>}
-          {computerEmbed?.conversationID === conversationID && <>
-            <div className={`computer-panel-status computer-panel-status-${computerEmbed.status}`} role="status" aria-live="polite">
-              {computerEmbed.status === 'ready' ? '工作台已就绪' : computerEmbed.status === 'error'
-                ? computerEmbed.error || '工作台连接失败。' : computerEmbed.status === 'submitting' ? '正在安全连接…' : '正在等待工作台就绪…'}
-              {computerEmbed.status === 'ready' && <small>远程桌面连接和控制状态以工作台内的实时提示为准。</small>}
-              {computerEmbed.status === 'ready' && <small>可用功能：{computerEmbed.targets.map((target) => ({
-                browser: '桌面', terminal: '终端', workspace: 'Workspace', files: '主机文件', vscode: 'VS Code',
-              }[target])).join('、')}</small>}
-              {computerEmbed.status === 'error' && selectedComputerHost && <button type="button" className="button button-small button-secondary"
-                onClick={() => {
-                  try {
-                    const fallbackTarget = selectedComputerHost.owned ? undefined
-                      : selectedComputerInitialTarget === 'browser' ? 'desktop'
-                        : selectedComputerInitialTarget === 'terminal' || selectedComputerInitialTarget === 'workspace'
-                          ? selectedComputerInitialTarget : undefined;
-                    enterHostInNewTab(selectedComputerHost.id, fallbackTarget);
-                  } catch (error) { notify(errorDetails(error).message, 'error'); }
-                }}>在新窗口打开工作台</button>}
+            {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
+              <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
+            {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
+            {!conversationID && <p className="muted">发送第一条消息后，才能把电脑连接到该会话。</p>}
+            {selectedComputerHost && selectedComputerHost.state !== 'running' && <p className="muted">此电脑当前未运行，启动后才能连接。</p>}
+            {selectedComputerHost && !selectedComputerTargets.length && <p className="muted">此电脑没有可嵌入的授权功能。</p>}
+            <div className="computer-panel-preview" aria-label="云端电脑快捷入口">
+              <strong className="computer-panel-brand">MORDE CLOUD</strong>
+              <div className="computer-panel-actions" role="group" aria-label="打开云端电脑功能">
+                {computerQuickActions.map((action) => {
+                  const target = action.target === 'files' && !selectedComputerTargets.includes('files') && selectedComputerTargets.includes('workspace')
+                    ? 'workspace' : action.target;
+                  const allowed = selectedComputerTargets.includes(target);
+                  const disabled = computerConnecting || !conversationID || !selectedComputerHost || selectedComputerHost.state !== 'running' || !allowed;
+                  const reason = !conversationID ? '发送第一条消息后才能连接此会话'
+                    : !selectedComputerHost ? '请先设置默认云端电脑'
+                      : selectedComputerHost.state !== 'running' ? '云端电脑运行后才能连接'
+                        : !allowed ? '此电脑未授权此功能' : undefined;
+                  return <button key={action.icon} type="button" className={`computer-panel-action computer-panel-action-${action.icon}`}
+                    aria-label={`打开云端电脑${action.label}`} title={reason ?? action.label} disabled={disabled}
+                    onClick={() => void requestComputerEmbed(target)}>
+                    <ComputerActionIcon icon={action.icon} />
+                  </button>;
+                })}
+              </div>
             </div>
-            <div ref={computerFrameBounds} className="computer-panel-frame">
-              {!computerEmbed.native && <iframe key={computerEmbed.nonce} ref={computerFrame} name={`morde-cloud-${computerEmbed.nonce}`} title="当前会话云端电脑工作台"
-                src="about:blank" allow="fullscreen" onError={() => setComputerEmbed((current) => current?.nonce === computerEmbed.nonce
-                  ? { ...current, status: 'error', error: '工作台页面加载失败，请重试。' } : current)} />}
+            {selectedComputerHost && <HostControlPanel host={selectedComputerHost}
+              canControl={selectedComputerHost.owned || selectedComputerHost.permissions.includes('desktop:control')}
+              canReleaseAnyLease={selectedComputerHost.owned} compact />}
+          </div> : <>
+            <div className="computer-panel-toolbar">
+              <div className="computer-panel-availability" role="status" aria-live="polite">
+                <span className={`computer-panel-availability-dot${selectedComputerHost?.state === 'running' ? ' is-ready' : ''}`} aria-hidden="true" />
+                <strong>{selectedComputerHost?.state === 'running' ? '已连接'
+                  : selectedComputerHost ? hostStateLabel[selectedComputerHost.state] || '暂不可用' : '云端电脑暂不可用'}</strong>
+                {selectedComputerHost && <small>{selectedComputerHost.name}</small>}
+              </div>
             </div>
+            {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
+              <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
+            {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
+            {computerEmbed?.conversationID === conversationID && <>
+              <div ref={computerFrameBounds} className="computer-panel-frame">
+                {!computerEmbed.native && <iframe key={computerEmbed.nonce} ref={computerFrame} name={`morde-cloud-${computerEmbed.nonce}`} title="当前会话云端电脑工作台"
+                  src="about:blank" allow="fullscreen" onError={() => setComputerEmbed((current) => current?.nonce === computerEmbed.nonce
+                    ? { ...current, status: 'error', error: '工作台页面加载失败，请重试。' } : current)} />}
+              </div>
+            </>}
           </>}
         </section>
       </aside>}

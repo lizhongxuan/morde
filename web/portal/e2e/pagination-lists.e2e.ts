@@ -290,11 +290,14 @@ test.describe("screen pagination for business lists", () => {
     await expectPageFitsViewport(page);
   });
 
-  test("paginates personal and team models plus MCP connections without page-level scrolling", async ({ page }) => {
+  test("paginates personal models and MCP connections without page-level scrolling", async ({ page }) => {
     await signInWithLongListFixtures(page);
     await navigateWithinPortal(page, "/connections");
     await expect(page.getByRole("heading", { name: "我的模型" })).toBeVisible();
     await seedConnectionFixtures(page);
+    await expect(page.getByRole("heading", { name: "模型与工具", level: 1 })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "团队模型" })).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: /^验收团队模型/ })).toHaveCount(0);
 
     await page.getByRole("button", { name: /添加个人模型/ }).click();
     await page.getByLabel("显示名称").fill("本地刷新触发模型");
@@ -314,20 +317,6 @@ test.describe("screen pagination for business lists", () => {
     }
     await expect(firstPersonalModel).toBeHidden();
     await expect(lastPersonalModel).toBeVisible();
-    await expectPageFitsViewport(page);
-
-    await page.getByRole("button", { name: /^团队模型/ }).click();
-    const teamPagination = page.getByRole("navigation", { name: "团队模型分页" });
-    const firstTeamModel = page.getByRole("heading", { name: "验收团队模型 01" });
-    const lastTeamModel = page.getByRole("heading", { name: "验收团队模型 12" });
-    await expect(firstTeamModel).toBeVisible();
-    await expect(lastTeamModel).toBeHidden();
-    await expectPageFitsViewport(page);
-    for (let pageIndex = 0; pageIndex < 12 && !(await lastTeamModel.isVisible()); pageIndex += 1) {
-      await teamPagination.getByRole("button", { name: "下一页" }).click();
-    }
-    await expect(firstTeamModel).toBeHidden();
-    await expect(lastTeamModel).toBeVisible();
     await expectPageFitsViewport(page);
 
     await page.getByRole("button", { name: "MCP 工具" }).click();

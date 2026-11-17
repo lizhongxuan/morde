@@ -1,42 +1,23 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useLocation } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, enterHostInNewTab, newIdempotencyKey, portalApi } from '../app/api';
 import type { HostMemberPermission } from '../app/api';
-import type { components } from '../api/schema';
 import { useAuth } from '../app/auth';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { HostControlPanel } from '../components/HostControlPanel';
 import { HostMemberManager } from '../components/HostMemberManager';
+import { MordeIcon } from '../components/MordeIcon';
 import { ScreenPagination } from '../components/ScreenPagination';
 import './Hosts.css';
 import { FloatingError } from '../components/FloatingError';
 
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
-type ControlActionRequest = components['schemas']['ControlActionRequest'];
-type ControlStatus = Awaited<ReturnType<typeof portalApi.hostControl>>;
 const unsettled = new Set(['creating', 'stopping', 'deleting']);
-const controlStateLabels: Record<ControlStatus['control_state'], string> = {
-  ai: '云端 AI 控制', taking_over: '正在接管', user: '人工控制', returning: '正在交还 AI',
-};
-const controlPhaseLabels: Record<components['schemas']['ControlTransition']['phase'], string> = {
-  blocking: '阻止新的 AI 操作', draining: '等待在途工具停止', drained: '工具已停止，正在切换控制权', completed: '已完成',
-};
-const controlFailureLabels: Record<string, string> = {
-  operations_pending: '仍有运行中的工具操作，接管会继续等待停止确认。',
-  runtime_unavailable: '云端运行环境暂时不可用，请稍后重试。',
-  runtime_quiesce_failed: '运行中的工具尚未确认停止，请重试或检查主机状态。',
-  runtime_fence_mismatch: '云端控制状态发生变化，正在重新读取。',
-  audit_unavailable: '操作记录服务暂时不可用。',
-  task_snapshot_failed: '无法确认当前任务状态，请稍后重试。',
-  transition_persistence_failed: '控制状态尚未保存，请核对状态后重试。',
-  receipt_invalid: '云端停止回执未通过校验，请联系管理员。',
-  runtime_control_failed: '云端运行环境未确认切换控制权，请重试。',
-  invalid_action: '当前控制操作无效，请刷新主机状态。',
-};
 const sharingPermissionLabels: Record<HostMemberPermission, string> = {
   'desktop:view': '查看桌面',
   'desktop:control': '操作桌面',
@@ -144,12 +125,16 @@ export function Hosts() {
   };
 
   return <section className="hosts-page">
+    <header className="hosts-page-heading">
+      {listMode === 'owned' ? <><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑、文件和运行状态。</p></div><div className="inline-actions">{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></>
+        : <div><h2 id="shared-hosts-title">共享给我的电脑</h2><p>查看其他人共享给你的云端电脑。</p></div>}
+    </header>
     <nav className="inline-actions hosts-list-toggle" aria-label="云端电脑视图">
       <button type="button" className={`button ${listMode === 'owned' ? 'button-primary' : 'button-secondary'}`} aria-pressed={listMode === 'owned'} onClick={() => selectList('owned')}>我的电脑</button>
       <button type="button" className={`button ${listMode === 'shared' ? 'button-primary' : 'button-secondary'}`} aria-pressed={listMode === 'shared'} onClick={() => selectList('shared')}>共享给我的</button>
     </nav>
     {listMode === 'owned' ? <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
-    <div className="design-panel-header"><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑、文件和运行状态。</p></div><div className="inline-actions">{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></div>
+    <h3 className="hosts-list-title">电脑列表</h3>
     {hosts.isSuccess && <div className="host-default-settings" aria-label="默认云端电脑设置">
       <label htmlFor="default-cloud-host">默认云端电脑
         <select id="default-cloud-host" value={preferences.data?.default_host_id ?? ''}
@@ -170,7 +155,7 @@ export function Hosts() {
         <button type="button" className="button button-small button-secondary" onClick={() => void preferences.refetch()}>重试</button>
       </FloatingError>}
     </div>}
-    {hosts.isPending || (!hosts.data && hosts.isError && isTransientNetworkError(hosts.error)) ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError && !isTransientNetworkError(hosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError> : !ownedHosts.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <ScreenPagination
+    {hosts.isPending || (!hosts.data && hosts.isError && isTransientNetworkError(hosts.error)) ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError && !isTransientNetworkError(hosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError> : !ownedHosts.length ? <div className="empty-card hosts-empty"><span className="hosts-empty-icon" aria-hidden="true"><MordeIcon name="monitor" /></span><h3>还没有主机</h3><p>创建一台主机开始使用浏览器、终端和文件工具。</p></div> : <ScreenPagination
       items={displayedHosts}
       getKey={(host) => host.id}
       estimatedItemHeight={72}
@@ -187,7 +172,7 @@ export function Hosts() {
           || binding.sync_conflicts.length > 0 || binding.applied_revision !== binding.desired_revision
           || binding.applied_revision !== binding.workspace.revision
         ));
-        const copyReason = atLimit ? '已达到云端电脑数量上限。'
+        const copyReason = atLimit ? undefined
           : host.state !== 'stopped' ? '请先停止源电脑。'
             : host.control_state !== 'ai' ? '请先将电脑控制权交还给云端 AI。'
               : !filesReady ? '源电脑文件尚未全部确认或仍有冲突。' : undefined;
@@ -197,17 +182,17 @@ export function Hosts() {
             ? '电脑文件正在准备、同步或存在冲突；打开和移交操作暂不可用。'
             : !filesReady ? '电脑文件尚未准备好，暂不能打开。' : undefined}
           filesRestorable={filesRestorable}
-          canShowCopy={ownsHost} canCopy={ownsHost && !copyReason} copyReason={ownsHost ? copyReason : undefined}
+          canShowCopy={ownsHost} canCopy={ownsHost && !atLimit && !copyReason} copyReason={ownsHost ? copyReason : undefined}
           copyPending={copyHost.isPending && copyHost.variables?.host.id === host.id}
           onCopy={() => setCopyDialog({ host, name: `${(host.name || '云端电脑').slice(0, 96)} 副本`, idempotencyKey: newIdempotencyKey() })}
           onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ action: 'restore', host })} onDelete={() => setDeleting(host)} />;
       }}
     />}
-    </section> : <section className="shared-hosts-section design-panel">
-      <div className="design-panel-header"><h2>共享给我的电脑</h2></div>
+    </section> : <section className="shared-hosts-section design-panel" aria-labelledby="shared-hosts-title">
+      <h3 className="hosts-list-title">电脑列表</h3>
       {sharedHosts.isPending || (!sharedHosts.data && sharedHosts.isError && isTransientNetworkError(sharedHosts.error)) ? <div className="loading-card" role="status">正在加载共享电脑…</div>
         : sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>
-          : !sharedHosts.data?.items.length ? <div className="empty-card compact"><p>还没有人与你共享云端电脑。</p></div>
+          : !sharedHosts.data?.items.length ? <div className="empty-card hosts-empty"><span className="hosts-empty-icon" aria-hidden="true"><MordeIcon name="monitor" /></span><h3>还没有共享电脑</h3><p>还没有人与你共享云端电脑。</p></div>
             : <ScreenPagination
               items={displayedSharedHosts}
               getKey={(host) => host.id}
@@ -358,144 +343,4 @@ function hasRestorableComputerFiles(host: Host) {
   return bindings.length === 1 && !!binding && binding.workspace.state === 'ready'
     && binding.workspace.revision === binding.desired_revision && binding.sync_state === 'healthy' && binding.sync_conflicts.length === 0
     && (binding.state === 'preparing' || (binding.state === 'active' && binding.applied_revision === binding.desired_revision));
-}
-
-function HostControlPanel({ host, canControl, canReleaseAnyLease }: {
-  host: { id: string; name?: string; control_state?: Host['control_state'] }; canControl: boolean; canReleaseAnyLease: boolean;
-}) {
-  const queryClient = useQueryClient();
-  const { user } = useAuth();
-  const { notify } = useToast();
-  const [confirmAction, setConfirmAction] = useState<ControlActionRequest | null>(null);
-  const [pendingOperationCount, setPendingOperationCount] = useState(0);
-  const control = useQuery({
-    queryKey: ['host-control', host.id],
-    queryFn: () => portalApi.hostControl(host.id),
-    refetchInterval: (query) => {
-      const value = query.state.data;
-      return value && (value.active_transition || value.control_state === 'taking_over' || value.control_state === 'returning') ? 1500 : false;
-    },
-  });
-  useNetworkReadNotice([{ failed: control.isError, error: control.error, retry: control.refetch }], '电脑控制状态读取失败，已保留当前内容。');
-  const updateControl = useMutation({
-    mutationFn: (body: ControlActionRequest) => portalApi.hostControlAction(host.id, body),
-    onSuccess: async (result, body) => {
-      setPendingOperationCount(result.pending_operation_ids.length);
-      queryClient.setQueryData<ControlStatus>(['host-control', host.id], {
-        host_id: result.host_id,
-        control_state: result.control_state,
-        control_version: result.control_version,
-        control_actor_user_id: result.control_actor_user_id,
-        control_lease_expires_at: result.control_lease_expires_at,
-        control_lease_active: result.control_lease_active,
-        control_lease_held_by_me: result.control_lease_held_by_me,
-        active_transition: result.active_transition,
-      });
-      setConfirmAction(null);
-      void queryClient.invalidateQueries({ queryKey: ['host-control', host.id] });
-      void queryClient.invalidateQueries({ queryKey: ['hosts'] });
-      if (result.active_transition || result.control_state === 'taking_over' || result.control_state === 'returning') {
-        notify(body.action === 'take_over' ? '接管请求已受理，等待云端工具停止确认；完成前桌面操作仍受限制。' : '交还请求已受理，等待云端确认控制权切换。', 'info');
-      } else if (body.action === 'take_over' && result.control_state === 'user') {
-        notify('接管已完成，现在可以操作电脑。', 'success');
-      } else if (body.action === 'release' && result.control_state === 'ai') {
-        notify('已交还 AI，主机和电脑文件状态已刷新。', 'success');
-      } else {
-        notify('控制状态已更新，正在核对主机状态。', 'info');
-      }
-    },
-    onError: (error) => {
-      const details = errorDetails(error);
-      if (details.code === 'conflict') {
-        setConfirmAction(null);
-        notify('控制状态已变化，已刷新最新状态，请重新操作。', 'error');
-      } else {
-        notify(details.message, 'error');
-      }
-      void queryClient.invalidateQueries({ queryKey: ['host-control', host.id] });
-      void queryClient.invalidateQueries({ queryKey: ['hosts'] });
-    },
-  });
-  const status = control.data;
-  const refetchControl = control.refetch;
-  const state = status?.control_state ?? host.control_state;
-  const transition = status?.active_transition;
-  const transitioning = state === 'taking_over' || state === 'returning';
-  const operator = status?.control_lease_active && status.control_actor_user_id
-    ? status.control_actor_user_id === user?.id ? '你' : `账号 ${status.control_actor_user_id}`
-    : '未知';
-  const canRelease = canControl && state === 'user' && !!status
-    && (canReleaseAnyLease || status.control_lease_held_by_me);
-
-  useEffect(() => {
-    if (state !== 'user' || !status?.control_lease_active || !status.control_lease_held_by_me) return;
-    let renewing = false;
-    const timer = window.setInterval(() => {
-      if (renewing) return;
-      renewing = true;
-      void portalApi.renewHostControlLease(host.id, status.control_version)
-        .then((next) => queryClient.setQueryData<ControlStatus>(['host-control', host.id], next))
-        .catch(() => void refetchControl())
-        .finally(() => { renewing = false; });
-    }, 10_000);
-    return () => window.clearInterval(timer);
-  }, [host.id, queryClient, refetchControl, state, status?.control_lease_active, status?.control_lease_held_by_me, status?.control_version]);
-
-  const startAction = (action: ControlActionRequest['action']) => {
-    if (!status) return;
-    setConfirmAction({ action, request_id: newIdempotencyKey(), expected_control_version: status.control_version });
-  };
-  const resumeTransition = () => {
-    if (!transition) return;
-    updateControl.mutate({
-      action: transition.action,
-      request_id: transition.request_id,
-      expected_control_version: transition.expected_control_version,
-    });
-  };
-
-  return <section className="host-control" aria-label={`电脑控制状态 ${host.name || host.id}`}>
-    <div className="host-control-summary">
-      <div>
-        <strong>电脑控制：{state ? controlStateLabels[state] : '读取中'}</strong>
-        <p className="muted">{!state
-          ? '正在读取控制状态；状态确认前不会开放人工操作。'
-          : state === 'ai'
-            ? '当前由云端 AI 控制。工作台仅供查看；接管完成并确认工具停止后，才允许人工操作。'
-            : state === 'user'
-              ? status?.control_lease_active
-                ? `当前由${operator}人工控制。交还完成后，云端 AI 才能恢复操作。`
-                : '操作租约已失效；工作台保持只读，请重新读取控制状态。'
-              : '控制权切换期间，工作台操作会保持受限。'}</p>
-        {state === 'user' && status && <p className="muted">操作租约：{status.control_lease_active
-          ? `${status.control_lease_held_by_me ? '由你持有' : `由${operator}持有`}，到期时间 ${status.control_lease_expires_at ? formatDate(status.control_lease_expires_at) : '未知'}`
-          : '当前无有效租约'}</p>}
-        {status && <p className="muted">控制版本：v{status.control_version}</p>}
-        <p className="muted">桌面画面可能显示电脑文件，获准查看桌面的共享成员也能看到。</p>
-      </div>
-      {canControl && !control.isPending && !control.isError && status && !transitioning && state === 'ai' && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('take_over')}>接管操作</button>}
-      {canRelease && !transitioning && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('release')}>交还 AI</button>}
-      {canControl && transition && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={resumeTransition}>{transition.action === 'take_over' ? '继续接管确认' : '继续交还确认'}</button>}
-      {control.isError && !isTransientNetworkError(control.error) && <button type="button" className="button button-secondary" onClick={() => void control.refetch()}>重试读取控制状态</button>}
-      {control.isPending && <span className="muted" role="status">正在读取控制状态…</span>}
-    </div>
-    {transition && <p className="host-control-transition" role="status">
-      {transition.action === 'take_over' ? '接管尚未完成' : '交还尚未完成'}：{controlPhaseLabels[transition.phase]}。
-      {transition.failure_reason && ` ${controlFailureLabels[transition.failure_reason] || '云端尚未确认控制切换。'}`}
-      {pendingOperationCount > 0 && ` 尚有 ${pendingOperationCount} 项操作等待停止确认。`}
-      {transition.failure_reason === 'operations_pending' && pendingOperationCount === 0 && (transition.action === 'take_over' ? ' 云端仍有未完成操作，继续等待停止回执后再接管。' : ' 云端仍有未完成操作，继续等待工具结束后再交还。')}
-    </p>}
-    {transitioning && !transition && <p className="host-control-transition" role="status">控制状态正在切换，尚未收到最终确认；请等待刷新。</p>}
-    {control.isError && !isTransientNetworkError(control.error) && <FloatingError className="error-inline" role="alert">{errorDetails(control.error).message}</FloatingError>}
-    {confirmAction && <ConfirmDialog
-      title={confirmAction.action === 'take_over' ? `接管主机 ${host.name || host.id}` : `交还主机 ${host.name || host.id} 给 AI`}
-      description={confirmAction.action === 'take_over'
-        ? '接管会先阻止新的 AI 操作，并等待在途工具确认停止。等待期间工作台保持只读；只有云端确认停止并完成控制权切换后，才允许人工操作。'
-        : '交还会把主机控制权恢复给云端 AI。完成后页面会重新读取主机和电脑文件状态。'}
-      confirmLabel={confirmAction.action === 'take_over' ? '开始接管' : '交还给 AI'}
-      busy={updateControl.isPending}
-      onClose={() => setConfirmAction(null)}
-      onConfirm={() => updateControl.mutate(confirmAction)}
-    />}
-  </section>;
 }

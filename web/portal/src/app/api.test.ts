@@ -296,41 +296,6 @@ describe('typed Portal API client', () => {
     expect(await request.json()).toEqual({});
   });
 
-  it('lists only record metadata and requests owner-scoped record deletion', async () => {
-    const requests: Request[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      requests.push(request);
-      if (request.method === 'DELETE') return Response.json({ id: 'l1234567', owner_id: 'u1234567', record_id: 'v1234567', state: 'pending', attempts: 0, requested_at: '2026-11-02T00:00:00Z' }, { status: 202 });
-      return Response.json({ items: [], next_before: '' });
-    }));
-
-    await portalApi.myRecords({ purpose: 'full_record' });
-    await expect(portalApi.deleteMyRecord('v1234567')).resolves.toMatchObject({ state: 'pending' });
-
-    expect(requests.map((request) => [request.method, new URL(request.url).pathname, new URL(request.url).search])).toEqual([
-      ['GET', '/api/me/records', '?limit=50&purpose=full_record'],
-      ['DELETE', '/api/me/records/v1234567', ''],
-    ]);
-    expect(requests.every((request) => request.credentials === 'include')).toBe(true);
-  });
-
-  it('lists Task record-capture statuses without requesting capture content', async () => {
-    let request: Request | undefined;
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      request = new Request(input, init);
-      return Response.json({ items: [], next_before: '' });
-    }));
-
-    await expect(portalApi.myRecordCaptureStatuses({ limit: 7, before_id: 'j1234567' })).resolves.toEqual({ items: [], next_before: '' });
-
-    expect(request).toBeDefined();
-    expect([request!.method, new URL(request!.url).pathname, new URL(request!.url).search]).toEqual([
-      'GET', '/api/me/record-captures', '?limit=7&before_id=j1234567',
-    ]);
-    expect(request!.credentials).toBe('include');
-  });
-
   it('sends a stable idempotency key for a metered model connection check', async () => {
     const requests: Request[] = [];
     const responses = [

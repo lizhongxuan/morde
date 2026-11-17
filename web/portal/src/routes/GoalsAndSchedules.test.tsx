@@ -6,6 +6,7 @@ import { MemoryRouter, Route, Routes } from 'react-router';
 import type { components } from '../api/schema';
 import { api, ApiError } from '../api/client';
 import { portalApi } from '../app/api';
+import { RecoverablePageBoundary } from '../app/PageErrorBoundary';
 import { ToastProvider } from '../app/toast';
 import { PortalLayout } from '../components/PortalLayout';
 import { GoalsAndSchedules } from './GoalsAndSchedules';
@@ -41,9 +42,9 @@ describe('GoalsAndSchedules', () => {
 
   function renderPage() {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    return render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter initialEntries={['/goals']}><Routes>
+    return render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter initialEntries={['/goals']}><RecoverablePageBoundary homePath="/assistant" homeLabel="返回助手"><Routes>
       <Route element={<PortalLayout />}><Route path="/goals" element={<GoalsAndSchedules />} /></Route>
-    </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
+    </Routes></RecoverablePageBoundary></MemoryRouter></ToastProvider></QueryClientProvider>);
   }
 
   function mockAvailableModels() {
@@ -117,7 +118,7 @@ describe('GoalsAndSchedules', () => {
     })));
   });
 
-  it('keeps an unfinished schedule form when switching sidebar categories', async () => {
+  it('keeps an unfinished schedule form when switching main menu entries', async () => {
     const user = userEvent.setup();
     mockEmptyGoalsAndSchedules();
     renderPage();
@@ -129,6 +130,19 @@ describe('GoalsAndSchedules', () => {
     await user.click(screen.getByRole('link', { name: '定时计划' }));
 
     expect(screen.getByLabelText('计划内容')).toHaveValue('保留这个编辑草稿');
+  });
+
+  it('keeps an unfinished goal form when switching main menu entries', async () => {
+    const user = userEvent.setup();
+    mockEmptyGoalsAndSchedules();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '＋ 新建目标' }));
+    await user.type(screen.getByLabelText('目标名称'), '保留目标草稿');
+    await user.click(screen.getByRole('link', { name: '定时计划' }));
+    await user.click(screen.getByRole('link', { name: '目标' }));
+
+    expect(screen.getByLabelText('目标名称')).toHaveValue('保留目标草稿');
   });
 
   it('keeps an unfinished schedule form while paging the schedule list', async () => {

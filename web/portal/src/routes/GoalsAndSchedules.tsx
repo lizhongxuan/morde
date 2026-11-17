@@ -224,7 +224,7 @@ export function GoalsAndSchedules() {
       {goalWriteError && <FloatingError className="error-card" role="alert">{errorDetails(goalWriteError).message}</FloatingError>}
       {goals.isPending || (goalsNetworkError && !goals.data) ? <div className="loading-card" role="status">正在读取目标…</div>
         : goals.isError && !goalsNetworkError ? <FloatingError className="error-card" role="alert">{errorDetails(goals.error).message}<button type="button" className="button button-secondary" onClick={() => void (goals.isFetchNextPageError ? goals.fetchNextPage() : goals.refetch())}>重试</button></FloatingError>
-          : goalRecords.length === 0 ? <div className="empty-card"><h3>还没有云端目标</h3><p>创建后可随时更新状态或删除目标。</p></div>
+          : goalRecords.length === 0 ? <div className="empty-card"><h3>还没有云端目标</h3></div>
           : <ScreenPagination
             items={goalRecords}
             getKey={(goal) => goal.object_id}
@@ -288,10 +288,9 @@ export function GoalsAndSchedules() {
         <button type="button" className="button button-secondary" onClick={() => { if (hosts.isError && !hostsNetworkError) void hosts.refetch(); if (models.isError && !modelsNetworkError) void models.refetch(); }}>重试</button>
       </FloatingError>}
       {!hosts.isPending && !hosts.isError && !hostItems.length && <FloatingNotice className="notice-warning" data-notice-label="主机不可用">当前没有可访问的主机。可以创建仅文本计划；使用浏览器观察时必须选择 Host。</FloatingNotice>}
-      {!models.isPending && !models.isError && !modelItems.length && <FloatingNotice className="notice-warning" data-notice-label="模型不可用">当前没有可用模型。创建计划需要先配置模型。</FloatingNotice>}
       {schedules.isPending || (schedulesNetworkError && !schedules.data) ? <div className="loading-card" role="status">正在读取定时计划…</div>
         : schedules.isError && !schedulesNetworkError ? <FloatingError className="error-card" role="alert">{errorDetails(schedules.error).message}<button type="button" className="button button-secondary" onClick={() => void (schedules.isFetchNextPageError ? schedules.fetchNextPage() : schedules.refetch())}>重试</button></FloatingError>
-          : scheduleRecords.length === 0 ? <div className="empty-card"><h3>还没有云端计划</h3><p>只有通过上方按钮提交创建后，计划才会写入云端。</p></div>
+          : scheduleRecords.length === 0 ? <div className="empty-card"><p>只有通过上方按钮提交创建后，计划才会写入云端。</p></div>
             : <ScreenPagination
               items={scheduleRecords}
               getKey={(schedule) => schedule.id}

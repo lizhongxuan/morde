@@ -750,7 +750,7 @@ export default function Workbench() {
     <main className={`workbench-app${workspaceOnly ? ' is-workspace-only' : ''}${embedded ? ' is-embedded' : ''}${embedded && !embedVisible ? ' is-embedded-hidden' : ''}`}
       aria-hidden={embedded && !embedVisible ? true : undefined}
       inert={embedded && !embedVisible}>
-      {!workspaceOnly && <TopBar
+      {!workspaceOnly && !embedded && <TopBar
         embedded={embedded}
         host={host}
         renewing={renewing}
@@ -784,7 +784,7 @@ export default function Workbench() {
       ) : (
         <>
           <div className="workbench-content">
-          {(!embedded || host) && <nav ref={workbenchTabsRef} className="workbench-tabs" aria-label="工作台功能">
+          {!embedded && <nav ref={workbenchTabsRef} className="workbench-tabs" aria-label="工作台功能">
             <div className="primary-tabs">
               {visibleTabs.map((tab) => {
                 const menu: MobileMenu = tab.id === 'browser' || tab.id === 'terminal' || tab.id === 'files' ? tab.id : null;
@@ -986,9 +986,9 @@ export default function Workbench() {
                     : <p className="panel-loading" role="status">请先接管电脑后使用 VSCode。</p>}
               </div>
             )}
-            {!workspaceOnly && visibleActive === 'browser' && <span className="mobile-status-badge" role="status">{mobileControlStatus}</span>}
+            {!workspaceOnly && !embedded && visibleActive === 'browser' && <span className="mobile-status-badge" role="status">{mobileControlStatus}</span>}
           </div>
-          {!workspaceOnly && (
+          {!workspaceOnly && !embedded && (
             <div className="mobile-control-footer" aria-label="电脑控制权">
               {controlError && !controlNetworkUnavailable && <button className="button button-secondary mobile-control-retry" type="button" onClick={reloadControl} disabled={controlLoading}>重试</button>}
               {controlActionLabel && <button
