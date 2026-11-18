@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:,">
+<title>Morde PC · 冰淇淋蓝聊天</title>
+<style>
+:root{
+  --brand:#60a5fa;
+  --brand-hover:#3b82f6;
+  --brand-pressed:#2563eb;
+  --brand-soft:#dbeafe;
+  --brand-tint:#bfdbfe;
+  --brand-ink:#2563eb;
+  --brand-deep:#1d4ed8;
+  --bg:#f8faff;
+  --side:#eff6ff;
+  --surface:#ffffff;
+  --card:#ffffff;
+  --ink:#334155;
+  --muted:#94a3b8;
+  --muted-strong:#64748b;
+  --line:#dbeafe;
+  --line-strong:#bfdbfe;
+  --success:#34b27a;
+  --success-bg:#d1fae5;
+  --success-ink:#047857;
+  --warning:#b45309;
+  --warning-bg:#fef3c7;
+  --warning-dot:#f59e0b;
+  --danger:#f0655a;
+  --danger-bg:#fee2e2;
+  --danger-ink:#b91c1c;
+  --info:#60a5fa;
+  --info-bg:#dbeafe;
+  --info-ink:#1d4ed8;
+  --radius-sm:12px;
+  --radius-md:16px;
+  --radius-lg:20px;
+  --radius-card:24px;
+  --radius-composer:24px;
+  --radius-bubble:22px;
+  --radius-pill:999px;
+  --shadow-jelly:0 14px 30px rgba(96,165,250,.18);
+  --shadow-soft:0 8px 20px rgba(96,165,250,.12);
+  --shadow-btn:0 6px 16px rgba(96,165,250,.28);
+  --font:"Yuanti SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --d-dur:1.5s;
+  --d-ease:ease-in-out;
+  --spin-dur:1.5s;
+  --p-dur:1.8s;
+  --sh-dur:1.7s;
+  --bob-dur:2s;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.65;-webkit-font-smoothing:antialiased}
+.shell{display:flex;height:100vh;overflow:hidden}
+
+/* ---------- 侧边栏 272px ---------- */
+.sidebar{width:272px;flex:0 0 272px;height:100%;display:flex;flex-direction:column;background:var(--side);border-right:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;padding:18px 18px 14px}
+.brand-mark{width:34px;height:34px;border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;background:var(--brand);font-weight:800;font-size:17px;box-shadow:var(--shadow-btn);flex:0 0 auto}
+.brand b{font-size:16px;letter-spacing:-.02em}
+.brand small{display:block;color:var(--muted);font-size:11px;font-weight:500}
+.new-chat{margin:2px 16px 12px;min-height:38px;border:0;border-radius:var(--radius-pill);background:var(--brand);color:#fff;font-weight:700;font-size:13.5px;box-shadow:var(--shadow-btn);text-align:center}
+.side-scroll{flex:1;overflow-y:auto;padding:2px 12px 8px}
+.side-group{margin:14px 6px 5px;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.09em}
+.side-group:first-child{margin-top:2px}
+.row{display:flex;align-items:center;gap:9px;width:100%;min-height:34px;padding:6px 10px;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--muted-strong);font-size:13.5px;text-align:left}
+.row.on{background:var(--brand-soft);color:var(--brand-ink);font-weight:700}
+.row .ic{width:18px;text-align:center;font-size:14px;flex:0 0 auto}
+.row span.t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv{flex-direction:column;align-items:flex-start;gap:1px;min-height:44px;padding:8px 10px}
+.conv strong{font-size:13.5px;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.conv small{color:var(--muted);font-size:11.5px}
+.conv.on strong{color:var(--brand-ink)}
+.side-foot{border-top:1px solid var(--line);padding:12px 14px}
+.me{display:flex;align-items:center;gap:10px;margin-top:10px;padding:2px 4px 0}
+.avatar{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--brand-soft);color:var(--brand-deep);font-size:12px;font-weight:800;flex:0 0 auto;border:1.5px solid var(--brand-tint)}
+.me b{display:block;font-size:13px}
+.me small{display:block;color:var(--muted);font-size:11px}
+
+/* ---------- 主区 ---------- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{height:56px;flex:0 0 56px;display:flex;align-items:center;gap:16px;padding:0 22px;border-bottom:1px solid var(--line);background:#fff}
+.topbar .t-title{font-weight:800;font-size:15px}
+.topbar .t-sub{color:var(--muted);font-size:12.5px}
+.topbar .sp{flex:1}
+.model-picker{display:inline-flex;align-items:center;gap:9px;min-height:40px;padding:7px 8px 7px 16px;border:1.5px solid var(--line-strong);border-radius:var(--radius-pill);background:#fff;font-size:14px;font-weight:700;color:var(--ink)}
+.model-picker .mp-ava{width:24px;height:24px;border-radius:50%;background:var(--brand);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center}
+.model-picker .chev{width:26px;height:26px;border-radius:50%;background:var(--brand-soft);color:var(--brand-deep);display:flex;align-items:center;justify-content:center;font-size:12px}
+.search-pill{font-size:12px;color:var(--muted-strong);border:1px solid var(--line);border-radius:var(--radius-pill);padding:4px 12px;min-height:28px;display:inline-flex;align-items:center;background:var(--side)}
+
+.status-strip{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 22px;background:#fff;border-bottom:1px solid var(--line);color:var(--muted-strong);font-size:12.5px}
+.status-strip .dot{width:7px;height:7px;border-radius:50%;background:var(--success);flex:0 0 auto;box-shadow:0 0 0 3px rgba(52,178,122,.15)}
+.status-strip .sep{color:var(--brand-tint)}
+.status-strip .warn{color:var(--warning);font-weight:700}
+
+.chat-scroll{flex:1;overflow-y:auto}
+.col{max-width:768px;margin:0 auto;padding:36px 28px 22px}
+.msg-list{display:flex;flex-direction:column;gap:28px}
+.row-u{display:flex;justify-content:flex-end}
+.bubble-u{background:var(--brand);color:#fff;padding:11px 16px;border-radius:var(--radius-bubble);border-bottom-right-radius:8px;max-width:78%;font-size:15px;line-height:1.55;box-shadow:var(--shadow-btn)}
+.ai-row{display:flex;gap:10px;align-items:flex-start}
+.ai-ava{width:32px;height:32px;border-radius:50%;background:var(--brand-soft);color:var(--brand-deep);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;flex:0 0 auto;border:1px solid var(--brand-tint)}
+.bubble-ai{background:#fff;border:1px solid var(--line);padding:11px 16px;border-radius:var(--radius-bubble);border-bottom-left-radius:8px;max-width:88%;font-size:15px;line-height:1.75}
+.bubble-ai p{margin:0 0 11px}
+.bubble-ai p:last-child{margin-bottom:0}
+.bubble-ai code{font-family:var(--font-mono);font-size:13px;background:var(--side);padding:1px 6px;border-radius:6px;color:var(--brand-deep)}
+.ai-actions{display:flex;gap:2px;margin-top:9px}
+.ai-actions span{padding:4px 9px;border-radius:7px;color:var(--muted);font-size:12px}
+.msg-time{color:var(--muted);font-size:12px;margin-top:6px}
+.file-chip{display:inline-flex;align-items:center;gap:10px;margin-top:12px;padding:9px 13px;border:1px solid var(--line);border-radius:var(--radius-sm);background:#fff;font-size:13px;box-shadow:var(--shadow-soft)}
+.file-chip .fi{width:26px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;background:var(--side);font-size:13px}
+.file-chip b{font-weight:700}
+.file-chip span{color:var(--muted);font-size:12px}
+
+/* 思考中：吉祥物 + 圆点（仅加载动画） */
+.think-bubble{display:inline-flex;align-items:center;gap:10px;background:#fff;border:1px solid var(--line);border-radius:var(--radius-bubble);padding:10px 16px}
+.think-txt{color:var(--muted-strong);font-size:13px}
+.dots{display:inline-flex;gap:5px;align-items:center}
+.dots i{width:7px;height:7px;border-radius:50%;background:var(--brand);animation:dotbounce var(--d-dur) var(--d-ease) infinite}
+.dots i:nth-child(2){animation-delay:.18s}
+.dots i:nth-child(3){animation-delay:.36s}
+.mascot{position:relative;width:34px;height:34px;border-radius:50%;background:#93c5fd;flex:0 0 auto;animation:bob var(--bob-dur) ease-in-out infinite}
+.mascot::before{content:"";position:absolute;left:9px;top:13px;width:5px;height:6px;border-radius:50%;background:#fff;box-shadow:11px 0 0 #fff;animation:blink 3.4s ease-in-out infinite}
+.mascot i{position:absolute;left:50%;bottom:7px;width:12px;height:6px;margin-left:-6px;border:2px solid transparent;border-bottom-color:#fff;border-radius:0 0 12px 12px}
+
+/* ---------- 任务卡 / 审批卡 ---------- */
+.taskcard,.approvalcard{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-card);padding:16px 18px;box-shadow:var(--shadow-jelly);width:100%}
+.card-top{display:flex;align-items:center;gap:8px;font-weight:700;flex-wrap:wrap;font-size:14.5px}
+.card-top .tid{color:var(--muted);font-weight:600;font-size:12.5px;font-family:var(--font-mono)}
+.card-sub{color:var(--muted-strong);font-size:12.5px;margin-top:6px}
+.card-desc{color:var(--muted-strong);font-size:13.5px;margin:6px 0 0}
+.card-desc code{font-family:var(--font-mono);font-size:12.5px;background:var(--side);padding:1px 6px;border-radius:6px;color:var(--brand-deep)}
+.card-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.spin{width:16px;height:16px;border-radius:50%;border:2.5px solid var(--line);border-top-color:var(--brand);animation:spin var(--spin-dur) linear infinite;flex:0 0 auto;margin-left:auto}
+.progress{height:10px;border-radius:99px;background:var(--brand-soft);overflow:hidden;margin:12px 0 4px}
+.progress i{display:block;height:100%;border-radius:99px;background:var(--brand);background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.35) 0 7px,transparent 7px 14px);animation:progmove 3.2s ease-in-out infinite alternate,stripes 1.6s linear infinite}
+.steps{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:10px}
+.steps li{display:flex;align-items:flex-start;gap:11px;font-size:13.5px}
+.steps .mk{width:19px;height:19px;flex:0 0 auto;margin-top:1px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800}
+.steps .done .mk{background:var(--success-bg);color:var(--success-ink)}
+.steps .run .mk{background:var(--brand-soft);color:var(--brand-ink)}
+.steps .todo{color:var(--muted)}
+.steps .todo .mk{border:1.5px solid var(--brand-tint);color:transparent}
+.steps small{display:block;color:var(--muted);font-size:12px}
+.steps .run small{color:var(--brand-ink)}
+.skel{margin-top:12px}
+.skel i{display:block;height:11px;border-radius:99px;margin:7px 0;background:linear-gradient(90deg,var(--line) 25%,#fff 50%,var(--line) 75%);background-size:200% 100%;animation:shimmer var(--sh-dur) linear infinite}
+.skel span{color:var(--muted-strong);font-size:12.5px}
+
+.badge{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:3px 12px;border-radius:var(--radius-pill);font-size:12.5px;font-weight:700;white-space:nowrap}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.badge-run{background:var(--info-bg);color:var(--info-ink)}
+.badge-wait{background:var(--warning-bg);color:var(--warning)}
+.badge-wait.pulsing{animation:pulse var(--p-dur) ease-in-out infinite}
+.fields{display:grid;grid-template-columns:1fr 1fr;margin-top:12px;border-top:1px solid var(--line)}
+.field{padding:12px 16px 12px 0;border-bottom:1px solid var(--line)}
+.field:nth-child(even){padding-left:16px;border-left:1px solid var(--line)}
+.field label{display:block;margin-bottom:4px;color:var(--muted);font-size:11.5px;font-weight:700;letter-spacing:.05em}
+.field div{font-size:13.5px;line-height:1.55;overflow-wrap:anywhere}
+.field div code{font-family:var(--font-mono);font-size:12.5px;background:var(--side);padding:1px 6px;border-radius:6px;color:var(--brand-deep)}
+.cost-line{padding:11px 0;border-bottom:1px solid var(--line);color:var(--muted-strong);font-size:13px}
+.cost-line b{font-family:var(--font-mono);font-weight:700;color:var(--ink)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border-radius:var(--radius-pill);font-family:var(--font);font-weight:700;border:1px solid transparent;white-space:nowrap;min-height:40px;padding:8px 20px;font-size:14px;line-height:1.4}
+.btn-primary{background:var(--brand);color:#fff;box-shadow:var(--shadow-btn)}
+.btn-secondary{background:#fff;color:var(--brand-deep);border-color:var(--brand-tint)}
+.approval-note{color:var(--muted);font-size:12px;margin-top:10px}
+
+/* ---------- 输入框 768px 居中 ---------- */
+.composer-wrap{flex:0 0 auto;padding:14px 22px 10px;background:linear-gradient(to top,var(--bg) 80%,transparent)}
+.composer{max-width:768px;margin:0 auto;border:1.5px solid var(--line-strong);border-radius:var(--radius-composer);background:#fff;box-shadow:var(--shadow-jelly)}
+.composer .input-line{display:block;width:100%;min-height:50px;padding:14px 17px 6px;font-size:15px;line-height:1.55;color:var(--muted)}
+.composer-bar{display:flex;align-items:center;gap:6px;padding:6px 11px 10px}
+.icon-btn{width:32px;height:32px;border:0;border-radius:9px;background:transparent;color:var(--muted-strong);font-size:16px;display:flex;align-items:center;justify-content:center}
+.chip-btn{display:inline-flex;align-items:center;gap:6px;min-height:30px;padding:4px 11px;border:1px solid var(--line);border-radius:var(--radius-pill);background:var(--side);color:var(--muted-strong);font-size:12.5px;font-weight:600;white-space:nowrap}
+.composer-bar .sp{flex:1}
+.send-btn{width:40px;height:40px;border:0;border-radius:50%;background:var(--brand);color:#fff;font-size:16px;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-btn);flex:0 0 auto}
+.composer-hint{max-width:768px;margin:8px auto 0;text-align:center;color:var(--muted);font-size:11.5px}
+
+@keyframes dotbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+@keyframes blink{0%,90%,100%{transform:scaleY(1)}94%{transform:scaleY(.1)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes progmove{from{width:38%}to{width:78%}}
+@keyframes stripes{to{background-position:28px 0}}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.07);opacity:.72}}
+@keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+@media (prefers-reduced-motion: reduce){
+  .dots i,.mascot,.mascot::before,.spin,.progress i,.badge-wait.pulsing,.skel i{animation-duration:0.01s;animation-iteration-count:1}
+}
+@media (max-width:900px){
+  .sidebar{width:76px;flex:0 0 76px}
+  .sidebar .brand b,.sidebar .brand small,.new-chat span,.row span.t,.conv strong,.conv small,.side-group,.me div{display:none}
+  .new-chat{font-size:18px}
+  .row{justify-content:center}
+  .topbar{flex-wrap:nowrap;padding:0 12px;gap:10px}
+  .topbar .t-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .topbar .search-pill{display:none}
+  .status-strip{overflow-x:auto;white-space:nowrap;padding:8px 12px}
+  .composer-bar{flex-wrap:wrap}
+  .composer-wrap{padding:10px 12px 8px}
+  .col{padding:24px 16px 16px}
+  .fields{grid-template-columns:1fr}
+  .field:nth-child(even){padding-left:0;border-left:none}
+  .model-picker .mp-txt{display:none}
+  .topbar .t-sub{display:none}
+}
+@media (max-width:560px){
+  .chip-model{display:none}
+  .bubble-u{max-width:88%}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ 侧边栏 ============ -->
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">M</span><span><b>Morde</b><small>PC 端 · AI 助手</small></span></div>
+    <div class="new-chat">＋ <span>新建旁聊</span></div>
+    <div class="side-scroll">
+      <div class="side-group">会话</div>
+      <div class="row conv on"><strong>修复登录超时</strong><small>今天 14:32 · 任务进行中</small></div>
+      <div class="row conv"><strong>把桌面文件归档到工作区</strong><small>今天 11:05</small></div>
+      <div class="row conv"><strong>云电脑 PC-01 状态怎么样</strong><small>今天 09:18</small></div>
+      <div class="side-group">工作</div>
+      <div class="row"><span class="ic">▣</span><span class="t">云端电脑</span></div>
+      <div class="row on"><span class="ic">✦</span><span class="t">AI 助手</span></div>
+      <div class="row"><span class="ic">◉</span><span class="t">个人资料</span></div>
+      <div class="row"><span class="ic">◎</span><span class="t">目标</span></div>
+      <div class="row"><span class="ic">↻</span><span class="t">定时计划</span></div>
+      <div class="side-group">设置与授权</div>
+      <div class="row"><span class="ic">⛓</span><span class="t">模型与工具</span></div>
+      <div class="row"><span class="ic">▣</span><span class="t">客户端</span></div>
+      <div class="row"><span class="ic">⚿</span><span class="t">API Key</span></div>
+      <div class="row"><span class="ic">⚙</span><span class="t">账户设置</span></div>
+    </div>
+    <div class="side-foot">
+      <div class="row"><span class="ic">⇄</span><span class="t">切换至管理后台</span></div>
+      <div class="me"><span class="avatar">我</span><div><b>我</b><small>PC 用户端</small></div></div>
+    </div>
+  </aside>
+
+  <!-- ============ 主区 ============ -->
+  <main class="main">
+    <div class="topbar">
+      <span class="t-title">修复登录超时</span>
+      <span class="t-sub">任务 T-1042 · 登录模块</span>
+      <span class="sp"></span>
+    </div>
+
+    <div class="status-strip"><span class="dot"></span><span>云电脑 PC-01 已连接</span><span class="sep">·</span><span>模型 DeepSeek Flash</span><span class="sep">·</span><span class="warn">1 项审批待处理</span></div>
+
+    <div class="chat-scroll">
+      <div class="col">
+        <div class="msg-list">
+
+          <div class="row-u"><div class="bubble-u">帮我把登录超时的 bug 修了，改完跑一遍测试。</div></div>
+
+          <div class="ai-row">
+            <div class="ai-ava">M</div>
+            <div>
+              <div class="bubble-ai">
+                <p>好的，我拆成两步：先定位超时原因，再改重试逻辑。已经开始执行，第一步的结果马上出来。</p>
+              </div>
+              <div class="msg-time">14:32</div>
+            </div>
+          </div>
+
+          <div class="ai-row">
+            <div class="mascot" aria-hidden="true"><i></i></div>
+            <div class="think-bubble"><span class="dots"><i></i><i></i><i></i></span><span class="think-txt">思考中…</span></div>
+          </div>
+
+          <div class="taskcard">
+            <div class="card-top"><span class="badge badge-run"><span class="dot"></span>任务</span>修复登录超时 <span class="tid">T-1042</span><span class="spin" aria-hidden="true"></span></div>
+            <div class="progress"><i></i></div>
+            <div class="card-sub">第 2 步 / 共 3 步 · 正在修改重试逻辑 · 本次 ¥0.42 · 14:32</div>
+            <ol class="steps">
+              <li class="done"><span class="mk">✓</span><span>定位超时原因<small>超时 5 秒，服务端偶发慢响应</small></span></li>
+              <li class="run"><span class="mk">◌</span><span>正在修改重试逻辑<small>修改 auth/session.ts，加一次自动重试</small></span></li>
+              <li class="todo"><span class="mk">·</span><span>跑一遍登录测试<small>完成后把结果存入工作区</small></span></li>
+            </ol>
+            <div class="skel"><i style="width:86%"></i><i style="width:64%"></i><span>正在生成摘要…</span></div>
+          </div>
+
+          <div class="approvalcard">
+            <div class="card-top"><span class="badge badge-wait"><span class="dot"></span>需要审批</span>修改 auth/session.ts <span class="badge badge-wait pulsing">等待中</span></div>
+            <p class="card-desc">将超时从 <code>5s</code> 改为 <code>15s</code>，并加一次自动重试。影响范围：登录模块；可回滚。</p>
+            <div class="fields">
+              <div class="field"><label>对象</label><div><code>auth/session.ts</code></div></div>
+              <div class="field"><label>内容</label><div>超时 5 秒改 15 秒，加一次自动重试</div></div>
+              <div class="field"><label>可能影响</label><div>登录模块；失败可回滚到上一版</div></div>
+              <div class="field"><label>风险</label><div>低 · 只改超时与重试，不动鉴权逻辑</div></div>
+              <div class="field"><label>本次费用</label><div>估算 ¥0.40</div></div>
+              <div class="field"><label>累计费用</label><div>估算 ¥0.42</div></div>
+              <div class="field"><label>替代方案</label><div>不适用</div></div>
+              <div class="field"><label>撤销方式</label><div>可回滚到上一版</div></div>
+            </div>
+            <div class="card-actions"><span class="btn btn-primary">允许</span><span class="btn btn-secondary">拒绝</span></div>
+            <div class="approval-note">批准后才会执行。你可以随时在任务页查看进度。</div>
+          </div>
+
+          <div class="ai-row">
+            <div class="ai-ava">M</div>
+            <div>
+              <div class="bubble-ai">
+                <p>等你确认。改动我都核对过：只动 <code>auth/session.ts</code> 里的超时和重试，不碰鉴权逻辑，确认后我马上改，改完跑一遍登录测试再告诉你。</p>
+              </div>
+              <div class="file-chip"><span class="fi">📄</span><b>session.ts.diff</b><span>3 KB · 待审批后写入</span></div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 输入框 ===== -->
+    <div class="composer-wrap">
+      <div class="composer">
+        <div class="input-line">输入消息，Enter 发送…</div>
+        <div class="composer-bar">
+          <span class="icon-btn" aria-hidden="true">📎</span>
+          <span class="icon-btn" aria-hidden="true">🎙</span>
+          <span class="sp"></span>
+          <span class="chip-btn">工具 ▾</span>
+          <span class="chip-btn chip-model">DeepSeek Flash ▾</span>
+          <span class="send-btn" aria-hidden="true">↑</span>
+        </div>
+      </div>
+      <div class="composer-hint">Enter 发送 · Shift + Enter 换行</div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:,">
+<title>Morde 管理后台 · 冰淇淋蓝</title>
+<style>
+:root{
+  --brand:#60a5fa;
+  --brand-hover:#3b82f6;
+  --brand-ink:#2563eb;
+  --brand-deep:#1d4ed8;
+  --brand-soft:#dbeafe;
+  --brand-tint:#bfdbfe;
+  --bg:#f8faff;
+  --side:#eff6ff;
+  --surface:#ffffff;
+  --ink:#334155;
+  --muted:#94a3b8;
+  --muted-strong:#64748b;
+  --line:#dbeafe;
+  --success:#34b27a;
+  --success-bg:#d1fae5;
+  --success-ink:#047857;
+  --warning:#b45309;
+  --warning-bg:#fef3c7;
+  --warning-dot:#f59e0b;
+  --danger:#f0655a;
+  --danger-bg:#fee2e2;
+  --danger-ink:#b91c1c;
+  --radius-card:24px;
+  --radius-md:16px;
+  --radius-lg:20px;
+  --radius-bubble:22px;
+  --radius-pill:999px;
+  --shadow-jelly:0 14px 30px rgba(96,165,250,.18);
+  --shadow-soft:0 8px 20px rgba(96,165,250,.12);
+  --shadow-btn:0 6px 16px rgba(96,165,250,.28);
+  --font:"Yuanti SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.7}
+a{color:var(--brand-ink);text-decoration:none}
+code{font-family:var(--font-mono);font-size:.86em;background:var(--side);padding:1px 6px;border-radius:6px;color:var(--brand-deep)}
+
+/* ---- layout ---- */
+.shell{display:flex;min-height:100vh}
+.sidebar{flex:0 0 232px;background:var(--side);border-right:1px solid var(--line);padding:20px 14px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
+.logo{display:flex;align-items:center;gap:10px;padding:6px 12px 18px}
+.logo-mark{width:40px;height:40px;border-radius:50%;background:var(--brand);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:18px;box-shadow:var(--shadow-btn);flex:0 0 auto}
+.logo b{font-size:18px;display:block;line-height:1.25}
+.logo span{font-size:12px;color:var(--muted-strong)}
+.nav-label{font-size:12px;color:var(--muted);padding:10px 12px 6px;font-weight:700}
+.navitem{display:flex;align-items:center;gap:10px;min-height:40px;padding:8px 12px;border-radius:12px;color:var(--muted-strong);font-size:14px;font-weight:600}
+.navitem .ico{font-size:16px;width:22px;text-align:center}
+.navitem.on{background:var(--brand-soft);color:var(--brand-deep);font-weight:700}
+.navitem .count{margin-left:auto;background:#fff;border:1px solid var(--brand-tint);color:var(--brand-deep);border-radius:var(--radius-pill);font-size:12px;font-weight:700;padding:1px 9px}
+.side-foot{margin-top:auto;background:#fff;border:1px solid var(--line);border-radius:var(--radius-md);padding:14px}
+.side-foot b{font-size:13.5px;display:block}
+.side-foot p{font-size:12.5px;color:var(--muted-strong);margin:4px 0 10px}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{min-height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;padding:10px 28px;position:sticky;top:0;z-index:5;flex-wrap:wrap}
+.topbar h1{font-size:19px;margin:0;font-weight:800}
+.topbar .crumb{font-size:13px;color:var(--muted-strong)}
+.searchbox{position:relative;flex:1;min-width:200px;max-width:420px}
+.searchbox .mag{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:15px}
+.searchbox input{width:100%;min-height:42px;border:1.5px solid var(--brand-tint);border-radius:var(--radius-pill);padding:9px 14px 9px 38px;font-family:var(--font);font-size:14px;color:var(--ink);background:#fff;outline:none}
+.searchbox input::placeholder{color:var(--muted)}
+.admin-id{margin-left:auto;display:flex;align-items:center;gap:10px}
+.admin-id .who{text-align:right;line-height:1.35}
+.admin-id .who b{font-size:14px;display:block}
+.admin-id .who span{font-size:12px;color:var(--muted-strong)}
+.avatar{position:relative;width:42px;height:42px;border-radius:50%;background:var(--brand-soft);color:var(--brand-deep);display:inline-flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;border:1.5px solid var(--brand-tint);flex:0 0 auto}
+.avatar .status{position:absolute;right:0;bottom:0;width:11px;height:11px;border-radius:50%;background:var(--success);border:2px solid #fff}
+.bell{width:42px;height:42px;border-radius:50%;background:#fff;border:1px solid var(--brand-tint);color:var(--brand-deep);display:flex;align-items:center;justify-content:center;font-size:17px;position:relative}
+.bell i{position:absolute;top:8px;right:9px;width:8px;height:8px;border-radius:50%;background:var(--danger);border:1.5px solid #fff}
+.content{padding:28px;max-width:1180px;width:100%;margin:0 auto}
+.lede{color:var(--muted-strong);font-size:14px;margin:0 0 20px}
+
+/* ---- stat cards ---- */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:22px}
+.stat{background:#fff;border:1px solid var(--line);border-radius:var(--radius-card);padding:20px;box-shadow:var(--shadow-soft)}
+.stat .label{font-size:13px;color:var(--muted-strong);font-weight:650;display:flex;align-items:center;gap:8px}
+.stat .label .ico{width:34px;height:34px;border-radius:12px;background:var(--brand-soft);color:var(--brand-deep);display:inline-flex;align-items:center;justify-content:center;font-size:16px}
+.stat .num{font-size:30px;font-weight:800;line-height:1.25;margin:8px 0 2px;font-family:var(--font-mono)}
+.stat .trend{font-size:12.5px;color:var(--muted-strong)}
+.stat .trend b{color:var(--success-ink)}
+.stat .trend .warn{color:var(--warning)}
+.spin{width:16px;height:16px;border-radius:50%;border:2.5px solid var(--line);border-top-color:var(--brand);animation:spin 1.5s linear infinite;flex:0 0 auto}
+.refresh-note{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted-strong)}
+
+/* ---- sections / cards ---- */
+.grid2{display:grid;grid-template-columns:1.6fr 1fr;gap:20px;margin-bottom:22px}
+.grid2b{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:22px}
+.card{background:#fff;border:1px solid var(--line);border-radius:var(--radius-card);padding:22px 24px;box-shadow:var(--shadow-jelly)}
+.card h2{font-size:17px;margin:0 0 4px;font-weight:800}
+.card .sub{font-size:13px;color:var(--muted-strong);margin:0 0 16px}
+.card-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.card-head .more{font-size:13px;font-weight:700}
+
+/* ---- table ---- */
+.table-wrap{border:1px solid var(--line);border-radius:var(--radius-md);overflow:hidden}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{background:var(--side);color:var(--muted-strong);font-size:12.5px;font-weight:700;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+.who-cell{display:flex;align-items:center;gap:10px}
+.avatar.sm{width:32px;height:32px;font-size:12px}
+.who-cell b{display:block;font-size:13.5px;line-height:1.35}
+.who-cell span{font-size:12px;color:var(--muted-strong)}
+.mono{font-family:var(--font-mono);font-size:12.5px;color:var(--muted-strong)}
+
+/* ---- badges / buttons ---- */
+.badge{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:3px 12px;border-radius:var(--radius-pill);font-size:12.5px;font-weight:700;white-space:nowrap}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.badge-run{background:var(--brand-soft);color:var(--brand-deep)}
+.badge-done{background:var(--success-bg);color:var(--success-ink)}
+.badge-wait{background:var(--warning-bg);color:var(--warning)}
+.badge-fail{background:var(--danger-bg);color:var(--danger-ink)}
+.badge-wait.pulsing{animation:pulse 1.8s ease-in-out infinite}
+.badge-off{background:var(--side);color:var(--muted-strong)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border-radius:var(--radius-pill);font-family:var(--font);font-weight:700;border:1px solid transparent;white-space:nowrap;min-height:36px;padding:5px 16px;font-size:13px;line-height:1.4}
+.btn-primary{background:var(--brand);color:#fff;box-shadow:var(--shadow-btn)}
+.btn-secondary{background:#fff;color:var(--brand-deep);border-color:var(--brand-tint)}
+.btn-sm{min-height:32px;padding:4px 14px;font-size:12.5px}
+.chip{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:3px 11px;border-radius:var(--radius-pill);background:var(--side);border:1px solid var(--line);font-size:12.5px}
+.chip.on{background:var(--brand-soft);border-color:var(--brand-tint);color:var(--brand-deep);font-weight:650}
+
+/* ---- approvals / tasks ---- */
+.appr{border:1px solid var(--line);border-radius:var(--radius-lg);padding:16px 18px;margin-bottom:14px;background:#fff}
+.appr:last-child{margin-bottom:0}
+.appr-top{display:flex;align-items:center;gap:8px;font-weight:700;flex-wrap:wrap;font-size:14.5px}
+.appr-top .tid{color:var(--muted);font-weight:600;font-size:12.5px;font-family:var(--font-mono)}
+.appr p{color:var(--muted-strong);font-size:13.5px;margin:8px 0 0}
+.appr p code{background:var(--side)}
+.appr-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.appr-meta{font-size:12.5px;color:var(--muted-strong);margin-top:8px}
+.progress{height:10px;border-radius:99px;background:var(--brand-soft);overflow:hidden;margin:12px 0 4px}
+.progress i{display:block;height:100%;border-radius:99px;background:var(--brand)}
+.task-row{display:flex;align-items:center;gap:12px;padding:12px 2px;border-bottom:1px solid var(--line)}
+.task-row:last-child{border-bottom:none}
+.task-row .t-ico{width:36px;height:36px;border-radius:12px;background:var(--brand-soft);color:var(--brand-deep);display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 auto}
+.task-row b{font-size:14px;display:block;line-height:1.4}
+.task-row span{font-size:12.5px;color:var(--muted-strong)}
+.task-row .badge{margin-left:auto}
+
+/* ---- events feed ---- */
+.feed{list-style:none;margin:0;padding:0}
+.feed li{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}
+.feed li:last-child{border-bottom:none}
+.e-dot{width:10px;height:10px;border-radius:50%;margin-top:7px;flex:0 0 auto}
+.e-dot.blue{background:var(--brand)}
+.e-dot.green{background:var(--success)}
+.e-dot.amber{background:var(--warning-dot)}
+.e-dot.red{background:var(--danger)}
+.feed b{font-size:14px;display:block;line-height:1.45}
+.feed span{font-size:12.5px;color:var(--muted-strong)}
+.feed time{font-family:var(--font-mono);font-size:12px;color:var(--muted);margin-left:auto;white-space:nowrap}
+.skel{padding:12px 0}
+.skel i{display:block;height:11px;border-radius:99px;margin:7px 0;background:linear-gradient(90deg,var(--line) 25%,#ffffff 50%,var(--line) 75%);background-size:200% 100%;animation:shimmer 1.7s linear infinite}
+.skel-note{font-size:12.5px;color:var(--muted-strong);display:flex;align-items:center;gap:8px}
+
+/* ---- health ---- */
+.health-row{display:flex;align-items:center;gap:12px;padding:13px 2px;border-bottom:1px solid var(--line)}
+.health-row:last-child{border-bottom:none}
+.health-row .h-ico{width:36px;height:36px;border-radius:12px;background:var(--side);border:1px solid var(--line);color:var(--brand-deep);display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 auto}
+.health-row b{font-size:14px;display:block;line-height:1.4}
+.health-row span{font-size:12.5px;color:var(--muted-strong)}
+.status-dot{width:10px;height:10px;border-radius:50%;margin-left:auto;flex:0 0 auto}
+.status-dot.ok{background:var(--success)}
+.status-dot.warn{background:var(--warning-dot)}
+.status-dot.bad{background:var(--danger)}
+.health-note{font-size:12.5px;color:var(--muted-strong);margin-top:14px;background:var(--side);border:1px solid var(--line);border-radius:var(--radius-md);padding:12px 14px}
+.health-note b{color:var(--ink)}
+.uptime{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
+.uptime div{background:var(--side);border:1px solid var(--line);border-radius:var(--radius-md);padding:10px 12px;text-align:center}
+.uptime b{font-size:16px;display:block;font-family:var(--font-mono)}
+.uptime span{font-size:12px;color:var(--muted-strong)}
+
+footer.page{color:var(--muted-strong);font-size:13px;margin-top:6px;text-align:center}
+
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.07);opacity:.72}}
+@keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+@keyframes dotbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+.dots{display:inline-flex;gap:5px;align-items:center}
+.dots i{width:7px;height:7px;border-radius:50%;background:var(--brand);animation:dotbounce 1.5s ease-in-out infinite}
+.dots i:nth-child(2){animation-delay:.18s}
+.dots i:nth-child(3){animation-delay:.36s}
+@media (prefers-reduced-motion: reduce){
+  .spin,.badge-wait.pulsing,.skel i,.dots i{animation-duration:0.01s;animation-iteration-count:1}
+}
+
+@media(max-width:960px){
+  .stats{grid-template-columns:1fr 1fr}
+  .grid2,.grid2b{grid-template-columns:1fr}
+  .uptime{grid-template-columns:1fr 1fr}
+}
+@media(max-width:760px){
+  .shell{flex-direction:column}
+  .sidebar{flex:none;height:auto;position:static;flex-direction:row;flex-wrap:wrap;align-items:center;padding:14px}
+  .logo{padding:0 8px 0 0}
+  .nav-label,.side-foot{display:none}
+  .navitem{flex:1 1 auto;justify-content:center}
+  .navitem .count{display:none}
+  .content{padding:20px 16px}
+  .topbar{padding:10px 16px}
+  .admin-id .who{display:none}
+  .stats{grid-template-columns:1fr}
+  .uptime{grid-template-columns:1fr}
+  .table-wrap{border:none;overflow:visible}
+  .table-wrap table,.table-wrap tbody,.table-wrap tr,.table-wrap td{display:block;width:100%}
+  .table-wrap thead{display:none}
+  .table-wrap tr{border:1px solid var(--line);border-radius:var(--radius-md);padding:8px 6px;margin-bottom:10px;background:#fff}
+  .table-wrap td{border-bottom:none;padding:4px 10px}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- 左侧导航 -->
+  <nav class="sidebar" aria-label="管理后台导航">
+    <div class="logo">
+      <span class="logo-mark">M</span>
+      <span><b>Morde 管理后台</b><span>冰淇淋蓝 · 浅色</span></span>
+    </div>
+    <div class="nav-label">日常管理</div>
+    <span class="navitem on"><span class="ico">◈</span>总览</span>
+    <span class="navitem"><span class="ico">◯</span>用户</span>
+    <span class="navitem"><span class="ico">⚙</span>配置与预算</span>
+    <span class="navitem"><span class="ico">✦</span>平台模型</span>
+    <span class="navitem"><span class="ico">▦</span>用量与统计</span>
+    <span class="navitem"><span class="ico">◎</span>质量与风险</span>
+    <span class="navitem"><span class="ico">🔔</span>规则与通知</span>
+    <span class="navitem"><span class="ico">▣</span>云端电脑</span>
+    <span class="navitem"><span class="ico">≡</span>审计</span>
+    <div class="side-foot">
+      <span class="navitem"><span class="ico">⇄</span>切换至 PC 用户端</span>
+    </div>
+  </nav>
+
+  <!-- 主区 -->
+  <div class="main">
+    <header class="topbar">
+      <div>
+        <h1>总览</h1>
+        <span class="crumb">管理后台 / 总览 · 2026-11-18</span>
+      </div>
+      <div class="admin-id">
+        <span class="avatar">管<span class="status"></span></span>
+        <span class="who"><b>超级管理员</b><span>super_admin · 在线</span></span>
+      </div>
+    </header>
+
+    <main class="content">
+      <p class="lede">服务与资源的当前状态，每 30 秒自动刷新。</p>
+
+      <!-- 平台概况 -->
+      <section class="card" aria-label="平台概况" style="margin-bottom:22px">
+        <div class="card-head">
+          <div><h2>平台概况</h2><p class="sub">服务与资源的当前状态</p></div>
+          <span class="btn btn-secondary btn-sm">刷新数据</span>
+        </div>
+        <div class="uptime">
+          <div><b style="color:var(--success-ink)">就绪</b><span>服务就绪状态</span></div>
+          <div><b>12</b><span>在线安装数</span></div>
+          <div><b>今天 09:39</b><span>检查时间</span></div>
+          <div><b>2.4 核 / 8 核</b><span>CPU 已分配 / 上限</span></div>
+          <div><b>6.2 GB / 16 GB</b><span>内存已分配 / 上限</span></div>
+        </div>
+      </section>
+
+      <!-- Host 状态 -->
+      <section class="card" aria-label="Host 状态" style="margin-bottom:22px">
+        <div class="card-head">
+          <div><h2>Host 状态</h2><p class="sub">云端电脑按状态统计</p></div>
+        </div>
+        <div class="uptime">
+          <div><b>3</b><span>运行中</span></div>
+          <div><b>1</b><span>已停止</span></div>
+          <div><b>0</b><span>未就绪</span></div>
+        </div>
+      </section>
+
+      <!-- Agent 状态 -->
+      <section class="card" aria-label="Agent 状态">
+        <div class="card-head">
+          <div><h2>Agent 状态</h2><p class="sub">Agent 按状态统计</p></div>
+        </div>
+        <div class="uptime">
+          <div><b>5</b><span>空闲</span></div>
+          <div><b>2</b><span>执行中</span></div>
+          <div><b>1</b><span>离线</span></div>
+        </div>
+      </section>
+
+      <footer class="page">Morde 管理后台 · 冰淇淋蓝（方案 P）· 浅色 only · 演示数据为示例内容 · 2026-11-18</footer>
+    </main>
+  </div>
+</div>
+</body>
+</html>
