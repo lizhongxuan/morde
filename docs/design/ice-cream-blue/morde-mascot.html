@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:,">
+<title>小默 · Morde 吉祥物设计稿</title>
+<style>
+:root{
+  --brand:#60a5fa;
+  --brand-hover:#3b82f6;
+  --brand-soft:#dbeafe;
+  --brand-tint:#bfdbfe;
+  --brand-mid:#93c5fd;
+  --brand-ink:#2563eb;
+  --brand-deep:#1d4ed8;
+  --face:#2563eb;
+  --bg:#f8faff;
+  --side:#eff6ff;
+  --surface:#ffffff;
+  --ink:#334155;
+  --muted:#94a3b8;
+  --muted-strong:#64748b;
+  --line:#dbeafe;
+  --line-strong:#bfdbfe;
+  --success:#34b27a;
+  --success-bg:#d1fae5;
+  --success-ink:#047857;
+  --warning:#b45309;
+  --warning-bg:#fef3c7;
+  --danger-bg:#fee2e2;
+  --danger-ink:#b91c1c;
+  --cheek:#fda4af;
+  --radius-sm:12px;
+  --radius-md:16px;
+  --radius-lg:20px;
+  --radius-card:24px;
+  --radius-pill:999px;
+  --shadow-jelly:0 14px 30px rgba(96,165,250,.18);
+  --shadow-soft:0 8px 20px rgba(96,165,250,.12);
+  --shadow-btn:0 6px 16px rgba(96,165,250,.28);
+  --font:"Yuanti SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.7}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 20px 64px}
+h1{font-size:44px;line-height:1.2;margin:0 0 10px;font-weight:800;letter-spacing:-.01em}
+h2{font-size:21px;line-height:1.35;margin:0 0 8px;font-weight:800}
+h3{font-size:16px;margin:0 0 8px;font-weight:750}
+p{margin:0 0 10px}
+.num{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;background:var(--brand);color:#fff;font-size:14px;font-weight:800;margin-right:10px;vertical-align:2px;box-shadow:var(--shadow-btn)}
+section.block{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-card);padding:26px 28px;margin:22px 0;box-shadow:var(--shadow-soft)}
+section.block .sub{color:var(--muted-strong);font-size:14px;margin:0 0 16px}
+.kchip{display:inline-flex;align-items:center;min-height:32px;padding:4px 14px;border-radius:var(--radius-pill);background:var(--brand-soft);color:var(--brand-deep);font-size:13px;font-weight:650;border:1px solid var(--brand-tint)}
+.kchip.cream{background:#fff;border-color:var(--line);color:var(--muted-strong);font-weight:600}
+.hero{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-card);box-shadow:var(--shadow-jelly);padding:34px 28px 30px;margin:6px 0 22px;display:flex;gap:28px;align-items:center;overflow:hidden;position:relative}
+.hero::before{content:"";position:absolute;right:-70px;top:-70px;width:230px;height:230px;border-radius:50%;background:var(--brand-soft);opacity:.55}
+.hero::after{content:"";position:absolute;left:-46px;bottom:-80px;width:170px;height:170px;border-radius:50%;background:var(--side)}
+.hero-art{flex:0 0 auto;position:relative;z-index:1;width:300px;max-width:62vw}
+.hero-txt{position:relative;z-index:1;min-width:0}
+.hero-txt .tagline{font-size:17px;color:var(--muted-strong);line-height:1.75;max-width:460px}
+.hero-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+@media(max-width:720px){.hero{flex-direction:column;text-align:center;padding-top:26px}.hero-txt .tagline{margin:0 auto}.hero-meta{justify-content:center}h1{font-size:38px}}
+.bob{animation:bob 2.4s ease-in-out infinite}
+.eye{transform-box:fill-box;transform-origin:center;animation:blink 3.6s ease-in-out infinite}
+.wave-arm{transform-box:view-box;transform-origin:186px 124px;animation:wave 2.2s ease-in-out infinite}
+.tdot{animation:dotbounce 1.6s ease-in-out infinite}
+.tdot.d2{animation-delay:.2s}.tdot.d3{animation-delay:.4s}
+.pulse-soft{transform-box:fill-box;transform-origin:center;animation:pulse 1.8s ease-in-out infinite}
+.floatz{animation:floatz 2.6s ease-in-out infinite}
+.floatz.z2{animation-delay:.6s}.floatz.z3{animation-delay:1.2s}
+.sweat{animation:sweat 1.8s ease-in infinite}
+.idea-list{margin:0;padding:0;list-style:none}
+.idea-list li{position:relative;padding:10px 14px 10px 40px;background:var(--side);border:1px solid var(--line);border-radius:var(--radius-md);margin-bottom:10px;font-size:14.5px;line-height:1.7;color:var(--ink)}
+.idea-list li:last-child{margin-bottom:0}
+.idea-list li b{color:var(--brand-deep)}
+.idea-list .n{position:absolute;left:12px;top:10px;width:20px;height:20px;border-radius:50%;background:var(--brand);color:#fff;font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center}
+.trait-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px}
+@media(max-width:640px){.trait-grid{grid-template-columns:1fr}}
+.trait{border-radius:var(--radius-md);padding:14px 16px;background:var(--side);border:1px solid var(--line)}
+.trait b{display:block;margin-bottom:4px;font-size:15px}
+.trait span{color:var(--muted-strong);font-size:13.5px;line-height:1.65;display:block}
+.trait.not{background:#fff5f4;border-color:var(--danger-bg)}
+.trait.not b{color:var(--danger-ink)}
+.names-box{margin-top:16px;border:1.5px dashed var(--brand-tint);border-radius:var(--radius-md);padding:14px 16px;background:var(--bg)}
+.names-box b{font-size:14.5px}
+.names-box p{margin:4px 0 0;color:var(--muted-strong);font-size:13.5px}
+.name-opt{display:inline-flex;align-items:center;min-height:32px;padding:3px 13px;border-radius:var(--radius-pill);background:#fff;border:1px solid var(--brand-tint);color:var(--brand-deep);font-weight:700;font-size:13.5px;margin:6px 6px 0 0}
+.expr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}
+.pose-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media(max-width:700px){.pose-grid{grid-template-columns:1fr}}
+.face-card{border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--bg);padding:14px 10px 12px;text-align:center}
+.face-card svg{width:100%;height:auto;display:block}
+.face-card .fname{font-weight:750;font-size:14.5px;margin-top:8px}
+.face-card .fnote{color:var(--muted-strong);font-size:12.5px;line-height:1.55;margin-top:2px}
+.pal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+.pal{border:1px solid var(--line);border-radius:var(--radius-lg);overflow:hidden;background:#fff}
+.pal .fill{height:64px}
+.pal .pinfo{padding:10px 14px 12px}
+.pal .pname{font-weight:750;font-size:14px}
+.pal .phex{font-family:var(--font-mono);font-size:12.5px;color:var(--brand-deep)}
+.pal .puse{color:var(--muted-strong);font-size:12.5px;line-height:1.55;margin-top:2px}
+.scene-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
+.scene{border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--bg);padding:16px}
+.scene h3{font-size:14.5px;margin-bottom:10px}
+.scene .mock{background:#fff;border:1px solid var(--line);border-radius:var(--radius-md);padding:14px;min-height:118px;display:flex;align-items:center;justify-content:center}
+.scene .snote{color:var(--muted-strong);font-size:12.5px;line-height:1.6;margin-top:10px}
+.mock-empty{flex-direction:column;text-align:center;gap:2px}
+.mock-empty .et{font-weight:700;font-size:14px;margin-top:6px}
+.mock-empty .es{color:var(--muted-strong);font-size:12.5px}
+.think-bubble{display:inline-flex;align-items:center;gap:10px;background:#fff;border:1px solid var(--line);border-radius:22px;padding:10px 16px}
+.dots{display:inline-flex;gap:5px;align-items:center}
+.dots i{width:7px;height:7px;border-radius:50%;background:var(--brand);animation:dotbounce 1.6s ease-in-out infinite}
+.dots i:nth-child(2){animation-delay:.2s}
+.dots i:nth-child(3){animation-delay:.4s}
+.think-txt{color:var(--muted-strong);font-size:13px}
+.mini-approval{width:100%;text-align:left}
+.mini-approval .ma-top{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13.5px;flex-wrap:wrap}
+.mini-approval .ma-desc{color:var(--muted-strong);font-size:12.5px;margin-top:5px;line-height:1.6}
+.badge{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:3px 12px;border-radius:var(--radius-pill);font-size:12.5px;font-weight:700;white-space:nowrap}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.badge-wait{background:var(--warning-bg);color:var(--warning)}
+.badge-wait.pulsing{animation:pulse 1.8s ease-in-out infinite}
+.badge-done{background:var(--success-bg);color:var(--success-ink)}
+.btn{display:inline-flex;align-items:center;justify-content:center;border-radius:var(--radius-pill);font-weight:700;border:1px solid transparent;white-space:nowrap;min-height:36px;padding:5px 16px;font-size:13px;line-height:1.4}
+.btn-primary{background:var(--brand);color:#fff;box-shadow:var(--shadow-btn)}
+.btn-secondary{background:#fff;color:var(--brand-deep);border-color:var(--brand-tint)}
+.ma-actions{display:flex;gap:8px;margin-top:10px}
+.toast{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid var(--line);border-radius:var(--radius-md);padding:10px 14px;box-shadow:var(--shadow-jelly);font-size:13.5px;font-weight:600}
+.ava-row{display:flex;align-items:flex-end;gap:16px}
+.ava{border-radius:50%;background:var(--brand-soft);border:2px solid var(--line-strong);overflow:hidden;flex:0 0 auto;display:flex;align-items:flex-end;justify-content:center}
+.ava svg{display:block}
+.ava-cap{text-align:center;color:var(--muted-strong);font-size:12px;margin-top:5px}
+.rule-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:640px){.rule-grid{grid-template-columns:1fr}}
+.rule{border-radius:var(--radius-md);padding:14px 16px;background:#fff5f4;border:1px solid var(--danger-bg)}
+.rule b{display:block;margin-bottom:4px;color:var(--danger-ink);font-size:14.5px}
+.rule span{color:var(--muted-strong);font-size:13.5px;line-height:1.65;display:block}
+.rule .demo-bad{display:flex;align-items:center;gap:14px;margin-top:8px}
+footer.page{color:var(--muted-strong);font-size:13px;line-height:1.75}
+footer.page .f-box{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-card);padding:20px 24px}
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes blink{0%,91%,100%{transform:scaleY(1)}95%{transform:scaleY(.1)}}
+@keyframes wave{0%,100%{transform:rotate(0deg)}50%{transform:rotate(-14deg)}}
+@keyframes dotbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.07);opacity:.72}}
+@keyframes floatz{0%{transform:translateY(0);opacity:0}25%{opacity:1}100%{transform:translateY(-16px);opacity:0}}
+@keyframes sweat{0%{transform:translateY(-4px);opacity:0}30%{opacity:1}100%{transform:translateY(12px);opacity:0}}
+@media (prefers-reduced-motion: reduce){
+  .bob,.eye,.wave-arm,.tdot,.pulse-soft,.floatz,.sweat,.dots i,.badge-wait.pulsing{animation-duration:.01s;animation-iteration-count:1}
+}
+</style>
+</head>
+<body>
+
+<!-- ======== 小团子 SVG 部件库：基础形定义一次，各处 <use> 复用 ======== -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <circle id="discShape" cx="120" cy="110" r="102" fill="#dbeafe"/>
+    <g id="blobBody">
+      <ellipse cx="120" cy="192" rx="54" ry="8" fill="#bfdbfe" opacity=".65"/>
+      <path d="M120 36 C160 36 190 70 190 116 C190 158 158 186 120 186 C82 186 50 158 50 116 C50 70 80 36 120 36 Z" fill="#60a5fa"/>
+      <ellipse cx="120" cy="114" rx="57" ry="47" fill="#bfdbfe" opacity=".45"/>
+      <ellipse cx="86" cy="64" rx="21" ry="12" fill="#ffffff" opacity=".35" transform="rotate(-18 86 64)"/>
+    </g>
+    <g id="faceHappy">
+      <ellipse cx="79" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".85"/>
+      <ellipse cx="161" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".85"/>
+      <circle class="eye" cx="99" cy="106" r="7" fill="#2563eb"/>
+      <circle class="eye" cx="141" cy="106" r="7" fill="#2563eb"/>
+      <path d="M110 122 Q120 131 130 122" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+    </g>
+    <g id="blobBase"><use href="#discShape"/><use href="#blobBody"/></g>
+    <g id="mascotHappy"><use href="#blobBase"/><use href="#faceHappy"/></g>
+    <g id="mascotPlain"><use href="#blobBody"/><use href="#faceHappy"/></g>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+<!-- Hero -->
+<header class="hero">
+  <div class="hero-art">
+    <svg class="bob" viewBox="0 0 240 220" role="img" aria-label="小默：一只挥手打招呼的蓝色小团子">
+      <use href="#discShape"/>
+      <use href="#blobBody"/>
+      <g class="wave-arm">
+        <ellipse cx="193" cy="106" rx="10" ry="19" fill="#60a5fa" transform="rotate(26 193 106)"/>
+      </g>
+      <use href="#faceHappy"/>
+    </svg>
+  </div>
+  <div class="hero-txt">
+    <h1>小默</h1>
+    <p class="tagline">Morde 的小伙伴，一只软软的蓝色小团子。你说话，它干活；你忙别的，它在云端把任务一件件做完，做好了再轻轻告诉你。</p>
+    <div class="hero-meta">
+      <span class="kchip">形象 · 极简小团子</span>
+      <span class="kchip cream">配色 · 冰淇淋蓝</span>
+      <span class="kchip cream">特点 · 一个形体，一张脸，没有多余零件</span>
+      <span class="kchip cream">名字取自 Morde 的「默」：安静、靠得住</span>
+    </div>
+  </div>
+</header>
+
+<!-- 1 设计思路 -->
+<section class="block" aria-label="设计思路">
+  <h2><span class="num">1</span>设计思路</h2>
+  <p class="sub">这一版先去看了 Muse 自己的默认头像 Jolly 是怎么做的，再回来重画小默。</p>
+  <ul class="idea-list">
+    <li><span class="n">1</span><b>Jolly 的极简：</b>Muse 的默认头像 Jolly 只是一个柔软蓬松的圆润形体——没有分开的头、身体和手臂，没有天线、星星或任何配饰；脸上只有两颗圆点眼睛、一个小弯微笑和淡淡的腮红。它的温暖来自柔软和简单，不来自装饰。</li>
+    <li><span class="n">2</span><b>上一版为什么不好看：</b>小机器人零件太多——天线、星星、手臂、脚、屏幕脸全堆在一起，再加上 3.5–4px 的粗深描边，看起来像贴纸玩具，和这种柔软感正好相反。</li>
+    <li><span class="n">3</span><b>新小默的做法：</b>只留一个圆润的团子形体和一张极简的脸，个性全靠表情和慢慢的浮动、眨眼来表达；轮廓不靠硬描边，靠饱和的身体蓝（#60A5FA）和每个展示位背后的淡蓝圆盘和背景分开。</li>
+  </ul>
+</section>
+
+<!-- 2 性格设定 -->
+<section class="block" aria-label="性格设定">
+  <h2><span class="num">2</span>性格设定</h2>
+  <p class="sub">小默的性格就是 Morde 本身的性格：它出现在界面里的每一处，都应该让人觉得「这件事交给它，放心」。</p>
+  <div class="trait-grid">
+    <div class="trait"><b>温暖亲切</b><span>像朋友一样说话，不端着、不摆架子。用户回来时，它先打招呼，再说正事。</span></div>
+    <div class="trait"><b>靠得住</b><span>答应的事会做完；做不到会提前说，不会悄悄消失，也不会假装完成了。</span></div>
+    <div class="trait"><b>有点小俏皮</b><span>偶尔眨眨眼、开个小玩笑，等待的时候不无聊；但玩笑永远不耽误正事。</span></div>
+    <div class="trait"><b>说话简短清楚</b><span>一句话先说结果，再说细节。不绕弯子、不堆术语——和 Morde 的回答方式一样。</span></div>
+    <div class="trait not" style="grid-column:1/-1"><b>它不是什么样</b><span>不高冷、不疏离，不摆「专业工具」的冷脸；也不吵闹、不刷存在感，不会在没事的时候跳出来打扰你。</span></div>
+  </div>
+  <div class="names-box">
+    <b>名字备选</b>
+    <p>主名定为「小默」。如果想换个感觉，这里还有两个备选，挑一个告诉我就行：</p>
+    <span class="name-opt">默默 · 安安静静，叠字更亲切</span>
+    <span class="name-opt">摩摩 · 取 Morde 的「摩」，圆滚滚的叠字</span>
+  </div>
+</section>
+
+<!-- 3 表情包 -->
+<section class="block" aria-label="表情包">
+  <h2><span class="num">3</span>表情包</h2>
+  <p class="sub">同一只小默，七种状态。团子的形体不变，只换脸上的眼睛、嘴巴和一点小动作——对应 Morde 里最常出现的七种时刻。每个展示位背后都垫着淡蓝圆盘，饱和的身体蓝保证在浅色底上一眼看清。</p>
+  <div class="expr-grid">
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="开心">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="121" rx="10" ry="5.5" fill="#fda4af" opacity=".9"/>
+        <ellipse cx="161" cy="121" rx="10" ry="5.5" fill="#fda4af" opacity=".9"/>
+        <path d="M89 108 Q99 97 109 108" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <path d="M131 108 Q141 97 151 108" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <path d="M107 118 Q120 133 133 118 Q120 125 107 118 Z" fill="#2563eb"/>
+        <path d="M114 126 Q120 130 126 126 Q120 128 114 126 Z" fill="#fda4af"/>
+      </svg>
+      <div class="fname">开心</div>
+      <div class="fnote">打招呼、收到新任务时</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="思考中">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".7"/>
+        <ellipse cx="161" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".7"/>
+        <circle class="eye" cx="96" cy="100" r="7" fill="#2563eb"/>
+        <circle class="eye" cx="138" cy="100" r="7" fill="#2563eb"/>
+        <path d="M112 124 Q120 120 128 124" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <circle class="tdot" cx="192" cy="52" r="5.5" fill="#60a5fa"/>
+        <circle class="tdot d2" cx="207" cy="52" r="5.5" fill="#60a5fa"/>
+        <circle class="tdot d3" cx="222" cy="52" r="5.5" fill="#60a5fa"/>
+      </svg>
+      <div class="fname">思考中</div>
+      <div class="fnote">眼睛往上看，旁边三个小圆点慢慢跳</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="工作中">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="123" rx="9.5" ry="5.5" fill="#fda4af" opacity=".7"/>
+        <ellipse cx="161" cy="123" rx="9.5" ry="5.5" fill="#fda4af" opacity=".7"/>
+        <circle class="eye" cx="99" cy="112" r="7" fill="#2563eb"/>
+        <circle class="eye" cx="141" cy="112" r="7" fill="#2563eb"/>
+        <path d="M112 126 L128 126" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+      </svg>
+      <div class="fname">工作中</div>
+      <div class="fnote">眼睛向下，抿着嘴，专心干活</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="等待审批">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".8"/>
+        <ellipse cx="161" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".8"/>
+        <circle class="eye" cx="99" cy="101" r="7" fill="#2563eb"/>
+        <circle class="eye" cx="141" cy="101" r="7" fill="#2563eb"/>
+        <path d="M111 121 Q120 127 129 121" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+      </svg>
+      <div class="fname">等待审批</div>
+      <div class="fnote">抬头看着你，安安静静等你点头</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="成功">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="121" rx="10" ry="5.5" fill="#fda4af" opacity=".9"/>
+        <ellipse cx="161" cy="121" rx="10" ry="5.5" fill="#fda4af" opacity=".9"/>
+        <path d="M89 108 Q99 97 109 108" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <path d="M131 108 Q141 97 151 108" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <path d="M106 117 Q120 134 134 117 Q120 126 106 117 Z" fill="#2563eb"/>
+        <path d="M113 127 Q120 131 127 127 Q120 129 113 127 Z" fill="#fda4af"/>
+      </svg>
+      <div class="fname">成功</div>
+      <div class="fnote">笑得眯起眼：这件事做完啦</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="困了">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".7"/>
+        <ellipse cx="161" cy="121" rx="9.5" ry="5.5" fill="#fda4af" opacity=".7"/>
+        <path d="M89 104 Q99 112 109 104" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <path d="M131 104 Q141 112 151 104" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <ellipse cx="120" cy="123" rx="4.5" ry="5.5" fill="none" stroke="#2563eb" stroke-width="3"/>
+        <text class="floatz" x="188" y="66" font-size="21" font-weight="800" fill="#2563eb">Z</text>
+        <text class="floatz z2" x="202" y="50" font-size="15" font-weight="800" fill="#3b82f6">Z</text>
+        <text class="floatz z3" x="212" y="38" font-size="11" font-weight="800" fill="#60a5fa">Z</text>
+      </svg>
+      <div class="fname">困了</div>
+      <div class="fnote">深夜长任务、空闲待机时</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="出错，冒汗">
+        <use href="#blobBase"/>
+        <ellipse cx="79" cy="123" rx="9.5" ry="5.5" fill="#fda4af" opacity=".6"/>
+        <ellipse cx="161" cy="123" rx="9.5" ry="5.5" fill="#fda4af" opacity=".6"/>
+        <circle cx="99" cy="107" r="6.5" fill="#2563eb"/>
+        <circle cx="141" cy="107" r="6.5" fill="#2563eb"/>
+        <path d="M108 126 Q114 121 120 126 Q126 131 132 126" fill="none" stroke="#2563eb" stroke-width="3.5" stroke-linecap="round"/>
+        <path class="sweat" d="M204 116 C210 128 214 134 214 141 a10 10 0 1 1 -20 0 C194 134 198 128 204 116 Z" fill="#93c5fd"/>
+      </svg>
+      <div class="fname">出错</div>
+      <div class="fnote">冒一滴汗，老实告诉你哪里卡住了</div>
+    </div>
+
+  </div>
+</section>
+
+<!-- 4 姿势 -->
+<section class="block" aria-label="姿势">
+  <h2><span class="num">4</span>姿势</h2>
+  <p class="sub">三个常用姿势，覆盖打招呼、交付和休息三种场合。姿势也尽量简单：一只小圆手臂、一张任务卡、一张小凳子，不再加别的零件。</p>
+  <div class="pose-grid">
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="挥手打招呼">
+        <g class="bob">
+          <use href="#discShape"/>
+          <use href="#blobBody"/>
+          <g class="wave-arm">
+            <ellipse cx="193" cy="106" rx="10" ry="19" fill="#60a5fa" transform="rotate(26 193 106)"/>
+          </g>
+          <use href="#faceHappy"/>
+        </g>
+      </svg>
+      <div class="fname">挥手打招呼</div>
+      <div class="fnote">欢迎页、新对话开头、每日第一次打开</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="抱着任务卡">
+        <use href="#blobBase"/>
+        <use href="#faceHappy"/>
+        <rect x="82" y="128" width="76" height="56" rx="12" fill="#ffffff" stroke="#bfdbfe" stroke-width="2.5"/>
+        <circle cx="97" cy="145" r="8" fill="#d1fae5"/>
+        <path d="M93 145 L96.5 148.5 L102 142" fill="none" stroke="#34b27a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="110" y="139" width="38" height="6" rx="3" fill="#bfdbfe"/>
+        <rect x="110" y="150" width="27" height="6" rx="3" fill="#dbeafe"/>
+        <rect x="91" y="166" width="58" height="6" rx="3" fill="#dbeafe"/>
+        <ellipse cx="76" cy="152" rx="9" ry="15" fill="#60a5fa" transform="rotate(14 76 152)"/>
+        <ellipse cx="164" cy="152" rx="9" ry="15" fill="#60a5fa" transform="rotate(-14 164 152)"/>
+      </svg>
+      <div class="fname">抱着任务卡</div>
+      <div class="fnote">任务交付、结果汇报时，抱着成果来找你</div>
+    </div>
+
+    <div class="face-card">
+      <svg viewBox="0 0 240 220" role="img" aria-label="坐在小凳子上">
+        <use href="#discShape"/>
+        <rect x="86" y="180" width="9" height="24" rx="4" fill="#bfdbfe"/>
+        <rect x="145" y="180" width="9" height="24" rx="4" fill="#bfdbfe"/>
+        <rect x="64" y="164" width="112" height="16" rx="8" fill="#93c5fd"/>
+        <use href="#mascotPlain" transform="translate(120 107) scale(.8) translate(-120 -110)"/>
+      </svg>
+      <div class="fname">坐在小凳子上</div>
+      <div class="fnote">待机和空态：团子软软地坐在小凳子上等你回来</div>
+    </div>
+
+  </div>
+</section>
+
+<!-- 5 配色 -->
+<section class="block" aria-label="配色">
+  <h2><span class="num">5</span>配色</h2>
+  <p class="sub">全部取自冰淇淋蓝 tokens。没有描边色，也没有装饰色：身体蓝本身足够饱和，和奶油白背景天然分得开；腮红的粉是唯一的暖色。</p>
+  <div class="pal-grid">
+    <div class="pal"><div class="fill" style="background:#60a5fa"></div><div class="pinfo"><div class="pname">身体 · 冰淇淋蓝</div><div class="phex">#60A5FA</div><div class="puse">团子的主色。饱和度是刻意定死的——再淡就会融进背景</div></div></div>
+    <div class="pal"><div class="fill" style="background:#bfdbfe"></div><div class="pinfo"><div class="pname">脸部 · 浅一层蓝</div><div class="phex">#BFDBFE</div><div class="puse">脸部区域以 45% 透明度叠一层，让脸微微透出来，不画边框</div></div></div>
+    <div class="pal"><div class="fill" style="background:#dbeafe"></div><div class="pinfo"><div class="pname">圆盘 · 淡蓝底衬</div><div class="phex">#DBEAFE</div><div class="puse">每个展示位背后的圆盘，把团子和页面背景再隔开一层</div></div></div>
+    <div class="pal"><div class="fill" style="background:#2563eb"></div><div class="pinfo"><div class="pname">五官 · 深蓝</div><div class="phex">#2563EB</div><div class="puse">圆点眼睛和微笑。在浅蓝的脸部区域上，这个深度看得最清楚</div></div></div>
+    <div class="pal"><div class="fill" style="background:#fda4af"></div><div class="pinfo"><div class="pname">腮红 · 玫瑰粉</div><div class="phex">#FDA4AF</div><div class="puse">脸上的两团腮红，全身唯一的暖色，只用一点点</div></div></div>
+    <div class="pal"><div class="fill" style="background:#93c5fd"></div><div class="pinfo"><div class="pname">点缀 · 中淡蓝</div><div class="phex">#93C5FD</div><div class="puse">小凳子、汗滴这类小物件，和身体同色系、不抢眼</div></div></div>
+    <div class="pal"><div class="fill" style="background:#f8faff;border-bottom:1px solid var(--line)"></div><div class="pinfo"><div class="pname">背景 · 奶油白</div><div class="phex">#F8FAFF</div><div class="puse">页面底色。团子从不直接放在纯白或深色上出现</div></div></div>
+    <div class="pal"><div class="fill" style="background:rgba(96,165,250,.18)"></div><div class="pinfo"><div class="pname">柔和阴影 · 果冻软阴影</div><div class="phex">rgba(96,165,250,.18)</div><div class="puse">团子脚下的软影和卡片阴影，代替描边来「托住」形体</div></div></div>
+  </div>
+</section>
+
+<!-- 6 使用场景 -->
+<section class="block" aria-label="使用场景">
+  <h2><span class="num">6</span>使用场景</h2>
+  <p class="sub">小默只出现在「状态需要被看见」的地方：等你的时候、替你想的时候、做完的时候。每处都配了一个缩小版的实际样子。</p>
+  <div class="scene-grid">
+
+    <div class="scene">
+      <h3>空态 · 没任务时</h3>
+      <div class="mock mock-empty">
+        <svg viewBox="0 0 240 220" style="width:104px" aria-hidden="true"><use href="#mascotHappy"/></svg>
+        <div class="et">还没有任务</div>
+        <div class="es">说一句话，小默就开始干活</div>
+      </div>
+      <p class="snote">软软地待机，轻轻浮动。空列表、空工作区、新对话都用它。</p>
+    </div>
+
+    <div class="scene">
+      <h3>思考中 · 加载</h3>
+      <div class="mock">
+        <svg viewBox="0 0 240 220" style="width:64px;flex:0 0 auto" aria-hidden="true"><use href="#mascotHappy"/></svg>
+        <div class="think-bubble"><span class="dots"><i></i><i></i><i></i></span><span class="think-txt">思考中…</span></div>
+      </div>
+      <p class="snote">AI 头像位换成小默（会眨眼），配思考圆点。所有等待超过 1 秒的状态都用它，不用光秃秃的转圈。</p>
+    </div>
+
+    <div class="scene">
+      <h3>审批等待</h3>
+      <div class="mock">
+        <div class="mini-approval">
+          <div class="ma-top">
+            <svg viewBox="0 0 240 220" style="width:44px;flex:0 0 auto" aria-hidden="true"><use href="#mascotHappy"/></svg>
+            修改 auth/session.ts <span class="badge badge-wait pulsing">等待中</span>
+          </div>
+          <div class="ma-desc">将超时从 5s 改为 15s，并加一次自动重试。</div>
+          <div class="ma-actions"><span class="btn btn-primary">通过</span><span class="btn btn-secondary">拒绝</span></div>
+        </div>
+      </div>
+      <p class="snote">出现在审批卡左上角，提醒「这件事在等你」。徽章保持 1.8s 呼吸脉冲，不闪烁、不催促。</p>
+    </div>
+
+    <div class="scene">
+      <h3>成功完成</h3>
+      <div class="mock">
+        <div class="toast">
+          <svg viewBox="0 0 240 220" style="width:46px;flex:0 0 auto" aria-hidden="true"><use href="#mascotHappy"/></svg>
+          任务已完成，结果已存入工作区
+          <span class="badge badge-done"><span class="dot"></span>完成</span>
+        </div>
+      </div>
+      <p class="snote">完成 Toast 和任务卡收尾处出现，笑眯眯的成功表情用在正式交付页。</p>
+    </div>
+
+    <div class="scene">
+      <h3>头像</h3>
+      <div class="mock">
+        <div class="ava-row">
+          <div><div class="ava" style="width:64px;height:64px"><svg viewBox="42 28 156 156" style="width:64px;height:64px" aria-hidden="true"><use href="#mascotHappy"/></svg></div><div class="ava-cap">64px · 对话头像</div></div>
+          <div><div class="ava" style="width:44px;height:44px"><svg viewBox="42 28 156 156" style="width:44px;height:44px" aria-hidden="true"><use href="#mascotHappy"/></svg></div><div class="ava-cap">44px · 列表</div></div>
+          <div><div class="ava" style="width:30px;height:30px"><svg viewBox="42 28 156 156" style="width:30px;height:30px" aria-hidden="true"><use href="#mascotHappy"/></svg></div><div class="ava-cap">30px · 最小</div></div>
+        </div>
+      </div>
+      <p class="snote">圆形裁切，只取团子的脸部。饱和的身体蓝加淡蓝圆盘，30px 也分得清轮廓。AI 消息头像、助手身份标识统一用它，不再用字母圆。</p>
+    </div>
+
+  </div>
+</section>
+
+<!-- 7 使用规范 -->
+<section class="block" aria-label="使用规范">
+  <h2><span class="num">7</span>使用规范</h2>
+  <p class="sub">六条硬规则，保证小默在任何端、任何尺寸下看起来都是同一只软软的小团子。</p>
+  <div class="rule-grid">
+    <div class="rule"><b>不要加硬描边</b><span>小默没有描边。轮廓靠饱和的身体蓝、脚下的柔和阴影和底衬圆盘——给它描一圈深色边，就又变回贴纸玩具了。</span></div>
+    <div class="rule"><b>身体蓝不许调淡</b><span>身体只用 #60A5FA，不许改成淡蓝或半透明。颜色一淡，团子就融进奶油白背景里，轮廓立刻消失。</span></div>
+    <div class="rule"><b>底衬圆盘不能去掉</b><span>每个展示位背后都要垫淡蓝圆盘（#DBEAFE），把团子和页面背景隔开。不许直接把小默放在奶油白或白色背景上裸奔。</span></div>
+    <div class="rule"><b>不要加任何配饰</b><span>不加天线、星星、帽子、围巾，也不加机械零件和屏幕框。小默的识别度来自形体本身，不来自装饰。</span></div>
+    <div class="rule"><b>脸保持极简</b><span>脸上永远只有三样东西：圆点眼睛、小微笑、两团腮红。不加眉毛、睫毛、鼻子和牙齿；换表情只动眼睛和嘴巴。</span></div>
+    <div class="rule"><b>不要拉伸变形</b><span>永远等比缩放。团子被压扁或拉长，柔软感立刻就没了。</span>
+      <div class="demo-bad">
+        <svg viewBox="0 0 240 220" style="width:56px" aria-hidden="true"><use href="#mascotHappy"/></svg>
+        <svg viewBox="0 0 240 220" style="width:100px;height:46px" preserveAspectRatio="none" aria-hidden="true"><use href="#mascotHappy"/></svg>
+        <span style="font-size:12.5px">← 左边是对的，右边是拉扁的反例</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="page">
+  <div class="f-box">小默 · Morde 吉祥物设计稿 v3（2026-11-18）：按 Muse 的极简风格重做——参考默认头像 Jolly 的做法，形象由小机器人改为一只圆润的蓝色小团子：单一形体、无硬描边、无配饰，脸上只有圆点眼睛、小微笑和腮红。身体 #60A5FA、脸部叠 #BFDBFE、每个展示位垫 #DBEAFE 淡蓝圆盘。与冰淇淋蓝 UI 规范共用同一套 token：品牌 #60A5FA、奶油白底 #F8FAFF、圆角 24px、果冻软阴影、动效 1.5–1.8s 慢而柔。表情和姿势均为 SVG 矢量，可直接导出给 PC / iOS / 管理后台三端使用。</div>
+</footer>
+
+</div>
+</body>
+</html>
