@@ -51,7 +51,9 @@ const clientContract = JSON.parse(readFileSync(
     Awaited<ReturnType<typeof portalApi.capabilities>>>;
 };
 const model = {
-  id: 'p1234567', name: '团队模型', base_url: 'https://models.example.test/v1', model_name: 'morde-test', shared: true, has_api_key: true,
+  id: 'p1234567', name: '团队模型', base_url: 'https://models.example.test/v1', model_name: 'morde-test', context_window_tokens: null,
+  context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
+  shared: true, has_api_key: true,
   capabilities: { text: true, tools: true, vision: false, text_stream: false }, checked_at: timestamp, created_at: timestamp, updated_at: timestamp,
 } satisfies Awaited<ReturnType<typeof portalApi.modelConnections>>['items'][number];
 const mcpConnector = {
@@ -77,8 +79,8 @@ const targetHost: Awaited<ReturnType<typeof portalApi.hosts>>['items'][number] =
   expires_at: null, last_active_at: null, created_at: timestamp,
 };
 const conversation = { id: 'c1234567', scope: 'personal' as const, is_main: true, title: '你好', created_at: timestamp, updated_at: timestamp };
-const message = { id: 'm1234567', conversation_id: conversation.id, sequence: 1, role: 'user' as const, content: '你好', task_id: 'q1234567', delivery_status: 'applied' as const, created_at: timestamp };
-const reply = { id: 'm7654321', conversation_id: conversation.id, sequence: 2, role: 'assistant' as const, content: '你好！', task_id: 'q1234567', delivery_status: 'applied' as const, created_at: timestamp };
+const message = { id: 'm1234567', conversation_id: conversation.id, sequence: 1, role: 'user' as const, content: '你好', task_id: 'q1234567', delivery_status: 'applied' as const, agent_acknowledged: false, created_at: timestamp };
+const reply = { id: 'm7654321', conversation_id: conversation.id, sequence: 2, role: 'assistant' as const, content: '你好！', task_id: 'q1234567', delivery_status: 'applied' as const, agent_acknowledged: false, created_at: timestamp };
 const task = {
   id: 'q1234567', owner_id: 'u1234567', initiator_id: 'u1234567', execution_location: 'server' as const, conversation_id: conversation.id,
   model_id: model.id, objective: message.content, status: 'completed' as const, queue_priority: 'normal' as const, event_sequence: 0, current_step: null,
@@ -113,7 +115,7 @@ function acceptedReceipt(conversationID: string, body: AcceptConversationMessage
     id: `m${String(sequence).padStart(7, '0')}`, conversation_id: conversationID,
     sequence: message.sequence + sequence, role: 'user', content: body.content,
     client_message_id: body.client_message_id, attachment_ids: [], routing_status: 'pending',
-    delivery_status: 'pending', created_at: timestamp,
+    delivery_status: 'pending', agent_acknowledged: false, created_at: timestamp,
   };
   return { message: submitted, replayed: false };
 }
@@ -509,7 +511,7 @@ describe('Assistant durable tasks', () => {
       control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null,
     };
     vi.spyOn(portalApi, 'hostControl').mockImplementation(async () => controlStatus);
-    const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockImplementation(async (hostID, _body) => {
+    const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockImplementation(async (hostID) => {
       controlStatus = { ...controlStatus, host_id: hostID, control_state: 'user', control_actor_user_id: authUser.id,
         control_lease_expires_at: timestamp, control_lease_active: true, control_lease_held_by_me: true };
       return { ...controlStatus, pending_operation_ids: [], active_transition: null };
@@ -522,32 +524,32 @@ describe('Assistant durable tasks', () => {
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
     expect(portalApi.issueHostEmbedTicket).toHaveBeenCalledWith(targetHost.id, expect.objectContaining({ target: 'browser' }));
     const frame = await within(sidebar).findByTitle('当前会话云端电脑工作台') as HTMLIFrameElement;
-    expect(within(sidebar).queryByRole('group', { name: '云端电脑功能' })).not.toBeInTheDocument();
-    expect(within(sidebar).queryByRole('button', { name: '接管电脑' })).not.toBeInTheDocument();
+    const dock = within(sidebar).getByRole('group', { name: '云端电脑功能' });
+    for (const label of ['桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeDisabled();
+    const takeOver = await within(sidebar).findByRole('button', { name: '接管控制权' });
+    expect(takeOver).toBeDisabled();
     const postMessage = vi.spyOn(frame.contentWindow!, 'postMessage');
     const handshake = { channel: 'morde.workbench.embed', version: 1, nonce: 'B'.repeat(32) };
     act(() => window.dispatchEvent(new MessageEvent('message', {
       origin: new URL(targetHost.url).origin, source: frame.contentWindow,
       data: { ...handshake, type: 'ready' },
     })));
-    expect(within(sidebar).queryByRole('group', { name: '云端电脑功能' })).not.toBeInTheDocument();
+    expect(dock).toBeInTheDocument();
     act(() => window.dispatchEvent(new MessageEvent('message', {
       origin: new URL(targetHost.url).origin, source: frame.contentWindow,
       data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
         active_target: 'browser', remote_desktop: 'disconnected', control_state: 'ai', control_version: 2,
         control_lease_active: false, control_lease_held_by_me: false, control_locked: true, lock_seq: 0, selection_seq: 0 },
     })));
-    expect(within(sidebar).queryByRole('group', { name: '云端电脑功能' })).not.toBeInTheDocument();
-    expect(within(sidebar).queryByRole('button', { name: '接管电脑' })).not.toBeInTheDocument();
+    expect(dock).toBeInTheDocument();
+    expect(takeOver).toBeDisabled();
     act(() => window.dispatchEvent(new MessageEvent('message', {
       origin: new URL(targetHost.url).origin, source: frame.contentWindow,
       data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
         active_target: 'browser', remote_desktop: 'connected', control_state: 'ai', control_version: 2,
         control_lease_active: false, control_lease_held_by_me: false, control_locked: true, lock_seq: 0, selection_seq: 0 },
     })));
-    const dock = within(sidebar).getByRole('group', { name: '云端电脑功能' });
-    for (const label of ['远程桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeDisabled();
-    const takeOver = within(sidebar).getByRole('button', { name: '接管电脑' });
+    for (const label of ['桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeDisabled();
     await waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'control_lock', locked: true }), new URL(targetHost.url).origin));
     const lock = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>).reverse()
       .find((message) => message.type === 'control_lock' && message.locked === true)!;
@@ -565,7 +567,7 @@ describe('Assistant durable tasks', () => {
     expect(controlAction).toHaveBeenCalledOnce();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(await screen.findByText('接管已完成，现在可以操作电脑。')).toBeInTheDocument();
-    const release = within(sidebar).getByRole('button', { name: '交还 AI' });
+    const release = within(sidebar).getByRole('button', { name: '归还控制权' });
     expect(release).toBeEnabled();
     await waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'control_lock', locked: false }), new URL(targetHost.url).origin));
     const unlock = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>).reverse()
@@ -577,11 +579,11 @@ describe('Assistant durable tasks', () => {
         control_lease_active: true, control_lease_held_by_me: true, control_locked: false, lock_seq: unlock.seq, selection_seq: 0 },
     })));
     await waitFor(() => {
-      for (const label of ['远程桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeEnabled();
+      for (const label of ['桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeEnabled();
     });
   });
 
-  it('shows a retry button below the cloud desktop connection error and retries opening it', async () => {
+  it('keeps the app entries visible on a connection error without a separate retry button', async () => {
     mockCommon({ conversations: [conversation], hosts: [targetHost] });
     const openHostWorkbenchEmbed = vi.fn().mockRejectedValue(new Error('无法连接指定云端电脑，请重试。'));
     Object.defineProperty(window, 'morde', { configurable: true, value: { openHostWorkbenchEmbed } });
@@ -593,11 +595,52 @@ describe('Assistant durable tasks', () => {
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
 
     const error = await within(sidebar).findByRole('alert');
-    const retry = within(error).getByRole('button', { name: '重试连接' });
-    expect(error.lastElementChild).toBe(retry);
-    await user.click(retry);
+    expect(within(error).queryByRole('button')).not.toBeInTheDocument();
+    const dock = within(sidebar).getByRole('group', { name: '云端电脑功能' });
+    for (const label of ['桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeDisabled();
+    expect(within(sidebar).getByRole('button', { name: '接管控制权' })).toBeDisabled();
+    const tabs = within(sidebar).getByRole('navigation', { name: '侧边栏内容' });
+    await user.click(within(tabs).getByRole('button', { name: '文件' }));
+    await user.click(within(tabs).getByRole('button', { name: '云端电脑' }));
     await waitFor(() => expect(openHostWorkbenchEmbed).toHaveBeenCalledTimes(2));
-    expect(await within(sidebar).findByRole('button', { name: '重试连接' })).toBeInTheDocument();
+  });
+
+  it('does not let the cloud sidebar release another member’s control lease', async () => {
+    mockCommon({ conversations: [conversation], hosts: [targetHost] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue({ host_id: targetHost.id, control_state: 'user', control_version: 2,
+      control_actor_user_id: 'u7654321', control_lease_expires_at: timestamp, control_lease_active: true,
+      control_lease_held_by_me: false, active_transition: null });
+    const controlAction = vi.spyOn(portalApi, 'hostControlAction');
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(private readonly callback: () => void) {}
+      observe() { this.callback(); }
+      disconnect() {}
+    });
+    const nonce = 'N'.repeat(32);
+    let receive: ((value: unknown) => void) | undefined;
+    Object.defineProperty(window, 'morde', { configurable: true, value: {
+      openHostWorkbenchEmbed: vi.fn().mockResolvedValue({ hostID: targetHost.id, hostOrigin: targetHost.url,
+        conversationID: conversation.id, nonce, targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'] }),
+      setHostWorkbenchBounds: vi.fn().mockResolvedValue({ updated: true }),
+      sendHostWorkbenchCommand: vi.fn().mockResolvedValue({ sent: true }),
+      onHostWorkbenchMessage: (listener: (value: unknown) => void) => { receive = listener; return () => { receive = undefined; }; },
+    } });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
+    const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
+    await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
+    act(() => receive?.({ type: 'state', nonce, conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+      active_target: 'browser', remote_desktop: 'connected', control_state: 'user', control_lease_active: true,
+      control_lease_held_by_me: false, control_version: 2, control_locked: true, lock_seq: 0, selection_seq: 0 }));
+
+    const dock = within(sidebar).getByRole('group', { name: '云端电脑功能' });
+    for (const label of ['桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeDisabled();
+    const controlButton = await within(sidebar).findByRole('button', { name: '接管控制权' });
+    expect(controlButton).toBeDisabled();
+    expect(within(sidebar).getByText('其他成员正在控制电脑')).toBeInTheDocument();
+    expect(controlAction).not.toHaveBeenCalled();
   });
 
   it('opens the Host Workbench in a top-level native view with a nonce-scoped state bridge', async () => {
@@ -729,6 +772,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     expect(await within(activity).findByRole('progressbar', { name: '读取本机文件进度：reports/brief.pdf' })).toHaveAttribute('value', '512');
     expect(activity).toHaveTextContent('本机 Mac');
     expect(activity).not.toHaveTextContent(taskFileFetch.source_version);
@@ -2135,6 +2179,10 @@ describe('Assistant durable tasks', () => {
     vi.mocked(portalApi.conversationMessages).mockImplementation(async (id) => ({
       items: id === main.id ? [mainMessage] : [sideMessage], next_cursor: null,
     }));
+    vi.spyOn(portalApi, 'myAgentWorkspace').mockResolvedValue({ id: 'w1234567', root_path: '~/workspace', state: 'ready' });
+    vi.spyOn(portalApi, 'agentWorkspaceEntries').mockResolvedValue({
+      workspace_id: 'w1234567', path: '', entries: [{ name: '报告.md', path: '报告.md', kind: 'file', size_bytes: 12, modified_at: timestamp }],
+    });
     const conversationTaskRead = vi.mocked(portalApi.conversationTasks).mockImplementation(async (id, options) => {
       if (id === main.id && options?.view !== 'recent') return mainTaskResult;
       if (id === side.id && options?.view === 'recent') return { items: [], next_cursor: null, pending_count: 0 };
@@ -2162,6 +2210,7 @@ describe('Assistant durable tasks', () => {
     await user.click(within(taskPanel).getByRole('button', { name: '文件' }));
     const filesPanel = document.querySelector<HTMLElement>('#assistant-task-panel .task-panel-files')!;
     expect(within(filesPanel).getByRole('link', { name: '管理本机项目' })).toHaveAttribute('href', '/hosts?sync=1');
+    expect(within(filesPanel).queryByRole('heading', { name: 'Agent Workspace' })).not.toBeInTheDocument();
     expect(within(filesPanel).getByRole('link', { name: '下载消息附件 1' })).toHaveAttribute(
       'href', '/api/personal-data/attachments/a7654321');
     expect(within(filesPanel).queryByRole('link', { name: /a1234567/ })).not.toBeInTheDocument();
@@ -2181,6 +2230,10 @@ describe('Assistant durable tasks', () => {
     expect(within(taskPanel).queryByText('旁聊任务')).not.toBeInTheDocument();
     await user.click(within(taskPanel).getByRole('button', { name: '文件' }));
     const mainFilesPanel = document.querySelector<HTMLElement>('#assistant-task-panel .task-panel-files')!;
+    expect(await within(mainFilesPanel).findByRole('heading', { name: 'Agent Workspace' })).toBeInTheDocument();
+    expect(within(mainFilesPanel).getByRole('link', { name: '下载云端文件 报告.md' })).toHaveAttribute(
+      'href', '/api/workspaces/w1234567/files/%E6%8A%A5%E5%91%8A.md');
+    expect(portalApi.agentWorkspaceEntries).toHaveBeenCalledWith('w1234567', { limit: 100 });
     expect(within(mainFilesPanel).getByRole('link', { name: '下载消息附件 1' })).toHaveAttribute(
       'href', '/api/personal-data/attachments/a1234567');
     expect(within(mainFilesPanel).queryByRole('link', { name: /a7654321/ })).not.toBeInTheDocument();
@@ -2229,7 +2282,7 @@ describe('Assistant durable tasks', () => {
     await user.type(composer, '保存后断线');
     await user.click(screen.getByRole('button', { name: '发送' }));
     const retry = await screen.findByRole('button', { name: '核对并重试' });
-    expect(screen.queryByRole('img', { name: '消息已收到' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('img', { name: '主 Agent 已接下，正在处理' })).not.toBeInTheDocument();
     expect(composer).toBeEnabled();
     const firstCall = submit.mock.calls[0]!;
     await user.click(retry);
@@ -2557,29 +2610,37 @@ describe('Assistant durable tasks', () => {
     }
   });
 
-  it('shows the received reaction on persisted user messages, including ordinary and failed messages', async () => {
-    const ordinary = { ...message, task_id: undefined, content: '普通问答', routing_status: 'routed' as const };
-    const failed = { ...message, id: 'm2345678', sequence: 2, task_id: undefined, content: '处理失败但已收到',
-      routing_status: 'failed' as const, delivery_status: 'unknown' as const };
-    mockCommon({ conversations: [conversation], messages: [ordinary, failed] });
+  it('shows 👌🏻 only when the persisted message says the main agent acknowledged it', async () => {
+    const ordinary = { ...message, task_id: undefined, content: 'literal_under_score 保持原样', routing_status: 'routed' as const };
+    const acknowledged = { ...message, id: 'm2345678', sequence: 2, task_id: undefined, content: '长任务已接下',
+      routing_status: 'failed' as const, delivery_status: 'unknown' as const, agent_acknowledged: true };
+    mockCommon({ conversations: [conversation], messages: [ordinary, acknowledged] });
     renderPage();
 
-    const reactions = await screen.findAllByRole('img', { name: '消息已收到' });
-    expect(reactions).toHaveLength(2);
-    expect(reactions[0]?.closest('article')).toHaveTextContent('普通问答');
-    expect(reactions[1]?.closest('article')).toHaveTextContent('处理失败但已收到');
-    expect(reactions[0]?.closest('article')).toHaveClass('chat-message-user-received');
-    expect(reactions[1]?.closest('article')).toHaveClass('chat-message-user-received');
+    const reaction = await screen.findByRole('img', { name: '主 Agent 已接下，正在处理' });
+    expect(reaction.closest('article')).toHaveTextContent('长任务已接下');
+    expect(reaction.closest('article')).toHaveClass('chat-message-user-received');
+    const ordinaryArticle = screen.getByText(ordinary.content).closest('article');
+    expect(ordinaryArticle).not.toHaveClass('chat-message-user-received');
+    expect(ordinaryArticle?.querySelector('u')).toBeNull();
+    expect(ordinaryArticle?.querySelector('.message-variant-controls')).toBeNull();
+    expect(ordinaryArticle).toHaveTextContent('literal_under_score 保持原样');
   });
 
-  it('shows animated thinking dots only for a started running Task before its reply begins', async () => {
-    mockCommon({ conversations: [conversation], messages: [{ ...message, routing_status: 'routed' }] });
+  it('keeps the animated thinking bubble during active work after an assistant reply starts', async () => {
+    const progress = { ...reply, id: 'm3456789', sequence: 2, content: '正在整理第一步', output_status: 'streaming' as const };
+    mockCommon({ conversations: [conversation], messages: [{ ...message, routing_status: 'routed' }, progress] });
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'running', result: null, finished_at: null,
-      current_revision: 1, desired_revision: 1, current_revision_started: true });
+      current_revision: 1, desired_revision: 1, current_revision_started: true, assistant_message: {
+        id: progress.id, conversation_id: conversation.id, sequence: progress.sequence, task_id: task.id,
+        role: 'assistant', content: progress.content, status: 'streaming', task_revision: 1, created_at: timestamp,
+      } });
     renderPage();
 
     const thinking = await screen.findByRole('status', { name: 'Morde 正在思考' });
     expect(thinking.querySelectorAll('.thinking-dots span')).toHaveLength(3);
+    expect(thinking.querySelector('.thinking-mascot')).toBeInTheDocument();
+    expect(thinking).not.toHaveTextContent('思考中…');
   });
 
   it('shows thinking while the server is actively routing a durably received message', async () => {
@@ -2594,15 +2655,24 @@ describe('Assistant durable tasks', () => {
       id: 'k1234567', version: 1, kind: 'approval' as const, status: 'pending' as const, title: '确认操作', object: '工作区',
       content: '写入文件', impact: '会修改工作区文件', disclosures: unknownApprovalDisclosures, expires_at: null,
     } }],
-    ['回复开始', { assistant_message: { id: 'm7654321', conversation_id: conversation.id, sequence: 2, task_id: task.id,
-      role: 'assistant' as const, content: '处理中', status: 'streaming' as const, task_revision: 1, created_at: timestamp } }],
+    ['已完成', { status: 'completed' as const }],
+    ['失败', { status: 'failed' as const }],
   ])('hides thinking dots when the Task is %s', async (_state, taskChange) => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, routing_status: 'routed' }] });
-    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'running', result: null, finished_at: null,
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, result: null, finished_at: null,
       current_revision: 1, desired_revision: 1, current_revision_started: true, ...taskChange });
     renderPage();
 
     await screen.findByText(message.content);
+    expect(screen.queryByRole('status', { name: 'Morde 正在思考' })).not.toBeInTheDocument();
+  });
+
+  it('does not show an active thinking bubble when the Task state is unknown', async () => {
+    mockCommon({ conversations: [conversation], messages: [{ ...message, routing_status: 'routed' }] });
+    vi.spyOn(portalApi, 'task').mockRejectedValue(new Error('Task state unavailable'));
+    renderPage();
+
+    expect(await screen.findByText(message.content)).toBeInTheDocument();
     expect(screen.queryByRole('status', { name: 'Morde 正在思考' })).not.toBeInTheDocument();
   });
 
@@ -2791,6 +2861,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const firstPanel = await findTaskActivity(firstTask.id);
+    await user.click(within(firstPanel).getByText('更多信息'));
     expect(firstPanel).toHaveTextContent('已完成');
     expect(within(firstPanel).getByRole('region', { name: '子任务进度' })).toHaveTextContent('整理来源 A已完成');
     expect(within(firstPanel).getByRole('region', { name: '子任务进度' })).toHaveTextContent('校验来源 B失败');
@@ -2992,6 +3063,7 @@ describe('Assistant durable tasks', () => {
     vi.mocked(portalApi.task).mockResolvedValue(plannedTask);
     const rendered = renderPage();
     const activity = await findTaskActivity(task.id);
+    await userEvent.setup().click(within(activity).getByText('更多信息'));
     const billing = within(activity).getByRole('region', { name: '用量与费用' });
     expect(billing).toHaveTextContent('模型调用 4 次');
     expect(billing).toHaveTextContent('Token 12 / 1000');
@@ -3227,6 +3299,7 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     renderPage();
     const panel = await findTaskActivity(task.id);
+    await user.click(within(panel).getByText('更多信息'));
     await user.click(within(panel).getByText('工作过程'));
     expect(within(panel).getAllByText('搜索网页').length).toBeGreaterThan(0);
     expect(within(panel).getByText('读取网页')).toBeInTheDocument();
@@ -3312,6 +3385,7 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     renderPage();
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     expect(within(activity).getByRole('region', { name: '主 Agent' })).toHaveTextContent('读取项目');
     expect(within(activity).getByRole('region', { name: '子 Agent 01' })).toHaveTextContent('读取文件 A');
     expect(within(activity).getByRole('region', { name: '子 Agent 02' })).toHaveTextContent('搜索资料 B');
@@ -3337,6 +3411,7 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     const { client } = renderPage();
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     await user.click(within(activity).getByRole('button', { name: /读取受保护文件/ }));
     expect(await within(activity).findByText(/private-content/)).toBeInTheDocument();
     await act(async () => { await client.invalidateQueries({ queryKey: ['task-step-detail'] }); });
@@ -3393,6 +3468,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     const button = within(activity).getByRole('button', { name: '重试步骤 搜索资料' });
     expect(within(activity).queryByRole('button', { name: '重试步骤 写入文件' })).not.toBeInTheDocument();
     expect(within(activity).getByText('因操作副作用状态未知，不能安全重试。')).toBeInTheDocument();
@@ -3423,6 +3499,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const activity = await findTaskActivity(task.id);
+    await userEvent.setup().click(within(activity).getByText('更多信息'));
     expect(within(activity).queryByRole('button', { name: '重试步骤 搜索资料' })).not.toBeInTheDocument();
   });
 
@@ -3441,6 +3518,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     const button = within(activity).getByRole('button', { name: '重试步骤 搜索资料' });
     await user.click(button);
     expect(button).toBeDisabled();
@@ -3471,6 +3549,7 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     renderPage();
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     const first = within(activity).getByRole('button', { name: /动作 1\b/ });
     expect(first).toHaveTextContent('准备中');
     expect(first).not.toHaveTextContent('进行中');
@@ -3491,6 +3570,7 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     const { client } = renderPage();
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     await user.click(within(activity).getByRole('button', { name: /读取授权内容/ }));
     expect(await within(activity).findByText(/private-content/)).toBeInTheDocument();
     await act(async () => { await client.invalidateQueries({ queryKey: ['task-step-detail'] }); });
@@ -3514,6 +3594,7 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     const { client } = renderPage();
     const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByText('更多信息'));
     await user.click(within(activity).getByRole('button', { name: /读取最新内容/ }));
     expect(await within(activity).findByText('正在读取详情…')).toBeInTheDocument();
     expect(activity).not.toHaveTextContent('旧内容');
@@ -3578,9 +3659,14 @@ describe('Assistant durable tasks', () => {
     expect(invalidate).not.toHaveBeenCalled();
     await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({ task_id: second.id, sequence: 8 }) })));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['task', second.id] });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['conversation-messages', conversation.id] });
     const calls = invalidate.mock.calls.length;
     await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({ task_id: second.id, sequence: 8 }) })));
     expect(invalidate).toHaveBeenCalledTimes(calls);
+    await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({
+      task_id: second.id, sequence: 9, payload: { phase: 'started' },
+    }) })));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['conversation-messages', conversation.id] });
   });
 
   it('keeps the current Task revision when a late older-revision event arrives', async () => {
@@ -3965,7 +4051,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.getByRole('button', { name: '发送' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByText(/已保存在本机，等待发送/)).toBeInTheDocument();
-    expect(screen.queryByRole('img', { name: '消息已收到' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('img', { name: '主 Agent 已接下，正在处理' })).not.toBeInTheDocument();
     expect(within(screen.getByRole('article', { name: '你的消息' })).getByRole('status'))
       .toHaveTextContent(/等待确认原服务和账号/);
     expect(accept).not.toHaveBeenCalled();

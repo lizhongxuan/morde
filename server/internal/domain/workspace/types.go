@@ -2,6 +2,13 @@ package workspace
 
 import "time"
 
+type DirectoryEntry struct {
+	Name       string
+	Kind       string
+	SizeBytes  int64
+	ModifiedAt time.Time
+}
+
 type State string
 
 const (

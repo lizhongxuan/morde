@@ -57,17 +57,20 @@ type ProjectTaskWorkspaceSelection interface {
 	WithProjectTaskWorkspaceSelection(context.Context, task.Task, DeferredTaskTarget, bool, func(context.Context, string) error) error
 }
 
-func deferredWorkspaceToolDefinitions(authorization task.Authorization) []AgentToolDefinition {
-	definitions := cloudDSHWorkspaceToolDefinitions(-1)
+func deferredWorkspaceToolDefinitions(authorization task.Authorization, liveDirectory bool) []AgentToolDefinition {
+	definitions := cloudDSHWorkspaceToolDefinitions(-1, liveDirectory)
 	principal := identity.Principal{Kind: identity.Kind(authorization.Kind), Scopes: agentScopeSnapshot(authorization.Scopes)}
 	filtered := definitions[:0]
 	for i := range definitions {
 		if !principal.HasScope(definitions[i].RequiredScope) {
 			continue
 		}
-		definitions[i].Description = "Use only the Workspace selected for this Task. " +
-			"On the first call set expected_revision to -1; the server fixes the current authorized snapshot. " +
-			"Use the returned revision for later calls. Never invent an operation result. " + definitions[i].Description
+		bindingDescription := "On the first call set expected_revision to -1; the server fixes the current authorized snapshot. Use the returned revision for later calls. "
+		if liveDirectory {
+			bindingDescription = "On the first call set expected_revision to -1; the server binds the current task checkpoint. Calls read the live directory, and expected_revision does not freeze Host changes. Use the returned revision for later calls. "
+		}
+		definitions[i].Description = "Use only the Workspace selected for this Task. " + bindingDescription +
+			"Never invent an operation result. " + definitions[i].Description
 		var schema map[string]any
 		if json.Unmarshal(definitions[i].Parameters, &schema) != nil {
 			continue

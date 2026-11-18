@@ -3,11 +3,17 @@ package postgres
 import (
 	"context"
 	"encoding/hex"
+	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
@@ -165,6 +171,230 @@ func TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding
 		workspaceValue.ID, folder.FolderID).Scan(&nodeBindings); err != nil || nodeBindings != 0 {
 		t.Fatalf("project Syncthing bindings after upload = %d, err=%v; want zero", nodeBindings, err)
 	}
+}
+
+func TestWorkspaceProjectSourceRebindsWithStableAgentWorkspace(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	agentWorkspace, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHost := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, agentWorkspace.ID)
+	portal := workspaceSyncPortalPrincipal(t, store, owner.ID)
+	folderService, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folderService.CreateFolder(ctx, portal, firstHost.ID, "demo", "project-folder-first-host")
+	if err != nil {
+		t.Fatalf("register project folder on initial Host: %v", err)
+	}
+	installationID := createTestClientInstallation(t, pool, owner.ID, nil)
+	sourceID := "12345678-1234-4234-8234-123456789abc"
+	deviceAccess := &workspaceSyncDeviceAccess{ownerID: owner.ID, workspaceID: agentWorkspace.ID, installationID: installationID}
+	if err := store.WithTx(ctx, func(tx pgx.Tx) error {
+		return ensureWorkspaceSyncProjectSourceTx(ctx, tx, workspace.SyncSession{OwnerID: owner.ID,
+			WorkspaceID: agentWorkspace.ID, FolderID: folder.FolderID, SourceBindingID: sourceID}, deviceAccess, folder)
+	}); err != nil {
+		t.Fatalf("bind project source to initial Host: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_sync_project_sources SET last_applied_session_id='p1234567',
+last_applied_target_revision=0,last_applied_manifest_sha256=decode(repeat('a',64),'hex') WHERE source_binding_id=$1`, sourceID); err != nil {
+		t.Fatalf("seed project source baseline: %v", err)
+	}
+
+	binding, err := store.GetWorkspaceBinding(ctx, firstHost.ID, agentWorkspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbinding, err := store.TransitionWorkspaceBinding(ctx, firstHost.ID, agentWorkspace.ID, binding.BindingVersion,
+		workspace.BindingActive, workspace.BindingUnbinding, binding.DesiredRevision, binding.AppliedRevision)
+	if err != nil {
+		t.Fatalf("begin Agent Workspace Host switch: %v", err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, firstHost.ID, agentWorkspace.ID, unbinding.BindingVersion,
+		workspace.BindingUnbinding, workspace.BindingDetached, binding.DesiredRevision, binding.AppliedRevision); err != nil {
+		t.Fatalf("detach Agent Workspace from initial Host: %v", err)
+	}
+	if _, err := store.TransitionHost(ctx, firstHost.ID, host.StateRunning, host.StateStopped, ""); err != nil {
+		t.Fatalf("stop initial Host before computer switch: %v", err)
+	}
+	secondHost := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, agentWorkspace.ID)
+	folderAfterSwitch, err := folderService.CreateFolder(ctx, portal, secondHost.ID, "demo", "project-folder-second-host")
+	if err != nil || folderAfterSwitch.FolderID != folder.FolderID {
+		t.Fatalf("reuse project folder on replacement Host = %#v, err=%v; want folder %q", folderAfterSwitch, err, folder.FolderID)
+	}
+
+	if err := store.WithTx(ctx, func(tx pgx.Tx) error {
+		return ensureWorkspaceSyncProjectSourceTx(ctx, tx, workspace.SyncSession{OwnerID: owner.ID,
+			WorkspaceID: agentWorkspace.ID, FolderID: folder.FolderID, SourceBindingID: sourceID,
+			SourceBaselineSessionID: "p1234567"}, deviceAccess, folderAfterSwitch)
+	}); err != nil {
+		t.Fatalf("rebind project source to replacement Host: %v", err)
+	}
+	var sourceHostID string
+	var sourceBindingVersion int64
+	var sourceBaseline string
+	if err := pool.QueryRow(ctx, `SELECT host_id,binding_version,last_applied_session_id
+FROM workspace_sync_project_sources WHERE source_binding_id=$1`, sourceID).Scan(&sourceHostID, &sourceBindingVersion, &sourceBaseline); err != nil {
+		t.Fatal(err)
+	}
+	currentBinding, err := store.GetWorkspaceBinding(ctx, secondHost.ID, agentWorkspace.ID)
+	if err != nil || sourceHostID != secondHost.ID || sourceBindingVersion != currentBinding.BindingVersion || sourceBaseline != "p1234567" {
+		t.Fatalf("project source after Host switch = host %q version %d baseline %q; current binding %#v err=%v",
+			sourceHostID, sourceBindingVersion, sourceBaseline, currentBinding, err)
+	}
+}
+
+func TestAgentWorkspaceProjectUploadCommitsDirectlyWithoutMaterialization(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	agentWorkspace, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAgentWorkspaceDirectoryInitialized(ctx, owner.ID, agentWorkspace.ID); err != nil {
+		t.Fatal(err)
+	}
+	currentRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(currentRoot, "project", "demo"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	current := projectUploadReadOnlyDirectory{WorkspaceCurrentDirectory: nil, ownerID: owner.ID, workspaceID: agentWorkspace.ID, root: currentRoot}
+	hostValue := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, agentWorkspace.ID)
+	portal := workspaceSyncPortalPrincipal(t, store, owner.ID)
+	folderService, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folderService.CreateFolder(ctx, portal, hostValue.ID, "demo", "direct-project-folder")
+	if err != nil {
+		t.Fatalf("register direct project folder: %v", err)
+	}
+	installationID := createTestClientInstallation(t, pool, owner.ID, nil)
+	syncToken := clientTestToken(t, owner.ID, installationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, syncToken); err != nil {
+		t.Fatal(err)
+	}
+	device := identity.Principal{
+		UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: syncToken.ID,
+		ClientInstallationID: installationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	syncService, err := app.NewWorkspaceSyncServiceWithOptions(store, workspaceTransferTestBlocks{},
+		workspace.MaxSyncManifestBytes, 1<<30, app.WorkspaceSyncOptions{ProjectUploadEnabled: true, LiveDirectorySourceEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syncService.SetWorkspaceCurrentDirectory(current); err != nil {
+		t.Fatal(err)
+	}
+	session, err := syncService.CreateSyncSession(ctx, device, agentWorkspace.ID, workspace.CreateSyncSession{
+		FolderID: folder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, Files: []workspace.File{},
+	}, "direct-project-create")
+	if err != nil {
+		t.Fatalf("create direct project upload session: %v", err)
+	}
+	var materializationsBefore int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workspace_current_materializations WHERE workspace_id=$1`, agentWorkspace.ID).
+		Scan(&materializationsBefore); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := syncService.CommitSyncSession(ctx, device, agentWorkspace.ID, session.ID, "direct-project-commit")
+	if err != nil || committed.State != workspace.SyncCompleted || committed.HostApplication == nil || committed.HostApplication.Status != "applied" {
+		t.Fatalf("direct project upload commit = %#v err=%v; want completed with an applied receipt", committed, err)
+	}
+	var receiptState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM workspace_sync_project_upload_applications WHERE workspace_id=$1 AND session_id=$2`,
+		agentWorkspace.ID, session.ID).Scan(&receiptState); err != nil || receiptState != "applied" {
+		t.Fatalf("direct upload receipt = %q, err=%v; want applied", receiptState, err)
+	}
+	var materializationsAfter int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workspace_current_materializations WHERE workspace_id=$1`, agentWorkspace.ID).
+		Scan(&materializationsAfter); err != nil || materializationsAfter != materializationsBefore {
+		t.Fatalf("direct project upload queued current-directory materialization: before=%d after=%d err=%v",
+			materializationsBefore, materializationsAfter, err)
+	}
+}
+
+type projectUploadReadOnlyDirectory struct {
+	app.WorkspaceCurrentDirectory
+	ownerID, workspaceID, root string
+}
+
+func (d projectUploadReadOnlyDirectory) path(ownerID, workspaceID, relative string) (string, error) {
+	if ownerID != d.ownerID || workspaceID != d.workspaceID ||
+		(relative != "" && workspace.ValidateRelativePath(relative) != nil) {
+		return "", os.ErrNotExist
+	}
+	if relative == "" {
+		return d.root, nil
+	}
+	return filepath.Join(d.root, filepath.FromSlash(relative)), nil
+}
+
+func (d projectUploadReadOnlyDirectory) ReadDirectory(ownerID, workspaceID, relative string) ([]workspace.DirectoryEntry, error) {
+	path, err := d.path(ownerID, workspaceID, relative)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	result := make([]workspace.DirectoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		info, err := os.Lstat(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		kind := "other"
+		if info.IsDir() {
+			kind = "directory"
+		} else if info.Mode().IsRegular() {
+			kind = "file"
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			kind = "symlink"
+		}
+		result = append(result, workspace.DirectoryEntry{Name: entry.Name(), Kind: kind, SizeBytes: info.Size(), ModifiedAt: info.ModTime()})
+	}
+	return result, nil
+}
+
+func (d projectUploadReadOnlyDirectory) OpenRegularFile(ownerID, workspaceID, relative string) (*os.File, os.FileInfo, error) {
+	path, err := d.path(ownerID, workspaceID, relative)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = os.ErrInvalid
+		}
+		return nil, nil, err
+	}
+	file, err := os.Open(path)
+	return file, info, err
+}
+
+func (d projectUploadReadOnlyDirectory) ReadSymbolicLink(ownerID, workspaceID, relative string) (string, error) {
+	path, err := d.path(ownerID, workspaceID, relative)
+	if err != nil {
+		return "", err
+	}
+	return os.Readlink(path)
+}
+
+func (d projectUploadReadOnlyDirectory) StatPath(ownerID, workspaceID, relative string) (os.FileInfo, error) {
+	path, err := d.path(ownerID, workspaceID, relative)
+	if err != nil {
+		return nil, err
+	}
+	return os.Lstat(path)
 }
 
 func TestWorkspaceProjectUploadReceiptRejectsConcurrentBaselineAdvance(t *testing.T) {

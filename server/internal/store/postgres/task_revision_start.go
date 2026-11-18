@@ -27,7 +27,7 @@ func recordTaskRevisionStartedInTx(ctx context.Context, tx pgx.Tx, taskID string
 		return fmt.Errorf("check task revision start: %w", err)
 	}
 	if exists {
-		return nil
+		return acknowledgeStartedTaskMessagesInTx(ctx, tx, taskID, current)
 	}
 	var previous int64
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0) FROM task_steps WHERE task_id=$1`, taskID).Scan(&previous); err != nil {
@@ -59,6 +59,51 @@ VALUES ($1,$2,$3,'progress','succeeded',$4,$5)`, stepID, taskID, previous+1, tit
 	if _, err := tx.Exec(ctx, `INSERT INTO task_revision_starts (task_id,revision,step_id,event_sequence) VALUES ($1,$2,$3,$4)`,
 		taskID, current, stepID, eventSequence); err != nil {
 		return fmt.Errorf("record task revision start: %w", err)
+	}
+	return acknowledgeStartedTaskMessagesInTx(ctx, tx, taskID, current)
+}
+
+func acknowledgeStartedTaskMessagesInTx(ctx context.Context, tx pgx.Tx, taskID string, revision int64) error {
+	rows, err := tx.Query(ctx, `UPDATE conversation_message_routes r
+SET acknowledgement_requested=false,agent_acknowledged=true,updated_at=clock_timestamp()
+FROM conversation_messages m
+WHERE r.message_id=m.id AND m.role='user' AND r.acknowledgement_requested AND NOT r.agent_acknowledged
+ AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=$1 AND t.status='running' AND t.lease_expires_at>clock_timestamp()
+  AND t.current_revision=$2 AND t.desired_revision=$2
+  AND EXISTS (SELECT 1 FROM task_revision_starts started WHERE started.task_id=t.id AND started.revision=t.current_revision))
+ AND (
+  m.task_id=$1
+  OR EXISTS (SELECT 1 FROM task_revision_intents intent WHERE intent.message_id=m.id
+    AND intent.task_id=$1 AND intent.expected_revision+1=$2)
+  OR EXISTS (SELECT 1 FROM conversation_message_routes duplicate_route
+    JOIN conversation_messages original ON original.id=duplicate_route.duplicate_of_message_id
+      AND original.owner_id=m.owner_id AND original.conversation_id=m.conversation_id
+    WHERE duplicate_route.message_id=m.id AND original.task_id=$1)
+ )
+RETURNING m.id,m.owner_id,r.client_message_id`, taskID, revision)
+	if err != nil {
+		return fmt.Errorf("confirm accepted messages when Task starts: %w", err)
+	}
+	type acknowledgedMessage struct{ id, ownerID, clientMessageID string }
+	var acknowledged []acknowledgedMessage
+	for rows.Next() {
+		var message acknowledgedMessage
+		if err := rows.Scan(&message.id, &message.ownerID, &message.clientMessageID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read Task-start acknowledgements: %w", err)
+		}
+		acknowledged = append(acknowledged, message)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate Task-start acknowledgements: %w", err)
+	}
+	rows.Close()
+	for _, message := range acknowledged {
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: message.ownerID,
+			ObjectType: "message", ObjectID: message.id, Operation: "upsert", MutationID: message.clientMessageID}); err != nil {
+			return err
+		}
 	}
 	return nil
 }

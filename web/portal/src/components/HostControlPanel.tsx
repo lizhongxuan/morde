@@ -104,8 +104,9 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
   const operator = status?.control_lease_active && status.control_actor_user_id
     ? status.control_actor_user_id === user?.id ? '你' : `账号 ${status.control_actor_user_id}`
     : '未知';
+  const leaseHeldByMe = state === 'user' && status?.control_lease_active === true && status.control_lease_held_by_me;
   const canRelease = canControl && state === 'user' && !!status
-    && (canReleaseAnyLease || status.control_lease_held_by_me);
+    && (compact ? status.control_lease_held_by_me : canReleaseAnyLease || status.control_lease_held_by_me);
   const compactLabel = control.isError ? '控制权状态暂不可用'
     : !status ? '正在确认控制权…'
       : state === 'ai' ? 'Morde 拥有控制权'
@@ -164,29 +165,34 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
   };
 
   if (compact) {
-    const action = state === 'ai' ? 'take_over' : state === 'user' ? 'release' : null;
+    const resumableTransition = Boolean(transition?.failure_reason && canControl &&
+      (transition.action === 'take_over' || status?.control_lease_held_by_me));
+    const action = state === 'ai' ? 'take_over' : leaseHeldByMe ? 'release' : null;
+    const nextAction = resumableTransition && transition ? transition.action : action;
     const enabled = actionReady && canControl && !compactActionPreparing && !control.isPending && !control.isFetching && !control.isError && !!status &&
-      !updateControl.isPending && (action === 'take_over' ? !transitioning
-        : action === 'release' ? canRelease && !transitioning
-          : Boolean(transition && transition.failure_reason));
+      !updateControl.isPending && Boolean(nextAction) && (!transitioning || resumableTransition) &&
+      (resumableTransition || (nextAction === 'take_over' ? state === 'ai' : canRelease));
     const label = compactActionPreparing ? '正在锁定工作台…'
-      : updateControl.isPending ? action === 'release' ? '正在交还…' : '正在接管…'
+      : updateControl.isPending ? nextAction === 'release' ? '正在归还控制权…' : '正在接管控制权…'
       : control.isPending || (!status && !control.isError) ? '正在确认…'
         : control.isError ? '状态不可用'
-          : !actionReady ? '工作台未就绪'
-          : !canControl ? '无接管权限'
-            : transition ? transition.failure_reason ? transition.action === 'take_over' ? '继续接管' : '继续交还'
-              : transition.action === 'take_over' ? '正在接管…' : '正在交还…'
-              : state === 'ai' ? '接管电脑'
-                : state === 'user' ? status?.control_lease_active
-                  ? status.control_lease_held_by_me ? '交还 AI' : '他人控制中'
-                  : '租约已失效' : '状态不可用';
-    const nextAction = transition?.failure_reason ? transition.action : action;
+            : resumableTransition ? nextAction === 'take_over' ? '重试接管控制权' : '重试归还控制权'
+              : transitioning ? state === 'taking_over' ? '正在接管控制权…' : '正在归还控制权…'
+                : leaseHeldByMe ? '归还控制权' : '接管控制权';
+    const reason = control.isError ? '控制权状态暂不可用'
+      : !status ? '正在确认控制权状态'
+        : !canControl ? '当前账号没有控制权限'
+          : !actionReady ? '工作台尚未就绪'
+            : transitioning ? '控制权正在切换'
+              : state === 'user' && status.control_lease_active && !status.control_lease_held_by_me ? '其他成员正在控制电脑'
+                : state === 'user' && !status.control_lease_active ? '控制租约已失效，正在核实状态'
+                  : !nextAction ? '当前控制操作不可用' : '';
     return <section className="host-control host-control-compact computer-panel-control" aria-label="云端电脑控制">
       <button type="button" className="button button-primary" disabled={!enabled || !nextAction}
-        aria-label={label} title={label} onClick={() => nextAction && void runCompactAction(nextAction)}>
+        aria-label={label} title={reason || label} onClick={() => nextAction && void runCompactAction(nextAction)}>
         {label}
       </button>
+      {reason && status && !control.isError && <small className="computer-panel-control-reason" role="status">{reason}</small>}
     </section>;
   }
 

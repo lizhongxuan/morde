@@ -678,6 +678,17 @@ func (s *summaryRouteModelsStub) ResolveConversationSummaryModel(context.Context
 	return "p1234567", s.window, nil
 }
 
+func (s *summaryRouteModelsStub) EstimateConversationSummaryTokenPressure(_ context.Context,
+	request CloudDSHConversationSummaryEstimateRequest) ([]int, error) {
+	counts := make([]int, len(request.Sources))
+	pressure := 128
+	for index, source := range request.Sources {
+		pressure += utf8.RuneCountInString(source.Content)
+		counts[index] = pressure
+	}
+	return counts, nil
+}
+
 func (s *summaryRouteModelsStub) CompactConversationSummary(_ context.Context, request CloudDSHConversationSummaryRequest) (CloudDSHConversationSummaryResult, error) {
 	s.request = request
 	return s.result, nil
@@ -771,6 +782,41 @@ func TestConversationRouteWorkerCommitsBoundedDSHSummaryBeforeRouting(t *testing
 		Ciphertext: store.commit.Ciphertext, Sources: store.commit.Sources})
 	if err != nil || opened.Text != "short summary" || !bytes.Equal(opened.Sources[0].SHA256, sourceDigest[:]) {
 		t.Fatalf("committed summary failed to reopen: %+v err=%v", opened, err)
+	}
+}
+
+func TestConversationRouteWorkerTriggersSummaryByTokenPressureBeforeTransportWatermark(t *testing.T) {
+	worker, route, models, store, _, _, _ := newSummaryRouteWorkerHarness(t, strings.Repeat("x", 22_000), 32_768,
+		CloudDSHConversationSummaryResult{Text: "short summary", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
+	committed, err := worker.compactConversationSummary(context.Background(), route.claim, "p1234567")
+	if err != nil || !committed || len(models.request.Sources) != 1 ||
+		conversationSummaryMaintenanceInputBytes("", models.request.Sources) >= conversationSummaryMaintenanceMaxInputBytes*3/4 ||
+		len(store.commit.Ciphertext) == 0 {
+		t.Fatalf("token-pressure summary committed=%t sources=%d input_bytes=%d commit=%+v err=%v",
+			committed, len(models.request.Sources), conversationSummaryMaintenanceInputBytes("", models.request.Sources), store.commit, err)
+	}
+}
+
+func TestConversationRouteWorkerTrimsSummaryAtWholeSourceTokenBoundary(t *testing.T) {
+	worker, route, models, store, _, identity, _ := newSummaryRouteWorkerHarness(t, "placeholder", 16_384,
+		CloudDSHConversationSummaryResult{Text: "short summary", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
+	route.claim.Message.Sequence = 3
+	firstText, secondText := strings.Repeat("x", 8_000), strings.Repeat("y", 6_000)
+	firstDigest, secondDigest := sha256.Sum256([]byte(firstText)), sha256.Sum256([]byte(secondText))
+	firstSource := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234567", Sequence: 1, SHA256: firstDigest[:]}
+	secondSource := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234568", Sequence: 2, SHA256: secondDigest[:]}
+	worker.options.SummaryInputs = summaryInputPageStub{page: app.ConversationSummaryInputPage{
+		Identity: identity, BoundarySequence: 2, Head: app.ConversationSummaryHead{Identity: identity},
+		Sources: []app.ConversationSummaryPromptSource{
+			{Source: firstSource, Role: "user", Content: firstText},
+			{Source: secondSource, Role: "assistant", Content: secondText},
+		},
+	}}
+	committed, err := worker.compactConversationSummary(context.Background(), route.claim, "p1234567")
+	if err != nil || !committed || len(models.request.Sources) != 1 || models.request.Sources[0].Source.ID != firstSource.ID ||
+		len(store.commit.Sources) != 1 || store.commit.Sources[0].ID != firstSource.ID {
+		t.Fatalf("summary crossed a source token boundary: committed=%t request=%+v proofs=%+v err=%v",
+			committed, models.request.Sources, store.commit.Sources, err)
 	}
 }
 

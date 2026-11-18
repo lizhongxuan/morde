@@ -361,7 +361,7 @@ func (*startupMaterializationTestStore) MarkWorkspaceCurrentMaterializedForRecei
 	return nil
 }
 
-func TestStartupReconcileVerifiesProjectionBeforeSkippingMaterialization(t *testing.T) {
+func TestStartupReconcileRejectsDriftBeforeMaterialization(t *testing.T) {
 	content := []byte("durable")
 	digest := sha256.Sum256(content)
 	file := workspace.File{Path: "result.txt", SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Mode: 0640,
@@ -404,15 +404,115 @@ func TestStartupReconcileVerifiesProjectionBeforeSkippingMaterialization(t *test
 				t.Fatal(err)
 			}
 
-			if err := service.ReconcilePendingWorkspaceCurrentMaterializations(context.Background()); err != nil {
+			err = service.ReconcilePendingWorkspaceCurrentMaterializations(context.Background())
+			if matches && err != nil {
 				t.Fatalf("startup reconciliation: %v", err)
 			}
-			wantMaterializations := 0
-			if !matches {
-				wantMaterializations = 1
+			if !matches && domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+				t.Fatalf("startup reconciliation with directory drift = %v; want workspace conflict", err)
 			}
-			if verifications != 1 || materializations != wantMaterializations || store.materializationMarks != 1 {
-				t.Fatalf("verifications=%d materializations=%d marks=%d; want 1/%d/1", verifications, materializations, store.materializationMarks, wantMaterializations)
+			wantMarks := 0
+			if matches {
+				wantMarks = 1
+			}
+			if verifications != 1 || materializations != 0 || store.materializationMarks != wantMarks {
+				t.Fatalf("verifications=%d materializations=%d marks=%d; want 1/0/%d", verifications, materializations, store.materializationMarks, wantMarks)
+			}
+		})
+	}
+}
+
+func TestInitialCurrentMaterializationCreatesMissingWorkspaceDirectory(t *testing.T) {
+	store := &startupMaterializationTestStore{quotaReceiveTestStore: newQuotaReceiveTestStore(t)}
+	service, err := NewWorkspaceSyncService(store, quotaReceiveTestBlocks{}, 1024, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materializations, verifications := 0, 0
+	if err := service.SetWorkspaceCurrentMaterializer(func(_ context.Context, ownerID, workspaceID string, revision int64,
+		files []workspace.File, emptyDirectories []string, directories []workspace.Directory) error {
+		materializations++
+		if ownerID != store.workspace.OwnerID || workspaceID != store.workspace.ID || revision != 0 || len(files)+len(emptyDirectories)+len(directories) != 0 {
+			t.Fatalf("initial Workspace materialization = %s/%s rev %d, files %d, empty directories %d, directories %d",
+				ownerID, workspaceID, revision, len(files), len(emptyDirectories), len(directories))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetWorkspaceCurrentRevisionReader(func(string, string) (int64, bool, error) { return 0, false, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetWorkspaceCurrentManifestVerifier(func(context.Context, string, string, []workspace.File, []string, []workspace.Directory) (bool, error) {
+		verifications++
+		return false, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.InitializeWorkspaceCurrent(context.Background(), store.workspace.ID); err != nil {
+		t.Fatalf("InitializeWorkspaceCurrent() for an absent revision-zero directory: %v", err)
+	}
+	if materializations != 1 || verifications != 0 || store.materializationMarks != 1 {
+		t.Fatalf("initial materialization counts = materialized %d, verified %d, marked %d; want 1/0/1",
+			materializations, verifications, store.materializationMarks)
+	}
+}
+
+func TestMaterializationChecksAppliedRevisionBeforeAdvancing(t *testing.T) {
+	oldContent, nextContent := []byte("old"), []byte("next")
+	oldDigest, nextDigest := sha256.Sum256(oldContent), sha256.Sum256(nextContent)
+	oldFile := workspace.File{Path: "result.txt", SizeBytes: int64(len(oldContent)), SHA256: hex.EncodeToString(oldDigest[:]), Mode: 0640,
+		Chunks: []workspace.Chunk{{SHA256: hex.EncodeToString(oldDigest[:]), SizeBytes: int64(len(oldContent))}}}
+	nextFile := workspace.File{Path: "result.txt", SizeBytes: int64(len(nextContent)), SHA256: hex.EncodeToString(nextDigest[:]), Mode: 0640,
+		Chunks: []workspace.Chunk{{SHA256: hex.EncodeToString(nextDigest[:]), SizeBytes: int64(len(nextContent))}}}
+	for _, matches := range []bool{true, false} {
+		t.Run(map[bool]string{true: "clean-base", false: "drifted-base"}[matches], func(t *testing.T) {
+			base := newQuotaReceiveTestStore(t)
+			base.workspace.Revision = 2
+			base.workspace.UsedBytes = nextFile.SizeBytes
+			base.snapshots[1], base.snapshots[2] = []workspace.File{oldFile}, []workspace.File{nextFile}
+			store := &startupMaterializationTestStore{quotaReceiveTestStore: base,
+				rows: []WorkspaceCurrentMaterialization{{WorkspaceID: base.workspace.ID, OwnerID: base.workspace.OwnerID, DesiredRevision: 2, AppliedRevision: 1}}}
+			service, err := NewWorkspaceSyncService(store, quotaReceiveTestBlocks{}, 1024, 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			materializations := 0
+			if err := service.SetWorkspaceCurrentMaterializer(func(_ context.Context, _ string, _ string, revision int64, files []workspace.File, _ []string, _ []workspace.Directory) error {
+				materializations++
+				if revision != 2 || len(files) != 1 || files[0].SHA256 != nextFile.SHA256 {
+					t.Fatalf("materialization revision/files = %d/%+v", revision, files)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.SetWorkspaceCurrentRevisionReader(func(string, string) (int64, bool, error) { return 1, true, nil }); err != nil {
+				t.Fatal(err)
+			}
+			verifications := 0
+			if err := service.SetWorkspaceCurrentManifestVerifier(func(_ context.Context, _, _ string, files []workspace.File, _ []string, _ []workspace.Directory) (bool, error) {
+				verifications++
+				if len(files) != 1 || files[0].SHA256 != oldFile.SHA256 {
+					t.Fatalf("verified base files = %+v; want applied revision", files)
+				}
+				return matches, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err = service.ReconcilePendingWorkspaceCurrentMaterializations(context.Background())
+			if matches && err != nil {
+				t.Fatalf("reconcile from clean base: %v", err)
+			}
+			if !matches && domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+				t.Fatalf("reconcile from drifted base = %v; want workspace conflict", err)
+			}
+			wantMaterializations, wantMarks := 0, 0
+			if matches {
+				wantMaterializations, wantMarks = 1, 1
+			}
+			if verifications != 1 || materializations != wantMaterializations || store.materializationMarks != wantMarks {
+				t.Fatalf("verifications=%d materializations=%d marks=%d; want 1/%d/%d", verifications, materializations, store.materializationMarks, wantMaterializations, wantMarks)
 			}
 		})
 	}

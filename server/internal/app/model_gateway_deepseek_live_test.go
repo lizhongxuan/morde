@@ -10,9 +10,46 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/model"
 )
+
+type liveConversationRouteStore struct {
+	liveModelCallStore
+	calls       int
+	settlements []routeSettlement
+}
+
+type routeSettlement struct {
+	decision app.ConversationRouteDecision
+	usage    app.ModelUsage
+	unknown  bool
+}
+
+func (*liveConversationRouteStore) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
+	return "p1234567", nil
+}
+
+func (*liveConversationRouteStore) PrepareConversationRouteModelCall(context.Context, app.ModelCallReservation,
+	*app.ProjectModelReservation) (*app.ConversationRouteDecision, error) {
+	return nil, nil
+}
+
+func (store *liveConversationRouteStore) BeginConversationRouteModelCall(context.Context, app.ModelCallReservation) error {
+	store.calls++
+	return nil
+}
+
+func (store *liveConversationRouteStore) SettleConversationRouteModelCall(_ context.Context, _ app.ModelCallReservation,
+	decision *app.ConversationRouteDecision, usage app.ModelUsage, unknown bool) error {
+	settled := routeSettlement{usage: usage, unknown: unknown}
+	if decision != nil {
+		settled.decision = *decision
+	}
+	store.settlements = append(store.settlements, settled)
+	return nil
+}
 
 func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 	key := strings.TrimSpace(os.Getenv("MORDE_TEST_DEEPSEEK_KEY"))
@@ -72,6 +109,50 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 		})
 		if strings.TrimSpace(response.Text) == "" || !strings.Contains(response.Text, "1") || !strings.Contains(response.Text, "2") || !strings.Contains(response.Text, "3") {
 			t.Fatalf("formatted answer did not contain the requested three numbered items: %q", response.Text)
+		}
+	})
+
+	t.Run("route acknowledgement follows expected effort", func(t *testing.T) {
+		routeStore := &liveConversationRouteStore{}
+		routeGateway, err := app.NewModelGatewayService(routeStore, resolver, client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			name        string
+			content     string
+			acknowledge bool
+		}{
+			{name: "read one project file", content: "查看当前项目根目录的 README，找出运行命令并回复我，不要修改文件。"},
+			{name: "audit and repair deployment", content: "全面核对当前仓库的部署配置与服务代码，修复不一致，运行相关测试，并编写可重复运行的检查脚本。", acknowledge: true},
+			{name: "run one short command", content: "在当前项目执行 git status，只回复工作树是否干净。"},
+			{name: "prepare a deployment script", content: "在当前仓库编写可重复运行的部署脚本，包含配置检查、构建、数据库迁移、启动和端到端验证，并实际运行脚本验证。", acknowledge: true},
+		}
+		for index, test := range cases {
+			t.Run(test.name, func(t *testing.T) {
+				messageID := []string{"m1234567", "m2345678", "m3456789", "m4567890"}[index]
+				claim := app.ConversationRouteClaim{Message: conversation.Message{ID: messageID, ConversationID: "c1234567",
+					OwnerID: principal.UserID, ActorID: principal.UserID, Role: conversation.RoleUser, Sequence: int64(index + 1),
+					Content: test.content}, ServiceInstanceID: "00000000-0000-4000-8000-000000000001", RouteAttempt: 1,
+					LeaseOwner: "deepseek-route-test", LeaseVersion: 1}
+				value := app.ConversationRouteContext{ActorID: principal.UserID, ModelID: "p1234567", RouteAttempt: 1, Content: test.content}
+				decision, err := routeGateway.ClassifyConversationRoute(ctx, claim, value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if decision.Action != app.ConversationRouteNew || decision.InvalidOutput || decision.Acknowledge != test.acknowledge {
+					t.Fatalf("route decision did not match expected effort: action=%q acknowledge=%t invalid=%t output=%q",
+						decision.Action, decision.Acknowledge, decision.InvalidOutput, decision.ModelOutput)
+				}
+			})
+		}
+		if routeStore.calls != len(cases) || len(routeStore.settlements) != len(cases) {
+			t.Fatalf("route model calls were not durably settled: calls=%d settlements=%d", routeStore.calls, len(routeStore.settlements))
+		}
+		for index, settlement := range routeStore.settlements {
+			if settlement.unknown || !settlement.usage.Known || settlement.decision.InvalidOutput {
+				t.Fatalf("route call %d did not settle a valid model decision: %#v", index+1, settlement)
+			}
 		}
 	})
 

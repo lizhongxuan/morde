@@ -12,7 +12,7 @@ import (
 	"morde/server/internal/domain/project"
 )
 
-func TestProjectMessageProjectsOnlyCommittedAuthorizedAttachments(t *testing.T) {
+func TestProjectMessageProjectsOnlyCommittedAttachmentsAndAuthorAcknowledgement(t *testing.T) {
 	f := newProjectAttachmentFixture(t)
 	ctx := context.Background()
 	const clientID = "project-projection-message-001"
@@ -24,8 +24,11 @@ func TestProjectMessageProjectsOnlyCommittedAuthorizedAttachments(t *testing.T) 
 		t.Fatal(err)
 	}
 	before, err := f.store.ListProjectConversationMessages(ctx, f.owner.UserID, f.projectID, f.conversationID, app.PageRequest{Limit: 20})
-	if err != nil || len(before.Items) != 1 || len(before.Items[0].AttachmentIDs) != 0 {
-		t.Fatalf("uncommitted attachment was exposed: %+v err=%v", before, err)
+	if err != nil || len(before.Items) != 1 || len(before.Items[0].AttachmentIDs) != 0 || before.Items[0].AgentAcknowledged {
+		t.Fatalf("uncommitted attachment or acknowledgement was exposed: %+v err=%v", before, err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET agent_acknowledged=true WHERE client_message_id=$1`, clientID); err != nil {
+		t.Fatal(err)
 	}
 	digest := sha256.Sum256(content)
 	if _, err := f.service.PutChunk(ctx, f.member, scope, 0, hex.EncodeToString(digest[:]), bytes.NewReader(content), int64(len(content))); err != nil {
@@ -36,13 +39,15 @@ func TestProjectMessageProjectsOnlyCommittedAuthorizedAttachments(t *testing.T) 
 	}
 	for _, actor := range []string{f.owner.UserID, f.member.UserID} {
 		page, err := f.store.ListProjectConversationMessages(ctx, actor, f.projectID, f.conversationID, app.PageRequest{Limit: 20})
-		if err != nil || len(page.Items) != 1 || len(page.Items[0].AttachmentIDs) != 1 || page.Items[0].AttachmentIDs[0] != created.AttachmentID {
-			t.Fatalf("authorized project attachment projection for %s: %+v err=%v", actor, page, err)
+		wantAcknowledged := actor == f.member.UserID
+		if err != nil || len(page.Items) != 1 || len(page.Items[0].AttachmentIDs) != 1 || page.Items[0].AttachmentIDs[0] != created.AttachmentID ||
+			page.Items[0].AgentAcknowledged != wantAcknowledged {
+			t.Fatalf("authorized project message projection for %s: %+v err=%v", actor, page, err)
 		}
 	}
 	reconciled, found, err := f.store.FindConversationMessageByClientID(ctx, f.member.UserID, f.projectID, f.conversationID, clientID, f.instanceID)
-	if err != nil || !found || len(reconciled.AttachmentIDs) != 1 || reconciled.AttachmentIDs[0] != created.AttachmentID {
-		t.Fatalf("project outbox reconciliation lost attachment: %+v found=%t err=%v", reconciled, found, err)
+	if err != nil || !found || len(reconciled.AttachmentIDs) != 1 || reconciled.AttachmentIDs[0] != created.AttachmentID || !reconciled.AgentAcknowledged {
+		t.Fatalf("project outbox reconciliation lost attachment or acknowledgement: %+v found=%t err=%v", reconciled, found, err)
 	}
 	if _, err := f.store.ListProjectConversationMessages(ctx, f.outsider.UserID, f.projectID, f.conversationID, app.PageRequest{Limit: 20}); err == nil || domain.CodeOf(err) == domain.CodeInternal {
 		t.Fatalf("project outsider could read message attachments: %v", err)
@@ -56,7 +61,7 @@ func TestProjectMessageProjectsOnlyCommittedAuthorizedAttachments(t *testing.T) 
 		t.Fatal(err)
 	}
 	page, err := f.store.ListProjectConversationMessages(ctx, f.outsider.UserID, f.projectID, f.conversationID, app.PageRequest{Limit: 20})
-	if err != nil || len(page.Items) != 1 || len(page.Items[0].AttachmentIDs) != 1 || page.Items[0].AttachmentIDs[0] != created.AttachmentID {
-		t.Fatalf("viewer could not read project message attachments: %+v err=%v", page, err)
+	if err != nil || len(page.Items) != 1 || len(page.Items[0].AttachmentIDs) != 1 || page.Items[0].AttachmentIDs[0] != created.AttachmentID || page.Items[0].AgentAcknowledged {
+		t.Fatalf("viewer could not read project message or saw another author's acknowledgement: %+v err=%v", page, err)
 	}
 }

@@ -5,6 +5,7 @@ AssertPathExists=/etc/morde/dsh-docker/daemon.json
 Requires=morde-dsh-containerd.service
 After=morde-dsh-containerd.service
 After=network-online.target local-fs.target
+Before=docker.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 

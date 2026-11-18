@@ -270,6 +270,9 @@ describe('Workbench MVP navigation', () => {
     expect(await screen.findByTitle('远程桌面')).toBeVisible();
     expect(container.querySelector('.tab-panel-terminal')).toBeNull();
     expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
+    for (const label of ['续期', '重试交回 AI', '适应窗口', '键盘', 'Alt+Tab', '找回窗口', '全屏']) {
+      expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
+    }
     expect(gatewayApi.control).toHaveBeenCalled();
     expect(gatewayApi.workspaces).not.toHaveBeenCalled();
   });

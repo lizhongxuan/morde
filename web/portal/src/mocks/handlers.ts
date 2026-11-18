@@ -9,7 +9,6 @@ type Workspace = components["schemas"]["Workspace"];
 type WorkspaceRef = components["schemas"]["WorkspaceRef"];
 type WorkspaceBinding = components["schemas"]["WorkspaceBinding"];
 type Host = Omit<components["schemas"]["Host"], "workspaces"> & { sandbox_id?: string | null; workspaces: WorkspaceBinding[] };
-type HostCopyResult = components["schemas"]["HostCopyResult"];
 type ControlTransition = components["schemas"]["ControlTransition"];
 type ControlActionRequest = components["schemas"]["ControlActionRequest"];
 type ControlActionResponse = components["schemas"]["ControlActionResponse"];
@@ -266,7 +265,6 @@ let notificationOwners = new Map<string, string>();
 const workspaceCreateReplays = new Map<string, { request: string; response: Workspace }>();
 const workspaceRestoreReplays = new Map<string, { request: string; response: components["schemas"]["WorkspaceRestoreResult"] }>();
 const hostCreateReplays = new Map<string, { request: string; response: Host }>();
-const hostCopyReplays = new Map<string, { request: string; response: HostCopyResult }>();
 const hostControlTransitions = new Map<string, ControlTransition>();
 const hostControlActionReplays = new Map<string, { request: string; response: ControlActionResponse }>();
 const hostControlLeases = new Map<string, string>();
@@ -508,7 +506,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaceOwners.clear();
   apiKeys = [];
   schedules = [];
-  modelConnections = [{ id: "pmodel01", name: "团队示例模型", base_url: "https://models.example.invalid/v1", model_name: "morde-demo", shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false, text_stream: false }, checked_at: now(), created_at: now(), updated_at: now() }];
+  modelConnections = [{ id: "pmodel01", name: "团队示例模型", base_url: "https://models.example.invalid/v1", model_name: "morde-demo", context_window_tokens: null, context_window_override_tokens: null, context_window_source: "unknown", context_window_resolved_at: null, context_window_catalog_version: null, shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false, text_stream: false }, checked_at: now(), created_at: now(), updated_at: now() }];
   modelConnectionOwners.clear();
   mcpConnectors = [];
   mcpConnectorOwners.clear();
@@ -564,7 +562,6 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaceCreateReplays.clear();
   workspaceRestoreReplays.clear();
   hostCreateReplays.clear();
-  hostCopyReplays.clear();
   hostControlTransitions.clear();
   hostControlActionReplays.clear();
   hostControlLeases.clear();
@@ -2055,10 +2052,9 @@ export const handlers = [
     persistAssistantState();
     return json(host, 201);
   }),
-  http.post("/api/hosts/:hostId/copies", async ({ params, request, cookies }) => {
-    const user = sessionUser(cookies)!;
-    const source = hosts.find((item) => item.id === String(params.hostId) && item.owner_id === user.id);
-    if (!source) return failure("not_found", "主机不存在", 404);
+  http.post("/api/hosts/:hostId/copies", async ({ request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthorized", "请先登录", 401);
     const key = request.headers.get("Idempotency-Key") ?? "";
     if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "需要有效的 Idempotency-Key", 400);
     const body = await request.json().catch(() => null) as { name?: unknown; expected_current_revision?: unknown } | null;
@@ -2067,51 +2063,7 @@ export const handlers = [
       || typeof body.expected_current_revision !== "number" || !Number.isSafeInteger(body.expected_current_revision) || body.expected_current_revision < 0) {
       return failure("invalid_argument", "电脑复制请求无效", 400);
     }
-    const name = body.name.trim();
-    const normalizedRequest = JSON.stringify({ name, expected_current_revision: body.expected_current_revision });
-    const replayKey = `${user.id}\u0000${source.id}\u0000${key}`;
-    const prior = hostCopyReplays.get(replayKey);
-    if (prior) {
-      if (prior.request !== normalizedRequest) return failure("idempotency_conflict", "幂等键已用于不同的电脑复制请求", 409);
-      return json({ ...prior.response, replayed: true }, 200);
-    }
-    if (source.state !== "stopped" || source.sandbox_id || source.control_state !== "ai") return failure("workspace_busy", "请先停止源电脑并交还 AI 控制权", 409);
-    const bindings = source.workspaces.filter((binding) => binding.state !== "detached");
-    const binding = bindings[0];
-    const sourceWorkspace = binding && workspaces.find((item) => item.id === binding.workspace.id && workspaceOwners.get(item.id) === user.id);
-    if (bindings.length !== 1 || !binding || binding.state !== "active" || !sourceWorkspace || sourceWorkspace.state !== "ready"
-      || binding.sync_state !== "healthy" || binding.sync_conflicts.length > 0 || binding.desired_revision !== body.expected_current_revision
-      || binding.applied_revision !== body.expected_current_revision || sourceWorkspace.revision !== body.expected_current_revision) {
-      return failure("workspace_conflict", "源电脑文件尚未完全确认", 409);
-    }
-    const usage = usageFor(user.id);
-    if (usage.hosts >= user.quota.hosts || usage.cpu_milli + source.resources.cpu_milli > user.quota.cpu_milli
-      || usage.mem_mib + source.resources.mem_mib > user.quota.mem_mib) return failure("quota_exceeded", "已达到用户主机配额上限", 409);
-    const allocated = capacityUsage();
-    if (allocated.cpu_milli + source.resources.cpu_milli > capacityLimit.cpu_milli
-      || allocated.mem_mib + source.resources.mem_mib > capacityLimit.mem_mib) return failure("capacity_exceeded", "集群资源容量不足", 409);
-
-    const timestamp = now();
-    const copiedWorkspace: Workspace = { ...sourceWorkspace, id: id("w"), name: `${name} 文件`, revision: 1, state: "ready", created_at: timestamp, updated_at: timestamp };
-    const copiedHost: Host = {
-      id: id("h"), name, owner_id: user.id, template_id: source.template_id, isolation: source.isolation,
-      state: "creating", state_reason: "", runtime_generation: 1, control_version: 0, control_state: "ai",
-      url: import.meta.env.VITE_WORKBENCH_URL ?? "http://127.0.0.1:5174",
-      workspaces: [{ workspace: toWorkspaceRef(copiedWorkspace), directory: `projects/${copiedWorkspace.id}`, state: "active", binding_version: 1,
-        desired_revision: 1, applied_revision: 1, sync_state: "healthy", sync_conflicts: [] }],
-      resources: { ...source.resources }, expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(), last_active_at: timestamp, created_at: timestamp,
-    };
-    const result: HostCopyResult = {
-      source_host_id: source.id, source_workspace_id: sourceWorkspace.id, host: copiedHost,
-      workspace: { id: copiedWorkspace.id, name: copiedWorkspace.name, revision: 1, state: "ready" },
-      source_revision: sourceWorkspace.revision, state: "completed", replayed: false,
-    };
-    workspaces.unshift(copiedWorkspace);
-    workspaceOwners.set(copiedWorkspace.id, user.id);
-    hosts.unshift(copiedHost);
-    hostCopyReplays.set(replayKey, { request: normalizedRequest, response: result });
-    persistAssistantState();
-    return json(result, 201);
+    return failure("workspace_conflict", "云端电脑必须使用用户的 Agent Workspace，暂不支持复制独立电脑", 409);
   }),
   http.get("/api/hosts/:hostId/control", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2926,7 +2878,7 @@ export const handlers = [
     try { parsedURL = new URL(body.base_url); } catch { return failure("invalid_argument", "服务地址无效", 400); }
     if (parsedURL.protocol !== "https:" || parsedURL.username || parsedURL.password || parsedURL.hash) return failure("invalid_argument", "服务地址必须是有效的 HTTPS 地址", 400);
     const timestamp = now();
-    const connection: ModelConnection = { id: id("p"), name: body.name.trim(), base_url: body.base_url, model_name: body.model_name.trim(), shared: body.shared, has_api_key: true, capabilities: { text: false, tools: false, vision: false, text_stream: false }, checked_at: null, created_at: timestamp, updated_at: timestamp };
+    const connection: ModelConnection = { id: id("p"), name: body.name.trim(), base_url: body.base_url, model_name: body.model_name.trim(), context_window_tokens: null, context_window_override_tokens: null, context_window_source: "unknown", context_window_resolved_at: null, context_window_catalog_version: null, shared: body.shared, has_api_key: true, capabilities: { text: false, tools: false, vision: false, text_stream: false }, checked_at: null, created_at: timestamp, updated_at: timestamp };
     modelConnections.unshift(connection);
     if (!connection.shared) modelConnectionOwners.set(connection.id, actor.id);
     if (connection.shared) recordMockAudit(actor, "model.connection.create", connection.id, { shared: true, model_name: connection.model_name, base_host: parsedURL.hostname, has_api_key: true });

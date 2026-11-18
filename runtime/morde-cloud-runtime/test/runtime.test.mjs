@@ -5,8 +5,9 @@ import { readFile } from 'node:fs/promises'
 import { once } from 'node:events'
 import { createInterface } from 'node:readline'
 import { PassThrough } from 'node:stream'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { AccountRuntime } from '../src/account-runtime.mjs'
+import { AccountRuntime, workspaceWorkingDirectory } from '../src/account-runtime.mjs'
 import { coordinatorCompactionModelCallID, coordinatorModelCallID, ENGINE_VERSION, modelCallID, validMessageDelivery, validStart } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
@@ -36,13 +37,13 @@ function launch(onFrame, extraEnv = {}, entrypoint = 'bin.mjs') {
   return { child, frames }
 }
 
-function launchAccount(onFrame) {
+function launchAccount(onFrame, extraEnv = {}) {
   return launch((frame, proc) => {
     onFrame(frame, proc)
     if (frame.type === 'task_process_ready') {
       send(proc, taskProcessAdmission(frame))
     }
-  }, {}, 'bin-account.mjs')
+  }, extraEnv, 'bin-account.mjs')
 }
 
 function send(child, frame) {
@@ -66,6 +67,12 @@ function accountTask(taskID, prompt = `prompt ${taskID}`, runtimeSequence = 1) {
     runtime_sequence: runtimeSequence,
   }
 }
+
+test('account DSH children accept only the fixed mounted Workspace directory', () => {
+  assert.equal(workspaceWorkingDirectory(undefined), fileURLToPath(new URL('..', import.meta.url)))
+  assert.equal(workspaceWorkingDirectory('/workspace'), '/workspace')
+  assert.throws(() => workspaceWorkingDirectory('/tmp/workspace'), /Workspace directory is invalid/)
+})
 
 function taskProcessAdmission(frame) {
   return {
@@ -505,6 +512,40 @@ for (const type of ['model_chunk', 'model_end']) {
     output.destroy()
   })
 }
+
+test('only the allowlisted provider context overflow reaches DSH recovery', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  input.write(`${JSON.stringify(start)}\n`)
+  const sentFrame = once(output, 'data')
+  const response = ipc.streamModel(taskFence(start), 'model_context_overflow', 0, { messages: [], tools: [] })
+  const rejected = assert.rejects(response.next(), error => error.code === 'CONTEXT_WINDOW_EXCEEDED')
+  await sentFrame
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_context_overflow', ok: false,
+    failure_code: 'CONTEXT_WINDOW_EXCEEDED' })}\n`)
+  await rejected
+  assert.equal(ipc.failed, false)
+  input.destroy()
+  output.destroy()
+})
+
+test('model failure frames reject provider text and non-allowlisted failure codes', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  input.write(`${JSON.stringify(start)}\n`)
+  const sentFrame = once(output, 'data')
+  const response = ipc.streamModel(taskFence(start), 'model_bad_failure', 0, { messages: [], tools: [] })
+  const rejected = assert.rejects(response.next(), /request cancelled/)
+  await sentFrame
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_bad_failure', ok: false,
+    failure_code: 'provider said the private key was rejected' })}\n`)
+  await rejected
+  assert.equal(ipc.failed, true)
+  input.destroy()
+  output.destroy()
+})
 
 test('late model frames after cancellation are drained through the matching model_end', async () => {
   const input = new PassThrough()
@@ -3095,6 +3136,50 @@ test('account runtime compacts a bounded text-only conversation through the DSH 
   assert.equal(frames.some(frame => frame.type === 'settled' || frame.type === 'task_started'), false)
 })
 
+test('measures summary token pressure without a checkpoint or model call', async t => {
+  const { prompt: _prompt, ...base } = coordinatorStart('m7890123')
+  const startFrame = {
+    ...base, purpose: 'compaction', operation_id: 'operation_measure_123', measure_only: true,
+    context_window_tokens: 32_768,
+    previous_summary: { version: 0, sha256: '', text: '' },
+    source_messages: [
+      { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', content: '用户需要保留已确认的目标和约束。'.repeat(40) },
+      { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', content: '{"properties":{"status":{"type":"string"}}}'.repeat(30) },
+      { kind: 'task_result', id: 'task_123', object_type: '', version: 0, sequence: 3, role: 'assistant', content: '{"status":"succeeded","output":"fixture tool result"}'.repeat(30) },
+      { kind: 'message', id: 'm3456789', object_type: '', version: 0, sequence: 4, role: 'assistant', content: 'The existing decision remains valid for the next implementation step. '.repeat(30) },
+    ],
+  }
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (['checkpoint', 'model'].includes(frame.type)) assert.fail(`measurement unexpectedly emitted ${frame.type}`)
+    if (frame.type === 'coordinator_settled') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (['coordinator_failed', 'coordinator_terminated', 'protocol_error'].includes(frame.type)) {
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  const settled = frames.find(frame => frame.type === 'coordinator_settled')
+  assert.deepEqual(coordinatorFence(settled), coordinatorFence(startFrame))
+  const measurement = JSON.parse(settled.result)
+  assert.equal(measurement.version, 1)
+  assert.equal(measurement.source_token_counts.length, startFrame.source_messages.length)
+  assert.ok(measurement.source_token_counts.every((value, index, values) => Number.isSafeInteger(value) && value > 0 &&
+    (index === 0 || value >= values[index - 1])))
+  let previous = 0
+  for (const [index, source] of startFrame.source_messages.entries()) {
+    const delta = measurement.source_token_counts[index] - previous
+    assert.ok(delta >= Math.ceil(source.content.length / 2), `${source.kind} fixture did not receive the conservative DSH margin`)
+    if (index === 0) assert.ok(delta >= source.content.length, 'CJK source should not use DSH’s raw 4-char density')
+    previous = measurement.source_token_counts[index]
+  }
+  assert.equal(frames.some(frame => ['checkpoint', 'model', 'coordinator_failed'].includes(frame.type)), false)
+})
+
 test('restores a durably checkpointed DSH compaction after runtime restart', async t => {
   const operationID = 'operation_compact_456'
   const { prompt: _prompt, ...base } = coordinatorStart('m4567890')
@@ -3219,6 +3304,13 @@ test('resumes compaction when a runtime restart follows only the source checkpoi
   assert.equal(resumed.frames.find(frame => frame.type === 'coordinator_settled')?.result, 'The user prefers Chinese.')
 })
 
+test('task start accepts only a bounded optional context window', () => {
+  assert.equal(validStart(start), true)
+  assert.equal(validStart({ ...start, context_window_tokens: 1_050_000 }), true)
+  assert.equal(validStart({ ...start, context_window_tokens: 4095 }), false)
+  assert.equal(validStart({ ...start, context_window_tokens: 2_000_001 }), false)
+})
+
 test('compaction coordinator start rejects missing capacity, malformed sources, and tools', () => {
   const base = coordinatorStart('m3456789')
   const { prompt: _prompt, ...conversationStart } = base
@@ -3231,6 +3323,13 @@ test('compaction coordinator start rejects missing capacity, malformed sources, 
     ],
   }
   assert.equal(validStart({ ...valid, type: 'start' }), true)
+  const measurement = { ...valid, type: 'start', measure_only: true,
+    previous_summary: { version: 0, sha256: '', text: '' } }
+  const { previous_summary: _previousSummary, ...missingMeasurementSummary } = measurement
+  assert.equal(validStart(measurement), true)
+  assert.equal(validStart(missingMeasurementSummary), false)
+  assert.equal(validStart({ ...coordinatorStart(), type: 'start', measure_only: true }), false)
+  assert.equal(validStart({ ...measurement, resume: true, checkpoint_through_seq: 0, checkpoint_sha256: '0'.repeat(64) }), false)
   assert.equal(validStart({ ...valid, type: 'start', context_window_tokens: undefined }), false)
   assert.equal(validStart({ ...valid, type: 'start', context_window_tokens: 2048 }), false)
   assert.equal(validStart({ ...valid, type: 'start', source_messages: [{ ...valid.source_messages[0], id: 'foreign id' }, valid.source_messages[1]] }), false)
@@ -3802,6 +3901,42 @@ test('account runtime rejects an invalid first runtime identity before accepting
   assert.equal(code, 1)
   assert.equal(frames.some(frame => frame.type === 'runtime_ready'), false)
   assert.equal(frames.some(frame => frame.type === 'task_started'), false)
+})
+
+test('account runtime accepts the fixed Workspace mount and rejects arbitrary paths', async t => {
+  const mounted = launchAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  }, { MORDE_WORKSPACE_DIR: '/workspace' })
+  t.after(() => mounted.child.kill())
+  const mountedClosed = once(mounted.child, 'close')
+  send(mounted.child, account)
+  const [mountedCode] = await mountedClosed
+  assert.equal(mountedCode, 0, `frames: ${mounted.frames.map(frame => frame.type).join(', ')}`)
+  assert.ok(mounted.frames.some(frame => frame.type === 'runtime_ready'))
+
+  const invalid = launchAccount(() => {}, { MORDE_WORKSPACE_DIR: '/tmp/workspace' })
+  t.after(() => invalid.child.kill())
+  const invalidClosed = once(invalid.child, 'close')
+  const [invalidCode] = await invalidClosed
+  assert.equal(invalidCode, 1)
+  assert.equal(invalid.frames.some(frame => frame.type === 'runtime_ready'), false)
+  assert.ok(invalid.frames.some(frame => frame.type === 'failed'))
+})
+
+test('account runtime forwards the bounded task context capacity to DSH', async t => {
+  const child = launchAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, { ...accountTask('task_context_window'), context_window_tokens: 1_048_576 })
+    if (frame.type === 'task_started') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.child.kill())
+  const closed = once(child.child, 'close')
+  send(child.child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${child.frames.map(frame => frame.type).join(', ')}`)
+  assert.ok(child.frames.some(frame => frame.type === 'task_started'))
+  assert.equal(child.frames.some(frame => frame.type === 'protocol_error'), false)
 })
 
 test('account runtime accepts a new Task after settlement and rejects duplicate identity', async t => {

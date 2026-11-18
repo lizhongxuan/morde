@@ -321,16 +321,16 @@ private struct MIFTaskTimelineMarkerView: View {
         switch marker {
         case .completed:
             Circle()
-                .stroke(Color.green, lineWidth: 2)
+                .stroke(NanoMuseTones.success, lineWidth: 2)
                 .overlay {
                     Image(systemName: "checkmark")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Color.green)
+                        .foregroundStyle(NanoMuseTones.successInk)
                 }
                 .frame(width: 24, height: 24)
         case .current:
             Circle()
-                .fill(Color.primary)
+                .fill(NanoMuseTones.action)
                 .frame(width: 24, height: 24)
                 .overlay {
                     Circle()
@@ -339,11 +339,11 @@ private struct MIFTaskTimelineMarkerView: View {
                 }
         case .failed:
             Circle()
-                .stroke(Color.red, lineWidth: 2)
+                .stroke(NanoMuseTones.danger, lineWidth: 2)
                 .overlay {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(Color.red)
+                        .foregroundStyle(NanoMuseTones.dangerInk)
                 }
                 .frame(width: 24, height: 24)
         case .upcoming:
@@ -580,7 +580,7 @@ struct MIFTaskListRoom: View {
                     Button(action: { onNewConversation?() }) {
                         Text("＋")
                             .font(.system(size: 19, weight: .regular))
-                            .foregroundStyle(Color.primary)
+                            .foregroundStyle(NanoMuseTones.ink)
                             .frame(width: 38, height: 38)
                             .background(NanoMuseTones.surface, in: Circle())
                             .overlay(Circle().strokeBorder(NanoMuseTones.hairline))
@@ -598,7 +598,7 @@ struct MIFTaskListRoom: View {
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Color.primary)
+                            .foregroundStyle(NanoMuseTones.ink)
                             .frame(width: 38, height: 38)
                             .background(NanoMuseTones.surface, in: Circle())
                             .overlay(Circle().strokeBorder(NanoMuseTones.hairline))
@@ -1091,7 +1091,7 @@ private struct MIFTaskAgentGroupHeader: View {
     private var titleView: some View {
         Text(verbatim: title)
             .font(.system(size: 13, weight: .bold, design: .monospaced))
-            .foregroundColor(.primary)
+            .foregroundColor(NanoMuseTones.ink)
     }
 
     @ViewBuilder
@@ -1099,7 +1099,7 @@ private struct MIFTaskAgentGroupHeader: View {
         if let status = group.status {
             Text(verbatim: MIFTaskPresentation.agentStatusLabel(status))
                 .font(.caption.weight(.medium))
-                .foregroundColor(.secondary)
+                .foregroundColor(NanoMuseTones.secondaryText)
         }
     }
 }
@@ -1128,21 +1128,11 @@ struct MIFTaskDetailView: View {
     @FocusState private var isClarificationFocused: Bool
 
     private var taskSecondaryText: Color {
-        Color(uiColor: UIColor { traits in
-            if traits.userInterfaceStyle == .dark {
-                return UIColor(red: 0.73, green: 0.73, blue: 0.77, alpha: 1)
-            }
-            return UIColor(red: 115.0 / 255, green: 115.0 / 255, blue: 120.0 / 255, alpha: 1)
-        })
+        NanoMuseTones.secondaryText
     }
 
     private var taskStepConnector: Color {
-        Color(uiColor: UIColor { traits in
-            if traits.userInterfaceStyle == .dark {
-                return UIColor(red: 0.227, green: 0.227, blue: 0.235, alpha: 1)
-            }
-            return UIColor(red: 217.0 / 255, green: 217.0 / 255, blue: 222.0 / 255, alpha: 1)
-        })
+        NanoMuseTones.hairline
     }
 
     private var task: MordeTask? {
@@ -1343,7 +1333,7 @@ struct MIFTaskDetailView: View {
                             ForEach(dependencies, id: \.task_id) { dependency in
                                 HStack(alignment: .top, spacing: 10) {
                                     Image(systemName: dependency.satisfied ? "checkmark.circle.fill" : "clock")
-                                        .foregroundStyle(dependency.satisfied ? NanoMuseTones.action : .orange)
+                                        .foregroundStyle(dependency.satisfied ? NanoMuseTones.success : NanoMuseTones.warning)
                                         .accessibilityHidden(true)
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(String(format: AppLocalized("%@ · required revision %lld"),
@@ -1357,7 +1347,7 @@ struct MIFTaskDetailView: View {
                                     Spacer(minLength: 4)
                                     Text(AppLocalized(dependency.satisfied ? "Dependency satisfied" : "Waiting for dependency"))
                                         .font(.caption.weight(.medium))
-                                        .foregroundStyle(dependency.satisfied ? NanoMuseTones.action : .orange)
+                                        .foregroundStyle(dependency.satisfied ? NanoMuseTones.success : NanoMuseTones.warning)
                                         .multilineTextAlignment(.trailing)
                                 }
                                 .accessibilityElement(children: .combine)
@@ -1446,17 +1436,17 @@ struct MIFTaskDetailView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Text(pending.impact)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
 
                     if let expiresAt = pending.expirationDate {
                         Text(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
                             .font(.footnote)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
@@ -1464,17 +1454,17 @@ struct MIFTaskDetailView: View {
                         if pending.isExpired {
                             Text(AppLocalized("Approval expired; the requested action was not run."))
                                 .font(.footnote.weight(.semibold))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(NanoMuseTones.secondaryText)
                                 .accessibilityIdentifier("morde.task.approval.expired")
                         } else if pending.deadlineHasPassed(at: timeline.date) {
                             Text(AppLocalized("Approval deadline passed; refresh to confirm its status."))
                                 .font(.footnote)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(NanoMuseTones.secondaryText)
                                 .accessibilityIdentifier("morde.task.approval.deadline.\(pending.id)")
                         } else if !pending.canRespond(taskStatus: task.status, at: timeline.date) {
                             Text(AppLocalized("Approval status is unknown; refresh task details before acting."))
                                 .font(.footnote)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(NanoMuseTones.secondaryText)
                                 .accessibilityIdentifier("morde.task.approval.unknown.\(pending.id)")
                         } else if pending.kind == nil || pending.kind == "approval" {
                             if pending.media_preview_operation_id != nil {
@@ -1520,7 +1510,11 @@ struct MIFTaskDetailView: View {
                         .accessibilityIdentifier("morde.task.clarification.question")
                     TextField(AppLocalized("回复"), text: $clarificationAnswer, axis: .vertical)
                         .lineLimit(3...6)
-                        .textFieldStyle(.roundedBorder)
+                        .textFieldStyle(.plain)
+                        .padding(12)
+                        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
                         .focused($isClarificationFocused)
                         .disabled(store.actionInFlight || isLoadingDetail || detailError != nil)
                         .accessibilityIdentifier("morde.task.clarification.answer")
@@ -1601,7 +1595,7 @@ struct MIFTaskDetailView: View {
 
     private func taskActionButton(_ option: MIFTaskActionOption, taskID: String) -> some View {
         let actionColor = option.kind == .cancel
-            ? Color(red: 0.78, green: 0.12, blue: 0.12)
+            ? NanoMuseTones.danger
             : NanoMuseTones.action
         let isDisabled = isPerformingAction || store.actionInFlight || isLoadingDetail || detailError != nil
         return Button {
@@ -1868,13 +1862,13 @@ struct MIFTaskDetailView: View {
                                 }
                                 Text(taskFileFetchStatus(fetch))
                                     .font(.subheadline.weight(.medium))
-                                    .foregroundStyle(fetch.status == "failed" ? .orange : taskSecondaryText)
+                                    .foregroundStyle(fetch.status == "failed" ? NanoMuseTones.danger : taskSecondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .accessibilityIdentifier("morde.task.fileFetch.status.\(fetch.fetch_id)")
                                 if fetch.status == "failed" {
                                     Text(taskFileFetchFailureReason(fetch))
                                         .font(.caption)
-                                        .foregroundStyle(.orange)
+                                        .foregroundStyle(NanoMuseTones.dangerInk)
                                         .fixedSize(horizontal: false, vertical: true)
                                         .accessibilityIdentifier("morde.task.fileFetch.failureReason.\(fetch.fetch_id)")
                                 }
@@ -2166,14 +2160,14 @@ private struct MIFTaskListRow: View {
     }
 
     private enum IconPalette {
-        static let activeStart = Color(red: 183.0 / 255, green: 186.0 / 255, blue: 201.0 / 255)
-        static let activeEnd = Color(red: 142.0 / 255, green: 147.0 / 255, blue: 168.0 / 255)
-        static let completed = Color(red: 52.0 / 255, green: 199.0 / 255, blue: 89.0 / 255)
-        static let failed = Color(red: 200.0 / 255, green: 30.0 / 255, blue: 30.0 / 255)
-        static let detailText = Color(red: 115.0 / 255, green: 115.0 / 255, blue: 120.0 / 255)
-        static let tertiaryText = Color(red: 172.0 / 255, green: 172.0 / 255, blue: 177.0 / 255)
-        static let plainBackground = Color(red: 236.0 / 255, green: 236.0 / 255, blue: 240.0 / 255)
-        static let failedBackground = Color(red: 253.0 / 255, green: 236.0 / 255, blue: 236.0 / 255)
+        static let activeStart = NanoMuseTones.brandSoft
+        static let activeEnd = NanoMuseTones.brand
+        static let completed = NanoMuseTones.success
+        static let failed = NanoMuseTones.danger
+        static let detailText = NanoMuseTones.secondaryText
+        static let tertiaryText = NanoMuseTones.muted
+        static let plainBackground = NanoMuseTones.fill
+        static let failedBackground = NanoMuseTones.dangerFill
     }
 
     var body: some View {
@@ -2325,7 +2319,9 @@ struct MIFTaskErrorState: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
         .padding(.horizontal, 16)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("morde.task.loadError")
@@ -2364,7 +2360,7 @@ struct MIFTaskBillingSection: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(NanoMuseTones.fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(NanoMuseTones.fill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("morde.task.billing")
         }
@@ -2478,7 +2474,7 @@ struct MIFTaskPlanSection: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(NanoMuseTones.fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(NanoMuseTones.fill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("morde.task.plan")
         }
@@ -2501,7 +2497,7 @@ private struct MIFTaskInlineError: View {
         HStack(alignment: .top, spacing: 10) {
             Text(message)
                 .font(.footnote)
-                .foregroundStyle(.orange)
+                .foregroundStyle(NanoMuseTones.dangerInk)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

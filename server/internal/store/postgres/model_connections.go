@@ -17,7 +17,10 @@ import (
 func (s *Store) CreateModelConnection(ctx context.Context, value app.ModelConnectionRecord) (app.ModelConnectionRecord, error) {
 	row, err := s.q.CreateModelConnection(ctx, sqlcgen.CreateModelConnectionParams{
 		ID: value.ID, OwnerID: nullableText(value.OwnerID), Name: value.Name, BaseUrl: value.BaseURL,
-		ModelName: value.ModelName, ContextWindowTokens: nullableInt4(value.ContextWindowTokens), ApiKeyCipher: value.APIKeyCipher,
+		ModelName: value.ModelName, ContextWindowTokens: nullableInt4(value.ContextWindowTokens),
+		ContextWindowOverrideTokens: nullableInt4(value.ContextWindowOverrideTokens), ContextWindowSource: string(modelContextWindowSource(value.ContextWindowSource)),
+		ContextWindowResolvedAt: nullableTimestamp(value.ContextWindowResolvedAt), ContextWindowCatalogVersion: nullableTextPointer(value.ContextWindowCatalogVersion),
+		ApiKeyCipher: value.APIKeyCipher,
 	})
 	if err != nil {
 		var postgresErr *pgconn.PgError
@@ -88,6 +91,10 @@ func (s *Store) UpdateModelConnection(ctx context.Context, value app.ModelConnec
 	row, err := s.q.UpdateModelConnection(ctx, sqlcgen.UpdateModelConnectionParams{
 		ID: value.ID, Name: value.Name, BaseUrl: value.BaseURL, ModelName: value.ModelName,
 		ContextWindowTokens:             nullableInt4(value.ContextWindowTokens),
+		ContextWindowOverrideTokens:     nullableInt4(value.ContextWindowOverrideTokens),
+		ContextWindowSource:             string(modelContextWindowSource(value.ContextWindowSource)),
+		ContextWindowResolvedAt:         nullableTimestamp(value.ContextWindowResolvedAt),
+		ContextWindowCatalogVersion:     nullableTextPointer(value.ContextWindowCatalogVersion),
 		ApiKeyCipher:                    value.APIKeyCipher,
 		CapabilityText:                  value.Capabilities.Text,
 		CapabilityTools:                 value.Capabilities.Tools,
@@ -118,8 +125,9 @@ func (s *Store) DeleteModelConnection(ctx context.Context, id string) error {
 func modelConnectionDomain(row sqlcgen.ModelConnection) app.ModelConnectionRecord {
 	return app.ModelConnectionRecord{
 		ID: row.ID, OwnerID: row.OwnerID.String, Name: row.Name, BaseURL: row.BaseUrl, ModelName: row.ModelName,
-		ContextWindowTokens: intPointer(row.ContextWindowTokens),
-		APIKeyCipher:        append([]byte(nil), row.ApiKeyCipher...),
+		ContextWindowTokens: intPointer(row.ContextWindowTokens), ContextWindowOverrideTokens: intPointer(row.ContextWindowOverrideTokens),
+		ContextWindowSource: app.ModelContextWindowSource(row.ContextWindowSource), ContextWindowResolvedAt: timePointer(row.ContextWindowResolvedAt),
+		ContextWindowCatalogVersion: textPointer(row.ContextWindowCatalogVersion), APIKeyCipher: append([]byte(nil), row.ApiKeyCipher...),
 		Capabilities: app.ModelCapabilities{
 			Text: row.CapabilityText, Tools: row.CapabilityTools, Vision: row.CapabilityVision,
 			MediaGeneration: app.ModelMediaGenerationCapabilities{
@@ -130,6 +138,28 @@ func modelConnectionDomain(row sqlcgen.ModelConnection) app.ModelConnectionRecor
 		},
 		CheckedAt: timePointer(row.CheckedAt), CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
+}
+
+func modelContextWindowSource(value app.ModelContextWindowSource) app.ModelContextWindowSource {
+	if value == "" {
+		return app.ModelContextWindowUnknown
+	}
+	return value
+}
+
+func nullableTextPointer(value *string) pgtype.Text {
+	if value == nil || *value == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *value, Valid: true}
+}
+
+func textPointer(value pgtype.Text) *string {
+	if !value.Valid {
+		return nil
+	}
+	result := value.String
+	return &result
 }
 
 var _ app.ModelConnectionStore = (*Store)(nil)

@@ -90,11 +90,11 @@ type hostService struct {
 	logger               *zap.Logger
 }
 
-// HostDefaultWorkspaceProvider creates server-managed persistent storage for a
-// Host and prepares the initial storage used by the account's default Host.
+// HostDefaultWorkspaceProvider resolves the stable per-owner Agent Workspace
+// used by every computer created for that account.
 type HostDefaultWorkspaceProvider interface {
-	EnsureDefaultWorkspace(context.Context, string) (workspace.Workspace, error)
-	CreateHostWorkspace(context.Context, string, string) (workspace.Workspace, error)
+	EnsureAgentWorkspace(context.Context, string) (workspace.Workspace, error)
+	IsAgentWorkspaceWorkspace(context.Context, string, string) (bool, error)
 }
 
 type HostWorkspaceDeleter interface {
@@ -193,8 +193,8 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 
 	sortedWorkspaceIDs := append([]string(nil), command.WorkspaceIDs...)
 	if command.WorkspaceIDs != nil {
-		if len(sortedWorkspaceIDs) != 1 {
-			return host.Host{}, domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
+		if len(sortedWorkspaceIDs) > 1 {
+			return host.Host{}, domain.InvalidArgument("workspace_ids", "at most one workspace may be selected")
 		}
 		for _, workspaceID := range sortedWorkspaceIDs {
 			if !domain.ValidWorkspaceID(workspaceID) {
@@ -206,11 +206,24 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		}
 		sort.Strings(sortedWorkspaceIDs)
 	}
-	var idempotency IdempotencyRecord
-	if command.IdempotencyKey != "" {
+	if principal.Kind != identity.KindSession {
+		return host.Host{}, domain.NewError(domain.CodeForbidden, "a Portal session is required to bind the Agent Workspace")
+	}
+	if len(sortedWorkspaceIDs) == 0 || command.IdempotencyKey != "" {
 		if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
 			return host.Host{}, err
 		}
+	}
+	agentWorkspace, err := s.ensureOwnerAgentWorkspace(ctx, principal.UserID)
+	if err != nil {
+		return host.Host{}, err
+	}
+	if len(sortedWorkspaceIDs) == 1 && sortedWorkspaceIDs[0] != agentWorkspace.ID {
+		return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "a cloud computer can only bind its owner's stable Agent Workspace")
+	}
+	sortedWorkspaceIDs = []string{agentWorkspace.ID}
+	var idempotency IdempotencyRecord
+	if command.IdempotencyKey != "" {
 		record, err := idempotencyRecord(principal.UserID, "host.create", command.IdempotencyKey, struct {
 			Name         string   `json:"name"`
 			WorkspaceIDs []string `json:"workspace_ids"`
@@ -232,52 +245,35 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 			return replay, nil
 		}
 	}
-	if command.WorkspaceIDs == nil {
-		if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
-			return host.Host{}, err
+	unlock := func() error { return nil }
+	if locker, ok := s.hosts.(hostDefaultCreationLocker); ok {
+		var lockErr error
+		unlock, lockErr = locker.AcquireDefaultHostLock(ctx, principal.UserID)
+		if lockErr != nil {
+			return host.Host{}, lockErr
 		}
-		unlock := func() error { return nil }
-		if locker, ok := s.hosts.(hostDefaultCreationLocker); ok {
-			var lockErr error
-			unlock, lockErr = locker.AcquireDefaultHostLock(ctx, principal.UserID)
-			if lockErr != nil {
-				return host.Host{}, lockErr
-			}
-			if unlock == nil {
-				return host.Host{}, domain.NewError(domain.CodeInternal, "default Host lock is unavailable")
-			}
-			defer func() {
-				if unlockErr := unlock(); unlockErr != nil {
-					resultErr = errors.Join(resultErr, fmt.Errorf("release default Host lock: %w", unlockErr))
-				}
-			}()
+		if unlock == nil {
+			return host.Host{}, domain.NewError(domain.CodeInternal, "Host creation lock is unavailable")
 		}
-		if command.IdempotencyKey != "" {
-			replay, found, err := s.hosts.GetHostCreateReplay(ctx, idempotency)
-			if err != nil {
-				return host.Host{}, err
+		defer func() {
+			if unlockErr := unlock(); unlockErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("release Host creation lock: %w", unlockErr))
 			}
-			if found {
-				if replay.State == host.StateCreating {
-					if err := s.notifyCreate(ctx, replay.ID); err != nil {
-						s.logger.Error("notify host creation retry failed", zap.String("host_id", replay.ID), zap.Error(err))
-					}
-				}
-				return replay, nil
-			}
-		}
-		if s.defaultWorkspaces == nil {
-			return host.Host{}, domain.NewError(domain.CodeInternal, "default workspace provider is unavailable")
-		}
-		selected, err := s.defaultWorkspaces.CreateHostWorkspace(ctx, principal.UserID, command.IdempotencyKey)
+		}()
+	}
+	if command.IdempotencyKey != "" {
+		replay, found, err := s.hosts.GetHostCreateReplay(ctx, idempotency)
 		if err != nil {
 			return host.Host{}, err
 		}
-		if !domain.ValidWorkspaceID(selected.ID) || selected.OwnerID != principal.UserID ||
-			selected.State != workspace.StateReady || selected.DeletedAt != nil {
-			return host.Host{}, domain.NewError(domain.CodeInvalidState, "computer storage is unavailable")
+		if found {
+			if replay.State == host.StateCreating {
+				if err := s.notifyCreate(ctx, replay.ID); err != nil {
+					s.logger.Error("notify host creation retry failed", zap.String("host_id", replay.ID), zap.Error(err))
+				}
+			}
+			return replay, nil
 		}
-		sortedWorkspaceIDs = []string{selected.ID}
 	}
 	for _, workspaceID := range sortedWorkspaceIDs {
 		value, err := s.workspaces.GetWorkspace(ctx, workspaceID)
@@ -287,6 +283,9 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		if value.State != workspace.StateReady || value.DeletedAt != nil {
 			return host.Host{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace is not ready")
 		}
+	}
+	if err := s.requireAgentWorkspaceUnbound(ctx, principal.UserID, agentWorkspace.ID); err != nil {
+		return host.Host{}, err
 	}
 
 	user, err := s.users.GetUserByID(ctx, principal.UserID)
@@ -405,6 +404,10 @@ func (s *hostService) EnsureDefaultStopped(ctx context.Context, user identity.Us
 		user.DefaultHostCPUMilli > math.MaxInt32 || user.DefaultHostMemMiB > math.MaxInt32 {
 		return host.Host{}, false, domain.NewError(domain.CodeInvalidState, "default host resources are invalid")
 	}
+	agentWorkspace, err := s.ensureOwnerAgentWorkspace(ctx, user.ID)
+	if err != nil {
+		return host.Host{}, false, err
+	}
 	unlock := func() error { return nil }
 	if locker, ok := s.hosts.(hostDefaultCreationLocker); ok {
 		unlock, err = locker.AcquireDefaultHostLock(ctx, user.ID)
@@ -415,14 +418,14 @@ func (s *hostService) EnsureDefaultStopped(ctx context.Context, user identity.Us
 			return host.Host{}, false, domain.NewError(domain.CodeInternal, "default Host lock is unavailable")
 		}
 	}
-	created, didCreate, ensureErr := s.ensureDefaultStoppedLocked(ctx, user)
+	created, didCreate, ensureErr := s.ensureDefaultStoppedLocked(ctx, user, agentWorkspace)
 	if unlockErr := unlock(); unlockErr != nil {
 		return host.Host{}, false, errors.Join(ensureErr, fmt.Errorf("release default Host lock: %w", unlockErr))
 	}
 	return created, didCreate, ensureErr
 }
 
-func (s *hostService) ensureDefaultStoppedLocked(ctx context.Context, user identity.User) (host.Host, bool, error) {
+func (s *hostService) ensureDefaultStoppedLocked(ctx context.Context, user identity.User, agentWorkspace workspace.Workspace) (host.Host, bool, error) {
 	if lookup, ok := s.hosts.(hostDefaultWorkspaceLookup); ok {
 		existing, found, err := lookup.GetDefaultHostForOwner(ctx, user.ID)
 		if domain.CodeOf(err) == domain.CodeConflict {
@@ -441,6 +444,9 @@ func (s *hostService) ensureDefaultStoppedLocked(ctx context.Context, user ident
 			}
 			activeCount := 0
 			for _, binding := range bindings {
+				if binding.OwnerID != user.ID || binding.HostID != existing.ID || binding.Workspace.ID != agentWorkspace.ID {
+					return host.Host{}, false, domain.NewError(domain.CodeWorkspaceConflict, "the existing default computer is bound to a different Workspace; delete it safely before switching")
+				}
 				if binding.State != workspace.BindingDetached {
 					activeCount++
 				}
@@ -453,7 +459,10 @@ func (s *hostService) ensureDefaultStoppedLocked(ctx context.Context, user ident
 				if err != nil {
 					return host.Host{}, false, err
 				}
-				return s.ensureDefaultHostForWorkspace(ctx, user, binding.Workspace.ID)
+				if binding.Workspace.ID != agentWorkspace.ID {
+					return host.Host{}, false, domain.NewError(domain.CodeWorkspaceConflict, "the existing default computer uses legacy storage; delete it safely before switching to the Agent Workspace")
+				}
+				return s.ensureDefaultHostForWorkspace(ctx, user, agentWorkspace.ID)
 			}
 			if existing.State != host.StateStopped {
 				return host.Host{}, false, domain.NewError(domain.CodeWorkspaceConflict, "default Host is missing its workspace binding")
@@ -463,22 +472,63 @@ func (s *hostService) ensureDefaultStoppedLocked(ctx context.Context, user ident
 	if user.QuotaHosts == 0 {
 		return host.Host{}, false, nil
 	}
-	if s.defaultWorkspaces == nil {
-		return host.Host{}, false, domain.NewError(domain.CodeInternal, "default workspace provider is unavailable")
-	}
-	defaultWorkspace, err := s.defaultWorkspaces.EnsureDefaultWorkspace(ctx, user.ID)
-	if err != nil {
+	if err := s.requireAgentWorkspaceUnbound(ctx, user.ID, agentWorkspace.ID); err != nil {
 		return host.Host{}, false, err
 	}
-	if !domain.ValidWorkspaceID(defaultWorkspace.ID) || defaultWorkspace.OwnerID != user.ID ||
-		defaultWorkspace.State != workspace.StateReady || defaultWorkspace.DeletedAt != nil {
-		return host.Host{}, false, domain.NewError(domain.CodeInvalidState, "default workspace is unavailable")
+	return s.ensureDefaultHostForWorkspace(ctx, user, agentWorkspace.ID)
+}
+
+func (s *hostService) ensureOwnerAgentWorkspace(ctx context.Context, ownerID string) (workspace.Workspace, error) {
+	if s.defaultWorkspaces == nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace provider is unavailable")
 	}
-	return s.ensureDefaultHostForWorkspace(ctx, user, defaultWorkspace.ID)
+	value, err := s.defaultWorkspaces.EnsureAgentWorkspace(ctx, ownerID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if !domain.ValidWorkspaceID(value.ID) || value.OwnerID != ownerID || value.State != workspace.StateReady || value.DeletedAt != nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeInvalidState, "Agent Workspace is unavailable")
+	}
+	return value, nil
+}
+
+func (s *hostService) requireAgentWorkspaceUnbound(ctx context.Context, ownerID, workspaceID string) error {
+	bindings, err := s.workspaces.GetWorkspaceBindingsByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("check Agent Workspace computer binding before creation: %w", err)
+	}
+	for _, binding := range bindings {
+		if binding.OwnerID != ownerID || binding.Workspace.ID != workspaceID || !domain.ValidHostID(binding.HostID) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace computer binding ownership is ambiguous")
+		}
+		if binding.State != workspace.BindingDetached {
+			return domain.NewError(domain.CodeWorkspaceBusy, "delete or safely detach the existing computer before binding its Agent Workspace to another computer")
+		}
+	}
+	return nil
+}
+
+func (s *hostService) requireHostAgentWorkspaceBinding(ctx context.Context, hostID, ownerID, workspaceID string) error {
+	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return fmt.Errorf("read Agent Workspace binding before Sandbox creation: %w", err)
+	}
+	if len(bindings) != 1 || bindings[0].HostID != hostID || bindings[0].OwnerID != ownerID || bindings[0].Workspace.ID != workspaceID {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer binding does not match its owner's stable Agent Workspace")
+	}
+	return nil
 }
 
 func (s *hostService) ensureDefaultHostForWorkspace(ctx context.Context, user identity.User, workspaceID string) (host.Host, bool, error) {
 	tmpl := s.templates[s.defaultTemplateID]
+	volumeCheckHostID, err := domain.NewHostID()
+	if err != nil {
+		return host.Host{}, false, fmt.Errorf("generate default Host volume validation id: %w", err)
+	}
+	if _, err := s.workspaceVolumes.PrepareHostWorkspaceVolume(ctx, user.ID, volumeCheckHostID,
+		workspaceID, tmpl.Workspace.MountPath, tmpl.Workspace.Size); err != nil {
+		return host.Host{}, false, err
+	}
 	value, err := s.newHostRecord(user.ID, tmpl.Name, tmpl, host.StateStopped,
 		user.DefaultHostCPUMilli, user.DefaultHostMemMiB, user.DefaultHostCPUMilli, user.DefaultHostMemMiB)
 	if err != nil {
@@ -517,6 +567,10 @@ func (s *hostService) AdvanceCreate(ctx context.Context, hostID string) (result 
 		}
 		return hostStateError(value.State)
 	}
+	agentWorkspace, err := s.ensureOwnerAgentWorkspace(ctx, value.OwnerID)
+	if err != nil {
+		return err
+	}
 	lock, acquired, err := s.createLocks.TryHostCreateLock(ctx, hostID)
 	if err != nil {
 		return fmt.Errorf("acquire host create lock: %w", err)
@@ -537,6 +591,9 @@ func (s *hostService) AdvanceCreate(ctx context.Context, hostID string) (result 
 			return nil
 		}
 		return hostStateError(value.State)
+	}
+	if err := s.requireHostAgentWorkspaceBinding(ctx, value.ID, value.OwnerID, agentWorkspace.ID); err != nil {
+		return err
 	}
 	startedAt := value.CreatedAt
 	if startedAt.IsZero() {
@@ -634,7 +691,7 @@ func (s *hostService) createRequest(ctx context.Context, value host.Host) (Sandb
 		return SandboxCreateRequest{}, err
 	}
 	workspaceLayout := "legacy"
-	if workspaceVolume.ClaimName == WorkspaceNamedVolumeName(binding.Workspace.ID) {
+	if workspaceVolume.HostPath != "" || workspaceVolume.ClaimName == WorkspaceNamedVolumeName(binding.Workspace.ID) {
 		workspaceLayout = "workspace"
 	}
 	key, err := s.sealer.Open(value.AIOKeyEnc)

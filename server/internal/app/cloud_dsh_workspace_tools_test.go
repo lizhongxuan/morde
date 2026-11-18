@@ -6,7 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +18,213 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage/workspacecurrent"
 )
+
+type cloudDSHLiveWorkspaceDirectory struct{ root string }
+
+func (d cloudDSHLiveWorkspaceDirectory) ReadDirectory(ownerID, workspaceID, relative string) ([]workspace.DirectoryEntry, error) {
+	if ownerID != "u1234567" || workspaceID != "w1234567" {
+		return nil, os.ErrNotExist
+	}
+	root := d.root
+	if relative != "" {
+		root = filepath.Join(root, filepath.FromSlash(relative))
+	}
+	values, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Name() < values[j].Name() })
+	result := make([]workspace.DirectoryEntry, 0, len(values))
+	for _, value := range values {
+		info, err := os.Lstat(filepath.Join(root, value.Name()))
+		if err != nil {
+			return nil, err
+		}
+		kind := "other"
+		if info.Mode().IsRegular() {
+			kind = "file"
+		} else if info.IsDir() {
+			kind = "directory"
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			kind = "symlink"
+		}
+		result = append(result, workspace.DirectoryEntry{Name: value.Name(), Kind: kind, SizeBytes: info.Size(), ModifiedAt: info.ModTime().UTC()})
+	}
+	return result, nil
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) OpenRegularFile(ownerID, workspaceID, relative string) (*os.File, os.FileInfo, error) {
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return nil, nil, os.ErrNotExist
+	}
+	path := filepath.Join(d.root, filepath.FromSlash(relative))
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = os.ErrInvalid
+		}
+		return nil, nil, err
+	}
+	file, err := os.Open(path)
+	return file, info, err
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) ReadSymbolicLink(ownerID, workspaceID, relative string) (string, error) {
+	if ownerID != "u1234567" || workspaceID != "w1234567" {
+		return "", os.ErrNotExist
+	}
+	return os.Readlink(filepath.Join(d.root, filepath.FromSlash(relative)))
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) StatPath(ownerID, workspaceID, relative string) (os.FileInfo, error) {
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return nil, os.ErrNotExist
+	}
+	return os.Lstat(filepath.Join(d.root, filepath.FromSlash(relative)))
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) WriteRegularFile(ctx context.Context, ownerID, workspaceID, relative string, content []byte, mode uint32, expectedSHA string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return os.ErrNotExist
+	}
+	path := filepath.Join(d.root, filepath.FromSlash(relative))
+	old, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if expectedSHA != "" {
+			return workspacecurrent.ErrWriteConflict
+		}
+	} else if err != nil {
+		return err
+	} else {
+		digest := sha256.Sum256(old)
+		if expectedSHA == "" || hex.EncodeToString(digest[:]) != expectedSHA {
+			return workspacecurrent.ErrWriteConflict
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".live-write-")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer os.Remove(name)
+	if _, err := temporary.Write(content); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Chmod(os.FileMode(mode)); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) WriteRegularFileFrom(ctx context.Context, ownerID, workspaceID, relative string, source io.Reader, size int64,
+	digest string, mode uint32, expectedSHA string) error {
+	if source == nil || size < 0 {
+		return os.ErrInvalid
+	}
+	content, err := io.ReadAll(io.LimitReader(source, size+1))
+	if err != nil || int64(len(content)) != size || sha256Hex(content) != digest {
+		return os.ErrInvalid
+	}
+	return d.WriteRegularFile(ctx, ownerID, workspaceID, relative, content, mode, expectedSHA)
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) CreateDirectory(ctx context.Context, ownerID, workspaceID, relative string, mode uint32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return os.ErrNotExist
+	}
+	return os.MkdirAll(filepath.Join(d.root, filepath.FromSlash(relative)), os.FileMode(mode))
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) RemoveEmptyDirectory(ctx context.Context, ownerID, workspaceID, relative string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return os.ErrNotExist
+	}
+	return os.Remove(filepath.Join(d.root, filepath.FromSlash(relative)))
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) RemoveRegularFile(ctx context.Context, ownerID, workspaceID, relative, expectedSHA string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return os.ErrNotExist
+	}
+	path := filepath.Join(d.root, filepath.FromSlash(relative))
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if sha256Hex(content) != expectedSHA {
+		return workspacecurrent.ErrWriteConflict
+	}
+	return os.Remove(path)
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) WriteSymbolicLink(ctx context.Context, ownerID, workspaceID, relative, target, expectedTarget string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return os.ErrNotExist
+	}
+	path := filepath.Join(d.root, filepath.FromSlash(relative))
+	current, err := os.Readlink(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if expectedTarget != "" {
+			return workspacecurrent.ErrWriteConflict
+		}
+	} else if err != nil || current != expectedTarget {
+		if err != nil {
+			return err
+		}
+		return workspacecurrent.ErrWriteConflict
+	} else if current == target {
+		return nil
+	} else if err := os.Remove(path); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	return os.Symlink(target, path)
+}
+
+func (d cloudDSHLiveWorkspaceDirectory) RemoveSymbolicLink(ctx context.Context, ownerID, workspaceID, relative, expectedTarget string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ownerID != "u1234567" || workspaceID != "w1234567" || workspace.ValidateRelativePath(relative) != nil {
+		return os.ErrNotExist
+	}
+	path := filepath.Join(d.root, filepath.FromSlash(relative))
+	current, err := os.Readlink(path)
+	if err != nil {
+		return err
+	}
+	if current != expectedTarget {
+		return workspacecurrent.ErrWriteConflict
+	}
+	return os.Remove(path)
+}
 
 func newCloudDSHT08WorkspaceBroker(t *testing.T) (*runtimeToolExecutorFixture, *cloudDSHBrokerTaskStore,
 	*CloudDSHToolBroker, *cloudDSHT08WorkspaceStore, task.Task) {
@@ -199,6 +409,82 @@ func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T)
 	unknownWorkspace := `{"expected_revision":0,"path":"notes/readme.txt","workspace_id":"w7654321"}`
 	if _, err := tools.execute(context.Background(), current, ModelToolCall{CallID: "cross-workspace", Name: cloudDSHWorkspaceReadToolName, Arguments: unknownWorkspace}, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("caller supplied workspace ID error = %v; want invalid argument", err)
+	}
+}
+
+func TestCloudDSHWorkspaceToolsReadLiveDirectoryInsteadOfSnapshot(t *testing.T) {
+	tools, _, _, current := newCloudDSHT08WorkspaceTools(t, nil, nil, nil)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "live.txt"), []byte("host wrote this"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tools.workspaces.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: root}
+	tools.workspaces.liveDirectorySource = true
+	list, err := tools.list(context.Background(), current, cloudDSHWorkspaceListArguments{ExpectedRevision: 0, Limit: 10})
+	var listed cloudDSHWorkspaceListOutput
+	if err != nil || list.Status != AgentToolSucceeded || json.Unmarshal([]byte(list.Output), &listed) != nil || len(listed.Entries) != 1 || listed.Entries[0].Path != "live.txt" {
+		t.Fatalf("live Workspace list = %#v, err=%v", list, err)
+	}
+	read, err := tools.read(context.Background(), current, cloudDSHWorkspaceReadArguments{ExpectedRevision: 0, Path: "live.txt"})
+	var readValue cloudDSHWorkspaceReadOutput
+	if err != nil || read.Status != AgentToolSucceeded || json.Unmarshal([]byte(read.Output), &readValue) != nil || readValue.Content != "host wrote this" {
+		t.Fatalf("live Workspace read = %#v, err=%v", read, err)
+	}
+	search, err := tools.search(context.Background(), current, cloudDSHWorkspaceSearchArguments{ExpectedRevision: 0, Query: "HOST WROTE", MaxResults: 10})
+	var searchValue cloudDSHWorkspaceSearchOutput
+	if err != nil || search.Status != AgentToolSucceeded || json.Unmarshal([]byte(search.Output), &searchValue) != nil || len(searchValue.Matches) != 1 || searchValue.Matches[0].Path != "live.txt" {
+		t.Fatalf("live Workspace search = %#v, err=%v", search, err)
+	}
+}
+
+func TestCloudDSHWorkspaceWriteUpdatesLiveDirectoryWithoutMaterializingRevision(t *testing.T) {
+	tools, store, _, current := newCloudDSHT08WorkspaceTools(t, nil, nil, nil)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "host-file.txt"), []byte("host data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tools.workspaces.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: root}
+	tools.workspaces.liveDirectorySource = true
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "live-write", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/summary.md", Content: "agent data",
+	})
+	result, err := tools.execute(context.Background(), current, call, false, nil)
+	var receipt cloudDSHWorkspaceWriteReceiptOutput
+	if err != nil || result.Status != AgentToolSucceeded || json.Unmarshal([]byte(result.Output), &receipt) != nil ||
+		receipt.PublishedRevision != 1 || store.commits != 1 || store.workspace.Revision != 1 {
+		t.Fatalf("live Workspace write = %#v, err=%v, receipt=%#v commits=%d revision=%d",
+			result, err, receipt, store.commits, store.workspace.Revision)
+	}
+	digest, digestErr := workspace.ManifestTreeWithMetadataSHA256(store.snapshots[1], store.emptyDirectorySnapshots[1], store.directorySnapshots[1])
+	if digestErr != nil || digest != receipt.ManifestSHA256 {
+		t.Fatalf("direct receipt manifest digest = %q, err=%v; want %q", digest, digestErr, receipt.ManifestSHA256)
+	}
+	for filePath, want := range map[string]string{"host-file.txt": "host data", "reports/summary.md": "agent data"} {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(filePath)))
+		if err != nil || string(content) != want {
+			t.Fatalf("live Workspace %q = %q, err=%v", filePath, content, err)
+		}
+	}
+}
+
+func TestCloudDSHWorkspaceWritePreservesAHostChangeToTheSameFile(t *testing.T) {
+	baselineFile := syncServiceFile("report.txt", []byte("manifest version"))
+	tools, store, blocks, current := newCloudDSHT08WorkspaceTools(t, []workspace.File{baselineFile}, nil, nil)
+	blocks.data[baselineFile.SHA256] = []byte("manifest version")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, baselineFile.Path), []byte("host version"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tools.workspaces.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: root}
+	tools.workspaces.liveDirectorySource = true
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "live-conflict", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: baselineFile.Path, Content: "agent version",
+	})
+	result, err := tools.execute(context.Background(), current, call, false, nil)
+	content, readErr := os.ReadFile(filepath.Join(root, baselineFile.Path))
+	if err != nil || result.Status != AgentToolFailed || readErr != nil || string(content) != "host version" || store.commits != 0 || store.workspace.Revision != 0 {
+		t.Fatalf("conflicting live write = %#v, err=%v, file=%q, readErr=%v, commits=%d revision=%d",
+			result, err, content, readErr, store.commits, store.workspace.Revision)
 	}
 }
 

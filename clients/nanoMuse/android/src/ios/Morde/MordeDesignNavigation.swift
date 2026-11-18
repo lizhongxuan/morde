@@ -90,7 +90,7 @@ private struct MordeDesignGlyph: View {
 
     var body: some View {
         MordeDesignGlyphShape(kind: kind)
-            .stroke(Color.primary, style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
+            .stroke(NanoMuseTones.ink, style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
     }
 }
 
@@ -332,9 +332,9 @@ struct MordeDesignNavigationShell<Content: View>: View {
         }
         .frame(width: width)
         .frame(maxHeight: .infinity)
-        .background(Color(uiColor: .systemGroupedBackground))
+        .background(NanoMuseTones.side)
         .clipShape(MordeDrawerShape())
-        .shadow(color: .black.opacity(0.16), radius: 24, x: 12, y: 0)
+        .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("morde.nav.drawer")
     }
@@ -344,14 +344,14 @@ struct MordeDesignNavigationShell<Content: View>: View {
         if let title = section.title {
             Text(title)
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NanoMuseTones.secondaryText)
                 .padding(.horizontal, 12)
                 .padding(.top, 18)
         }
         if let hint = section.hint {
             Text(hint)
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NanoMuseTones.secondaryText)
                 .padding(.horizontal, 12)
                 .padding(.top, 5)
         }
@@ -365,14 +365,14 @@ struct MordeDesignNavigationShell<Content: View>: View {
         } else if let emptyMessage = section.emptyMessage {
             Text(emptyMessage)
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NanoMuseTones.secondaryText)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
         }
         if section.id != drawerSections.last?.id {
             Rectangle()
-                .fill(Color.primary.opacity(0.08))
-                .frame(height: 1)
+                .fill(NanoMuseTones.hairline)
+                .frame(height: 1.5)
                 .padding(.horizontal, 12)
                 .padding(.top, 16)
         }
@@ -404,19 +404,19 @@ struct MordeDesignNavigationShell<Content: View>: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 6)
                         .frame(minWidth: 19, minHeight: 19)
-                        .background(Color.red, in: Capsule())
+                        .background(NanoMuseTones.danger, in: Capsule())
                 }
             }
-            .foregroundStyle(Color.primary)
+            .foregroundStyle(item.isSelected ? NanoMuseTones.brandDeep : NanoMuseTones.ink)
             .padding(.horizontal, item.systemImage == nil ? 12 : 13)
             .padding(.vertical, 11)
             .contentShape(Capsule())
             .background {
                 if item.systemImage == nil {
                     RoundedRectangle(cornerRadius: 12)
-                        .fill(item.isSelected ? Color.primary.opacity(0.08) : Color.clear)
+                        .fill(item.isSelected ? NanoMuseTones.brandSoft : Color.clear)
                 } else {
-                    Capsule().fill(item.isSelected ? Color.primary.opacity(0.08) : Color.clear)
+                    Capsule().fill(item.isSelected ? NanoMuseTones.brandSoft : Color.clear)
                 }
             }
         }
@@ -441,7 +441,7 @@ struct MordeDesignNavigationShell<Content: View>: View {
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                 TextField(footer.searchPlaceholder, text: $searchText)
                     .font(.body)
                     .textInputAutocapitalization(.never)
@@ -452,8 +452,8 @@ struct MordeDesignNavigationShell<Content: View>: View {
             }
             .padding(.horizontal, 13)
             .frame(height: 38)
-            .background(Color(uiColor: .systemBackground), in: Capsule())
-            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1))
+            .background(NanoMuseTones.surface, in: Capsule())
+            .overlay(Capsule().strokeBorder(NanoMuseTones.brandTint, lineWidth: 1))
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("morde.nav.drawer.search.container")
 
@@ -466,7 +466,7 @@ struct MordeDesignNavigationShell<Content: View>: View {
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, max(20, bottomInset + 8))
-        .background(Color(uiColor: .systemGroupedBackground))
+        .background(NanoMuseTones.side)
     }
 
     private func openDrawer() {
@@ -506,9 +506,9 @@ struct MordeDesignTabBar: View {
         }
         .padding(5)
         .frame(height: 62)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
-        .shadow(color: .black.opacity(0.08), radius: 12, y: 5)
+        .background(NanoMuseTones.surface, in: Capsule())
+        .overlay(Capsule().strokeBorder(NanoMuseTones.hairline, lineWidth: 1))
+        .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
     }
 
     private func tabButton(_ tab: MordeDesignTab) -> some View {
@@ -532,13 +532,13 @@ struct MordeDesignTabBar: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 4)
                         .frame(minWidth: 17, minHeight: 17)
-                        .background(Color.red, in: Capsule())
+                        .background(NanoMuseTones.danger, in: Capsule())
                         .overlay(Capsule().strokeBorder(Color(uiColor: .systemBackground), lineWidth: 2))
                         .offset(x: -8, y: 2)
                 }
             }
-            .foregroundStyle(Color.primary)
-            .background(isSelected ? Color.primary.opacity(0.08) : Color.clear, in: Capsule())
+            .foregroundStyle(isSelected ? NanoMuseTones.brandDeep : NanoMuseTones.secondaryText)
+            .background(isSelected ? NanoMuseTones.brandSoft : Color.clear, in: Capsule())
             .frame(maxWidth: .infinity)
             .frame(height: 52)
         }

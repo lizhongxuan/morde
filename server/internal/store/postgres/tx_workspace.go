@@ -627,6 +627,17 @@ func bindingStateConflict(ctx context.Context, tx pgx.Tx, hostID, workspaceID st
 }
 
 func (s *Store) ClaimWorkspaceForDelete(ctx context.Context, workspaceID string, expectedRevision int64) (workspace.Workspace, error) {
+	return s.claimWorkspaceForDelete(ctx, "", workspaceID, expectedRevision)
+}
+
+func (s *Store) ClaimAgentWorkspaceForDelete(ctx context.Context, ownerID, workspaceID string, expectedRevision int64) (workspace.Workspace, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.Workspace{}, domain.InvalidArgument("agent_workspace", "Agent Workspace owner is invalid")
+	}
+	return s.claimWorkspaceForDelete(ctx, ownerID, workspaceID, expectedRevision)
+}
+
+func (s *Store) claimWorkspaceForDelete(ctx context.Context, agentOwnerID, workspaceID string, expectedRevision int64) (workspace.Workspace, error) {
 	if !domain.ValidWorkspaceID(workspaceID) || expectedRevision < 0 {
 		return workspace.Workspace{}, domain.InvalidArgument("workspace", "workspace deletion identity is invalid")
 	}
@@ -637,6 +648,13 @@ func (s *Store) ClaimWorkspaceForDelete(ctx context.Context, workspaceID string,
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		} else if err != nil {
 			return fmt.Errorf("lock workspace before deletion: %w", err)
+		}
+		if agentOwnerID == "" {
+			if err := rejectAgentWorkspaceMutation(ctx, tx, workspaceID, "deleted"); err != nil {
+				return err
+			}
+		} else if err := requireCurrentAgentWorkspaceOwner(ctx, tx, agentOwnerID, workspaceID); err != nil {
+			return err
 		}
 		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
 			return err
@@ -690,6 +708,17 @@ WHERE id=$1 AND state='ready' AND revision=$2`, workspaceID, expectedRevision)
 }
 
 func (s *Store) CompleteWorkspaceDelete(ctx context.Context, workspaceID string, expectedRevision int64) (workspace.Workspace, error) {
+	return s.completeWorkspaceDelete(ctx, "", workspaceID, expectedRevision)
+}
+
+func (s *Store) CompleteAgentWorkspaceDelete(ctx context.Context, ownerID, workspaceID string, expectedRevision int64) (workspace.Workspace, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.Workspace{}, domain.InvalidArgument("agent_workspace", "Agent Workspace owner is invalid")
+	}
+	return s.completeWorkspaceDelete(ctx, ownerID, workspaceID, expectedRevision)
+}
+
+func (s *Store) completeWorkspaceDelete(ctx context.Context, agentOwnerID, workspaceID string, expectedRevision int64) (workspace.Workspace, error) {
 	if !domain.ValidWorkspaceID(workspaceID) || expectedRevision < 0 {
 		return workspace.Workspace{}, domain.InvalidArgument("workspace", "workspace deletion identity is invalid")
 	}
@@ -701,12 +730,26 @@ func (s *Store) CompleteWorkspaceDelete(ctx context.Context, workspaceID string,
 			return storeError("lock workspace to complete deletion", "workspace", err)
 		}
 		if state == string(workspace.StateDeleted) {
+			if agentOwnerID == "" {
+				if err := rejectAgentWorkspaceMutation(ctx, tx, workspaceID, "deleted"); err != nil {
+					return err
+				}
+			} else if err := requireAgentWorkspaceHistoryOwner(ctx, tx, agentOwnerID, workspaceID); err != nil {
+				return err
+			}
 			row, err := sqlcgen.New(tx).GetWorkspace(ctx, workspaceID)
 			if err != nil {
 				return fmt.Errorf("read deleted workspace: %w", err)
 			}
 			deleted = workspaceDomain(row)
 			return nil
+		}
+		if agentOwnerID == "" {
+			if err := rejectAgentWorkspaceMutation(ctx, tx, workspaceID, "deleted"); err != nil {
+				return err
+			}
+		} else if err := requireCurrentAgentWorkspaceOwner(ctx, tx, agentOwnerID, workspaceID); err != nil {
+			return err
 		}
 		if state != string(workspace.StateDeleting) || revision != expectedRevision {
 			row, err := sqlcgen.New(tx).GetWorkspace(ctx, workspaceID)
@@ -741,6 +784,15 @@ UPDATE workspaces SET state='deleted', deleted_at=now(), updated_at=now()
 WHERE id=$1 AND state='deleting' AND revision=$2`, workspaceID, expectedRevision); err != nil {
 			return fmt.Errorf("complete workspace deletion: %w", err)
 		}
+		if agentOwnerID != "" {
+			result, err := tx.Exec(ctx, `DELETE FROM user_agent_workspaces WHERE owner_id=$1 AND workspace_id=$2`, agentOwnerID, workspaceID)
+			if err != nil {
+				return fmt.Errorf("retire stable Agent Workspace mapping: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace mapping changed during deletion")
+			}
+		}
 		row, err := sqlcgen.New(tx).GetWorkspace(ctx, workspaceID)
 		if err != nil {
 			return fmt.Errorf("read completed workspace deletion: %w", err)
@@ -752,6 +804,38 @@ WHERE id=$1 AND state='deleting' AND revision=$2`, workspaceID, expectedRevision
 		return workspace.Workspace{}, err
 	}
 	return deleted, nil
+}
+
+func requireCurrentAgentWorkspaceOwner(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return domain.InvalidArgument("agent_workspace", "Agent Workspace identity is invalid")
+	}
+	var mappedOwnerID string
+	if err := tx.QueryRow(ctx, `SELECT owner_id FROM user_agent_workspaces WHERE workspace_id=$1 FOR UPDATE`, workspaceID).Scan(&mappedOwnerID); errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace mapping is no longer current")
+	} else if err != nil {
+		return fmt.Errorf("lock current Agent Workspace mapping: %w", err)
+	}
+	if mappedOwnerID != ownerID {
+		return domain.NewError(domain.CodeNotFound, "Agent Workspace not found")
+	}
+	return nil
+}
+
+func requireAgentWorkspaceHistoryOwner(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return domain.InvalidArgument("agent_workspace", "Agent Workspace identity is invalid")
+	}
+	var found bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM agent_workspace_history WHERE owner_id=$1 AND workspace_id=$2
+)`, ownerID, workspaceID).Scan(&found); err != nil {
+		return fmt.Errorf("check Agent Workspace history owner: %w", err)
+	}
+	if !found {
+		return domain.NewError(domain.CodeNotFound, "Agent Workspace not found")
+	}
+	return nil
 }
 
 func workspaceRevisionConflict(current, expected int64) error {

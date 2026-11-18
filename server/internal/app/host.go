@@ -250,7 +250,7 @@ func (s *hostService) Delete(ctx context.Context, principal identity.Principal, 
 		return host.Host{}, err
 	}
 	if !command.ConfirmWorkspaceDeletion {
-		return host.Host{}, domain.InvalidArgument("confirm_delete_workspace", "confirm deletion of this computer and its workspace directory")
+		return host.Host{}, domain.InvalidArgument("confirm_delete_workspace", "confirm deletion of this computer; its Agent Workspace files are retained")
 	}
 	if value.RuntimeGeneration > 1 && (value.StateReason == "restore_unknown" ||
 		(value.State == host.StateCreating && value.CreateAttemptedAt != nil)) {
@@ -271,14 +271,22 @@ func (s *hostService) Delete(ctx context.Context, principal identity.Principal, 
 		return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage binding is missing or ambiguous")
 	}
 	for workspaceID := range boundWorkspaceIDs {
+		isAgentWorkspace, err := s.defaultWorkspaces.IsAgentWorkspaceWorkspace(ctx, value.OwnerID, workspaceID)
+		if err != nil {
+			return host.Host{}, err
+		}
 		otherBindings, err := s.workspaces.GetWorkspaceBindingsByWorkspace(ctx, workspaceID)
 		if err != nil {
 			return host.Host{}, err
 		}
 		for _, binding := range otherBindings {
-			if binding.HostID != value.ID {
-				return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage is shared with another computer")
+			if binding.HostID == value.ID {
+				continue
 			}
+			if isAgentWorkspace && binding.State == workspace.BindingDetached {
+				continue
+			}
+			return host.Host{}, domain.NewError(domain.CodeWorkspaceConflict, "computer storage is shared with another computer")
 		}
 		if s.hostWorkspaceDeleter == nil {
 			return host.Host{}, domain.NewError(domain.CodeInvalidState, "computer storage cleanup is unavailable")

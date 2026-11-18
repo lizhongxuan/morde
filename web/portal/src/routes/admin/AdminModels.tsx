@@ -11,9 +11,24 @@ import { Modal } from '../../components/Modal';
 import { FloatingError } from '../../components/FloatingError';
 
 type AdminModelConnection = Awaited<ReturnType<typeof portalApi.adminModelConnections>>['items'][number];
-type ModelConnectionForm = { name: string; baseURL: string; modelName: string; contextWindowTokens: string; apiKey: string };
+type ModelConnectionForm = { name: string; baseURL: string; modelName: string; contextWindowOverrideTokens: string; clearContextWindowOverride: boolean; apiKey: string };
 
-const emptyForm: ModelConnectionForm = { name: '', baseURL: '', modelName: '', contextWindowTokens: '', apiKey: '' };
+const emptyForm: ModelConnectionForm = { name: '', baseURL: '', modelName: '', contextWindowOverrideTokens: '', clearContextWindowOverride: false, apiKey: '' };
+
+function presetForRoute(baseURL: string, modelName: string) {
+  return modelConnectionPresets.find((preset) => preset.baseURL.replace(/\/+$/, '') === baseURL.replace(/\/+$/, '') && preset.modelName === modelName);
+}
+
+function contextWindowSourceLabel(source: AdminModelConnection['context_window_source']) {
+  switch (source) {
+    case 'override': return '高级覆盖';
+    case 'legacy_manual': return '旧手工配置';
+    case 'provider_metadata': return '服务商元数据';
+    case 'model_catalog': return 'Morde 模型目录';
+    case 'provider_error': return '服务商错误响应';
+    default: return '暂未识别';
+  }
+}
 
 export function AdminModels() {
   const client = useQueryClient();
@@ -52,14 +67,15 @@ export function AdminModels() {
   const create = useMutation({
     mutationFn: ({ value }: { value: ModelConnectionForm; presetID: string }) => portalApi.createModelConnection({
       name: value.name.trim(), base_url: value.baseURL.trim(), model_name: value.modelName.trim(), api_key: value.apiKey, shared: true,
-      ...(value.contextWindowTokens ? { context_window_tokens: Number(value.contextWindowTokens) } : {}),
+      ...(value.clearContextWindowOverride ? { context_window_override_tokens: null }
+        : !presetForRoute(value.baseURL, value.modelName) && value.contextWindowOverrideTokens ? { context_window_override_tokens: Number(value.contextWindowOverrideTokens) } : {}),
     }),
     onSuccess: async (created, { presetID: selectedPresetID }) => {
       setFormOpen(false);
       setFormID(null);
       setForm(emptyForm);
       setPresetID('');
-      if (selectedPresetID) {
+      if (modelConnectionPresets.some((preset) => preset.id === selectedPresetID)) {
         try {
           await check.mutateAsync(created.id);
         } catch (error) {
@@ -75,7 +91,8 @@ export function AdminModels() {
   const update = useMutation({
     mutationFn: ({ id, value }: { id: string; value: ModelConnectionForm }) => portalApi.updateModelConnection(id, {
       name: value.name.trim(), base_url: value.baseURL.trim(), model_name: value.modelName.trim(),
-      ...(value.contextWindowTokens ? { context_window_tokens: Number(value.contextWindowTokens) } : {}),
+      ...(value.clearContextWindowOverride ? { context_window_override_tokens: null }
+        : !presetForRoute(value.baseURL, value.modelName) && value.contextWindowOverrideTokens ? { context_window_override_tokens: Number(value.contextWindowOverrideTokens) } : {}),
       ...(value.apiKey ? { api_key: value.apiKey } : {}),
     }),
     onSuccess: async () => {
@@ -112,11 +129,13 @@ export function AdminModels() {
   }
 
   function openEdit(model: AdminModelConnection) {
+    const preset = presetForRoute(model.base_url, model.model_name);
     setFormOpen(true);
     setFormID(model.id);
     setForm({ name: model.name, baseURL: model.base_url, modelName: model.model_name,
-      contextWindowTokens: model.context_window_tokens ? String(model.context_window_tokens) : '', apiKey: '' });
-    setPresetID('');
+      contextWindowOverrideTokens: preset ? '' : model.context_window_override_tokens ? String(model.context_window_override_tokens) : '',
+      clearContextWindowOverride: false, apiKey: '' });
+    setPresetID(preset?.id ?? 'custom');
     create.reset();
     update.reset();
   }
@@ -144,7 +163,7 @@ export function AdminModels() {
             {models.map((model) => <tr key={model.id}>
               <td><strong>{model.name}</strong><small className="table-sub">{model.model_name}</small></td>
               <td className="mono">{model.base_url}</td>
-              <td>{model.context_window_tokens ? `${model.context_window_tokens.toLocaleString()} tokens` : '未配置'}</td>
+              <td>{model.context_window_tokens ? `${model.context_window_tokens.toLocaleString()} tokens` : '暂未识别'}<small className="table-sub">来源：{contextWindowSourceLabel(model.context_window_source)}{model.context_window_catalog_version ? ` · 目录 ${model.context_window_catalog_version}` : ''}</small></td>
               <td>{model.has_api_key ? '已配置' : '未配置'}</td>
               <td>{model.checked_at ? <><span>{capabilitySummary(model.capabilities)} · 流式能力{model.capabilities.text_stream ? '可用' : '未验证'}</span><small className="table-sub">已检查 · {formatDate(model.checked_at)}</small></> : <span className="muted">尚未检查</span>}
                 {checked?.id === model.id && <p className="notice notice-info model-check-result">本次检查：{capabilitySummary(checked.capabilities)}</p>}
@@ -169,30 +188,35 @@ export function AdminModels() {
           </tbody></table></div>}
     </section>
 
-    {formOpen && <Modal title={formID === null ? '添加平台模型连接' : '编辑平台模型连接'} onClose={closeForm}><ModelConnectionFormView form={form} setForm={setForm} presetID={presetID} setPresetID={setPresetID} isEditing={formID !== null} onSubmit={submit} pending={formMutation.isPending} error={formMutation.error} onCancel={closeForm} /></Modal>}
+    {formOpen && <Modal title={formID === null ? '添加平台模型连接' : '编辑平台模型连接'} onClose={closeForm}><ModelConnectionFormView form={form} setForm={setForm} presetID={presetID} setPresetID={setPresetID} isEditing={formID !== null} legacyOverride={models.find((model) => model.id === formID)?.context_window_override_tokens ?? null} onSubmit={submit} pending={formMutation.isPending} error={formMutation.error} onCancel={closeForm} /></Modal>}
   </section>;
 }
 
-function ModelConnectionFormView({ form, setForm, presetID, setPresetID, isEditing, onSubmit, pending, error, onCancel }: {
+function ModelConnectionFormView({ form, setForm, presetID, setPresetID, isEditing, legacyOverride, onSubmit, pending, error, onCancel }: {
   form: ModelConnectionForm;
   setForm: (value: ModelConnectionForm) => void;
   presetID: string;
   setPresetID: (value: string) => void;
   isEditing: boolean;
+  legacyOverride: number | null;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   pending: boolean;
   error: Error | null;
   onCancel: () => void;
 }) {
+  const isSystemRoute = Boolean(presetForRoute(form.baseURL, form.modelName));
+  const isPresetSelection = modelConnectionPresets.some((preset) => preset.id === presetID);
   return <form className="connection-form" onSubmit={onSubmit}>
     <p className="muted">{isEditing ? '仅维护共享的平台连接。密钥不会回显；留空可保留当前密钥。修改模型地址后需要重新检查连接。' : '仅维护共享的平台连接。选择预设后填写 API 密钥即可；保存时会检查连接，以便设置为平台默认模型。'}</p>
     <div className="connection-form-grid">
-      {!isEditing && <div className="connection-form-wide"><label htmlFor="admin-model-preset">选择服务和模型</label><select id="admin-model-preset" value={presetID} onChange={(event) => {
+      <div className="connection-form-wide"><label htmlFor="admin-model-preset">选择服务和模型</label><select id="admin-model-preset" value={presetID} onChange={(event) => {
         const preset = modelConnectionPresets.find((item) => item.id === event.target.value);
-        setPresetID(preset?.id ?? '');
-        if (preset) setForm({ ...form, name: preset.name, baseURL: preset.baseURL, modelName: preset.modelName });
+        setPresetID(preset?.id ?? (event.target.value === 'custom' ? 'custom' : ''));
+        if (preset) setForm({ ...form, name: preset.name, baseURL: preset.baseURL, modelName: preset.modelName, contextWindowOverrideTokens: '', clearContextWindowOverride: false });
+        else if (event.target.value === 'custom' && legacyOverride != null) setForm({ ...form, contextWindowOverrideTokens: String(legacyOverride), clearContextWindowOverride: false });
       }}>
-        <option value="">选择预设，或手动填写兼容模型</option>
+        <option value="">选择服务商和模型</option>
+        <option value="custom">自定义兼容模型</option>
         <optgroup label="OpenAI / GPT">
           {modelConnectionPresets.filter((preset) => preset.id.startsWith('gpt-')).map((preset) => <option key={preset.id} value={preset.id}>{preset.modelName}</option>)}
         </optgroup>
@@ -202,15 +226,17 @@ function ModelConnectionFormView({ form, setForm, presetID, setPresetID, isEditi
         <optgroup label="Z.ai / GLM">
           {modelConnectionPresets.filter((preset) => preset.id.startsWith('glm-')).map((preset) => <option key={preset.id} value={preset.id}>{preset.modelName}</option>)}
         </optgroup>
-      </select><small className="muted">自动填写模型名和服务地址；连接检查验证文本和工具调用，可能产生少量服务商费用。</small></div>}
+      </select><small className="muted">系统预设的上下文窗口由 Morde 自动识别；连接检查会发起模型调用，可能产生用量。</small></div>
       <div><label htmlFor="admin-model-name">显示名称</label><input id="admin-model-name" value={form.name} maxLength={80} required onChange={(event) => setForm({ ...form, name: event.target.value })} /></div>
-      <div><label htmlFor="admin-model-provider-name">模型名</label><input id="admin-model-provider-name" value={form.modelName} maxLength={256} required onChange={(event) => setForm({ ...form, modelName: event.target.value })} /></div>
-      <div className="connection-form-wide"><label htmlFor="admin-model-context-window">上下文窗口（tokens）</label><input id="admin-model-context-window" type="number" min={4096} max={1000000} step={1} value={form.contextWindowTokens} onChange={(event) => setForm({ ...form, contextWindowTokens: event.target.value })} /><small className="muted">按服务商模型文档填写。压缩需要此值；留空时会安全停用该模型的自动压缩。</small></div>
-      <div className="connection-form-wide"><label htmlFor="admin-model-base-url">服务地址</label><input id="admin-model-base-url" type="url" pattern="https://.*" value={form.baseURL} required onChange={(event) => setForm({ ...form, baseURL: event.target.value })} /><small className="muted">只接受 HTTPS；服务端还会执行出站地址校验。</small></div>
+      <div><label htmlFor="admin-model-provider-name">模型名</label><input id="admin-model-provider-name" value={form.modelName} maxLength={256} required readOnly={isPresetSelection} onChange={(event) => { setPresetID('custom'); setForm({ ...form, modelName: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false }); }} /></div>
+      {isSystemRoute && <p className="muted connection-form-wide">上下文窗口由 Morde 模型目录自动识别，不能手工修改。</p>}
+      {!isSystemRoute && <div className="connection-form-wide"><label htmlFor="admin-model-context-window">上下文窗口高级覆盖（tokens，可选）</label><input id="admin-model-context-window" type="number" min={4096} max={2000000} step={1} value={form.contextWindowOverrideTokens} onChange={(event) => setForm({ ...form, contextWindowOverrideTokens: event.target.value, clearContextWindowOverride: false })} /><small className="muted">只用于自动发现不到容量的自定义服务；留空则保持未知。</small></div>}
+      {isSystemRoute && isEditing && legacyOverride != null && <div className="connection-form-wide notice notice-info"><p>此系统预设保留了旧手工容量 {legacyOverride.toLocaleString()} tokens。</p><button type="button" className="button button-secondary button-small" disabled={form.clearContextWindowOverride} onClick={() => setForm({ ...form, clearContextWindowOverride: true })}>{form.clearContextWindowOverride ? '保存时将清除旧值' : '清除旧手工值，使用 Morde 目录容量'}</button></div>}
+      <div className="connection-form-wide"><label htmlFor="admin-model-base-url">服务地址</label><input id="admin-model-base-url" type="url" pattern="https://.*" value={form.baseURL} required readOnly={isPresetSelection} onChange={(event) => { setPresetID('custom'); setForm({ ...form, baseURL: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false }); }} /><small className="muted">只接受 HTTPS；服务端还会执行出站地址校验。</small></div>
       <div className="connection-form-wide"><label htmlFor="admin-model-api-key">API 密钥</label><input id="admin-model-api-key" type="password" autoComplete="new-password" value={form.apiKey} maxLength={4096} required={!isEditing} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} /><small className="muted">{isEditing ? '密钥不会回显；留空则保留已保存的密钥，输入新值才会替换。' : '密钥只提交给 Morde 服务端，保存后只显示“已配置”。'}</small></div>
     </div>
     {error && <FloatingError className="error-inline" role="alert">{errorDetails(error).message}</FloatingError>}
-    <div className="form-actions"><button type="button" className="button button-secondary" disabled={pending} onClick={onCancel}>取消</button><button type="submit" className="button button-primary" disabled={pending}>{pending ? '保存中…' : isEditing ? '保存连接' : presetID ? '添加并检查连接' : '添加连接'}</button></div>
+    <div className="form-actions"><button type="button" className="button button-secondary" disabled={pending} onClick={onCancel}>取消</button><button type="submit" className="button button-primary" disabled={pending}>{pending ? '保存中…' : isEditing ? '保存连接' : modelConnectionPresets.some((preset) => preset.id === presetID) ? '添加并检查连接' : '添加连接'}</button></div>
   </form>;
 }
 

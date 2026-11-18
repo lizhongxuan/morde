@@ -202,38 +202,27 @@ struct MIFResourceRoom: View {
     let state: MIFResourcePageState
     let actions: MIFResourcePageActions
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.colorScheme) private var colorScheme
     @State private var resourceToast: String?
     @State private var resourceToastID = UUID()
 
     private var rowIconFill: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.fill
-            : Color(red: 236.0 / 255.0, green: 236.0 / 255.0, blue: 240.0 / 255.0)
+        NanoMuseTones.fill
     }
 
     private var rowIconStrokeColor: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.ink
-            : Color(red: 58.0 / 255.0, green: 58.0 / 255.0, blue: 60.0 / 255.0)
+        NanoMuseTones.ink
     }
 
     private var rowSummaryColor: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.secondaryText
-            : Color(red: 115.0 / 255.0, green: 115.0 / 255.0, blue: 120.0 / 255.0)
+        NanoMuseTones.secondaryText
     }
 
     private var rowStatusColor: Color {
-        Color(uiColor: colorScheme == .dark
-              ? UIColor.tertiaryLabel
-              : UIColor(red: 172.0 / 255.0, green: 172.0 / 255.0, blue: 177.0 / 255.0, alpha: 1))
+        NanoMuseTones.muted
     }
 
     private var resourceCanvasColor: Color {
-        colorScheme == .dark
-            ? .black
-            : Color(red: 250.0 / 255.0, green: 250.0 / 255.0, blue: 250.0 / 255.0)
+        NanoMuseTones.canvas
     }
 
     var body: some View {
@@ -291,11 +280,12 @@ struct MIFResourceRoom: View {
             if let resourceToast {
                 Text(resourceToast)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(NanoMuseTones.ink)
                     .padding(.horizontal, 15)
                     .padding(.vertical, 10)
-                    .background(Color.black.opacity(0.95), in: Capsule())
-                    .shadow(color: .black.opacity(0.25), radius: 14, x: 0, y: 10)
+                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+                    .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
                     .allowsHitTesting(false)
                     .accessibilityIdentifier("morde.resources.add.unavailable")
                     .transition(.opacity)
@@ -313,7 +303,7 @@ struct MIFResourceRoom: View {
                 .foregroundStyle(NanoMuseTones.ink)
                 .frame(width: 38, height: 38)
                 .background(NanoMuseTones.surface, in: Circle())
-                .overlay(Circle().strokeBorder(Color.primary.opacity(0.09), lineWidth: 1))
+                .overlay(Circle().strokeBorder(NanoMuseTones.hairline, lineWidth: 1))
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
@@ -354,7 +344,7 @@ struct MIFResourceRoom: View {
                 .foregroundStyle(NanoMuseTones.ink)
                 .frame(width: 38, height: 38)
                 .background(NanoMuseTones.surface, in: Circle())
-                .overlay(Circle().strokeBorder(Color.primary.opacity(0.09), lineWidth: 1))
+                .overlay(Circle().strokeBorder(NanoMuseTones.hairline, lineWidth: 1))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -431,7 +421,7 @@ struct MIFResourceRoom: View {
                         if host.status == .running && !host.canOpen && host.scope == .owned {
                             Text(AppLocalized("电脑文件尚未就绪，暂时无法打开这台电脑。"))
                                 .font(.footnote)
-                                .foregroundStyle(Color.primary)
+                                .foregroundStyle(NanoMuseTones.ink)
                                 .padding(.top, 1)
                         } else if host.scope == .sharedUnavailable && host.status == .running {
                             Text(AppLocalized("You do not have permission to view this computer."))
@@ -442,7 +432,7 @@ struct MIFResourceRoom: View {
                         if let error = host.error {
                             Text(error)
                                 .font(.footnote)
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(NanoMuseTones.dangerInk)
                                 .padding(.top, 1)
                                 .accessibilityIdentifier("morde.resources.host.error.\(host.id)")
                         }
@@ -498,7 +488,7 @@ struct MIFResourceRoom: View {
             Label("\(AppLocalized("Agent Runtime")) · \(host.runtimeStatus.localizedTitle)",
                   systemImage: "antenna.radiowaves.left.and.right")
                 .font(.caption.weight(.medium))
-                .foregroundStyle(host.runtimeStatus == .offline ? Color.orange : rowStatusColor)
+                .foregroundStyle(host.runtimeStatus == .offline ? NanoMuseTones.warning : rowStatusColor)
                 .accessibilityIdentifier("morde.resources.host.runtime.\(host.id)")
             if let lastSeenAt = host.runtimeLastSeenAt {
                 Text(String(format: AppLocalized("Last seen: %@"),
@@ -518,7 +508,7 @@ struct MIFResourceRoom: View {
                 if control.lease == .expired {
                     Label(control.lease.localizedTitle, systemImage: "exclamationmark.lock")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NanoMuseTones.warning)
                 } else {
                     Label(control.state.localizedTitle, systemImage: "lock.shield")
                         .font(.caption.weight(.medium))
@@ -526,21 +516,21 @@ struct MIFResourceRoom: View {
                 if let error = control.error {
                     Text(error)
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NanoMuseTones.dangerInk)
                         .accessibilityIdentifier("morde.resources.host.controlError.\(host.id)")
                 }
             }
         } else {
             Text(AppLocalized("Control status unknown; control actions are disabled."))
                 .font(.footnote)
-                .foregroundStyle(.orange)
+                .foregroundStyle(NanoMuseTones.warning)
         }
     }
 
     private var resourceDisclosureChevron: some View {
         Text("›")
             .font(.system(size: 20, weight: .light))
-            .foregroundStyle(Color(red: 198.0 / 255.0, green: 198.0 / 255.0, blue: 203.0 / 255.0))
+            .foregroundStyle(NanoMuseTones.muted)
             .padding(.top, 9)
             .accessibilityHidden(true)
     }

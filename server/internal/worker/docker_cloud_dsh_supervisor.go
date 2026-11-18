@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	dockerDSHUser     = "65532:65532"
-	dockerDSHMemory   = int64(512 << 20)
-	dockerDSHNanoCPUs = int64(1_000_000_000)
-	dockerDSHPIDs     = int64(64)
+	dockerDSHUser         = "65532:65532"
+	dockerDSHWorkspaceDir = "/workspace"
+	dockerDSHMemory       = int64(512 << 20)
+	dockerDSHNanoCPUs     = int64(1_000_000_000)
+	dockerDSHPIDs         = int64(64)
 )
 
 var dockerDSHImageDigest = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
@@ -56,11 +57,12 @@ type DockerCloudDSHGuardian interface {
 }
 
 type DockerCloudDSHSupervisorOptions struct {
-	DockerHost string
-	Image      string
-	NodePath   string
-	ScriptPath string
-	Guardian   DockerCloudDSHGuardian
+	DockerHost    string
+	Image         string
+	NodePath      string
+	ScriptPath    string
+	Guardian      DockerCloudDSHGuardian
+	WorkspacePath func(context.Context, string) (string, error)
 }
 
 type DockerCloudDSHSupervisor struct {
@@ -76,8 +78,9 @@ func NewDockerCloudDSHSupervisor(options DockerCloudDSHSupervisorOptions) (*Dock
 	endpoint, err := url.Parse(options.DockerHost)
 	if err != nil || endpoint.Scheme != "unix" || endpoint.Host != "" || endpoint.User != nil || endpoint.Opaque != "" || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" ||
 		!filepath.IsAbs(endpoint.Path) || filepath.Clean(endpoint.Path) != endpoint.Path || endpoint.Path == "/" ||
-		!dockerDSHImageDigest.MatchString(options.Image) || !cleanDockerDSHPath(options.NodePath) || !cleanDockerDSHPath(options.ScriptPath) || options.Guardian == nil {
-		return nil, errors.New("docker dsh supervisor requires a Unix socket, pinned image, fixed command and independent guardian")
+		!dockerDSHImageDigest.MatchString(options.Image) || !cleanDockerDSHPath(options.NodePath) || !cleanDockerDSHPath(options.ScriptPath) ||
+		options.Guardian == nil || options.WorkspacePath == nil {
+		return nil, errors.New("docker dsh supervisor requires a Unix socket, pinned image, fixed command, Agent Workspace resolver, and independent guardian")
 	}
 	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", endpoint.Path)
@@ -116,12 +119,14 @@ func (s *DockerCloudDSHSupervisor) validateImage(ctx context.Context) error {
 	return nil
 }
 
-func (s *DockerCloudDSHSupervisor) containerCreateForScript(labels map[string]string, scriptPath string) any {
+func (s *DockerCloudDSHSupervisor) containerCreateForScript(labels map[string]string, scriptPath, workspacePath string) any {
+	workspaceEnv := "MORDE_WORKSPACE_DIR=" + dockerDSHWorkspaceDir
 	return map[string]any{
 		"Image":      s.options.Image,
 		"User":       dockerDSHUser,
-		"Env":        []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"},
-		"Entrypoint": []string{"/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production", s.options.NodePath},
+		"WorkingDir": dockerDSHWorkspaceDir,
+		"Env":        []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production", workspaceEnv},
+		"Entrypoint": []string{"/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production", workspaceEnv, s.options.NodePath},
 		"Cmd":        []string{scriptPath},
 		"Labels":     labels,
 		"OpenStdin":  true, "AttachStdin": true, "AttachStdout": true, "AttachStderr": false,
@@ -134,6 +139,7 @@ func (s *DockerCloudDSHSupervisor) containerCreateForScript(labels map[string]st
 			"PidsLimit": dockerDSHPIDs, "IpcMode": "private", "CgroupnsMode": "private",
 			"Init": true, "AutoRemove": false, "LogConfig": map[string]any{"Type": "none", "Config": map[string]string{}},
 			"RestartPolicy": map[string]any{"Name": "no"},
+			"Mounts":        []map[string]any{{"Type": "bind", "Source": workspacePath, "Target": dockerDSHWorkspaceDir, "ReadOnly": true}},
 		},
 	}
 }
@@ -144,6 +150,7 @@ type dockerDSHInspect struct {
 	Config struct {
 		Image           string                     `json:"Image"`
 		User            string                     `json:"User"`
+		WorkingDir      string                     `json:"WorkingDir"`
 		Env             []string                   `json:"Env"`
 		Entrypoint      []string                   `json:"Entrypoint"`
 		Cmd             []string                   `json:"Cmd"`
@@ -161,26 +168,26 @@ type dockerDSHInspect struct {
 		} `json:"Healthcheck"`
 	} `json:"Config"`
 	HostConfig struct {
-		NetworkMode    string            `json:"NetworkMode"`
-		ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
-		Privileged     bool              `json:"Privileged"`
-		CapDrop        []string          `json:"CapDrop"`
-		CapAdd         []string          `json:"CapAdd"`
-		SecurityOpt    []string          `json:"SecurityOpt"`
-		Memory         int64             `json:"Memory"`
-		MemorySwap     int64             `json:"MemorySwap"`
-		NanoCPUs       int64             `json:"NanoCpus"`
-		PidsLimit      *int64            `json:"PidsLimit"`
-		IpcMode        string            `json:"IpcMode"`
-		CgroupnsMode   string            `json:"CgroupnsMode"`
-		PidMode        string            `json:"PidMode"`
-		Init           *bool             `json:"Init"`
-		AutoRemove     bool              `json:"AutoRemove"`
-		Binds          []string          `json:"Binds"`
-		Mounts         []json.RawMessage `json:"Mounts"`
-		Devices        []json.RawMessage `json:"Devices"`
-		DeviceRequests []json.RawMessage `json:"DeviceRequests"`
-		VolumesFrom    []string          `json:"VolumesFrom"`
+		NetworkMode    string               `json:"NetworkMode"`
+		ReadonlyRootfs bool                 `json:"ReadonlyRootfs"`
+		Privileged     bool                 `json:"Privileged"`
+		CapDrop        []string             `json:"CapDrop"`
+		CapAdd         []string             `json:"CapAdd"`
+		SecurityOpt    []string             `json:"SecurityOpt"`
+		Memory         int64                `json:"Memory"`
+		MemorySwap     int64                `json:"MemorySwap"`
+		NanoCPUs       int64                `json:"NanoCpus"`
+		PidsLimit      *int64               `json:"PidsLimit"`
+		IpcMode        string               `json:"IpcMode"`
+		CgroupnsMode   string               `json:"CgroupnsMode"`
+		PidMode        string               `json:"PidMode"`
+		Init           *bool                `json:"Init"`
+		AutoRemove     bool                 `json:"AutoRemove"`
+		Binds          []string             `json:"Binds"`
+		Mounts         []dockerDSHMountSpec `json:"Mounts"`
+		Devices        []json.RawMessage    `json:"Devices"`
+		DeviceRequests []json.RawMessage    `json:"DeviceRequests"`
+		VolumesFrom    []string             `json:"VolumesFrom"`
 		LogConfig      struct {
 			Type string `json:"Type"`
 		} `json:"LogConfig"`
@@ -194,7 +201,21 @@ type dockerDSHInspect struct {
 		Paused     *bool `json:"Paused"`
 		PID        *int  `json:"Pid"`
 	} `json:"State"`
-	Mounts []json.RawMessage `json:"Mounts"`
+	Mounts []dockerDSHMountInspect `json:"Mounts"`
+}
+
+type dockerDSHMountSpec struct {
+	Type     string `json:"Type"`
+	Source   string `json:"Source"`
+	Target   string `json:"Target"`
+	ReadOnly bool   `json:"ReadOnly"`
+}
+
+type dockerDSHMountInspect struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	RW          bool   `json:"RW"`
 }
 
 func (s *DockerCloudDSHSupervisor) inspect(ctx context.Context, id string) (dockerDSHInspect, error) {
@@ -203,12 +224,14 @@ func (s *DockerCloudDSHSupervisor) inspect(ctx context.Context, id string) (dock
 	return inspected, err
 }
 
-func (s *DockerCloudDSHSupervisor) validContainerIsolation(value dockerDSHInspect, scriptPath string, running bool) bool {
+func (s *DockerCloudDSHSupervisor) validContainerIsolation(value dockerDSHInspect, scriptPath, workspacePath string, running bool) bool {
 	config, host := value.Config, value.HostConfig
-	wantEnv := []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}
-	wantEntrypoint := []string{"/usr/bin/env", "-i", wantEnv[0], wantEnv[1], wantEnv[2], s.options.NodePath}
+	wantEnv := []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production", "MORDE_WORKSPACE_DIR=" + dockerDSHWorkspaceDir}
+	wantEntrypoint := []string{"/usr/bin/env", "-i", wantEnv[0], wantEnv[1], wantEnv[2], wantEnv[3], s.options.NodePath}
+	wantHostMount := []dockerDSHMountSpec{{Type: "bind", Source: workspacePath, Target: dockerDSHWorkspaceDir, ReadOnly: true}}
+	wantContainerMount := []dockerDSHMountInspect{{Type: "bind", Source: workspacePath, Destination: dockerDSHWorkspaceDir, RW: false}}
 	if value.State == nil || value.State.Running == nil || value.State.Restarting == nil || value.State.Paused == nil || value.State.PID == nil ||
-		config.Image != s.options.Image || config.User != dockerDSHUser ||
+		config.Image != s.options.Image || config.User != dockerDSHUser || config.WorkingDir != dockerDSHWorkspaceDir ||
 		!equalDockerDSHEnv(config.Env, wantEnv) || !slices.Equal(config.Entrypoint, wantEntrypoint) || !slices.Equal(config.Cmd, []string{scriptPath}) ||
 		len(config.Volumes) != 0 || !config.OpenStdin || !config.AttachStdin || !config.AttachStdout || config.AttachStderr || !config.StdinOnce || config.Tty || !config.NetworkDisabled ||
 		config.Healthcheck == nil || !slices.Equal(config.Healthcheck.Test, []string{"NONE"}) ||
@@ -217,11 +240,20 @@ func (s *DockerCloudDSHSupervisor) validContainerIsolation(value dockerDSHInspec
 		host.Memory != dockerDSHMemory || host.MemorySwap != dockerDSHMemory || host.NanoCPUs != dockerDSHNanoCPUs ||
 		host.PidsLimit == nil || *host.PidsLimit != dockerDSHPIDs || host.IpcMode != "private" || host.CgroupnsMode != "private" ||
 		(host.PidMode != "" && host.PidMode != "private") || host.Init == nil || !*host.Init || host.AutoRemove ||
-		len(host.Binds) != 0 || len(host.Mounts) != 0 || len(host.Devices) != 0 || len(host.DeviceRequests) != 0 || len(host.VolumesFrom) != 0 || len(value.Mounts) != 0 ||
+		len(host.Binds) != 0 || !equalDockerDSHMountSpecs(host.Mounts, wantHostMount) || !equalDockerDSHMountInspect(value.Mounts, wantContainerMount) ||
+		len(host.Devices) != 0 || len(host.DeviceRequests) != 0 || len(host.VolumesFrom) != 0 ||
 		host.LogConfig.Type != "none" || host.RestartPolicy.Name != "no" || *value.State.Restarting || *value.State.Paused || (running && !*value.State.Running) {
 		return false
 	}
 	return true
+}
+
+func equalDockerDSHMountSpecs(got, want []dockerDSHMountSpec) bool {
+	return len(got) == 1 && len(want) == 1 && got[0] == want[0]
+}
+
+func equalDockerDSHMountInspect(got, want []dockerDSHMountInspect) bool {
+	return len(got) == 1 && len(want) == 1 && got[0] == want[0]
 }
 
 func equalDockerDSHEnv(got, expected []string) bool {

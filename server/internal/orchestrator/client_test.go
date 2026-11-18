@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -135,6 +136,105 @@ func TestCreateRequiresRegisteredVolumesToExist(t *testing.T) {
 	}
 	if createIfNotExists {
 		t.Fatal("OpenSandbox createIfNotExists = true for a registered Workspace volume")
+	}
+}
+
+func TestCreateSerializesWritableHostPathVolume(t *testing.T) {
+	gotBody := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read sandbox request: %v", err)
+		}
+		gotBody <- body
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `{"id":"sandbox-host-path","status":{"state":"Running"}}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, nil)
+	client.checkNetworkPolicy = func(context.Context, string, string) error { return nil }
+	_, err := client.Create(context.Background(), app.SandboxCreateRequest{
+		Image: "registry.local/cloudhost/host:1.0.0",
+		Volumes: []app.SandboxVolume{{
+			Name: "workspace", MountPath: "/home/gem/workspace",
+			HostPath:        "/srv/morde-workspace-sync/current/owner/workspace",
+			RequireExisting: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+
+	var request struct {
+		Volumes []struct {
+			Name      string `json:"name"`
+			MountPath string `json:"mountPath"`
+			Host      struct {
+				Path string `json:"path"`
+			} `json:"host"`
+			PVC      json.RawMessage `json:"pvc"`
+			ReadOnly *bool           `json:"readOnly"`
+		} `json:"volumes"`
+	}
+	if err := json.Unmarshal(<-gotBody, &request); err != nil {
+		t.Fatalf("decode captured request: %v", err)
+	}
+	if len(request.Volumes) != 1 {
+		t.Fatalf("volumes = %#v, want one host path volume", request.Volumes)
+	}
+	volume := request.Volumes[0]
+	if volume.Name != "workspace" || volume.MountPath != "/home/gem/workspace" || volume.Host.Path != "/srv/morde-workspace-sync/current/owner/workspace" {
+		t.Fatalf("host volume = %#v", volume)
+	}
+	if len(volume.PVC) != 0 {
+		t.Fatalf("host volume also serialized a PVC backend: %s", volume.PVC)
+	}
+	if volume.ReadOnly == nil || *volume.ReadOnly {
+		t.Fatalf("host volume readOnly = %v, want explicit read-write false", volume.ReadOnly)
+	}
+}
+
+func TestCreateRejectsInvalidHostPathVolumesBeforeRequest(t *testing.T) {
+	for name, volume := range map[string]app.SandboxVolume{
+		"relative host path": {
+			Name: "workspace", MountPath: "/home/gem/workspace", HostPath: "relative/workspace", RequireExisting: true,
+		},
+		"traversal in host path": {
+			Name: "workspace", MountPath: "/home/gem/workspace", HostPath: "/srv/workspaces/../other", RequireExisting: true,
+		},
+		"root host path": {
+			Name: "workspace", MountPath: "/home/gem/workspace", HostPath: "/", RequireExisting: true,
+		},
+		"root container mount": {
+			Name: "workspace", MountPath: "/", HostPath: "/srv/workspaces/alice", RequireExisting: true,
+		},
+		"not prevalidated": {
+			Name: "workspace", MountPath: "/home/gem/workspace", HostPath: "/srv/workspaces/alice",
+		},
+		"mixed PVC and host backends": {
+			Name: "workspace", MountPath: "/home/gem/workspace", HostPath: "/srv/workspaces/alice",
+			ClaimName: "workspace-1", RequireExisting: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+
+			client := newTestClient(server.URL, nil)
+			client.checkNetworkPolicy = func(context.Context, string, string) error { return nil }
+			_, err := client.Create(context.Background(), app.SandboxCreateRequest{Image: "host", Volumes: []app.SandboxVolume{volume}})
+			if !errors.Is(err, app.ErrSandboxUnsupported) {
+				t.Fatalf("Create() error = %v, want ErrSandboxUnsupported", err)
+			}
+			if got := requests.Load(); got != 0 {
+				t.Fatalf("OpenSandbox requests = %d, want 0", got)
+			}
+		})
 	}
 }
 

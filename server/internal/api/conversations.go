@@ -70,6 +70,7 @@ type messageResponse struct {
 	ClientMessageID           string                            `json:"client_message_id,omitempty"`
 	RoutingStatus             conversation.RoutingStatus        `json:"routing_status,omitempty"`
 	RoutingFailureReason      conversation.RoutingFailureReason `json:"routing_failure_reason,omitempty"`
+	AgentAcknowledged         bool                              `json:"agent_acknowledged"`
 	Sources                   []conversation.MessageSource      `json:"sources,omitempty"`
 	DeliveryStatus            conversation.DeliveryStatus       `json:"delivery_status"`
 	OutputStatus              conversation.OutputStatus         `json:"output_status,omitempty"`
@@ -587,6 +588,7 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		(value.RelatedTaskID != "" && (value.DuplicateOfMessageID == "" || !domain.ValidTaskID(value.RelatedTaskID))) ||
 		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.Sequence < 1 || value.CreatedAt.IsZero() ||
 		!deliveryStatus.Valid() || (value.RoutingStatus != "" && !value.RoutingStatus.Valid()) ||
+		(value.AgentAcknowledged && value.Role != conversation.RoleUser) ||
 		(value.RoutingFailureReason != "" && !value.RoutingFailureReason.Valid()) {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
@@ -621,8 +623,9 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		TaskID: value.TaskID, DuplicateOfMessageID: value.DuplicateOfMessageID, RelatedTaskID: value.RelatedTaskID,
 		AttachmentIDs:   append([]string(nil), value.AttachmentIDs...),
 		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
-		Sources:        append([]conversation.MessageSource(nil), value.Sources...),
-		DeliveryStatus: deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,
+		AgentAcknowledged: value.AgentAcknowledged,
+		Sources:           append([]conversation.MessageSource(nil), value.Sources...),
+		DeliveryStatus:    deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,
 		OutputResultEventSequence: value.OutputResultEventSequence, VariantGroupID: value.VariantGroupID,
 		VariantVersion: value.VariantVersion, VariantAction: value.VariantAction, CreatedAt: value.CreatedAt,
 	}, nil

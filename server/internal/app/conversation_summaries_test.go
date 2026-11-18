@@ -148,7 +148,7 @@ func TestConversationSummaryPromptDigestBindsTextAndProof(t *testing.T) {
 	if _, err := ConversationSummaryPromptDigest([]ConversationSummaryPromptSource{firstPart, secondPart}); err == nil {
 		t.Fatal("accepted non-contiguous chunks from one source")
 	}
-	if page, err := ConversationSummaryInputPageBudget(4096); err != nil || page != 8192 {
+	if page, err := ConversationSummaryInputPageBudget(4096); err != nil || page != MaxConversationSummaryInputPageBytes {
 		t.Fatalf("minimum-window page budget = %d, %v", page, err)
 	}
 	if page, err := ConversationSummaryInputPageBudget(32_768); err != nil || page != MaxConversationSummaryInputPageBytes {

@@ -31,6 +31,43 @@ private func ios03HTTPResponseMatchesOrigin(_ response: HTTPURLResponse, origin:
 }
 
 final class IOS03SimulatorAcceptanceUITests: XCTestCase {
+    private struct TaskActivityConfiguration {
+        let origin: URL
+        let username: String
+        let password: String
+        let taskID: String
+        let objective: String
+        let stepTitle: String
+    }
+
+    private struct TaskActivityFixtureConfiguration {
+        let token: String
+        let scenario: String
+        let progressTitle: String
+    }
+
+    private struct TaskActivityFixtureRun: Decodable {
+        let name: String
+        let objective: String
+        let stage: String
+        let taskID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case name, objective, stage
+            case taskID = "task_id"
+        }
+    }
+
+    private struct TaskActivityFixtureStatus: Decodable {
+        let runs: [TaskActivityFixtureRun]
+        let activeEventStreams: [String: [String: Int]]
+
+        enum CodingKeys: String, CodingKey {
+            case runs
+            case activeEventStreams = "active_event_streams"
+        }
+    }
+
     private func openComputerFiles(_ app: XCUIApplication, hostID: String) {
         let host = app.buttons["morde.resources.host.open.\(hostID)"]
         XCTAssertTrue(host.waitForExistence(timeout: 10))
@@ -87,65 +124,55 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
     @MainActor
     func testTaskActivityShowsSharedPortalTask() throws {
-        let environment = ProcessInfo.processInfo.environment
-        guard let configuredOrigin = environment["MORDE_TASK_ACTIVITY_PORTAL_ORIGIN"],
-              let username = environment["MORDE_TASK_ACTIVITY_USERNAME"], !username.isEmpty,
-              let password = environment["MORDE_TASK_ACTIVITY_PASSWORD"], !password.isEmpty,
-              let taskID = environment["MORDE_TASK_ACTIVITY_TASK_ID"], !taskID.isEmpty,
-              let expectedObjective = environment["MORDE_TASK_ACTIVITY_OBJECTIVE"], !expectedObjective.isEmpty,
-              let expectedStepTitle = environment["MORDE_TASK_ACTIVITY_STEP_TITLE"], !expectedStepTitle.isEmpty else {
-            throw XCTSkip("Set local Portal task activity credentials, origin, task ID, objective, and step title.")
-        }
-
-        guard configuredOrigin == configuredOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
-              var components = URLComponents(string: Self.repairLoopbackSchemeSeparator(configuredOrigin)),
-              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
-              let host = components.host?.lowercased(), Self.isLocalPortalHost(host),
-              components.user == nil, components.password == nil,
-              components.query == nil, components.fragment == nil,
-              components.path.isEmpty || components.path == "/",
-              components.port.map({ (1...65_535).contains($0) }) ?? true,
-              components.url != nil else {
-            XCTFail("The task activity acceptance origin must be a local loopback origin.")
-            return
-        }
-        components.scheme = scheme
-        components.host = host
-        components.path = ""
-
-        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        app.launchArguments = ["-morde.server", components.string!, "-AppleLanguages", "(zh-Hans)"]
-        app.launch()
-
-        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu"
-        )).firstMatch
-        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
-        if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
-
-        let usernameField = app.textFields["morde.auth.username"]
-        XCTAssertTrue(usernameField.waitForExistence(timeout: 15))
-        usernameField.tap()
-        usernameField.typeText(username)
-        let passwordField = app.secureTextFields["morde.auth.password"]
-        passwordField.tap()
-        passwordField.typeText(password)
-        app.buttons["morde.auth.submit"].tap()
-
-        let tasksTab = app.buttons["morde.nav.tab.tasks"]
-        XCTAssertTrue(tasksTab.waitForExistence(timeout: 30), "The iOS client should open after local Portal sign-in.")
-        tasksTab.tap()
-        let taskRow = app.buttons["morde.tasks.row.\(taskID)"]
-        XCTAssertTrue(taskRow.waitForExistence(timeout: 30), "iOS should load the exact Task created by the PC client.")
-        taskRow.tap()
-
-        let objective = app.staticTexts["morde.task.objective"]
-        XCTAssertTrue(objective.waitForExistence(timeout: 20))
-        XCTAssertEqual(objective.label, expectedObjective)
+        let configuration = try taskActivityConfiguration(loopbackOnly: false)
+        let app = openTaskActivityDetail(configuration)
         let currentStep = app.descendants(matching: .any).matching(NSPredicate(
-            format: "label CONTAINS %@", expectedStepTitle
+            format: "label CONTAINS %@", configuration.stepTitle
         )).firstMatch
         XCTAssertTrue(currentStep.waitForExistence(timeout: 20), "The same Task's persisted activity should appear on iOS.")
+    }
+
+    @MainActor
+    func testTaskActivityShowsLiveProgressFromLocalPortalSSE() async throws {
+        let configuration = try taskActivityConfiguration(loopbackOnly: false)
+        let fixture = try taskActivityFixtureConfiguration(stepTitle: configuration.stepTitle)
+        let app = openTaskActivityDetail(configuration)
+
+        let existingStep = app.descendants(matching: .any).matching(NSPredicate(
+            format: "label CONTAINS %@", configuration.stepTitle
+        )).firstMatch
+        XCTAssertTrue(existingStep.waitForExistence(timeout: 20),
+                      "The seeded Task step should be visible before advancing the fixture.")
+
+        let liveEventQuery = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "morde.task.event.", fixture.progressTitle
+        ))
+        let liveStepQuery = app.staticTexts.matching(NSPredicate(
+            format: "label == %@", fixture.progressTitle
+        ))
+        guard !liveEventQuery.firstMatch.exists else {
+            XCTFail("The fixture progress event must be new for this Task.")
+            return
+        }
+
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
+        sessionConfiguration.timeoutIntervalForRequest = 8
+        let fixtureSession = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
+        defer { fixtureSession.invalidateAndCancel() }
+
+        try await waitForTaskActivityWatcher(configuration: configuration, fixture: fixture,
+                                             session: fixtureSession)
+        try await advanceTaskActivityFixture(configuration: configuration, fixture: fixture,
+                                             session: fixtureSession)
+
+        XCTAssertTrue(liveEventQuery.firstMatch.waitForExistence(timeout: 30),
+                      "The unique task.step SSE event should appear in the native task activity timeline.")
+        XCTAssertTrue(liveStepQuery.firstMatch.waitForExistence(timeout: 30),
+                      "The event snapshot should update the native Task step list.")
     }
 
     @MainActor
@@ -5085,6 +5112,206 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         guard octets.count == 4 else { return false }
         return octets[0] == 10 || (octets[0] == 172 && (16...31).contains(Int(octets[1]))) ||
             (octets[0] == 192 && octets[1] == 168)
+    }
+
+    private static func isLoopbackPortalHost(_ host: String) -> Bool {
+        ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host.lowercased())
+    }
+
+    private func taskActivityConfiguration(loopbackOnly: Bool) throws -> TaskActivityConfiguration {
+        let environment = ProcessInfo.processInfo.environment
+        guard let configuredOrigin = environment["MORDE_TASK_ACTIVITY_PORTAL_ORIGIN"],
+              let username = environment["MORDE_TASK_ACTIVITY_USERNAME"], !username.isEmpty,
+              let password = environment["MORDE_TASK_ACTIVITY_PASSWORD"], !password.isEmpty,
+              let taskID = environment["MORDE_TASK_ACTIVITY_TASK_ID"], !taskID.isEmpty,
+              let objective = environment["MORDE_TASK_ACTIVITY_OBJECTIVE"], !objective.isEmpty,
+              let stepTitle = environment["MORDE_TASK_ACTIVITY_STEP_TITLE"], !stepTitle.isEmpty else {
+            throw XCTSkip("Set local Portal task activity credentials, origin, task ID, objective, and step title.")
+        }
+
+        guard configuredOrigin == configuredOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
+              var components = URLComponents(string: Self.repairLoopbackSchemeSeparator(configuredOrigin)),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host?.lowercased(),
+              (loopbackOnly ? Self.isLoopbackPortalHost(host) : Self.isLocalPortalHost(host)),
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              components.port.map({ (1...65_535).contains($0) }) ?? true else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: loopbackOnly
+                            ? "The live SSE acceptance origin must use localhost or 127.0.0.1."
+                            : "The task activity acceptance origin must be local."])
+        }
+        components.scheme = scheme
+        components.host = host
+        components.path = ""
+        guard let origin = components.url else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not normalize the local Portal origin."])
+        }
+        return TaskActivityConfiguration(origin: origin, username: username, password: password,
+                                         taskID: taskID, objective: objective, stepTitle: stepTitle)
+    }
+
+    private func taskActivityFixtureConfiguration(stepTitle: String) throws -> TaskActivityFixtureConfiguration {
+        let environment = ProcessInfo.processInfo.environment
+        guard let token = environment["MORDE_TASK_ACTIVITY_FIXTURE_TOKEN"], !token.isEmpty,
+              let scenario = environment["MORDE_TASK_ACTIVITY_SCENARIO"], !scenario.isEmpty,
+              let progressTitle = environment["MORDE_TASK_ACTIVITY_PROGRESS_TITLE"], !progressTitle.isEmpty else {
+            throw XCTSkip("Set the local fixture token, scenario, and expected progress title for live SSE acceptance.")
+        }
+        let allowedScenarios: Set<String> = [
+            "merge-a", "merge-b", "search", "separate-a", "separate-b",
+            "stream", "stream-other", "failed", "approval",
+        ]
+        guard allowedScenarios.contains(scenario) else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "The fixture scenario is not an allowed local activity scenario."])
+        }
+        let expectedProgressTitle = scenario == "search" ? "正在检索固定的本地索引" : "正在整理测试信息"
+        guard progressTitle == expectedProgressTitle, progressTitle != stepTitle,
+              token == token.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.contains("\r"), !token.contains("\n") else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "The expected progress title or local fixture token is invalid."])
+        }
+        return TaskActivityFixtureConfiguration(token: token, scenario: scenario, progressTitle: progressTitle)
+    }
+
+    @MainActor
+    private func openTaskActivityDetail(_ configuration: TaskActivityConfiguration) -> XCUIApplication {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        let origin = configuration.origin.absoluteString
+        app.launchArguments = ["-morde.server", origin,
+                              "-morde.portalMessageTransportFailureFixture",
+                              "-morde.portalMessageTransportFailureOrigin", origin,
+                              "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+
+        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu"
+        )).firstMatch
+        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
+        if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
+
+        let usernameField = app.textFields["morde.auth.username"]
+        guard usernameField.waitForExistence(timeout: 15) else {
+            XCTFail("The local Portal sign-in form should be visible.")
+            return app
+        }
+        usernameField.tap()
+        usernameField.typeText(configuration.username)
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        XCTAssertTrue(passwordField.waitForExistence(timeout: 10))
+        passwordField.tap()
+        passwordField.typeText(configuration.password)
+        app.buttons["morde.auth.submit"].tap()
+
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allowLocalNetwork = springboard.alerts.buttons
+            .matching(NSPredicate(format: "label IN %@", ["Allow", "允许"])).firstMatch
+        if allowLocalNetwork.waitForExistence(timeout: 5) { allowLocalNetwork.tap() }
+
+        let tasksTab = app.buttons["morde.nav.tab.tasks"]
+        XCTAssertTrue(tasksTab.waitForExistence(timeout: 30), "The iOS client should open after local Portal sign-in.")
+        tasksTab.tap()
+        let taskRow = app.buttons["morde.tasks.row.\(configuration.taskID)"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 30), "iOS should load the configured synthetic Task.")
+        taskRow.tap()
+
+        let objective = app.staticTexts["morde.task.objective"]
+        XCTAssertTrue(objective.waitForExistence(timeout: 20))
+        XCTAssertEqual(objective.label, configuration.objective)
+        return app
+    }
+
+    private func taskActivityFixtureRequest(
+        configuration: TaskActivityConfiguration,
+        fixture: TaskActivityFixtureConfiguration,
+        session: URLSession,
+        path: String,
+        method: String
+    ) async throws -> (Data, HTTPURLResponse) {
+        guard var components = URLComponents(url: configuration.origin, resolvingAgainstBaseURL: false) else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not construct a local fixture request."])
+        }
+        components.path = path
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not construct a local fixture URL."])
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpShouldHandleCookies = false
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(fixture.token, forHTTPHeaderField: "X-Morde-Fixture-Token")
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              ios03HTTPResponseMatchesOrigin(httpResponse, origin: configuration.origin) else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 7,
+                          userInfo: [NSLocalizedDescriptionKey: "The fixture response did not come from the configured loopback origin."])
+        }
+        return (data, httpResponse)
+    }
+
+    private func taskActivityFixtureStatus(
+        configuration: TaskActivityConfiguration,
+        fixture: TaskActivityFixtureConfiguration,
+        session: URLSession
+    ) async throws -> TaskActivityFixtureStatus {
+        let (data, response) = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/status", method: "GET")
+        guard response.statusCode == 200 else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: response.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback fixture status endpoint returned HTTP \(response.statusCode)."])
+        }
+        return try JSONDecoder().decode(TaskActivityFixtureStatus.self, from: data)
+    }
+
+    private func waitForTaskActivityWatcher(
+        configuration: TaskActivityConfiguration,
+        fixture: TaskActivityFixtureConfiguration,
+        session: URLSession
+    ) async throws {
+        let deadline = Date().addingTimeInterval(30)
+        var lastObservation = "fixture run not found"
+        while Date() < deadline {
+            let status = try await taskActivityFixtureStatus(
+                configuration: configuration, fixture: fixture, session: session)
+            if let run = status.runs.first(where: { $0.name == fixture.scenario }) {
+                guard run.objective == configuration.objective, run.taskID == configuration.taskID else {
+                    throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 8,
+                                  userInfo: [NSLocalizedDescriptionKey: "The configured Task does not match the selected fixture run."])
+                }
+                let iosWatchers = status.activeEventStreams[configuration.taskID]?["ios"] ?? 0
+                if run.stage == "started" && iosWatchers > 0 { return }
+                lastObservation = "stage=\(run.stage), iOS event streams=\(iosWatchers)"
+            }
+            try await Task.sleep(nanoseconds: 300_000_000)
+        }
+        throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 9,
+                      userInfo: [NSLocalizedDescriptionKey: "The iOS SSE watcher did not attach to the started fixture Task within 30 seconds (\(lastObservation))."])
+    }
+
+    private func advanceTaskActivityFixture(
+        configuration: TaskActivityConfiguration,
+        fixture: TaskActivityFixtureConfiguration,
+        session: URLSession
+    ) async throws {
+        let path = "/__morde_fixture/advance/\(fixture.scenario)/progress"
+        let (_, response) = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: path, method: "POST")
+        guard response.statusCode == 204 else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: response.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback fixture could not advance the progress event (HTTP \(response.statusCode))."])
+        }
     }
 
     private func launchLocalChat(_ app: XCUIApplication, additionalArguments: [String] = [],

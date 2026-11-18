@@ -910,6 +910,13 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		if current.Context.ResultReview != nil && decision.Action != app.ConversationRouteReply {
 			return domain.NewError(domain.CodeInvalidState, "task result review must produce a reply")
 		}
+		if decision.Acknowledge && decision.Action != app.ConversationRouteNew &&
+			decision.Action != app.ConversationRouteUpdate && decision.Action != app.ConversationRouteJoin {
+			return domain.InvalidArgument("route_decision", "only background task actions can acknowledge a message")
+		}
+		if err := recordConversationMessageAcknowledgementDecisionInTx(ctx, tx, claim, decision.Acknowledge); err != nil {
+			return err
+		}
 		var candidate *app.ConversationRouteCandidate
 		for index := range current.Context.Candidates {
 			item := &current.Context.Candidates[index]
@@ -931,14 +938,20 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		}
 		switch decision.Action {
 		case app.ConversationRouteJoin:
-			return linkDuplicateConversationRouteInTx(ctx, tx, claim, current, decision.TargetMessageID)
+			if err := linkDuplicateConversationRouteInTx(ctx, tx, claim, current, decision.TargetMessageID); err != nil {
+				return err
+			}
+			return acknowledgeConversationMessageForRunningTaskInTx(ctx, tx, claim)
 		case app.ConversationRouteNew:
 			if !app.ValidConversationRouteAggregateIDs(decision.AggregateMessageIDs, current.Context.AggregationCandidates) {
 				return domain.NewError(domain.CodeConflict, "conversation aggregation candidates changed")
 			}
 			if !decision.ExplicitNew {
 				if duplicate := exactConversationRouteDuplicate(current.Context.RequestCandidates, claim); duplicate != "" {
-					return linkDuplicateConversationRouteInTx(ctx, tx, claim, current, duplicate)
+					if err := linkDuplicateConversationRouteInTx(ctx, tx, claim, current, duplicate); err != nil {
+						return err
+					}
+					return acknowledgeConversationMessageForRunningTaskInTx(ctx, tx, claim)
 				}
 			}
 			routedContent := current.Context.Content
@@ -1039,6 +1052,62 @@ WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, candidate.
 	})
 }
 
+func recordConversationMessageAcknowledgementDecisionInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, acknowledge bool) error {
+	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET
+acknowledgement_requested=$8 AND NOT agent_acknowledged,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5
+ AND state='processing' AND lease_owner=$6 AND lease_version=$7 AND lease_expires_at>clock_timestamp()`, claim.ServiceInstanceID, claim.Message.ID,
+		claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion, acknowledge)
+	if err != nil {
+		return fmt.Errorf("record main Agent message acknowledgement decision: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeConflict, "conversation acknowledgement decision is no longer current")
+	}
+	return nil
+}
+
+func acknowledgeConversationMessageForRunningTaskInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
+	rows, err := tx.Query(ctx, `UPDATE conversation_message_routes r SET acknowledgement_requested=false,agent_acknowledged=true,updated_at=clock_timestamp()
+FROM conversation_messages m
+WHERE r.message_id=m.id AND r.message_id=$1 AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+ AND r.acknowledgement_requested AND NOT r.agent_acknowledged
+ AND EXISTS (
+  SELECT 1 FROM tasks t WHERE t.id=COALESCE(m.task_id,
+    (SELECT root.task_id FROM conversation_messages root WHERE root.id=r.duplicate_of_message_id AND root.owner_id=m.owner_id),
+    (SELECT intent.task_id FROM task_revision_intents intent WHERE intent.message_id=m.id ORDER BY intent.expected_revision DESC LIMIT 1))
+   AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id AND t.status='running'
+   AND t.lease_expires_at>clock_timestamp() AND t.current_revision=t.desired_revision
+   AND EXISTS (SELECT 1 FROM task_revision_starts started WHERE started.task_id=t.id AND started.revision=t.current_revision)
+ )
+RETURNING m.id,m.owner_id,r.client_message_id`, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID)
+	if err != nil {
+		return fmt.Errorf("confirm conversation acknowledgement for running Task: %w", err)
+	}
+	type acknowledgedMessage struct{ id, ownerID, clientMessageID string }
+	var messages []acknowledgedMessage
+	for rows.Next() {
+		var message acknowledgedMessage
+		if err := rows.Scan(&message.id, &message.ownerID, &message.clientMessageID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read confirmed conversation acknowledgement: %w", err)
+		}
+		messages = append(messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate confirmed conversation acknowledgements: %w", err)
+	}
+	rows.Close()
+	for _, message := range messages {
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: message.ownerID,
+			ObjectType: "message", ObjectID: message.id, Operation: "upsert", MutationID: message.clientMessageID}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func requeueConversationRouteForReclassification(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
 	const maxAutomaticConflicts = 3
 	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET
@@ -1046,7 +1115,7 @@ state=CASE WHEN auto_retry_count+1 >= $9 THEN 'failed' ELSE 'pending' END,
 failure_reason=CASE WHEN auto_retry_count+1 >= $9 THEN 'routing_context_unavailable' ELSE '' END,
 route_attempt=CASE WHEN auto_retry_count+1 >= $9 THEN route_attempt ELSE route_attempt+1 END,
 auto_retry_count=LEAST(auto_retry_count+1,$9),lease_owner='',lease_expires_at=NULL,
-available_after=clock_timestamp(),updated_at=clock_timestamp()
+acknowledgement_requested=false,available_after=clock_timestamp(),updated_at=clock_timestamp()
 WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5
  AND state='processing' AND lease_owner=$6 AND lease_version=$7 AND route_attempt=$8 AND lease_expires_at>clock_timestamp()`,
 		claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID,

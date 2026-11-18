@@ -128,6 +128,7 @@ export function AdminUsage() {
       {usage.data && <p className="muted">统计区间：{usage.data.from} 至 {usage.data.to}</p>}
       {usage.isPending || (usageNetworkError && !usage.data) ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
         : usage.isError && !usageNetworkError ? <UsageError error={usage.error} retry={() => void usage.refetch()} />
+          : !usage.data ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
           : <>
             <UsageMetrics data={usage.data} />
             <UsageByDay data={usage.data} />
@@ -138,7 +139,8 @@ export function AdminUsage() {
       <h2 id="admin-platform-stats-heading">平台统计</h2>
       {stats.isPending || (statsNetworkError && !stats.data) ? <div className="loading-card" role="status">正在加载平台统计…</div>
         : stats.isError && !statsNetworkError ? <UsageError error={stats.error} retry={() => void stats.refetch()} />
-          : <PlatformStats data={stats.data} />}
+          : !stats.data ? <div className="loading-card" role="status">正在加载平台统计…</div>
+            : <PlatformStats data={stats.data} />}
     </section>
   </section>;
 }

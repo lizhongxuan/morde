@@ -9,7 +9,7 @@ import (
 
 func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 	toolNames := make(map[string]struct{})
-	for _, definition := range cloudDSHWorkspaceToolDefinitions(0) {
+	for _, definition := range cloudDSHWorkspaceToolDefinitions(0, false) {
 		toolNames[definition.Name] = struct{}{}
 	}
 	for _, definition := range cloudDSHBuiltinSearchDefinitions() {

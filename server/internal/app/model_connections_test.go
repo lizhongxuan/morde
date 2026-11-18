@@ -765,9 +765,10 @@ func TestModelConnectionContextWindowIsBoundToConfiguredModel(t *testing.T) {
 	window := 32_768
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
 		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
-		ContextWindowTokens: &window,
+		ContextWindowOverrideTokens: &window, ContextWindowOverridePresent: true,
 	})
-	if err != nil || created.ContextWindowTokens == nil || *created.ContextWindowTokens != window {
+	if err != nil || created.ContextWindowTokens == nil || *created.ContextWindowTokens != window ||
+		created.ContextWindowOverrideTokens == nil || *created.ContextWindowOverrideTokens != window || created.ContextWindowSource != ModelContextWindowOverride {
 		t.Fatalf("created context window = %+v, %v", created.ContextWindowTokens, err)
 	}
 	if _, err := checkModelForTest(t, service, client, principal, created.ID); err != nil {
@@ -780,8 +781,15 @@ func TestModelConnectionContextWindowIsBoundToConfiguredModel(t *testing.T) {
 	unchanged, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
 		Name: "platform", BaseURL: created.BaseURL, ModelName: created.ModelName,
 	})
-	if err != nil || unchanged.ContextWindowTokens == nil || *unchanged.ContextWindowTokens != window {
+	if err != nil || unchanged.ContextWindowTokens == nil || *unchanged.ContextWindowTokens != window ||
+		unchanged.ContextWindowOverrideTokens == nil || *unchanged.ContextWindowOverrideTokens != window || unchanged.ContextWindowSource != ModelContextWindowOverride {
 		t.Fatalf("same endpoint update lost context window = %+v, %v", unchanged.ContextWindowTokens, err)
+	}
+	cleared, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
+		Name: "platform", BaseURL: created.BaseURL, ModelName: created.ModelName, ContextWindowOverridePresent: true,
+	})
+	if err != nil || cleared.ContextWindowTokens != nil || cleared.ContextWindowOverrideTokens != nil || cleared.ContextWindowSource != ModelContextWindowUnknown {
+		t.Fatalf("explicit null override was not cleared: %+v, %v", cleared, err)
 	}
 	changed, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
 		Name: "platform", BaseURL: created.BaseURL, ModelName: "gpt-next",
@@ -789,11 +797,11 @@ func TestModelConnectionContextWindowIsBoundToConfiguredModel(t *testing.T) {
 	if err != nil || changed.ContextWindowTokens != nil {
 		t.Fatalf("model change retained stale context window = %+v, %v", changed.ContextWindowTokens, err)
 	}
-	for _, invalid := range []int{4095, 1_000_001} {
+	for _, invalid := range []int{4095, 2_000_001} {
 		invalidWindow := invalid
 		if _, err := service.Create(context.Background(), principal, ModelConnectionCommand{
 			Name: "invalid", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
-			ContextWindowTokens: &invalidWindow,
+			ContextWindowOverrideTokens: &invalidWindow, ContextWindowOverridePresent: true,
 		}); err == nil {
 			t.Errorf("context window %d was accepted", invalid)
 		}
@@ -846,6 +854,18 @@ func cloneModelConnection(value ModelConnectionRecord) ModelConnectionRecord {
 	if value.ContextWindowTokens != nil {
 		window := *value.ContextWindowTokens
 		value.ContextWindowTokens = &window
+	}
+	if value.ContextWindowOverrideTokens != nil {
+		window := *value.ContextWindowOverrideTokens
+		value.ContextWindowOverrideTokens = &window
+	}
+	if value.ContextWindowResolvedAt != nil {
+		resolved := *value.ContextWindowResolvedAt
+		value.ContextWindowResolvedAt = &resolved
+	}
+	if value.ContextWindowCatalogVersion != nil {
+		version := *value.ContextWindowCatalogVersion
+		value.ContextWindowCatalogVersion = &version
 	}
 	if value.CheckedAt != nil {
 		checked := *value.CheckedAt

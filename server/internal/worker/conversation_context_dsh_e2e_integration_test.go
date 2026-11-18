@@ -54,10 +54,11 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	window := 16_384
+	// The two 4 KiB sources cross the 75% summary trigger with the fixed DSH prompt.
+	window := 8_192
 	model, err := store.CreateModelConnection(ctx, app.ModelConnectionRecord{ID: "p1234567", OwnerID: owner.ID,
 		Name: "Local conversation context E2E", BaseURL: "https://models.example.invalid/v1", ModelName: "synthetic-e2e",
-		ContextWindowTokens: &window, APIKeyCipher: modelKey})
+		ContextWindowTokens: &window, ContextWindowOverrideTokens: &window, ContextWindowSource: app.ModelContextWindowLegacyManual, APIKeyCipher: modelKey})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,6 +464,11 @@ func (m *conversationContextE2ERouteModels) ClassifyConversationRoute(ctx contex
 func (m *conversationContextE2ERouteModels) ResolveConversationSummaryModel(ctx context.Context,
 	claim app.ConversationRouteClaim) (string, int, error) {
 	return m.gateway.ResolveConversationSummaryModel(ctx, claim)
+}
+
+func (m *conversationContextE2ERouteModels) EstimateConversationSummaryTokenPressure(ctx context.Context,
+	request CloudDSHConversationSummaryEstimateRequest) ([]int, error) {
+	return m.coordinators[request.Claim.Message.ConversationID].EstimateConversationSummaryTokenPressure(ctx, request)
 }
 
 func (m *conversationContextE2ERouteModels) CompactConversationSummary(ctx context.Context,

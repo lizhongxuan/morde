@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -107,16 +108,11 @@ func (c *Client) Create(ctx context.Context, input app.SandboxCreateRequest) (re
 			Volumes:          make([]createVolume, 0, len(input.Volumes)),
 		}
 		for _, volume := range input.Volumes {
-			request.Volumes = append(request.Volumes, createVolume{
-				Name:      volume.Name,
-				MountPath: volume.MountPath,
-				PVC: pvc{
-					ClaimName:                  volume.ClaimName,
-					CreateIfNotExists:          !volume.RequireExisting,
-					DeleteOnSandboxTermination: false,
-					Storage:                    volume.Storage,
-				},
-			})
+			encodedVolume, encodeErr := encodeVolume(volume)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			request.Volumes = append(request.Volumes, encodedVolume)
 		}
 		body, callErr := json.Marshal(request)
 		if callErr != nil {
@@ -428,10 +424,44 @@ type pvc struct {
 	Storage                    string `json:"storage"`
 }
 
+type hostVolume struct {
+	Path string `json:"path"`
+}
+
 type createVolume struct {
-	Name      string `json:"name"`
-	MountPath string `json:"mountPath"`
-	PVC       pvc    `json:"pvc"`
+	Name      string      `json:"name"`
+	MountPath string      `json:"mountPath"`
+	PVC       *pvc        `json:"pvc,omitempty"`
+	Host      *hostVolume `json:"host,omitempty"`
+	ReadOnly  *bool       `json:"readOnly,omitempty"`
+}
+
+func encodeVolume(volume app.SandboxVolume) (createVolume, error) {
+	request := createVolume{Name: volume.Name, MountPath: volume.MountPath}
+	if volume.HostPath != "" {
+		if strings.TrimSpace(volume.Name) == "" || !volume.RequireExisting || volume.ClaimName != "" || volume.Storage != "" || !validHostMountPath(volume.HostPath) || !validContainerMountPath(volume.MountPath) {
+			return createVolume{}, fmt.Errorf("invalid host-path sandbox volume: %w", app.ErrSandboxUnsupported)
+		}
+		request.Host = &hostVolume{Path: volume.HostPath}
+		readOnly := false
+		request.ReadOnly = &readOnly
+		return request, nil
+	}
+	request.PVC = &pvc{
+		ClaimName:                  volume.ClaimName,
+		CreateIfNotExists:          !volume.RequireExisting,
+		DeleteOnSandboxTermination: false,
+		Storage:                    volume.Storage,
+	}
+	return request, nil
+}
+
+func validHostMountPath(value string) bool {
+	return value != "/" && path.IsAbs(value) && path.Clean(value) == value && !strings.ContainsRune(value, '\x00')
+}
+
+func validContainerMountPath(value string) bool {
+	return value != "/" && path.IsAbs(value) && path.Clean(value) == value && !strings.ContainsRune(value, '\x00')
 }
 
 type createRequest struct {

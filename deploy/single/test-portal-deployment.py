@@ -9,6 +9,7 @@ import pathlib
 import socket
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -27,6 +28,12 @@ allowlist_spec = importlib.util.spec_from_file_location(
 assert allowlist_spec and allowlist_spec.loader
 allowlist_sync = importlib.util.module_from_spec(allowlist_spec)
 allowlist_spec.loader.exec_module(allowlist_sync)
+opensandbox_config_spec = importlib.util.spec_from_file_location(
+    "render_opensandbox_config", ROOT / "render-opensandbox-config.py"
+)
+assert opensandbox_config_spec and opensandbox_config_spec.loader
+opensandbox_config = importlib.util.module_from_spec(opensandbox_config_spec)
+opensandbox_config_spec.loader.exec_module(opensandbox_config)
 
 
 class DeploymentTests(unittest.TestCase):
@@ -149,6 +156,54 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('path_overlaps "$archive_real" "$postgres_real"', installer)
         self.assertIn('path_overlaps "$archive_real" "$workspace_real"', installer)
         self.assertIn('[[ $archive_device != "$1" ]] || die', installer)
+
+    def test_opensandbox_host_path_allowlist_tracks_only_workspace_current_root(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        installer = (ROOT / "install-portal-service.sh").read_text()
+        template = (ROOT / "opensandbox.toml").read_text()
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = pathlib.Path(directory).resolve()
+            root = directory_path / "current"
+            root.mkdir()
+            rendered = opensandbox_config.render_config(template, str(root))
+            self.assertEqual(
+                tomllib.loads(rendered)["storage"]["allowed_host_paths"],
+                [str(root)],
+            )
+            opensandbox_config.validate_rendered_config(tomllib.loads(rendered), str(root))
+            with self.assertRaisesRegex(ValueError, "only the Workspace"):
+                opensandbox_config.validate_rendered_config(tomllib.loads(template), str(root))
+
+            changed_root = directory_path / "new-current"
+            changed_root.mkdir()
+            rerendered = opensandbox_config.render_config(rendered, str(changed_root))
+            self.assertEqual(
+                tomllib.loads(rerendered)["storage"]["allowed_host_paths"],
+                [str(changed_root)],
+            )
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                opensandbox_config.render_config(rendered, str(changed_root / ".." / "new-current"))
+
+        service = compose.split("  opensandbox-server:", 1)[1].split("\n  # Deliberately opt-in:", 1)[0]
+        self.assertIn(
+            "source: ${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:?Set CH_WORKSPACE_SYNC_CURRENT_FILES_DIR",
+            service,
+        )
+        self.assertIn(
+            "target: ${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:?Set CH_WORKSPACE_SYNC_CURRENT_FILES_DIR",
+            service,
+        )
+        self.assertIn("read_only: true", service)
+        self.assertIn("create_host_path: false", service)
+        self.assertIn("render-opensandbox-config.py", installer)
+        self.assertIn("render-opensandbox-config.py\" --check", installer)
+        self.assertIn("up --detach --force-recreate --no-deps opensandbox-server", installer)
+        self.assertLess(
+            installer.index("render-opensandbox-config.py"),
+            installer.index("force-recreate --no-deps opensandbox-server"),
+        )
+        self.assertIn('__MORDE_WORKSPACE_CURRENT_FILES_DIR__', template)
 
     def test_postgres_wal_archive_script_validates_and_publishes_safely(self):
         script = ROOT / "backup/archive-wal.sh"

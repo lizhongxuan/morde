@@ -1626,6 +1626,11 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 		HostFence: fence, ViewID: group.viewID, InputManifestSHA256: inputManifestSHA,
 		OperationKey: operationKey, RequestHash: requestHash[:],
 	}
+	liveDirectory, err := e.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(current), group.workspaceID)
+	if err != nil {
+		return taskWorkspacePublishErrorVerification(err)
+	}
+	command.DirectDirectorySource = liveDirectory
 	receipt, err := e.workspaces.ReserveTaskWorkspacePublish(ctx, command)
 	if err != nil {
 		return taskWorkspacePublishErrorVerification(err)
@@ -1646,6 +1651,28 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 	}
 	if receipt.State == TaskWorkspacePublishQuotaRejected {
 		return workspacePublishQuotaVerification()
+	}
+	if liveDirectory {
+		live, snapshotErr := readWorkspaceLiveSnapshot(ctx, e.workspaces.currentDirectory, taskWorkspaceOwner(current), group.workspaceID, e.workspaces.maxOwnerBytes)
+		if snapshotErr != nil {
+			return taskWorkspacePublishErrorVerification(snapshotErr)
+		}
+		artifacts, artifactErr := e.workspaceOutputDeltaArtifacts(ctx, current, *current.WorkspaceCheckpointRevision, live.files, result.Artifacts)
+		if artifactErr != nil {
+			return unknownAgentVerification("The live Workspace output does not match durable file evidence.")
+		}
+		if len(artifacts) == 0 {
+			return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}
+		}
+		result.Artifacts = artifacts
+		receipt, err = e.workspaces.CommitTaskWorkspacePublishDirect(ctx, command, live.files, live.emptyDirectories, live.directories,
+			live.manifestSHA256, func(_ context.Context, digest string) ([]byte, error) {
+				return live.readBlock(e.workspaces.currentDirectory, taskWorkspaceOwner(current), group.workspaceID, digest)
+			})
+		if err != nil {
+			return taskWorkspacePublishErrorVerification(err)
+		}
+		return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result)
 	}
 	if group.output == nil {
 		files, emptyDirectories, directories, manifestSHA, outputErr := taskWorkspaceOutputManifest(ctx, session, current, group)

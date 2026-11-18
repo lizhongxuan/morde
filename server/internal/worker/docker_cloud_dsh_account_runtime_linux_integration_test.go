@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ import (
 	identitydomain "morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/dshguardian"
+	modelclient "morde/server/internal/model"
 	"morde/server/internal/storage/workspacefs"
 )
 
@@ -94,7 +96,14 @@ func TestRealDockerGuardianProcess(t *testing.T) {
 func startRealDockerGuardianProcess(t *testing.T, stateDir, keyPath, socketPath string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestRealDockerGuardianProcess$")
-	cmd.Env = append(os.Environ(), "MORDE_REAL_DOCKER_GUARDIAN_HELPER=1",
+	cmd.Env = make([]string, 0, len(os.Environ())+3)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "MORDE_TEST_DEEPSEEK_KEY=") || strings.HasPrefix(entry, "CH_TEST_DATABASE_URL=") {
+			continue
+		}
+		cmd.Env = append(cmd.Env, entry)
+	}
+	cmd.Env = append(cmd.Env, "MORDE_REAL_DOCKER_GUARDIAN_HELPER=1",
 		"MORDE_REAL_DOCKER_GUARDIAN_STATE="+stateDir, "MORDE_REAL_DOCKER_GUARDIAN_KEY="+keyPath,
 		"MORDE_REAL_DOCKER_GUARDIAN_SOCKET="+socketPath)
 	cmd.Stderr = os.Stderr
@@ -127,7 +136,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 	}
 	dockerHost := os.Getenv("MORDE_REAL_DOCKER_HOST")
 	if dockerHost == "" {
-		dockerHost = "/var/run/docker.sock"
+		dockerHost = "unix:///var/run/docker.sock"
 	}
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -153,9 +162,36 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 		t.Fatal(err)
 	}
 	guardian := guardianInterface.(*unixSocketDockerCloudDSHGuardian)
+	workspacePath := t.TempDir()
+	scriptPath := "/opt/morde-cloud-runtime/bin.mjs"
+	if sourceDir := strings.TrimSpace(os.Getenv("MORDE_REAL_DOCKER_RUNTIME_SOURCE_DIR")); sourceDir != "" {
+		if !filepath.IsAbs(sourceDir) {
+			t.Fatal("MORDE_REAL_DOCKER_RUNTIME_SOURCE_DIR must be an absolute path")
+		}
+		resolvedSourceDir, err := filepath.EvalSymlinks(sourceDir)
+		if err != nil || !filepath.IsAbs(resolvedSourceDir) || filepath.Clean(resolvedSourceDir) != resolvedSourceDir {
+			t.Fatal("MORDE_REAL_DOCKER_RUNTIME_SOURCE_DIR must resolve to an absolute directory")
+		}
+		sourceInfo, err := os.Stat(resolvedSourceDir)
+		if err != nil || !sourceInfo.IsDir() {
+			t.Fatal("MORDE_REAL_DOCKER_RUNTIME_SOURCE_DIR must resolve to a directory")
+		}
+		for _, required := range []struct {
+			path string
+			dir  bool
+		}{{"bin.mjs", false}, {"bin-account.mjs", false}, {"node_modules", true}} {
+			info, err := os.Stat(filepath.Join(resolvedSourceDir, required.path))
+			if err != nil || required.dir && !info.IsDir() || !required.dir && !info.Mode().IsRegular() {
+				t.Fatalf("MORDE_REAL_DOCKER_RUNTIME_SOURCE_DIR is missing required runtime entry: %s", required.path)
+			}
+		}
+		workspacePath = resolvedSourceDir
+		scriptPath = "/workspace/bin.mjs"
+	}
 	docker, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{
 		DockerHost: dockerHost, Image: image, NodePath: "/usr/local/bin/node",
-		ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", Guardian: guardian,
+		ScriptPath: scriptPath, Guardian: guardian,
+		WorkspacePath: func(context.Context, string) (string, error) { return workspacePath, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -566,11 +602,55 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 		if err != nil {
 			t.Fatal(err)
 		}
-		taskService, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
+		sealer, err := app.NewSealer(bytes.Repeat([]byte{9}, 32))
 		if err != nil {
 			t.Fatal(err)
 		}
-		sealer, err := app.NewSealer(bytes.Repeat([]byte{9}, 32))
+		var (
+			configuredModels app.ConfiguredModelCatalog = f01ConfiguredModels{}
+			dshModels        CloudDSHModels             = f01ImmediateCloudDSHModel{}
+			useDeepSeek      bool
+		)
+		deepSeekKey := []byte(strings.TrimSpace(os.Getenv("MORDE_TEST_DEEPSEEK_KEY")))
+		if len(deepSeekKey) > 0 {
+			client, err := modelclient.NewResponsesClient([]string{"api.deepseek.com"}, "")
+			if err != nil {
+				clear(deepSeekKey)
+				t.Fatal(err)
+			}
+			keyCipher, err := sealer.Seal(deepSeekKey)
+			clear(deepSeekKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection, err := store.CreateModelConnection(ctx, app.ModelConnectionRecord{
+				ID: "p1234567", OwnerID: owner.ID, Name: "DeepSeek DSH E2E",
+				BaseURL: "https://api.deepseek.com", ModelName: "deepseek-flash", APIKeyCipher: keyCipher,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkedAt := time.Now().UTC()
+			connection.Capabilities = app.ModelCapabilities{Text: true}
+			connection.CheckedAt = &checkedAt
+			if _, err := store.UpdateModelConnection(ctx, connection); err != nil {
+				t.Fatal(err)
+			}
+			modelConnections, err := app.NewModelConnectionService(store, sealer, client, []string{"api.deepseek.com"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gateway, err := app.NewModelGatewayService(store, modelConnections, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gateway.SetModelResponseSealer(sealer); err != nil {
+				t.Fatal(err)
+			}
+			configuredModels, dshModels, useDeepSeek = modelConnections, gateway, true
+			t.Log("using the opt-in DeepSeek ModelGateway path with a fixed synthetic question")
+		}
+		taskService, err := app.NewTaskService(store, credentials, configuredModels)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -659,10 +739,21 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 		if err != nil {
 			t.Fatal(err)
 		}
+		toolCapabilities := cloudDSHTestToolCapability{allowed: true}
+		var taskTools CloudDSHTools = toolBroker
+		var taskChildren CloudDSHChildSessions = children
+		objective := "Answer with one sentence."
+		modelTokens := int64(1000)
+		if useDeepSeek {
+			toolCapabilities = cloudDSHTestToolCapability{}
+			taskTools, taskChildren = nil, nil
+			objective = "请只回答数字：1+1等于几？"
+			modelTokens = 16384
+		}
 		executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-			ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "supervisor-test", AccountRuntimes: manager,
-			Instances: instances, Checkpoints: checkpoints, Models: f01ImmediateCloudDSHModel{},
-			Tools: toolBroker, Children: children, Completion: toolBroker,
+			ToolCapabilities: toolCapabilities, SupervisorID: "supervisor-test", AccountRuntimes: manager,
+			Instances: instances, Checkpoints: checkpoints, Models: dshModels,
+			Tools: taskTools, Children: taskChildren, Completion: toolBroker,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -693,8 +784,8 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 		cookie := createF01Session(t, ctx, store, owner.ID)
 		postCtx, cancelPost := context.WithCancel(ctx)
 		body, err := json.Marshal(map[string]any{
-			"model_id": "p1234567", "objective": "Answer with one sentence.",
-			"budget": map[string]int64{"active_seconds": 60, "tool_calls": 5, "model_tokens": 1000},
+			"model_id": "p1234567", "objective": objective,
+			"budget": map[string]int64{"active_seconds": 60, "tool_calls": 5, "model_tokens": modelTokens},
 		})
 		if err != nil {
 			cancelPost()
@@ -765,9 +856,18 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
-		if completed.ID == "" || completed.Result != "The persistent cloud task completed." ||
+		if completed.ID == "" || (!useDeepSeek && completed.Result != "The persistent cloud task completed.") ||
+			(useDeepSeek && !strings.Contains(completed.Result, "2")) ||
 			completed.FileDeliveryIntent != task.FileDeliveryNone || completed.AgentInstanceID == "" {
 			t.Fatalf("Portal-submitted Task did not complete through the persistent Runtime after disconnect: task=%+v last_get_error=%v", completed, lastGetErr)
+		}
+		if useDeepSeek {
+			var settledModelCalls int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM model_call_ledger
+WHERE owner_id=$1 AND task_id=$2 AND source='task' AND provider_model='deepseek-flash' AND state='settled'`,
+				owner.ID, accepted.ID).Scan(&settledModelCalls); err != nil || settledModelCalls == 0 {
+				t.Fatalf("real DeepSeek reply did not settle through the Morde ModelGateway: settled_calls=%d err=%v", settledModelCalls, err)
+			}
 		}
 		messages, err := store.ListMessages(ctx, owner.ID, completed.ConversationID, app.PageRequest{Limit: 20})
 		if err != nil || len(messages.Items) != 2 || messages.Items[0].Role != "assistant" || messages.Items[0].Content != completed.Result {

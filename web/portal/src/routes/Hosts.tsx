@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Link, useLocation } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { errorDetails, enterHostInNewTab, newIdempotencyKey, portalApi } from '../app/api';
+import { errorDetails, enterHostInNewTab, portalApi } from '../app/api';
 import type { HostMemberPermission } from '../app/api';
 import { useAuth } from '../app/auth';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../app/format';
@@ -68,7 +68,6 @@ export function Hosts() {
   const atLimit = !!user && ownedHosts.length >= user.quota.hosts;
   const [deleting, setDeleting] = useState<Host | null>(null);
   const [lifecycleAction, setLifecycleAction] = useState<{ host: Host; action: 'release' | 'restore' } | null>(null);
-  const [copyDialog, setCopyDialog] = useState<{ host: Host; name: string; idempotencyKey: string } | null>(null);
   const update = useMutation({
     mutationFn: async ({ action, host }: { action: 'renew' | 'delete' | 'release' | 'restore'; host: Host }) => {
       if (action === 'renew') return portalApi.renewHost(host.id);
@@ -79,31 +78,13 @@ export function Hosts() {
     onSuccess: (_, variables) => {
       void queryClient.invalidateQueries({ queryKey: ['hosts'] });
       if (variables.action === 'delete') {
-        notify('已提交删除请求；云端电脑和专属资料目录会在后台一并清理。', 'success'); setDeleting(null);
+        notify('已提交删除请求；Agent Workspace 文件会保留。', 'success'); setDeleting(null);
       }
       else if (variables.action === 'release') { notify('已提交释放请求，文件和工作目录会保留。', 'success'); setLifecycleAction(null); }
       else if (variables.action === 'restore') { notify('已提交恢复请求。', 'success'); setLifecycleAction(null); }
       else notify('主机已续期。', 'success');
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
-  });
-  const copyHost = useMutation({
-    mutationFn: ({ host, name, idempotencyKey }: { host: Host; name: string; idempotencyKey: string }) => {
-      const binding = host.workspaces.find((item) => item.state !== 'detached');
-      if (!binding) throw new Error('找不到可复制的云端文件版本。');
-      return portalApi.copyHost(host.id, { name: name.trim(), expected_current_revision: binding.workspace.revision }, idempotencyKey);
-    },
-    onSuccess: async (result) => {
-      await queryClient.invalidateQueries({ queryKey: ['hosts'] });
-      notify(`已创建云端电脑“${result.host.name || result.host.id}”。`, 'success');
-      setCopyDialog(null);
-    },
-    onError: async (error) => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['hosts'] }),
-      ]);
-      notify(`${errorDetails(error).message} 若结果不确定，请保持名称不变并在此窗口重试。`, 'error');
-    },
   });
   const enter = async (host: Host) => {
     try { await enterHostInNewTab(host.id); }
@@ -177,19 +158,12 @@ export function Hosts() {
           || binding.sync_conflicts.length > 0 || binding.applied_revision !== binding.desired_revision
           || binding.applied_revision !== binding.workspace.revision
         ));
-        const copyReason = atLimit ? undefined
-          : host.state !== 'stopped' ? '请先停止源电脑。'
-            : host.control_state !== 'ai' ? '请先将电脑控制权交还给云端 AI。'
-              : !filesReady ? '源电脑文件尚未全部确认或仍有冲突。' : undefined;
         return <HostCard key={host.id} host={host} isDefaultHost={host.id === preferences.data?.default_host_id} busy={update.isPending && update.variables?.host.id === host.id}
           canEnter={ownsHost && filesReady}
           enterReason={!ownsHost ? '仅电脑所有者可以进入工作环境。' : blockedFiles
             ? '电脑文件正在准备、同步或存在冲突；打开和移交操作暂不可用。'
             : !filesReady ? '电脑文件尚未准备好，暂不能打开。' : undefined}
           filesRestorable={filesRestorable}
-          canShowCopy={ownsHost} canCopy={ownsHost && !atLimit && !copyReason} copyReason={ownsHost ? copyReason : undefined}
-          copyPending={copyHost.isPending && copyHost.variables?.host.id === host.id}
-          onCopy={() => setCopyDialog({ host, name: `${(host.name || '云端电脑').slice(0, 96)} 副本`, idempotencyKey: newIdempotencyKey() })}
           onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ action: 'restore', host })} onDelete={() => setDeleting(host)} />;
       }}
     />}
@@ -228,20 +202,7 @@ export function Hosts() {
               }}
             />}
     </section>}
-    {deleting && <ConfirmDialog title={`永久删除云端电脑 ${deleting.name || deleting.id}`} description="继续后会永久删除这台电脑及其专属 ~/workspace/ 目录（包括项目文件和其他电脑文件）。此操作无法恢复。本机 PC 文件和其他云端电脑不受影响。" confirmLabel="永久删除电脑和数据" danger busy={update.isPending} onClose={() => setDeleting(null)} onConfirm={() => update.mutate({ action: 'delete', host: deleting })} />}
-    {copyDialog && <ConfirmDialog
-      title={`复制云端电脑 ${copyDialog.host.name || copyDialog.host.id}`}
-      description={`将复制已确认的云端文件版本；其中可能包含隐藏文件、配置和密钥。新电脑拥有独立文件空间，源电脑保持不变。运行环境、应用状态、平台凭据、任务和本机同步关联不会复制。`}
-      confirmLabel="创建副本"
-      busy={copyHost.isPending}
-      confirmDisabled={!copyDialog.name.trim()}
-      onClose={() => setCopyDialog(null)}
-      onConfirm={() => copyHost.mutate(copyDialog)}
-    >
-      <label htmlFor="host-copy-name">新电脑名称</label>
-      <input id="host-copy-name" value={copyDialog.name} maxLength={100} onChange={(event) => setCopyDialog({ ...copyDialog, name: event.target.value })} />
-      <p className="muted">提交后如需重试，请保留相同名称；本次操作会继续使用同一个幂等键。</p>
-    </ConfirmDialog>}
+    {deleting && <ConfirmDialog title={`永久删除云端电脑 ${deleting.name || deleting.id}`} description="继续后会永久删除这台云端电脑并释放计算资源。你的 Agent Workspace 文件会保留，可在新云端电脑中继续访问。" confirmLabel="永久删除云端电脑" danger busy={update.isPending} onClose={() => setDeleting(null)} onConfirm={() => update.mutate({ action: 'delete', host: deleting })} />}
     {lifecycleAction && <ConfirmDialog
       title={lifecycleAction.action === 'release' ? `释放主机 ${lifecycleAction.host.name || lifecycleAction.host.id} 的运行资源` : `恢复主机 ${lifecycleAction.host.name || lifecycleAction.host.id}`}
       description={lifecycleAction.action === 'release'
@@ -263,14 +224,13 @@ function prioritizeHostForHash<T extends { id: string }>(items: readonly T[], ho
   return target ? [target, ...items.slice(0, index), ...items.slice(index + 1)] : items;
 }
 
-function HostCard({ host, isDefaultHost, busy, canEnter, enterReason, filesRestorable, canShowCopy, canCopy, copyReason, copyPending, onCopy, onEnter, onRenew, onRelease, onRestore, onDelete }: {
-  host: Host; isDefaultHost: boolean; busy: boolean; canEnter: boolean; enterReason?: string; filesRestorable: boolean; canShowCopy: boolean; canCopy: boolean; copyReason?: string; copyPending: boolean;
-  onCopy: () => void; onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
+function HostCard({ host, isDefaultHost, busy, canEnter, enterReason, filesRestorable, onEnter, onRenew, onRelease, onRestore, onDelete }: {
+  host: Host; isDefaultHost: boolean; busy: boolean; canEnter: boolean; enterReason?: string; filesRestorable: boolean;
+  onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const name = host.name || host.id;
   const enterHelpID = `host-enter-help-${host.id}`;
-  const copyHelpID = `host-copy-help-${host.id}`;
   const runtimeState = host.workspace_runtime_online === true ? '在线' : host.workspace_runtime_online === false ? '离线' : '未知';
   const fileBindings = host.workspaces.filter((binding) => binding.state !== 'detached');
   const fileBinding = fileBindings[0];
@@ -301,8 +261,6 @@ function HostCard({ host, isDefaultHost, busy, canEnter, enterReason, filesResto
           {host.state === 'running' && <button type="button" className="button button-secondary" onClick={onRelease} disabled={busy} aria-label={`释放运行资源 ${name}`}>释放运行资源</button>}
           {host.state === 'stopped' && <button type="button" className="button button-primary" onClick={onRestore} disabled={busy || !filesRestorable} aria-label={`恢复云端电脑 ${name}`} title={!filesRestorable ? '电脑专属数据目录尚未准备好' : undefined}>恢复</button>}
           {host.state === 'stopped' && !filesRestorable && <span className="muted" role="status">电脑专属数据目录尚未准备好，暂不能恢复。</span>}
-          {canShowCopy && <button type="button" className="button button-secondary" onClick={onCopy} disabled={!canCopy || copyPending} aria-label={`复制云端电脑 ${name}`} aria-describedby={copyReason ? copyHelpID : undefined}>复制电脑</button>}
-          {copyReason && <span className="muted" id={copyHelpID}>{copyReason}</span>}
           <button type="button" className="button button-danger-quiet" onClick={onDelete} disabled={host.state === 'deleting' || host.state === 'creating' || host.state === 'stopping' || busy} aria-label={`删除云端电脑 ${name}`}>删除</button>
         </div>
       </details>

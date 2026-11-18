@@ -200,7 +200,7 @@ export function PortalLayout() {
       <button type="button" className="morde-top-control" aria-label="前进" title="前进" disabled={!canGoForward} onClick={goForward}><MordeIcon name="forward" /></button>
       <span className="morde-top-divider" aria-hidden="true" />
       {hasCollapsibleSidebar && <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>}
-      {isAssistantPage && <div className="morde-top-navigation-status"><ToastNoticeCenter autoOpenErrors /></div>}
+      {isAssistantPage && <div className="morde-top-navigation-status"><ToastNoticeCenter /></div>}
     </div><div className={`morde-top-actions${isAssistantPage ? ' morde-top-actions-assistant' : ''}`}>{!isAssistantPage && <ToastNoticeCenter autoOpenErrors />}{isAssistantPage ? <>
       {assistantPanelOpen && <nav className="morde-workspace-tabs" aria-label="对话工作区">
       <div className="morde-workspace-tab-list">{assistantPanelTabs.filter(({ id }) => assistantOpenPanelTabs.includes(id)).map(({ id: tab, label, icon }) => {

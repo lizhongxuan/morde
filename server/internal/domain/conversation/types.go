@@ -102,6 +102,7 @@ type Message struct {
 	ClientMessageID           string
 	RoutingStatus             RoutingStatus
 	RoutingFailureReason      RoutingFailureReason
+	AgentAcknowledged         bool
 	Sources                   []MessageSource
 	ModelID                   string
 	Sequence                  int64

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import { coordinatorCompactionModelCallID, coordinatorModelCallID, validMessageDelivery } from './engine.mjs'
 
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024
@@ -33,6 +33,18 @@ function isObject(value) {
 
 function exactKeys(value, expected) {
   return Object.keys(value).sort().join(',') === [...expected].sort().join(',')
+}
+
+function validModelEndFrame(frame, identity) {
+  const fence = identity.context_role === 'coordinator'
+    ? COORDINATOR_IDENTITY_FIELDS
+    : ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+  if (typeof frame.ok !== 'boolean') return false
+  if (frame.ok === true || !Object.hasOwn(frame, 'failure_code')) {
+    return exactKeys(frame, ['type', ...fence, 'id', 'ok'])
+  }
+  return frame.ok === false && frame.failure_code === CONTEXT_WINDOW_EXCEEDED_CODE &&
+    exactKeys(frame, ['type', ...fence, 'id', 'ok', 'failure_code'])
 }
 
 function matchesCoordinatorIdentity(frame, identity) {
@@ -336,7 +348,8 @@ export class WorkerIPC {
     if (frame.type === 'model_chunk' || frame.type === 'model_end') {
       const cancelledIdentity = this.cancelledModels.get(frame.id)
       if (cancelledIdentity) {
-        if (cancelledIdentity.context_role === 'coordinator' &&
+        if (frame.type === 'model_end' && !validModelEndFrame(frame, cancelledIdentity) ||
+            frame.type === 'model_chunk' && cancelledIdentity.context_role === 'coordinator' &&
             (!exactKeys(frame, frame.type === 'model_chunk'
               ? ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'index', 'chunk']
               : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, cancelledIdentity))) {
@@ -348,7 +361,8 @@ export class WorkerIPC {
       }
       const model = this.models.get(frame.id)
       if (!model) throw new Error('unknown model response')
-      if (model.identity.context_role === 'coordinator' &&
+      if (frame.type === 'model_end' && !validModelEndFrame(frame, model.identity) ||
+          frame.type === 'model_chunk' && model.identity.context_role === 'coordinator' &&
           (!exactKeys(frame, frame.type === 'model_chunk'
             ? ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'index', 'chunk']
             : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, model.identity))) {
@@ -562,7 +576,11 @@ export class WorkerIPC {
       if (ended) throw new Error('model response already ended')
       if (frame.type === 'model_end') {
         ended = true
-        if (frame.ok !== true || !finished) failure = new Error('model request failed')
+        if (frame.ok !== true) {
+          failure = frame.failure_code === CONTEXT_WINDOW_EXCEEDED_CODE
+            ? new LlmError('provider confirmed the model context window was exceeded', CONTEXT_WINDOW_EXCEEDED_CODE)
+            : new Error('model request failed')
+        } else if (!finished) failure = new Error('model request failed')
         notify()
         return
       }

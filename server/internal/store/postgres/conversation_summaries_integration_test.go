@@ -1181,7 +1181,9 @@ func TestConversationSummaryMigrationRefusesDestructiveRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := f.store.pool.Exec(context.Background(), `UPDATE conversation_message_routes SET route_attempt=0
+	// Clear the later route-aggregation rollback guard so this test reaches the summary migration guard.
+	if _, err := f.store.pool.Exec(context.Background(), `UPDATE conversation_message_routes SET route_attempt=0,
+aggregation_state='settled',aggregation_deadline=aggregation_started_at
 WHERE message_id=ANY($1::text[])`, []string{prior.Message.ID, claim.Message.ID}); err != nil {
 		t.Fatalf("prepare legacy route receipts for summary rollback: %v", err)
 	}

@@ -142,7 +142,8 @@ func TestConversationRouteLegacyAttemptKeepsVersionedRequest(t *testing.T) {
 	}
 	decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
 	if err != nil || decision.Action != ConversationRouteNew || client.calls != 1 ||
-		client.request.Instructions != legacyConversationRouteInstructions ||
+		!strings.Contains(client.request.Instructions, legacyConversationRouteInstructions) ||
+		!strings.Contains(client.request.Instructions, conversationRouteAcknowledgementInstructions) ||
 		!strings.Contains(client.request.Instructions, "An explicit request to create, write, export, save, or deliver a file or document") {
 		t.Fatalf("legacy route attempt did not preserve its prompt: decision=%+v instructions=%q err=%v",
 			decision, client.request.Instructions, err)

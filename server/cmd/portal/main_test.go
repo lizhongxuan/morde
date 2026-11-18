@@ -542,6 +542,36 @@ func TestParseWorkspaceImportFlags(t *testing.T) {
 	}
 }
 
+func TestParseAgentWorkspaceAdoptionFlags(t *testing.T) {
+	manifestHash := strings.Repeat("a", 64)
+	for _, test := range []struct {
+		name        string
+		args        []string
+		wantApply   bool
+		wantErrPart string
+	}{
+		{name: "read-only preflight", args: []string{"--owner", "u1234567", "--workspace", "w1234567"}},
+		{name: "confirmed apply", args: []string{"--owner", "u1234567", "--workspace", "w1234567", "--apply", "--service-stopped", "--source-audited", "--expected-revision", "3", "--manifest-sha256", manifestHash}, wantApply: true},
+		{name: "apply requires preflight revision and digest", args: []string{"--owner", "u1234567", "--workspace", "w1234567", "--apply"}, wantErrPart: "requires --expected-revision and --manifest-sha256"},
+		{name: "apply requires offline confirmation", args: []string{"--owner", "u1234567", "--workspace", "w1234567", "--apply", "--service-stopped", "--expected-revision", "0", "--manifest-sha256", manifestHash}, wantErrPart: "requires --service-stopped and --source-audited"},
+		{name: "digest must be lowercase sha256", args: []string{"--owner", "u1234567", "--workspace", "w1234567", "--manifest-sha256", strings.Repeat("A", 64)}, wantErrPart: "lowercase SHA-256 digest"},
+		{name: "unexpected argument", args: []string{"--owner", "u1234567", "--workspace", "w1234567", "extra"}, wantErrPart: "unexpected arguments"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options, err := parseAgentWorkspaceAdoptionFlags(test.args, &bytes.Buffer{})
+			if test.wantErrPart != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErrPart) {
+					t.Fatalf("parseAgentWorkspaceAdoptionFlags() error = %v, want substring %q", err, test.wantErrPart)
+				}
+				return
+			}
+			if err != nil || options.ownerID != "u1234567" || options.workspaceID != "w1234567" || options.apply != test.wantApply {
+				t.Fatalf("parseAgentWorkspaceAdoptionFlags() = %#v, %v", options, err)
+			}
+		})
+	}
+}
+
 func TestParseLegacyPCPortalEnabled(t *testing.T) {
 	for _, test := range []struct {
 		name        string

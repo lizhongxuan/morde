@@ -1818,10 +1818,12 @@ private final class MordeAuthURLProtocol: URLProtocol {
         [
             ["id": "m0000401", "conversation_id": "c1234567", "sequence": 1,
              "task_id": "q1234567", "role": "user", "content": "First request in one task",
-             "routing_status": "routed", "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
+             "routing_status": "routed", "agent_acknowledged": false,
+             "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
             ["id": "m0000402", "conversation_id": "c1234567", "sequence": 2,
              "task_id": "q1234567", "role": "user", "content": "Follow-up in the same task",
-             "routing_status": "routed", "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
+             "routing_status": "routed", "agent_acknowledged": true,
+             "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
             ["id": "m0000403", "conversation_id": "c1234567", "sequence": 3,
              "task_id": "q1234567", "role": "assistant", "content": "Task started fixture reply",
              "status": "completed", "owner_id": "u_localtest1", "actor_id": "u_localtest1"],
@@ -4550,6 +4552,7 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
     let variant_group_id: String?
     let variant_version: Int64?
     let variant_action: String?
+    let agent_acknowledged: Bool?
 
     var clientMessage: MordeClientMessage {
         MordeClientMessage(id: id, conversation_id: conversation_id, sequence: sequence, task_id: task_id,
@@ -4559,7 +4562,8 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
             related_task_id: related_task_id, local_send_status: local_send_status,
             owner_id: owner_id, actor_id: actor_id, sources: sources, output_status: output_status,
             output_task_revision: output_task_revision, output_result_event_sequence: output_result_event_sequence,
-            variant_group_id: variant_group_id, variant_version: variant_version, variant_action: variant_action)
+            variant_group_id: variant_group_id, variant_version: variant_version, variant_action: variant_action,
+            agent_acknowledged: agent_acknowledged)
     }
 }
 private struct MordeProjectConversationTask: Decodable {
@@ -5044,12 +5048,12 @@ private struct MordeTaskMediaPreviewControls: View {
                     .disabled(!canRespond || !isPendingCurrent() || busy || loadingPreview || responding)
             } else {
                 Text(AppLocalized("Media preview unavailable"))
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     .accessibilityIdentifier("morde.task.media.unavailable")
             }
             if loadingPreview { ProgressView().controlSize(.small) }
             if let previewFailure {
-                Text(previewFailure).font(.footnote).foregroundStyle(.orange)
+                Text(previewFailure).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
             }
             if client.taskMediaGenerationAvailable != true, canRespond {
                 Button(AppLocalized("拒绝"), role: .destructive) { Task { await decide("reject") } }
@@ -5062,8 +5066,8 @@ private struct MordeTaskMediaPreviewControls: View {
                 VStack(spacing: 12) {
                     NanoMuseQuickLook(url: file.fileURL)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    Text(pending.impact).font(.footnote).foregroundStyle(.secondary)
-                    Text(file.mediaType).font(.caption).foregroundStyle(.secondary)
+                    Text(pending.impact).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+                    Text(file.mediaType).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 .padding(.horizontal)
                 .navigationTitle(pending.title)
@@ -7300,7 +7304,7 @@ private struct MordeIndependentSendTarget {
                 output_result_event_sequence: message.displayResultEventSequence,
                 local_send_status: message.local_send_status, sources: message.sources,
                 variant_group_id: message.variant_group_id, variant_version: message.variant_version,
-                variant_action: message.variant_action)
+                variant_action: message.variant_action, agent_acknowledged: message.agent_acknowledged)
         }
         let receivedIDs = Set(displayed.compactMap(\.client_message_id))
         let pending = pendingMessages.filter {
@@ -7315,7 +7319,7 @@ private struct MordeIndependentSendTarget {
                 attachment_ids: $0.attachments.filter(\.linked).compactMap(\.attachmentID),
                 output_status: nil, output_task_revision: nil, output_result_event_sequence: nil,
                 local_send_status: $0.state.rawValue, sources: nil,
-                variant_group_id: nil, variant_version: nil, variant_action: nil)
+                variant_group_id: nil, variant_version: nil, variant_action: nil, agent_acknowledged: nil)
         }
         let ordered = orderedProjectConversationMessages(displayed)
         let visibleIDs = Set(MordeConversationVariantPresentation.visibleMessages(
@@ -8365,7 +8369,7 @@ private struct MordeIndependentSendTarget {
                         output_result_event_sequence: received.output_result_event_sequence,
                         local_send_status: nil, sources: received.sources,
                         variant_group_id: received.variant_group_id, variant_version: received.variant_version,
-                        variant_action: received.variant_action)
+                        variant_action: received.variant_action, agent_acknowledged: received.agent_acknowledged)
                     projectConversationMessages.removeAll { $0.id == received.id || $0.client_message_id == id }
                     projectConversationMessages.append(projectMessage)
                     projectConversationMessages = orderedProjectConversationMessages(projectConversationMessages)
@@ -15131,6 +15135,11 @@ public struct MordeEmbeddedView: View {
     public var body: some View {
         // The design tab bar is 62 pt tall with 8/16 pt top/bottom spacing.
         MordeClientContainer(layout: .full, ownsLifecycle: ownsLifecycle, bottomOverlay: 86)
+            .foregroundStyle(NanoMuseTones.ink)
+            .tint(NanoMuseTones.action)
+            .textFieldStyle(NanoMuseIceCreamTextFieldStyle())
+            .preferredColorScheme(.light)
+            .background(NanoMuseTones.canvas.ignoresSafeArea())
     }
 }
 
@@ -15150,10 +15159,10 @@ struct MordeAccountSettingsView: View {
                     LabeledContent("Account ID", value: user.id)
                 } else if client.signedIn {
                     Text("Loading account information…")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 } else {
                     Text("Not signed in to Morde.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.account.signedOut")
                 }
             }
@@ -15228,10 +15237,14 @@ struct MordeAccountSettingsView: View {
                 Section("Status") {
                     Text(error)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NanoMuseTones.canvas)
+        .listRowBackground(NanoMuseTones.surface)
+        .listRowSeparatorTint(NanoMuseTones.hairline)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             Color.clear.frame(height: 86).accessibilityHidden(true)
         }
@@ -15301,9 +15314,9 @@ private struct MordePortalSettingsView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 12) {
-                    Image(systemName: "lock.shield").font(.title2).foregroundStyle(.secondary)
+                    Image(systemName: "lock.shield").font(.title2).foregroundStyle(NanoMuseTones.secondaryText)
                     Text(error ?? AppLocalized("Sign in to Morde to open this page."))
-                        .multilineTextAlignment(.center).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center).foregroundStyle(NanoMuseTones.secondaryText)
                     Button("Retry") { Task { await openPage() } }
                         .disabled(!client.signedIn)
                 }
@@ -15466,9 +15479,9 @@ private struct MordeComputerFilesView: View {
         }
     }
 
-    private static let workspaceIconBackground = Color(red: 0.925, green: 0.925, blue: 0.941)
-    private static let workspaceMetadataColor = Color(red: 115.0 / 255, green: 115.0 / 255, blue: 120.0 / 255)
-    private static let workspaceFileIconColor = Color(red: 58.0 / 255, green: 58.0 / 255, blue: 60.0 / 255)
+    private static let workspaceIconBackground = NanoMuseTones.brandSoft
+    private static let workspaceMetadataColor = NanoMuseTones.secondaryText
+    private static let workspaceFileIconColor = NanoMuseTones.ink
 
     @StateObject private var client = MordeClient.shared
     @Environment(\.dismiss) private var dismiss
@@ -15657,7 +15670,7 @@ private struct MordeComputerFilesView: View {
                     if crumb.path == currentDirectoryPath {
                         if !currentDirectoryPath.isEmpty {
                             Text("/")
-                                .foregroundStyle(Color(red: 198.0 / 255, green: 198.0 / 255, blue: 203.0 / 255))
+                                .foregroundStyle(NanoMuseTones.muted)
                         }
                         Text(crumb.title)
                             .fontWeight(.medium)
@@ -15700,7 +15713,7 @@ private struct MordeComputerFilesView: View {
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 20, weight: .light))
-                    .foregroundStyle(Color(red: 198.0 / 255, green: 198.0 / 255, blue: 203.0 / 255))
+                    .foregroundStyle(NanoMuseTones.muted)
                     .padding(.top, 9)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -15715,7 +15728,7 @@ private struct MordeComputerFilesView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(selection.file.path).font(.headline)
             Text("\(Self.fileSize(selection.file.sizeBytes)) · SHA-256")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             Text(verbatim: selection.file.sha256)
                 .font(.system(size: 12, design: .monospaced))
                 .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
@@ -15728,17 +15741,17 @@ private struct MordeComputerFilesView: View {
                 .disabled(isTransferring || selectedWorkspace == nil || client.workspaceSyncAvailable != true)
             if selectedFiles.isEmpty {
                 Text("尚未选择文件。取消文件选择或本确认框都不会上传。")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             } else {
                 ForEach(selectedFiles) { selection in localSelectionRow(selection) }
-                Text(selectionSummary).font(.footnote).foregroundStyle(.secondary)
+                Text(selectionSummary).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 Button("上传并确认检查点") { confirmUpload = true }
                     .disabled(isTransferring || client.workspaceSyncAvailable != true)
             }
             if let (done, total) = transferProgress, isTransferring {
                 ProgressView(value: total == 0 ? 1 : Double(done) / Double(total))
                 Text("已确认 \(Self.fileSize(done)) / \(Self.fileSize(total))")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
         } header: {
             Text("选择并确认上传范围")
@@ -15763,13 +15776,13 @@ private struct MordeComputerFilesView: View {
                      ? "服务端未开放电脑文件传输；上传和下载已锁定。"
                      : "正在确认服务端文件能力。")
                     .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .padding(.vertical, 12)
                     .accessibilityIdentifier("morde.workspace.capability.unavailable")
             } else if let manifestError {
                 Text("文件清单暂不可用：\(manifestError)")
                     .font(.system(size: 14))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(NanoMuseTones.dangerInk)
                     .padding(.vertical, 12)
                     .accessibilityIdentifier("morde.workspace.manifest.error")
             } else if manifestLoading && manifestRevision == nil {
@@ -15778,12 +15791,12 @@ private struct MordeComputerFilesView: View {
             } else if manifestRevision != nil && directFileRows.isEmpty && directSubdirectoryPaths.isEmpty && nextCursor == nil {
                 Text("此目录当前没有文件。")
                     .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .padding(.vertical, 12)
             } else if manifestRevision == nil {
                 Text("选择获准电脑后读取其文件清单。")
                     .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .padding(.vertical, 12)
             }
             ForEach(directSubdirectoryPaths, id: \.self) { path in directoryRow(path) }
@@ -15811,7 +15824,7 @@ private struct MordeComputerFilesView: View {
             ProgressView(value: total == 0 ? 1 : Double(done) / Double(total))
             Text("已确认 \(Self.fileSize(done)) / \(Self.fileSize(total))")
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NanoMuseTones.secondaryText)
         } else {
             ProgressView("正在提交文件操作…")
         }
@@ -15827,17 +15840,17 @@ private struct MordeComputerFilesView: View {
                 ProgressView("正在读取文件版本差异…")
             }
             if let workspaceHistoryError {
-                Text(workspaceHistoryError).font(.footnote).foregroundStyle(.orange)
+                Text(workspaceHistoryError).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
             }
             if let workspaceHistoryNotice {
-                Text(workspaceHistoryNotice).font(.footnote).foregroundStyle(.secondary)
+                Text(workspaceHistoryNotice).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
             if let workspaceDiff {
                 Text("v\(workspaceDiff.from_revision) → v\(workspaceDiff.to_revision) · \(workspaceDiff.changes.count) 项")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 if workspaceDiff.changes.isEmpty {
                     Text("这两个版本之间没有差异。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 ForEach(workspaceDiff.changes) { change in
                     Button {
@@ -15852,10 +15865,10 @@ private struct MordeComputerFilesView: View {
                                 Text("\(workspaceDiffActionTitle(change.action)) · \(change.path)")
                                     .font(.footnote)
                                 if let before = change.before?.path, before != change.path {
-                                    Text("原路径：\(before)").font(.caption).foregroundStyle(.secondary)
+                                    Text("原路径：\(before)").font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                                 }
                                 Text(workspaceDiffStatusTitle(change.display_status))
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -15933,6 +15946,10 @@ private struct MordeComputerFilesView: View {
                     if tool == .upload { uploadSelectionSection }
                     else { workspaceHistorySection }
                 }
+                .scrollContentBackground(.hidden)
+                .background(NanoMuseTones.canvas)
+                .listRowBackground(NanoMuseTones.surface)
+                .listRowSeparatorTint(NanoMuseTones.hairline)
                 .navigationTitle(tool.title)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -16469,36 +16486,36 @@ private struct MordeClientInstallationsSettingsView: View {
                         .accessibilityIdentifier("morde.hub.open.url")
                 } else {
                     Text("This Morde service has not confirmed Hub v1 support; device relay is unavailable.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 Text("Online is advisory Hub presence. The target confirms the open request; no confirmation means the result is unknown.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 switch client.devicesState {
                 case .loading:
                     ProgressView("Loading devices…")
                 case .failed(let message):
-                    Text(message).foregroundStyle(.orange)
+                    Text(message).foregroundStyle(NanoMuseTones.dangerInk)
                     Button("Retry devices") { Task { await client.loadDevices() } }
                 case .loaded:
                     if client.devices.isEmpty {
-                        Text("No client devices are registered.").foregroundStyle(.secondary)
+                        Text("No client devices are registered.").foregroundStyle(NanoMuseTones.secondaryText)
                     }
                     ForEach(client.devices) { device in deviceRelayRow(device) }
                 }
                 if let notice = client.hubRelayNotice {
-                    Label(notice, systemImage: "checkmark.circle").foregroundStyle(.secondary)
+                    Label(notice, systemImage: "checkmark.circle").foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 if let error = client.hubRelayError {
-                    Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+                    Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(NanoMuseTones.dangerInk)
                 }
                 Text("Only an explicit open-link request is sent. This screen does not send files, screenshots, commands, or notifications.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
 
             if let notice = client.pendingRevocationNotice {
                 Section {
                     Label(notice, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NanoMuseTones.warning)
                     Button("Retry") {
                         Task {
                             await client.retryPendingRevocations()
@@ -16516,14 +16533,14 @@ private struct MordeClientInstallationsSettingsView: View {
                 }
             case .failed(let message):
                 Section {
-                    Text(message).foregroundStyle(.orange)
+                    Text(message).foregroundStyle(NanoMuseTones.dangerInk)
                     Button("Retry") { Task { await client.loadClientInstallations() } }
                 }
             case .loaded:
                 if client.clientInstallations.isEmpty {
                     Section {
                         Text("No client installations are registered.")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
                     }
                 } else {
                     Section("Client installations") {
@@ -16534,7 +16551,7 @@ private struct MordeClientInstallationsSettingsView: View {
                     if !client.clientInstallations.contains(where: { $0.id != client.currentClientInstallationID }) {
                         Section {
                             Text("No other client installations.")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(NanoMuseTones.secondaryText)
                         }
                     }
                 }
@@ -16543,15 +16560,19 @@ private struct MordeClientInstallationsSettingsView: View {
             if let notice = client.clientInstallationsNotice {
                 Section {
                     Label(notice, systemImage: "checkmark.circle")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 }
             }
             if let error = client.clientInstallationsActionError {
                 Section {
-                    Text(error).foregroundStyle(.orange)
+                    Text(error).foregroundStyle(NanoMuseTones.dangerInk)
                 }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NanoMuseTones.canvas)
+        .listRowBackground(NanoMuseTones.surface)
+        .listRowSeparatorTint(NanoMuseTones.hairline)
         .navigationTitle("Client installations")
         .navigationBarTitleDisplayMode(.inline)
         .refreshable {
@@ -16606,9 +16627,9 @@ private struct MordeClientInstallationsSettingsView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(device.display_name).font(.headline)
                     Text("\(device.platform) · \(presence)\(currentDevice)")
-                        .font(.footnote).foregroundStyle(device.online ? .secondary : .tertiary)
+                        .font(.footnote).foregroundStyle(device.online ? NanoMuseTones.secondaryText : NanoMuseTones.muted)
                     if device.revoked {
-                        Text("Installation revoked.").font(.caption).foregroundStyle(.secondary)
+                        Text("Installation revoked.").font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             .accessibilityIdentifier("morde.hub.revokedDevice")
                     }
                 }
@@ -16634,24 +16655,24 @@ private struct MordeClientInstallationsSettingsView: View {
                     Text(installation.display_name).font(.headline)
                     Text(installation.id)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                         .textSelection(.enabled)
                 }
                 Spacer(minLength: 8)
                 if isCurrent {
                     Text("Current device")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 }
             }
 
             HStack {
                 if installation.revoked {
-                    Text("Installation revoked.").font(.footnote).foregroundStyle(.secondary)
+                    Text("Installation revoked.").font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 } else if isCurrent {
                     Text("This is the current device. To revoke it, sign out of this account.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 Spacer()
                 if MordeClientInstallationPolicy.revokePath(
@@ -16710,7 +16731,7 @@ private struct MordeHostSharingSheet: View {
                         .disabled(isWorking || !MordeProjectPolicy.hasValidUserID(recipientUserID) || recipientUserID == client.user?.id)
                         .accessibilityIdentifier("morde.hostShare.grant")
                     Text(AppLocalized("Control remains available until you revoke access. Each control session still follows the existing lease and renewal flow."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.hostShare.leasePolicy")
                 }
 
@@ -16718,10 +16739,10 @@ private struct MordeHostSharingSheet: View {
                     if isLoading {
                         ProgressView()
                     } else if let loadError {
-                        Text(loadError).foregroundStyle(.orange)
+                        Text(loadError).foregroundStyle(NanoMuseTones.dangerInk)
                         Button(AppLocalized("Retry")) { Task { await reloadMembers() } }
                     } else if members.isEmpty {
-                        Text(verbatim: emptyMembersMessage).foregroundStyle(Color.secondary)
+                        Text(verbatim: emptyMembersMessage).foregroundStyle(NanoMuseTones.secondaryText)
                     } else {
                         ForEach(members) { member in
                             HStack(alignment: .top, spacing: 12) {
@@ -16729,7 +16750,7 @@ private struct MordeHostSharingSheet: View {
                                     Text(member.user_id)
                                         .font(.body.weight(.medium))
                                     Text(permissionSummary(member.permissions))
-                                        .font(.footnote).foregroundStyle(.secondary)
+                                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                                         .accessibilityIdentifier("morde.hostShare.member.permissions.\(member.user_id)")
                                 }
                                 Spacer(minLength: 8)
@@ -16745,12 +16766,15 @@ private struct MordeHostSharingSheet: View {
                 }
 
                 if let notice {
-                    Section { Text(notice).foregroundStyle(.secondary) }
+                    Section { Text(notice).foregroundStyle(NanoMuseTones.secondaryText) }
                 }
                 if let actionError {
-                    Section { Text(actionError).foregroundStyle(.orange) }
+                    Section { Text(actionError).foregroundStyle(NanoMuseTones.dangerInk) }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(NanoMuseTones.canvas)
+            .tint(NanoMuseTones.action)
             .navigationTitle(AppLocalized("Share cloud computer"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -17010,14 +17034,7 @@ private struct MordeChatMascotFace: View {
     var body: some View {
         ZStack {
             if speechState == .idle {
-                LinearGradient(
-                    colors: [
-                        Color(red: 247.0 / 255.0, green: 238.0 / 255.0, blue: 226.0 / 255.0),
-                        Color(red: 237.0 / 255.0, green: 220.0 / 255.0, blue: 196.0 / 255.0),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
+                Circle().fill(NanoMuseTones.brand)
                 MordeChatMascotMarks()
                     .frame(width: 30, height: 30)
             } else {
@@ -17029,13 +17046,13 @@ private struct MordeChatMascotFace: View {
         }
         .frame(width: 44, height: 44)
         .clipShape(Circle())
-        .overlay(Circle().stroke(Color.black.opacity(0.05), lineWidth: 1))
+        .overlay(Circle().stroke(NanoMuseTones.brandTint, lineWidth: 1))
     }
 }
 
 private struct MordeChatMascotMarks: View {
-    private let ink = Color(red: 58.0 / 255.0, green: 50.0 / 255.0, blue: 48.0 / 255.0)
-    private let cheek = Color(red: 240.0 / 255.0, green: 185.0 / 255.0, blue: 166.0 / 255.0)
+    private let ink = Color.white
+    private let cheek = Color.white.opacity(0.6)
 
     var body: some View {
         GeometryReader { geometry in
@@ -17502,14 +17519,15 @@ private struct MordeRoot: View {
     private var currentConversationTask: MordeTask? {
         client.conversationTasks.first { $0.id == chatAppendTaskID && $0.conversation_id == client.currentConversation }
     }
-    private var startedConversationMessageIDs: Set<String> {
+    private var processingConversationMessageIDs: Set<String> {
         guard let conversationID = client.currentConversation else { return [] }
         let tasks = client.conversationTasks.filter { $0.conversation_id == conversationID }.map {
-            MordeTaskStartedAcknowledgementState(taskID: $0.id, currentRevision: $0.current_revision,
-                desiredRevision: $0.desired_revision, currentRevisionStarted: $0.current_revision_started)
+            MordeAgentMessageProcessingTaskState(taskID: $0.id, status: $0.status,
+                currentRevision: $0.current_revision, desiredRevision: $0.desired_revision,
+                currentRevisionStarted: $0.current_revision_started)
         }
-        return MordeTaskStartedAcknowledgementPolicy.messageIDs(
-            messages: client.displayedConversationMessages, tasks: tasks)
+        return MordeAgentMessageStatusPresentation.processingMessageIDs(
+            messages: client.displayedConversationMessages.filter { $0.conversation_id == conversationID }, tasks: tasks)
     }
     private var canQueueConversationFollowUp: Bool {
         guard let task = currentConversationTask else { return false }
@@ -17866,7 +17884,7 @@ private struct MordeRoot: View {
             resource: resource, state: state, itemCount: itemCount, emptyMessage: emptyMessage) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(message).font(.subheadline)
-                    .foregroundStyle(state.isFailed ? Color.orange : Color.primary)
+                    .foregroundStyle(state.isFailed ? NanoMuseTones.danger : NanoMuseTones.ink)
                 if state.isFailed {
                     Button("重试读取") { Task { await client.load() } }
                 }
@@ -17880,7 +17898,7 @@ private struct MordeRoot: View {
                     LazyVStack(alignment: .leading, spacing: 18) {
                     if let failure = client.mainConversationLoadError {
                         Label(failure, systemImage: "exclamationmark.triangle")
-                            .font(.footnote).foregroundStyle(.orange)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                         Button("重试读取") { Task { await client.load() } }
                     } else if client.currentConversation == nil {
                         VStack(spacing: 10) {
@@ -17894,7 +17912,7 @@ private struct MordeRoot: View {
                     if client.currentConversation != nil {
                         let messageState = client.resourceState(.messages)
                         if let failure = messageState.failureMessage {
-                            Text(failure).font(.subheadline).foregroundStyle(.orange)
+                            Text(failure).font(.subheadline).foregroundStyle(NanoMuseTones.dangerInk)
                             Button("重试读取") { Task { await client.retryCurrentConversationMessages() } }
                                 .accessibilityIdentifier("morde.chat.messages.retry")
                         } else if let emptyMessage = MordeResourcePresentation.emptyListMessage(
@@ -17904,7 +17922,7 @@ private struct MordeRoot: View {
                                 .foregroundStyle(NanoMuseTones.secondaryText)
                         }
                         if let failure = client.messageHistoryError {
-                            Text(failure).font(.footnote).foregroundStyle(.orange)
+                            Text(failure).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                             Button("重试读取") { Task { await client.loadEarlierMessages() } }
                                 .accessibilityIdentifier("morde.chat.messages.retryEarlier")
                         } else if client.messageNextCursor != nil {
@@ -17935,7 +17953,7 @@ private struct MordeRoot: View {
                                     message.duplicate_of_message_id == nil &&
                                     (pending == nil || pending?.state == .accepted) &&
                                     MordeRoutingPresentation.canRetryProcessing(message.routing_failure_reason),
-                                showsTaskStartedAcknowledgement: startedConversationMessageIDs.contains(message.id),
+                                showsAgentProcessingBubble: processingConversationMessageIDs.contains(message.id),
                                 onRetry: { if let id = message.client_message_id { client.retryPendingMessage(id) } },
                                 onSendIndependently: pending.flatMap(client.independentSendTarget).map { target in
                                     { independentSendTarget = target }
@@ -17975,7 +17993,7 @@ private struct MordeRoot: View {
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text(message.content).textSelection(.enabled)
                                     Text("项目 \(message.projectID ?? "") · 会话 \(message.conversationID)")
-                                        .font(.caption).foregroundStyle(.secondary)
+                                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                                     ForEach(message.attachments) { attachment in
                                         if let path = attachment.localPath {
                                             Label(attachment.originalFilename ?? URL(fileURLWithPath: path).lastPathComponent, systemImage: "paperclip")
@@ -17983,11 +18001,11 @@ private struct MordeRoot: View {
                                         }
                                     }
                                     Text(verbatim: NSLocalizedString(message.statusLocalizationKey, comment: "Message send status"))
-                                        .font(.caption).foregroundStyle(.secondary)
-                                    if let failure = message.error { Text(verbatim: failure).font(.caption).foregroundStyle(.orange) }
+                                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
+                                    if let failure = message.error { Text(verbatim: failure).font(.caption).foregroundStyle(NanoMuseTones.dangerInk) }
                                     if let waiting = MordeOutboxScheduling.waitingForEarlierMessage(message, in: client.pendingMessages) {
                                         Text(verbatim: NSLocalizedString(waiting, comment: "Message send status"))
-                                            .font(.caption).foregroundStyle(.secondary)
+                                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                                     }
                                     Button("重试发送") { client.retryPendingMessage(message.id) }
                                         .font(.caption).frame(minHeight: 44)
@@ -17998,7 +18016,9 @@ private struct MordeRoot: View {
                                     }
                                 }
                                 .padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                                .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 14))
+                                .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+                                .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
                                 .accessibilityIdentifier("morde.projectOutbox.message.\(message.id)")
                             }
                         }
@@ -18174,9 +18194,10 @@ private struct MordeRoot: View {
             }
             .padding(.horizontal, 4)
             .padding(.vertical, 1)
-            .background(NanoMuseTones.bubble, in: Capsule())
-            .clipShape(Capsule())
-            .shadow(color: Color.black.opacity(0.08), radius: 4, x: 0, y: 2)
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
+            .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
             .padding(.horizontal, 16)
             .frame(maxWidth: 680)
 
@@ -18206,10 +18227,10 @@ private struct MordeRoot: View {
                 Spacer()
                 Text(showDetailedReason ? AppLocalized("Waiting for you") : task.statusLabel)
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
             }
             if showDetailedReason {
-                Text(task.statusLabel).font(.footnote).foregroundStyle(.orange)
+                Text(task.statusLabel).font(.footnote).foregroundStyle(NanoMuseTones.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Text((task.isWaitingForRevisionStart ? task.objective : task.displayedCurrentStep) ??
@@ -18217,7 +18238,7 @@ private struct MordeRoot: View {
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
-                Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
+                Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
             conversationTaskRelations(task)
             NavigationLink {
@@ -18231,7 +18252,9 @@ private struct MordeRoot: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
         .accessibilityIdentifier("morde.chat.taskSummary")
     }
 
@@ -18274,7 +18297,7 @@ private struct MordeRoot: View {
                         .font(.caption)
                 }
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(NanoMuseTones.secondaryText)
             .accessibilityIdentifier("morde.chat.taskRelations.\(task.id)")
         }
     }
@@ -18326,7 +18349,7 @@ private struct MordeRoot: View {
                 Text(chatAppendTaskID == nil
                      ? "助手会判断消息与活动任务的关系。"
                      : "助手会结合所选任务判断消息意图。")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
             Section("目标电脑") {
                 emptyResourceState(.hosts, itemCount: client.hosts.count,
@@ -18347,10 +18370,10 @@ private struct MordeRoot: View {
                 .accessibilityIdentifier("morde.chat.hostTarget")
                 if let selectedHost {
                     Text("电脑状态：\(MordeTaskTargetPresentation.hostState(selectedHost.state)) · \(MordeTaskTargetPresentation.hostControlState(selectedHost.control_state))")
-                        .font(.footnote).foregroundStyle(selectedHostReady ? Color.secondary : Color.orange)
+                        .font(.footnote).foregroundStyle(selectedHostReady ? NanoMuseTones.secondaryText : NanoMuseTones.warning)
                     if !selectedHostReady {
                         Text("任务需要使用这台电脑时，助手会检查其状态。")
-                            .font(.footnote).foregroundStyle(.orange)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     }
                 } else if !host.isEmpty {
                     Text(client.resourceState(.hosts).failureMessage.map {
@@ -18358,7 +18381,7 @@ private struct MordeRoot: View {
                     } ?? (client.resourceState(.hosts).isLoaded
                           ? "所选电脑当前状态未知，使用时将核验。"
                           : "电脑状态尚未确认，使用时将核验。"))
-                        .font(.footnote).foregroundStyle(.orange)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                 }
             }
             Section("模型") {
@@ -18373,9 +18396,12 @@ private struct MordeRoot: View {
                 emptyResourceState(.models, itemCount: client.models.count,
                                    emptyMessage: "当前没有可用的文本工具模型。")
                 Text("目标和模型只影响后续提交；已受理 Task 的目标及输入版本保持固定。")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NanoMuseTones.canvas)
+        .tint(NanoMuseTones.action)
     }
 
     private var chatTaskTargetLabel: String {
@@ -18390,7 +18416,7 @@ private struct MordeRoot: View {
                     Text(notificationTitle(item))
                     Spacer()
                     Text(item.read_at == nil ? "未读" : "已读")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 Text(item.displaySummary).font(.caption)
             }
@@ -18409,7 +18435,12 @@ private struct MordeRoot: View {
                     }
                     .disabled(client.loadingMoreNotifications)
                 }
-            }.navigationTitle("通知")
+            }
+            .scrollContentBackground(.hidden)
+            .background(NanoMuseTones.canvas)
+            .listRowBackground(NanoMuseTones.surface)
+            .listRowSeparatorTint(NanoMuseTones.hairline)
+            .navigationTitle("通知")
             Button("退出登录", role: .destructive) { confirmsSignOut = true }
                 .disabled(client.busy)
         }.tabItem { Label("通知", systemImage: "bell") }.tag(3)
@@ -18514,7 +18545,7 @@ private struct MordeRoot: View {
             TimelineView(.periodic(from: .now, by: 60)) { context in
                 if let notice = client.expiryNotice(at: context.date) {
                     Text(notice).font(.headline).frame(maxWidth: .infinity)
-                        .padding().background(Color.orange.opacity(0.25))
+                        .padding().background(NanoMuseTones.warningFill)
                 }
             }
         }
@@ -18617,8 +18648,8 @@ private struct MordeRoot: View {
 
     private func unavailableRoute(_ title: String, symbol: String) -> some View {
         VStack(spacing: 10) {
-            Image(systemName: symbol).font(.title2).foregroundStyle(.secondary)
-            Text(title).font(.body).foregroundStyle(.secondary)
+            Image(systemName: symbol).font(.title2).foregroundStyle(NanoMuseTones.secondaryText)
+            Text(title).font(.body).foregroundStyle(NanoMuseTones.secondaryText)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(NanoMuseTones.canvas.ignoresSafeArea())
@@ -18646,7 +18677,7 @@ private struct MordeRoot: View {
                     .accessibilityIdentifier("morde.chat.header.speechState")
                 Text(chatHeaderStatus)
                     .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(Color(red: 163.0 / 255.0, green: 163.0 / 255.0, blue: 168.0 / 255.0))
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .tracking(0.02)
                     .lineLimit(1)
                     .accessibilityIdentifier("morde.chat.header.status")
@@ -18721,7 +18752,7 @@ private struct MordeRoot: View {
                     if let notice = client.pendingRevocationNotice {
                         Text(notice)
                             .font(.footnote)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(NanoMuseTones.warning)
                             .accessibilityIdentifier("morde.auth.pendingRevocationNotice")
                     }
                     Section(AppLocalized(registrationMode ? "Create account" : "Sign in")) {
@@ -18782,7 +18813,7 @@ private struct MordeRoot: View {
                         Button(AppLocalized("Sign in")) { showExpiredSessionLogin = true }
                             .accessibilityIdentifier("morde.auth.expiredSignIn")
                     }
-                    .font(.footnote).padding(12).background(Color.orange.opacity(0.15))
+                    .font(.footnote).padding(12).background(NanoMuseTones.warningFill)
                     conversationContent
                 }
             } else if layout == .conversation {
@@ -18791,6 +18822,9 @@ private struct MordeRoot: View {
                 designNavigation
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NanoMuseTones.canvas)
+        .tint(NanoMuseTones.action)
     }
 
     private var rootWithShellNotifications: some View {
@@ -18958,11 +18992,11 @@ private struct MordeUnconfirmedMessageCard: View {
                 if !message.attachmentIDs.isEmpty {
                     Text("\(message.attachmentIDs.count) 个附件引用待处理").font(.caption)
                 }
-                Text(message.reason).font(.caption).foregroundStyle(.orange)
+                Text(message.reason).font(.caption).foregroundStyle(NanoMuseTones.warning)
                 if let status = message.localAttachmentStatus {
-                    Text(status).font(.caption).foregroundStyle(.secondary)
+                    Text(status).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 } else if !message.stagedAttachments.isEmpty {
-                    Text("正在将附件原件保存到本机…").font(.caption).foregroundStyle(.secondary)
+                    Text("正在将附件原件保存到本机…").font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 HStack {
                     Button("确认并恢复", action: onRestore)
@@ -18996,26 +19030,10 @@ private enum MordeDesignSettingsDestination: String, CaseIterable, Identifiable 
 }
 
 private enum MordeSettingsPalette {
-    static let canvas = Color(uiColor: UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? .black
-            : UIColor(red: 0.980, green: 0.980, blue: 0.980, alpha: 1)
-    })
-    static let muted = Color(uiColor: UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(white: 0.64, alpha: 1)
-            : UIColor(red: 0.639, green: 0.639, blue: 0.659, alpha: 1)
-    })
-    static let chevron = Color(uiColor: UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(white: 0.58, alpha: 1)
-            : UIColor(red: 0.776, green: 0.776, blue: 0.796, alpha: 1)
-    })
-    static let danger = Color(uiColor: UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? .systemRed
-            : UIColor(red: 0.784, green: 0.118, blue: 0.118, alpha: 1)
-    })
+    static let canvas = NanoMuseTones.canvas
+    static let muted = NanoMuseTones.muted
+    static let chevron = NanoMuseTones.muted
+    static let danger = NanoMuseTones.danger
 }
 
 private struct MordeDesignSettingsRoot: View {
@@ -19056,7 +19074,8 @@ private struct MordeDesignSettingsRoot: View {
                                  ? AppLocalized("重新启用全部任务")
                                  : AppLocalized("急停全部任务"))
                                 .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(MordeSettingsPalette.danger)
+                                .foregroundStyle(execution.state == "disabled"
+                                    ? NanoMuseTones.actionText : MordeSettingsPalette.danger)
                             Spacer()
                             if execution.isBusy { ProgressView().controlSize(.small) }
                         }
@@ -19110,10 +19129,13 @@ private struct MordeDesignSettingsRoot: View {
                 }
                 Text("›")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(NanoMuseTones.ink)
+                    .foregroundStyle(MordeSettingsPalette.chevron)
             }
             .padding(.vertical, 13)
             .contentShape(Rectangle())
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(NanoMuseTones.hairline))
         }
         .buttonStyle(MordeDesignSettingsPressStyle())
         .accessibilityIdentifier("morde.settings.row.\(item.rawValue)")
@@ -19156,7 +19178,7 @@ private struct MordeDesignSettingsDetail: View {
         case .about:
             VStack(alignment: .leading, spacing: 10) {
                 Text(appVersion).font(.headline)
-                Text("Morde iOS") .font(.subheadline).foregroundStyle(.secondary)
+                Text("Morde iOS") .font(.subheadline).foregroundStyle(NanoMuseTones.secondaryText)
                 Spacer()
             }
             .padding(20)
@@ -19214,8 +19236,8 @@ private struct MIFConversationMessageSourceList: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
-                .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(NanoMuseTones.hairline))
+                .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(NanoMuseTones.hairline))
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(combinedLabel)
                 .accessibilityIdentifier("\(accessibilityPrefix).\(line.source.task_id).r\(line.source.task_revision).e\(line.source.event_sequence)")
@@ -19225,11 +19247,7 @@ private struct MIFConversationMessageSourceList: View {
 }
 
 private enum MordeConversationBubblePalette {
-    static let userMessage = Color(uiColor: UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.17, green: 0.31, blue: 0.47, alpha: 1)
-            : UIColor(red: 240.0 / 255.0, green: 240.0 / 255.0, blue: 242.0 / 255.0, alpha: 1)
-    })
+    static let userMessage = NanoMuseTones.userMessage
 }
 
 private struct MIFMordeMessageBubble: View {
@@ -19242,7 +19260,7 @@ private struct MIFMordeMessageBubble: View {
     let serviceNeedsUpdate: Bool
     let processingRetryInFlight: Bool
     let canRetryProcessing: Bool
-    let showsTaskStartedAcknowledgement: Bool
+    let showsAgentProcessingBubble: Bool
     let onRetry: () -> Void
     let onSendIndependently: (() -> Void)?
     let onRetryProcessing: () -> Void
@@ -19267,16 +19285,16 @@ private struct MIFMordeMessageBubble: View {
                 Button(action: onRetryProcessing) {
                     Group {
                         if processingRetryInFlight {
-                            ProgressView().tint(.red)
+                            ProgressView().tint(NanoMuseTones.danger)
                         } else {
                             Image(systemName: "exclamationmark")
                                 .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(.red)
+                                .foregroundStyle(NanoMuseTones.dangerInk)
                         }
                     }
                     .frame(width: 34, height: 34)
-                    .background(Color(uiColor: .systemBackground), in: Circle())
-                    .overlay(Circle().stroke(Color.red.opacity(0.32), lineWidth: 1))
+                    .background(NanoMuseTones.surface, in: Circle())
+                    .overlay(Circle().stroke(NanoMuseTones.danger.opacity(0.32), lineWidth: 1))
                     .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
@@ -19337,17 +19355,18 @@ private struct MIFMordeMessageBubble: View {
                                     : pending.statusLocalizationKey,
                                     comment: "Message send status"))
                                     .font(.caption)
-                                    .foregroundStyle(pending.state == .failed || pending.state == .unknown ? Color.orange : Color.secondary)
+                                    .foregroundStyle(pending.state == .failed || pending.state == .unknown
+                                        ? NanoMuseTones.danger : NanoMuseTones.secondaryText)
                                     .accessibilityIdentifier("morde.chat.message.status.\(message.client_message_id ?? pending.id)")
                                 if pending.state == .failed || pending.state == .unknown || pending.error != nil {
                                     Button(AppLocalized("Retry"), action: onRetry)
                                         .font(.caption.weight(.medium))
                                 }
                             }
-                            if let error = pending.error { Text(verbatim: error).font(.caption).foregroundStyle(.secondary) }
+                            if let error = pending.error { Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.secondaryText) }
                             if let waitingForEarlier {
                                 Text(verbatim: NSLocalizedString(waitingForEarlier, comment: "Message send status"))
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             }
                             if let onSendIndependently {
                                 Button("Send this message independently", action: onSendIndependently)
@@ -19357,47 +19376,57 @@ private struct MIFMordeMessageBubble: View {
                         }
                     } else if isUser, message.client_message_id != nil, message.routing_status != "failed" {
                         Text(AppLocalized("Sent"))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             .accessibilityIdentifier("morde.chat.message.status.\(message.client_message_id ?? message.id)")
                     }
                     if isUser, (pending == nil || pending?.state == .accepted),
                        let originalMessageID = message.duplicate_of_message_id {
                         Text(verbatim: MordeRoutingPresentation.duplicateMessageLocalizationKey(
                             originalMessageID: originalMessageID, taskID: message.related_task_id))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                     } else if isUser, (pending == nil || pending?.state == .accepted),
                        let key = MordeRoutingPresentation.localizationKey(message.routing_status) {
                         Text(verbatim: NSLocalizedString(key, comment: "Message routing status"))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                     }
                     if message.displayStatus == "streaming" {
                         Text("正在生成…")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     } else if message.displayStatus == "interrupted" {
                         Text("回复已中断")
-                            .font(.footnote).foregroundStyle(.orange)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.warning)
                     }
                 }
-                .padding(.horizontal, isUser ? 15 : 0)
-                .padding(.vertical, isUser ? 10 : 0)
+                .foregroundStyle(isUser ? Color.white : NanoMuseTones.ink)
+                .padding(.horizontal, isUser ? 15 : 16)
+                .padding(.vertical, 10)
                 .frame(maxWidth: isUser ? maximumBubbleWidth : .infinity, alignment: .leading)
                 .background {
-                    if isUser {
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .fill(userMessageFill)
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(isUser ? userMessageFill : NanoMuseTones.surface)
+                }
+                .overlay {
+                    if !isUser {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .strokeBorder(NanoMuseTones.hairline)
                     }
                 }
                 .overlay(alignment: .bottomTrailing) {
-                    if isUser && showsTaskStartedAcknowledgement {
+                    if MordeAgentMessageStatusPresentation.showsAcknowledgement(for: message) {
                         Text("👌🏻")
                             .font(.system(size: 17))
                             .padding(3)
-                            .background(.regularMaterial, in: Circle())
-                            .overlay(Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                            .background(NanoMuseTones.surface, in: Circle())
+                            .overlay(Circle().strokeBorder(NanoMuseTones.hairline))
                             .offset(x: 7, y: 7)
                             .accessibilityLabel(AppLocalized("Task started"))
                             .accessibilityIdentifier("morde.chat.message.task-started.\(message.id)")
                     }
+                }
+                if isUser && showsAgentProcessingBubble {
+                    MordeAgentProcessingBubble(
+                        accessibilityIdentifier: "morde.chat.message.processing.\(message.id)")
+                        .padding(.top, 8)
                 }
             }
             if !isUser { Spacer(minLength: 0) }
@@ -19459,11 +19488,51 @@ private struct MIFMordeMessageBubble: View {
             }
         }
         .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(Color.primary)
+        .foregroundStyle(isUser ? Color.white : NanoMuseTones.ink)
         .padding(.horizontal, 11)
         .padding(.vertical, 8)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(NanoMuseTones.hairline))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(NanoMuseTones.hairline))
+    }
+}
+
+private struct MordeAgentProcessingBubble: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var shouldPulse = false
+    let accessibilityIdentifier: String
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Text("M")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(NanoMuseTones.brandDeep)
+                .frame(width: 34, height: 34)
+                .background(NanoMuseTones.brandTint, in: Circle())
+
+            HStack(spacing: 4) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(NanoMuseTones.brand)
+                        .frame(width: 7, height: 7)
+                        .scaleEffect(reduceMotion ? 1 : (shouldPulse ? 1 : 0.68))
+                        .opacity(reduceMotion ? 1 : (shouldPulse ? 1 : 0.55))
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.65)
+                            .repeatForever(autoreverses: true).delay(Double(index) * 0.16), value: shouldPulse)
+                }
+            }
+
+            Text(AppLocalized("Processing message"))
+                .font(.system(size: 14))
+                .foregroundStyle(NanoMuseTones.secondaryText)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(NanoMuseTones.surface, in: Capsule())
+        .overlay(Capsule().strokeBorder(NanoMuseTones.hairline))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(AppLocalized("Processing message"))
+        .accessibilityIdentifier(accessibilityIdentifier)
+        .onAppear { shouldPulse = !reduceMotion }
     }
 }
 
@@ -19514,7 +19583,7 @@ private struct MordeConversationVariantControls: View {
                                 .font(.caption.weight(.medium))
                                 .disabled(isBusy(.editResend))
                                 if let error = error(.editResend) {
-                                    Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                    Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                                 }
                             } else {
                                 Button(editing ? AppLocalized("Cancel") : AppLocalized("Edit and resend")) {
@@ -19532,7 +19601,7 @@ private struct MordeConversationVariantControls: View {
                             .font(.caption.weight(.medium))
                             .disabled(isBusy(.editResend))
                             if let error = error(.editResend) {
-                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                             }
                         } else if message.role == "assistant",
                                   isPending(.regenerateText) {
@@ -19542,7 +19611,7 @@ private struct MordeConversationVariantControls: View {
                             .font(.caption.weight(.medium))
                             .disabled(isBusy(.regenerateText))
                             if let error = error(.regenerateText) {
-                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                             }
                         } else if message.role == "assistant",
                                   MordeConversationVariantPresentation.allows(.regenerateText, for: message) {
@@ -19553,7 +19622,7 @@ private struct MordeConversationVariantControls: View {
                             .disabled(isBusy(.regenerateText) || hasAnyPending)
                             .accessibilityIdentifier("morde.message.variants.regenerate.\(message.id)")
                             if let error = error(.regenerateText) {
-                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                             }
                         } else if message.role == "assistant",
                                   isPending(.continueGeneration) {
@@ -19563,7 +19632,7 @@ private struct MordeConversationVariantControls: View {
                             .font(.caption.weight(.medium))
                             .disabled(isBusy(.continueGeneration))
                             if let error = error(.continueGeneration) {
-                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                             }
                         } else if message.role == "assistant",
                                   MordeConversationVariantPresentation.allows(.continueGeneration, for: message) {
@@ -19574,7 +19643,7 @@ private struct MordeConversationVariantControls: View {
                             .disabled(isBusy(.continueGeneration) || hasAnyPending)
                             .accessibilityIdentifier("morde.message.variants.continue.\(message.id)")
                             if let error = error(.continueGeneration) {
-                                Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                                Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                             }
                         }
                         if isBusy(.editResend) || isBusy(.regenerateText) || isBusy(.continueGeneration) {
@@ -19585,7 +19654,7 @@ private struct MordeConversationVariantControls: View {
                         TextEditor(text: $draft)
                             .frame(minHeight: 92, maxHeight: 180)
                             .padding(6)
-                            .background(Color(uiColor: .secondarySystemBackground),
+                            .background(NanoMuseTones.side,
                                         in: RoundedRectangle(cornerRadius: 10))
                             .accessibilityIdentifier("morde.message.variants.edit.content.\(message.id)")
                         HStack {
@@ -19600,10 +19669,10 @@ private struct MordeConversationVariantControls: View {
                             .accessibilityIdentifier("morde.message.variants.edit.submit.\(message.id)")
                         }
                         if let error = error(.editResend) {
-                            Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                            Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                         }
                     } else if let error = error(.editResend), isOwnUserMessage {
-                        Text(verbatim: error).font(.caption).foregroundStyle(.orange)
+                        Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                     }
                 }
                 .padding(.leading, message.role == "assistant" ? 4 : 0)
@@ -19923,17 +19992,17 @@ private struct MordeProjectsRoom: View {
             List {
             Section("收到的邀请") {
                 if let failure = client.projectInvitationsState.failureMessage {
-                    Text("邀请列表读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                    Text("邀请列表读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                     Button("重试读取") { Task { await client.loadProjects() } }
                 } else if client.projectInvitations.isEmpty && client.projectInvitationsState.isLoaded {
                     Text("当前没有待接受的项目邀请。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 ForEach(client.projectInvitations) { invitation in
                     VStack(alignment: .leading, spacing: 6) {
                         Text("项目 \(invitation.project_id)").font(.headline)
                         Text("邀请人 \(invitation.inviter_id) · 权限：\(roleLabel(invitation.role))")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         Button("接受邀请") { Task { await client.acceptProjectInvitation(invitation) } }
                             .disabled(client.projectActionInFlight)
                     }
@@ -19941,11 +20010,11 @@ private struct MordeProjectsRoom: View {
             }
             Section("项目") {
                 if let failure = client.projectsState.failureMessage {
-                    Text("项目列表读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                    Text("项目列表读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                     Button("重试读取") { Task { await client.loadProjects() } }
                 } else if client.projects.isEmpty && client.projectsState.isLoaded {
                     Text("当前账号尚未加入项目。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 if !client.projectsState.isLoaded && !client.projectsState.isFailed {
                     ProgressView("正在读取项目…")
@@ -19968,24 +20037,24 @@ private struct MordeProjectsRoom: View {
             if let project = selectedProject {
                 Section("共享范围") {
                     Text("加入项目不会自动共享个人主会话或记忆。关联电脑或其文件只记录资源，不复制文件，也不授予项目成员访问权限。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 Section("项目共享会话") {
                     if client.selectedProjectConversationID == nil, let error = client.projectConversationError {
-                        Text(error).font(.footnote).foregroundStyle(.orange)
+                        Text(error).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                     }
                     if client.projectBudgetExecutionAvailable != true && client.projectConversations.isEmpty {
                         Text("当前服务未声明项目会话执行能力；不会提交项目任务。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     } else {
                         if let failure = client.projectConversationsState.failureMessage {
-                            Text("会话列表读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                            Text("会话列表读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                             Button("重试读取") { Task { await client.loadProjectConversations(project.id) } }
                         } else if !client.projectConversationsState.isLoaded {
                             ProgressView("正在读取项目会话…")
                         } else if client.projectConversations.isEmpty {
                             Text("当前项目还没有共享会话。")
-                                .font(.footnote).foregroundStyle(.secondary)
+                                .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         }
                         ForEach(client.projectConversations) { projectConversationRow($0) }
                         if canManageWorkItems {
@@ -20001,7 +20070,7 @@ private struct MordeProjectsRoom: View {
                             .disabled(client.projectActionInFlight || projectConversationTitle.unicodeScalars.count > 120)
                         } else {
                             Text("项目权限由服务端在处理消息时核对。")
-                                .font(.footnote).foregroundStyle(.secondary)
+                                .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         }
 
                         if let conversation = selectedProjectConversation {
@@ -20011,9 +20080,9 @@ private struct MordeProjectsRoom: View {
                 }
                 Section("项目成员") {
                     Text(isOwner ? "你是项目负责人。" : "你是项目成员；仅负责人可管理成员和资源关联。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     if let failure = client.projectDetailState.failureMessage {
-                        Text("项目详情读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                        Text("项目详情读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                         Button("重试读取") { Task { await client.selectProject(project.id) } }
                     } else if !client.projectDetailState.isLoaded {
                         ProgressView("正在读取成员和资源…")
@@ -20022,7 +20091,7 @@ private struct MordeProjectsRoom: View {
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(member.user_id)
-                                Text(roleLabel(member.role)).font(.caption).foregroundStyle(.secondary)
+                                Text(roleLabel(member.role)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             }
                             Spacer()
                             if isOwner && member.role != "owner" {
@@ -20046,13 +20115,13 @@ private struct MordeProjectsRoom: View {
 
                 Section("工作项") {
                     if let failure = client.projectWorkItemsState.failureMessage {
-                        Text("工作项读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                        Text("工作项读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                         Button("重试读取") { Task { await client.loadProjectExecution(project.id) } }
                     } else if !client.projectWorkItemsState.isLoaded {
                         ProgressView("正在读取工作项…")
                     } else if client.projectWorkItems.isEmpty {
                         Text("还没有项目工作项。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     }
                     ForEach(client.projectWorkItems) { projectWorkItemRow($0, projectID: project.id) }
                     if canManageWorkItems {
@@ -20069,16 +20138,16 @@ private struct MordeProjectsRoom: View {
                         .disabled(client.projectActionInFlight || workItemTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     } else {
                         Text("只读成员可以查看工作项；创建和变更由负责人或项目成员执行。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     }
                 }
 
                 Section("项目预算与费用") {
                     if client.projectBudgetExecutionAvailable != true {
                         Text("当前服务未声明项目预算执行能力，暂不显示费用状态。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     } else if let failure = client.projectBudgetState.failureMessage {
-                        Text("预算读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                        Text("预算读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                         Button("重试读取") { Task { await client.loadProjectExecution(project.id) } }
                     } else if !client.projectBudgetState.isLoaded {
                         ProgressView("正在读取预算和费用…")
@@ -20089,11 +20158,11 @@ private struct MordeProjectsRoom: View {
                             LabeledContent("已预留", value: formatMicros(budget.reserved_micros, currency: budget.currency))
                             if budget.has_unknown {
                                 Text("有费用结果待核对；预留金额仍保留，不能当作已结算费用。")
-                                    .font(.footnote).foregroundStyle(.orange)
+                                    .font(.footnote).foregroundStyle(NanoMuseTones.warning)
                             }
                         } else {
                             Text("项目尚未配置预算；当前没有费用额度可供执行。")
-                                .font(.footnote).foregroundStyle(.orange)
+                                .font(.footnote).foregroundStyle(NanoMuseTones.warning)
                         }
                         if isOwner {
                             TextField("币种（三位大写代码）", text: $budgetCurrency)
@@ -20120,7 +20189,7 @@ private struct MordeProjectsRoom: View {
                                     .font(.footnote)
                                 Text("预留 \(formatMicros(entry.reserved_micros, currency: entry.currency))" +
                                      (entry.actual_micros.map { " · 实际 \(formatMicros($0, currency: entry.currency))" } ?? ""))
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             }
                         }
                     }
@@ -20144,7 +20213,7 @@ private struct MordeProjectsRoom: View {
                         .disabled(client.projectActionInFlight || inviteUserID.isEmpty)
                         if let invitations = client.recentProjectInvitations[project.id], !invitations.isEmpty {
                             Text("服务端只提供当前账号收到的邀请列表；刚创建的邀请可在本机当前会话中撤销。")
-                                .font(.footnote).foregroundStyle(.secondary)
+                                .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                             ForEach(invitations) { invitation in
                                 HStack {
                                     Text("\(invitation.invitee_id) · \(roleLabel(invitation.role))")
@@ -20158,7 +20227,7 @@ private struct MordeProjectsRoom: View {
                     Section("负责人交接") {
                         if transferCandidates.isEmpty {
                             Text("需要先有一位已接受邀请的成员，才能转移负责人。")
-                                .font(.footnote).foregroundStyle(.secondary)
+                                .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         } else {
                             Picker("交接给", selection: $ownerTransferUserID) {
                                 Text("选择成员").tag("")
@@ -20172,17 +20241,17 @@ private struct MordeProjectsRoom: View {
 
                 Section("关联的电脑与文件") {
                     Text("关联只记录项目资源，不会授予其他项目成员访问电脑或文件的权限。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     if client.projectResources.isEmpty && client.projectDetailState.isLoaded {
                         Text("没有当前账号可见的关联资源。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     }
                     ForEach(client.projectResources) { resource in
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(resourceTitle(resource))
                                 Text(resource.kind == "host" ? "电脑状态：\(hostState(resource.resource_id))" : "电脑文件访问仍需单独授权")
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             }
                             Spacer()
                             if isOwner {
@@ -20201,17 +20270,21 @@ private struct MordeProjectsRoom: View {
                         }
                         .disabled(client.projectActionInFlight || resourceID.isEmpty)
                         Text("当前服务未开放电脑文件复制或移交；资源关联不代表副本，也不会授予成员访问权限。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                     }
                 }
             }
             if let notice = client.projectNotice {
-                Section { Text(notice).font(.footnote).foregroundStyle(.secondary) }
+                Section { Text(notice).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText) }
             }
             if let failure = client.projectActionError {
-                Section { Text(failure).font(.footnote).foregroundStyle(.orange) }
+                Section { Text(failure).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk) }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NanoMuseTones.canvas)
+        .listRowBackground(NanoMuseTones.surface)
+        .listRowSeparatorTint(NanoMuseTones.hairline)
         .accessibilityIdentifier("morde.projects.list")
         .navigationTitle("项目")
         .onChange(of: client.user?.id) { _ in revealedProjectUnconfirmedIDs.removeAll() }
@@ -20401,8 +20474,8 @@ private struct MordeProjectsRoom: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(.regularMaterial)
-                .overlay(alignment: .top) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5) }
+                .background(NanoMuseTones.surface)
+                .overlay(alignment: .top) { Rectangle().fill(NanoMuseTones.hairline).frame(height: 1) }
                 .offset(y: -86)
             }
         }
@@ -20431,13 +20504,13 @@ private struct MordeProjectsRoom: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(conversation.title.isEmpty ? "新共享会话" : conversation.title)
                 Text("创建者 \(conversation.owner_id) · \(conversation.id)")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("morde.projectConversation.row.\(conversation.id)")
         .listRowBackground(client.selectedProjectConversationID == conversation.id
-                           ? Color.accentColor.opacity(0.12) : nil)
+                           ? NanoMuseTones.brandSoft : nil)
     }
 
     private func projectWorkItemRow(_ item: MordeProjectWorkItem, projectID: String) -> some View {
@@ -20445,17 +20518,17 @@ private struct MordeProjectsRoom: View {
             HStack {
                 Text(item.title).font(.headline)
                 Spacer()
-                Text(workItemStateLabel(item.state)).font(.caption).foregroundStyle(.secondary)
+                Text(workItemStateLabel(item.state)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
             Text("\(item.assignee_id.map { "负责人 \($0)" } ?? "待认领") · v\(item.version) · 关联任务 \(item.task_ids.count) 项")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             if !item.description.isEmpty { Text(item.description).font(.footnote) }
             if !item.blocked_reason.isEmpty {
-                Text("阻塞原因：\(item.blocked_reason)").font(.footnote).foregroundStyle(.orange)
+                Text("阻塞原因：\(item.blocked_reason)").font(.footnote).foregroundStyle(NanoMuseTones.warning)
             }
             if let delivery = item.delivery {
                 Text("已记录交付：Task \(delivery.task_id) · 电脑文件版本 v\(delivery.revision)")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
             if canManageWorkItems, let task = selectedProjectConversationTask {
                 if MordeProjectPolicy.canLinkTask(role: client.projectMembers.first(where: {
@@ -20501,13 +20574,14 @@ private struct MordeProjectsRoom: View {
     private func projectConversationTranscript(_ project: MordeProject,
                                                conversation: MordeProjectConversation) -> some View {
         let conversationMessages = client.displayedProjectConversationMessages
-        let startedTaskStates = client.projectConversationTasks.filter { $0.conversation_id == conversation.id }.map {
-            MordeTaskStartedAcknowledgementState(taskID: $0.id, currentRevision: $0.current_revision,
-                desiredRevision: $0.desired_revision, currentRevisionStarted: $0.current_revision_started)
+        let statusMessages = conversationMessages.filter { $0.conversation_id == conversation.id }
+        let processingTaskStates = client.projectConversationTasks.filter { $0.conversation_id == conversation.id }.map {
+            MordeAgentMessageProcessingTaskState(taskID: $0.id, status: $0.status,
+                currentRevision: $0.current_revision, desiredRevision: $0.desired_revision,
+                currentRevisionStarted: $0.current_revision_started)
         }
-        let startedMessageIDs = MordeTaskStartedAcknowledgementPolicy.messageIDs(
-            messages: conversationMessages.filter { $0.conversation_id == conversation.id }.map(\.clientMessage),
-            tasks: startedTaskStates)
+        let processingMessageIDs = MordeAgentMessageStatusPresentation.processingMessageIDs(
+            messages: statusMessages.map(\.clientMessage), tasks: processingTaskStates)
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(conversation.title.isEmpty ? "新共享会话" : conversation.title).font(.headline)
@@ -20518,14 +20592,14 @@ private struct MordeProjectsRoom: View {
                 }
             }
             if let failure = client.projectConversationMessagesState.failureMessage {
-                Text("消息读取失败：\(failure)").font(.footnote).foregroundStyle(.orange)
+                Text("消息读取失败：\(failure)").font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
             } else if !client.projectConversationMessagesState.isLoaded {
                 ProgressView("正在读取消息…")
             } else if client.displayedProjectConversationMessages.isEmpty {
-                Text("这条共享会话还没有消息。").font(.footnote).foregroundStyle(.secondary)
+                Text("这条共享会话还没有消息。").font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
             ForEach(conversationMessages) {
-                projectConversationMessageRow($0, startedTaskMessageIDs: startedMessageIDs)
+                projectConversationMessageRow($0, showsProcessingBubble: processingMessageIDs.contains($0.id))
             }
             ForEach(client.visibleUnconfirmedMessages.filter {
                 $0.projectID == project.id && $0.conversationID == conversation.id
@@ -20550,7 +20624,7 @@ private struct MordeProjectsRoom: View {
     }
 
     private func projectConversationMessageRow(_ message: MordeProjectConversationMessage,
-                                                startedTaskMessageIDs: Set<String>) -> some View {
+                                                showsProcessingBubble: Bool) -> some View {
         let isUser = message.role == "user"
         let pending = client.pendingMessages.first {
             $0.id == message.client_message_id && $0.projectID == client.selectedProjectID &&
@@ -20581,16 +20655,16 @@ private struct MordeProjectsRoom: View {
                 } label: {
                     Group {
                         if client.routingRetryInFlight.contains(message.id) {
-                            ProgressView().tint(.red)
+                            ProgressView().tint(NanoMuseTones.danger)
                         } else {
                             Image(systemName: "exclamationmark")
                                 .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(.red)
+                                .foregroundStyle(NanoMuseTones.dangerInk)
                         }
                     }
                     .frame(width: 34, height: 34)
-                    .background(Color(uiColor: .systemBackground), in: Circle())
-                    .overlay(Circle().stroke(Color.red.opacity(0.32), lineWidth: 1))
+                    .background(NanoMuseTones.surface, in: Circle())
+                    .overlay(Circle().stroke(NanoMuseTones.danger.opacity(0.32), lineWidth: 1))
                     .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
@@ -20600,7 +20674,7 @@ private struct MordeProjectsRoom: View {
             }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
             Text(message.role == "user" ? message.actor_id : "AI 回复")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             if sourceLines.isEmpty || !sourceContentMatchesMessage {
                 Text(message.content).textSelection(.enabled)
             }
@@ -20609,9 +20683,9 @@ private struct MordeProjectsRoom: View {
                                                  accessibilityPrefix: "morde.projectConversation.message.source")
             }
             if message.role == "assistant", message.output_status == "streaming" {
-                Text("正在生成…").font(.footnote).foregroundStyle(.secondary)
+                Text("正在生成…").font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             } else if message.role == "assistant", message.output_status == "interrupted" {
-                Text("回复已中断").font(.footnote).foregroundStyle(.orange)
+                Text("回复已中断").font(.footnote).foregroundStyle(NanoMuseTones.warning)
             }
             ForEach(attachmentIDs, id: \.self) { attachmentID in
                 let serverMessageID = pending?.serverMessageID ?? message.id
@@ -20636,7 +20710,7 @@ private struct MordeProjectsRoom: View {
             ForEach(pending?.attachments.filter { !$0.linked } ?? []) { attachment in
                 if let path = attachment.localPath {
                     Label(attachment.originalFilename ?? URL(fileURLWithPath: path).lastPathComponent, systemImage: "paperclip")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
             }
             if message.role == "user", let pending {
@@ -20645,7 +20719,7 @@ private struct MordeProjectsRoom: View {
                         ? "Automatic conversation processing is unconfirmed; sending will still be attempted."
                         : pending.statusLocalizationKey,
                         comment: "Message send status"))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.projectConversation.message.status.\(pending.id)")
                     if pending.state == .failed || pending.state == .unknown || pending.error != nil {
                         Button(AppLocalized("Retry")) { client.retryPendingMessage(pending.id) }
@@ -20653,10 +20727,10 @@ private struct MordeProjectsRoom: View {
                             .accessibilityIdentifier("morde.projectConversation.message.retry.\(pending.id)")
                     }
                 }
-                if let error = pending.error { Text(verbatim: error).font(.caption).foregroundStyle(.secondary) }
+                if let error = pending.error { Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.secondaryText) }
                 if let waiting = MordeOutboxScheduling.waitingForEarlierMessage(pending, in: client.pendingMessages) {
                     Text(verbatim: NSLocalizedString(waiting, comment: "Message send status"))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 if let target = client.independentSendTarget(for: pending) {
                     Button("Send this message independently") { independentSendTarget = target }
@@ -20675,27 +20749,32 @@ private struct MordeProjectsRoom: View {
                     }
                 }
             } else if message.role == "user", message.client_message_id != nil, message.routing_status != "failed" {
-                Text(AppLocalized("Sent")).font(.caption).foregroundStyle(.secondary)
+                Text(AppLocalized("Sent")).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
             if message.role == "user", let originalMessageID = message.duplicate_of_message_id,
                !client.pendingMessages.contains(where: { $0.id == message.client_message_id && $0.state != .accepted }) {
                 Text(verbatim: MordeRoutingPresentation.duplicateMessageLocalizationKey(
                     originalMessageID: originalMessageID, taskID: message.related_task_id))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             } else if message.role == "user",
                !client.pendingMessages.contains(where: { $0.id == message.client_message_id && $0.state != .accepted }),
                let key = MordeRoutingPresentation.localizationKey(message.routing_status) {
                 Text(verbatim: NSLocalizedString(key, comment: "Message routing status"))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
-            if isUser && startedTaskMessageIDs.contains(message.id) {
+            if MordeAgentMessageStatusPresentation.showsAcknowledgement(for: message.clientMessage) {
                 Text("👌🏻")
                     .font(.system(size: 17))
                     .padding(3)
-                    .background(.regularMaterial, in: Circle())
-                    .overlay(Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                    .background(NanoMuseTones.surface, in: Circle())
+                    .overlay(Circle().strokeBorder(NanoMuseTones.hairline))
                     .accessibilityLabel(AppLocalized("Task started"))
                     .accessibilityIdentifier("morde.projectConversation.message.task-started.\(message.id)")
+            }
+            if isUser && showsProcessingBubble {
+                MordeAgentProcessingBubble(
+                    accessibilityIdentifier: "morde.projectConversation.message.processing.\(message.id)")
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             }
             if !isUser { Spacer(minLength: 0) }
@@ -20730,13 +20809,13 @@ private struct MordeProjectsRoom: View {
             Text(task.objective).font(.footnote.weight(.semibold))
             Text("Task：\(task.statusLabel)").font(.footnote)
             if let step = task.displayedCurrentStep, !step.isEmpty, step != task.statusLabel {
-                Text(step).font(.caption).foregroundStyle(.secondary)
+                Text(step).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
             if let result = task.result, !result.isEmpty, !projectResultAlreadyDisplayed(task) {
                 Text(result).font(.footnote)
             }
             ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
-                Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(.secondary)
+                Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
             if let pending = task.pending_request { projectConversationApprovalControls(task, pending: pending) }
             if let clarification = task.clarification_request {
@@ -20749,7 +20828,7 @@ private struct MordeProjectsRoom: View {
                 }
             } else {
                 Text("仅共享会话创建者可以刷新 Task 状态和处理审批。")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
         }
     }
@@ -20770,7 +20849,7 @@ private struct MordeProjectsRoom: View {
             Text(pending.title).font(.headline)
             if let object = pending.object, !object.isEmpty { Text(object).font(.footnote) }
             Text(pending.content)
-            Text(pending.impact).font(.footnote).foregroundStyle(.secondary)
+            Text(pending.impact).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             LabeledContent(AppLocalized("Risk"), value: MordeTaskApprovalDisclosurePresentation.text(pending.disclosures?.risk))
             LabeledContent(AppLocalized("Cost of this action"), value: MordeTaskApprovalDisclosurePresentation.cost(pending.disclosures?.this_cost))
             LabeledContent(AppLocalized("Cumulative cost"), value: MordeTaskApprovalDisclosurePresentation.cost(pending.disclosures?.cumulative_cost))
@@ -20778,20 +20857,20 @@ private struct MordeProjectsRoom: View {
             LabeledContent(AppLocalized("Revocation method"), value: MordeTaskApprovalDisclosurePresentation.text(pending.disclosures?.revocation))
             if let expiresAt = pending.expirationDate {
                 Text(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
             TimelineView(.periodic(from: .now, by: 1)) { timeline in
                 if pending.isExpired {
                     Text(AppLocalized("Approval expired; the requested action was not run."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.projectConversation.approval.expired.\(pending.id)")
                 } else if pending.deadlineHasPassed(at: timeline.date) {
                     Text(AppLocalized("Approval deadline passed; refresh to confirm its status."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.projectConversation.approval.deadline.\(pending.id)")
                 } else if !pending.canRespond(taskStatus: task.status, at: timeline.date) {
                     Text(AppLocalized("Approval status is unknown; refresh task details before acting."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.projectConversation.approval.unknown.\(pending.id)")
                 } else if pending.media_preview_operation_id != nil {
                     MordeTaskMediaPreviewControls(
@@ -20903,7 +20982,7 @@ private struct MordeProjectsRoom: View {
             TextField("发送项目消息", text: $projectConversationDraft, axis: .vertical)
                 .accessibilityIdentifier("morde.projectConversation.composer")
             if let error = client.projectConversationError {
-                Text(error).font(.footnote).foregroundStyle(.orange)
+                Text(error).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                     .accessibilityIdentifier("morde.projectConversation.error")
             }
             HStack {
@@ -20944,7 +21023,7 @@ private struct MordeProjectsRoom: View {
                 .accessibilityIdentifier("morde.projectConversation.send")
             }
             Text("项目消息由当前账号提交；需要使用电脑文件时会在执行时核验。")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
         }
     }
 
@@ -20957,14 +21036,14 @@ private struct MordeProjectsRoom: View {
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 Text(project.name).font(.headline)
-                Text(summary).font(.caption).foregroundStyle(.secondary)
+                Text(summary).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 if !project.description.isEmpty { Text(project.description).font(.footnote) }
             }
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("morde.project.row.\(project.id)")
         .accessibilityValue(client.selectedProjectID == project.id ? "已选择" : "未选择")
-        .listRowBackground(client.selectedProjectID == project.id ? Color.accentColor.opacity(0.12) : nil)
+                .listRowBackground(client.selectedProjectID == project.id ? NanoMuseTones.brandSoft : NanoMuseTones.surface)
     }
 
     private func formatMicros(_ micros: Int64, currency: String) -> String {
@@ -21139,7 +21218,7 @@ private struct MordeComputerDesignRoom: View {
                     .font(.system(size: 15.5, weight: .semibold))
                     .foregroundStyle(.white)
                     .frame(minWidth: 102, minHeight: 46)
-                    .background(Color(red: 0.173, green: 0.173, blue: 0.188), in: Capsule())
+                    .background(NanoMuseTones.danger, in: Capsule())
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("morde.computer.stopTask")
@@ -21147,9 +21226,9 @@ private struct MordeComputerDesignRoom: View {
             Button {} label: {
                 Text("停止任务")
                     .font(.system(size: 15.5, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .frame(minWidth: 102, minHeight: 46)
-                    .background(Color(red: 0.173, green: 0.173, blue: 0.188), in: Capsule())
+                    .background(NanoMuseTones.brandSoft, in: Capsule())
             }
             .buttonStyle(.plain)
             .disabled(true)
@@ -21168,7 +21247,7 @@ private struct MordeComputerDesignRoom: View {
                     .font(.system(size: 15.5, weight: .semibold))
                     .foregroundStyle(.white)
                     .frame(minWidth: 102, minHeight: 46)
-                    .background(Color(red: 0.173, green: 0.173, blue: 0.188), in: Capsule())
+                    .background(NanoMuseTones.danger, in: Capsule())
             }
             .accessibilityIdentifier("morde.computer.stopTask")
         }
@@ -21183,13 +21262,13 @@ private struct MordeComputerDesignRoom: View {
                         .tracking(-0.19)
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(NanoMuseTones.ink)
                         .accessibilityIdentifier("morde.computer.title")
                     Text(computerSubtitle)
                         .font(.system(size: 13))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
-                        .foregroundStyle(.white.opacity(0.58))
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.computer.subtitle")
                     HStack(spacing: 4) {
                         Text(AppLocalized("Desktop connection"))
@@ -21198,8 +21277,8 @@ private struct MordeComputerDesignRoom: View {
                     }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(desktopConnectionStatus == .connected
-                        ? Color.green : (desktopConnectionStatus == .disconnected || desktopConnectionStatus == .failed
-                            ? Color.orange : Color.white.opacity(0.66)))
+                        ? NanoMuseTones.successInk : (desktopConnectionStatus == .disconnected || desktopConnectionStatus == .failed
+                            ? NanoMuseTones.warning : NanoMuseTones.secondaryText))
                     .accessibilityIdentifier("morde.computer.desktopConnection")
                 }
                 .frame(maxWidth: .infinity)
@@ -21232,17 +21311,19 @@ private struct MordeComputerDesignRoom: View {
                                             control2: CGPoint(x: 4, y: 18.3284))
                             camera.closeSubpath()
                             context.stroke(camera.applying(transform),
-                                           with: .color(.white),
+                                           with: .color(NanoMuseTones.brandDeep),
                                            style: StrokeStyle(lineWidth: 1.8 * scale,
                                                               lineCap: .round, lineJoin: .round))
                             let lens = Path(ellipseIn: CGRect(x: 8.6, y: 9.2, width: 6.8, height: 6.8))
                             context.stroke(lens.applying(transform),
-                                           with: .color(.white),
+                                           with: .color(NanoMuseTones.brandDeep),
                                            style: StrokeStyle(lineWidth: 1.8 * scale))
                         }
                         .frame(width: 19, height: 19)
                             .frame(width: 38, height: 38)
-                            .background(Color(red: 0.173, green: 0.173, blue: 0.188), in: Circle())
+                            .background(NanoMuseTones.surface, in: Circle())
+                            .overlay(Circle().strokeBorder(NanoMuseTones.brandTint))
+                            .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 8, y: 4)
                     }
                     .buttonStyle(.plain)
                     .disabled(hostWebView == nil || pageLoadState != .loaded)
@@ -21252,9 +21333,11 @@ private struct MordeComputerDesignRoom: View {
                     Button(action: onClose) {
                         Image(systemName: "xmark")
                             .font(.system(size: 17, weight: .medium))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(NanoMuseTones.brandDeep)
                             .frame(width: 38, height: 38)
-                            .background(Color(red: 0.173, green: 0.173, blue: 0.188), in: Circle())
+                            .background(NanoMuseTones.surface, in: Circle())
+                            .overlay(Circle().strokeBorder(NanoMuseTones.brandTint))
+                            .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 8, y: 4)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("关闭云电脑")
@@ -21269,7 +21352,7 @@ private struct MordeComputerDesignRoom: View {
                 if let url = client.hostURL {
                     ZStack {
                         LinearGradient(
-                            colors: [Color(red: 0.686, green: 0.835, blue: 0.973), Color(red: 0.596, green: 0.776, blue: 0.945)],
+                            colors: [NanoMuseTones.brandSoft, NanoMuseTones.brandTint],
                             startPoint: .top,
                             endPoint: .bottom
                         )
@@ -21283,39 +21366,44 @@ private struct MordeComputerDesignRoom: View {
                             .accessibilityIdentifier("morde.computer.webview")
                         if pageLoadState == .loading {
                             ProgressView("连接中…")
-                                .tint(.white)
-                                .foregroundStyle(.white)
+                                .tint(NanoMuseTones.action)
+                                .foregroundStyle(NanoMuseTones.ink)
                                 .padding(16)
-                                .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12))
+                                .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+                                .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
                                 .accessibilityIdentifier("morde.computer.pageLoading")
                         } else if pageLoadState == .failed {
                             VStack(spacing: 8) {
                                 Image(systemName: "exclamationmark.triangle")
-                                    .foregroundStyle(.white.opacity(0.88))
+                                    .foregroundStyle(NanoMuseTones.dangerInk)
                                 Text("连接失败")
-                                    .foregroundStyle(.white)
+                                    .foregroundStyle(NanoMuseTones.ink)
                                     .multilineTextAlignment(.center)
                                     .accessibilityIdentifier("morde.computer.pageLoadFailure")
                             }
                             .padding(16)
-                            .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12))
+                            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+                            .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
                         }
                     }
                 } else if client.hostOpenErrors[hostID] != nil {
                     VStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle")
-                            .foregroundStyle(.white.opacity(0.88))
+                            .foregroundStyle(NanoMuseTones.dangerInk)
                         Text("连接失败")
-                            .foregroundStyle(.white)
+                            .foregroundStyle(NanoMuseTones.ink)
                             .multilineTextAlignment(.center)
                             .accessibilityIdentifier("morde.computer.pageLoadFailure")
                     }
                     .padding(16)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
                 } else {
                     ProgressView("连接中…")
-                        .tint(.white)
-                        .foregroundStyle(.white)
+                        .tint(NanoMuseTones.action)
+                        .foregroundStyle(NanoMuseTones.ink)
                         .accessibilityIdentifier("morde.computer.ticketLoading")
                 }
             }
@@ -21324,10 +21412,11 @@ private struct MordeComputerDesignRoom: View {
                 if pageLoadState == .loaded {
                     Text(controlBadgeTitle)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(NanoMuseTones.brandDeep)
                         .padding(.horizontal, 11)
                         .padding(.vertical, 6)
-                        .background(Color.black.opacity(0.78), in: Capsule())
+                        .background(NanoMuseTones.surface, in: Capsule())
+                        .overlay(Capsule().strokeBorder(NanoMuseTones.brandTint))
                         .padding(.leading, 15)
                         .padding(.bottom, 10)
                         .accessibilityIdentifier("morde.computer.controlStatus")
@@ -21340,15 +21429,16 @@ private struct MordeComputerDesignRoom: View {
                     Button(action: performControlAction) {
                         Text(title)
                             .font(.system(size: 15.5, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(title == "交还给 AI" ? NanoMuseTones.brandDeep : Color.white)
                             .frame(maxWidth: .infinity, minHeight: 46)
-                            .background(title == "交还给 AI" ? Color(red: 0.173, green: 0.173, blue: 0.188) : Color(red: 0.039, green: 0.518, blue: 1.0), in: Capsule())
+                            .background(title == "交还给 AI" ? NanoMuseTones.surface : NanoMuseTones.action, in: Capsule())
+                            .overlay(Capsule().strokeBorder(title == "交还给 AI" ? NanoMuseTones.brandTint : Color.clear))
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("morde.computer.controlAction")
                 } else if controlActionInFlight {
                     ProgressView()
-                        .tint(.white)
+                        .tint(NanoMuseTones.action)
                         .frame(maxWidth: .infinity, minHeight: 46)
                         .accessibilityLabel(controlActionTitle ?? "控制权更新中")
                 }
@@ -21357,7 +21447,7 @@ private struct MordeComputerDesignRoom: View {
             .padding(.top, 4)
             .padding(.bottom, 20)
         }
-        .background(Color(red: 0.055, green: 0.055, blue: 0.063).ignoresSafeArea())
+        .background(NanoMuseTones.canvas.ignoresSafeArea())
         .task(id: "\(hostID):\(shared)") {
             pageLoadState = .loading
             hostWebView = nil

@@ -137,20 +137,22 @@ type WorkspaceStorage struct {
 }
 
 type WorkspaceSyncNode struct {
-	Enabled               bool     `yaml:"enabled"`
-	ProjectUploadEnabled  bool     `yaml:"project_upload_enabled"`
-	DataRoot              string   `yaml:"data_root"`
-	ImageDigest           string   `yaml:"image_digest"`
-	RelayImageDigest      string   `yaml:"relay_image_digest"`
-	RelayPublicAddress    string   `yaml:"relay_public_address"`
-	RelayBindAddress      string   `yaml:"relay_bind_address"`
-	RelayToken            string   `yaml:"relay_token"`
-	RelayStateRoot        string   `yaml:"relay_state_root"`
-	StateRoot             string   `yaml:"state_root"`
-	WorkspaceRoot         string   `yaml:"workspace_root"`
-	QuotaSocketRoot       string   `yaml:"quota_socket_root"`
-	RelayContainerName    string   `yaml:"relay_container_name"`
-	ProtectedStorageRoots []string `yaml:"protected_storage_roots"`
+	Enabled                                  bool     `yaml:"enabled"`
+	ProjectUploadEnabled                     bool     `yaml:"project_upload_enabled"`
+	AgentWorkspaceHostMountEnabled           bool     `yaml:"agent_workspace_host_mount_enabled"`
+	AgentWorkspaceLiveDirectorySourceEnabled bool     `yaml:"agent_workspace_live_directory_source_enabled"`
+	DataRoot                                 string   `yaml:"data_root"`
+	ImageDigest                              string   `yaml:"image_digest"`
+	RelayImageDigest                         string   `yaml:"relay_image_digest"`
+	RelayPublicAddress                       string   `yaml:"relay_public_address"`
+	RelayBindAddress                         string   `yaml:"relay_bind_address"`
+	RelayToken                               string   `yaml:"relay_token"`
+	RelayStateRoot                           string   `yaml:"relay_state_root"`
+	StateRoot                                string   `yaml:"state_root"`
+	WorkspaceRoot                            string   `yaml:"workspace_root"`
+	QuotaSocketRoot                          string   `yaml:"quota_socket_root"`
+	RelayContainerName                       string   `yaml:"relay_container_name"`
+	ProtectedStorageRoots                    []string `yaml:"protected_storage_roots"`
 }
 
 type SiteStorage struct {
@@ -485,6 +487,9 @@ func (c Config) validate() error {
 	}
 	if c.WorkspaceStorage.MaxWorkspaceBytes <= 0 || c.WorkspaceStorage.MaxOwnerBytes <= 0 || c.WorkspaceStorage.MinFreeBytes <= 0 {
 		return fmt.Errorf("config.workspace_storage quotas and min_free_bytes must be positive")
+	}
+	if c.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled != c.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled {
+		return fmt.Errorf("config.workspace_sync_node.agent_workspace_live_directory_source_enabled and agent_workspace_host_mount_enabled must be enabled together")
 	}
 	workspaceRoot := filepath.Clean(c.WorkspaceStorage.RootDir)
 	dockerRoot := filepath.Clean(c.Storage.DockerDataDir)

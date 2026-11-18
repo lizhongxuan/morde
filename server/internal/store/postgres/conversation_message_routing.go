@@ -144,6 +144,7 @@ COALESCE(m.task_id,''),m.model_id,m.sequence,
 CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,
 m.created_at,r.client_message_id,COALESCE(original_route.state,r.state),r.request_hash,r.service_instance_id::text,
 COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(c.project_id,''),
+COALESCE(r.agent_acknowledged,false),
 COALESCE(r.duplicate_of_message_id,''),COALESCE(original_message.task_id,'')
 FROM conversation_message_routes r
 JOIN service_identity i ON i.instance_id=r.service_instance_id AND i.singleton=true
@@ -156,7 +157,7 @@ LEFT JOIN conversation_messages original_message ON original_message.id=original
 WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorID, conversationID, clientID).Scan(
 		&value.ID, &value.ConversationID, &value.OwnerID, &value.ActorID, &role, &value.Content, &value.TaskID,
 		&value.ModelID, &value.Sequence, &delivery, &value.CreatedAt, &value.ClientMessageID, &routing, &hash, &instanceID, &routingFailure, &projectID,
-		&value.DuplicateOfMessageID, &value.RelatedTaskID)
+		&value.AgentAcknowledged, &value.DuplicateOfMessageID, &value.RelatedTaskID)
 	if err != nil {
 		return conversation.Message{}, nil, err
 	}
@@ -194,7 +195,8 @@ func (s *Store) FindConversationMessageByClientID(ctx context.Context, actorID, 
 COALESCE(m.task_id,''),m.model_id,m.sequence,
 CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,
 m.created_at,r.client_message_id,COALESCE(r.duplicate_of_message_id,''),COALESCE(original_message.task_id,''),
-COALESCE(original_route.state,r.state),COALESCE(original_route.failure_reason,r.failure_reason)
+COALESCE(original_route.state,r.state),COALESCE(original_route.failure_reason,r.failure_reason),
+COALESCE(r.agent_acknowledged,false)
 FROM conversation_message_routes r
 JOIN service_identity i ON i.instance_id=r.service_instance_id AND i.singleton=true
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.conversation_id=r.conversation_id
@@ -209,7 +211,8 @@ WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.ar
        ($2<>'' AND c.project_id=$2 AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.user_id=$1)))`,
 			actorID, projectID, conversationID, clientID).Scan(&value.ID, &value.ConversationID, &value.OwnerID,
 			&value.ActorID, &role, &value.Content, &value.TaskID, &value.ModelID, &value.Sequence, &delivery,
-			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure)
+			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure,
+			&value.AgentAcknowledged)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

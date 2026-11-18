@@ -785,7 +785,7 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 	}
 	if value.InvalidOutput {
 		return value.Action == app.ConversationRouteClarify && value.TaskID == "" && value.TargetMessageID == "" &&
-			!value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
+			!value.Acknowledge && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 &&
 			value.Question != "" && utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
 	}
@@ -802,15 +802,16 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 			len(value.AggregateMessageIDs) == 0 &&
 			app.ValidConversationRouteJoinTarget(value.TargetMessageID, context.RequestCandidates)
 	case app.ConversationRouteReply:
-		return value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Question == "" && len(value.DependencyTaskIDs) == 0 &&
+		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Question == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 &&
 			app.ValidConversationRouteReply(value.Reply)
 	case app.ConversationRouteClarify:
-		return value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
+		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 && value.Question != "" &&
 			utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if value.ExplicitNew || value.Question != "" || value.Reply != "" || len(value.DependencyTaskIDs) != 0 || len(value.AggregateMessageIDs) != 0 {
+		if value.Action != app.ConversationRouteUpdate && value.Acknowledge || value.ExplicitNew || value.Question != "" ||
+			value.Reply != "" || len(value.DependencyTaskIDs) != 0 || len(value.AggregateMessageIDs) != 0 {
 			return false
 		}
 		if value.Action == app.ConversationRouteStop && value.TargetMessageID != "" {

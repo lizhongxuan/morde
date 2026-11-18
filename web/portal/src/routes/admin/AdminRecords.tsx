@@ -189,6 +189,7 @@ export function AdminRecords() {
     <div className="page-heading"><div><p className="eyebrow">账号记录</p><h1>记录与样本</h1><p className="muted">完整记录和训练样本使用独立同意；当前页面只显示获授权的元数据和操作。</p></div></div>
     {accessQuery.isPending || (accessNetworkError && !accessQuery.data) ? <div className="loading-card" role="status">正在读取记录权限…</div>
       : accessQuery.isError && !accessNetworkError ? <RecordsError error={accessQuery.error} retry={() => void accessQuery.refetch()} />
+        : !accessQuery.data ? <div className="loading-card" role="status">正在读取记录权限…</div>
         : <>
           <section className="admin-detail-section" aria-labelledby="record-consent-heading">
             <h2 id="record-consent-heading">用户同意状态</h2>

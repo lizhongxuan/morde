@@ -8,6 +8,10 @@
 - PC 与 iOS 的跨端体验、会话和任务协同按两种用户客户端验收；后台 Web 端和服务端分别承担管理界面与业务服务职责。
 - Morde 各产品端统一使用 `images/morde-logo-reference.png` 所示的蓝色 M 标识；可按平台调整尺寸和图标底色，不另行更换标识主体。
 
+## 统一 UI 设计规范
+
+- Morde 所有产品端及配套界面组件统一按照 [`docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html`](docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html) 设计，保持统一的视觉风格和样式；颜色、字体、间距、圆角、阴影、控件及交互状态遵循该规范。可按平台适配布局和原生交互，但不得另设冲突的设计风格。
+
 ## Agent Runtime 与 DSH 插件
 
 - Morde 云端 AI Agent 统一使用 DSH（DeepSeek Harness）作为唯一的 Agent Runtime。对话、并发任务和子 Agent 可以分别拥有执行上下文，但不另外实现 Agent 循环或并行引入第二套 Agent Runtime。GPT、DeepSeek 等模型继续通过 Morde 模型网关接入。

@@ -1724,7 +1724,7 @@ func TestRuntimeToolExecutorVerifyAgainstWorkspaceFileHandler(t *testing.T) {
 	}
 }
 
-func TestRuntimeToolExecutorPublishesBinaryTaskWorkspaceOutputFromHostShell(t *testing.T) {
+func TestRuntimeToolExecutorPublishesBinaryTaskWorkspaceOutputFromSharedLiveWorkspace(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
 		capability: "shell.exec", action: "run",
 		result: `{"exit_code":0,"stdout":"Office export complete","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
@@ -1745,6 +1745,11 @@ func TestRuntimeToolExecutorPublishesBinaryTaskWorkspaceOutputFromHostShell(t *t
 	fixture.store.mu.Unlock()
 
 	filePath := "exports/quarterly.xlsx"
+	liveRoot := t.TempDir()
+	fixture.executor.workspaces.liveDirectorySource = true
+	if err := fixture.executor.workspaces.SetWorkspaceCurrentDirectory(cloudDSHLiveWorkspaceDirectory{root: liveRoot}); err != nil {
+		t.Fatal(err)
+	}
 	privateView := filepath.Join(fixture.workspaceRoot, ".morde-task-views", request.Task.ID, testTaskWorkspaceViewID(request.Task, request.WorkspaceID, preparation.BindingVersion), "workspace")
 	absolutePath := filepath.Join(privateView, filepath.FromSlash(filePath))
 	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
@@ -1755,6 +1760,12 @@ func TestRuntimeToolExecutorPublishesBinaryTaskWorkspaceOutputFromHostShell(t *t
 		data[index] = byte(index*31 + 7)
 	}
 	if err := os.WriteFile(absolutePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(liveRoot, "exports"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(liveRoot, filepath.FromSlash(filePath)), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(data)
@@ -1772,7 +1783,7 @@ func TestRuntimeToolExecutorPublishesBinaryTaskWorkspaceOutputFromHostShell(t *t
 	}
 	receipt, err := fixture.executor.workspaces.FindTaskWorkspacePublishReceipt(context.Background(), fixture.store.details.Task.OwnerID,
 		fixture.store.details.Task.ID, fixture.store.details.Task.WorkspaceID, taskWorkspacePublishOperationKey("s1234567", "w1234567"))
-	if err != nil || receipt.State != TaskWorkspacePublishSucceeded || receipt.BaseRevision != 0 || receipt.PublishedRevision != artifact.Revision {
+	if err != nil || receipt.State != TaskWorkspacePublishSucceeded || !receipt.DirectDirectorySource || receipt.BaseRevision != 0 || receipt.PublishedRevision != artifact.Revision {
 		t.Fatalf("publish receipt = %#v, %v; want revision-bound success", receipt, err)
 	}
 	replayed, err := fixture.executor.VerifyTaskWorkspaceOutput(context.Background(), fixture.store.details.Task, "s1234567", inputs, request.Fence)

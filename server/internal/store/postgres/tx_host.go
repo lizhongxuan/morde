@@ -377,7 +377,13 @@ SELECT 1 FROM workspace_bindings WHERE workspace_id=$1
 			return nil, fmt.Errorf("check computer storage uniqueness before binding: %w", err)
 		}
 		if alreadyBound {
-			return nil, domain.NewError(domain.CodeWorkspaceConflict, "computer storage cannot be assigned to another computer")
+			canRebind, err := canRebindAgentWorkspace(ctx, tx, ownerID, id)
+			if err != nil {
+				return nil, err
+			}
+			if !canRebind {
+				return nil, domain.NewError(domain.CodeWorkspaceConflict, "computer storage cannot be assigned to another computer")
+			}
 		}
 		if copyReservationID == "" {
 			if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, id); err != nil {
@@ -400,6 +406,26 @@ WHERE id=$1 AND target_owner_id=$2 AND target_workspace_id=$3 AND state='complet
 		}
 	}
 	return revisions, nil
+}
+
+func canRebindAgentWorkspace(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) (bool, error) {
+	var isAgentWorkspace, hasUnsafeBinding bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM user_agent_workspaces WHERE owner_id=$1 AND workspace_id=$2
+)`, ownerID, workspaceID).Scan(&isAgentWorkspace); err != nil {
+		return false, fmt.Errorf("verify stable Agent Workspace before Host switch: %w", err)
+	}
+	if !isAgentWorkspace {
+		return false, nil
+	}
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_bindings b JOIN hosts h ON h.id=b.host_id AND h.owner_id=b.owner_id
+WHERE b.workspace_id=$1 AND (b.state<>'detached' OR
+  (h.deleted_at IS NULL AND h.state NOT IN ('stopped','deleted','failed')))
+)`, workspaceID).Scan(&hasUnsafeBinding); err != nil {
+		return false, fmt.Errorf("verify previous Agent Workspace Host before switch: %w", err)
+	}
+	return !hasUnsafeBinding, nil
 }
 
 func bindingID(hostID, workspaceID string) string {

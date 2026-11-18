@@ -121,10 +121,10 @@ struct MordeCodexSessionsRoom: View {
         if store.selectedInstallation?.revoked == false {
             VStack(alignment: .leading, spacing: 8) {
                 Text(AppLocalized("Codex profiles"))
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .font(.caption.weight(.semibold)).foregroundStyle(NanoMuseTones.secondaryText)
                 if let error = store.installationLoadError {
                     HStack(spacing: 8) {
-                        Text(error).font(.caption).foregroundStyle(.orange)
+                        Text(error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                         Spacer(minLength: 4)
                         Button(AppLocalized("Retry")) { Task { await store.loadInstallations() } }
                             .font(.caption)
@@ -134,7 +134,7 @@ struct MordeCodexSessionsRoom: View {
                     ProgressView().controlSize(.small)
                 } else if let error = store.selectedProfileConnectionError {
                     HStack(spacing: 8) {
-                        Text(error).font(.caption).foregroundStyle(.orange)
+                        Text(error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk)
                         Spacer(minLength: 4)
                         Button(AppLocalized("Retry")) {
                             guard let id = store.selectedInstallationID else { return }
@@ -145,7 +145,7 @@ struct MordeCodexSessionsRoom: View {
                     }
                 } else if store.selectedProfileConnections.isEmpty {
                     Text(AppLocalized("No connected Codex profiles"))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 } else {
                     ForEach(store.selectedProfileConnections) { connection in
                         profileConnectionRow(connection)
@@ -162,12 +162,12 @@ struct MordeCodexSessionsRoom: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Text(profileLabel(connection.profile_key)).font(.subheadline.weight(.medium))
-                Text(AppLocalized("Authorized")).font(.caption).foregroundStyle(.secondary)
+                Text(AppLocalized("Authorized")).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 Spacer(minLength: 4)
                 if store.selectedProfileConnectionsLoading { ProgressView().controlSize(.small) }
             }
             Text(connection.scopes.sorted().joined(separator: ", "))
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.caption2).foregroundStyle(NanoMuseTones.secondaryText)
             if let discovery = connection.session_discovery {
                 HStack(spacing: 8) {
                     Text(discoveryStateLabel(discovery.state))
@@ -175,26 +175,26 @@ struct MordeCodexSessionsRoom: View {
                         Text("\(AppLocalized("Updated")) · \(date.formatted(date: .abbreviated, time: .shortened))")
                     }
                     if let errorCode = discovery.error_code {
-                        Text(discoveryErrorLabel(errorCode)).foregroundStyle(.orange)
+                        Text(discoveryErrorLabel(errorCode)).foregroundStyle(NanoMuseTones.dangerInk)
                     }
                 }
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 if let history = connection.history_sync {
                     Text(String(format: AppLocalized("Sessions with complete history: %1$lld of %2$lld"),
                                 history.history_complete_sessions, history.discovered_sessions))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                     Text(String(format: AppLocalized("Pending upload events: %lld"),
                                 history.pending_upload_event_count))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
             } else {
                 Text(AppLocalized("Pending first sync"))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
         }
         .padding(10)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(NanoMuseTones.hairline))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
         .accessibilityIdentifier("morde.codex.profileConnection.\(connection.profile_key)")
     }
 
@@ -226,7 +226,8 @@ struct MordeCodexSessionsRoom: View {
                 .font(.caption.weight(.medium))
                 .lineLimit(1)
                 .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(store.selectedProfileKey == profileKey ? NanoMuseTones.surface : .clear,
+                .foregroundStyle(store.selectedProfileKey == profileKey ? NanoMuseTones.brandDeep : NanoMuseTones.secondaryText)
+                .background(store.selectedProfileKey == profileKey ? NanoMuseTones.brandSoft : NanoMuseTones.surface,
                             in: Capsule())
                 .overlay(Capsule().strokeBorder(NanoMuseTones.hairline))
         }
@@ -254,14 +255,15 @@ struct MordeCodexSessionsRoom: View {
                                     let presence = store.installationOnline(installation.id)
                                     let onlineLabel = presence.map { presenceLabel(for: $0) } ?? AppLocalized("Unknown")
                                     Text(installation.revoked ? AppLocalized("Installation revoked.") : onlineLabel)
-                                        .font(.caption).foregroundStyle(.secondary)
+                                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                                     if !installation.revoked {
                                         Text(AppLocalized("Authorized PC installation"))
-                                            .font(.caption2).foregroundStyle(.secondary)
+                                            .font(.caption2).foregroundStyle(NanoMuseTones.secondaryText)
                                     }
                                 }
                                 .padding(.horizontal, 14).padding(.vertical, 9)
-                                .background(store.selectedInstallationID == installation.id ? NanoMuseTones.surface : .clear,
+                                .foregroundStyle(store.selectedInstallationID == installation.id ? NanoMuseTones.brandDeep : NanoMuseTones.ink)
+                                .background(store.selectedInstallationID == installation.id ? NanoMuseTones.brandSoft : NanoMuseTones.surface,
                                             in: Capsule())
                                 .overlay(Capsule().strokeBorder(NanoMuseTones.hairline))
                             }
@@ -280,26 +282,26 @@ struct MordeCodexSessionsRoom: View {
             Button { store.selectSession(session.id) } label: {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(session.title.isEmpty ? AppLocalized("Untitled chat") : session.title)
-                        .font(.headline).foregroundStyle(.primary).lineLimit(1)
+                        .font(.headline).foregroundStyle(NanoMuseTones.ink).lineLimit(1)
                     if let profileKey = session.profile_key {
-                        Text(profileLabel(profileKey)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(profileLabel(profileKey)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText).lineLimit(1)
                     }
                     if !session.cwd_label.isEmpty {
                         let cwd = session.cwd_label
-                        Text(cwd).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(cwd).font(.caption).foregroundStyle(NanoMuseTones.secondaryText).lineLimit(1)
                     }
                     if !session.thread_id.isEmpty {
                         Text("\(AppLocalized("Session ID")) · \(session.shortThreadID)")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText).lineLimit(1)
                     }
                     if let updatedAt = session.updatedAtDate {
                         let relativeTime = RelativeDateTimeFormatter().localizedString(for: updatedAt, relativeTo: Date())
                         Text("\(AppLocalized("Last active")) · \(relativeTime)")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText).lineLimit(1)
                     }
                     statusBadge(statusLabel(store.status(for: session)))
                     if let error = store.deleteErrors[session.id] {
-                        Text(error).font(.caption).foregroundStyle(.orange).lineLimit(2)
+                        Text(error).font(.caption).foregroundStyle(NanoMuseTones.dangerInk).lineLimit(2)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -311,7 +313,7 @@ struct MordeCodexSessionsRoom: View {
                 Button {
                     UIPasteboard.general.string = session.thread_id
                 } label: {
-                    Image(systemName: "doc.on.doc").frame(width: 38, height: 38).foregroundStyle(.secondary)
+                    Image(systemName: "doc.on.doc").frame(width: 38, height: 38).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(AppLocalized("Copy"))
@@ -321,7 +323,7 @@ struct MordeCodexSessionsRoom: View {
                 deleteTarget = session
             } label: {
                 if store.deletingSessions.contains(session.id) { ProgressView().frame(width: 38, height: 38) }
-                else { Image(systemName: "trash").frame(width: 38, height: 38).foregroundStyle(.secondary) }
+                else { Image(systemName: "trash").frame(width: 38, height: 38).foregroundStyle(NanoMuseTones.secondaryText) }
             }
             .buttonStyle(.plain)
             .disabled(store.deletingSessions.contains(session.id))
@@ -329,8 +331,9 @@ struct MordeCodexSessionsRoom: View {
             .accessibilityIdentifier("morde.codex.delete.\(session.id)")
         }
         .padding(14)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(NanoMuseTones.hairline))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
     }
 
     private func sessionDetail(_ session: MordeCodexSession) -> some View {
@@ -345,9 +348,9 @@ struct MordeCodexSessionsRoom: View {
                     Text(session.title.isEmpty ? AppLocalized("Untitled chat") : session.title)
                         .font(.headline).lineLimit(1)
                     if let profileKey = session.profile_key {
-                        Text(profileLabel(profileKey)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(profileLabel(profileKey)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText).lineLimit(1)
                     }
-                    Text(statusLabel(store.selectedSessionStatus)).font(.caption).foregroundStyle(.secondary)
+                    Text(statusLabel(store.selectedSessionStatus)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 Spacer()
                 Button { deleteTarget = session } label: { Image(systemName: "trash") }
@@ -357,7 +360,7 @@ struct MordeCodexSessionsRoom: View {
             }
             .padding(.horizontal, 18).padding(.vertical, 10)
             if let error = store.deleteErrors[session.id] {
-                Text(error).font(.footnote).foregroundStyle(.orange)
+                Text(error).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 18).padding(.top, 4)
             }
@@ -366,19 +369,19 @@ struct MordeCodexSessionsRoom: View {
             } else {
                 if !session.hasScope("read") {
                     Text(AppLocalized("Read history permission is unavailable."))
-                        .font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText).frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 18).padding(.vertical, 8)
                 }
                 if session.hasScope("read") {
                     Text(String(format: AppLocalized("Loaded events: %1$lld / server current sequence: %2$lld"),
                                 Int64(store.events.count), store.serverCurrentSequence(for: session)))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 18).padding(.top, 4)
                         .accessibilityIdentifier("morde.codex.historyProgress")
                 }
                 if let error = store.eventErrors[session.id] {
-                    Text(eventErrorText(error)).font(.footnote).foregroundStyle(.orange)
+                    Text(eventErrorText(error)).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.vertical, 5)
                 }
                 ScrollView {
@@ -398,7 +401,7 @@ struct MordeCodexSessionsRoom: View {
                         if store.loadingEvents.contains(session.id) && store.events.isEmpty {
                             ProgressView().padding(.vertical, 18)
                         } else if store.events.isEmpty && store.eventErrors[session.id] == nil {
-                            Text(AppLocalized("No visible events yet.")).font(.footnote).foregroundStyle(.secondary)
+                            Text(AppLocalized("No visible events yet.")).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                                 .padding(.vertical, 18)
                         }
                         ForEach(store.timeline) { item in timelineItem(item, session: session) }
@@ -423,9 +426,9 @@ struct MordeCodexSessionsRoom: View {
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text(eventLabel(item.kind)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(eventLabel(item.kind)).font(.caption.weight(.semibold)).foregroundStyle(NanoMuseTones.secondaryText)
                     Spacer()
-                    if let status = item.status { Text(statusLabel(status)).font(.caption).foregroundStyle(.secondary) }
+                    if let status = item.status { Text(statusLabel(status)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText) }
                 }
                 if let text = item.text, !text.isEmpty {
                     Text(text).font(.body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
@@ -442,7 +445,7 @@ struct MordeCodexSessionsRoom: View {
                                         Spacer(minLength: 4)
                                         if let stateKey = detail.state.localizationKey {
                                             Text(verbatim: NSLocalizedString(stateKey, comment: "Codex event detail state"))
-                                                .font(.caption).foregroundStyle(.secondary)
+                                                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                                         }
                                     }
                                     if let value = detail.text, !value.isEmpty {
@@ -463,9 +466,9 @@ struct MordeCodexSessionsRoom: View {
                 }
             }
             .padding(12)
-            .background(item.kind == .user ? Color.accentColor.opacity(0.08) : NanoMuseTones.surface,
-                        in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(NanoMuseTones.hairline))
+            .background(item.kind == .user ? NanoMuseTones.brandSoft : NanoMuseTones.surface,
+                        in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(NanoMuseTones.hairline))
         }
     }
 
@@ -483,21 +486,21 @@ struct MordeCodexSessionsRoom: View {
             }
             if let expiry = approval.expirationDate() {
                 Text(String(format: AppLocalized("Expires: %@"), expiry.formatted(date: .abbreviated, time: .shortened)))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             }
             TimelineView(.periodic(from: .now, by: 15)) { timeline in
                 let expired = approval.expirationDate().map { $0 <= timeline.date } == true || approval.isNoLongerPending
                 if expired {
                     Text(AppLocalized("Approval is no longer valid."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.codex.approval.expired.\(approval.id)")
                 } else if !approval.canRespond(at: timeline.date) {
                     Text(AppLocalized("Approval validity is unknown."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                         .accessibilityIdentifier("morde.codex.approval.unknown.\(approval.id)")
                 } else if !session.hasScope("read") || !session.hasScope("approval") {
                     Text(AppLocalized("Approval permission is unavailable."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
                 } else {
                     HStack {
                         Button(AppLocalized("Approve")) {
@@ -517,14 +520,15 @@ struct MordeCodexSessionsRoom: View {
             }
         }
         .padding(14)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Color.orange.opacity(0.4)))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.brandTint))
+        .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
     }
 
     private func commandFooter(_ session: MordeCodexSession) -> some View {
         VStack(spacing: 8) {
             if let error = store.commandErrors[session.id] {
-                Text(commandErrorText(error)).font(.footnote).foregroundStyle(.orange)
+                Text(commandErrorText(error)).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if store.hasPendingCommand(for: session.id) {
                     Button(AppLocalized("Retry the same request")) {
@@ -536,7 +540,7 @@ struct MordeCodexSessionsRoom: View {
             }
             if store.selectedSessionStatus == "unknown" {
                 Text(AppLocalized("Status is unknown. Refresh the session before sending again."))
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             }
             HStack(spacing: 8) {
                 if store.canInterrupt {
@@ -549,9 +553,11 @@ struct MordeCodexSessionsRoom: View {
                 }
                 TextField(AppLocalized("Message Codex"), text: $draft, axis: .vertical)
                     .lineLimit(1...4).focused($composerFocused)
+                    .textFieldStyle(.plain)
                     .padding(.horizontal, 12).padding(.vertical, 9)
-                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18))
-                    .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(NanoMuseTones.hairline))
+                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
+                    .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
                     .accessibilityIdentifier("morde.codex.composer")
                 Button {
                     let message = draft
@@ -610,14 +616,14 @@ struct MordeCodexSessionsRoom: View {
     }
 
     private func statusBadge(_ text: String) -> some View {
-        Text(text).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+        Text(text).font(.caption.weight(.medium)).foregroundStyle(NanoMuseTones.secondaryText)
             .padding(.horizontal, 8).padding(.vertical, 4)
             .background(NanoMuseTones.canvas, in: Capsule())
     }
 
     private func emptyState(_ text: String) -> some View {
         VStack(spacing: 8) {
-            Image(systemName: "desktopcomputer").font(.title2).foregroundStyle(.secondary).accessibilityHidden(true)
+            Image(systemName: "desktopcomputer").font(.title2).foregroundStyle(NanoMuseTones.secondaryText).accessibilityHidden(true)
             Text(text).multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity).padding(24)
@@ -625,7 +631,7 @@ struct MordeCodexSessionsRoom: View {
 
     private func failureState(_ message: String, retry: @escaping () -> Void) -> some View {
         VStack(spacing: 10) {
-            Text(message).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
+            Text(message).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk).multilineTextAlignment(.center)
             Button(AppLocalized("Retry"), action: retry).buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity).padding(24)
@@ -671,16 +677,16 @@ private struct MordeCodexQuestionCard: View {
             Label(AppLocalized("Codex has a question"), systemImage: "questionmark.circle")
                 .font(.headline)
             if question.status == "answered" {
-                Text(AppLocalized("Answered")).font(.caption).foregroundStyle(.secondary)
+                Text(AppLocalized("Answered")).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
             } else if question.status == "stale" {
-                Text(AppLocalized("Question is no longer available.")).font(.footnote).foregroundStyle(.secondary)
+                Text(AppLocalized("Question is no longer available.")).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             } else if !session.hasScope("read") || !session.hasScope("send") {
-                Text(AppLocalized("Sending permission is unavailable.")).font(.footnote).foregroundStyle(.secondary)
+                Text(AppLocalized("Sending permission is unavailable.")).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             } else if question.questions.isEmpty {
-                Text(AppLocalized("Question details are unavailable.")).font(.footnote).foregroundStyle(.secondary)
+                Text(AppLocalized("Question details are unavailable.")).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
             } else {
                 Text(AppLocalized("Answer every question to continue."))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                 ForEach(question.questions) { item in
                     VStack(alignment: .leading, spacing: 6) {
                         if !item.header.isEmpty { Text(item.header).font(.subheadline.weight(.semibold)) }
@@ -696,21 +702,37 @@ private struct MordeCodexQuestionCard: View {
                                     ? "checkmark.square.fill" : "square")
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
+                            .foregroundStyle(selectedOptions[item.id, default: []].contains(index)
+                                ? NanoMuseTones.brandDeep : NanoMuseTones.ink)
+                            .padding(10)
+                            .background(selectedOptions[item.id, default: []].contains(index)
+                                ? NanoMuseTones.brandSoft : NanoMuseTones.surface,
+                                in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(NanoMuseTones.hairline))
                             .buttonStyle(.plain)
                             .accessibilityIdentifier("morde.codex.question.\(item.id).option.\(index)")
                             if !option.description.isEmpty {
-                                Text(option.description).font(.caption).foregroundStyle(.secondary)
+                                Text(option.description).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
                             }
                         }
                         if item.isOther || item.options.isEmpty {
                             let prompt = AppLocalized(item.options.isEmpty ? "Your answer" : "Other")
                             if item.isSecret {
                                 SecureField(prompt, text: answerBinding(for: item.id))
-                                    .textFieldStyle(.roundedBorder)
+                                    .textFieldStyle(.plain)
+                                    .padding(12)
+                                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
                             } else {
                                 TextField(prompt, text: answerBinding(for: item.id), axis: .vertical)
                                     .lineLimit(1...3)
-                                    .textFieldStyle(.roundedBorder)
+                                    .textFieldStyle(.plain)
+                                    .padding(12)
+                                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
                             }
                         }
                     }
@@ -730,8 +752,9 @@ private struct MordeCodexQuestionCard: View {
             }
         }
         .padding(14)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(NanoMuseTones.hairline))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
         .onChange(of: question.status) { status in
             if status == "answered" || status == "stale" { clearAnswers() }
         }

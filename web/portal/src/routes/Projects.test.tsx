@@ -13,6 +13,7 @@ import type { PendingMessageVariantOperation } from '../app/message-variant-outb
 import * as messageVariantAPI from '../app/message-variants';
 import { projectApi } from '../app/project-api';
 import type { AcceptedProjectConversationMessageResponse, Project, ProjectBudget, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectWorkItem } from '../app/project-api';
+import { ToastNoticeCenter, ToastProvider } from '../app/toast';
 import { Projects } from './Projects';
 
 const projectAuthState = vi.hoisted(() => ({ role: 'user' as string }));
@@ -45,6 +46,7 @@ const newerProjectHistoryMessage: ProjectConversationMessage = {
 };
 const modelConnection: components['schemas']['ModelConnection'] = {
   id: 'model-test', name: '团队文本模型', base_url: 'https://models.example.invalid/v1', model_name: 'test-model',
+  context_window_tokens: null, context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
   shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false, text_stream: false },
   checked_at: '2026-11-02T00:00:00Z', created_at: '2026-11-02T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
 };
@@ -75,7 +77,7 @@ const task = {
 
 function renderProjects() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
-  const result = render(<QueryClientProvider client={client}><MemoryRouter><Projects /></MemoryRouter></QueryClientProvider>);
+  const result = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors={false} /><MemoryRouter><Projects /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { ...result, client };
 }
 
@@ -128,6 +130,11 @@ describe('Projects API integration', () => {
     vi.spyOn(projectApi, 'createWorkItem').mockResolvedValue(workItem);
     vi.spyOn(projectApi, 'claimWorkItem').mockResolvedValue(workItem);
     vi.spyOn(projectApi, 'tasks').mockResolvedValue([task]);
+    vi.spyOn(portalApi, 'task').mockImplementation(async (id) => ({
+      ...task, id, event_sequence: 0, result: null, current_revision: 1, desired_revision: 1, current_revision_started: false,
+      waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null, clarification_request: null,
+      stop_request: null, assistant_message: null, finished_at: null,
+    } as Awaited<ReturnType<typeof portalApi.task>>));
     vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [modelConnection], configuration_status: 'configured' });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(readyCapabilities);
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
@@ -152,6 +159,41 @@ describe('Projects API integration', () => {
     const link = await screen.findByRole('link', { name: '下载附件 1' });
     expect(link).toHaveAttribute('href', `/api/projects/${project.id}/conversations/${projectConversation.id}/messages/${projectHistoryMessage.id}/attachments-by-id/${attachmentID}/content`);
     expect(link).toHaveAttribute('download');
+  });
+
+  it('shows project acknowledgment and the processing bubble only while its Task is running', async () => {
+    const userMessage = { ...projectHistoryMessage, actor_id: teammate.user_id, task_id: 'qhistory1', agent_acknowledged: true };
+    const progress = { ...projectHistoryMessage, id: 'mprogress1', sequence: 2, role: 'assistant' as const,
+      task_id: 'qhistory1', content: '正在整理第一步', output_status: 'streaming' as const };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([userMessage, progress]);
+    vi.mocked(projectApi.tasks).mockResolvedValue([{ ...task, id: 'qhistory1', conversation_id: projectConversation.id,
+      status: 'running', current_revision: 1, desired_revision: 1 }]);
+    vi.mocked(portalApi.task).mockResolvedValue({
+      ...task, id: 'qhistory1', conversation_id: projectConversation.id, status: 'running', event_sequence: 1, result: null,
+      current_revision: 1, desired_revision: 1, current_revision_started: true, waiting_reason: null, steps: [], batch_items: [],
+      artifacts: [], pending_request: null, clarification_request: null, stop_request: null, assistant_message: null, finished_at: null,
+    } as Awaited<ReturnType<typeof portalApi.task>>);
+    renderProjects();
+    await openProject();
+
+    const acknowledgment = await screen.findByRole('img', { name: '主 Agent 已接下，正在处理' });
+    expect(acknowledgment).toBeInTheDocument();
+    const thinking = await screen.findByRole('status', { name: 'Morde 正在思考' });
+    expect(thinking.querySelectorAll('.thinking-dots span')).toHaveLength(3);
+    expect(thinking).not.toHaveTextContent('思考中…');
+    const userCard = screen.getByText(userMessage.content).closest('article');
+    expect(userCard?.querySelector('u')).toBeNull();
+    expect(userCard?.querySelector('.message-variant-controls')).toBeNull();
+  });
+
+  it('does not show an active processing bubble for a completed project Task', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([{ ...projectHistoryMessage, task_id: 'qhistory1' }]);
+    vi.mocked(projectApi.tasks).mockResolvedValue([{ ...task, id: 'qhistory1', conversation_id: projectConversation.id, status: 'completed' }]);
+    renderProjects();
+    await openProject();
+
+    expect(await screen.findByText(projectHistoryMessage.content)).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 正在思考' })).not.toBeInTheDocument();
   });
 
   it('edits a project message as a new branch using the group high-water version and keeps the composer draft', async () => {

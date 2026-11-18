@@ -3,6 +3,9 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import { disableDemoWorker } from "./app/disable-demo-worker";
 import "./styles.css";
+import "./ice-cream-blue.css";
+
+if ("morde" in window) document.documentElement.classList.add("morde-pc-theme");
 
 async function start() {
   if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1") {

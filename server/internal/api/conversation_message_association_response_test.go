@@ -30,6 +30,15 @@ func TestConversationMessageAssociationResponseFieldsAreOptionalAndScoped(t *tes
 	if _, ok := body["related_task_id"]; ok {
 		t.Fatalf("message without a task exposed related task: %s", encoded)
 	}
+	if body["agent_acknowledged"] != false {
+		t.Fatalf("unacknowledged message projection = %v, want false", body["agent_acknowledged"])
+	}
+	message.AgentAcknowledged = true
+	view, err = toMessageResponse(message)
+	if err != nil || !view.AgentAcknowledged {
+		t.Fatalf("agent acknowledgement was not projected: %+v err=%v", view, err)
+	}
+	message.AgentAcknowledged = false
 
 	message.DuplicateOfMessageID = "m7654321"
 	message.RelatedTaskID = "q1234567"

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,8 +14,13 @@ import (
 )
 
 type workspaceServiceStore struct {
+	agentInitLock sync.Mutex
 	WorkspaceStore
 	values        map[string]workspace.Workspace
+	agentByOwner  map[string]workspace.Workspace
+	agentInit     map[string]bool
+	agentHistory  map[string]string
+	agentCreates  int
 	bindings      map[string][]workspace.Binding
 	volumes       map[string]WorkspaceVolumeRegistry
 	byIdempotency map[string]workspace.Workspace
@@ -107,6 +113,58 @@ func (s *workspaceServiceStore) CreateWorkspace(_ context.Context, value workspa
 	return value, s.createReplay, nil
 }
 
+func (s *workspaceServiceStore) GetAgentWorkspace(_ context.Context, ownerID string) (workspace.Workspace, bool, error) {
+	value, ok := s.agentByOwner[ownerID]
+	if !ok {
+		return workspace.Workspace{}, false, domain.NewError(domain.CodeNotFound, "Agent Workspace not found")
+	}
+	return value, s.agentInit[ownerID], nil
+}
+
+func (s *workspaceServiceStore) CreateAgentWorkspace(_ context.Context, value workspace.Workspace) (workspace.Workspace, bool, error) {
+	if s.agentByOwner == nil {
+		s.agentByOwner = make(map[string]workspace.Workspace)
+	}
+	if existing, ok := s.agentByOwner[value.OwnerID]; ok {
+		return existing, s.agentInit[value.OwnerID], nil
+	}
+	s.agentCreates++
+	s.agentByOwner[value.OwnerID] = value
+	if s.agentHistory == nil {
+		s.agentHistory = make(map[string]string)
+	}
+	s.agentHistory[value.ID] = value.OwnerID
+	if s.values == nil {
+		s.values = make(map[string]workspace.Workspace)
+	}
+	s.values[value.ID] = value
+	return value, false, nil
+}
+
+func (s *workspaceServiceStore) MarkAgentWorkspaceDirectoryInitialized(_ context.Context, ownerID, workspaceID string) error {
+	value, ok := s.agentByOwner[ownerID]
+	if !ok || value.ID != workspaceID {
+		return domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace mapping changed")
+	}
+	if s.agentInit == nil {
+		s.agentInit = make(map[string]bool)
+	}
+	s.agentInit[ownerID] = true
+	return nil
+}
+
+func (s *workspaceServiceStore) AcquireAgentWorkspaceInitializationLock(context.Context, string) (func() error, error) {
+	s.agentInitLock.Lock()
+	return func() error {
+		s.agentInitLock.Unlock()
+		return nil
+	}, nil
+}
+
+func (s *workspaceServiceStore) IsAgentWorkspaceWorkspace(_ context.Context, ownerID, workspaceID string) (bool, error) {
+	return s.agentHistory[workspaceID] == ownerID, nil
+}
+
 func (s *workspaceServiceStore) TryWorkspaceBlockStoreLock(context.Context, string) (LeaderLock, bool, error) {
 	return blockGCTestLock{}, true, nil
 }
@@ -141,6 +199,26 @@ func (s *workspaceServiceStore) CompleteWorkspaceDelete(_ context.Context, id st
 	now := time.Now().UTC()
 	value.DeletedAt = &now
 	s.values[id] = value
+	return value, nil
+}
+
+func (s *workspaceServiceStore) ClaimAgentWorkspaceForDelete(ctx context.Context, ownerID, id string, expectedRevision int64) (workspace.Workspace, error) {
+	value, ok := s.agentByOwner[ownerID]
+	if !ok || value.ID != id {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace mapping is no longer current")
+	}
+	return s.ClaimWorkspaceForDelete(ctx, id, expectedRevision)
+}
+
+func (s *workspaceServiceStore) CompleteAgentWorkspaceDelete(ctx context.Context, ownerID, id string, expectedRevision int64) (workspace.Workspace, error) {
+	value, err := s.CompleteWorkspaceDelete(ctx, id, expectedRevision)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if current, ok := s.agentByOwner[ownerID]; ok && current.ID == id {
+		delete(s.agentByOwner, ownerID)
+		delete(s.agentInit, ownerID)
+	}
 	return value, nil
 }
 
@@ -223,105 +301,45 @@ func TestWorkspaceServiceCreateReportsCurrentDirectoryInitializationFailure(t *t
 	}
 }
 
-func TestWorkspaceServiceEnsureDefaultWorkspaceAlwaysCreatesPrivateStorage(t *testing.T) {
+func TestWorkspaceServiceEnsureAgentWorkspaceIsStableAndInitializesOnce(t *testing.T) {
 	store := &workspaceServiceStore{
 		values: map[string]workspace.Workspace{
-			"w1234567": {ID: "w1234567", OwnerID: "u1234567", Name: "older bound", State: workspace.StateReady, CreatedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)},
-			"w2345678": {ID: "w2345678", OwnerID: "u1234567", Name: "available", State: workspace.StateReady, CreatedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)},
-			"w3456789": {ID: "w3456789", OwnerID: "u7654321", Name: "foreign", State: workspace.StateReady},
-			"w4567890": {ID: "w4567890", OwnerID: "u1234567", Name: "deleting", State: workspace.StateDeleting},
-		},
-		bindings: map[string][]workspace.Binding{
-			"w1234567": {{HostID: "h1234567", Workspace: workspace.Workspace{ID: "w1234567"}, State: workspace.BindingDetached}},
-			"w2345678": {{HostID: "h2345678", Workspace: workspace.Workspace{ID: "w2345678"}, State: workspace.BindingActive}},
-		},
-		volumes: map[string]WorkspaceVolumeRegistry{
-			"w1234567": {WorkspaceID: "w1234567", OwnerID: "u1234567", State: WorkspaceVolumeReady, VolumeName: "workspace-w1234567"},
-		},
-	}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	selected, err := service.EnsureDefaultWorkspace(context.Background(), "u1234567")
-	if err != nil || selected.ID == "w1234567" || selected.ID == "w2345678" || selected.Name != "Computer storage" || store.createRecord.Key == "" {
-		t.Fatalf("EnsureDefaultWorkspace() = %#v, %v; create record=%#v", selected, err, store.createRecord)
-	}
-}
-
-func TestWorkspaceServiceEnsureDefaultWorkspaceDoesNotReuseLegacyStorage(t *testing.T) {
-	store := &workspaceServiceStore{
-		values: map[string]workspace.Workspace{
-			"w1234567": {ID: "w1234567", OwnerID: "u1234567", Name: "legacy", State: workspace.StateReady},
+			"w1234567": {ID: "w1234567", OwnerID: "u1234567", Name: "Agent Workspace", State: workspace.StateReady},
 		},
 		bindings: map[string][]workspace.Binding{},
-		volumes: map[string]WorkspaceVolumeRegistry{
-			"w1234567": {WorkspaceID: "w1234567", OwnerID: "u1234567", State: WorkspaceVolumeLegacy},
-		},
 	}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	selected, err := service.EnsureDefaultWorkspace(context.Background(), "u1234567")
-	if err != nil || selected.ID == "w1234567" || selected.Name != "Computer storage" {
-		t.Fatalf("EnsureDefaultWorkspace() = %#v, %v; legacy storage must not be reused", selected, err)
-	}
-}
-
-func TestWorkspaceServiceEnsureDefaultWorkspaceCreatesThroughQuotaAndInitializer(t *testing.T) {
-	store := &workspaceServiceStore{values: map[string]workspace.Workspace{}, bindings: map[string][]workspace.Binding{}}
 	capacity := &workspaceCapacityStub{}
 	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, capacity, &credentialAudit{}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var initialized string
-	if err := service.SetWorkspaceCurrentInitializer(func(_ context.Context, id string) error { initialized = id; return nil }); err != nil {
+	var initialized []string
+	if err := service.SetWorkspaceCurrentInitializer(func(_ context.Context, id string) error {
+		initialized = append(initialized, id)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	created, err := service.EnsureDefaultWorkspace(context.Background(), "u1234567")
-	if err != nil || created.Name != "Computer storage" || created.OwnerID != "u1234567" || initialized != created.ID || capacity.calls != 1 {
-		t.Fatalf("EnsureDefaultWorkspace() = %#v, %v; initialized=%q capacity=%d", created, err, initialized, capacity.calls)
+
+	first, err := service.EnsureAgentWorkspace(context.Background(), "u1234567")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if store.createRecord.Operation != "workspace.create" || len(store.createRecord.Key) <= len("default-host-workspace-") {
-		t.Fatalf("default workspace idempotency record = %#v", store.createRecord)
+	second, err := service.EnsureAgentWorkspace(context.Background(), "u1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID || first.Name != "Agent Workspace" || store.agentCreates != 1 || capacity.calls != 1 ||
+		len(initialized) != 1 || initialized[0] != first.ID {
+		t.Fatalf("EnsureAgentWorkspace() = %#v then %#v; creates=%d capacity=%d initialized=%v",
+			first, second, store.agentCreates, capacity.calls, initialized)
+	}
+	if _, exists := store.values["w1234567"]; !exists {
+		t.Fatal("existing same-named user Workspace was lost")
 	}
 }
 
-func TestWorkspaceServiceEnsureDefaultWorkspaceUsesFreshKeyAfterDeletion(t *testing.T) {
-	store := &workspaceServiceStore{values: map[string]workspace.Workspace{}, bindings: map[string][]workspace.Binding{}}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	first, err := service.EnsureDefaultWorkspace(context.Background(), "u1234567")
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstKey := store.createRecord.Key
-	first.State = workspace.StateDeleted
-	store.values[first.ID] = first
-
-	second, err := service.EnsureDefaultWorkspace(context.Background(), "u1234567")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.ID == first.ID || store.createRecord.Key == firstKey {
-		t.Fatalf("default Workspace after deletion = %q with key %q; first = %q with key %q", second.ID, store.createRecord.Key, first.ID, firstKey)
-	}
-}
-
-func TestWorkspaceServiceCreatesDistinctIdempotentHostStorage(t *testing.T) {
+func TestWorkspaceServiceConcurrentEnsureUsesOneStableWorkspaceAndDirectory(t *testing.T) {
 	store := &workspaceServiceStore{values: map[string]workspace.Workspace{}, bindings: map[string][]workspace.Binding{}}
 	capacity := &workspaceCapacityStub{}
 	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, capacity, &credentialAudit{}, 1<<30)
@@ -331,17 +349,62 @@ func TestWorkspaceServiceCreatesDistinctIdempotentHostStorage(t *testing.T) {
 	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	first, err := service.CreateHostWorkspace(context.Background(), "u1234567", "host-create-key-01")
+	const callers = 8
+	var wait sync.WaitGroup
+	errorsOut := make(chan error, callers)
+	ids := make(chan string, callers)
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			value, err := service.EnsureAgentWorkspace(context.Background(), "u1234567")
+			if err != nil {
+				errorsOut <- err
+				return
+			}
+			ids <- value.ID
+		}()
+	}
+	wait.Wait()
+	close(errorsOut)
+	close(ids)
+	for err := range errorsOut {
+		t.Fatalf("concurrent EnsureAgentWorkspace() error = %v", err)
+	}
+	first := ""
+	for id := range ids {
+		if first == "" {
+			first = id
+		} else if id != first {
+			t.Fatalf("concurrent EnsureAgentWorkspace() returned IDs %q and %q", first, id)
+		}
+	}
+	if store.agentCreates != 1 || capacity.calls != 1 || !store.agentInit["u1234567"] {
+		t.Fatalf("concurrent ensure creates=%d capacity=%d initialized=%t", store.agentCreates, capacity.calls, store.agentInit["u1234567"])
+	}
+}
+
+func TestWorkspaceServiceEnsureAgentWorkspaceRetriesCurrentDirectoryInitialization(t *testing.T) {
+	store := &workspaceServiceStore{values: map[string]workspace.Workspace{}, bindings: map[string][]workspace.Binding{}}
+	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := service.CreateHostWorkspace(context.Background(), "u1234567", "host-create-key-01")
-	if err != nil || replayed.ID != first.ID || replayed.Name != "Computer storage" {
-		t.Fatalf("idempotent Host storage = %#v / %#v, %v", first, replayed, err)
+	initErr := errors.New("current directory unavailable")
+	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return initErr }); err != nil {
+		t.Fatal(err)
 	}
-	second, err := service.CreateHostWorkspace(context.Background(), "u1234567", "host-create-key-02")
-	if err != nil || second.ID == first.ID || len(store.values) != 2 || capacity.calls != 3 {
-		t.Fatalf("second Host storage = %#v, rows=%d capacity calls=%d err=%v", second, len(store.values), capacity.calls, err)
+	if _, err := service.EnsureAgentWorkspace(context.Background(), "u1234567"); !errors.Is(err, initErr) {
+		t.Fatalf("first EnsureAgentWorkspace() error = %v, want initializer failure", err)
+	}
+	if store.agentCreates != 1 || len(store.agentByOwner) != 1 {
+		t.Fatalf("failed initialization lost stable mapping: creates=%d mappings=%d", store.agentCreates, len(store.agentByOwner))
+	}
+	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnsureAgentWorkspace(context.Background(), "u1234567"); err != nil || store.agentCreates != 1 {
+		t.Fatalf("retry EnsureAgentWorkspace() = %v, creates=%d; want same mapping and successful initialization", err, store.agentCreates)
 	}
 }
 
@@ -524,5 +587,77 @@ func TestWorkspaceServiceOnlyHostDeleteCanDeleteDetachedBoundStorage(t *testing.
 	if err != nil || deleted.State != workspace.StateDeleted || deleted.DeletedAt == nil || volume.deleteCalls != 1 ||
 		len(content.deletes) != 1 || len(current.deletes) != 1 {
 		t.Fatalf("Host storage deletion = %#v, volume deletes=%d content=%v current=%v err=%v", deleted, volume.deleteCalls, content.deletes, current.deletes, err)
+	}
+}
+
+func TestWorkspaceServiceHostDeleteRetainsAgentWorkspace(t *testing.T) {
+	value := workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", Name: "Agent Workspace", State: workspace.StateReady}
+	binding := workspace.Binding{
+		ID: "b1234567", OwnerID: value.OwnerID, HostID: "h1234567", Workspace: value,
+		Directory: value.ID, State: workspace.BindingDetached, BindingVersion: 2,
+	}
+	store := &workspaceServiceStore{
+		values:       map[string]workspace.Workspace{value.ID: value},
+		agentByOwner: map[string]workspace.Workspace{value.OwnerID: value},
+		agentHistory: map[string]string{value.ID: value.OwnerID},
+		bindings:     map[string][]workspace.Binding{value.ID: {binding}},
+	}
+	content := &workspaceContentStub{}
+	current := &workspaceCurrentDeleterStub{}
+	service, err := NewWorkspaceService(store, content, current, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeleteHostWorkspace(context.Background(), value.OwnerID, binding.HostID); err != nil {
+		t.Fatalf("DeleteHostWorkspace(Agent Workspace) = %v", err)
+	}
+	stored, err := store.GetWorkspace(context.Background(), value.ID)
+	if err != nil || stored.State != workspace.StateReady || store.claimCalls != 0 || len(content.deletes) != 0 || len(current.deletes) != 0 {
+		t.Fatalf("Host deletion changed Agent Workspace: %#v, claims=%d content=%v current=%v err=%v",
+			stored, store.claimCalls, content.deletes, current.deletes, err)
+	}
+}
+
+func TestWorkspaceServiceExplicitlyDeletesAndRecreatesAgentWorkspace(t *testing.T) {
+	const ownerID = "u1234567"
+	const oldID = "w1234567"
+	const hostID = "h1234567"
+	value := workspace.Workspace{ID: oldID, OwnerID: ownerID, Name: "Agent Workspace", State: workspace.StateReady, Revision: 3}
+	binding := workspace.Binding{
+		ID: "b1234567", OwnerID: ownerID, HostID: hostID, Workspace: value,
+		Directory: oldID, State: workspace.BindingDetached, BindingVersion: 2,
+	}
+	store := &workspaceServiceStore{
+		values:       map[string]workspace.Workspace{oldID: value},
+		agentByOwner: map[string]workspace.Workspace{ownerID: value},
+		agentInit:    map[string]bool{ownerID: true},
+		agentHistory: map[string]string{oldID: ownerID},
+		bindings:     map[string][]workspace.Binding{oldID: {binding}},
+	}
+	content := &workspaceContentStub{}
+	current := &workspaceCurrentDeleterStub{}
+	service, err := NewWorkspaceService(store, content, current, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: ownerID, TokenID: "t1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	deleted, err := service.DeleteWorkspace(context.Background(), principal, oldID)
+	if err != nil || deleted.State != workspace.StateDeleted || store.agentByOwner[ownerID].ID != "" ||
+		len(content.deletes) != 1 || len(current.deletes) != 1 {
+		t.Fatalf("explicit Agent Workspace delete = %#v, current mapping=%#v, content=%v current=%v err=%v",
+			deleted, store.agentByOwner[ownerID], content.deletes, current.deletes, err)
+	}
+	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := service.EnsureAgentWorkspace(context.Background(), ownerID)
+	if err != nil || recreated.ID == oldID || recreated.OwnerID != ownerID || store.agentCreates != 1 {
+		t.Fatalf("recreated Agent Workspace = %#v, creates=%d, err=%v", recreated, store.agentCreates, err)
+	}
+	if err := service.DeleteHostWorkspace(context.Background(), ownerID, hostID); err != nil {
+		t.Fatalf("late Host cleanup for retired Agent Workspace = %v", err)
+	}
+	if len(content.deletes) != 1 || len(current.deletes) != 1 {
+		t.Fatalf("late Host cleanup deleted retired Agent Workspace data: content=%v current=%v", content.deletes, current.deletes)
 	}
 }

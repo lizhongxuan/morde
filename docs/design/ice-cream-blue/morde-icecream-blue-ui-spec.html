@@ -156,15 +156,15 @@ select.input{appearance:none;-webkit-appearance:none;background-image:url("data:
 .ai-row{display:flex;gap:10px;align-items:flex-start}
 .ai-ava{width:32px;height:32px;border-radius:50%;background:var(--brand-soft);color:var(--brand-deep);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;flex:0 0 auto;border:1px solid var(--brand-tint)}
 .bubble-ai{background:#fff;border:1px solid var(--line);padding:10px 16px;border-radius:var(--radius-bubble);border-bottom-left-radius:8px;max-width:88%;font-size:14px}
-.think-bubble{display:inline-flex;align-items:center;gap:10px;background:#fff;border:1px solid var(--line);border-radius:var(--radius-bubble);padding:10px 16px}
-.think-txt{color:var(--muted-strong);font-size:13px}
+.think-bubble{display:inline-flex;align-items:center;background:#fff;border:1px solid var(--line);border-radius:var(--radius-bubble);padding:10px 16px}
 .dots{display:inline-flex;gap:5px;align-items:center}
 .dots i{width:7px;height:7px;border-radius:50%;background:var(--brand);animation:dotbounce var(--d-dur) var(--d-ease) infinite}
 .dots i:nth-child(2){animation-delay:.18s}
 .dots i:nth-child(3){animation-delay:.36s}
-.mascot{position:relative;width:34px;height:34px;border-radius:50%;background:#93c5fd;flex:0 0 auto;animation:bob var(--bob-dur) ease-in-out infinite}
-.mascot::before{content:"";position:absolute;left:9px;top:13px;width:5px;height:6px;border-radius:50%;background:#fff;box-shadow:11px 0 0 #fff;animation:blink 3.4s ease-in-out infinite}
-.mascot i{position:absolute;left:50%;bottom:7px;width:12px;height:6px;margin-left:-6px;border:2px solid transparent;border-bottom-color:#fff;border-radius:0 0 12px 12px}
+.mascot{position:relative;width:24px;height:24px;flex:0 0 auto;animation:bob var(--bob-dur) ease-in-out infinite}
+.mascot::before{content:"";position:absolute;left:2px;top:7px;width:20px;height:16px;box-sizing:border-box;border:1.5px solid var(--brand);border-radius:8px;background:radial-gradient(circle,var(--brand) 1.5px,transparent 1.7px) 4px 3px/4px 4px no-repeat,radial-gradient(circle,var(--brand) 1.5px,transparent 1.7px) 12px 3px/4px 4px no-repeat,radial-gradient(ellipse,#fda4af 0 1px,transparent 1.5px) 1px 8px/4px 3px no-repeat,radial-gradient(ellipse,#fda4af 0 1px,transparent 1.5px) 15px 8px/4px 3px no-repeat,var(--brand-soft)}
+.mascot::after{content:"";position:absolute;left:11px;top:2px;width:2px;height:5px;border-radius:2px;background:var(--brand);box-shadow:0 -2px 0 1px var(--brand)}
+.mascot i{position:absolute;z-index:1;left:9px;top:17px;width:6px;height:3px;border-bottom:1.5px solid var(--brand);border-radius:0 0 6px 6px}
 
 /* cards */
 .taskcard,.approvalcard{background:#fff;border:1px solid var(--line);border-radius:var(--radius-card);padding:16px 18px;box-shadow:var(--shadow-jelly);width:100%}
@@ -285,14 +285,13 @@ footer.page .f-box{background:var(--surface);border:1px solid var(--line);border
 
 @keyframes dotbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
 @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
-@keyframes blink{0%,90%,100%{transform:scaleY(1)}94%{transform:scaleY(.1)}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes progmove{from{width:38%}to{width:78%}}
 @keyframes stripes{to{background-position:28px 0}}
 @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.07);opacity:.72}}
 @keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
 @media (prefers-reduced-motion: reduce){
-  .dots i,.mascot,.mascot::before,.spin,.mini-spin,.progress i,.badge-wait.pulsing,.skel i{animation-duration:0.01s;animation-iteration-count:1}
+  .dots i,.mascot,.spin,.mini-spin,.progress i,.badge-wait.pulsing,.skel i{animation-duration:0.01s;animation-iteration-count:1}
 }
 </style>
 </head>
@@ -313,7 +312,7 @@ footer.page .f-box{background:var(--surface);border:1px solid var(--line);border
 <!-- 1 理念 -->
 <section class="block" aria-label="设计理念">
   <h2><span class="num">1</span>设计理念</h2>
-  <p>冰淇淋蓝是 Morde 的统一风格：主色是柔和的淡蓝 <code>#60A5FA</code>，大面积底色是带一点蓝的奶油白 <code>#F8FAFF</code>，卡片和输入框用 24px 的大圆角，阴影是带蓝色的果冻软阴影。整体像一勺刚挖出来的冰淇淋——软、圆、凉凉的，但不甜腻。等待和加载状态不藏起来，而是做成轻轻动的小风景：思考时圆点慢慢跳、吉祥物眨眨眼，审批等待时徽章像呼吸一样一明一暗，让「等」这件事本身也显得安心。</p>
+  <p>冰淇淋蓝是 Morde 的统一风格：主色是柔和的淡蓝 <code>#60A5FA</code>，大面积底色是带一点蓝的奶油白 <code>#F8FAFF</code>，卡片和输入框用 24px 的大圆角，阴影是带蓝色的果冻软阴影。整体像一勺刚挖出来的冰淇淋——软、圆、凉凉的，但不甜腻。等待和加载状态不藏起来，而是做成轻轻动的小风景：思考时三个圆点慢慢跳、简洁的机器人头像轻轻浮动，审批等待时徽章像呼吸一样一明一暗，让「等」这件事本身也显得安心。</p>
   <p>它刻意不走另外两条路：不做扁平的企业蓝（太正经、显旧），也不做冷峻的极简黑白（太冷、太安静）。Morde 是一个人的个人智能体，每天陪着用户说话、干活、等审批——它应该像一个脾气好、靠得住的朋友，而不是一套办公软件。所以文字不用纯黑，用柔和的石板灰蓝 <code>#334155</code>；状态色也全部降了饱和，成功是薄荷绿、失败是珊瑚红，都不刺眼。</p>
   <p>这套风格是用户在 2026-11-18 经过四轮方案对比后定下来的：从最初的企业蓝、参考 Linear / Vercel 的极简风、活泼可爱的撞色风，一路比到四个蓝色方案，最终选了最温柔的冰淇淋蓝（方案 P）。定稿之后，各端只换 token，不再争论风格。</p>
   <div class="meta-line" style="margin:14px 0 6px">
@@ -445,10 +444,10 @@ footer.page .f-box{background:var(--surface);border:1px solid var(--line);border
       <div class="chatbox">
         <div class="row-u"><div class="bubble-u">帮我把登录超时的 bug 修了，改完跑一遍测试。</div></div>
         <div class="ai-row"><div class="ai-ava">M</div><div class="bubble-ai">好的，我拆成两步：先定位超时原因，再改重试逻辑。已经开始执行，第一步的结果马上出来。</div></div>
-        <div class="ai-row"><div class="mascot" aria-hidden="true"><i></i></div><div class="think-bubble"><span class="dots"><i></i><i></i><i></i></span><span class="think-txt">思考中…</span></div></div>
+        <div class="ai-row"><div class="mascot" aria-hidden="true"><i></i></div><div class="think-bubble"><span class="dots"><i></i><i></i><i></i></span></div></div>
       </div>
     </div>
-    <p class="spec"><b>规格：</b>用户气泡品牌蓝底白字、右对齐；AI 气泡白底 <code>--line</code> 描边、左对齐带 32px 头像；圆角 <code>--radius-bubble 22px</code>，靠外一侧尾角收至 8px；内边距 10×16，字号 14px，最大宽度 82–88%。思考中：圆点 7px 品牌蓝，1.5s 依次跳动；吉祥物 34px 淡蓝圆脸，2s 上下浮动 + 3.4s 眨一次眼。</p>
+    <p class="spec"><b>规格：</b>用户气泡品牌蓝底白字、右对齐；AI 气泡白底 <code>--line</code> 描边、左对齐带 32px 头像；圆角 <code>--radius-bubble 22px</code>，靠外一侧尾角收至 8px；内边距 10×16，字号 14px，最大宽度 82–88%。思考中：圆点 7px 品牌蓝，1.5s 依次跳动；简洁机器人头像 24px，2s 上下轻浮动。</p>
   </div>
 
   <!-- Task card -->
@@ -608,13 +607,13 @@ footer.page .f-box{background:var(--surface);border:1px solid var(--line);border
 <!-- 4 动画 -->
 <section class="block" aria-label="动画规范">
   <h2><span class="num">4</span>动画规范</h2>
-  <p class="sub">冰淇淋蓝是四套蓝色方案里动得最慢、最软的一套：四个核心等待动画的时长 token 全部落在 1.5–1.8 秒（圆点 1.5 · 转圈 1.5 · 骨架微光 1.7 · 审批呼吸 1.8），缓动以 ease-in-out 为主，不用弹跳过冲；只有连续循环类（转圈、进度斜纹、微光扫过）用 linear 匀速，才不会一顿一顿。另有三个明确列出的例外，属于环境节奏、故意更慢，不算加载反馈：吉祥物浮动 2s（源方案 P 原值）、眨眼间隔 3.4s、进度条涨幅往返 3.2s。原则只有一句：<b>动效是安抚，不是表演</b>——慢、轻、幅度小，永远不抢内容的注意力，更不能让人晕。</p>
+  <p class="sub">冰淇淋蓝是四套蓝色方案里动得最慢、最软的一套：四个核心等待动画的时长 token 全部落在 1.5–1.8 秒（圆点 1.5 · 转圈 1.5 · 骨架微光 1.7 · 审批呼吸 1.8），缓动以 ease-in-out 为主，不用弹跳过冲；只有连续循环类（转圈、进度斜纹、微光扫过）用 linear 匀速，才不会一顿一顿。另有两个明确列出的例外，属于环境节奏、故意更慢、不算加载反馈：机器人头像轻浮动 2s、进度条涨幅往返 3.2s。原则只有一句：<b>动效是安抚，不是表演</b>——慢、轻、幅度小，永远不抢内容的注意力，更不能让人晕。</p>
   <div class="table-wrap" style="margin-bottom:18px">
   <table>
     <thead><tr><th>动画</th><th>Token</th><th>时长 / 缓动</th><th>关键帧</th></tr></thead>
     <tbody>
       <tr><td>思考圆点跳动</td><td><code>--d-dur</code> · <code>--d-ease</code></td><td>1.5s · ease-in-out，三点依次延迟 .18s</td><td><code>dotbounce</code> 上跳 5px</td></tr>
-      <tr><td>吉祥物浮动 / 眨眼（例外 · 环境节奏）</td><td><code>--bob-dur</code></td><td>浮动 2s · 眨眼间隔 3.4s</td><td><code>bob</code> 上下 3px · <code>blink</code> 眼睛压扁</td></tr>
+      <tr><td>机器人头像轻浮动（例外 · 环境节奏）</td><td><code>--bob-dur</code></td><td>浮动 2s</td><td><code>bob</code> 上下 3px</td></tr>
       <tr><td>加载转圈</td><td><code>--spin-dur</code></td><td>1.5s · linear</td><td><code>spin</code> 旋转 360°</td></tr>
       <tr><td>任务进度流动</td><td>—</td><td>涨幅往返 3.2s ease-in-out（例外 · 环境节奏）· 斜纹流动 1.6s linear</td><td><code>progmove</code> + <code>stripes</code></td></tr>
       <tr><td>等待审批呼吸</td><td><code>--p-dur</code></td><td>1.8s · ease-in-out</td><td><code>pulse</code> 缩放 1→1.07、透明 1→.72</td></tr>
@@ -623,7 +622,7 @@ footer.page .f-box{background:var(--surface);border:1px solid var(--line);border
   </table>
   </div>
   <div class="anim-grid">
-    <div class="anim-cell"><h4>① 思考中</h4><div class="anim-stage"><div class="mascot" aria-hidden="true"><i></i></div><div class="think-bubble"><span class="dots"><i></i><i></i><i></i></span><span class="think-txt">思考中…</span></div></div><div class="a-spec">吉祥物眨眼 + 浮动，圆点依次跳。AI 开始思考到吐出第一个字之间展示。</div></div>
+    <div class="anim-cell"><h4>① 思考中</h4><div class="anim-stage"><div class="mascot" aria-hidden="true"><i></i></div><div class="think-bubble"><span class="dots"><i></i><i></i><i></i></span></div></div><div class="a-spec">24px 圆润机器人头像带笑脸和淡淡腮红，轻轻浮动；三个圆点依次跳。AI 开始思考到吐出第一个字之间展示。</div></div>
     <div class="anim-cell"><h4>② 任务执行中</h4><div class="anim-stage" style="display:block"><div class="card-top" style="font-size:13.5px">修复登录超时 <span class="spin"></span></div><div class="progress"><i></i></div></div><div class="a-spec">条纹进度条边流边涨 + 右上角转圈。任务卡存续期间常驻。</div></div>
     <div class="anim-cell"><h4>③ 等待审批</h4><div class="anim-stage"><span class="badge badge-wait pulsing">等待中</span><span style="font-size:13.5px;color:var(--muted-strong)">审批卡上的徽章像呼吸灯一样一明一暗，提醒但不催促。</span></div><div class="a-spec">脉冲只用在「等用户」的徽章上；用户处理完立即停止。</div></div>
     <div class="anim-cell"><h4>④ 骨架屏</h4><div class="anim-stage" style="display:block"><div class="skel"><i style="width:84%"></i><i style="width:62%"></i></div><div class="card-sub" style="margin-top:6px">正在生成摘要…</div></div><div class="a-spec">内容生成中的占位：圆条 + 微光扫过，下方跟一行说明文字。</div></div>
@@ -668,7 +667,7 @@ footer.page .f-box{background:var(--surface);border:1px solid var(--line);border
   <h3>工作台（Workbench）</h3>
   <p style="font-size:14px">工作台是独立样式：把 <code>--primary</code> 从 <code>#4263D6</code> 换成 <code>#60A5FA</code>，<code>--radius</code> 从 6px 换成按控件分级的新变量（卡片 24 / 输入 16 / 按钮胶囊）；去掉应用底色的青色径向光晕，换成奶油白 <code>#F8FAFF</code> 平底；字体栈换成圆体优先。结构和布局不动，只换 token。</p>
   <h3>iOS（原生）</h3>
-  <p style="font-size:14px">新增一份品牌 token 文件（Asset Catalog 颜色 + 常量），停止用系统蓝 <code>Color.accentColor</code> 当品牌色：brand、brandSoft、success、danger 等语义色写死为本规范色值；背景和文字层级仍可用系统语义色，但要校准到奶油白与石板灰蓝。圆角用 <code>cornerRadius</code> 按同一阶梯取值；动效用 SwiftUI 的 <code>withAnimation(.easeInOut(duration: 1.5))</code> 对应圆点与呼吸灯，转圈用 <code>ProgressView</code> 自定义色或旋转动画，骨架微光用渐变 mask 扫过实现，核心动画时长与 Web 端对齐（1.5–1.8s；吉祥物浮动 2s 等环境节奏为例外，同 Web 端），不用 spring 过冲。</p>
+  <p style="font-size:14px">新增一份品牌 token 文件（Asset Catalog 颜色 + 常量），停止用系统蓝 <code>Color.accentColor</code> 当品牌色：brand、brandSoft、success、danger 等语义色写死为本规范色值；背景和文字层级仍可用系统语义色，但要校准到奶油白与石板灰蓝。圆角用 <code>cornerRadius</code> 按同一阶梯取值；动效用 SwiftUI 的 <code>withAnimation(.easeInOut(duration: 1.5))</code> 对应圆点与呼吸灯，转圈用 <code>ProgressView</code> 自定义色或旋转动画，骨架微光用渐变 mask 扫过实现，核心动画时长与 Web 端对齐（1.5–1.8s；机器人头像轻浮动 2s 等环境节奏为例外，同 Web 端），不用 spring 过冲。</p>
   <div class="table-wrap" style="margin-top:14px">
   <table>
     <thead><tr><th>规范 Token</th><th>Portal（CSS）</th><th>工作台</th><th>iOS（SwiftUI）</th></tr></thead>

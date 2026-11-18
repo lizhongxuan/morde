@@ -28,7 +28,7 @@ func (b testBlocks) Open(_ string, digest string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(value)), nil
 }
 
-func TestMaterializeAtomicallyPublishesVerifiedWorkspaceTree(t *testing.T) {
+func TestMaterializePublishesVerifiedWorkspaceTree(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "current")
 	store, err := Open(root)
 	if err != nil {

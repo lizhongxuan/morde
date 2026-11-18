@@ -47,6 +47,7 @@ type Deps struct {
 	Verifier                     app.Verifier
 	Auth                         AuthService
 	WorkspaceOps                 WorkspaceService
+	AgentWorkspaceFiles          AgentWorkspaceFilesService
 	WorkspaceSync                WorkspaceSyncService
 	WorkspaceSyncDevices         WorkspaceSyncDeviceService
 	WorkspaceDiff                WorkspaceDiffService
@@ -224,6 +225,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	}
 	h.registerTaskWorkbenchObservationTickets(group, deps.TaskObservationTickets)
 	h.registerResources(group)
+	h.registerAgentWorkspaceFiles(group, deps.AgentWorkspaceFiles)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync, deps.WorkspaceSyncDevices)
 	h.registerWorkspaceSyncDeviceRoutes(group, deps.WorkspaceSyncDevices)
 	h.registerWorkspaceDiff(group, deps.WorkspaceDiff)

@@ -20,6 +20,11 @@ seccomp_profile = "unconfined"
 drop_capabilities = ["NET_RAW"]
 sandbox_binds = ["/etc/cloudhost/resolv.conf:/etc/resolv.conf:ro"]
 
+[storage]
+# render-opensandbox-config.py replaces this placeholder with the exact
+# CH_WORKSPACE_SYNC_CURRENT_FILES_DIR before OpenSandbox starts.
+allowed_host_paths = ["__MORDE_WORKSPACE_CURRENT_FILES_DIR__"]
+
 [secure_runtime]
 type = "gvisor"
 docker_runtime = "runsc"

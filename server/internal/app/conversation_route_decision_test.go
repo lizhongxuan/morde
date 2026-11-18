@@ -29,12 +29,38 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "reference_time and time_zone") ||
 		!strings.Contains(request.Instructions, "server time is unavailable") ||
 		!strings.Contains(request.Instructions, "acknowledgements") ||
+		!strings.Contains(request.Instructions, "only on expected duration, never on the topic") ||
 		!strings.Contains(request.Instructions, "text-only requests for small code snippets") ||
 		!strings.Contains(request.Instructions, "An explicit request to create, write, export, save, or deliver a file or document") ||
 		!strings.Contains(request.Instructions, "Explicit requests to search, browse, consult sources") ||
 		!strings.Contains(request.Instructions, "require a Task; do not replace requested work with a text-only answer") ||
 		!strings.Contains(request.Instructions, "ask for that exact information") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
+	}
+}
+
+func TestConversationRouteAcknowledgementIsExplicitAndLimitedToBackgroundWork(t *testing.T) {
+	context := ConversationRouteContext{ActorID: "u1234567", Content: "Please handle this request", Candidates: []ConversationRouteCandidate{{
+		TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 2,
+	}}}
+	for _, test := range []struct {
+		name, output string
+		action       ConversationRouteAction
+		acknowledge  bool
+		invalid      bool
+	}{
+		{"new work acknowledged", `{"action":"new","task_id":"","acknowledge":true}`, ConversationRouteNew, true, false},
+		{"new work without decision", `{"action":"new","task_id":""}`, ConversationRouteNew, false, false},
+		{"update work acknowledged", `{"action":"update","task_id":"q1234567","acknowledge":true}`, ConversationRouteUpdate, true, false},
+		{"quick reply cannot acknowledge", `{"action":"reply","task_id":"","reply":"Done.","acknowledge":true}`, ConversationRouteClarify, false, true},
+		{"status cannot acknowledge", `{"action":"status","task_id":"q1234567","acknowledge":true}`, ConversationRouteClarify, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(test.output, context)
+			if decision.Action != test.action || decision.Acknowledge != test.acknowledge || decision.InvalidOutput != test.invalid {
+				t.Fatalf("decision = %+v, want action=%s acknowledge=%t invalid=%t", decision, test.action, test.acknowledge, test.invalid)
+			}
+		})
 	}
 }
 
@@ -383,6 +409,8 @@ func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || len(request.Input) != 1 || len(request.Tools) != 0 ||
+		!request.DisableThinking || request.Temperature == nil || *request.Temperature != 0 ||
+		!strings.Contains(request.Instructions, `"acknowledge" is the only acceptance signal`) ||
 		!strings.Contains(request.Input[0].Text, "只看收入和净利润") || !strings.Contains(request.Input[0].Text, "q1234567") ||
 		strings.Contains(request.Input[0].Text, "u1234567") {
 		t.Fatalf("routing request is invalid: %+v err=%v", request, err)

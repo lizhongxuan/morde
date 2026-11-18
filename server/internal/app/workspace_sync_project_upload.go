@@ -73,6 +73,15 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
+	liveDirectory, err := s.UsesLiveDirectorySource(ctx, value.OwnerID, workspaceID)
+	if err != nil {
+		return workspace.SyncSession{}, err
+	}
+	if !liveDirectory {
+		if err := s.rejectRevisionWorkspaceWrite(ctx, value.OwnerID, workspaceID); err != nil {
+			return workspace.SyncSession{}, err
+		}
+	}
 	if value.ReadOnly {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 	}
@@ -108,7 +117,14 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
-	currentFiles, currentEmptyDirectories, currentDirectories, err := s.readManifest(ctx, value.OwnerID, workspaceID, value.Revision, command.Scope)
+	var currentFiles []workspace.File
+	var currentEmptyDirectories []string
+	var currentDirectories []workspace.Directory
+	if liveDirectory {
+		currentFiles, currentEmptyDirectories, currentDirectories, err = s.readLiveProjectManifest(ctx, value.OwnerID, workspaceID, folder.RelativePath)
+	} else {
+		currentFiles, currentEmptyDirectories, currentDirectories, err = s.readManifest(ctx, value.OwnerID, workspaceID, value.Revision, command.Scope)
+	}
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
@@ -270,7 +286,7 @@ func projectDestinationConflictPlan(command workspace.CreateSyncSession, remoteF
 		add(file.Path, local, &file)
 	}
 	for _, path := range remoteEmptyDirectories {
-		if !projectPathWithinRoot(path, root) {
+		if strings.EqualFold(path, root) || !projectPathWithinRoot(path, root) {
 			continue
 		}
 		add(path, nil, nil)
@@ -315,7 +331,7 @@ func hasProjectDestinationContents(root string, files []workspace.File, emptyDir
 		}
 	}
 	for _, directory := range emptyDirectories {
-		if projectPathWithinRoot(directory, root) {
+		if projectPathWithinRoot(directory, root) && !strings.EqualFold(directory, root) {
 			return true
 		}
 	}

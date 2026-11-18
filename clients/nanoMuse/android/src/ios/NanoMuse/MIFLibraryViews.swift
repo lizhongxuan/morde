@@ -245,26 +245,10 @@ enum MIFLibraryPreviewPolicy {
 
 private enum MIFLibraryDesignPalette {
     #if MORDE_STANDALONE
-    static let secondaryText = Color(uiColor: UIColor {
-        $0.userInterfaceStyle == .dark
-            ? UIColor(red: 0.73, green: 0.73, blue: 0.77, alpha: 1)
-            : UIColor(red: 0.45098, green: 0.45098, blue: 0.470588, alpha: 1)
-    })
-    static let selectedSourceFill = Color(uiColor: UIColor {
-        $0.userInterfaceStyle == .dark
-            ? UIColor(red: 0.165, green: 0.165, blue: 0.18, alpha: 1)
-            : UIColor(red: 0.937255, green: 0.937255, blue: 0.937255, alpha: 1)
-    })
-    static let defaultTypeFill = Color(uiColor: UIColor {
-        $0.userInterfaceStyle == .dark
-            ? UIColor(red: 0.165, green: 0.165, blue: 0.18, alpha: 1)
-            : UIColor(red: 0.92549, green: 0.92549, blue: 0.941176, alpha: 1)
-    })
-    static let defaultTypeText = Color(uiColor: UIColor {
-        $0.userInterfaceStyle == .dark
-            ? UIColor(red: 0.73, green: 0.73, blue: 0.77, alpha: 1)
-            : UIColor(red: 0.333333, green: 0.333333, blue: 0.360784, alpha: 1)
-    })
+    static let secondaryText = NanoMuseTones.secondaryText
+    static let selectedSourceFill = NanoMuseTones.brandSoft
+    static let defaultTypeFill = NanoMuseTones.fill
+    static let defaultTypeText = NanoMuseTones.secondaryText
     #else
     static let secondaryText = NanoMuseTones.secondaryText
     static let selectedSourceFill = NanoMuseTones.fill
@@ -353,7 +337,7 @@ struct MIFLibraryPage: View {
                             } label: {
                                 Text(option.title)
                                     .font(.system(size: 14.5, weight: .semibold))
-                                    .foregroundStyle(option == source ? Color.primary : MIFLibraryDesignPalette.secondaryText)
+                                    .foregroundStyle(option == source ? NanoMuseTones.brandDeep : MIFLibraryDesignPalette.secondaryText)
                                     .padding(.horizontal, 13)
                                     .padding(.vertical, 7)
                                     .background {
@@ -633,31 +617,36 @@ struct MIFLibraryPage: View {
         switch normalized {
         case "PDF":
             #if MORDE_STANDALONE
-            fill = Color(red: 253.0 / 255.0, green: 236.0 / 255.0, blue: 236.0 / 255.0)
-            foreground = Color(red: 200.0 / 255.0, green: 30.0 / 255.0, blue: 30.0 / 255.0)
+            fill = NanoMuseTones.dangerFill
+            foreground = NanoMuseTones.dangerInk
             #else
             fill = Color(red: 0.992, green: 0.925, blue: 0.925)
             foreground = Color(red: 0.78, green: 0.12, blue: 0.12)
             #endif
         case "DOC", "DOCX":
             #if MORDE_STANDALONE
-            fill = Color(red: 232.0 / 255.0, green: 240.0 / 255.0, blue: 254.0 / 255.0)
-            foreground = Color(red: 26.0 / 255.0, green: 86.0 / 255.0, blue: 219.0 / 255.0)
+            fill = NanoMuseTones.brandSoft
+            foreground = NanoMuseTones.brandDeep
             #else
             fill = Color(red: 0.91, green: 0.94, blue: 0.99)
             foreground = Color(red: 0.10, green: 0.34, blue: 0.86)
             #endif
         case "图片", "IMAGE":
             #if MORDE_STANDALONE
-            fill = Color(red: 230.0 / 255.0, green: 247.0 / 255.0, blue: 236.0 / 255.0)
-            foreground = Color(red: 30.0 / 255.0, green: 142.0 / 255.0, blue: 62.0 / 255.0)
+            fill = NanoMuseTones.successFill
+            foreground = NanoMuseTones.successInk
             #else
             fill = Color(red: 0.90, green: 0.97, blue: 0.92)
             foreground = Color(red: 0.12, green: 0.55, blue: 0.24)
             #endif
         case "构件", "ART":
+            #if MORDE_STANDALONE
+            fill = NanoMuseTones.fill
+            foreground = NanoMuseTones.ink
+            #else
             fill = .black
             foreground = .white
+            #endif
         default:
             fill = MIFLibraryDesignPalette.defaultTypeFill
             foreground = MIFLibraryDesignPalette.defaultTypeText
@@ -669,7 +658,7 @@ struct MIFLibraryPage: View {
             .minimumScaleFactor(0.7)
             .foregroundStyle(foreground)
             .frame(width: 32, height: 38)
-            .background(fill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .background(fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
@@ -1343,10 +1332,10 @@ struct MIFPersonalAttachmentPreview: View {
                 .padding(.horizontal, 19)
                 .padding(.vertical, 22)
                 .background(NanoMuseTones.surface,
-                            in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            in: RoundedRectangle(cornerRadius: 24, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(NanoMuseTones.hairline, lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(NanoMuseTones.hairline, lineWidth: 1)
                 }
                 .padding(.horizontal, 22)
                 .padding(.top, 2)
@@ -1415,12 +1404,12 @@ private struct MIFQuickLookFilePreview: View {
             .background(ChatColors.background)
 
             GeometryReader { geometry in
-                let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+                let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
                 NanoMuseQuickLook(url: url)
                     .frame(width: geometry.size.width - 44, height: geometry.size.height - 2)
                     .background(NanoMuseTones.surface, in: shape)
                     .clipShape(shape)
-                    .overlay { shape.stroke(NanoMuseTones.hairline, lineWidth: 0.5) }
+                    .overlay { shape.stroke(NanoMuseTones.hairline, lineWidth: 1) }
                     .padding(.horizontal, 22)
                     .padding(.top, 2)
                     .accessibilityIdentifier("morde.attachment.preview.quickLook")

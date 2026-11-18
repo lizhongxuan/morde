@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 )
@@ -17,6 +18,9 @@ import (
 type coordinatorTestModels struct {
 	completeCalls   int
 	recoverCalls    int
+	directCalls     int
+	directDecision  app.ConversationRouteDecision
+	directErr       error
 	response        app.ModelResponse
 	request         json.RawMessage
 	summaryModelID  string
@@ -25,6 +29,12 @@ type coordinatorTestModels struct {
 	summaryCalls    int
 	summaryFence    app.ConversationSummaryModelFence
 	summaryRequest  json.RawMessage
+}
+
+func (m *coordinatorTestModels) ClassifyConversationRoute(context.Context, app.ConversationRouteClaim,
+	app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	m.directCalls++
+	return m.directDecision, m.directErr
 }
 
 func (m *coordinatorTestModels) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
@@ -107,11 +117,12 @@ func (s *coordinatorTestStream) read(context.Context) (cloudDSHCoordinatorFrame,
 type coordinatorTestRuntimeManager struct {
 	runtime      *coordinatorTestRuntime
 	acquireCalls int
+	acquireErr   error
 }
 
 func (m *coordinatorTestRuntimeManager) Acquire(context.Context, string, string) (cloudDSHCoordinatorRuntime, error) {
 	m.acquireCalls++
-	return m.runtime, nil
+	return m.runtime, m.acquireErr
 }
 
 type coordinatorTestRuntime struct {
@@ -146,6 +157,56 @@ func coordinatorTestClaimAndContext() (app.ConversationRouteClaim, app.Conversat
 		Authorization: task.Authorization{Version: 3}}
 	value := app.ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
 	return claim, value
+}
+
+func TestCloudDSHCoordinatorUsesToolFreeReplyWhenOwnerExecutionIsDisabled(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	disabled := domain.NewError(domain.CodeConflict, "owner execution is not enabled")
+	disabled.Details["state"] = "disabled"
+	models := &coordinatorTestModels{directDecision: app.ConversationRouteDecision{
+		Action: app.ConversationRouteReply, Reply: "收到测试", ModelOutput: `{"action":"reply"}`}}
+	manager := &coordinatorTestRuntimeManager{acquireErr: disabled}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: manager}
+
+	decision, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || decision.Reply != "收到测试" ||
+		decision.ModelOutput != `{"action":"reply"}` || models.directCalls != 1 || manager.acquireCalls != 1 || models.completeCalls != 0 {
+		t.Fatalf("tool-free reply fallback = %+v, err=%v; direct calls=%d runtime calls=%d DSH model calls=%d",
+			decision, err, models.directCalls, manager.acquireCalls, models.completeCalls)
+	}
+}
+
+func TestCloudDSHCoordinatorDoesNotFallbackForOtherRuntimeConflicts(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	conflict := domain.NewError(domain.CodeConflict, "runtime lease is active in another worker")
+	models := &coordinatorTestModels{}
+	manager := &coordinatorTestRuntimeManager{acquireErr: conflict}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: manager}
+
+	if _, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value); err != conflict || models.directCalls != 0 {
+		t.Fatalf("non-disabled Runtime conflict was masked: err=%v direct calls=%d", err, models.directCalls)
+	}
+}
+
+func TestCloudDSHCoordinatorDoesNotStartTasksWhenOwnerExecutionIsDisabled(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	disabled := domain.NewError(domain.CodeConflict, "owner execution is not enabled")
+	disabled.Details["state"] = "disabled"
+	models := &coordinatorTestModels{directDecision: app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, ModelOutput: `{"action":"new"}`}}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: &coordinatorTestRuntimeManager{acquireErr: disabled}}
+
+	decision, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteClarify || decision.Question == "" ||
+		decision.ModelOutput != `{"action":"new"}` || models.directCalls != 1 {
+		t.Fatalf("disabled task fallback = %+v, err=%v direct calls=%d", decision, err, models.directCalls)
+	}
 }
 
 func TestCloudDSHCoordinatorUsesFreshSessionPerRouteAttempt(t *testing.T) {
@@ -435,5 +496,32 @@ func TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH(t *testing.T) {
 		models.summaryFence.SessionID != identitySession || string(models.summaryRequest) != string(modelRequest) ||
 		len(summaries.checkpoints) != 1 || summaries.checkpoints[0].Through != through {
 		t.Fatalf("summary model/checkpoint fence was not preserved: fence=%+v checkpoints=%+v", models.summaryFence, summaries.checkpoints)
+	}
+}
+
+func TestCloudDSHCoordinatorEstimatesSummaryPressureWithoutModelOrCheckpoint(t *testing.T) {
+	claim, _ := coordinatorTestClaimAndContext()
+	content := "用户已确认的约束。"
+	digest := sha256.Sum256([]byte(content))
+	sources := []app.ConversationSummaryPromptSource{{
+		Source: app.ConversationSummarySource{Kind: app.ConversationSummarySourceMessage, ID: "m1234567",
+			Sequence: 1, SHA256: digest[:]},
+		Role: "user", Content: content,
+	}}
+	through := int64(0)
+	runtime := &coordinatorTestRuntime{stream: &coordinatorTestStream{frames: []cloudDSHCoordinatorFrame{{
+		Type: "coordinator_settled", State: "completed", Through: &through,
+		Result: `{"version":1,"source_token_counts":[17]}`,
+	}}}}
+	models := &coordinatorTestModels{summaryModelID: "p1234567", summaryWindow: 32_768}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{Models: models},
+		runtimes: &coordinatorTestRuntimeManager{runtime: runtime}}
+	counts, err := coordinator.EstimateConversationSummaryTokenPressure(context.Background(), CloudDSHConversationSummaryEstimateRequest{
+		Claim: claim, ModelID: models.summaryModelID, ContextWindowTokens: models.summaryWindow, Sources: sources,
+	})
+	if err != nil || len(counts) != 1 || counts[0] != 17 || runtime.startRequest["measure_only"] != true ||
+		runtime.startRequest["resume"] != false || runtime.stopCalls != 1 || runtime.writeCalls != 0 || models.summaryCalls != 0 {
+		t.Fatalf("summary estimate counts=%v start=%+v starts=%d stops=%d writes=%d model_calls=%d err=%v",
+			counts, runtime.startRequest, runtime.startCalls, runtime.stopCalls, runtime.writeCalls, models.summaryCalls, err)
 	}
 }

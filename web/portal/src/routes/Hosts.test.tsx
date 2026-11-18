@@ -311,13 +311,13 @@ describe('Hosts', () => {
     expect(screen.queryByRole('button', { name: /暂停主机|恢复云端电脑|管理主机令牌/ })).not.toBeInTheDocument();
     await openMoreActions(user, ownedHost);
     await user.click(await screen.findByRole('button', { name: '删除云端电脑 测试主机' }));
-    expect(screen.getByText(/永久删除这台电脑及其专属 ~\/workspace\/ 目录/)).toBeInTheDocument();
+    expect(screen.getByText(/Agent Workspace 文件会保留/)).toBeInTheDocument();
     expect(deleteHost).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: '取消' }));
     expect(deleteHost).not.toHaveBeenCalled();
     await openMoreActions(user, { id: 'h1234567', name: '测试主机' });
     await user.click(screen.getByRole('button', { name: '删除云端电脑 测试主机' }));
-    await user.click(screen.getByRole('button', { name: '永久删除电脑和数据' }));
+    await user.click(screen.getByRole('button', { name: '永久删除云端电脑' }));
     await waitFor(() => expect(deleteHost).toHaveBeenCalledWith('h1234567', true));
     expect(portalApi.templates).not.toHaveBeenCalled();
   });
@@ -477,47 +477,7 @@ describe('Hosts', () => {
     await waitFor(() => expect(restore).toHaveBeenCalledWith(host.id));
   });
 
-  it('copies a stopped host from its confirmed Workspace revision and reuses the idempotency key on retry', async () => {
-    const host: Host = { ...ownedHost, state: 'stopped' };
-    const copiedHost: Host = {
-      ...host, id: 'h7654321', name: '复制的测试主机',
-      workspaces: [{ ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, id: 'w7654321', name: '复制的测试主机文件' } }],
-    };
-    const copyResult: Awaited<ReturnType<typeof portalApi.copyHost>> = {
-      source_host_id: host.id, source_workspace_id: hostWorkspaceBinding.workspace.id, host: copiedHost,
-      workspace: { id: 'w7654321', name: '复制的测试主机文件', revision: 1, state: 'ready' },
-      source_revision: 2, state: 'completed', replayed: false,
-    };
-    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
-    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
-    const copy = vi.spyOn(portalApi, 'copyHost')
-      .mockRejectedValueOnce(new Error('网络超时'))
-      .mockResolvedValue(copyResult);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
-
-    await screen.findByRole('button', { name: `查看云端电脑 ${host.name}` });
-    await openMoreActions(user, host);
-    await user.click(await screen.findByRole('button', { name: `复制云端电脑 ${host.name}` }));
-    expect(screen.getByText(/隐藏文件、配置和密钥/)).toBeInTheDocument();
-    expect(screen.getByText(/运行环境、应用状态、平台凭据、任务和本机同步关联不会复制/)).toBeInTheDocument();
-    const name = screen.getByLabelText('新电脑名称');
-    await user.clear(name);
-    await user.type(name, '复制的测试主机');
-    await user.click(screen.getByRole('button', { name: '创建副本' }));
-    expect(await screen.findByText(/网络超时/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '创建副本' }));
-
-    await waitFor(() => expect(copy).toHaveBeenCalledTimes(2));
-    expect(copy.mock.calls[0]![0]).toBe(host.id);
-    expect(copy.mock.calls[0]![1]).toEqual({ name: '复制的测试主机', expected_current_revision: 2 });
-    expect(copy.mock.calls[0]![2]).toBeTruthy();
-    expect(copy.mock.calls[1]).toEqual(copy.mock.calls[0]);
-    expect(await screen.findByText(/已创建云端电脑“复制的测试主机”/)).toBeInTheDocument();
-  });
-
-  it('disables host copy unless the owner has stopped the computer at a confirmed revision with AI control', async () => {
+  it('does not offer independent Host copies while each computer uses the same Agent Workspace', async () => {
     const stopped: Host = { ...ownedHost, id: 'h7654321', name: '已停止电脑', state: 'stopped' };
     const stale: Host = { ...stopped, id: 'h7654322', name: '文件未确认电脑', workspaces: [{
       ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, revision: 3 },
@@ -533,10 +493,8 @@ describe('Hosts', () => {
     await openMoreActions(user, ownedHost);
     await openMoreActions(user, { id: stale.id, name: stale.name });
     await openMoreActions(user, { id: userControlled.id, name: userControlled.name });
-    expect(screen.getByRole('button', { name: `复制云端电脑 ${ownedHost.name}` })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '复制云端电脑 文件未确认电脑' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '复制云端电脑 人工控制电脑' })).toBeDisabled();
-    expect(screen.queryByRole('button', { name: '复制云端电脑 已停止电脑' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /复制云端电脑/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '创建副本' })).not.toBeInTheDocument();
   });
 
   it.each(pollingHostCases)('re-polls a %s host after three seconds', async (state, label) => {

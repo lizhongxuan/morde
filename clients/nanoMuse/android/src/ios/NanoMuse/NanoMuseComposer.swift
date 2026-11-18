@@ -6,8 +6,7 @@
 //  row on a flat grey capsule — plus on the left, the field in the middle,
 //  the mic on the right while there is nothing to send, the send arrow once
 //  there is, the stop square while the agent answers. Bare glyphs for plus
-//  and mic; send and stop sit on the chat's ink disc (black in light, white
-//  in dark, the glyph in the canvas colour), as Android's send since #331.
+//  and mic; send and stop use the shared Morde brand disc.
 //  Android: the `nmPill` branch of ChatScreen.kt.
 //
 
@@ -47,8 +46,6 @@ struct NanoMuseComposerPill<Field: View>: View {
     @ViewBuilder var field: () -> Field
 
     @State private var showAttachMenu = false
-    @Environment(\.colorScheme) private var scheme
-
     private let glyph: CGFloat = 44
     /// The send disc's diameter, the size the `arrow.up.circle.fill` glyph had.
     private var disc: CGFloat { designCompactLayout ? 34 : 30 }
@@ -77,7 +74,7 @@ struct NanoMuseComposerPill<Field: View>: View {
     private var plusButton: some View {
         let icon = Image(systemName: "plus")
             .font(.system(size: 22, weight: .regular))
-            .foregroundStyle(Color.primary)
+            .foregroundStyle(NanoMuseTones.ink)
             .frame(width: glyph, height: glyph)
             .contentShape(Circle())
             .accessibilityLabel(Text("Add attachment", comment: "VoiceOver label for the attachment button"))
@@ -115,18 +112,16 @@ struct NanoMuseComposerPill<Field: View>: View {
 
     // MARK: Mic · send · stop
 
-    /// A glyph on the ink disc: the send arrow, and the stop square while the agent answers.
-    /// Enabled: the disc in the ink colour, the glyph in the canvas colour. Disabled (nothing
-    /// sendable yet): the disc a faint wash of the ink and the glyph at 40 percent, Android's
-    /// `nmSendBg` / `nmSendFg`.
+    /// The send arrow and stop square share the blue action disc; disabled uses the tint token.
     private func inkDisc(_ symbol: String, enabled: Bool) -> some View {
         ZStack {
             Circle()
-                .fill(enabled ? NanoMuseTones.ink : NanoMuseTones.ink.opacity(scheme == .dark ? 0.15 : 0.08))
+                .fill(enabled ? NanoMuseTones.action : NanoMuseTones.brandTint)
             Image(systemName: symbol)
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(enabled ? NanoMuseTones.onInk : Color.primary.opacity(0.4))
+                .foregroundStyle(enabled ? NanoMuseTones.onInk : NanoMuseTones.brandDeep)
         }
+        .shadow(color: enabled ? NanoMuseTones.action.opacity(0.28) : .clear, radius: 8, y: 4)
         .frame(width: disc, height: disc)
         .frame(width: glyph, height: glyph)
         .contentShape(Rectangle())
@@ -162,7 +157,7 @@ struct NanoMuseComposerPill<Field: View>: View {
             Button(action: onMic) {
                 Image(systemName: "mic")
                     .font(.system(size: 20, weight: .regular))
-                    .foregroundStyle(Color.primary)
+                    .foregroundStyle(NanoMuseTones.ink)
                     .frame(width: glyph, height: glyph)
                     .contentShape(Circle())
             }

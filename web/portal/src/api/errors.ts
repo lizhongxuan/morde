@@ -50,7 +50,7 @@ export function modelConnectionSaveErrorMessage(error: unknown): string {
       case "base_url": return "服务地址无效或未获服务端允许，请检查 HTTPS 地址并联系管理员核对允许的域名。";
       case "api_key": return "API 密钥不能为空，且首尾不能有空格。";
       case "name": return "请检查显示名称和模型名是否为空或超出长度限制。";
-      case "model_connection": return "上下文窗口需为 4096 到 1000000 的整数。";
+      case "model_connection": return "上下文窗口需为 4096 到 2000000 的整数。";
       case "body": return "服务端无法识别提交内容，请检查 PC 客户端与服务端的版本是否匹配。";
     }
   }

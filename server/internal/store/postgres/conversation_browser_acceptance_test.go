@@ -186,6 +186,14 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	taskStopWorker, err := worker.NewTaskStopWorker(worker.TaskStopWorkerOptions{
+		Store: store, Executor: browserAcceptanceTaskStopExecutor{}, WorkerID: "browser-acceptance-stop",
+		LeaseDuration: time.Minute, PollInterval: 100 * time.Millisecond, OperationTimeout: 2 * time.Second,
+		Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	maxConcurrentRoutes := 2
 	if crossClientAcceptance {
 		maxConcurrentRoutes = 4
@@ -202,9 +210,11 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
-	workerDone := make(chan error, 3)
+	workerDone := make(chan error, 4)
 	workerCount := 0
 	go func() { workerDone <- taskWorker.Run(workerCtx) }()
+	workerCount++
+	go func() { workerDone <- taskStopWorker.Run(workerCtx) }()
 	workerCount++
 	if (projectAttachmentResume == nil || activity != nil) && messageUploadResume == nil {
 		go func() { workerDone <- routerWorker.Run(workerCtx) }()
@@ -422,7 +432,17 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 				if activity != nil || attachmentResume != nil || projectAttachmentResume != nil || messageUploadResume != nil {
 					minimumMessages = 1
 				}
-				if err := store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM conversation_messages WHERE owner_id=$1`, owner.ID).Scan(&messages, &replies); err != nil || messages < minimumMessages || (attachmentResume == nil && projectAttachmentResume == nil && messageUploadResume == nil && replies < 1) {
+				minimumReplies := 1
+				if activity != nil {
+					minimumReplies = 0
+					for _, scenario := range activity.required {
+						if scenario != "failed" && scenario != "approval" {
+							minimumReplies = 1
+							break
+						}
+					}
+				}
+				if err := store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM conversation_messages WHERE owner_id=$1`, owner.ID).Scan(&messages, &replies); err != nil || messages < minimumMessages || (attachmentResume == nil && projectAttachmentResume == nil && messageUploadResume == nil && replies < minimumReplies) {
 					t.Fatalf("browser messages=%d replies=%d err=%v", messages, replies, err)
 				}
 				if os.Getenv("MORDE_BROWSER_DUPLICATE_EXPECTED") == "1" {
@@ -511,6 +531,8 @@ WHERE owner_id=$1 AND conversation_id=$2 AND role='user'`, owner.ID, projectAtta
 const browserAcceptanceDuplicateContent = "Morde browser acceptance: analyze project"
 const browserAcceptanceStatusContent = "本机浏览器验收：进度如何"
 const browserAcceptanceIndependentContent = "本机浏览器验收：独立总结当前会话"
+const browserAcceptanceQuickReplyContent = "Morde browser acceptance: quick reply"
+const browserAcceptanceAcknowledgedContent = "Morde browser acceptance: long background task"
 
 type browserAcceptanceModel struct {
 	nativeAcceptanceModel
@@ -913,6 +935,21 @@ func (f *browserAttachmentResumeFixture) observe(r *http.Request, status int) {
 
 func (model browserAcceptanceModel) Complete(ctx context.Context, request app.ModelRequest) (app.ModelResponse, error) {
 	if strings.HasPrefix(request.Instructions, "Review the completed Task results") {
+		var input struct {
+			Results []app.ConversationTaskResultSource `json:"completed_task_results"`
+		}
+		if len(request.Input) > 0 && json.Unmarshal([]byte(request.Input[0].Text), &input) == nil && len(input.Results) > 0 {
+			results := make([]string, 0, len(input.Results))
+			for _, result := range input.Results {
+				results = append(results, result.Content)
+			}
+			reply, err := json.Marshal(map[string]string{"action": "reply", "reply": strings.Join(results, "\n\n")})
+			if err != nil {
+				return app.ModelResponse{}, err
+			}
+			return app.ModelResponse{Text: string(reply),
+				Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+		}
 		return app.ModelResponse{Text: `{"action":"reply","reply":"本地验收：任务结果已汇总。"}`,
 			Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 	}
@@ -924,6 +961,20 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 				PriorRequests []app.ConversationRouteRequestCandidate `json:"prior_requests"`
 			}
 			if json.Unmarshal([]byte(request.Input[0].Text), &input) == nil {
+				for name, objective := range browserActivityObjectives {
+					if name != "search" && input.Message == objective {
+						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":"","acknowledge":true}`,
+							Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+					}
+				}
+				if input.Message == browserAcceptanceQuickReplyContent {
+					return app.ModelResponse{Text: `{"action":"reply","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"本地验收：快速请求直接回复。","dependency_task_ids":[],"acknowledge":false}`,
+						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 8}}, nil
+				}
+				if input.Message == browserAcceptanceAcknowledgedContent {
+					return app.ModelResponse{Text: `{"action":"new","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"","dependency_task_ids":[],"acknowledge":true}`,
+						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 8}}, nil
+				}
 				if input.Message == browserAcceptanceStatusContent {
 					for _, candidate := range input.Tasks {
 						if candidate.Objective == browserAcceptanceDuplicateContent {
@@ -963,9 +1014,32 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 
 type browserAcceptanceExecutor struct{ store *Store }
 
+type browserAcceptanceTaskStopExecutor struct{}
+
+func (browserAcceptanceTaskStopExecutor) StopTaskOperation(ctx context.Context, _ task.Task, _ task.Operation) (task.OperationStatus, string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", false, err
+	}
+	return task.OperationCancelled, "stopped by local browser acceptance", false, nil
+}
+
 func (e browserAcceptanceExecutor) ExecuteTask(ctx context.Context, current task.Task) error {
 	delay := 750 * time.Millisecond
-	if current.Objective == browserAcceptanceDuplicateContent {
+	if current.Objective == browserAcceptanceAcknowledgedContent {
+		// Simulate DSH's persisted revision-start event for the PC acknowledgement fixture.
+		tx, err := e.store.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin acknowledgement fixture revision: %w", err)
+		}
+		if err := recordTaskRevisionStartedInTx(ctx, tx, current.ID); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("record acknowledgement fixture revision: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit acknowledgement fixture revision: %w", err)
+		}
+		delay = 2 * time.Minute
+	} else if current.Objective == browserAcceptanceDuplicateContent {
 		delay = 30 * time.Second
 	}
 	timer := time.NewTimer(delay)
@@ -1085,18 +1159,19 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // No file or user-provided content is needed by any of these scenarios.
 // With MORDE_BROWSER_ACTIVITY=1, GET /__morde_fixture/status lists the fixed
 // inputs and stages. POST /__morde_fixture/advance/{name}/{start|progress|
-// stream|complete} releases one stage, without a request body. The search
-// scenario uses a fixed local result and never accesses the network. Setting
-// MORDE_BROWSER_ACTIVITY_SCENARIOS=search runs only that scenario; omit it to
-// require the full merge, separate, search, stream and reconnect set. For a
-// full run, merge-a and merge-b must complete within the aggregation window;
-// separate-a and separate-b must complete in order. Start stream before
-// submitting stream-other, then disconnect both
-// clients using POST /__morde_fixture/disconnect/stream before completing the
-// pair. GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream}
-// checks progress/result identity, sources, result ordering and reconnect
-// cursors. The fixture does not pass until all checks succeed; visual
-// deduplication still needs to be checked in both clients after refresh/relaunch.
+// stream|complete|fail|approval} releases one stage, without a request body.
+// The search scenario uses a fixed local result and never accesses the network.
+// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,failed,approval selects individual
+// scenarios; omit it to require the full merge, separate, search, stream and
+// reconnect set. For a full run, merge-a and merge-b must complete within the
+// aggregation window; separate-a and separate-b must complete in order. Start
+// stream before submitting stream-other, then disconnect both clients using
+// POST /__morde_fixture/disconnect/stream before completing the pair.
+// GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream|failed|
+// approval} checks result identity and ordering, reconnect cursors, or the
+// persisted accepted route and requested Task outcome. The fixture does not
+// pass until all selected checks succeed; visual deduplication still needs to
+// be checked in both clients after refresh/relaunch.
 var browserActivityObjectives = map[string]string{
 	"merge-a":      "跨端活动验收：合并 A",
 	"merge-b":      "跨端活动验收：合并 B",
@@ -1105,6 +1180,8 @@ var browserActivityObjectives = map[string]string{
 	"separate-b":   "跨端活动验收：分开 B",
 	"stream":       "跨端活动验收：流式",
 	"stream-other": "跨端活动验收：流式后的独立任务",
+	"failed":       "跨端活动验收：已接单后任务失败",
+	"approval":     "跨端活动验收：等待用户授权",
 }
 
 const browserActivityStreamPrefix = "跨端活动验收：流式回复第一段"
@@ -1245,6 +1322,8 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 		"separate": {"separate-a", "separate-b"},
 		"search":   {"search"},
 		"stream":   {"stream", "stream-other"},
+		"failed":   {"failed"},
+		"approval": {"approval"},
 	}
 	var selected, required []string
 	seen := make(map[string]bool)
@@ -1276,6 +1355,9 @@ func TestBrowserActivitySelection(t *testing.T) {
 			required: "merge,separate,search,stream,reconnect"},
 		{name: "search only", input: "search", selected: "search", required: "search"},
 		{name: "stream includes reconnect", input: "stream", selected: "stream,stream-other", required: "stream,reconnect"},
+		{name: "failed only", input: "failed", selected: "failed", required: "failed"},
+		{name: "approval only", input: "approval", selected: "approval", required: "approval"},
+		{name: "failed and approval", input: "failed,approval", selected: "failed,approval", required: "failed,approval"},
 		{name: "combined logical scenarios", input: "search, merge", selected: "search,merge-a,merge-b", required: "search,merge"},
 		{name: "reject reconnect without stream", input: "reconnect", wantErr: true},
 		{name: "reject duplicate", input: "search,search", wantErr: true},
@@ -1294,6 +1376,23 @@ func TestBrowserActivitySelection(t *testing.T) {
 			}
 			if strings.Join(selected, ",") != test.selected || strings.Join(required, ",") != test.required {
 				t.Fatalf("selection=%v required=%v", selected, required)
+			}
+		})
+	}
+}
+
+func TestBrowserActivityOutcomeVerifyEndpoint(t *testing.T) {
+	for _, scenario := range []string{"failed", "approval"} {
+		t.Run(scenario, func(t *testing.T) {
+			activity := &browserAcceptanceActivity{controlToken: "fixture-token", runs: map[string]*browserActivityRun{
+				scenario: &browserActivityRun{name: scenario, stage: "progress"},
+			}}
+			request := httptest.NewRequest(http.MethodGet, "/__morde_fixture/verify/"+scenario, nil)
+			request.Header.Set("X-Morde-Fixture-Token", activity.controlToken)
+			response := httptest.NewRecorder()
+			activity.serveControl(response, request)
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "has not reached") {
+				t.Fatalf("verify endpoint status=%d body=%q", response.Code, response.Body.String())
 			}
 		})
 	}
@@ -1375,6 +1474,16 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 		return a.commitProgress(ctx, run)
 	}); err != nil {
 		return err
+	}
+	if run.name == "failed" {
+		return a.waitPhase(ctx, run, "fail", "failed", renewErr, func() error {
+			return a.commitFailedOutcome(ctx, run)
+		})
+	}
+	if run.name == "approval" {
+		return a.waitPhase(ctx, run, "approval", "waiting_user", renewErr, func() error {
+			return a.commitApprovalOutcome(ctx, run, lease)
+		})
 	}
 	var delta app.CloudDSHTextDelta
 	if run.name == "stream" {
@@ -1504,6 +1613,49 @@ func (a *browserAcceptanceActivity) commitProgress(ctx context.Context, run *bro
 	a.mu.Lock()
 	run.progressStepID = step.ID
 	a.mu.Unlock()
+	return a.verifyActivityEvents(ctx, run, false)
+}
+
+func (a *browserAcceptanceActivity) commitFailedOutcome(ctx context.Context, run *browserActivityRun) error {
+	current := run.current
+	step := task.Step{ID: run.progressStepID, TaskID: current.ID, Sequence: 2, Kind: "progress", Status: task.StepFailed,
+		Title: browserActivityProgressTitle(run), Summary: "测试任务已在接单后失败。"}
+	_, err := a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusFailed, CurrentStep: step.ID,
+		Result: "本地合成失败：任务已接单后失败。", Usage: current.Usage, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.result", Payload: []byte(`{"error":"synthetic_failure"}`)}})
+	if err != nil {
+		return fmt.Errorf("commit synthetic task failure: %w", err)
+	}
+	return a.verifyActivityEvents(ctx, run, false)
+}
+
+func (a *browserAcceptanceActivity) commitApprovalOutcome(ctx context.Context, run *browserActivityRun, lease app.AgentInstanceLease) error {
+	current := run.current
+	step := task.Step{ID: run.progressStepID, TaskID: current.ID, Sequence: 2, Kind: "progress", Status: task.StepWaitingUser,
+		Title: browserActivityProgressTitle(run), Summary: "测试任务正在等待用户授权。"}
+	pendingID, err := domain.NewPendingRequestID()
+	if err != nil {
+		return err
+	}
+	requestHash := sha256.Sum256([]byte(current.ID + ":browser-fixture-approval"))
+	expiresAt := time.Now().UTC().Add(24 * time.Hour)
+	pending := &task.PendingRequest{
+		ID: pendingID, TaskID: current.ID, Version: 1, Kind: "approval", Title: "确认合成测试操作",
+		Object: "本地合成资源", Content: "此测试任务需要用户授权后继续。",
+		Impact: "仅用于本地浏览器验收，不会执行外部操作。",
+		CallID: "browser-approval-" + current.ID, ToolName: "browser_fixture_approval",
+		RequestHash: requestHash[:], RuntimeGeneration: lease.Fence.AgentGeneration,
+		RuntimeInstanceID: lease.Fence.AgentInstanceID, ControlVersion: 0,
+		Status: task.PendingRequestPending, ExpiresAt: &expiresAt,
+	}
+	_, err = a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusWaitingUser, CurrentStep: step.ID,
+		WaitingReason: "approval_required", Usage: current.Usage, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.waiting_user", Payload: []byte(`{"reason":"approval_required"}`)}, PendingRequest: pending})
+	if err != nil {
+		return fmt.Errorf("commit synthetic approval wait: %w", err)
+	}
 	return a.verifyActivityEvents(ctx, run, false)
 }
 
@@ -1760,7 +1912,15 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 		a.verified[parts[1]] = true
 		a.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"scenario": parts[1], "status": "verified"})
+		result := map[string]any{"scenario": parts[1], "status": "verified"}
+		switch parts[1] {
+		case "failed":
+			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusFailed)
+		case "approval":
+			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusWaitingUser)
+			result["waiting_reason"], result["pending_request_status"] = "approval_required", string(task.PendingRequestPending)
+		}
+		_ = json.NewEncoder(w).Encode(result)
 		return
 	}
 	http.NotFound(w, r)
@@ -1784,11 +1944,14 @@ func (a *browserAcceptanceActivity) advance(ctx context.Context, name, phase str
 		a.mu.Unlock()
 		return errors.New("unknown synthetic scenario")
 	}
-	expected := map[string]string{"start": "claimed", "progress": "started", "stream": "progress", "complete": "progress"}[phase]
+	expected := map[string]string{"start": "claimed", "progress": "started", "stream": "progress", "complete": "progress",
+		"fail": "progress", "approval": "progress"}[phase]
 	if name == "stream" && phase == "complete" {
 		expected = "streaming"
 	}
-	if expected == "" || phase == "stream" && name != "stream" || run.stage != expected || run.busy {
+	if expected == "" || phase == "stream" && name != "stream" ||
+		phase == "fail" && name != "failed" || phase == "approval" && name != "approval" ||
+		(name == "failed" || name == "approval") && phase == "complete" || run.stage != expected || run.busy {
 		stage := run.stage
 		a.mu.Unlock()
 		return fmt.Errorf("phase %s is unavailable at stage %s", phase, stage)
@@ -1946,6 +2109,9 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	if scenario == "reconnect" {
 		return a.verifyReconnect("stream")
 	}
+	if scenario == "failed" || scenario == "approval" {
+		return a.verifyAcceptedOutcome(ctx, scenario)
+	}
 	var names []string
 	switch scenario {
 	case "merge":
@@ -2054,6 +2220,59 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 		return errors.New("results outside the grouping window were not published separately")
 	}
 	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, scenario string) error {
+	wantStage, wantStatus := "failed", task.StatusFailed
+	if scenario == "approval" {
+		wantStage, wantStatus = "waiting_user", task.StatusWaitingUser
+	}
+	a.mu.Lock()
+	run := a.runs[scenario]
+	if run == nil || run.stage != wantStage {
+		stage := "missing"
+		if run != nil {
+			stage = run.stage
+		}
+		a.mu.Unlock()
+		return fmt.Errorf("scenario %s has not reached %s (stage %s)", scenario, wantStage, stage)
+	}
+	current, userMessageID := run.current, run.userMessageID
+	a.mu.Unlock()
+
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read persisted %s task: %w", scenario, err)
+	}
+	if details.Task.Status != wantStatus || details.CurrentRevisionStarted == nil || !*details.CurrentRevisionStarted {
+		return fmt.Errorf("persisted task status/start = %s/%v, want %s and an accepted revision",
+			details.Task.Status, details.CurrentRevisionStarted, wantStatus)
+	}
+	if scenario == "failed" {
+		if details.PendingRequest != nil {
+			return errors.New("failed task unexpectedly has a pending approval request")
+		}
+	} else if details.Task.WaitingReason != "approval_required" || details.PendingRequest == nil ||
+		!domain.ValidPendingRequestID(details.PendingRequest.ID) || details.PendingRequest.TaskID != current.ID || details.PendingRequest.Version < 1 ||
+		details.PendingRequest.Kind != "approval" || details.PendingRequest.Status != task.PendingRequestPending ||
+		details.PendingRequest.Decision != "" || len(details.PendingRequest.RequestHash) != sha256.Size ||
+		details.PendingRequest.RuntimeGeneration < 0 || details.PendingRequest.RuntimeInstanceID == "" ||
+		details.PendingRequest.ControlVersion < 0 || details.PendingRequest.CallID == "" || details.PendingRequest.ToolName == "" ||
+		details.PendingRequest.ExpiresAt != nil && !details.PendingRequest.ExpiresAt.After(time.Now()) {
+		return errors.New("waiting task does not have a valid active approval request")
+	}
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read accepted synthetic route: %w", err)
+	}
+	for _, message := range page.Items {
+		if message.ID == userMessageID && message.TaskID == current.ID && message.Role == conversation.RoleUser &&
+			message.AgentAcknowledged && message.RoutingStatus == conversation.RoutingRouted &&
+			message.DeliveryStatus == conversation.DeliveryApplied {
+			return nil
+		}
+	}
+	return errors.New("synthetic route was not persisted with agent_acknowledged=true")
 }
 
 func (a *browserAcceptanceActivity) verifyReconnect(name string) error {

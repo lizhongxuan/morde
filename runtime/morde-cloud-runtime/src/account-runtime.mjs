@@ -9,6 +9,8 @@ const MAX_CONCURRENT_TASKS = 16
 const MAX_CONCURRENT_COORDINATORS = 16
 const MAX_COORDINATOR_MESSAGE_HISTORY = 4096
 const SHUTDOWN_TIMEOUT_MS = 5_000
+const RUNTIME_CWD = fileURLToPath(new URL('..', import.meta.url))
+const MORDE_WORKSPACE_DIR = '/workspace'
 // Startup can be delayed by concurrent tasks or a busy host. Keep a firm
 // upper bound, but avoid treating a healthy DSH child as unavailable after
 // only five seconds.
@@ -22,12 +24,12 @@ const RUNTIME_SHUTDOWN_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
 const TASK_PROCESS_ADMIT_KEYS = ['type', 'server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence', ...TASK_FENCE_FIELDS]
 const ACCOUNT_START_KEYS = [
   'type', 'version', ...TASK_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
-  'runtime_sequence', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'background_jobs', 'step_retry',
+  'runtime_sequence', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry',
 ]
 const COORDINATOR_START_KEYS = [
   'type', 'version', ...COORDINATOR_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
   'runtime_sequence', 'model', 'tools', 'system_prompt', 'prompt', 'resume',
-  'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'source_messages', 'previous_summary',
+  'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'source_messages', 'previous_summary', 'measure_only',
 ]
 const COORDINATOR_PROCESS_ADMIT_KEYS = [
   'type', 'server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'runtime_sequence',
@@ -54,6 +56,12 @@ function timeout(promise, ms) {
 function taskEnvironment() {
   const allowed = new Set(['PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV', '__CF_USER_TEXT_ENCODING', 'UV_USE_IO_URING'])
   return Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key)))
+}
+
+export function workspaceWorkingDirectory(workspaceDir) {
+  if (workspaceDir === undefined) return RUNTIME_CWD
+  if (workspaceDir !== MORDE_WORKSPACE_DIR) throw new Error('account Agent Runtime Workspace directory is invalid')
+  return MORDE_WORKSPACE_DIR
 }
 
 function exactKeys(value, expected) {
@@ -178,7 +186,9 @@ function validCoordinatorResponseFrame(frame, identity) {
       frame.index >= 0 && frame.chunk && typeof frame.chunk === 'object' && !Array.isArray(frame.chunk)
   }
   if (frame.type === 'model_end') {
-    return exactKeys(frame, [...base, 'id', 'ok']) && typeof frame.id === 'string' && typeof frame.ok === 'boolean'
+    if (exactKeys(frame, [...base, 'id', 'ok'])) return typeof frame.id === 'string' && typeof frame.ok === 'boolean'
+    return exactKeys(frame, [...base, 'id', 'ok', 'failure_code']) && typeof frame.id === 'string' && frame.ok === false &&
+      frame.failure_code === 'CONTEXT_WINDOW_EXCEEDED'
   }
   return false
 }
@@ -205,6 +215,7 @@ export class AccountRuntime {
   constructor(input, output) {
     this.input = input
     this.output = output
+    this.workspaceCwd = workspaceWorkingDirectory(process.env.MORDE_WORKSPACE_DIR)
     this.runtime = undefined
     this.tasks = new Map()
     this.coordinators = new Map()
@@ -379,7 +390,7 @@ export class AccountRuntime {
     this.activeTaskIDs.add(fence.task_id)
     try {
       task.child = spawn(process.execPath, [fileURLToPath(new URL('../bin.mjs', import.meta.url))], {
-        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        cwd: this.workspaceCwd,
         env: taskEnvironment(),
         detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'ignore'],
@@ -482,7 +493,7 @@ export class AccountRuntime {
     this.rememberCoordinatorMessage(messageKey, { contentDigest, state: 'starting' })
     try {
       coordinator.child = spawn(process.execPath, [fileURLToPath(new URL('../bin.mjs', import.meta.url))], {
-        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        cwd: this.workspaceCwd,
         env: taskEnvironment(),
         detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'ignore'],

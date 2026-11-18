@@ -82,9 +82,6 @@ export const portalApi = {
   createHost: async (body: components['schemas']['CreateHostRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/hosts', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
-  copyHost: async (id: string, body: components['schemas']['HostCopyRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/hosts/{id}/copies', {
-    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
-  })),
   enterHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/enter', { params: { path: { id } } })),
   issueHostEmbedTicket: async (id: string, body: HostEmbedTicketRequest): Promise<HostEmbedTicket> =>
     unwrapApiResponse(await api.POST('/api/hosts/{id}/embed-tickets', { params: { path: { id } }, body })),
@@ -96,10 +93,13 @@ export const portalApi = {
   renewHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/renew', { params: { path: { id } } })),
   releaseHost: async (id: string, confirmProcessTermination: boolean) => unwrapApiResponse(await api.POST('/api/hosts/{id}/release', { params: { path: { id } }, body: { confirm_process_termination: confirmProcessTermination } })),
   restoreHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/restore', { params: { path: { id } } })),
-  deleteHost: async (id: string, confirmDeleteWorkspace: true) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}', {
-    params: { path: { id }, query: { confirm_delete_workspace: confirmDeleteWorkspace } },
+  deleteHost: async (id: string, confirmDeleteHost: true) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}', {
+    params: { path: { id }, query: { confirm_delete_workspace: confirmDeleteHost } },
   })),
   workspaces: async () => unwrapApiResponse(await api.GET('/api/workspaces')),
+  myAgentWorkspace: async () => unwrapApiResponse(await api.GET('/api/me/agent-workspace')),
+  agentWorkspaceEntries: async (id: string, query: NonNullable<operations['listAgentWorkspaceEntries']['parameters']['query']> = {}) =>
+    unwrapApiResponse(await api.GET('/api/workspaces/{id}/entries', { params: { path: { id }, query } })),
   codexSessionEvents: async (id: string, afterSequence = 0, limit = 100) => unwrapApiResponse(await api.GET('/api/codex/sessions/{id}/events', {
     params: { path: { id }, query: { after_sequence: afterSequence, limit } },
   })),
@@ -243,6 +243,7 @@ export const portalApi = {
       ...(options.cursor ? { cursor: options.cursor } : {}),
     } } })),
   taskArtifactContentURL: (id: string, artifactID: string) => `/api/tasks/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifactID)}/content`,
+  agentWorkspaceFileURL: (id: string, path: string) => `/api/workspaces/${encodeURIComponent(id)}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
   taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
     params: { path: { id, step_id: stepID } },
   })),

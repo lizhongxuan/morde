@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,8 +13,119 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 )
+
+func TestHostBoundAgentWorkspaceTaskPublishRecordsDirectDirectorySnapshot(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
+	workspaceValue, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatalf("create Agent Workspace: %v", err)
+	}
+	if err := store.MarkAgentWorkspaceDirectoryInitialized(ctx, owner.ID, workspaceValue.ID); err != nil {
+		t.Fatalf("mark Agent Workspace directory initialized: %v", err)
+	}
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
+	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2 WHERE id=$1`, hostValue.ID, taskWorkspacePublishRuntimeID); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatalf("bind Host to Agent Workspace: %v", err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatalf("activate Agent Workspace Host binding: %v", err)
+	}
+	manifest, err := store.GetWorkspaceManifestPageForOwner(ctx, owner.ID, workspaceValue.ID, workspaceValue.Revision, "", "", 100)
+	if err != nil {
+		t.Fatalf("read Agent Workspace manifest: %v", err)
+	}
+	inputManifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(manifest.Files, manifest.EmptyDirectories, manifest.Directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextDigest, err := hex.DecodeString(inputManifestSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputRevision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "agent-workspace-direct-publish", "write a report")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &inputRevision
+	submission.Task.ContextDigest = contextDigest
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Host-bound Agent Workspace task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "agent-workspace-direct-publish-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Host-bound Agent Workspace task: %#v found=%t err=%v", claimed, found, err)
+	}
+	blocks, err := workspacefs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blocks.Close() })
+	directory, err := workspacecurrent.Open(filepath.Join(t.TempDir(), "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = directory.Close() })
+	service, err := app.NewWorkspaceSyncServiceWithOptions(store, blocks, workspace.MaxSyncManifestBytes, syncTestOwnerQuotaBytes,
+		app.WorkspaceSyncOptions{LiveDirectorySourceEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetWorkspaceCurrentDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("shared Agent Workspace report")
+	file := syncTestFile("report.txt", content)
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	emptyDirectories := []string{}
+	requestHash := sha256.Sum256([]byte("direct Agent Workspace publish"))
+	command := app.TaskWorkspacePublishCommand{
+		OwnerID: owner.ID, TaskID: claimed.ID, WorkspaceID: workspaceValue.ID, HostID: hostValue.ID,
+		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, BindingVersion: binding.BindingVersion,
+		InputRevision: inputRevision, BaseRevision: inputRevision,
+		HostFence: app.AgentHostFence{RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: taskWorkspacePublishRuntimeID,
+			ControlVersion: hostValue.ControlVersion, AIAllowed: true},
+		ViewID: "v" + strings.Repeat("a", 64), InputManifestSHA256: inputManifestSHA,
+		OperationKey: "agent:direct-directory-publish", RequestHash: requestHash[:], DirectDirectorySource: true,
+	}
+	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
+		t.Fatalf("reserve direct Host-bound Agent Workspace publish: %v", err)
+	}
+	receipt, err := service.CommitTaskWorkspacePublishDirect(ctx, command, files, emptyDirectories, directories, manifestSHA,
+		func(_ context.Context, digest string) ([]byte, error) {
+			if digest != file.SHA256 {
+				return nil, domain.NewError(domain.CodeNotFound, "unexpected Agent Workspace block")
+			}
+			return append([]byte(nil), content...), nil
+		})
+	if err != nil || receipt.State != app.TaskWorkspacePublishSucceeded || !receipt.DirectDirectorySource ||
+		receipt.PublishedRevision != inputRevision+1 {
+		t.Fatalf("commit direct Host-bound Agent Workspace snapshot = %#v, %v", receipt, err)
+	}
+	updatedBinding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+	if err != nil || updatedBinding.DesiredRevision != receipt.PublishedRevision || updatedBinding.AppliedRevision != receipt.PublishedRevision ||
+		updatedBinding.State != workspace.BindingActive || updatedBinding.SyncState != workspace.BindingSyncHealthy {
+		t.Fatalf("Host binding after direct Workspace snapshot = %#v, %v; want revision %d", updatedBinding, err, receipt.PublishedRevision)
+	}
+	updatedTask, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || updatedTask.Task.WorkspaceCheckpointRevision == nil || *updatedTask.Task.WorkspaceCheckpointRevision != receipt.PublishedRevision {
+		t.Fatalf("Task checkpoint after direct Workspace snapshot = %#v, %v", updatedTask.Task.WorkspaceCheckpointRevision, err)
+	}
+}
 
 func TestHostlessWorkspaceTaskSubmitPublishReceiptAndRecovery(t *testing.T) {
 	store, _ := newTemporaryStore(t)
@@ -113,6 +226,43 @@ func TestHostlessWorkspaceTaskSubmitPublishReceiptAndRecovery(t *testing.T) {
 		})
 	if err != nil || replayed != committed {
 		t.Fatalf("restart receipt replay = %#v, %v; original=%#v", replayed, err, committed)
+	}
+
+	directContent := []byte("shared directory result")
+	directDigest := sha256.Sum256(directContent)
+	directSHA := hex.EncodeToString(directDigest[:])
+	directFiles := append([]workspace.File(nil), files...)
+	directFiles = append(directFiles, workspace.File{Kind: workspace.FileKindRegular, Path: "shared.txt", SizeBytes: int64(len(directContent)),
+		SHA256: directSHA, Mode: 0644, MetadataKnown: true, Chunks: []workspace.Chunk{{SHA256: directSHA, SizeBytes: int64(len(directContent))}}})
+	directDirectories := append([]workspace.Directory(nil), copyDirectories...)
+	directManifest, err := workspace.ManifestTreeWithMetadataSHA256(directFiles, initialPage.EmptyDirectories, directDirectories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directHash := sha256.Sum256([]byte("direct Workspace write call"))
+	directCommand := command
+	directCommand.BaseRevision = committed.PublishedRevision
+	directCommand.OperationKey = "agent:hostless-direct-write-001"
+	directCommand.RequestHash = directHash[:]
+	directCommand.DirectDirectorySource = true
+	directReserved, err := service.ReserveTaskWorkspacePublish(ctx, directCommand)
+	if err != nil || directReserved.State != app.TaskWorkspacePublishPending {
+		t.Fatalf("reserve direct Workspace write receipt = %#v, %v", directReserved, err)
+	}
+	directCommitted, err := service.CommitTaskWorkspacePublishDirect(ctx, directCommand, directFiles, initialPage.EmptyDirectories, directDirectories, directManifest,
+		func(_ context.Context, digest string) ([]byte, error) {
+			if digest == directSHA {
+				return append([]byte(nil), directContent...), nil
+			}
+			return nil, domain.NewError(domain.CodeNotFound, "unexpected direct Workspace block")
+		})
+	if err != nil || directCommitted.State != app.TaskWorkspacePublishSucceeded || !directCommitted.DirectDirectorySource ||
+		directCommitted.PublishedRevision != committed.PublishedRevision+1 {
+		t.Fatalf("commit direct Workspace snapshot = %#v, %v", directCommitted, err)
+	}
+	var materializedRevision int64
+	if err := store.pool.QueryRow(ctx, `SELECT desired_revision FROM workspace_current_materializations WHERE workspace_id=$1`, workspaceValue.ID).Scan(&materializedRevision); err != nil || materializedRevision != committed.PublishedRevision {
+		t.Fatalf("direct Workspace write queued materialization revision = %d, err=%v; want previous revision %d", materializedRevision, err, committed.PublishedRevision)
 	}
 	secondHash := sha256.Sum256([]byte("second Hostless Workspace write call"))
 	secondCommand := app.TaskWorkspacePublishCommand{

@@ -55,6 +55,9 @@ func (s *WorkspaceSyncService) ApplyFileOperation(ctx context.Context, principal
 	if err != nil {
 		return WorkspaceFileOperationResult{}, err
 	}
+	if err := s.rejectRevisionWorkspaceWrite(ctx, value.OwnerID, workspaceID); err != nil {
+		return WorkspaceFileOperationResult{}, err
+	}
 	if value.ReadOnly {
 		return WorkspaceFileOperationResult{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 	}

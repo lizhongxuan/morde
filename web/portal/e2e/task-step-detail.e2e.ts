@@ -103,6 +103,7 @@ test.describe("Assistant Task step detail", () => {
     await page.getByRole("button", { name: new RegExp(`查看详情：${task.objective}`) }).click();
     const activity = page.locator(`.task-panel-detail .task-activity[data-task-id="${task.id}"]`);
     expect(detailReads).toBe(0);
+    await activity.getByText("更多信息").click();
     await activity.getByRole("button", { name: /读取项目文件/ }).click();
     const detail = activity.getByRole("region", { name: "动作详情：读取项目文件" });
     await expect(detail).toContainText("morde_workspace_read");

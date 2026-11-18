@@ -17,6 +17,8 @@ const (
 	WorkspaceVolumeLegacy  WorkspaceVolumeState = "legacy"
 	WorkspaceVolumePending WorkspaceVolumeState = "pending"
 	WorkspaceVolumeReady   WorkspaceVolumeState = "ready"
+
+	AgentWorkspaceHostMountPath = "/home/gem/workspace"
 )
 
 type WorkspaceVolumeRegistry struct {
@@ -78,9 +80,23 @@ type HostWorkspaceVolumeResolver interface {
 }
 
 type WorkspaceVolumeService struct {
-	store      WorkspaceVolumeRegistryStore
-	volumes    WorkspaceVolumeProvisioner
-	instanceID string
+	store                  WorkspaceVolumeRegistryStore
+	volumes                WorkspaceVolumeProvisioner
+	instanceID             string
+	agentWorkspaceHostPath AgentWorkspaceHostPathResolver
+}
+
+type AgentWorkspaceHostPathResolution struct {
+	IsAgentWorkspace bool
+	HostPath         string
+}
+
+// AgentWorkspaceHostPathResolver resolves the stable owner-to-Agent-Workspace
+// mapping and validates that this Workspace's own current directory exists as
+// a canonical host path. It must return an error when the mapping or directory
+// is unavailable.
+type AgentWorkspaceHostPathResolver interface {
+	ResolveAgentWorkspaceHostPath(context.Context, string, string) (AgentWorkspaceHostPathResolution, error)
 }
 
 func NewWorkspaceVolumeService(store WorkspaceVolumeRegistryStore, volumes WorkspaceVolumeProvisioner, instanceID string) (*WorkspaceVolumeService, error) {
@@ -90,13 +106,36 @@ func NewWorkspaceVolumeService(store WorkspaceVolumeRegistryStore, volumes Works
 	return &WorkspaceVolumeService{store: store, volumes: volumes, instanceID: instanceID}, nil
 }
 
+func (s *WorkspaceVolumeService) SetAgentWorkspaceHostPathResolver(resolver AgentWorkspaceHostPathResolver) error {
+	if s == nil || resolver == nil {
+		return errors.New("agent Workspace host-path resolver is required")
+	}
+	s.agentWorkspaceHostPath = resolver
+	return nil
+}
+
 func WorkspaceNamedVolumeName(workspaceID string) string {
 	return "workspace-" + workspaceID
 }
 
 func (s *WorkspaceVolumeService) PrepareHostWorkspaceVolume(ctx context.Context, ownerID, hostID, workspaceID, mountPath, storageSize string) (SandboxVolume, error) {
 	if s == nil || !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) ||
-		!filepath.IsAbs(mountPath) || filepath.Clean(mountPath) != mountPath || strings.TrimSpace(storageSize) == "" {
+		!filepath.IsAbs(mountPath) || filepath.Clean(mountPath) != mountPath {
+		return SandboxVolume{}, domain.InvalidArgument("workspace_volume", "workspace volume request is invalid")
+	}
+	hostPath, isAgentWorkspace, err := s.resolveAgentWorkspaceHostPath(ctx, ownerID, workspaceID)
+	if err != nil {
+		return SandboxVolume{}, err
+	}
+	if isAgentWorkspace {
+		if mountPath != AgentWorkspaceHostMountPath {
+			return SandboxVolume{}, domain.InvalidArgument("workspace_volume", "Agent Workspace must be mounted at /home/gem/workspace")
+		}
+		return SandboxVolume{
+			Name: "workspace", MountPath: mountPath, HostPath: hostPath, RequireExisting: true,
+		}, nil
+	}
+	if strings.TrimSpace(storageSize) == "" {
 		return SandboxVolume{}, domain.InvalidArgument("workspace_volume", "workspace volume request is invalid")
 	}
 	registered, err := s.store.GetWorkspaceVolumeRegistry(ctx, workspaceID)
@@ -142,6 +181,14 @@ func (s *WorkspaceVolumeService) PrepareHostWorkspaceVolume(ctx context.Context,
 }
 
 func (s *WorkspaceVolumeService) ValidateHostWorkspaceVolume(ctx context.Context, ownerID, hostID, workspaceID string) error {
+	if s == nil || !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) {
+		return domain.InvalidArgument("workspace_volume", "computer storage identity is invalid")
+	}
+	if _, isAgentWorkspace, err := s.resolveAgentWorkspaceHostPath(ctx, ownerID, workspaceID); err != nil {
+		return err
+	} else if isAgentWorkspace {
+		return nil
+	}
 	registered, err := s.workspaceVolumeForHost(ctx, ownerID, hostID, workspaceID)
 	if err != nil {
 		return err
@@ -157,6 +204,14 @@ func (s *WorkspaceVolumeService) ValidateHostWorkspaceVolume(ctx context.Context
 }
 
 func (s *WorkspaceVolumeService) DeleteHostWorkspaceVolume(ctx context.Context, ownerID, hostID, workspaceID string) error {
+	if s == nil || !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) {
+		return domain.InvalidArgument("workspace_volume", "computer storage identity is invalid")
+	}
+	if _, isAgentWorkspace, err := s.resolveAgentWorkspaceHostPath(ctx, ownerID, workspaceID); err != nil {
+		return err
+	} else if isAgentWorkspace {
+		return nil
+	}
 	registered, err := s.workspaceVolumeForHost(ctx, ownerID, hostID, workspaceID)
 	if err != nil {
 		return err
@@ -176,6 +231,31 @@ func (s *WorkspaceVolumeService) DeleteHostWorkspaceVolume(ctx context.Context, 
 		return domain.NewError(domain.CodeInvalidState, "computer storage deletion is unavailable")
 	}
 	return deleter.DeleteWorkspaceVolume(ctx, registered.VolumeName, s.instanceID, registered.ProvisionedOwnerID, workspaceID)
+}
+
+func (s *WorkspaceVolumeService) resolveAgentWorkspaceHostPath(ctx context.Context, ownerID, workspaceID string) (string, bool, error) {
+	if s.agentWorkspaceHostPath == nil {
+		return "", false, nil
+	}
+	resolution, err := s.agentWorkspaceHostPath.ResolveAgentWorkspaceHostPath(ctx, ownerID, workspaceID)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve stable Agent Workspace host path: %w", err)
+	}
+	if !resolution.IsAgentWorkspace {
+		if resolution.HostPath != "" {
+			return "", false, domain.NewError(domain.CodeInvalidState, "non-Agent Workspace host-path resolution is ambiguous")
+		}
+		return "", false, nil
+	}
+	if !validAgentWorkspaceHostPath(resolution.HostPath) {
+		return "", false, domain.NewError(domain.CodeInvalidState, "stable Agent Workspace host directory is unavailable or not canonical")
+	}
+	return resolution.HostPath, true, nil
+}
+
+func validAgentWorkspaceHostPath(hostPath string) bool {
+	return hostPath != "" && hostPath != string(filepath.Separator) && filepath.IsAbs(hostPath) &&
+		filepath.Clean(hostPath) == hostPath && !strings.ContainsRune(hostPath, '\x00')
 }
 
 func (s *WorkspaceVolumeService) workspaceVolumeForHost(ctx context.Context, ownerID, hostID, workspaceID string) (WorkspaceVolumeRegistry, error) {

@@ -56,9 +56,84 @@ type syncServiceStore struct {
 	usageFinalizeCalls                       int
 }
 
+type liveDirectoryRecoveryStore struct {
+	WorkspaceSyncStore
+	WorkspaceCurrentMaterializationStore
+	WorkspaceSyncReceiveStore
+	pending []WorkspaceCurrentMaterialization
+	active  []WorkspaceSyncReceiveReservation
+}
+
+func (s *liveDirectoryRecoveryStore) ListWorkspaceCurrentMaterializations(_ context.Context, after string, limit int32) ([]WorkspaceCurrentMaterialization, error) {
+	items := make([]WorkspaceCurrentMaterialization, 0, len(s.pending))
+	for _, item := range s.pending {
+		if item.WorkspaceID > after {
+			items = append(items, item)
+			if int32(len(items)) == limit {
+				break
+			}
+		}
+	}
+	return items, nil
+}
+
+func (*liveDirectoryRecoveryStore) MarkWorkspaceCurrentMaterialized(context.Context, string, int64) error {
+	return nil
+}
+
+func (s *liveDirectoryRecoveryStore) ListActiveWorkspaceSyncReceiveReservations(context.Context) ([]WorkspaceSyncReceiveReservation, error) {
+	return s.active, nil
+}
+
+func (*liveDirectoryRecoveryStore) GetAgentWorkspace(_ context.Context, ownerID string) (workspace.Workspace, bool, error) {
+	if ownerID != "u1234567" {
+		return workspace.Workspace{}, false, nil
+	}
+	return workspace.Workspace{ID: "w1234567", OwnerID: ownerID}, true, nil
+}
+
 type syncCreateReplay struct {
 	requestHash []byte
 	sessionID   string
+}
+
+func TestReconcileLiveDirectorySourceNeverReplaysRevisionMaterializations(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		pending []WorkspaceCurrentMaterialization
+		active  []WorkspaceSyncReceiveReservation
+		wantErr bool
+	}{
+		{name: "clean"},
+		{name: "pending materialization", pending: []WorkspaceCurrentMaterialization{{WorkspaceID: "w1234567", DesiredRevision: 2, AppliedRevision: 1}}, wantErr: true},
+		{name: "active receive", active: []WorkspaceSyncReceiveReservation{{ID: "r1234567", State: "reserved"}}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &liveDirectoryRecoveryStore{
+				WorkspaceSyncStore: newSyncServiceStore(), pending: test.pending, active: test.active,
+			}
+			service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<30)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.liveDirectorySource = true
+			service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+			materializations := 0
+			if err := service.SetWorkspaceCurrentMaterializer(func(context.Context, string, string, int64, []workspace.File, []string, []workspace.Directory) error {
+				materializations++
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.SetWorkspaceCurrentRevisionReader(func(string, string) (int64, bool, error) { return 0, true, nil }); err != nil {
+				t.Fatal(err)
+			}
+			err = service.ReconcilePendingWorkspaceCurrentMaterializations(context.Background())
+			if (err != nil) != test.wantErr || materializations != 0 {
+				t.Fatalf("reconcile error=%v, materializations=%d; wantErr=%v and no snapshot replay", err, materializations, test.wantErr)
+			}
+		})
+	}
 }
 
 type syncServiceBlockLock struct {
@@ -102,9 +177,39 @@ func (s *syncServiceStore) ReserveTaskWorkspacePublish(_ context.Context, value 
 		}
 		return receipt, nil
 	}
-	receipt := TaskWorkspacePublishReceipt{State: TaskWorkspacePublishPending, WorkspaceID: value.WorkspaceID, BaseRevision: value.BaseRevision}
+	receipt := TaskWorkspacePublishReceipt{State: TaskWorkspacePublishPending, WorkspaceID: value.WorkspaceID, BaseRevision: value.BaseRevision,
+		DirectDirectorySource: value.DirectDirectorySource}
 	s.taskWorkspacePublishReceipts[key], s.taskWorkspacePublishCommands[key] = receipt, value
 	return receipt, nil
+}
+
+func (s *syncServiceStore) GetAgentWorkspace(_ context.Context, ownerID string) (workspace.Workspace, bool, error) {
+	if s.workspace.OwnerID != ownerID {
+		return workspace.Workspace{}, false, nil
+	}
+	return s.workspace, true, nil
+}
+
+func TestLiveDirectorySourceAppliesOnlyToCurrentAgentWorkspace(t *testing.T) {
+	service, err := NewWorkspaceSyncService(newSyncServiceStore(), newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.liveDirectorySource = true
+	service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	for _, test := range []struct {
+		ownerID, workspaceID string
+		want                 bool
+	}{
+		{ownerID: "u1234567", workspaceID: "w1234567", want: true},
+		{ownerID: "u1234567", workspaceID: "w7654321", want: false},
+		{ownerID: "u7654321", workspaceID: "w1234567", want: false},
+	} {
+		live, err := service.UsesLiveDirectorySource(context.Background(), test.ownerID, test.workspaceID)
+		if err != nil || live != test.want {
+			t.Errorf("UsesLiveDirectorySource(%q, %q) = %t, %v; want %t", test.ownerID, test.workspaceID, live, err, test.want)
+		}
+	}
 }
 
 func (s *syncServiceStore) GetTaskWorkspacePublishReceipt(_ context.Context, value TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error) {
@@ -148,6 +253,7 @@ func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value T
 		revision++
 	}
 	receipt.State, receipt.ManifestSHA256, receipt.PublishedRevision = TaskWorkspacePublishSucceeded, manifestSHA, revision
+	receipt.DirectDirectorySource = value.DirectDirectorySource
 	s.taskWorkspacePublishReceipts[key] = receipt
 	s.workspace.Revision, s.snapshots[revision] = revision, append([]workspace.File(nil), files...)
 	s.emptyDirectorySnapshots[revision] = append([]string(nil), emptyDirectories...)
@@ -163,6 +269,19 @@ func (s *syncServiceStore) RejectTaskWorkspacePublishQuota(_ context.Context, va
 	}
 	if receipt.State == TaskWorkspacePublishPending {
 		receipt.State = TaskWorkspacePublishQuotaRejected
+		s.taskWorkspacePublishReceipts[key] = receipt
+	}
+	return nil
+}
+
+func (s *syncServiceStore) RejectTaskWorkspacePublishConflict(_ context.Context, value TaskWorkspacePublishCommand) error {
+	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
+	receipt, exists := s.taskWorkspacePublishReceipts[key]
+	if !exists {
+		return domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
+	}
+	if receipt.State == TaskWorkspacePublishPending {
+		receipt.State = TaskWorkspacePublishConflict
 		s.taskWorkspacePublishReceipts[key] = receipt
 	}
 	return nil

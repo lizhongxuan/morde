@@ -22,6 +22,7 @@ const settings: Settings = {
 type ModelConnection = Awaited<ReturnType<typeof portalApi.adminModelConnections>>['items'][number];
 const sharedModel: ModelConnection = {
   id: 'p1234567', name: '平台文本工具模型', base_url: 'https://models.example.test/v1', model_name: 'morde-test',
+  context_window_tokens: null, context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
   shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false, text_stream: false },
   checked_at: '2026-10-22T08:00:00Z', created_at: '2026-10-20T08:00:00Z', updated_at: '2026-10-22T08:00:00Z',
 };

@@ -20,7 +20,7 @@ final class MordeConversationMessageTests: XCTestCase {
     }
 
     func testClientMessageDecodesWireFields() throws {
-        let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":2,"task_id":"q1234567","role":"user","content":"继续处理","attachment_ids":["pa_12345678901234567890123456789012"],"delivery_status":"pending","created_at":"2026-11-09T12:00:00Z","client_message_id":"client-message-1","routing_status":"pending"}"#.utf8)
+        let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":2,"task_id":"q1234567","role":"user","content":"继续处理","attachment_ids":["pa_12345678901234567890123456789012"],"delivery_status":"pending","created_at":"2026-11-09T12:00:00Z","client_message_id":"client-message-1","routing_status":"pending","agent_acknowledged":true}"#.utf8)
 
         let message = try JSONDecoder().decode(MordeClientMessage.self, from: data)
 
@@ -34,16 +34,18 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(message.delivery_status, "pending")
         XCTAssertEqual(message.client_message_id, "client-message-1")
         XCTAssertEqual(message.routing_status, "pending")
+        XCTAssertEqual(message.agent_acknowledged, true)
     }
 
     func testClientMessageDecodesVariantProjection() throws {
-        let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":8,"role":"assistant","content":"second answer","variant_group_id":"m7654321","variant_version":2,"variant_action":"regenerate_text","output_status":"completed"}"#.utf8)
+        let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":8,"role":"assistant","content":"second answer","variant_group_id":"m7654321","variant_version":2,"variant_action":"regenerate_text","output_status":"completed","agent_acknowledged":false}"#.utf8)
 
         let message = try JSONDecoder().decode(MordeClientMessage.self, from: data)
 
         XCTAssertEqual(message.variant_group_id, "m7654321")
         XCTAssertEqual(message.variant_version, 2)
         XCTAssertEqual(message.variant_action, "regenerate_text")
+        XCTAssertEqual(message.agent_acknowledged, false)
         XCTAssertTrue(MordeConversationVariantPresentation.hasValidProjection(message))
     }
 
@@ -141,6 +143,7 @@ final class MordeConversationMessageTests: XCTestCase {
 
         XCTAssertEqual(message.duplicate_of_message_id, "m7654321")
         XCTAssertEqual(message.related_task_id, "q1234567")
+        XCTAssertNil(message.agent_acknowledged)
         XCTAssertEqual(MordeRoutingPresentation.duplicateMessageLocalizationKey(
             originalMessageID: message.duplicate_of_message_id!, taskID: message.related_task_id),
             "Repeated request · related task q1234567")
@@ -155,40 +158,67 @@ final class MordeConversationMessageTests: XCTestCase {
                        "Adjustment received; waiting to update")
     }
 
-    func testTaskStartedAcknowledgementMarksOneLatestEligibleMessagePerTask() {
+    func testAcknowledgementProjectionRequiresAuthoritativeTrueOnUserMessage() {
+        let acknowledged = MordeClientMessage(id: "m0000001", role: "user", content: "long task",
+                                              agent_acknowledged: true)
+        let rejected = MordeClientMessage(id: "m0000002", role: "user", content: "small task",
+                                          agent_acknowledged: false)
+        let missing = MordeClientMessage(id: "m0000003", role: "user", content: "legacy message")
+        let assistant = MordeClientMessage(id: "m0000004", role: "assistant", content: "reply",
+                                           agent_acknowledged: true)
+
+        XCTAssertTrue(MordeAgentMessageStatusPresentation.showsAcknowledgement(for: acknowledged))
+        XCTAssertFalse(MordeAgentMessageStatusPresentation.showsAcknowledgement(for: rejected))
+        XCTAssertFalse(MordeAgentMessageStatusPresentation.showsAcknowledgement(for: missing))
+        XCTAssertFalse(MordeAgentMessageStatusPresentation.showsAcknowledgement(for: assistant))
+    }
+
+    func testProcessingBubbleRequiresLatestRoutedMessageAndStartedRunningTask() {
         let messages = [
-            MordeClientMessage(id: "m0000008", sequence: 8, task_id: "q5678901",
-                               role: "user", content: "independent task"),
-            MordeClientMessage(id: "m0000007", sequence: 7, task_id: "q4567890",
-                               role: "user", content: "not started"),
-            MordeClientMessage(id: "m0000006", sequence: 6, task_id: "q3456789",
-                               role: "user", content: "waiting for revision"),
-            MordeClientMessage(id: "m0000005", sequence: 5, task_id: "q2345678",
-                               role: "user", content: "failed", routing_status: "failed"),
-            MordeClientMessage(id: "m0000004", sequence: 4, task_id: "q1234567",
-                               role: "assistant", content: "reply"),
-            MordeClientMessage(id: "m0000003", sequence: 3, role: "user", content: "exact repeat",
-                               duplicate_of_message_id: "m0000001", related_task_id: "q1234567"),
-            MordeClientMessage(id: "m0000002", sequence: 2, task_id: "q1234567",
-                               role: "user", content: "same task follow-up"),
-            MordeClientMessage(id: "m0000001", sequence: 1, task_id: "q1234567",
-                               role: "user", content: "task root"),
+            MordeClientMessage(id: "m0000001", sequence: 1, task_id: "q1234567", role: "user",
+                               content: "task root", routing_status: "routed"),
+            MordeClientMessage(id: "m0000002", sequence: 2, task_id: "q1234567", role: "user",
+                               content: "follow-up", routing_status: "routed"),
+            MordeClientMessage(id: "m0000003", sequence: 3, task_id: "q2345678", role: "user",
+                               content: "still pending", routing_status: "pending"),
+            MordeClientMessage(id: "m0000004", sequence: 4, task_id: "q3456789", role: "user",
+                               content: "waiting for user", routing_status: "routed"),
+            MordeClientMessage(id: "m0000005", sequence: 5, task_id: "q4567890", role: "user",
+                               content: "completed", routing_status: "routed"),
+            MordeClientMessage(id: "m0000006", sequence: 6, task_id: "q5678901", role: "user",
+                               content: "not started", routing_status: "routed"),
+            MordeClientMessage(id: "m0000007", sequence: 7, task_id: "q6789012", role: "user",
+                               content: "revision pending", routing_status: "routed"),
+            MordeClientMessage(id: "m0000008", sequence: 8, task_id: "q7890123", role: "user",
+                               content: "unknown state", routing_status: "routed"),
+            MordeClientMessage(id: "m0000009", sequence: 9, task_id: "q8901234", role: "user",
+                               content: "route failed", routing_status: "failed"),
+            MordeClientMessage(id: "m0000010", sequence: 10, task_id: "q9012345", role: "user",
+                               content: "task pending", routing_status: "routed"),
         ]
         let tasks = [
-            MordeTaskStartedAcknowledgementState(taskID: "q1234567", currentRevision: 2,
-                desiredRevision: 2, currentRevisionStarted: true),
-            MordeTaskStartedAcknowledgementState(taskID: "q2345678", currentRevision: 1,
-                desiredRevision: 1, currentRevisionStarted: true),
-            MordeTaskStartedAcknowledgementState(taskID: "q3456789", currentRevision: 1,
-                desiredRevision: 2, currentRevisionStarted: true),
-            MordeTaskStartedAcknowledgementState(taskID: "q4567890", currentRevision: 1,
-                desiredRevision: 1, currentRevisionStarted: false),
-            MordeTaskStartedAcknowledgementState(taskID: "q5678901", currentRevision: 1,
-                desiredRevision: 1, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q1234567", status: "running",
+                currentRevision: 2, desiredRevision: 2, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q2345678", status: "running",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q3456789", status: "waiting_user",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q4567890", status: "completed",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q5678901", status: "running",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: false),
+            MordeAgentMessageProcessingTaskState(taskID: "q6789012", status: "running",
+                currentRevision: 1, desiredRevision: 2, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q7890123", status: "unknown",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q8901234", status: "running",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: true),
+            MordeAgentMessageProcessingTaskState(taskID: "q9012345", status: "pending",
+                currentRevision: 1, desiredRevision: 1, currentRevisionStarted: true),
         ]
 
-        XCTAssertEqual(MordeTaskStartedAcknowledgementPolicy.messageIDs(messages: messages, tasks: tasks),
-                       Set(["m0000002", "m0000008"]))
+        XCTAssertEqual(MordeAgentMessageStatusPresentation.processingMessageIDs(messages: messages, tasks: tasks),
+                       Set(["m0000002"]))
     }
 
     func testPublishedTaskResultIsShownOnceWithItsSource() {

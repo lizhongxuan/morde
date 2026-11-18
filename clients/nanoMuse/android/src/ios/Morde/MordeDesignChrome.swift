@@ -7,22 +7,36 @@ enum NanoMuseMood: String, CaseIterable, Codable {
 }
 
 enum ChatColors {
-    static let background = Color(UIColor.systemBackground)
+    static let background = NanoMuseTones.canvas
 }
 
 enum NanoMuseTones {
-    static let surface = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.11, green: 0.11, blue: 0.118, alpha: 1) : .white })
-    static let fill = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.165, green: 0.165, blue: 0.18, alpha: 1) : UIColor(red: 0.945, green: 0.945, blue: 0.957, alpha: 1) })
-    static let bubble = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.149, green: 0.149, blue: 0.165, alpha: 1) : UIColor(red: 0.914, green: 0.918, blue: 0.925, alpha: 1) })
-    static let userMessage = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.17, green: 0.31, blue: 0.47, alpha: 1) : UIColor(red: 0.75, green: 0.87, blue: 0.99, alpha: 1) })
-    static let hairline = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.227, green: 0.227, blue: 0.235, alpha: 1) : UIColor(red: 0.898, green: 0.898, blue: 0.918, alpha: 1) })
-    static let canvas = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? .black : UIColor(red: 0.953, green: 0.953, blue: 0.961, alpha: 1) })
-    static let action = Color(red: 0.039, green: 0.4, blue: 0.894)
-    static let actionText = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.49, green: 0.68, blue: 1, alpha: 1) : UIColor(red: 0.039, green: 0.4, blue: 0.894, alpha: 1) })
-    static let secondaryText = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.73, green: 0.73, blue: 0.77, alpha: 1) : UIColor(red: 0.37, green: 0.37, blue: 0.4, alpha: 1) })
-    static let ink = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? .white : .black })
-    static let onInk = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? .black : .white })
-    static let agentPill = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.11, green: 0.11, blue: 0.118, alpha: 1) : UIColor(red: 0.949, green: 0.949, blue: 0.969, alpha: 1) })
+    static let brand = Color(red: 96.0 / 255, green: 165.0 / 255, blue: 250.0 / 255)
+    static let brandDeep = Color(red: 29.0 / 255, green: 78.0 / 255, blue: 216.0 / 255)
+    static let brandSoft = Color(red: 219.0 / 255, green: 234.0 / 255, blue: 254.0 / 255)
+    static let brandTint = Color(red: 191.0 / 255, green: 219.0 / 255, blue: 254.0 / 255)
+    static let canvas = Color(red: 248.0 / 255, green: 250.0 / 255, blue: 255.0 / 255)
+    static let side = Color(red: 239.0 / 255, green: 246.0 / 255, blue: 255.0 / 255)
+    static let surface = Color.white
+    static let fill = side
+    static let bubble = surface
+    static let userMessage = brand
+    static let hairline = brandSoft
+    static let action = brand
+    static let actionText = brandDeep
+    static let secondaryText = Color(red: 100.0 / 255, green: 116.0 / 255, blue: 139.0 / 255)
+    static let muted = Color(red: 148.0 / 255, green: 163.0 / 255, blue: 184.0 / 255)
+    static let ink = Color(red: 51.0 / 255, green: 65.0 / 255, blue: 85.0 / 255)
+    static let onInk = Color.white
+    static let agentPill = surface
+    static let success = Color(red: 52.0 / 255, green: 178.0 / 255, blue: 122.0 / 255)
+    static let successFill = Color(red: 209.0 / 255, green: 250.0 / 255, blue: 229.0 / 255)
+    static let successInk = Color(red: 4.0 / 255, green: 120.0 / 255, blue: 87.0 / 255)
+    static let warning = Color(red: 180.0 / 255, green: 83.0 / 255, blue: 9.0 / 255)
+    static let warningFill = Color(red: 254.0 / 255, green: 243.0 / 255, blue: 199.0 / 255)
+    static let danger = Color(red: 240.0 / 255, green: 101.0 / 255, blue: 90.0 / 255)
+    static let dangerFill = Color(red: 254.0 / 255, green: 226.0 / 255, blue: 226.0 / 255)
+    static let dangerInk = Color(red: 185.0 / 255, green: 28.0 / 255, blue: 28.0 / 255)
 }
 
 enum NanoMuseBottomBar {
@@ -50,7 +64,7 @@ struct NanoMuseRoundButton: View {
     var symbol: String
     var label: String
     var badge = false
-    var size: CGFloat = 44
+    var size: CGFloat = 40
     var accessibilityIdentifier: String? = nil
     var action: () -> Void
 
@@ -67,9 +81,11 @@ struct NanoMuseRoundButton: View {
             ZStack(alignment: .topTrailing) {
                 Circle()
                     .fill(NanoMuseTones.surface)
-                    .overlay(Circle().strokeBorder(NanoMuseTones.hairline, lineWidth: 0.5))
-                    .overlay(Image(systemName: symbol).font(.system(size: size * 0.41, weight: .medium)))
-                    .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+                    .overlay(Circle().strokeBorder(NanoMuseTones.hairline, lineWidth: 1))
+                    .overlay(Image(systemName: symbol)
+                        .font(.system(size: size * 0.41, weight: .medium))
+                        .foregroundStyle(NanoMuseTones.brandDeep))
+                    .shadow(color: NanoMuseTones.brand.opacity(0.12), radius: 8, y: 4)
                 if badge {
                     Circle().fill(NanoMuseTones.action).frame(width: 9, height: 9).padding(2)
                 }
@@ -133,12 +149,12 @@ struct NanoMuseMenuHeader<Trailing: View>: View {
                     Circle()
                         .fill(NanoMuseTones.surface)
                         .overlay(Circle().strokeBorder(NanoMuseTones.hairline, lineWidth: 0.5))
-                        .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+                        .shadow(color: NanoMuseTones.brand.opacity(0.12), radius: 8, y: 4)
                     VStack(spacing: 3.1) {
                         Capsule().frame(width: 13, height: 1.7)
                         Capsule().frame(width: 13, height: 1.7)
                     }
-                    .foregroundStyle(NanoMuseTones.ink)
+                    .foregroundStyle(NanoMuseTones.brandDeep)
                 }
                 .frame(width: 38, height: 38)
                 .contentShape(Circle())
@@ -153,7 +169,7 @@ struct NanoMuseMenuHeader<Trailing: View>: View {
             if let titleAccessory {
                 Text(titleAccessory)
                     .font(.system(size: 13.5, weight: .medium))
-                    .foregroundStyle(Color(red: 163.0 / 255, green: 163.0 / 255, blue: 168.0 / 255))
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .lineLimit(1)
                     .accessibilityIdentifier("mif.approval.count")
             }
@@ -178,7 +194,9 @@ struct NanoMuseCard<Content: View>: View {
 
     var body: some View {
         VStack(spacing: 0, content: content)
-            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+            .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
             .padding(.horizontal, 16)
     }
 }
@@ -187,7 +205,21 @@ struct NanoMuseRowDivider: View {
     var inset: CGFloat = 16
 
     var body: some View {
-        NanoMuseTones.hairline.frame(height: 0.5).padding(.leading, inset)
+        NanoMuseTones.hairline.frame(height: 1).padding(.leading, inset)
+    }
+}
+
+struct NanoMuseIceCreamTextFieldStyle: TextFieldStyle {
+    func _body(configuration: TextField<Self._Label>) -> some View {
+        configuration
+            .font(.body)
+            .foregroundStyle(NanoMuseTones.ink)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(minHeight: 44)
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
     }
 }
 

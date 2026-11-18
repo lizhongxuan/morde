@@ -18,7 +18,7 @@ JOIN conversation_messages m ON m.id=a.message_id AND m.owner_id=a.owner_id AND 
 JOIN conversation_message_routes r ON r.message_id=a.message_id AND r.service_instance_id=a.service_instance_id AND r.actor_id=a.actor_id
 WHERE a.service_instance_id=$1::uuid AND a.project_id=$2 AND a.owner_id=$3 AND a.conversation_id=$4 AND a.message_id IN
  ($6,(SELECT attachment_source_message_id FROM conversation_message_variants WHERE user_message_id=$6 AND actor_id=$5 AND attachment_source_message_id IS NOT NULL))
- AND a.actor_id=$5 AND a.state='committed' ORDER BY a.attachment_id`, instanceID, projectID, ownerID, actorID, conversationID, messageID)
+ AND a.actor_id=$5 AND a.state='committed' ORDER BY a.attachment_id`, instanceID, projectID, ownerID, conversationID, actorID, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("read project message attachments: %w", err)
 	}

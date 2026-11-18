@@ -15,7 +15,7 @@ import (
 
 // OpenRegularFile opens an already materialized file without following symlinks
 // below the current-file root. The returned descriptor remains stable if the
-// directory tree is atomically exchanged after it is opened.
+// file's Workspace path is replaced after it is opened.
 func (s *Store) OpenRegularFile(ownerID, workspaceID, relativePath string) (*os.File, os.FileInfo, error) {
 	if s == nil || s.dead.Load() {
 		return nil, nil, ErrClosed
@@ -24,7 +24,16 @@ func (s *Store) OpenRegularFile(ownerID, workspaceID, relativePath string) (*os.
 		return nil, nil, errors.New("invalid Workspace current file lookup")
 	}
 	ownerDigest := sha256.Sum256([]byte(ownerID))
-	path := filepath.Join(hex.EncodeToString(ownerDigest[:]), workspaceID, filepath.FromSlash(relativePath))
+	ownerHash := hex.EncodeToString(ownerDigest[:])
+	lock, err := s.lockWorkspaceRead(ownerHash, workspaceID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lock Workspace current file lookup: %w", err)
+	}
+	defer func() { _ = releaseLock(lock) }()
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
+		return nil, nil, err
+	}
+	path := filepath.Join(ownerHash, workspaceID, filepath.FromSlash(relativePath))
 	file, err := openWorkspaceCurrentFile(s.rootPath, path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open Workspace current file: %w", err)
@@ -39,6 +48,39 @@ func (s *Store) OpenRegularFile(ownerID, workspaceID, relativePath string) (*os.
 	return file, info, nil
 }
 
+func (s *Store) WorkspacePath(ownerID, workspaceID string) (string, error) {
+	if s == nil || s.dead.Load() || !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return "", errors.New("invalid Workspace current directory lookup")
+	}
+	ownerDigest := sha256.Sum256([]byte(ownerID))
+	ownerHash := hex.EncodeToString(ownerDigest[:])
+	lock, err := s.lockWorkspaceRead(ownerHash, workspaceID)
+	if err != nil {
+		return "", fmt.Errorf("lock Workspace current directory lookup: %w", err)
+	}
+	defer func() { _ = releaseLock(lock) }()
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
+		return "", err
+	}
+	relativePath := filepath.Join(ownerHash, workspaceID)
+	directory, err := openWorkspaceCurrentFile(s.rootPath, relativePath)
+	if err != nil {
+		return "", fmt.Errorf("open Workspace current directory: %w", err)
+	}
+	info, err := directory.Stat()
+	closeErr := directory.Close()
+	if err != nil {
+		return "", errors.Join(fmt.Errorf("inspect Workspace current directory: %w", err), closeErr)
+	}
+	if !info.IsDir() {
+		return "", errors.Join(ErrUnsafePath, closeErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("close Workspace current directory: %w", closeErr)
+	}
+	return filepath.Join(s.rootPath, relativePath), nil
+}
+
 // StatPath returns metadata for a path beneath one Workspace current directory
 // without following symlinks. It accepts directories so file-to-directory
 // transitions can settle a file deletion without touching descendants.
@@ -50,7 +92,16 @@ func (s *Store) StatPath(ownerID, workspaceID, relativePath string) (os.FileInfo
 		return nil, errors.New("invalid Workspace current path lookup")
 	}
 	ownerDigest := sha256.Sum256([]byte(ownerID))
-	path := filepath.Join(hex.EncodeToString(ownerDigest[:]), workspaceID, filepath.FromSlash(relativePath))
+	ownerHash := hex.EncodeToString(ownerDigest[:])
+	lock, err := s.lockWorkspaceRead(ownerHash, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("lock Workspace current path lookup: %w", err)
+	}
+	defer func() { _ = releaseLock(lock) }()
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(ownerHash, workspaceID, filepath.FromSlash(relativePath))
 	file, err := openWorkspaceCurrentFile(s.rootPath, path)
 	if err != nil {
 		return nil, fmt.Errorf("stat Workspace current path: %w", err)
@@ -74,7 +125,16 @@ func (s *Store) IsEmptyDirectory(ownerID, workspaceID, relativePath string) (emp
 		return false, errors.New("invalid Workspace current directory lookup")
 	}
 	ownerDigest := sha256.Sum256([]byte(ownerID))
-	path := filepath.Join(hex.EncodeToString(ownerDigest[:]), workspaceID, filepath.FromSlash(relativePath))
+	ownerHash := hex.EncodeToString(ownerDigest[:])
+	lock, err := s.lockWorkspaceRead(ownerHash, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("lock Workspace current directory lookup: %w", err)
+	}
+	defer func() { _ = releaseLock(lock) }()
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
+		return false, err
+	}
+	path := filepath.Join(ownerHash, workspaceID, filepath.FromSlash(relativePath))
 	directory, err := openWorkspaceCurrentFile(s.rootPath, path)
 	if err != nil {
 		return false, fmt.Errorf("open Workspace current directory: %w", err)

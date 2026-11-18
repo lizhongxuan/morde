@@ -1,0 +1,487 @@
+:root.morde-pc-theme {
+  color-scheme: light;
+  --ink: #334155;
+  --text: #334155;
+  --muted: #94a3b8;
+  --line: #dbeafe;
+  --surface: #fff;
+  --brand: #60a5fa;
+  --brand-hover: #3b82f6;
+  --brand-tint: #bfdbfe;
+  --brand-soft: #dbeafe;
+  --brand-ink: #2563eb;
+  --brand-deep: #1d4ed8;
+  --brand-pressed: #2563eb;
+  --muted-strong: #64748b;
+  --line-strong: #bfdbfe;
+  --danger: #f0655a;
+  --danger-bg: #fee2e2;
+  --danger-ink: #b91c1c;
+  --success: #34b27a;
+  --success-bg: #d1fae5;
+  --success-ink: #047857;
+  --warning: #b45309;
+  --warning-bg: #fef3c7;
+  --focus: #60a5fa;
+  --bg: #f8faff;
+  --side: #eff6ff;
+  --card: #fff;
+  --shadow: 0 14px 30px rgb(96 165 250 / 18%);
+  --shadow-jelly: 0 14px 30px rgb(96 165 250 / 18%);
+  --shadow-soft: 0 8px 20px rgb(96 165 250 / 12%);
+  --shadow-btn: 0 6px 16px rgb(96 165 250 / 28%);
+  --radius-sm: 12px;
+  --radius-md: 16px;
+  --radius-lg: 20px;
+  --radius-card: 24px;
+  --radius-composer: 24px;
+  --radius-bubble: 22px;
+  --radius-pill: 999px;
+  font-family: "Yuanti SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.morde-pc-theme body {
+  color: var(--ink);
+  background: var(--bg);
+  font-family: "Yuanti SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.morde-pc-theme a { color: var(--brand-ink); }
+.morde-pc-theme a:hover { color: var(--brand-hover); }
+.morde-pc-theme :focus-visible { outline-color: var(--focus); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page :focus-visible { outline-color: var(--focus); }
+
+/* Keep the PC shell light even when the operating system uses dark appearance. */
+.morde-pc-theme body:has(.morde-shell:not(.morde-admin-shell)) {
+  color-scheme: light;
+  color: var(--ink);
+  background: var(--bg);
+}
+.morde-pc-theme body:has(.morde-shell:not(.morde-admin-shell)) .morde-shell:not(.morde-admin-shell) {
+  --ink: #334155;
+  --text: #334155;
+  --muted: #94a3b8;
+  --line: #dbeafe;
+  --surface: #fff;
+  --brand: #60a5fa;
+  --brand-hover: #3b82f6;
+  --danger: #f0655a;
+  --success: #34b27a;
+  --focus: #60a5fa;
+  --shadow: var(--shadow-jelly);
+  --pc-page: #f8faff;
+  --pc-surface-soft: #eff6ff;
+  --pc-surface-raised: #fff;
+  --pc-border-strong: #bfdbfe;
+  --pc-blue-text: #2563eb;
+  --pc-blue-bg: #dbeafe;
+  --pc-green-text: #18794e;
+  --pc-green-bg: #d1fae5;
+  --pc-yellow-text: #b45309;
+  --pc-yellow-bg: #fef3c7;
+  --pc-red-text: #c34136;
+  --pc-red-bg: #fee2e2;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-sidebar,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .page-navigation,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-account-menu-popover,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .notice-center-panel {
+  color: var(--ink);
+  border-color: var(--line);
+  background: var(--side);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) > .morde-topbar {
+  color: var(--ink);
+  border-color: var(--line);
+  background: rgb(255 255 255 / 94%);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-brand,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-brand strong,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-profile strong,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-crumb-title,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page h1,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page h2,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page h3 { color: var(--ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-brand small,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-profile small,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-nav-heading,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-crumb,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-top-user { color: var(--muted); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-nav-link,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .page-navigation-link { color: #64748b; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-nav-link:hover,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .page-navigation-link:hover,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-nav-link.active,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .page-navigation-link.active {
+  color: var(--brand-ink);
+  background: var(--brand-soft);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-nav-link.active::after { background: var(--brand); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-sidebar-bottom,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .page-navigation { border-color: var(--line); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-avatar { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-top-control,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-workspace-icon,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-notification-link,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .assistant-sidebar-heading .icon-button {
+  color: #64748b;
+  border-color: var(--line);
+  border-radius: 50%;
+  background: #fff;
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-workspace-tab-wrap { border-radius: var(--radius-pill); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-workspace-tab-wrap.active {
+  color: var(--brand-ink);
+  background: #fff;
+  box-shadow: 0 3px 10px rgb(96 165 250 / 14%);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-workspace-tab,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-workspace-tab-close { color: inherit; }
+.morde-pc-theme .assistant-page .assistant-layout-with-computer-panel .computer-panel-frame { border: 0; border-radius: 0; background: transparent; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-workspace-add-menu {
+  border-color: var(--line);
+  border-radius: var(--radius-md);
+  background: #fff;
+  box-shadow: var(--shadow-jelly);
+}
+
+.morde-pc-theme .morde-page { color: var(--ink); }
+.morde-pc-theme .morde-page .muted,
+.morde-pc-theme .morde-page label,
+.morde-pc-theme .morde-page legend,
+.morde-pc-theme .morde-page small { color: var(--muted); }
+.morde-pc-theme .morde-page .design-panel,
+.morde-pc-theme .morde-page .form-card,
+.morde-pc-theme .morde-page .host-card,
+.morde-pc-theme .morde-page .task-card,
+.morde-pc-theme .morde-page .task-section,
+.morde-pc-theme .morde-page .pending-card,
+.morde-pc-theme .morde-page .clarification-card,
+.morde-pc-theme .morde-page .device-manager-card,
+.morde-pc-theme .morde-page .schedule-card,
+.morde-pc-theme .morde-page .notification-card,
+.morde-pc-theme .morde-page .model-connection-card,
+.morde-pc-theme .morde-page .review-item,
+.morde-pc-theme .morde-page .loading-card,
+.morde-pc-theme .morde-page .empty-card {
+  color: var(--ink);
+  border-color: var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-jelly);
+}
+.morde-pc-theme .morde-page .error-card,
+.morde-pc-theme .morde-page .form-error,
+.morde-pc-theme .morde-page .error-inline { color: #c34136; }
+.morde-pc-theme .morde-page .host-default-settings,
+.morde-pc-theme .morde-page .host-control,
+.morde-pc-theme .morde-page .host-secondary-content,
+.morde-pc-theme .morde-page .task-activity-card,
+.morde-pc-theme .morde-page .task-file-card,
+.morde-pc-theme .morde-page .account-settings-card-body,
+.morde-pc-theme .morde-page .memory-history,
+.morde-pc-theme .morde-page .codex-event pre {
+  color: var(--ink);
+  border-color: var(--line);
+  border-radius: var(--radius-md);
+  background: var(--side);
+}
+.morde-pc-theme .morde-page .local-project-folder-list li,
+.morde-pc-theme .morde-page .codex-thread-row,
+.morde-pc-theme .morde-page .codex-event,
+.morde-pc-theme .morde-page .task-activity {
+  color: var(--ink);
+  border-color: var(--line);
+  border-radius: var(--radius-card);
+  background: #fff;
+  box-shadow: var(--shadow-jelly);
+}
+.morde-pc-theme .morde-page .assistant-page .task-panel-detail .task-activity {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.morde-pc-theme .morde-page table th,
+.morde-pc-theme .morde-page table td,
+.morde-pc-theme .morde-page .design-panel-header,
+.morde-pc-theme .morde-page .connection-section-heading { border-color: var(--line); }
+.morde-pc-theme .morde-page table th { color: var(--muted); background: var(--side); }
+.morde-pc-theme .morde-page .table-wrap,
+.morde-pc-theme .morde-page .file-list-wrap { border-color: var(--line); border-radius: var(--radius-md); }
+.morde-pc-theme .morde-page input:not([type=checkbox]):not([type=radio]),
+.morde-pc-theme .morde-page select,
+.morde-pc-theme .morde-page textarea {
+  color: var(--ink);
+  border: 1px solid var(--brand-tint);
+  border-radius: var(--radius-md);
+  background: #fff;
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page input:not([type=checkbox]):not([type=radio]),
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page select,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page textarea { color: var(--ink); border-color: var(--brand-tint); background: #fff; }
+.morde-pc-theme .morde-page input::placeholder,
+.morde-pc-theme .morde-page textarea::placeholder { color: var(--muted); opacity: 1; }
+.morde-pc-theme .morde-page input:disabled,
+.morde-pc-theme .morde-page select:disabled { background: var(--side); }
+.morde-pc-theme .morde-page .assistant-selector select { min-height: 32px; border: 0; border-radius: 0; background: transparent; }
+.morde-pc-theme .morde-page input[type=checkbox],
+.morde-pc-theme .morde-page input[type=radio] { accent-color: var(--brand); }
+.morde-pc-theme .morde-page input[type=checkbox] { width: 20px; height: 20px; border-radius: 7px; }
+.morde-pc-theme .morde-page input[type=radio] { width: 20px; height: 20px; }
+
+.morde-pc-theme .button {
+  border-radius: var(--radius-pill);
+  font-weight: 700;
+  transition: background-color .15s ease, border-color .15s ease, transform .15s ease;
+}
+.morde-pc-theme .button-primary { color: #fff; background: var(--brand); box-shadow: 0 6px 16px rgb(96 165 250 / 22%); }
+.morde-pc-theme .button-primary:hover:not(:disabled) { color: #fff; background: var(--brand-hover); }
+.morde-pc-theme .button-primary:active:not(:disabled) { transform: scale(.97); }
+.morde-pc-theme .button-secondary { color: var(--brand-ink); border-color: var(--brand-tint); background: #fff; }
+.morde-pc-theme .button-secondary:hover:not(:disabled) { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .button-primary { color: #fff; background: var(--brand); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .button-primary:hover:not(:disabled) { color: #fff; background: var(--brand-hover); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .button-secondary { color: var(--brand-ink); border-color: var(--brand-tint); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .button-secondary:hover:not(:disabled) { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .button-quiet,
+.morde-pc-theme .icon-button { color: #64748b; }
+.morde-pc-theme .button-quiet:hover:not(:disabled),
+.morde-pc-theme .icon-button:hover { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .button-danger { color: #fff; background: var(--danger); }
+.morde-pc-theme .button-danger-quiet { color: var(--danger); }
+.morde-pc-theme .icon-button { border-radius: 50%; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-account-menu-action { border-radius: var(--radius-sm); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-account-menu-action:hover { color: var(--brand-ink); background: var(--brand-soft); }
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status { border-radius: var(--radius-pill); color: #64748b; background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-running,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-stopping,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-queued,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-pausing,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-cancelling { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-ready,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-completed,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-succeeded,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-enabled,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .notice-success,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .toast-success { color: #18794e; border-color: #a7f3d0; background: var(--success-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-creating,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-expiring,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-waiting_user,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .notice-warning { color: var(--warning); border-color: #fde68a; background: var(--warning-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .status-failed,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .error-card,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .error-inline,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .form-error,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .toast-error,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .toast-error-notice { color: #c34136; border-color: #fecaca; background: var(--danger-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .notice-info { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-page .notice-center-panel .toast-notice { border-color: var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-jelly); }
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar { color: var(--ink); border-color: var(--line) !important; background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-main,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel { color: var(--ink); border-color: var(--line); background: var(--surface); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-item.is-selected,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .codex-thread-row.active { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-item:hover,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-new:hover { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .conversation-view-heading { border-color: var(--line); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-chat-title h2 { color: var(--ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-chat-title p,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-author,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-status,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-sidebar-hint { color: var(--muted); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message { color: var(--ink); border-radius: var(--radius-bubble); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-user {
+  color: #fff;
+  background: var(--brand);
+  border-radius: var(--radius-bubble) var(--radius-bubble) 8px var(--radius-bubble);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-assistant {
+  width: fit-content;
+  max-width: 100%;
+  padding: 10px 16px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: var(--radius-bubble) var(--radius-bubble) var(--radius-bubble) 8px;
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .thinking-bubble { border-color: var(--line); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .thinking-dots span { background: var(--brand); animation-duration: 1.5s; }
+.morde-pc-theme .project-message-received { border-color: var(--surface); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer { background: linear-gradient(to top, var(--bg) 80%, transparent); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer form {
+  color: var(--ink);
+  border: 1.5px solid var(--brand-tint);
+  border-radius: var(--radius-composer);
+  background: #fff;
+  box-shadow: var(--shadow-jelly);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer textarea { color: var(--ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-send {
+  width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--brand);
+  box-shadow: 0 6px 16px rgb(96 165 250 / 22%);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-send:hover:not(:disabled) { background: var(--brand-hover); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-panel-toggle,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-panel-tabs button.is-selected { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-pending-count { color: var(--warning); background: var(--warning-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-activity-card-title > strong { color: var(--ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-activity-card-footer { color: var(--brand-ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-activity-status { border-radius: var(--radius-pill); color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-activity-status.status-waiting_user { color: var(--warning); background: var(--warning-bg); animation: ice-pulse 1.8s ease-in-out infinite; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-activity-status.status-failed { color: #c34136; background: var(--danger-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-activity-status.status-completed { color: #18794e; background: var(--success-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-approval { border-color: var(--line); border-radius: var(--radius-card); background: #fff; box-shadow: var(--shadow-jelly); }
+
+.morde-pc-theme .morde-page .mcp-endpoint,
+.morde-pc-theme .morde-page .schedule-runs,
+.morde-pc-theme .morde-page .personal-data-setting-help,
+.morde-pc-theme .morde-page .capability-no { color: var(--muted-strong); border-color: var(--line); border-radius: var(--radius-md); background: var(--side); }
+.morde-pc-theme .morde-page .capability-yes { color: #18794e; background: var(--success-bg); }
+.morde-pc-theme .morde-page .reviews-pending-count { color: var(--warning); border-color: #fde68a; background: var(--warning-bg); }
+.morde-pc-theme .morde-page .notification-unread { border-left-color: var(--brand); }
+.morde-pc-theme .morde-page .notification-read { background: var(--side); }
+.morde-pc-theme .morde-page .account-settings-tabs {
+  padding: 4px;
+  gap: 4px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--side);
+}
+.morde-pc-theme .morde-page .account-settings-tab {
+  min-height: 36px;
+  padding: 5px 14px;
+  border-radius: var(--radius-pill);
+}
+.morde-pc-theme .morde-page .account-settings-tab[aria-selected="true"] {
+  color: var(--brand-ink);
+  background: #fff;
+  box-shadow: 0 3px 10px rgb(96 165 250 / 14%);
+}
+.morde-pc-theme .morde-page .account-settings-tab[aria-selected="true"]::after { display: none; }
+.morde-pc-theme .morde-page .account-settings-card-body { border-radius: var(--radius-card); box-shadow: var(--shadow-jelly); }
+.morde-pc-theme .download-card { border-color: var(--line); border-radius: var(--radius-card); box-shadow: var(--shadow-jelly); }
+
+.morde-pc-theme .modal-card,
+.morde-pc-theme .morde-account-menu-popover,
+.morde-pc-theme .assistant-tool-connectors { border-color: var(--line); border-radius: var(--radius-card); background: #fff; box-shadow: var(--shadow-jelly); }
+.morde-pc-theme .toast-notice,
+.morde-pc-theme .toast-error-notice { border-radius: var(--radius-md); box-shadow: var(--shadow-jelly); }
+.morde-pc-theme .login-page,
+.morde-pc-theme .download-page { background: var(--bg); }
+.morde-pc-theme .login-card { border-color: var(--line); border-radius: var(--radius-card); box-shadow: var(--shadow-jelly); }
+.morde-pc-theme .login-card input { min-height: 44px; border-color: var(--brand-tint); border-radius: var(--radius-md); color: var(--ink); }
+.morde-pc-theme .login-card .button { min-height: 40px; }
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .eyebrow { color: var(--brand-ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .config-snippet,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-event-feed,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-detail,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-result,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-batch-item,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-k2,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .audit-detail,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .schedule-runs,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .host-more-actions[open] > div {
+  color: var(--ink);
+  border-color: var(--line);
+  border-radius: var(--radius-md);
+  background: var(--side);
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-result { border-radius: var(--radius-md); background: var(--success-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-notice,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .pending-card { border-color: #fde68a; background: var(--warning-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .pending-card-top .eyebrow,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .pending-icon { color: var(--warning); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .pending-icon { background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .clarification-card { border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .clarification-icon { color: var(--brand-ink); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .clarification-question { border: 1px solid var(--line); border-radius: var(--radius-md); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-marker { border-color: var(--muted); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-running { border-color: var(--brand); box-shadow: 0 0 0 4px var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-waiting_user { border-color: #fbbf24; background: #fcd34d; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-icon.status-running { color: var(--brand); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-icon.status-succeeded { color: #18794e; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-icon.status-failed { color: #c34136; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-result,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-k2 h4 { color: var(--ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-error,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-detail-message[role="alert"] { color: #c34136; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-link { color: var(--brand-ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-current-progress h3,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-panel-group > h3,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-panel-group-recent > summary,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-queue-priority h3,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-detail-work > summary,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-detail-diagnostics > summary { color: var(--muted-strong); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-panel-filters button { color: var(--muted-strong); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-panel-filters button.is-selected { border-color: var(--brand-tint); color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-card-button:hover { background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-detail p,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-step-detail-message,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-card-subtitle,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-card-footer small,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-billing > p,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-file-fetches > p,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .task-activity-artifacts li small { color: var(--muted-strong); }
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-mark { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-suggestions button { color: var(--ink); border-color: var(--line); border-radius: var(--radius-md); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-suggestions button:hover { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-target-row,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-setup-notice { color: var(--ink); border-color: var(--line); border-radius: var(--radius-md); background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-setup-notice strong { color: var(--warning); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-target-row select,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-selectors select { color: var(--ink); border-color: var(--brand-tint); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-attach-control:hover,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-voice-button-compact:hover { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-markdown pre,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-markdown :not(pre) > code { color: var(--ink); border-radius: var(--radius-sm); background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-source { border-color: var(--line); border-radius: var(--radius-md); background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-source-origin { color: var(--brand-ink); }
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .reviews-section { border-color: var(--line); border-radius: var(--radius-card); background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .review-item-heading > span { color: var(--muted-strong); background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .reviews-error { color: #c34136; border-color: #fecaca; border-radius: var(--radius-md); background: var(--danger-bg); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .reviews-error-mark { background: #fecaca; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .hosts-empty-icon,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .account-settings-avatar { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .host-action-reason,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .host-permissions { color: var(--muted-strong); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .host-secondary-details > summary,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .host-more-actions > summary { color: var(--muted-strong); border-color: var(--line); border-radius: var(--radius-pill); background: #fff; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .host-list-toggle .button-primary::after { background: var(--brand); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .mcp-endpoint { border-color: var(--brand-tint); border-radius: var(--radius-md); background: var(--side); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .mcp-endpoint code { color: var(--brand-deep); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .morde-page .personal-data-setting details { color: var(--ink); border-color: var(--line); border-radius: var(--radius-md); background: var(--side); }
+
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__controls { border-color: var(--line); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__controls button { color: var(--muted-strong); border-radius: var(--radius-pill); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__controls button:hover:not(:disabled) { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__controls button[aria-current="page"] { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__controls button:focus-visible,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__viewport:focus-visible,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__item--overflow:focus-visible { outline-color: var(--focus); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__ellipsis,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .screen-pagination__status { color: var(--muted); }
+
+@keyframes ice-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .72; transform: scale(1.07); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .morde-pc-theme *, .morde-pc-theme *::before, .morde-pc-theme *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}

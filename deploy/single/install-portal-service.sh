@@ -168,6 +168,8 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 [[ $repo_root =~ ^/[A-Za-z0-9_./-]+$ ]] || die 'repository path contains unsupported unit-file characters'
 if [[ $# == 1 && $1 == --check-workspace-sync-mount-bindings ]]; then
   check_workspace_sync_mount_bindings
+  [[ ${CH_OSB_CONFIG_FILE:-} == /* && -n ${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:-} ]] || die 'OpenSandbox config and Workspace current-files root are required'
+  python3 "$repo_root/deploy/single/render-opensandbox-config.py" --check "$CH_OSB_CONFIG_FILE" "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" || die 'OpenSandbox host-path allowlist does not match the configured Workspace current-files root'
   exit 0
 fi
 [[ $# == 1 ]] || die 'usage: sudo deploy/single/install-portal-service.sh <existing-portal-user>'
@@ -243,6 +245,12 @@ for key in CH_WORKSPACE_STORAGE_ROOT_DIR CH_SITE_STORAGE_ROOT_DIR CH_WORKSPACE_S
   [[ $path == /* && -d $path && ! -L $path && $(stat -c '%u:%a' "$path") == "$portal_uid:700" ]] || die "$key must be a mode 0700 directory owned by $portal_user"
   runuser -u "$portal_user" -- test -w "$path" || die "$portal_user cannot write $key"
 done
+[[ $CH_OSB_CONFIG_FILE == /* ]] || die 'CH_OSB_CONFIG_FILE must be an absolute path'
+python3 "$repo_root/deploy/single/render-opensandbox-config.py" "$CH_OSB_CONFIG_FILE" "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" || die 'could not render the OpenSandbox Workspace host-path allowlist'
+command -v docker >/dev/null 2>&1 || die 'Docker CLI is required to apply the OpenSandbox Workspace mount'
+DOCKER_HOST="$CH_DOCKER_HOST" docker compose --project-name cloudhost --env-file "$env_file" \
+  -f "$repo_root/deploy/single/docker-compose.yml" up --detach --force-recreate --no-deps opensandbox-server \
+  || die 'could not recreate OpenSandbox with the configured Workspace mount'
 for path in "$repo_root" "$repo_root/deploy/single/portal.yaml" "$repo_root/web/portal/dist/admin/index.html" "$repo_root/web/workbench/dist/index.html"; do
   runuser -u "$portal_user" -- test -r "$path" || die "$portal_user cannot read $path"
 done

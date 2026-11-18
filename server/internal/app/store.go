@@ -76,6 +76,24 @@ type WorkspaceStore interface {
 	CompleteWorkspaceBindingUnbind(context.Context, string, string, int64, int64, int64) (workspace.Binding, error)
 }
 
+// AgentWorkspaceStore maps each account to its stable Agent Workspace. Unlike
+// host bindings, this identity survives Host creation and deletion.
+type AgentWorkspaceStore interface {
+	GetAgentWorkspace(context.Context, string) (workspace.Workspace, bool, error)
+	CreateAgentWorkspace(context.Context, workspace.Workspace) (workspace.Workspace, bool, error)
+	MarkAgentWorkspaceDirectoryInitialized(context.Context, string, string) error
+	AcquireAgentWorkspaceInitializationLock(context.Context, string) (func() error, error)
+	IsAgentWorkspaceWorkspace(context.Context, string, string) (bool, error)
+}
+
+// AgentWorkspaceDeleteStore permits only an explicit owner deletion to retire
+// the current stable Agent Workspace mapping. Generic and Host cleanup paths
+// remain unable to delete its contents.
+type AgentWorkspaceDeleteStore interface {
+	ClaimAgentWorkspaceForDelete(context.Context, string, string, int64) (workspace.Workspace, error)
+	CompleteAgentWorkspaceDelete(context.Context, string, string, int64) (workspace.Workspace, error)
+}
+
 type workspaceBindingSyncStatusStore interface {
 	SetWorkspaceBindingSyncStatus(context.Context, string, string, int64, workspace.BindingSyncState, []string) (workspace.Binding, error)
 }
@@ -119,16 +137,18 @@ type TaskWorkspacePublishCommand struct {
 	BindingVersion, LeaseVersion, InputRevision, BaseRevision      int64
 	HostFence                                                      AgentHostFence
 	ViewID, InputManifestSHA256                                    string
+	DirectDirectorySource                                          bool
 	RequestHash                                                    []byte
 }
 
 type TaskWorkspacePublishReceipt struct {
-	State             TaskWorkspacePublishState
-	WorkspaceID       string
-	BaseRevision      int64
-	PublishedRevision int64
-	ManifestSHA256    string
-	RequestHash       string
+	State                 TaskWorkspacePublishState
+	WorkspaceID           string
+	BaseRevision          int64
+	PublishedRevision     int64
+	ManifestSHA256        string
+	RequestHash           string
+	DirectDirectorySource bool
 }
 
 // WorkspaceSyncStore owns durable manifests, change cursors, and resumable

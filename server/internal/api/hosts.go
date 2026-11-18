@@ -488,7 +488,7 @@ func (h *api) deleteHost(c *gin.Context) {
 	query := c.Request.URL.Query()
 	confirmation, exists := query["confirm_delete_workspace"]
 	if !exists || len(confirmation) != 1 || confirmation[0] != "true" || len(query) != 1 {
-		writeError(c, domain.InvalidArgument("confirm_delete_workspace", "confirm deletion of this computer and its workspace directory"))
+		writeError(c, domain.InvalidArgument("confirm_delete_workspace", "confirm deletion of this computer; its Agent Workspace files are retained"))
 		return
 	}
 	item, err := h.deps.Hosts.Delete(c.Request.Context(), principal, app.DeleteHostCommand{HostID: id, ConfirmWorkspaceDeletion: true})

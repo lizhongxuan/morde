@@ -222,6 +222,58 @@ FROM tasks t WHERE t.id=$1`, taskID, []string{second.Message.ID, third.Message.I
 	}
 }
 
+func TestConversationAcknowledgementAppearsOnlyAfterTaskRevisionStarts(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	const clientID = "route-acknowledgement-001"
+	claim := f.receive(t, clientID, "Please do a longer task", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, Acknowledge: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, claim.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 10})
+	if err != nil || len(page.Items) != 1 || page.Items[0].AgentAcknowledged {
+		t.Fatalf("queued Task was prematurely acknowledged: messages=%+v err=%v", page.Items, err)
+	}
+	receipt, found, err := f.store.FindConversationMessageByClientID(ctx, f.ownerID, "", f.conversation.ID, clientID, f.instanceID)
+	if err != nil || !found || receipt.AgentAcknowledged {
+		t.Fatalf("unstarted Task receipt was acknowledged: message=%+v found=%t err=%v", receipt, found, err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET status='running',lease_owner='ack-test',lease_version=1,
+lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := recordTaskRevisionStartedInTx(ctx, tx, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	page, err = f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 10})
+	if err != nil || len(page.Items) != 1 || !page.Items[0].AgentAcknowledged {
+		t.Fatalf("started Task acknowledgement missing: messages=%+v err=%v", page.Items, err)
+	}
+	receipt, found, err = f.store.FindConversationMessageByClientID(ctx, f.ownerID, "", f.conversation.ID, clientID, f.instanceID)
+	if err != nil || !found || !receipt.AgentAcknowledged {
+		t.Fatalf("started Task receipt acknowledgement missing: message=%+v found=%t err=%v", receipt, found, err)
+	}
+}
+
 func TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()

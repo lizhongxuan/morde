@@ -85,8 +85,10 @@ func TestDockerAccountRuntimeNameMatchesGuardianContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	host := config["HostConfig"].(map[string]any)
+	mounts, ok := host["Mounts"].([]any)
 	if host["NetworkMode"] != "none" || host["ReadonlyRootfs"] != true || host["Privileged"] != false ||
 		host["Memory"].(float64) <= 0 || host["NanoCpus"].(float64) <= 0 || host["PidsLimit"].(float64) <= 0 ||
+		!ok || len(mounts) != 1 || mounts[0].(map[string]any)["Target"] != dockerDSHWorkspaceDir || mounts[0].(map[string]any)["ReadOnly"] != true ||
 		config["User"] != dockerDSHUser || !strings.Contains(string(encoded), "no-new-privileges:true") ||
 		!strings.Contains(string(encoded), `"ALL"`) || bytes.Contains(encoded, nonce) {
 		t.Fatal("conversation Runtime container violated its isolation or secret boundary")
@@ -96,7 +98,11 @@ func TestDockerAccountRuntimeNameMatchesGuardianContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspected.HostConfig.Memory = 0
-	if err := supervisor.validateAccountRuntime(inspected, probe.guard, true); err == nil {
+	workspacePath, err := docker.options.WorkspacePath(context.Background(), fence.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.validateAccountRuntime(inspected, probe.guard, workspacePath, true); err == nil {
 		t.Fatal("account Runtime accepted a container without its memory limit")
 	}
 }

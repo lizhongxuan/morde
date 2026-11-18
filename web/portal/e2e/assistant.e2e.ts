@@ -328,6 +328,7 @@ test.describe("Assistant durable tasks", () => {
     const firstPanel = page.locator(`.task-panel-detail .task-activity[data-task-id="${taskIDs[0]}"]`);
     await expect(firstPanel).toContainText("写入文件");
     const approval = firstPanel.getByRole("region", { name: "需要批准的操作" });
+    await approval.getByText("审批详情").click();
     await expect(approval).toContainText("准备创建报告。");
     await expect(approval).toContainText("审批到期：");
     await expect(approval).toContainText("风险需要核对写入范围。");

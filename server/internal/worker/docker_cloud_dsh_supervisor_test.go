@@ -149,8 +149,17 @@ func (f *dockerDSHFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		if f.missingPID {
 			delete(state, "Pid")
 		}
-		result := map[string]any{"Id": f.id, "Name": "/" + f.name, "Config": config, "HostConfig": config["HostConfig"],
-			"State": state, "Mounts": []any{}}
+		hostConfig := config["HostConfig"].(map[string]any)
+		mounts := make([]any, 0)
+		if specs, ok := hostConfig["Mounts"].([]any); ok {
+			for _, item := range specs {
+				mount := item.(map[string]any)
+				mounts = append(mounts, map[string]any{"Type": mount["Type"], "Source": mount["Source"],
+					"Destination": mount["Target"], "RW": !mount["ReadOnly"].(bool)})
+			}
+		}
+		result := map[string]any{"Id": f.id, "Name": "/" + f.name, "Config": config, "HostConfig": hostConfig,
+			"State": state, "Mounts": mounts}
 		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(result)
 		return
@@ -246,8 +255,10 @@ func newDockerDSHFixture(t *testing.T) (*DockerCloudDSHSupervisor, *dockerDSHFak
 		engine.mu.Unlock()
 		server.Close()
 	})
+	workspacePath := t.TempDir()
 	supervisor, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{DockerHost: "unix://" + socket,
-		Image: image, NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", Guardian: guardian})
+		Image: image, NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", Guardian: guardian,
+		WorkspacePath: func(context.Context, string) (string, error) { return workspacePath, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}

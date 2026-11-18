@@ -162,6 +162,10 @@ type CloudDSHModels interface {
 	Complete(context.Context, app.ModelCall) (app.ModelResponse, error)
 }
 
+type CloudDSHTaskContextWindowResolver interface {
+	ResolveTaskContextWindow(context.Context, task.Task) (*int, error)
+}
+
 // CloudDSHRevisionStopWitness proves that a lease was fenced specifically by
 // a persisted, currently authorized revision stop request.
 type CloudDSHRevisionStopWitness interface {
@@ -1180,6 +1184,18 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 	message := frame("model_end")
 	message["ok"] = true
 	return writeCloudDSHFrame(ctx, target, message)
+}
+
+func writeCloudDSHModelFailure(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity) error {
+	if id == "" || !cloudDSHIdentityValid(identity) {
+		return errors.New("dsh model failure identity is invalid")
+	}
+	return writeCloudDSHFrame(ctx, target, map[string]any{
+		"type": "model_end", "task_id": identity.TaskID, "owner_id": identity.OwnerID,
+		"agent_id": identity.AgentID, "session_id": identity.SessionID, "generation": identity.Generation,
+		"authorization_version": identity.AuthorizationVersion, "id": id, "ok": false,
+		"failure_code": "CONTEXT_WINDOW_EXCEEDED",
+	})
 }
 
 var _ TaskExecutor = (*CloudDSHExecutor)(nil)

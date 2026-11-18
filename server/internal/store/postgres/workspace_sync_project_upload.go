@@ -31,15 +31,14 @@ func (s *Store) GetWorkspaceSyncProjectUploadBaseline(ctx context.Context, princ
 	}
 	var baseline *workspace.SyncSession
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var ownerID, installationID, sourceWorkspaceID, sourceFolderID, hostID, sourceState string
-		var bindingVersion int64
+		var ownerID, installationID, sourceWorkspaceID, sourceFolderID, sourceState string
 		var lastSessionID pgtype.Text
 		var lastTargetRevision pgtype.Int8
 		var lastDigest []byte
-		err := tx.QueryRow(ctx, `SELECT owner_id,client_installation_id,workspace_id,folder_id,host_id,binding_version,
+		err := tx.QueryRow(ctx, `SELECT owner_id,client_installation_id,workspace_id,folder_id,
 state,last_applied_session_id,last_applied_target_revision,last_applied_manifest_sha256
 FROM workspace_sync_project_sources WHERE source_binding_id=$1`, sourceBindingID).Scan(
-			&ownerID, &installationID, &sourceWorkspaceID, &sourceFolderID, &hostID, &bindingVersion,
+			&ownerID, &installationID, &sourceWorkspaceID, &sourceFolderID,
 			&sourceState, &lastSessionID, &lastTargetRevision, &lastDigest,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -55,22 +54,8 @@ FROM workspace_sync_project_sources WHERE source_binding_id=$1`, sourceBindingID
 		if sourceState != "pending" && sourceState != "active" {
 			return domain.NewError(domain.CodeWorkspaceUnavailable, "project source binding is unavailable")
 		}
-		var currentBindingVersion int64
-		var currentBindingState string
-		var hostState string
-		var hostDeleted bool
-		if err := tx.QueryRow(ctx, `SELECT b.binding_version,b.state,h.state,h.deleted_at IS NOT NULL
-FROM workspace_bindings b JOIN hosts h ON h.id=b.host_id AND h.owner_id=b.owner_id
-WHERE b.owner_id=$1 AND b.workspace_id=$2 AND b.host_id=$3`, ownerID, workspaceID, hostID).
-			Scan(&currentBindingVersion, &currentBindingState, &hostState, &hostDeleted); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.NewError(domain.CodeWorkspaceUnavailable, "project source Host binding is unavailable")
-			}
-			return fmt.Errorf("verify Workspace project source binding: %w", err)
-		}
-		if currentBindingVersion != bindingVersion || currentBindingState != string(workspace.BindingActive) ||
-			hostDeleted || hostState == string(host.StateDeleting) || hostState == string(host.StateDeleted) {
-			return domain.NewError(domain.CodeWorkspaceConflict, "project source Host binding changed; explicit rebind is required")
+		if err := requireWorkspaceSyncProjectHostBinding(ctx, tx, ownerID, workspaceID, folderID); err != nil {
+			return err
 		}
 		if !lastSessionID.Valid {
 			if lastTargetRevision.Valid || len(lastDigest) != 0 {
@@ -540,12 +525,23 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')`, session.SourceBindingID, folder.OwnerI
 			return fmt.Errorf("read project source binding for session creation: %w", err)
 		}
 		if ownerID != folder.OwnerID || installationID != deviceAccess.installationID || sourceWorkspaceID != folder.WorkspaceID ||
-			sourceFolderID != folder.FolderID || savedHostID != hostID || savedBindingVersion != bindingVersion || sourceState == "revoked" {
+			sourceFolderID != folder.FolderID || sourceState == "revoked" {
 			return domain.NewError(domain.CodeWorkspaceConflict, "project source identity is already bound to another installation or target")
 		}
 		if sourceState != "pending" && sourceState != "active" || lastSessionID.Valid != (session.SourceBaselineSessionID != "") ||
 			lastSessionID.Valid && lastSessionID.String != session.SourceBaselineSessionID {
 			return domain.NewError(domain.CodeWorkspaceConflict, "project source baseline changed before session creation")
+		}
+		if savedHostID != hostID || savedBindingVersion != bindingVersion {
+			updated, err := tx.Exec(ctx, `UPDATE workspace_sync_project_sources SET host_id=$2,binding_version=$3,updated_at=now()
+WHERE source_binding_id=$1 AND owner_id=$4 AND workspace_id=$5 AND folder_id=$6 AND state IN ('pending','active')`,
+				session.SourceBindingID, hostID, bindingVersion, folder.OwnerID, folder.WorkspaceID, folder.FolderID)
+			if err != nil {
+				return fmt.Errorf("rebind project source to current cloud computer: %w", err)
+			}
+			if updated.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "project source changed before Host rebind")
+			}
 		}
 	}
 	// Serialize the unresolved check behind the source row lock. A concurrent
@@ -703,22 +699,26 @@ FOR UPDATE OF source,b`, row.WorkspaceID, row.OwnerID, row.ID, folder.FolderID).
 }
 
 func createWorkspaceSyncProjectUploadApplication(ctx context.Context, tx pgx.Tx, row sqlcgen.WorkspaceSyncSession,
-	folder workspace.SyncFolder, targetRevision int64, session workspace.SyncSession) error {
+	folder workspace.SyncFolder, targetRevision int64, session workspace.SyncSession, directDirectory bool) error {
 	if !row.FolderID.Valid || row.FolderID.String != folder.FolderID || !row.SourceBindingID.Valid ||
 		!workspace.ValidProjectSourceBindingID(row.SourceBindingID.String) || targetRevision < 0 ||
 		len(row.Scope) != 1 || row.Scope[0] != folder.RelativePath {
 		return domain.NewError(domain.CodeWorkspaceConflict, "project upload source receipt fields are invalid")
 	}
-	var hostID, sourceState string
-	var sourceBindingVersion, workspaceBindingVersion int64
+	var hostID, sourceState, hostState string
+	var sourceBindingVersion, workspaceBindingVersion, runtimeGeneration int64
 	var savedBaselineSessionID pgtype.Text
-	err := tx.QueryRow(ctx, `SELECT source.host_id,source.binding_version,source.state,source.last_applied_session_id,b.binding_version
+	var deletedAt pgtype.Timestamptz
+	err := tx.QueryRow(ctx, `SELECT source.host_id,source.binding_version,source.state,source.last_applied_session_id,b.binding_version,
+h.state,h.runtime_generation,h.deleted_at
 FROM workspace_sync_project_sources source
 JOIN workspace_bindings b ON b.host_id=source.host_id AND b.workspace_id=source.workspace_id AND b.owner_id=source.owner_id
+JOIN hosts h ON h.id=source.host_id AND h.owner_id=source.owner_id
 WHERE source.source_binding_id=$1 AND source.owner_id=$2 AND source.workspace_id=$3 AND source.folder_id=$4
   AND b.state='active'
-FOR UPDATE OF source,b`, row.SourceBindingID.String, row.OwnerID, row.WorkspaceID, folder.FolderID).
-		Scan(&hostID, &sourceBindingVersion, &sourceState, &savedBaselineSessionID, &workspaceBindingVersion)
+FOR UPDATE OF source,b,h`, row.SourceBindingID.String, row.OwnerID, row.WorkspaceID, folder.FolderID).
+		Scan(&hostID, &sourceBindingVersion, &sourceState, &savedBaselineSessionID, &workspaceBindingVersion,
+			&hostState, &runtimeGeneration, &deletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeWorkspaceConflict, "project upload Host binding changed before commit")
 	}
@@ -729,6 +729,9 @@ FOR UPDATE OF source,b`, row.SourceBindingID.String, row.OwnerID, row.WorkspaceI
 		savedBaselineSessionID.Valid != row.SourceBaselineSessionID.Valid ||
 		savedBaselineSessionID.Valid && savedBaselineSessionID.String != row.SourceBaselineSessionID.String {
 		return domain.NewError(domain.CodeWorkspaceConflict, "project upload source baseline changed before commit")
+	}
+	if directDirectory && (hostState != string(host.StateRunning) || runtimeGeneration < 1 || deletedAt.Valid) {
+		return domain.NewError(domain.CodeWorkspaceBusy, "default cloud computer must be running for a direct project upload")
 	}
 	if sourceState == "pending" {
 		updated, err := tx.Exec(ctx, `UPDATE workspace_sync_project_sources SET state='active',updated_at=now()
@@ -751,6 +754,49 @@ WHERE source_binding_id=$1 AND state='pending'`, row.SourceBindingID.String)
 	digestBytes, err := hex.DecodeString(digest)
 	if err != nil || len(digestBytes) != 32 {
 		return domain.NewError(domain.CodeInternal, "project upload manifest digest is invalid")
+	}
+	if directDirectory {
+		appliedRevision := targetRevision
+		syncState := workspace.BindingSyncHealthy
+		report := workspace.HostProjectUploadApplicationReport{SourceBindingID: row.SourceBindingID.String,
+			TargetRevision: targetRevision, ManifestSHA256: digest, Status: "applied", AppliedRevision: &appliedRevision,
+			SyncState: &syncState, Impacts: []workspace.SyncHostApplicationImpact{}}
+		receiptDigest, err := hostProjectUploadReceiptHash(report)
+		if err != nil {
+			return fmt.Errorf("hash direct project upload receipt: %w", err)
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO workspace_sync_project_upload_applications
+(workspace_id,session_id,owner_id,folder_id,source_binding_id,source_binding_version,source_baseline_session_id,
+ host_id,workspace_binding_version,target_revision,state,runtime_generation,applied_revision,sync_state,manifest_sha256,receipt_sha256,impacts)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'applied',$11,$10,'healthy',$12,$13,'[]'::jsonb)`,
+			row.WorkspaceID, row.ID, row.OwnerID, folder.FolderID, row.SourceBindingID.String, sourceBindingVersion,
+			row.SourceBaselineSessionID, hostID, workspaceBindingVersion, targetRevision, runtimeGeneration, digestBytes, receiptDigest)
+		if err != nil {
+			return fmt.Errorf("persist direct project upload application receipt: %w", err)
+		}
+		updated, err := tx.Exec(ctx, `UPDATE workspace_sync_project_sources
+SET state='active',last_applied_session_id=$7,last_applied_target_revision=$8,last_applied_manifest_sha256=$9,updated_at=now()
+WHERE source_binding_id=$1 AND owner_id=$2 AND workspace_id=$3 AND folder_id=$4 AND host_id=$5 AND binding_version=$6
+  AND state IN ('pending','active') AND last_applied_session_id IS NOT DISTINCT FROM $10`, row.SourceBindingID.String,
+			row.OwnerID, row.WorkspaceID, folder.FolderID, hostID, sourceBindingVersion, row.ID, targetRevision, digestBytes,
+			row.SourceBaselineSessionID)
+		if err != nil || updated.RowsAffected() != 1 {
+			if err == nil {
+				err = domain.NewError(domain.CodeWorkspaceConflict, "project upload baseline changed before direct receipt")
+			}
+			return fmt.Errorf("advance direct project upload baseline: %w", err)
+		}
+		updated, err = tx.Exec(ctx, `UPDATE workspace_bindings SET desired_revision=$3,applied_revision=$3,
+sync_state='healthy',sync_conflicts='{}'::text[],updated_at=clock_timestamp()
+WHERE host_id=$1 AND workspace_id=$2 AND owner_id=$4 AND binding_version=$5 AND state='active'`, hostID, row.WorkspaceID,
+			targetRevision, row.OwnerID, workspaceBindingVersion)
+		if err != nil || updated.RowsAffected() != 1 {
+			if err == nil {
+				err = domain.NewError(domain.CodeWorkspaceConflict, "Host binding changed before direct project receipt")
+			}
+			return fmt.Errorf("advance shared-directory Host binding revision: %w", err)
+		}
+		return nil
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO workspace_sync_project_upload_applications
 (workspace_id,session_id,owner_id,folder_id,source_binding_id,source_binding_version,source_baseline_session_id,

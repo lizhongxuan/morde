@@ -13,6 +13,7 @@ type ModelConnection = Awaited<ReturnType<typeof portalApi.modelConnections>>['i
 type MCPConnector = Awaited<ReturnType<typeof portalApi.mcpConnectors>>['items'][number];
 const model: ModelConnection = {
   id: 'p1234567', name: '团队模型', base_url: 'https://models.example.test/v1', model_name: 'morde-test', shared: true, has_api_key: true,
+  context_window_tokens: null, context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
   capabilities: { text: true, tools: true, vision: false, text_stream: false }, checked_at: timestamp, created_at: timestamp, updated_at: timestamp,
 };
 const mcpConnector: MCPConnector = {
@@ -546,11 +547,12 @@ describe('Connections', () => {
     await user.type(screen.getByLabelText('显示名称'), '我的模型');
     await user.type(screen.getByLabelText('模型名'), 'private-model');
     await user.type(screen.getByLabelText('服务地址'), 'https://api.example.test/v1');
+    await user.type(screen.getByLabelText('上下文窗口高级覆盖（tokens，可选）'), '32768');
     await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
     expect(screen.getByRole('button', { name: '保存并检查连接' }).closest('form')).toBeValid();
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
-    expect(create).toHaveBeenCalledWith({ name: '我的模型', base_url: 'https://api.example.test/v1', model_name: 'private-model', api_key: 'private-test-secret', shared: false });
+    expect(create).toHaveBeenCalledWith({ name: '我的模型', base_url: 'https://api.example.test/v1', model_name: 'private-model', context_window_override_tokens: 32768, api_key: 'private-test-secret', shared: false });
     const card = (await screen.findByRole('heading', { name: '我的模型', level: 3 })).closest('article')!;
     expect(check).toHaveBeenCalledWith(personal.id);
     expect(await within(card).findByText('本次检查：文本可用 · 工具调用可用 · 视觉未验证')).toBeInTheDocument();
@@ -575,6 +577,8 @@ describe('Connections', () => {
 
     await user.click(await screen.findByRole('button', { name: /添加个人模型/ }));
     await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'deepseek-flash');
+    expect(screen.queryByLabelText('上下文窗口高级覆盖（tokens，可选）')).not.toBeInTheDocument();
+    expect(screen.getByText('上下文窗口由 Morde 自动识别；无需手动填写。')).toBeInTheDocument();
     await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
@@ -667,6 +671,8 @@ describe('Connections', () => {
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ api_key: 'local-test-secret' }));
+    expect(create.mock.calls[0]?.[0]).not.toHaveProperty('context_window_override_tokens');
+    expect(create.mock.calls[0]?.[0]).not.toHaveProperty('context_window_tokens');
     expect(await screen.findByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
     expect(screen.getByRole('alert')).toHaveTextContent('密钥已清除，请重新输入后重试');
     const dialog = screen.getByRole('dialog', { name: '添加个人模型' });

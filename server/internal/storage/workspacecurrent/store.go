@@ -24,10 +24,12 @@ import (
 )
 
 var (
-	ErrInvalidRoot        = errors.New("workspace current root must be an absolute non-root directory")
-	ErrUnsafePath         = errors.New("workspace current path is not a safe regular file or directory")
-	ErrUntrustedDirectory = errors.New("workspace current directory has no valid revision marker")
-	ErrClosed             = errors.New("workspace current store is closed")
+	ErrInvalidRoot                     = errors.New("workspace current root must be an absolute non-root directory")
+	ErrUnsafePath                      = errors.New("workspace current path is not a safe regular file or directory")
+	ErrWriteConflict                   = errors.New("workspace current file changed before write")
+	ErrUntrustedDirectory              = errors.New("workspace current directory has no valid revision marker")
+	ErrWorkspaceUpdateRecoveryRequired = errors.New("workspace current update recovery is required")
+	ErrClosed                          = errors.New("workspace current store is closed")
 )
 
 const defaultWorkspaceSyncNodeUID = 65532
@@ -96,6 +98,33 @@ func Open(rootPath string) (*Store, error) {
 	return &Store{rootPath: rootPath, ownerUID: ownerUID, ownerGID: ownerGID}, nil
 }
 
+func (s *Store) ensureWorkspaceUpdateResolved(ownerHash, workspaceID string) error {
+	stagingRoot := filepath.Join(s.rootPath, ".morde-staging")
+	entries, err := os.ReadDir(stagingRoot)
+	if err != nil {
+		return fmt.Errorf("inspect Workspace current staging: %w", err)
+	}
+	prefix := "backup-" + ownerHash + "-" + workspaceID + "-"
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(stagingRoot, entry.Name()))
+		if err != nil {
+			return fmt.Errorf("inspect interrupted Workspace update: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return ErrUnsafePath
+		}
+		return ErrWorkspaceUpdateRecoveryRequired
+	}
+	return nil
+}
+
+func (s *Store) lockWorkspaceRead(ownerHash, workspaceID string) (*os.File, error) {
+	return acquireLock(context.Background(), filepath.Join(s.rootPath, ".morde-locks", ownerHash+"-"+workspaceID+".lock"))
+}
+
 func (s *Store) Close() error {
 	if s != nil {
 		s.dead.Store(true)
@@ -124,6 +153,9 @@ func (s *Store) Delete(ctx context.Context, ownerID, workspaceID string) (retErr
 		}
 	}()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
 		return err
 	}
 
@@ -178,8 +210,9 @@ func (s *Store) Delete(ctx context.Context, ownerID, workspaceID string) (retErr
 	return nil
 }
 
-// Materialize reconstructs a complete revision off-path, verifies every block
-// and file digest, then atomically exchanges the directory on Linux.
+// Materialize reconstructs a complete revision off-path and verifies every
+// block and file digest before publishing it. Existing Workspace roots keep
+// their inode so bind mounts continue to observe subsequent revisions.
 func (s *Store) Materialize(ctx context.Context, ownerID, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string,
 	directories []workspace.Directory, blocks BlockReader) (retErr error) {
 	if s == nil || s.dead.Load() {
@@ -209,6 +242,9 @@ func (s *Store) Materialize(ctx context.Context, ownerID, workspaceID string, re
 			retErr = errors.Join(retErr, fmt.Errorf("release workspace current lock: %w", err))
 		}
 	}()
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
+		return err
+	}
 	tempRoot := filepath.Join(s.rootPath, ".morde-staging")
 	if err := removeStaleStages(tempRoot, ownerHash+"-"+workspaceID+"-"); err != nil {
 		return fmt.Errorf("recover Workspace current staging: %w", err)
@@ -221,8 +257,9 @@ func (s *Store) Materialize(ctx context.Context, ownerID, workspaceID string, re
 	if err != nil {
 		return fmt.Errorf("create workspace current staging tree: %w", err)
 	}
+	var contentUpdate *workspaceContentUpdate
 	defer func() {
-		if stage != "" {
+		if stage != "" && (contentUpdate == nil || contentUpdate.rollbackComplete) {
 			if err := removeWorkspaceTree(stage); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("remove workspace current staging tree: %w", err))
 			}
@@ -296,11 +333,13 @@ func (s *Store) Materialize(ctx context.Context, ownerID, workspaceID string, re
 	initialPublish := false
 	previousRevision := int64(0)
 	hasPreviousRevision := false
+	var backup string
+	var publishedRootMetadata *workspace.Directory
 	if info, err := os.Lstat(target); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return ErrUnsafePath
 		}
-		if currentRevision, exists, err := s.CurrentRevision(ownerID, workspaceID); err != nil {
+		if currentRevision, exists, err := s.currentRevisionByHash(ownerHash, workspaceID); err != nil {
 			return err
 		} else if !exists {
 			if revision == 0 && len(files) == 0 && len(emptyDirectories) == 0 {
@@ -329,9 +368,47 @@ func (s *Store) Materialize(ctx context.Context, ownerID, workspaceID string, re
 		} else {
 			previousRevision, hasPreviousRevision = currentRevision, true
 		}
-		if err := renameExchange(stage, target); err != nil {
-			return fmt.Errorf("atomically exchange workspace current directory: %w", err)
+		if err := os.Chmod(target, info.Mode().Perm()|0o700); err != nil {
+			return fmt.Errorf("prepare current Workspace root for update: %w", err)
 		}
+		oldRootMetadata, err := readWorkspaceRootMetadata(target, info)
+		if err != nil {
+			_ = os.Chmod(target, info.Mode().Perm())
+			return fmt.Errorf("read current Workspace root metadata: %w", err)
+		}
+		backup, err = os.MkdirTemp(tempRoot, "backup-"+ownerHash+"-"+workspaceID+"-")
+		if err != nil {
+			_ = os.Chmod(target, info.Mode().Perm())
+			return fmt.Errorf("create previous Workspace staging tree: %w", err)
+		}
+		contentUpdate, err = publishWorkspaceContents(s.rootPath, ownerHash, workspaceID, stage, backup)
+		if contentUpdate != nil {
+			contentUpdate.oldRootMetadata = oldRootMetadata
+		}
+		if err != nil {
+			cause := fmt.Errorf("publish Workspace contents in place: %w", err)
+			if contentUpdate != nil && !contentUpdate.rollbackComplete {
+				return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot,
+					initialPublish, hasPreviousRevision, previousRevision, s, nil, cause)
+			}
+			if contentUpdate == nil || contentUpdate.rollbackComplete {
+				_ = removeWorkspaceTree(backup)
+				_ = os.Chmod(target, info.Mode().Perm())
+			}
+			return cause
+		}
+		newRootMetadata := workspace.Directory{Path: ".", MetadataKnown: true}
+		for _, directory := range directories {
+			if directory.Path == "." {
+				newRootMetadata = directory
+				break
+			}
+		}
+		if newRootMetadata.ModTimeNS == nil {
+			modified := stageInfo.ModTime().UnixNano()
+			newRootMetadata.ModTimeNS = &modified
+		}
+		publishedRootMetadata = &newRootMetadata
 	} else if errors.Is(err, os.ErrNotExist) {
 		if err := s.writeRevisionMarker(ownerHash, workspaceID, revision); err != nil {
 			return fmt.Errorf("record initial Workspace revision before publish: %w", err)
@@ -345,31 +422,51 @@ func (s *Store) Materialize(ctx context.Context, ownerID, workspaceID string, re
 	}
 	rootHandle, err := openWorkspaceRootModeHandle(target)
 	if err != nil {
-		return rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot, tempRoot, initialPublish,
+		return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot, initialPublish,
 			hasPreviousRevision, previousRevision, s, nil, err)
 	}
+	if publishedRootMetadata != nil {
+		if err := applyDirectoryMetadata(target, []workspace.Directory{*publishedRootMetadata}); err != nil {
+			return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot,
+				initialPublish, hasPreviousRevision, previousRevision, s, rootHandle,
+				fmt.Errorf("apply published Workspace root metadata: %w", err))
+		}
+	}
 	if err := rootHandle.apply(rootMode); err != nil {
-		return rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot, tempRoot, initialPublish,
+		return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot, initialPublish,
 			hasPreviousRevision, previousRevision, s, rootHandle, fmt.Errorf("apply published Workspace root mode: %w", err))
 	}
 	if err := syncDir(ownerRoot); err != nil {
-		return rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot, tempRoot, initialPublish,
+		return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot, initialPublish,
 			hasPreviousRevision, previousRevision, s, rootHandle, fmt.Errorf("sync published workspace current directory: %w", err))
 	}
 	if err := syncDir(tempRoot); err != nil {
-		return rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot, tempRoot, initialPublish,
-			hasPreviousRevision, previousRevision, s, rootHandle, fmt.Errorf("sync workspace current staging parent: %w", err))
+		return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot,
+			initialPublish, hasPreviousRevision, previousRevision, s, rootHandle,
+			fmt.Errorf("sync workspace current staging parent: %w", err))
 	}
 	if !initialPublish {
 		if err := s.writeRevisionMarker(ownerHash, workspaceID, revision); err != nil {
-			return rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot, tempRoot, initialPublish,
+			return rollbackMaterializedWorkspace(contentUpdate, target, stage, backup, ownerRoot, tempRoot, initialPublish,
 				hasPreviousRevision, previousRevision, s, rootHandle, fmt.Errorf("record published Workspace revision: %w", err))
 		}
 	}
 	if err := rootHandle.close(); err != nil {
-		return fmt.Errorf("close published Workspace root handle: %w", err)
+		return errors.Join(fmt.Errorf("close published Workspace root handle: %w", err), func() error {
+			if contentUpdate != nil {
+				return contentUpdate.close()
+			}
+			return nil
+		}())
 	}
-	if err := removeWorkspaceTree(stage); err != nil {
+	if contentUpdate != nil {
+		if err := contentUpdate.close(); err != nil {
+			return fmt.Errorf("close Workspace content update: %w", err)
+		}
+		if err := removeWorkspaceTree(backup); err != nil {
+			return fmt.Errorf("remove previous workspace current contents: %w", err)
+		}
+	} else if err := removeWorkspaceTree(stage); err != nil {
 		return fmt.Errorf("remove previous workspace current directory: %w", err)
 	}
 	stage = ""
@@ -389,6 +486,18 @@ func (s *Store) CurrentRevision(ownerID, workspaceID string) (int64, bool, error
 	}
 	ownerDigest := sha256.Sum256([]byte(ownerID))
 	ownerHash := hex.EncodeToString(ownerDigest[:])
+	lock, err := s.lockWorkspaceRead(ownerHash, workspaceID)
+	if err != nil {
+		return 0, false, fmt.Errorf("lock Workspace current revision lookup: %w", err)
+	}
+	defer func() { _ = releaseLock(lock) }()
+	return s.currentRevisionByHash(ownerHash, workspaceID)
+}
+
+func (s *Store) currentRevisionByHash(ownerHash, workspaceID string) (int64, bool, error) {
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
+		return 0, false, err
+	}
 	ownerRoot := filepath.Join(s.rootPath, ownerHash)
 	if info, err := os.Lstat(ownerRoot); errors.Is(err, os.ErrNotExist) {
 		return 0, false, nil
@@ -460,6 +569,9 @@ func (s *Store) MatchesManifest(ctx context.Context, ownerID, workspaceID string
 		}
 	}()
 	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := s.ensureWorkspaceUpdateResolved(ownerHash, workspaceID); err != nil {
 		return false, err
 	}
 	ownerRoot := filepath.Join(s.rootPath, ownerHash)
@@ -850,8 +962,201 @@ func (handle *workspaceRootModeHandle) close() error {
 	return errors.Join(fileErr, rootErr)
 }
 
-func rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot, tempRoot string, initialPublish bool,
-	hasPreviousRevision bool, previousRevision int64, store *Store, handle *workspaceRootModeHandle, cause error) error {
+type workspaceContentUpdate struct {
+	root              *os.Root
+	rootPath          string
+	stage             string
+	backup            string
+	targetRelative    string
+	stageRelative     string
+	backupRelative    string
+	oldMoved          []string
+	newMoved          []string
+	oldDirectoryModes map[string]*workspaceCurrentDirectoryModeRestore
+	oldRootMetadata   workspace.Directory
+	rollbackComplete  bool
+}
+
+func publishWorkspaceContents(rootPath, ownerHash, workspaceID, stage, backup string) (*workspaceContentUpdate, error) {
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	update := &workspaceContentUpdate{
+		root:              root,
+		rootPath:          rootPath,
+		stage:             stage,
+		backup:            backup,
+		targetRelative:    filepath.Join(ownerHash, workspaceID),
+		oldDirectoryModes: make(map[string]*workspaceCurrentDirectoryModeRestore),
+	}
+	var relativeErr error
+	update.stageRelative, relativeErr = filepath.Rel(rootPath, stage)
+	if relativeErr == nil {
+		update.backupRelative, relativeErr = filepath.Rel(rootPath, backup)
+	}
+	if relativeErr != nil || filepath.IsAbs(update.stageRelative) || filepath.IsAbs(update.backupRelative) ||
+		update.stageRelative == ".." || strings.HasPrefix(update.stageRelative, ".."+string(os.PathSeparator)) ||
+		update.backupRelative == ".." || strings.HasPrefix(update.backupRelative, ".."+string(os.PathSeparator)) {
+		_ = root.Close()
+		return nil, ErrUnsafePath
+	}
+
+	oldNames, err := readWorkspaceDirectoryNames(root, update.targetRelative)
+	if err == nil {
+		newNames, readErr := readWorkspaceDirectoryNames(root, update.stageRelative)
+		err = readErr
+		if err == nil {
+			for _, name := range oldNames {
+				err = root.Rename(filepath.Join(update.targetRelative, name), filepath.Join(update.backupRelative, name))
+				if errors.Is(err, os.ErrPermission) {
+					var restore *workspaceCurrentDirectoryModeRestore
+					restore, prepareErr := prepareWorkspaceCurrentDirectoryForRename(rootPath, update.targetRelative, name)
+					if prepareErr != nil {
+						if restore != nil {
+							prepareErr = errors.Join(prepareErr, restore.restore(), restore.close())
+						}
+						err = errors.Join(err, prepareErr)
+					} else if restore != nil {
+						err = root.Rename(filepath.Join(update.targetRelative, name), filepath.Join(update.backupRelative, name))
+						if err != nil {
+							err = errors.Join(err, restore.restore(), restore.close())
+						} else {
+							update.oldDirectoryModes[name] = restore
+						}
+					}
+				}
+				if err != nil {
+					break
+				}
+				update.oldMoved = append(update.oldMoved, name)
+			}
+			if err == nil {
+				for _, name := range newNames {
+					if err = root.Rename(filepath.Join(update.stageRelative, name), filepath.Join(update.targetRelative, name)); err != nil {
+						break
+					}
+					update.newMoved = append(update.newMoved, name)
+				}
+			}
+		}
+	}
+	if err == nil {
+		err = update.syncDirectories()
+	}
+	if err != nil {
+		rollbackErr := update.rollbackContents()
+		if rollbackErr == nil {
+			update.rollbackComplete = true
+			rollbackErr = update.close()
+		}
+		return update, errors.Join(err, rollbackErr)
+	}
+	return update, nil
+}
+
+func readWorkspaceDirectoryNames(root *os.Root, path string) ([]string, error) {
+	directory, err := root.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = directory.Close() }()
+	file, err := directory.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	entries, readErr := file.ReadDir(-1)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, closeErr)
+	}
+	names := make([]string, len(entries))
+	for index, entry := range entries {
+		names[index] = entry.Name()
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (update *workspaceContentUpdate) syncDirectories() error {
+	return errors.Join(syncDir(filepath.Join(update.rootPath, update.targetRelative)),
+		syncDir(update.stage), syncDir(update.backup))
+}
+
+func (update *workspaceContentUpdate) rollbackContents() error {
+	if update == nil || update.root == nil {
+		return nil
+	}
+	var rollbackErr error
+	for index := len(update.newMoved) - 1; index >= 0; index-- {
+		name := update.newMoved[index]
+		if err := update.root.Rename(filepath.Join(update.targetRelative, name), filepath.Join(update.stageRelative, name)); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore staged Workspace entry %q: %w", name, err))
+		} else {
+			update.newMoved[index] = ""
+		}
+	}
+	for index := len(update.oldMoved) - 1; index >= 0; index-- {
+		name := update.oldMoved[index]
+		if err := update.root.Rename(filepath.Join(update.backupRelative, name), filepath.Join(update.targetRelative, name)); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace entry %q: %w", name, err))
+		} else {
+			update.oldMoved[index] = ""
+		}
+		if restore := update.oldDirectoryModes[name]; restore != nil {
+			if err := restore.restore(); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace directory mode %q: %w", name, err))
+			} else {
+				delete(update.oldDirectoryModes, name)
+			}
+		}
+	}
+	update.newMoved = compactWorkspaceEntryNames(update.newMoved)
+	update.oldMoved = compactWorkspaceEntryNames(update.oldMoved)
+	return errors.Join(rollbackErr, update.syncDirectories())
+}
+
+func compactWorkspaceEntryNames(names []string) []string {
+	result := names[:0]
+	for _, name := range names {
+		if name != "" {
+			result = append(result, name)
+		}
+	}
+	return result
+}
+
+func (update *workspaceContentUpdate) close() error {
+	if update == nil || update.root == nil {
+		return nil
+	}
+	err := update.root.Close()
+	update.root = nil
+	for name, restore := range update.oldDirectoryModes {
+		if closeErr := restore.close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close previous Workspace directory handle %q: %w", name, closeErr))
+		}
+		delete(update.oldDirectoryModes, name)
+	}
+	return err
+}
+
+func readWorkspaceRootMetadata(path string, info os.FileInfo) (workspace.Directory, error) {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return workspace.Directory{}, err
+	}
+	xattrs, acl, readErr := workspacefs.ReadTreeCopyMetadata(root, path, ".", false)
+	closeErr := root.Close()
+	if readErr != nil || closeErr != nil {
+		return workspace.Directory{}, errors.Join(readErr, closeErr)
+	}
+	mode, modified := uint32(info.Mode().Perm()), info.ModTime().UnixNano()
+	return workspace.Directory{Path: ".", Mode: &mode, ModTimeNS: &modified, Xattrs: xattrs, ACL: acl, MetadataKnown: true}, nil
+}
+
+func rollbackMaterializedWorkspace(update *workspaceContentUpdate, target, stage, backup, ownerRoot, tempRoot string,
+	initialPublish bool, hasPreviousRevision bool, previousRevision int64, store *Store, handle *workspaceRootModeHandle, cause error) error {
 	var rollbackErr error
 	if handle != nil {
 		rollbackErr = errors.Join(rollbackErr, handle.reset(), handle.close())
@@ -860,20 +1165,46 @@ func rollbackPublishedWorkspace(ownerHash, workspaceID, target, stage, ownerRoot
 		if err := os.Rename(target, stage); err != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace current directory: %w", err))
 		} else {
+			ownerHash := filepath.Base(filepath.Dir(target))
+			workspaceID := filepath.Base(target)
 			marker := filepath.Join(store.rootPath, revisionMarkerDirectory, ownerHash+"-"+workspaceID+".revision")
 			if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
 				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove failed initial Workspace revision marker: %w", err))
 			}
 			rollbackErr = errors.Join(rollbackErr, syncDir(filepath.Join(store.rootPath, revisionMarkerDirectory)))
 		}
-	} else if err := renameExchange(stage, target); err != nil {
-		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace current directory: %w", err))
-	} else if hasPreviousRevision {
-		if err := store.writeRevisionMarker(ownerHash, workspaceID, previousRevision); err != nil {
-			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace revision marker: %w", err))
+	} else if update != nil {
+		if err := os.Chmod(target, 0o700); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("prepare Workspace root for rollback: %w", err))
+		}
+		rollbackErr = errors.Join(rollbackErr, update.rollbackContents())
+		if err := applyDirectoryMetadata(target, []workspace.Directory{update.oldRootMetadata}); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace root metadata: %w", err))
+		}
+		oldRootHandle, err := openWorkspaceRootModeHandle(target)
+		if err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("open previous Workspace root for rollback: %w", err))
+		} else {
+			rollbackErr = errors.Join(rollbackErr, oldRootHandle.apply(update.oldRootMetadata.Mode), oldRootHandle.close())
+		}
+		if hasPreviousRevision {
+			ownerHash := filepath.Base(filepath.Dir(target))
+			workspaceID := filepath.Base(target)
+			if err := store.writeRevisionMarker(ownerHash, workspaceID, previousRevision); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous Workspace revision marker: %w", err))
+			}
 		}
 	}
 	rollbackErr = errors.Join(rollbackErr, syncDir(ownerRoot), syncDir(tempRoot))
+	if update != nil {
+		rollbackErr = errors.Join(rollbackErr, update.close())
+		if rollbackErr == nil {
+			update.rollbackComplete = true
+			if err := removeWorkspaceTree(backup); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove failed Workspace update backup: %w", err))
+			}
+		}
+	}
 	return errors.Join(cause, rollbackErr)
 }
 

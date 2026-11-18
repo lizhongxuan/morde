@@ -30,9 +30,10 @@ function alternativesDisclosure(value: components['schemas']['TaskApprovalAltern
   return value.options.length ? value.options.join('；') : '服务端标记为已知，但未提供方案';
 }
 
-export function TaskApprovalCard({ approval, submitting = false, onDecision }: {
+export function TaskApprovalCard({ approval, submitting = false, compact = false, onDecision }: {
   approval: ApprovalView;
   submitting?: boolean;
+  compact?: boolean;
   onDecision: (decision: TaskApprovalDecision) => void;
 }) {
   const [now, setNow] = useState(Date.now);
@@ -57,13 +58,20 @@ export function TaskApprovalCard({ approval, submitting = false, onDecision }: {
     <p className="task-approval-card-object">{approval.object}</p>
     <p>{approval.content}</p>
     <p>可能影响：{approval.impact}</p>
-    <dl className="task-approval-disclosures" aria-label="风险、费用和其他审批信息">
+    <dl className="task-approval-disclosures" aria-label={compact ? '风险和本次费用' : '风险、费用和其他审批信息'}>
       <dt>风险</dt><dd>{textDisclosure(approval.disclosures?.risk)}</dd>
       <dt>本次费用</dt><dd>{costDisclosure(approval.disclosures?.this_cost)}</dd>
-      <dt>累计费用</dt><dd>{costDisclosure(approval.disclosures?.cumulative_cost)}</dd>
-      <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
-      <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd>
+      {!compact && <><dt>累计费用</dt><dd>{costDisclosure(approval.disclosures?.cumulative_cost)}</dd>
+        <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
+        <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd></>}
     </dl>
+    {compact && <details className="task-approval-more"><summary>审批详情</summary>
+      <dl className="task-approval-disclosures" aria-label="其他审批信息">
+        <dt>累计费用</dt><dd>{costDisclosure(approval.disclosures?.cumulative_cost)}</dd>
+        <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
+        <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd>
+      </dl>
+    </details>}
     {approval.expires_at && <p>审批到期：{formatDate(approval.expires_at)}</p>}
     {approval.responded_at && <p>处理时间：{formatDate(approval.responded_at)}</p>}
     {approval.status === 'expired' ? <p role="status">审批已到期；该操作已被拒绝并未执行。</p>

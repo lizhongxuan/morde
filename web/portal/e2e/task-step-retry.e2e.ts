@@ -106,6 +106,7 @@ test.describe("Assistant Task step retry", () => {
     await page.getByRole("button", { name: /^最近结束/ }).click();
     await page.getByRole("button", { name: new RegExp(`查看详情：${task.objective}`) }).click();
     const activity = page.locator(`.task-panel-detail .task-activity[data-task-id="${task.id}"]`);
+    await activity.getByText("更多信息").click();
     const retryButton = activity.getByRole("button", { name: "重试步骤 搜索资料" });
     await expect(retryButton).toBeVisible();
     await expect(activity.getByText("因操作副作用状态未知，不能安全重试。")).toBeVisible();

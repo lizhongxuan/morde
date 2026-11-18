@@ -88,36 +88,49 @@ SELECT 1 FROM workspace_sync_folders WHERE workspace_id=$1 AND owner_id=$2 AND f
 		if hasRoot {
 			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace already has a legacy root sync folder")
 		}
-		rows, err := tx.Query(ctx, `SELECT project_name FROM workspace_sync_folders
+		rows, err := tx.Query(ctx, `SELECT project_name,folder_id FROM workspace_sync_folders
 WHERE workspace_id=$1 AND owner_id=$2 AND folder_kind='project' FOR UPDATE`, workspaceID, principal.UserID)
 		if err != nil {
 			return fmt.Errorf("list existing Workspace project names: %w", err)
 		}
 		nameKey := cases.Fold().String(value.ProjectName)
+		existingFolderID := ""
 		for rows.Next() {
 			var existingName string
-			if err := rows.Scan(&existingName); err != nil {
+			var existingID string
+			if err := rows.Scan(&existingName, &existingID); err != nil {
 				rows.Close()
 				return fmt.Errorf("read existing Workspace project name: %w", err)
 			}
 			if cases.Fold().String(norm.NFC.String(existingName)) == nameKey {
-				rows.Close()
-				return domain.NewError(domain.CodeWorkspaceConflict, "Workspace already has a project folder with this name")
+				if existingName != value.ProjectName {
+					rows.Close()
+					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace already has a project folder with this name")
+				}
+				existingFolderID = existingID
+				break
 			}
 		}
+		rows.Close()
 		if err := rows.Err(); err != nil {
-			rows.Close()
 			return fmt.Errorf("read existing Workspace project names: %w", err)
 		}
-		rows.Close()
 		value.WorkspaceID = workspaceID
-		value.State = "pending_node"
-		if err := tx.QueryRow(ctx, `INSERT INTO workspace_sync_folders
+		if existingFolderID != "" {
+			value, err = scanWorkspaceSyncFolder(tx.QueryRow(ctx, workspaceSyncFolderSelect+
+				`WHERE f.workspace_id=$1 AND f.owner_id=$2 AND f.folder_id=$3`, workspaceID, principal.UserID, existingFolderID))
+			if err != nil {
+				return fmt.Errorf("read existing Workspace project folder for Host rebind: %w", err)
+			}
+		} else {
+			value.State = "pending_node"
+			if err := tx.QueryRow(ctx, `INSERT INTO workspace_sync_folders
 (workspace_id,owner_id,folder_id,folder_kind,project_name,project_name_folded,relative_path,state)
 VALUES ($1,$2,$3,'project',$4,$5,$6,'pending_node')
 RETURNING created_at,updated_at`, workspaceID, principal.UserID, value.FolderID, value.ProjectName, nameKey, value.RelativePath).
-			Scan(&value.CreatedAt, &value.UpdatedAt); err != nil {
-			return fmt.Errorf("register Workspace project sync folder: %w", err)
+				Scan(&value.CreatedAt, &value.UpdatedAt); err != nil {
+				return fmt.Errorf("register Workspace project sync folder: %w", err)
+			}
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO workspace_sync_folder_registration_requests
 (owner_id,host_id,workspace_id,idempotency_key_hash,request_hash,folder_id)

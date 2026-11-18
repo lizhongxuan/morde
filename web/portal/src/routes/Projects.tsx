@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError } from '../api/client';
 import { isTransientNetworkError } from '../api/errors';
 import type { components } from '../api/schema';
@@ -221,6 +221,14 @@ function UserProjects() {
     refetchInterval: (query) => query.state.data?.some((message) => message.output_status === 'streaming') ? 1000
       : query.state.data?.some((message) => message.routing_status === 'pending' || message.routing_status === 'processing' || message.routing_status === 'waiting_adjustment') ? 2000 : 5000,
   });
+  const projectConversationTaskIDs = [...new Set((projectConversationMessagesQuery.data ?? []).flatMap((message) =>
+    message.role === 'user' && !message.duplicate_of_message_id ? [message.task_id, message.related_task_id].filter((id): id is string => Boolean(id)) : []))];
+  const projectConversationTaskQueries = useQueries({ queries: projectConversationTaskIDs.map((id) => ({
+    queryKey: ['project-conversation-task', id], queryFn: () => portalApi.task(id), enabled: Boolean(projectID && selectedProjectConversation), retry: false,
+    refetchInterval: (query: { state: { data: Awaited<ReturnType<typeof portalApi.task>> | undefined } }) =>
+      query.state.data && !['completed', 'failed', 'cancelled'].includes(query.state.data.status) ? 1500 : false,
+  })) });
+  const projectConversationTaskQueriesByID = new Map(projectConversationTaskIDs.map((id, index) => [id, projectConversationTaskQueries[index]]));
   useNetworkReadNotice([
     { failed: projectsQuery.isError, error: projectsQuery.error, retry: () => projectsQuery.refetch() },
     { failed: projectQuery.isError, error: projectQuery.error, retry: () => projectQuery.refetch() },
@@ -248,6 +256,11 @@ function UserProjects() {
   const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
   const projectVariantTimeline = buildMessageVariantTimeline(projectConversationMessages as ProjectVersionableMessage[], selectedVariantMap);
   const visibleProjectConversationMessages = projectVariantTimeline.items;
+  const latestProjectMessageByTaskID = new Map<string, string>();
+  for (const message of visibleProjectConversationMessages) {
+    const taskID = message.task_id ?? message.related_task_id;
+    if (message.role === 'user' && !message.duplicate_of_message_id && taskID) latestProjectMessageByTaskID.set(taskID, message.id);
+  }
   const readyTextModels = modelConnectionsQuery.data?.items.filter((model) => model.checked_at && model.capabilities.text) ?? [];
   const effectiveProjectModelID = projectModelID || (readyTextModels.length === 1 ? readyTextModels[0]?.id : '') || '';
 
@@ -990,6 +1003,9 @@ function UserProjects() {
                           (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
                         const editingThisMessage = editingMessageVariant?.messageID === message.id;
                         const task = taskByID.get(message.task_id ?? message.related_task_id ?? '');
+                        const taskID = message.task_id ?? message.related_task_id;
+                        const processingTaskQuery = taskID ? projectConversationTaskQueriesByID.get(taskID) : undefined;
+                        const processingTask = processingTaskQuery?.data;
                         const retryAccepted = retryAcceptedMessageIDs.has(message.id);
                         const retryAcceptedStatus = retryAccepted && ['failed', 'pending', 'processing'].includes(message.routing_status ?? '')
                           ? '正在重新处理消息' : null;
@@ -998,6 +1014,18 @@ function UserProjects() {
                             ? ` · Task ${message.related_task_id} · 状态 ${task?.status ?? '待核对'}` : ''}`
                           : message.role === 'user' ? retryAcceptedStatus ?? (message.delivery_status === 'applied' ? deliveryStatusText('applied') : null)
                             : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status);
+                        const processingRevisionIsCurrent = processingTask?.current_revision === undefined || processingTask?.desired_revision === undefined ||
+                          processingTask.current_revision === processingTask.desired_revision;
+                        const isAgentProcessing = message.role === 'user' && !message.duplicate_of_message_id &&
+                          (taskID ? Boolean(latestProjectMessageByTaskID.get(taskID) === message.id && processingTask &&
+                            !processingTaskQuery?.isError && !processingTaskQuery?.isRefetchError && processingTask.status === 'running' &&
+                            processingTask.current_revision_started === true && processingRevisionIsCurrent && !processingTask.waiting_reason && processingTask.pending_request?.status !== 'pending')
+                            : message.routing_status === 'processing' && !projectConversationMessagesQuery.isError && !projectConversationMessagesQuery.isRefetchError);
+                        const canEditThisMessage = message.role === 'user' && message.actor_id === user?.id && currentMember && currentMember.role !== 'viewer' && !editingThisMessage;
+                        const hasVariantControls = Boolean(variantGroup && (
+                          (message.role === 'user' && (variantGroup.versions.size > 1 || Boolean(canEditThisMessage))) ||
+                          (message.role === 'assistant' && canOperateVariant && ((message.content.trim() && message.output_status !== 'streaming') || message.output_status === 'interrupted'))
+                        ));
                         const sources = message.role === 'assistant' ? message.sources ?? [] : [];
                         const sourceContentMatches = sources.length > 0 && sources.every((source) => source.content.length > 0) &&
                           sources.map((source) => source.content).join('\n\n') === message.content;
@@ -1051,6 +1079,12 @@ function UserProjects() {
                               </span>)}
                             </div>}
                           </>}
+                          {message.role === 'user' && message.agent_acknowledged === true && <span className="project-message-received" role="img"
+                            aria-label="主 Agent 已接下，正在处理" title="主 Agent 已接下，正在处理">👌🏻</span>}
+                          {isAgentProcessing && <div className="chat-message-row chat-message-row-assistant chat-thinking-row project-agent-processing" role="status" aria-label="Morde 正在思考">
+                            <span className="thinking-mascot" aria-hidden="true"><i /></span>
+                            <div className="thinking-bubble"><div className="thinking-dots" aria-hidden="true"><span /><span /><span /></div></div>
+                          </div>}
                           {message.role === 'assistant' && message.output_status !== 'streaming' && message.output_status !== 'interrupted' &&
                             <AssistantReplySpeech text={message.content} sessionKey={`project:${project.id}:conversation:${message.conversation_id}`} />}
                           {message.attachment_ids?.length ? <p className="muted">附件 · {message.attachment_ids.length}
@@ -1060,7 +1094,7 @@ function UserProjects() {
                           </p> : null}
                           {message.output_status === 'streaming' && <small role="status">正在生成…</small>}
                           {message.output_status === 'interrupted' && <small role="status">回复已中断</small>}
-                          {variantGroup && <div className="message-variant-controls" aria-label="项目消息版本操作">
+                          {hasVariantControls && variantGroup && <div className="message-variant-controls" aria-label="项目消息版本操作">
                             {message.role === 'user' && variantGroup.versions.size > 1 && <label className="message-variant-picker">版本
                               <select aria-label="选择项目消息版本" value={selectedVariantVersion} onChange={(event) => setSelectedMessageVariantVersions((current) => ({
                                 ...current, [variantGroup.id]: Number(event.target.value),

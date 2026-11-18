@@ -23,6 +23,10 @@ type CloudDSHCoordinatorModelGateway interface {
 		string, int64, json.RawMessage) (app.ModelResponse, error)
 }
 
+type cloudDSHCoordinatorRouteFallback interface {
+	ClassifyConversationRoute(context.Context, app.ConversationRouteClaim, app.ConversationRouteContext) (app.ConversationRouteDecision, error)
+}
+
 type CloudDSHCoordinatorCheckpoints interface {
 	Head(context.Context, app.ConversationRouteClaim, app.ConversationCoordinatorIdentity, []byte) (app.ConversationCoordinatorCheckpointHead, error)
 	Save(context.Context, app.ConversationCoordinatorCheckpointCommand) (bool, error)
@@ -169,6 +173,21 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 	}
 	runtime, err := c.runtimes.Acquire(ctx, claim.Message.OwnerID, claim.Message.ConversationID)
 	if err != nil {
+		if isOwnerExecutionDisabled(err) {
+			if fallback, ok := c.options.Models.(cloudDSHCoordinatorRouteFallback); ok {
+				// Plain replies need no account execution permission and have no tools.
+				decision, fallbackErr := fallback.ClassifyConversationRoute(ctx, claim, value)
+				if fallbackErr != nil {
+					return app.ConversationRouteDecision{}, fallbackErr
+				}
+				if decision.Action != app.ConversationRouteReply && decision.Action != app.ConversationRouteClarify {
+					return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+						Question:    "当前账号的云端执行权限尚未启用，暂时不能启动任务或使用工具。请联系管理员启用后重试。",
+						ModelOutput: decision.ModelOutput}, nil
+				}
+				return decision, nil
+			}
+		}
 		return app.ConversationRouteDecision{}, err
 	}
 	stream, err := runtime.StartCoordinator(ctx, claim, identity, start)
@@ -292,6 +311,11 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 			return app.ConversationRouteDecision{}, fmt.Errorf("unsupported DSH coordinator frame %q", frame.Type)
 		}
 	}
+}
+
+func isOwnerExecutionDisabled(err error) bool {
+	var domainErr *domain.Error
+	return errors.As(err, &domainErr) && domainErr.Code == domain.CodeConflict && domainErr.Details["state"] == "disabled"
 }
 
 func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim, value app.ConversationRouteContext) app.ConversationCoordinatorIdentity {

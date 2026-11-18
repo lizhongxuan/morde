@@ -30,8 +30,8 @@ private struct MIFWorkItemTitleInput: View {
         .disabled(isDisabled)
         .padding(.horizontal, 15)
         .frame(minHeight: 44)
-        .background(NanoMuseTones.surface, in: Capsule())
-        .overlay(Capsule().strokeBorder(border))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(border, lineWidth: 1.5))
         .accessibilityIdentifier("morde.workItems.create.title")
     }
 }
@@ -148,7 +148,6 @@ struct MIFWorkItemRoom: View {
     var workItemSection: Binding<MIFTaskWorkItemSection>? = nil
     @StateObject private var store = MIFWorkItemPageStore.shared
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.colorScheme) private var colorScheme
     @State private var title = ""
     @State private var description = ""
     @FocusState private var focusedInput: MIFWorkItemInputField?
@@ -167,63 +166,43 @@ struct MIFWorkItemRoom: View {
     @State private var createSuccessToastID = UUID()
 
     private var workItemSecondaryText: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.secondaryText
-            : Color(red: 115.0 / 255.0, green: 115.0 / 255.0, blue: 120.0 / 255.0)
+        NanoMuseTones.secondaryText
     }
 
     private var workItemInk: Color {
-        colorScheme == .dark
-            ? .white
-            : Color(red: 17.0 / 255.0, green: 17.0 / 255.0, blue: 17.0 / 255.0)
+        NanoMuseTones.ink
     }
 
     private var workItemSheetBackground: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.canvas
-            : Color(red: 250.0 / 255.0, green: 250.0 / 255.0, blue: 250.0 / 255.0)
+        NanoMuseTones.canvas
     }
 
     private var workItemInputBorder: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.hairline
-            : Color(red: 232.0 / 255.0, green: 232.0 / 255.0, blue: 232.0 / 255.0)
+        NanoMuseTones.brandTint
     }
 
     private var workItemStatusText: Color {
-        colorScheme == .dark
-            ? Color(uiColor: UIColor.tertiaryLabel)
-            : Color(red: 172.0 / 255.0, green: 172.0 / 255.0, blue: 177.0 / 255.0)
+        NanoMuseTones.muted
     }
 
     private var workItemNeutralFill: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.fill
-            : Color(red: 236.0 / 255.0, green: 236.0 / 255.0, blue: 240.0 / 255.0)
+        NanoMuseTones.fill
     }
 
     private var workItemBugFill: Color {
-        colorScheme == .dark
-            ? Color.red.opacity(0.1)
-            : Color(red: 253.0 / 255.0, green: 236.0 / 255.0, blue: 236.0 / 255.0)
+        NanoMuseTones.dangerFill
     }
 
     private var workItemBugText: Color {
-        colorScheme == .dark
-            ? Color.red
-            : Color(red: 200.0 / 255.0, green: 30.0 / 255.0, blue: 30.0 / 255.0)
+        NanoMuseTones.dangerInk
     }
 
     private var workItemFilterFill: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.fill
-            : Color(red: 239.0 / 255.0, green: 239.0 / 255.0, blue: 239.0 / 255.0)
+        NanoMuseTones.side
     }
 
     private var workItemTypeToggleFill: Color {
-        colorScheme == .dark
-            ? NanoMuseTones.fill
-            : Color(red: 240.0 / 255.0, green: 240.0 / 255.0, blue: 242.0 / 255.0)
+        NanoMuseTones.side
     }
 
     private var selectedProject: MordeProject? {
@@ -333,10 +312,12 @@ struct MIFWorkItemRoom: View {
             if let createSuccessToast {
                 Text(createSuccessToast)
                     .font(.subheadline)
-                    .foregroundStyle(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .background(Color.black.opacity(0.82), in: Capsule())
+                    .foregroundStyle(NanoMuseTones.ink)
+                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+                    .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
                     .padding(.bottom, (onMenu != nil || chrome != nil) ? NanoMuseBottomBar.height + 24 : 24)
                     .accessibilityIdentifier("morde.workItems.create.successToast")
                     .transition(.opacity)
@@ -458,7 +439,7 @@ struct MIFWorkItemRoom: View {
                         .foregroundStyle(NanoMuseTones.action)
                     Text(selectedProject?.name ?? AppLocalized("Choose project"))
                         .font(.body.weight(.medium))
-                        .foregroundStyle(Color.primary)
+                        .foregroundStyle(NanoMuseTones.ink)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: "chevron.down")
@@ -490,7 +471,7 @@ struct MIFWorkItemRoom: View {
             if let failure = store.conversationsState.failureMessage {
                 Text(String(format: AppLocalized("Could not load project conversations: %@"), failure))
                     .font(.footnote)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(NanoMuseTones.dangerInk)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("morde.workItems.conversations.loadError")
             } else if !store.conversationsState.isLoaded {
@@ -554,7 +535,7 @@ struct MIFWorkItemRoom: View {
                 if let failure = store.conversationError {
                     Text(failure)
                         .font(.footnote)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NanoMuseTones.dangerInk)
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("morde.workItems.conversation.error")
                 } else if let task = store.currentTask {
@@ -578,8 +559,8 @@ struct MIFWorkItemRoom: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
         .padding(.horizontal, 16)
     }
 
@@ -616,7 +597,7 @@ struct MIFWorkItemRoom: View {
                 if let error = createFailure {
                     Text(error)
                         .font(.footnote)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NanoMuseTones.dangerInk)
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("morde.workItems.create.error")
                 }
@@ -634,7 +615,7 @@ struct MIFWorkItemRoom: View {
                     .font(.system(size: 15.5, weight: .semibold))
                     .foregroundStyle(NanoMuseTones.onInk)
                     .frame(maxWidth: .infinity, minHeight: 44)
-                    .background(workItemInk, in: Capsule())
+                    .background(NanoMuseTones.action, in: Capsule())
                 }
                 .buttonStyle(.plain)
                 .disabled(store.actionInFlight)
@@ -770,7 +751,7 @@ struct MIFWorkItemRoom: View {
                             .foregroundStyle(NanoMuseTones.onInk)
                             .padding(.horizontal, 15)
                             .padding(.vertical, 8)
-                            .background(workItemInk, in: Capsule())
+                            .background(NanoMuseTones.action, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .disabled(store.actionInFlight)
@@ -798,7 +779,7 @@ struct MIFWorkItemRoom: View {
             if !item.blocked_reason.isEmpty {
                 Text(String(format: AppLocalized("Blocked reason: %@"), item.blocked_reason))
                     .font(.footnote)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(NanoMuseTones.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !item.task_ids.isEmpty {
@@ -862,7 +843,11 @@ struct MIFWorkItemRoom: View {
                 if blockingItemID == item.id {
                     TextField(AppLocalized("Reason for blocking"), text: $blockedReason, axis: .vertical)
                         .lineLimit(2...5)
-                        .textFieldStyle(.roundedBorder)
+                        .textFieldStyle(.plain)
+                        .padding(12)
+                        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
                         .focused($focusedInput, equals: .blockReason)
                         .disabled(store.actionInFlight)
                         .accessibilityIdentifier("morde.workItems.blockReason.\(item.id)")
@@ -915,7 +900,7 @@ struct MIFWorkItemRoom: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(createCategory == category ? NanoMuseTones.onInk : workItemSecondaryText)
                 .frame(maxWidth: .infinity, minHeight: 40)
-                .background(createCategory == category ? workItemInk : workItemTypeToggleFill, in: Capsule())
+                .background(createCategory == category ? NanoMuseTones.action : workItemTypeToggleFill, in: Capsule())
         }
         .buttonStyle(.plain)
         .disabled(store.actionInFlight)
@@ -1053,7 +1038,7 @@ struct MIFWorkItemRoom: View {
         VStack(alignment: .leading, spacing: 10) {
             Label(AppLocalized("Could not load"), systemImage: "exclamationmark.triangle")
                 .font(.headline)
-                .foregroundStyle(.orange)
+                .foregroundStyle(NanoMuseTones.dangerInk)
             Text(message)
                 .font(.footnote)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1061,8 +1046,8 @@ struct MIFWorkItemRoom: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
         .padding(.horizontal, 16)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("morde.workItems.loadError")
@@ -1071,7 +1056,7 @@ struct MIFWorkItemRoom: View {
     private func inlineMessage(_ message: String, isError: Bool) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: isError ? "exclamationmark.circle" : "checkmark.circle")
-                .foregroundStyle(isError ? Color.orange : NanoMuseTones.action)
+                .foregroundStyle(isError ? NanoMuseTones.danger : NanoMuseTones.action)
                 .accessibilityHidden(true)
             Text(message)
                 .font(.footnote)
@@ -1079,7 +1064,7 @@ struct MIFWorkItemRoom: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .padding(.horizontal, 16)
         .accessibilityElement(children: .combine)
     }
@@ -1098,7 +1083,7 @@ struct MIFWorkItemRoom: View {
         }
         .frame(maxWidth: .infinity, minHeight: 150)
         .padding(20)
-        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .padding(.horizontal, 16)
         .accessibilityElement(children: .combine)
     }

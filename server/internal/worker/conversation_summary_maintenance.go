@@ -27,6 +27,7 @@ const conversationSummaryIncompleteNotice = "【历史摘要不完整】当前�
 
 type conversationSummaryMaintainer interface {
 	ResolveConversationSummaryModel(context.Context, app.ConversationRouteClaim) (string, int, error)
+	EstimateConversationSummaryTokenPressure(context.Context, CloudDSHConversationSummaryEstimateRequest) ([]int, error)
 	CompactConversationSummary(context.Context, CloudDSHConversationSummaryRequest) (CloudDSHConversationSummaryResult, error)
 }
 
@@ -41,6 +42,7 @@ type conversationSummaryMaintenanceInput struct {
 	sources         []app.ConversationSummaryPromptSource
 	proofs          []app.ConversationSummarySource
 	inputBytes      int
+	inputTokens     int
 }
 
 func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context, claim app.ConversationRouteClaim, routeModelID string) (bool, error) {
@@ -64,7 +66,8 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 	if err != nil {
 		return false, err
 	}
-	input, ready, err := collectConversationSummaryMaintenanceInput(ctx, w.options.SummaryInputs, claim, contextWindow, page, w.options.SummarySealer)
+	input, ready, err := collectConversationSummaryMaintenanceInput(ctx, w.options.SummaryInputs, maintainer,
+		claim, modelID, contextWindow, page, w.options.SummarySealer)
 	if err != nil || !ready {
 		return false, err
 	}
@@ -143,7 +146,8 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 }
 
 func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.ConversationSummaryInputPageStore,
-	claim app.ConversationRouteClaim, contextWindow int, first app.ConversationSummaryInputPage, sealer *app.Sealer) (conversationSummaryMaintenanceInput, bool, error) {
+	maintainer conversationSummaryMaintainer, claim app.ConversationRouteClaim, modelID string, contextWindow int,
+	first app.ConversationSummaryInputPage, sealer *app.Sealer) (conversationSummaryMaintenanceInput, bool, error) {
 	input := conversationSummaryMaintenanceInput{identity: first.Identity, head: first.Head}
 	if first.BoundarySequence != claim.Message.Sequence-1 || first.Head.Identity != first.Identity {
 		return input, false, domain.NewError(domain.CodeConflict, "conversation summary input boundary changed")
@@ -164,8 +168,8 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 	} else if first.Head.Version != 0 {
 		return input, false, domain.NewError(domain.CodeInvalidState, "conversation summary head has no stored version")
 	}
-	budget := conversationSummaryMaintenanceInputBudget(contextWindow)
-	if budget <= 0 {
+	tokenBudget := conversationSummaryMaintenanceTokenBudget(contextWindow)
+	if tokenBudget <= 0 {
 		return input, false, domain.NewError(domain.CodeUnsupported, "conversation summary model capacity is unavailable")
 	}
 	var cursor *app.ConversationSummaryInputCursor
@@ -175,25 +179,26 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 	currentEnd := int64(0)
 	selectedCount := 0
 	inspectedCount := 0
-	ready, stopped, exhausted := false, false, false
+	ready, stopped, exhausted, capped := false, false, false, false
 	appendCurrent := func() error {
 		if len(current) == 0 {
 			return nil
 		}
 		candidate := append(append([]app.ConversationSummaryPromptSource(nil), input.sources...), current...)
+		candidateBytes := conversationSummaryMaintenanceInputBytes(input.previousText, candidate)
 		if selectedCount+1 > conversationSummaryMaintenanceMaxSources || len(candidate) > app.MaxConversationSummarySources ||
-			conversationSummaryMaintenanceEstimate(input.previousText, candidate) > budget {
-			stopped = true
+			candidateBytes > conversationSummaryMaintenanceMaxInputBytes {
+			stopped, capped = true, true
 			return nil
 		}
 		input.sources = candidate
 		input.proofs = append(input.proofs, current[0].Source)
 		selectedCount++
-		input.inputBytes = conversationSummaryMaintenanceEstimate(input.previousText, input.sources)
+		input.inputBytes = candidateBytes
 		current = nil
 		currentKey, currentEnd = "", 0
-		if input.inputBytes >= budget*3/4 {
-			ready, stopped = true, true
+		if input.inputBytes >= conversationSummaryMaintenanceMaxInputBytes*3/4 {
+			ready, stopped, capped = true, true, true
 		}
 		return nil
 	}
@@ -208,7 +213,7 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 		for _, item := range page.Sources {
 			inspectedCount++
 			if inspectedCount > app.MaxConversationSummarySources {
-				stopped = true
+				stopped, capped = true, true
 				break
 			}
 			key := summaryMaintenanceSourceKey(item.Source)
@@ -232,9 +237,9 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 			}
 			current = append(current, item)
 			currentEnd += int64(len(item.Content))
-			if conversationSummaryMaintenanceEstimate(input.previousText,
-				append(append([]app.ConversationSummaryPromptSource(nil), input.sources...), current...)) > budget {
-				stopped = true
+			candidate := append(append([]app.ConversationSummaryPromptSource(nil), input.sources...), current...)
+			if conversationSummaryMaintenanceInputBytes(input.previousText, candidate) > conversationSummaryMaintenanceMaxInputBytes {
+				stopped, capped = true, true
 				break
 			}
 		}
@@ -264,8 +269,52 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 			return input, false, err
 		}
 	}
-	input.historyComplete = exhausted
-	if len(input.sources) == 0 || input.inputBytes < budget*3/4 {
+	if len(input.sources) == 0 {
+		return input, false, nil
+	}
+	counts, err := maintainer.EstimateConversationSummaryTokenPressure(ctx, CloudDSHConversationSummaryEstimateRequest{
+		Claim: claim, ModelID: modelID, ContextWindowTokens: contextWindow, Sources: input.sources,
+		PreviousSummaryText: input.previousText, PreviousSummaryVersion: input.previousVersion,
+		PreviousSummarySHA256: input.previousDigest,
+	})
+	if err != nil {
+		return input, false, err
+	}
+	if len(counts) != len(input.sources) {
+		return input, false, domain.NewError(domain.CodeInvalidState, "conversation summary token estimate does not match its sources")
+	}
+	selectedEnd, tokenLimitReached := 0, false
+	for start := 0; start < len(input.sources); {
+		end := start + 1
+		key := summaryMaintenanceSourceKey(input.sources[start].Source)
+		for end < len(input.sources) && summaryMaintenanceSourceKey(input.sources[end].Source) == key {
+			end++
+		}
+		pressure := counts[end-1]
+		if pressure > tokenBudget {
+			tokenLimitReached = true
+			break
+		}
+		selectedEnd, input.inputTokens = end, pressure
+		if pressure >= tokenBudget*3/4 {
+			ready = true
+			break
+		}
+		start = end
+	}
+	if selectedEnd == 0 {
+		return input, false, nil
+	}
+	if selectedEnd < len(input.sources) {
+		input.sources = input.sources[:selectedEnd]
+		input.inputBytes = conversationSummaryMaintenanceInputBytes(input.previousText, input.sources)
+		exhausted = false
+	}
+	input.historyComplete = exhausted && selectedEnd == len(counts)
+	if tokenLimitReached && selectedEnd > 0 || input.inputBytes >= conversationSummaryMaintenanceMaxInputBytes*3/4 || capped {
+		ready = true
+	}
+	if !ready {
 		return input, false, nil
 	}
 	if _, err := app.ConversationSummaryPromptDigest(input.sources); err != nil {
@@ -275,16 +324,16 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 	return input, err == nil, err
 }
 
-func conversationSummaryMaintenanceInputBudget(contextWindow int) int {
-	if contextWindow < 4096 || contextWindow > 1_000_000 {
+func conversationSummaryMaintenanceTokenBudget(contextWindow int) int {
+	if contextWindow < 4096 || contextWindow > app.MaxModelContextWindowTokens {
 		return 0
 	}
 	headroom := min(4096, contextWindow/8)
 	maxTokens := min(2048, max(256, contextWindow/16))
-	return min(conversationSummaryMaintenanceMaxInputBytes, contextWindow-headroom-maxTokens-conversationSummaryMaintenanceOverheadBytes)
+	return contextWindow - headroom - maxTokens
 }
 
-func conversationSummaryMaintenanceEstimate(previous string, sources []app.ConversationSummaryPromptSource) int {
+func conversationSummaryMaintenanceInputBytes(previous string, sources []app.ConversationSummaryPromptSource) int {
 	encoded, err := json.Marshal(cloudDSHConversationSummarySources(sources))
 	if err != nil {
 		return int(^uint(0) >> 1)

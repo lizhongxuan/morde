@@ -42,6 +42,160 @@ func TestWorkspaceVolumeServiceProvisionsPendingAndVerifiesReady(t *testing.T) {
 	}
 }
 
+func TestWorkspaceVolumeServiceUsesStableAgentWorkspaceHostPath(t *testing.T) {
+	store := &workspaceVolumeTestStore{}
+	provisioner := &workspaceVolumeTestProvisioner{}
+	service, err := NewWorkspaceVolumeService(store, provisioner, "instance-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &workspaceVolumeHostPathResolverStub{resolution: AgentWorkspaceHostPathResolution{
+		IsAgentWorkspace: true,
+		HostPath:         "/srv/morde-workspace-sync/current/owner/workspace",
+	}}
+	if err := service.SetAgentWorkspaceHostPathResolver(resolver); err != nil {
+		t.Fatal(err)
+	}
+
+	volume, err := service.PrepareHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567", "/home/gem/workspace", "")
+	if err != nil {
+		t.Fatalf("PrepareHostWorkspaceVolume(Agent Workspace) = %v", err)
+	}
+	if volume.Name != "workspace" || volume.MountPath != "/home/gem/workspace" || volume.HostPath != resolver.resolution.HostPath ||
+		volume.ClaimName != "" || volume.Storage != "" || !volume.RequireExisting {
+		t.Fatalf("Agent Workspace mount = %#v", volume)
+	}
+	if resolver.calls != 1 || resolver.lastOwnerID != "u1234567" || resolver.lastWorkspaceID != "w1234567" {
+		t.Fatalf("Agent Workspace resolver call = %#v", resolver)
+	}
+	if store.getCalls != 0 || store.readyCalls != 0 || provisioner.ensureCalls != 0 || provisioner.verifyCalls != 0 {
+		t.Fatalf("Agent Workspace unexpectedly used the PVC registry: store=%#v provisioner=%#v", store, provisioner)
+	}
+}
+
+func TestWorkspaceVolumeServiceRequiresAgentWorkspaceMountAtUserWorkspacePath(t *testing.T) {
+	service, err := NewWorkspaceVolumeService(&workspaceVolumeTestStore{}, &workspaceVolumeTestProvisioner{}, "instance-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &workspaceVolumeHostPathResolverStub{resolution: AgentWorkspaceHostPathResolution{
+		IsAgentWorkspace: true,
+		HostPath:         "/srv/morde-workspace-sync/current/owner/workspace",
+	}}
+	if err := service.SetAgentWorkspaceHostPathResolver(resolver); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PrepareHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567", "/workspace", "20Gi"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("PrepareHostWorkspaceVolume(alternate Agent Workspace path) error = %v, want invalid argument", err)
+	}
+}
+
+func TestWorkspaceVolumeServiceRejectsInvalidAgentWorkspaceHostPaths(t *testing.T) {
+	missingDirectoryErr := errors.New("Agent Workspace current directory is missing")
+	tests := []struct {
+		name        string
+		resolution  AgentWorkspaceHostPathResolution
+		resolverErr error
+		wantCode    domain.ErrorCode
+		wantCause   error
+	}{
+		{
+			name: "missing current directory", resolution: AgentWorkspaceHostPathResolution{IsAgentWorkspace: true},
+			resolverErr: missingDirectoryErr, wantCause: missingDirectoryErr,
+		},
+		{
+			name: "Host mount gate is closed", resolution: AgentWorkspaceHostPathResolution{IsAgentWorkspace: true},
+			resolverErr: domain.NewError(domain.CodeWorkspaceUnavailable, "Agent Workspace Host mount is disabled"),
+			wantCode:    domain.CodeWorkspaceUnavailable,
+		},
+		{name: "empty path", resolution: AgentWorkspaceHostPathResolution{IsAgentWorkspace: true}, wantCode: domain.CodeInvalidState},
+		{name: "relative path", resolution: AgentWorkspaceHostPathResolution{IsAgentWorkspace: true, HostPath: "current/workspace"}, wantCode: domain.CodeInvalidState},
+		{name: "root path", resolution: AgentWorkspaceHostPathResolution{IsAgentWorkspace: true, HostPath: "/"}, wantCode: domain.CodeInvalidState},
+		{name: "noncanonical path", resolution: AgentWorkspaceHostPathResolution{IsAgentWorkspace: true, HostPath: "/srv/current/../workspace"}, wantCode: domain.CodeInvalidState},
+		{name: "non-Agent result with path", resolution: AgentWorkspaceHostPathResolution{HostPath: "/srv/current/workspace"}, wantCode: domain.CodeInvalidState},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &workspaceVolumeTestStore{registry: WorkspaceVolumeRegistry{
+				WorkspaceID: "w1234567", OwnerID: "u1234567", ProvisionedOwnerID: "u1234567",
+				State: WorkspaceVolumeReady, VolumeName: WorkspaceNamedVolumeName("w1234567"),
+			}}
+			provisioner := &workspaceVolumeTestProvisioner{}
+			service, err := NewWorkspaceVolumeService(store, provisioner, "instance-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := &workspaceVolumeHostPathResolverStub{resolution: test.resolution, err: test.resolverErr}
+			if err := service.SetAgentWorkspaceHostPathResolver(resolver); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := service.PrepareHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567", "/home/gem/workspace", "20Gi"); err == nil {
+				t.Fatal("PrepareHostWorkspaceVolume() error = nil, want fail-closed result")
+			} else if test.wantCause != nil && !errors.Is(err, test.wantCause) {
+				t.Fatalf("PrepareHostWorkspaceVolume() error = %v, want cause %v", err, test.wantCause)
+			} else if test.wantCode != "" && domain.CodeOf(err) != test.wantCode {
+				t.Fatalf("PrepareHostWorkspaceVolume() error code = %q, want %q: %v", domain.CodeOf(err), test.wantCode, err)
+			}
+			if store.getCalls != 0 || provisioner.ensureCalls != 0 || provisioner.verifyCalls != 0 {
+				t.Fatalf("invalid Agent Workspace path fell back to PVC: store=%#v provisioner=%#v", store, provisioner)
+			}
+		})
+	}
+}
+
+func TestWorkspaceVolumeServiceKeepsPVCForNonAgentWorkspace(t *testing.T) {
+	store := &workspaceVolumeTestStore{registry: WorkspaceVolumeRegistry{
+		WorkspaceID: "w1234567", OwnerID: "u1234567", ProvisionedOwnerID: "u1234567",
+		State: WorkspaceVolumeReady, VolumeName: WorkspaceNamedVolumeName("w1234567"),
+	}}
+	provisioner := &workspaceVolumeTestProvisioner{}
+	service, err := NewWorkspaceVolumeService(store, provisioner, "instance-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetAgentWorkspaceHostPathResolver(&workspaceVolumeHostPathResolverStub{}); err != nil {
+		t.Fatal(err)
+	}
+
+	volume, err := service.PrepareHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567", "/home/gem/workspace", "20Gi")
+	if err != nil {
+		t.Fatalf("PrepareHostWorkspaceVolume(non-Agent Workspace) = %v", err)
+	}
+	if volume.HostPath != "" || volume.ClaimName != WorkspaceNamedVolumeName("w1234567") || volume.Storage != "20Gi" || !volume.RequireExisting {
+		t.Fatalf("non-Agent Workspace PVC = %#v", volume)
+	}
+	if store.getCalls != 1 || provisioner.verifyCalls != 1 || provisioner.ensureCalls != 0 {
+		t.Fatalf("non-Agent Workspace did not use its registered PVC: store=%#v provisioner=%#v", store, provisioner)
+	}
+}
+
+func TestWorkspaceVolumeServiceDoesNotDeleteStableAgentWorkspaceDirectory(t *testing.T) {
+	store := &workspaceVolumeTestStore{registry: WorkspaceVolumeRegistry{
+		WorkspaceID: "w1234567", OwnerID: "u1234567", State: WorkspaceVolumeReady,
+		VolumeName: WorkspaceNamedVolumeName("w1234567"), ProvisionedOwnerID: "u1234567",
+	}}
+	provisioner := &workspaceVolumeTestProvisioner{}
+	service, err := NewWorkspaceVolumeService(store, provisioner, "instance-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetAgentWorkspaceHostPathResolver(&workspaceVolumeHostPathResolverStub{resolution: AgentWorkspaceHostPathResolution{
+		IsAgentWorkspace: true, HostPath: "/srv/morde-workspace-sync/current/owner/workspace",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ValidateHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567"); err != nil {
+		t.Fatalf("ValidateHostWorkspaceVolume(Agent Workspace) = %v", err)
+	}
+	if err := service.DeleteHostWorkspaceVolume(context.Background(), "u1234567", "h1234567", "w1234567"); err != nil {
+		t.Fatalf("DeleteHostWorkspaceVolume(Agent Workspace) = %v", err)
+	}
+	if store.getCalls != 0 || provisioner.verifyDeleteCalls != 0 || provisioner.deleteWorkspaceCalls != 0 {
+		t.Fatalf("Agent Workspace directory was routed through PVC cleanup: store=%#v provisioner=%#v", store, provisioner)
+	}
+}
+
 func TestWorkspaceVolumeServiceFailsClosedForUnmappedLegacyWorkspace(t *testing.T) {
 	for _, legacyHostID := range []string{"", "h8765432"} {
 		store := &workspaceVolumeTestStore{registry: WorkspaceVolumeRegistry{
@@ -158,11 +312,13 @@ func TestWorkspaceVolumeServiceRejectsIdentityAndProvisionFailures(t *testing.T)
 type workspaceVolumeTestStore struct {
 	registry      WorkspaceVolumeRegistry
 	legacyVolumes []WorkspaceVolumeRegistry
+	getCalls      int
 	readyCalls    int
 	readyErr      error
 }
 
 func (s *workspaceVolumeTestStore) GetWorkspaceVolumeRegistry(context.Context, string) (WorkspaceVolumeRegistry, error) {
+	s.getCalls++
 	return s.registry, nil
 }
 
@@ -187,13 +343,15 @@ func (s *workspaceVolumeTestStore) MarkWorkspaceVolumeReady(_ context.Context, o
 }
 
 type workspaceVolumeTestProvisioner struct {
-	ensureCalls int
-	verifyCalls int
-	deleteCalls int
-	ensureErr   error
-	verifyErr   error
-	deleteErr   error
-	lastOwnerID string
+	ensureCalls          int
+	verifyCalls          int
+	verifyDeleteCalls    int
+	deleteCalls          int
+	deleteWorkspaceCalls int
+	ensureErr            error
+	verifyErr            error
+	deleteErr            error
+	lastOwnerID          string
 }
 
 func (p *workspaceVolumeTestProvisioner) EnsureWorkspaceVolume(_ context.Context, _, _, ownerID, _ string) error {
@@ -209,10 +367,27 @@ func (p *workspaceVolumeTestProvisioner) VerifyWorkspaceVolume(_ context.Context
 }
 
 func (p *workspaceVolumeTestProvisioner) VerifyWorkspaceVolumeForDelete(context.Context, string, string, string, string) error {
+	p.verifyDeleteCalls++
 	return p.verifyErr
 }
 
 func (p *workspaceVolumeTestProvisioner) DeleteWorkspaceVolume(context.Context, string, string, string, string) error {
 	p.deleteCalls++
+	p.deleteWorkspaceCalls++
 	return p.deleteErr
+}
+
+type workspaceVolumeHostPathResolverStub struct {
+	resolution      AgentWorkspaceHostPathResolution
+	err             error
+	calls           int
+	lastOwnerID     string
+	lastWorkspaceID string
+}
+
+func (r *workspaceVolumeHostPathResolverStub) ResolveAgentWorkspaceHostPath(_ context.Context, ownerID, workspaceID string) (AgentWorkspaceHostPathResolution, error) {
+	r.calls++
+	r.lastOwnerID = ownerID
+	r.lastWorkspaceID = workspaceID
+	return r.resolution, r.err
 }

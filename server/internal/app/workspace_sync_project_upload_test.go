@@ -171,10 +171,10 @@ func TestProjectDestinationConflictAllowsEmptyRegisteredRoot(t *testing.T) {
 	root := "project/demo"
 	command := workspace.CreateSyncSession{Scope: []string{root}, Files: []workspace.File{}}
 	rootOnly := []workspace.Directory{{Path: "project"}, {Path: root}}
-	if hasProjectDestinationContents(root, nil, nil, rootOnly) {
+	if hasProjectDestinationContents(root, nil, []string{root}, rootOnly) {
 		t.Fatal("an empty registered project root was treated as existing project content")
 	}
-	plan := projectDestinationConflictPlan(command, nil, nil, rootOnly)
+	plan := projectDestinationConflictPlan(command, nil, []string{root}, rootOnly)
 	if len(plan.Conflicts) != 0 {
 		t.Fatalf("project parent and empty root conflicts = %#v", plan.Conflicts)
 	}

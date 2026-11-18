@@ -110,7 +110,7 @@ function harness(initialAuth = null, existingRoot = null) {
   const dialog = { showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showMessageBox: async () => ({ response: 0 }) };
   const electron = {
     app: { setName() {}, getPath: (key) => paths[key] ?? root, setPath: (key, path) => { paths[key] = path; }, getLocale: () => 'en', getVersion: () => '0.1.0', requestSingleInstanceLock: () => true, isPackaged: false, whenReady: () => Promise.resolve(), on: (name, fn) => appEvents.set(name, fn), quit() {} },
-    BrowserWindow: FakeWindow, WebContentsView: FakeView, session: fakeSession,
+    BrowserWindow: FakeWindow, WebContentsView: FakeView, net: { fetch: (...args) => globalThis.fetch(...args) }, session: fakeSession,
     ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
     dialog,
     Menu: { buildFromTemplate: (template) => template, setApplicationMenu() {} },

@@ -1608,6 +1608,7 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     let variant_group_id: String?
     let variant_version: Int64?
     let variant_action: String?
+    let agent_acknowledged: Bool?
 
     var displayStatus: String? { output_status ?? status }
     var displayTaskRevision: Int64? { output_task_revision ?? task_revision }
@@ -1621,7 +1622,8 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
          task_revision: Int64? = nil, result_event_sequence: Int64? = nil,
          sources: [MordeClientMessageSource]? = nil, output_status: String? = nil,
          output_task_revision: Int64? = nil, output_result_event_sequence: Int64? = nil,
-         variant_group_id: String? = nil, variant_version: Int64? = nil, variant_action: String? = nil) {
+         variant_group_id: String? = nil, variant_version: Int64? = nil, variant_action: String? = nil,
+         agent_acknowledged: Bool? = nil) {
         self.id = id
         self.conversation_id = conversation_id
         self.sequence = sequence
@@ -1649,6 +1651,51 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
         self.variant_group_id = variant_group_id
         self.variant_version = variant_version
         self.variant_action = variant_action
+        self.agent_acknowledged = agent_acknowledged
+    }
+}
+
+struct MordeAgentMessageProcessingTaskState: Equatable, Sendable {
+    let taskID: String
+    let status: String
+    let currentRevision: Int64?
+    let desiredRevision: Int64?
+    let currentRevisionStarted: Bool?
+}
+
+enum MordeAgentMessageStatusPresentation {
+    static func showsAcknowledgement(for message: MordeClientMessage) -> Bool {
+        message.role == "user" && message.agent_acknowledged == true
+    }
+
+    static func processingMessageIDs(messages: [MordeClientMessage],
+                                     tasks: [MordeAgentMessageProcessingTaskState]) -> Set<String> {
+        let taskByID = Dictionary(tasks.map { ($0.taskID, $0) }, uniquingKeysWith: { first, _ in first })
+        var latestMessageByTask: [String: String] = [:]
+        let ordered = messages.enumerated().sorted { lhs, rhs in
+            switch (lhs.element.sequence, rhs.element.sequence) {
+            case let (left?, right?) where left != right: return left < right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return lhs.offset < rhs.offset
+            }
+        }
+
+        for (_, message) in ordered where message.role == "user" {
+            guard !message.id.isEmpty, message.routing_status == "routed",
+                  message.duplicate_of_message_id?.isEmpty != false,
+                  let taskID = message.task_id ?? message.related_task_id,
+                  MordeTaskResponsePolicy.hasValidTaskID(taskID) else { continue }
+            latestMessageByTask[taskID] = message.id
+        }
+
+        return Set(latestMessageByTask.compactMap { taskID, messageID in
+            guard let task = taskByID[taskID], task.status == "running",
+                  task.currentRevisionStarted == true,
+                  task.currentRevision == nil || task.desiredRevision == nil ||
+                    task.currentRevision == task.desiredRevision else { return nil }
+            return messageID
+        })
     }
 }
 
@@ -1930,7 +1977,7 @@ enum MordeTaskSnapshotMessageMerge {
             output_status: nil, output_task_revision: snapshot.output_task_revision,
             output_result_event_sequence: snapshot.output_result_event_sequence,
             variant_group_id: snapshot.variant_group_id, variant_version: snapshot.variant_version,
-            variant_action: snapshot.variant_action)
+            variant_action: snapshot.variant_action, agent_acknowledged: snapshot.agent_acknowledged)
     }
 
     static func shouldIncludeSnapshot(resultMessagePending: Bool?, resultMessagePublished: Bool?, status: String?) -> Bool {
@@ -2029,7 +2076,7 @@ enum MordeTaskSnapshotMessageMerge {
                     output_status: existing.output_status, output_task_revision: existing.output_task_revision,
                     output_result_event_sequence: existing.output_result_event_sequence,
                     variant_group_id: existing.variant_group_id, variant_version: existing.variant_version,
-                    variant_action: existing.variant_action)
+                    variant_action: existing.variant_action, agent_acknowledged: existing.agent_acknowledged)
             } else {
                 merged[index] = MordeClientMessage(
                     id: snapshot.id, conversation_id: snapshot.conversation_id ?? existing.conversation_id,
@@ -2053,7 +2100,8 @@ enum MordeTaskSnapshotMessageMerge {
                     output_result_event_sequence: snapshot.output_result_event_sequence ?? existing.output_result_event_sequence,
                     variant_group_id: snapshot.variant_group_id ?? existing.variant_group_id,
                     variant_version: snapshot.variant_version ?? existing.variant_version,
-                    variant_action: snapshot.variant_action ?? existing.variant_action)
+                    variant_action: snapshot.variant_action ?? existing.variant_action,
+                    agent_acknowledged: snapshot.agent_acknowledged ?? existing.agent_acknowledged)
             }
         } else {
             merged.append(snapshot)
@@ -2284,62 +2332,6 @@ enum MordeRoutingPresentation {
     }
 
     static func canRetryProcessing(_ reason: String?) -> Bool { reason != "message_too_long" }
-}
-
-struct MordeTaskStartedAcknowledgementState: Equatable, Sendable {
-    let taskID: String
-    let currentRevision: Int64?
-    let desiredRevision: Int64?
-    let currentRevisionStarted: Bool?
-}
-
-enum MordeTaskStartedAcknowledgementPolicy {
-    /// Mirrors the Web transcript: acknowledge only the newest eligible user message for a Task,
-    /// and only after the current Task revision has actually started.
-    static func messageIDs(messages: [MordeClientMessage],
-                           tasks: [MordeTaskStartedAcknowledgementState]) -> Set<String> {
-        var taskByID: [String: MordeTaskStartedAcknowledgementState] = [:]
-        var ambiguousTaskIDs = Set<String>()
-        for task in tasks {
-            guard MordeTaskResponsePolicy.hasValidTaskID(task.taskID) else { continue }
-            if taskByID[task.taskID] != nil {
-                taskByID.removeValue(forKey: task.taskID)
-                ambiguousTaskIDs.insert(task.taskID)
-            } else if !ambiguousTaskIDs.contains(task.taskID) {
-                taskByID[task.taskID] = task
-            }
-        }
-
-        let ordered = messages.enumerated().sorted { lhs, rhs in
-            switch (lhs.element.sequence, rhs.element.sequence) {
-            case let (left?, right?) where left != right:
-                return left < right
-            case (_?, nil):
-                return true
-            case (nil, _?):
-                return false
-            default:
-                return lhs.offset < rhs.offset
-            }
-        }
-
-        var seenTaskIDs = Set<String>()
-        var result = Set<String>()
-        for (_, message) in ordered.reversed() {
-            guard message.role == "user", !message.id.isEmpty,
-                  message.routing_status != "failed",
-                  message.duplicate_of_message_id?.isEmpty != false,
-                  let taskID = message.task_id ?? message.related_task_id,
-                  MordeTaskResponsePolicy.hasValidTaskID(taskID),
-                  !ambiguousTaskIDs.contains(taskID), !seenTaskIDs.contains(taskID),
-                  let task = taskByID[taskID], task.currentRevisionStarted == true,
-                  task.currentRevision == nil || task.desiredRevision == nil ||
-                    task.currentRevision == task.desiredRevision else { continue }
-            seenTaskIDs.insert(taskID)
-            result.insert(message.id)
-        }
-        return result
-    }
 }
 
 enum MordeRoutingRetryAttempt {

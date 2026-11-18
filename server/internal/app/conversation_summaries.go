@@ -324,13 +324,13 @@ func summarySourceKey(source ConversationSummarySource) string {
 	return strings.Join([]string{source.Kind, source.ID, source.ObjectType, strconv.FormatInt(source.Version, 10), strconv.FormatInt(source.Sequence, 10)}, "\x00")
 }
 
-// ConversationSummaryInputPageBudget leaves room for DSH metadata and the
-// summarizer prompt while staying bounded by the Morde gateway input limit.
+// ConversationSummaryInputPageBudget is a byte cap for each storage page; it
+// stays independent of token capacity to keep the two units separate.
 func ConversationSummaryInputPageBudget(contextWindowTokens int) (int, error) {
-	if contextWindowTokens < 4096 || contextWindowTokens > 1_000_000 {
+	if contextWindowTokens < 4096 || contextWindowTokens > MaxModelContextWindowTokens {
 		return 0, domain.InvalidArgument("conversation_summary_source", "conversation summary model capacity is invalid")
 	}
-	return min(contextWindowTokens*2, MaxConversationSummaryInputPageBytes), nil
+	return MaxConversationSummaryInputPageBytes, nil
 }
 
 func ConversationSummaryPromptProofs(sources []ConversationSummaryPromptSource) ([]ConversationSummarySource, error) {

@@ -351,18 +351,19 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 			return decision
 		}
 	case app.ConversationRouteReply:
-		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && decision.Question == "" &&
+		if !decision.Acknowledge && decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && decision.Question == "" &&
 			len(decision.DependencyTaskIDs) == 0 && len(decision.AggregateMessageIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
 			return decision
 		}
 	case app.ConversationRouteClarify:
-		if decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 &&
+		if !decision.Acknowledge && decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 &&
 			len(decision.AggregateMessageIDs) == 0 && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
 			!strings.ContainsRune(decision.Question, '\x00') && len([]rune(decision.Question)) <= 200 {
 			return decision
 		}
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if decision.ExplicitNew || decision.Question != "" || decision.Reply != "" || len(decision.AggregateMessageIDs) != 0 {
+		if decision.Action != app.ConversationRouteUpdate && decision.Acknowledge || decision.ExplicitNew ||
+			decision.Question != "" || decision.Reply != "" || len(decision.AggregateMessageIDs) != 0 {
 			return clarify
 		}
 		if decision.Action == app.ConversationRouteStop && decision.TargetMessageID != "" {

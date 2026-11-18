@@ -123,7 +123,7 @@ function UserRoutes() {
 }
 
 function AdminRoutes() {
-  return <Routes>
+  return <div className="morde-admin-app"><Routes>
     <Route path="/admin/login" element={<StandaloneToastPage><Login defaultTo="/admin/" allowRegister={false} /></StandaloneToastPage>} />
     <Route path="/admin/change-password" element={<StandaloneToastPage><ChangePassword loginPath="/admin/login" /></StandaloneToastPage>} />
     <Route element={<RouteGuard loginPath="/admin/login" />}>
@@ -146,7 +146,7 @@ function AdminRoutes() {
       </Route>
     </Route>
     <Route path="*" element={<RecoverableError title="管理后台地址无效" message="地址可能已经失效。可以返回上一页，或回到管理后台首页。" homePath="/admin" homeLabel="返回管理后台" />} />
-  </Routes>;
+  </Routes></div>;
 }
 
 export default function App() {

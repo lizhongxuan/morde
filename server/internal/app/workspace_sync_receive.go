@@ -68,6 +68,9 @@ var workspaceSyncReceiveOperationIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`
 // ReserveWorkspaceSyncReceive gates one direct Syncthing write per Workspace
 // and persists its quota/base-revision contract before the node changes disk.
 func (s *WorkspaceSyncService) ReserveWorkspaceSyncReceive(ctx context.Context, request WorkspaceSyncReceiveRequest) (WorkspaceSyncReceiveReservation, error) {
+	if err := s.rejectRevisionWorkspaceWrite(ctx, request.OwnerID, request.WorkspaceID); err != nil {
+		return WorkspaceSyncReceiveReservation{}, err
+	}
 	store, err := s.workspaceSyncReceiveStore()
 	if err != nil {
 		return WorkspaceSyncReceiveReservation{}, err
@@ -113,6 +116,9 @@ func (s *WorkspaceSyncService) RecordWorkspaceSyncReceiveQuotaRejection(ctx cont
 // CommitWorkspaceSyncReceive accepts already-written content after the caller
 // has verified files and accounted for every immutable block they reference.
 func (s *WorkspaceSyncService) CommitWorkspaceSyncReceive(ctx context.Context, ownerID, workspaceID, reservationID string, file *workspace.File, directory *string) (WorkspaceSyncReceiveReceipt, error) {
+	if err := s.rejectRevisionWorkspaceWrite(ctx, ownerID, workspaceID); err != nil {
+		return WorkspaceSyncReceiveReceipt{}, err
+	}
 	store, err := s.workspaceSyncReceiveStore()
 	if err != nil {
 		return WorkspaceSyncReceiveReceipt{}, err
@@ -150,11 +156,17 @@ func (s *WorkspaceSyncService) GetWorkspaceSyncReceiveReservation(ctx context.Co
 		return WorkspaceSyncReceiveReservation{}, err
 	}
 	if reservation.State == "settled" {
-		if err := s.materializeWorkspaceCurrent(ctx, reservation.WorkspaceID); err != nil {
-			if ctx.Err() != nil {
-				return WorkspaceSyncReceiveReservation{}, ctx.Err()
+		liveDirectory, err := s.UsesLiveDirectorySource(ctx, reservation.OwnerID, reservation.WorkspaceID)
+		if err != nil {
+			return WorkspaceSyncReceiveReservation{}, err
+		}
+		if !liveDirectory {
+			if err := s.materializeWorkspaceCurrent(ctx, reservation.WorkspaceID); err != nil {
+				if ctx.Err() != nil {
+					return WorkspaceSyncReceiveReservation{}, ctx.Err()
+				}
+				return WorkspaceSyncReceiveReservation{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace receive is settled but current-directory materialization is pending; retry the same reservation")
 			}
-			return WorkspaceSyncReceiveReservation{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace receive is settled but current-directory materialization is pending; retry the same reservation")
 		}
 	}
 	return reservation, nil
@@ -217,6 +229,9 @@ func (s *WorkspaceSyncService) AbortWorkspaceSyncReceive(ctx context.Context, ow
 		return err
 	}
 	workspaceID := current.WorkspaceID
+	if err := s.rejectRevisionWorkspaceWrite(ctx, current.OwnerID, workspaceID); err != nil {
+		return err
+	}
 	if current.State == "aborted" {
 		return nil
 	}

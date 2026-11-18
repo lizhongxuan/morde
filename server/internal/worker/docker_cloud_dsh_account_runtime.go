@@ -57,6 +57,13 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 	if !cleanDockerDSHPath(scriptPath) {
 		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("script_path", "account Agent Runtime script path is invalid", nil)
 	}
+	if s.docker.options.WorkspacePath == nil {
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("workspace_mount", "account Agent Runtime Workspace is unavailable", nil)
+	}
+	workspacePath, err := s.docker.options.WorkspacePath(ctx, fence.OwnerID)
+	if err != nil || !cleanDockerDSHPath(workspacePath) {
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("workspace_mount", "account Agent Runtime Workspace is unavailable", err)
+	}
 	nonceDigest := sha256.Sum256(nonce)
 	nonceHash := hex.EncodeToString(nonceDigest[:])
 	encodedFence, err := json.Marshal(fence)
@@ -70,7 +77,7 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 	if err := s.docker.validateImage(ctx); err != nil {
 		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("image_validation", "account Agent Runtime image is unavailable", err)
 	}
-	create := s.docker.containerCreateForScript(labels, scriptPath)
+	create := s.docker.containerCreateForScript(labels, scriptPath, workspacePath)
 	var created struct {
 		ID string `json:"Id"`
 	}
@@ -79,7 +86,7 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 	}
 	guard.ContainerID = created.ID
 	preflight, err := s.docker.inspect(ctx, created.ID)
-	if err != nil || s.validateAccountRuntime(preflight, guard, false) != nil || *preflight.State.Running || *preflight.State.PID != 0 {
+	if err != nil || s.validateAccountRuntime(preflight, guard, workspacePath, false) != nil || *preflight.State.Running || *preflight.State.PID != 0 {
 		if s.cleanupUnstartedContainer(ctx, created.ID, name) != nil {
 			return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_preflight_cleanup", "unverified account Agent Runtime container cleanup is unconfirmed", err)
 		}
@@ -104,7 +111,7 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_start", "account Agent Runtime container could not be started", err)
 	}
 	started, err := s.docker.inspect(ctx, created.ID)
-	if err != nil || s.validateAccountRuntime(started, guard, true) != nil || !*started.State.Running || *started.State.PID < 2 {
+	if err != nil || s.validateAccountRuntime(started, guard, workspacePath, true) != nil || !*started.State.Running || *started.State.PID < 2 {
 		_ = input.Close()
 		_ = output.Close()
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
@@ -138,10 +145,10 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) cleanupUnstartedContainer(ctx c
 	return s.docker.requireAbsent(cleanupCtx, name)
 }
 
-func (s *dockerCloudDSHAccountRuntimeSupervisor) validateAccountRuntime(value dockerDSHInspect, guard dshguardian.AccountRuntimeGuard, running bool) error {
+func (s *dockerCloudDSHAccountRuntimeSupervisor) validateAccountRuntime(value dockerDSHInspect, guard dshguardian.AccountRuntimeGuard, workspacePath string, running bool) error {
 	encodedFence, err := json.Marshal(guard.Fence)
 	scriptPath := filepath.Join(filepath.Dir(s.docker.options.ScriptPath), "bin-account.mjs")
-	if err != nil || !s.docker.validContainerIsolation(value, scriptPath, running) ||
+	if err != nil || !s.docker.validContainerIsolation(value, scriptPath, workspacePath, running) ||
 		value.ID != guard.ContainerID || value.Name != "/"+guard.ContainerName ||
 		value.Config.Labels[dockerAccountRuntimeFenceLabel] != string(encodedFence) ||
 		value.Config.Labels[dockerAccountRuntimeNonceLabel] != guard.NonceSHA256 {

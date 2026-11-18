@@ -2,8 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -42,6 +40,7 @@ type WorkspaceCapacityChecker interface {
 
 type WorkspaceService struct {
 	store                WorkspaceStore
+	agentWorkspaces      AgentWorkspaceStore
 	content              WorkspaceContentDeleter
 	current              WorkspaceCurrentDeleter
 	initializeCurrent    WorkspaceCurrentInitializer
@@ -55,8 +54,9 @@ func NewWorkspaceService(store WorkspaceStore, content WorkspaceContentDeleter, 
 	if store == nil || content == nil || current == nil || capacity == nil || writer == nil || maxWorkspaceBytes <= 0 {
 		return nil, errors.New("workspace service dependencies and quotas are required")
 	}
+	agentWorkspaces, _ := store.(AgentWorkspaceStore)
 	return &WorkspaceService{
-		store: store, content: content, current: current, capacity: capacity, audit: writer,
+		store: store, agentWorkspaces: agentWorkspaces, content: content, current: current, capacity: capacity, audit: writer,
 		maxWorkspaceBytes: maxWorkspaceBytes,
 	}, nil
 }
@@ -118,16 +118,85 @@ func (s *WorkspaceService) CreateWorkspace(ctx context.Context, principal identi
 	return created, nil
 }
 
-func (s *WorkspaceService) CreateHostWorkspace(ctx context.Context, ownerID, idempotencyKey string) (workspace.Workspace, error) {
-	if !domain.ValidUserID(ownerID) {
-		return workspace.Workspace{}, domain.InvalidArgument("owner_id", "computer owner is invalid")
+// EnsureAgentWorkspace returns the account's stable Agent Workspace and makes
+// sure its server-side current directory is materialized before callers create
+// a Host or Sandbox. Existing account workspaces are never adopted by name.
+func (s *WorkspaceService) EnsureAgentWorkspace(ctx context.Context, ownerID string) (result workspace.Workspace, resultErr error) {
+	if s == nil || !domain.ValidUserID(ownerID) {
+		return workspace.Workspace{}, domain.InvalidArgument("owner_id", "Agent Workspace owner is invalid")
 	}
-	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+	if s.agentWorkspaces == nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace store is unavailable")
+	}
+	if s.initializeCurrent == nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Workspace current initializer is unavailable")
+	}
+	unlock, err := s.agentWorkspaces.AcquireAgentWorkspaceInitializationLock(ctx, ownerID)
+	if err != nil {
+		return workspace.Workspace{}, fmt.Errorf("lock Agent Workspace initialization: %w", err)
+	}
+	if unlock == nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace initialization lock is unavailable")
+	}
+	defer func() {
+		if err := unlock(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("release Agent Workspace initialization lock: %w", err))
+		}
+	}()
+	value, initialized, err := s.agentWorkspaces.GetAgentWorkspace(ctx, ownerID)
+	if domain.CodeOf(err) == domain.CodeNotFound {
+		if err := s.capacity.CheckCapacity(ctx); err != nil {
+			return workspace.Workspace{}, err
+		}
+		id, idErr := domain.NewWorkspaceID()
+		if idErr != nil {
+			return workspace.Workspace{}, fmt.Errorf("generate Agent Workspace id: %w", idErr)
+		}
+		value, initialized, err = s.agentWorkspaces.CreateAgentWorkspace(ctx, workspace.Workspace{
+			ID: id, OwnerID: ownerID, Name: "Agent Workspace", State: workspace.StateReady,
+			QuotaBytes: s.maxWorkspaceBytes,
+		})
+	}
+	if err != nil {
 		return workspace.Workspace{}, err
 	}
-	digest := sha256.Sum256([]byte(ownerID + "\x00" + idempotencyKey))
-	return s.CreateWorkspace(ctx, identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession},
-		CreateWorkspaceCommand{Name: "Computer storage"}, "host-workspace-"+hex.EncodeToString(digest[:]))
+	if !domain.ValidWorkspaceID(value.ID) || value.OwnerID != ownerID {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace ownership is inconsistent")
+	}
+	if value.State != workspace.StateReady || value.DeletedAt != nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "Agent Workspace is not ready")
+	}
+	if !initialized {
+		if err := s.initializeCurrent(ctx, value.ID); err != nil {
+			return workspace.Workspace{}, fmt.Errorf("initialize Agent Workspace current directory: %w", err)
+		}
+		if err := s.agentWorkspaces.MarkAgentWorkspaceDirectoryInitialized(ctx, ownerID, value.ID); err != nil {
+			return workspace.Workspace{}, fmt.Errorf("record Agent Workspace current directory initialization: %w", err)
+		}
+	}
+	return value, nil
+}
+
+// GetAgentWorkspace resolves an existing stable mapping without creating or
+// rematerializing its directory. Read-only API paths should use this method.
+func (s *WorkspaceService) GetAgentWorkspace(ctx context.Context, ownerID string) (workspace.Workspace, error) {
+	if s == nil || !domain.ValidUserID(ownerID) {
+		return workspace.Workspace{}, domain.InvalidArgument("owner_id", "Agent Workspace owner is invalid")
+	}
+	if s.agentWorkspaces == nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace store is unavailable")
+	}
+	value, _, err := s.agentWorkspaces.GetAgentWorkspace(ctx, ownerID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if !domain.ValidWorkspaceID(value.ID) || value.OwnerID != ownerID {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace ownership is inconsistent")
+	}
+	if value.State != workspace.StateReady || value.DeletedAt != nil {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "Agent Workspace is not ready")
+	}
+	return value, nil
 }
 
 func (s *WorkspaceService) ListWorkspaces(ctx context.Context, principal identity.Principal) ([]workspace.Workspace, error) {
@@ -150,18 +219,6 @@ func (s *WorkspaceService) ListWorkspaces(ctx context.Context, principal identit
 	return result, nil
 }
 
-func (s *WorkspaceService) EnsureDefaultWorkspace(ctx context.Context, ownerID string) (workspace.Workspace, error) {
-	if !domain.ValidUserID(ownerID) {
-		return workspace.Workspace{}, domain.InvalidArgument("user_id", "user id is invalid")
-	}
-	key, err := domain.NewWorkspaceID()
-	if err != nil {
-		return workspace.Workspace{}, fmt.Errorf("generate default Workspace idempotency key: %w", err)
-	}
-	return s.CreateWorkspace(ctx, identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession},
-		CreateWorkspaceCommand{Name: "Computer storage"}, "default-host-workspace-"+key)
-}
-
 func (s *WorkspaceService) ValidateHostWorkspace(ctx context.Context, ownerID, hostID, workspaceID string) error {
 	if !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) {
 		return domain.InvalidArgument("host_workspace", "computer storage identity is invalid")
@@ -177,7 +234,20 @@ func (s *WorkspaceService) ValidateHostWorkspace(ctx context.Context, ownerID, h
 	if err != nil {
 		return fmt.Errorf("read computer storage references before deletion: %w", err)
 	}
-	if len(allBindings) != 1 || allBindings[0].HostID != hostID || allBindings[0].OwnerID != ownerID {
+	isAgentWorkspace, err := s.isAgentWorkspace(ctx, ownerID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if isAgentWorkspace {
+		for _, binding := range allBindings {
+			if binding.OwnerID != ownerID || binding.Workspace.ID != workspaceID || !domain.ValidHostID(binding.HostID) {
+				return domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace computer bindings are ambiguous")
+			}
+			if binding.HostID != hostID && binding.State != workspace.BindingDetached {
+				return domain.NewError(domain.CodeWorkspaceBusy, "Agent Workspace is still attached to another computer")
+			}
+		}
+	} else if len(allBindings) != 1 || allBindings[0].HostID != hostID || allBindings[0].OwnerID != ownerID {
 		return domain.NewError(domain.CodeWorkspaceConflict, "computer storage is shared or has ambiguous references")
 	}
 	value, err := s.store.GetWorkspace(ctx, workspaceID)
@@ -189,6 +259,9 @@ func (s *WorkspaceService) ValidateHostWorkspace(ctx context.Context, ownerID, h
 	}
 	if value.State != workspace.StateReady && value.State != workspace.StateDeleting && value.State != workspace.StateDeleted {
 		return domain.NewError(domain.CodeWorkspaceBusy, "computer storage is not ready for deletion")
+	}
+	if isAgentWorkspace {
+		return nil
 	}
 	if s.hostWorkspaceVolumes == nil {
 		return domain.NewError(domain.CodeInvalidState, "computer storage cleanup is unavailable")
@@ -214,9 +287,47 @@ func (s *WorkspaceService) DeleteHostWorkspace(ctx context.Context, ownerID, hos
 	if bindings[0].State != workspace.BindingDetached {
 		return domain.NewError(domain.CodeWorkspaceBusy, "computer storage is still attached")
 	}
+	isAgentWorkspace, err := s.isAgentWorkspace(ctx, ownerID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if isAgentWorkspace {
+		return nil
+	}
 	principal := identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession}
 	_, err = s.deleteWorkspace(ctx, principal, workspaceID, hostID)
 	return err
+}
+
+func (s *WorkspaceService) isAgentWorkspace(ctx context.Context, ownerID, workspaceID string) (bool, error) {
+	return s.IsAgentWorkspaceWorkspace(ctx, ownerID, workspaceID)
+}
+
+// IsAgentWorkspaceWorkspace reports whether a Workspace ID belongs to the
+// current or a retired Agent Workspace. Retired IDs remain protected while
+// detached Host cleanup can still arrive.
+func (s *WorkspaceService) IsAgentWorkspaceWorkspace(ctx context.Context, ownerID, workspaceID string) (bool, error) {
+	if s.agentWorkspaces == nil {
+		return false, domain.NewError(domain.CodeInternal, "Agent Workspace store is unavailable")
+	}
+	return s.agentWorkspaces.IsAgentWorkspaceWorkspace(ctx, ownerID, workspaceID)
+}
+
+func (s *WorkspaceService) isCurrentAgentWorkspace(ctx context.Context, ownerID, workspaceID string) (bool, error) {
+	if s.agentWorkspaces == nil {
+		return false, domain.NewError(domain.CodeInternal, "Agent Workspace store is unavailable")
+	}
+	value, _, err := s.agentWorkspaces.GetAgentWorkspace(ctx, ownerID)
+	if domain.CodeOf(err) == domain.CodeNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if value.OwnerID != ownerID || !domain.ValidWorkspaceID(value.ID) {
+		return false, domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace ownership mapping is inconsistent")
+	}
+	return value.ID == workspaceID, nil
 }
 
 func (s *WorkspaceService) ListDeviceWorkspaces(ctx context.Context, principal identity.Principal) ([]DeviceWorkspaceInfo, error) {
@@ -267,7 +378,7 @@ func (s *WorkspaceService) DeleteWorkspace(ctx context.Context, principal identi
 	return s.deleteWorkspace(ctx, principal, id, "")
 }
 
-func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identity.Principal, id, allowedHostID string) (workspace.Workspace, error) {
+func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identity.Principal, id, allowedHostID string) (result workspace.Workspace, resultErr error) {
 	if principal.Kind != identity.KindSession {
 		return workspace.Workspace{}, domain.NewError(domain.CodeForbidden, "portal session required")
 	}
@@ -284,12 +395,41 @@ func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identi
 	if value.OwnerID != principal.UserID {
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
+	isCurrentAgentWorkspace, err := s.isCurrentAgentWorkspace(ctx, principal.UserID, id)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if isCurrentAgentWorkspace && allowedHostID != "" {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceConflict, "Host cleanup cannot delete the owner's Agent Workspace")
+	}
+	if isCurrentAgentWorkspace {
+		unlock, err := s.agentWorkspaces.AcquireAgentWorkspaceInitializationLock(ctx, principal.UserID)
+		if err != nil {
+			return workspace.Workspace{}, fmt.Errorf("lock Agent Workspace before deletion: %w", err)
+		}
+		if unlock == nil {
+			return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace deletion lock is unavailable")
+		}
+		defer func() {
+			if err := unlock(); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("release Agent Workspace deletion lock: %w", err))
+			}
+		}()
+		isCurrentAgentWorkspace, err = s.isCurrentAgentWorkspace(ctx, principal.UserID, id)
+		if err != nil {
+			return workspace.Workspace{}, err
+		}
+		if !isCurrentAgentWorkspace {
+			return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceConflict, "Agent Workspace changed before deletion")
+		}
+	}
 	bindings, err := s.store.GetWorkspaceBindingsByWorkspace(ctx, id)
 	if err != nil {
 		return workspace.Workspace{}, fmt.Errorf("read computer storage bindings before deletion: %w", err)
 	}
 	for _, binding := range bindings {
-		if allowedHostID == "" || binding.HostID != allowedHostID || binding.State != workspace.BindingDetached {
+		if binding.State != workspace.BindingDetached || (allowedHostID != "" && binding.HostID != allowedHostID) ||
+			(!isCurrentAgentWorkspace && allowedHostID == "") {
 			return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "computer storage is assigned to a cloud computer")
 		}
 	}
@@ -311,12 +451,20 @@ func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identi
 	if value.OwnerID != principal.UserID {
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
+	isCurrentAgentWorkspace, err = s.isCurrentAgentWorkspace(ctx, principal.UserID, id)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if isCurrentAgentWorkspace && allowedHostID != "" {
+		return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceConflict, "Host cleanup cannot delete the owner's Agent Workspace")
+	}
 	bindings, err = s.store.GetWorkspaceBindingsByWorkspace(ctx, id)
 	if err != nil {
 		return workspace.Workspace{}, fmt.Errorf("recheck computer storage bindings before deletion: %w", err)
 	}
 	for _, binding := range bindings {
-		if allowedHostID == "" || binding.HostID != allowedHostID || binding.State != workspace.BindingDetached {
+		if binding.State != workspace.BindingDetached || (allowedHostID != "" && binding.HostID != allowedHostID) ||
+			(!isCurrentAgentWorkspace && allowedHostID == "") {
 			return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "computer storage is assigned to a cloud computer")
 		}
 	}
@@ -330,7 +478,15 @@ func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identi
 	}
 	wasReady := value.State == workspace.StateReady
 	if value.State == workspace.StateReady {
-		value, err = s.store.ClaimWorkspaceForDelete(ctx, id, value.Revision)
+		if isCurrentAgentWorkspace {
+			deleter, ok := s.store.(AgentWorkspaceDeleteStore)
+			if !ok {
+				return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace deletion is unavailable")
+			}
+			value, err = deleter.ClaimAgentWorkspaceForDelete(ctx, principal.UserID, id, value.Revision)
+		} else {
+			value, err = s.store.ClaimWorkspaceForDelete(ctx, id, value.Revision)
+		}
 		if err != nil {
 			return workspace.Workspace{}, err
 		}
@@ -356,7 +512,16 @@ func (s *WorkspaceService) deleteWorkspace(ctx context.Context, principal identi
 			return workspace.Workspace{}, err
 		}
 	}
-	deleted, err := s.store.CompleteWorkspaceDelete(ctx, id, value.Revision)
+	var deleted workspace.Workspace
+	if isCurrentAgentWorkspace {
+		deleter, ok := s.store.(AgentWorkspaceDeleteStore)
+		if !ok {
+			return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Agent Workspace deletion is unavailable")
+		}
+		deleted, err = deleter.CompleteAgentWorkspaceDelete(ctx, principal.UserID, id, value.Revision)
+	} else {
+		deleted, err = s.store.CompleteWorkspaceDelete(ctx, id, value.Revision)
+	}
 	if err != nil {
 		current, getErr := s.store.GetWorkspace(ctx, id)
 		if getErr == nil && (current.State == workspace.StateDeleted || current.DeletedAt != nil) {

@@ -16,6 +16,7 @@ EXPECTED = {
     "morde-dsh-containerd.service",
     "morde-dsh-docker.service",
     "morde-dsh-guardian.service",
+    "default-docker-morde-dsh.dropin",
 }
 
 
@@ -84,6 +85,11 @@ class RenderUnitsTests(unittest.TestCase):
         self.assertEqual({path.name for path in self.output.iterdir()}, EXPECTED)
         daemon = json.loads((self.output / "dsh-docker-daemon.json").read_text())
         self.assertEqual(daemon["group"], "morde_portal_test")
+        dsh_docker = (self.output / "morde-dsh-docker.service").read_text()
+        self.assertIn("Before=docker.service", dsh_docker)
+        default_docker = (self.output / "default-docker-morde-dsh.dropin").read_text()
+        self.assertIn("After=morde-dsh-docker.service", default_docker)
+        self.assertIn("PartOf=morde-dsh-docker.service", default_docker)
         guardian = (self.output / "morde-dsh-guardian.service").read_text()
         self.assertIn("Group=morde_portal_test", guardian)
         self.assertIn("--socket-mode=0660", guardian)

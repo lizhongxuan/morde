@@ -101,6 +101,7 @@ test.describe("Assistant Task billing", () => {
     await page.getByRole("button", { name: new RegExp(`查看详情：${task.objective}`) }).click();
 
     const activity = page.locator(`.task-panel-detail .task-activity[data-task-id="${task.id}"]`);
+    await activity.getByText("更多信息").click();
     const billing = activity.getByRole("region", { name: "用量与费用" });
     await expect(billing).toBeVisible();
     await expect(billing).toContainText("模型调用 4 次 · Token 73 / 1000");

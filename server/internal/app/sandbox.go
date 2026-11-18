@@ -35,8 +35,10 @@ type SandboxNetworkPolicy struct {
 }
 
 type SandboxVolume struct {
-	Name            string
-	MountPath       string
+	Name      string
+	MountPath string
+	// HostPath selects OpenSandbox's host.path volume backend instead of PVC.
+	HostPath        string
 	ClaimName       string
 	Storage         string
 	RequireExisting bool

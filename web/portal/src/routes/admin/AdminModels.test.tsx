@@ -11,6 +11,7 @@ type ModelConnection = Awaited<ReturnType<typeof portalApi.adminModelConnections
 
 const model: ModelConnection = {
   id: 'p1234567', name: '平台主模型', base_url: 'https://models.example.test/v1', model_name: 'gpt-test',
+  context_window_tokens: null, context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
   shared: true, has_api_key: true, capabilities: { text: true, tools: false, vision: false, text_stream: false },
   checked_at: '2026-10-22T08:00:00Z', created_at: '2026-10-20T08:00:00Z', updated_at: '2026-10-22T08:00:00Z',
 };
@@ -25,13 +26,40 @@ describe('admin platform model connections', () => {
 
   it('fills the GLM platform preset and leaves the API key empty', async () => {
     vi.spyOn(portalApi, 'adminModelConnections').mockResolvedValue({ items: [], configuration_status: 'not_configured' });
+    const create = vi.spyOn(portalApi, 'createModelConnection').mockResolvedValue({ ...model, name: 'GLM-5.1', base_url: 'https://api.z.ai/api/paas/v4', model_name: 'glm-5.1', has_api_key: true });
+    vi.spyOn(portalApi, 'checkModelConnection').mockResolvedValue(model.capabilities);
     const user = userEvent.setup();
     renderPage();
     await user.click(await screen.findByRole('button', { name: '添加平台模型' }));
     await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'glm-5.1');
     expect(screen.getByLabelText('模型名')).toHaveValue('glm-5.1');
+    expect(screen.getByLabelText('模型名')).toHaveAttribute('readonly');
     expect(screen.getByLabelText('服务地址')).toHaveValue('https://api.z.ai/api/paas/v4');
+    expect(screen.getByLabelText('服务地址')).toHaveAttribute('readonly');
+    expect(screen.queryByLabelText('上下文窗口高级覆盖（tokens，可选）')).not.toBeInTheDocument();
+    expect(screen.getByText('上下文窗口由 Morde 模型目录自动识别，不能手工修改。')).toBeInTheDocument();
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
+    await user.type(screen.getByLabelText('API 密钥'), 'provider-key');
+    await user.click(screen.getByRole('button', { name: '添加并检查连接' }));
+    expect(create).toHaveBeenCalledWith({ name: 'GLM-5.1', base_url: 'https://api.z.ai/api/paas/v4', model_name: 'glm-5.1', api_key: 'provider-key', shared: true });
+  });
+
+  it('lets an administrator clear a legacy manual value on a system preset', async () => {
+    const user = userEvent.setup();
+    const legacyPreset: ModelConnection = { ...model, name: 'DeepSeek Flash legacy', base_url: 'https://api.deepseek.com', model_name: 'deepseek-flash',
+      context_window_tokens: 32768, context_window_override_tokens: 32768, context_window_source: 'legacy_manual' };
+    vi.spyOn(portalApi, 'adminModelConnections').mockResolvedValue({ items: [legacyPreset], configuration_status: 'configured' });
+    const update = vi.spyOn(portalApi, 'updateModelConnection').mockResolvedValue(legacyPreset);
+    renderPage();
+
+    const row = await screen.findByRole('row', { name: /DeepSeek Flash legacy/ });
+    expect(within(row).getByText('来源：旧手工配置')).toBeInTheDocument();
+    await user.click(within(row).getByRole('button', { name: '编辑' }));
+    expect(screen.queryByLabelText('上下文窗口高级覆盖（tokens，可选）')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '清除旧手工值，使用 Morde 目录容量' }));
+    await user.click(screen.getByRole('button', { name: '保存连接' }));
+
+    expect(update).toHaveBeenCalledWith(legacyPreset.id, expect.objectContaining({ context_window_override_tokens: null }));
   });
 
   it('shows a loading state, then lists the shared model and only its key status', async () => {
@@ -79,10 +107,11 @@ describe('admin platform model connections', () => {
     await user.type(screen.getByLabelText('显示名称'), '新共享模型');
     await user.type(screen.getByLabelText('模型名'), 'vendor-model-1');
     await user.type(screen.getByLabelText('服务地址'), 'https://api.example.test/v1');
+    await user.type(screen.getByLabelText('上下文窗口高级覆盖（tokens，可选）'), '32768');
     await user.type(screen.getByLabelText('API 密钥'), 'test-only-secret');
     await user.click(screen.getByRole('button', { name: '添加连接' }));
 
-    expect(create).toHaveBeenCalledWith({ name: '新共享模型', base_url: 'https://api.example.test/v1', model_name: 'vendor-model-1', api_key: 'test-only-secret', shared: true });
+    expect(create).toHaveBeenCalledWith({ name: '新共享模型', base_url: 'https://api.example.test/v1', model_name: 'vendor-model-1', context_window_override_tokens: 32768, api_key: 'test-only-secret', shared: true });
     expect(await screen.findByRole('row', { name: /新共享模型/ })).toHaveTextContent('已配置');
     expect(screen.queryByText('test-only-secret')).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue('test-only-secret')).not.toBeInTheDocument();

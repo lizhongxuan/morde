@@ -236,9 +236,20 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 			definitions = append(definitions, cloudDSHTaskPlanDefinition())
 		}
 		if b.workspaceTools != nil && routed && details.Task.HostID == "" && target.WorkspaceID != "" {
-			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization)...)
+			liveDirectory := false
+			if details.Task.ProjectID == "" {
+				liveDirectory, err = b.workspaceTools.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(details.Task), target.WorkspaceID)
+				if err != nil {
+					return nil, err
+				}
+			}
+			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization, liveDirectory)...)
 		} else if b.workspaceTools != nil && cloudDSHWorkspaceToolsEligible(details.Task) {
-			definitions = append(definitions, cloudDSHWorkspaceToolDefinitions(*details.Task.WorkspaceCheckpointRevision)...)
+			liveDirectory, err := b.workspaceTools.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(details.Task), details.Task.WorkspaceID)
+			if err != nil {
+				return nil, err
+			}
+			definitions = append(definitions, cloudDSHWorkspaceToolDefinitions(*details.Task.WorkspaceCheckpointRevision, liveDirectory)...)
 		}
 		if !goalFollowupReadOnly && b.builtinSearch != nil && b.authorizeBuiltinSearch(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHBuiltinSearchDefinitions()...)

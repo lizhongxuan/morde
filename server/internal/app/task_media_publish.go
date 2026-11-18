@@ -19,6 +19,7 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage/workspacecurrent"
 )
 
 const taskMediaArtifactPrefix = "morde-media-"
@@ -83,6 +84,7 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInvalidState, "Task media save step is not active")
 	}
 	operationID := pending.MediaPreviewOperationID
+	pendingPublish := false
 	artifactPathPrefix := taskMediaArtifactPrefix + operationID + "."
 	artifact, artifactFound, err := taskMediaArtifactForStep(details.Artifacts, current, stepID, artifactPathPrefix)
 	if err != nil {
@@ -150,6 +152,7 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 				return TaskMediaSavedArtifact{}, e.discardTaskMediaAfterPublishFailure(ctx, current.ID, operationID,
 					domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace checkpoint changed during media save recovery"))
 			}
+			pendingPublish = true
 		default:
 			return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInternal, "Task media Workspace receipt state is invalid")
 		}
@@ -190,12 +193,32 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		return TaskMediaSavedArtifact{}, err
 	}
 	baseRevision := *current.WorkspaceCheckpointRevision
-	files, emptyDirectories, directories, err := e.workspaces.readManifest(ctx, taskWorkspaceOwner(current), current.WorkspaceID, baseRevision, nil)
+	liveDirectory, err := e.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(current), current.WorkspaceID)
 	if err != nil {
 		return TaskMediaSavedArtifact{}, err
 	}
+	var liveSnapshot workspaceLiveSnapshot
+	var files []workspace.File
+	var emptyDirectories []string
+	var directories []workspace.Directory
+	if liveDirectory {
+		liveSnapshot, err = readWorkspaceLiveSnapshot(ctx, e.workspaces.currentDirectory, taskWorkspaceOwner(current), current.WorkspaceID, e.workspaces.maxOwnerBytes)
+		if err != nil {
+			return TaskMediaSavedArtifact{}, err
+		}
+		files, emptyDirectories, directories = liveSnapshot.files, liveSnapshot.emptyDirectories, liveSnapshot.directories
+	} else {
+		files, emptyDirectories, directories, err = e.workspaces.readManifest(ctx, taskWorkspaceOwner(current), current.WorkspaceID, baseRevision, nil)
+		if err != nil {
+			return TaskMediaSavedArtifact{}, err
+		}
+	}
 	if taskMediaWorkspacePathExists(artifactPath, files, emptyDirectories, directories) {
-		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceConflict, "generated media path already exists in the Task Workspace")
+		file, exists := workspaceFileByPath(files, artifactPath)
+		if !liveDirectory || !pendingPublish || !exists || file.Kind != workspace.FileKindRegular ||
+			file.SizeBytes != staged.SizeBytes || file.SHA256 != hex.EncodeToString(staged.SHA256) {
+			return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceConflict, "generated media path already exists in the Task Workspace")
+		}
 	}
 	temp, err := os.CreateTemp("", "morde-task-media-*")
 	if err != nil {
@@ -215,12 +238,17 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		return TaskMediaSavedArtifact{}, err
 	}
 	mediaFile.Path = artifactPath
-	files = append(files, mediaFile)
-	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	sort.Strings(emptyDirectories)
-	manifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
-	if err != nil {
-		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceConflict, "Task media Workspace manifest is invalid")
+	if !liveDirectory {
+		files = append(files, mediaFile)
+		sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+		sort.Strings(emptyDirectories)
+	}
+	manifestSHA := liveSnapshot.manifestSHA256
+	if !liveDirectory {
+		manifestSHA, err = workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+		if err != nil {
+			return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceConflict, "Task media Workspace manifest is invalid")
+		}
 	}
 	inputManifestSHA := hex.EncodeToString(current.ContextDigest)
 	requestBody, err := json.Marshal(struct {
@@ -241,7 +269,7 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		ProjectID: current.ProjectID, InitiatorID: current.InitiatorID, WorkspaceOwnerID: taskWorkspaceOwner(current),
 		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, BindingVersion: bindingVersion,
 		InputRevision: *current.InputRevision, BaseRevision: baseRevision, HostFence: fence, ViewID: viewID,
-		InputManifestSHA256: inputManifestSHA, OperationKey: operationKey, RequestHash: requestHash[:],
+		InputManifestSHA256: inputManifestSHA, OperationKey: operationKey, RequestHash: requestHash[:], DirectDirectorySource: liveDirectory,
 	}
 	receipt, err := e.workspaces.ReserveTaskWorkspacePublish(ctx, command)
 	if err != nil {
@@ -260,18 +288,45 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 	default:
 		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInternal, "Task media Workspace reservation state is invalid")
 	}
-	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, directories, manifestSHA,
-		func(_ context.Context, blockSHA string) ([]byte, error) {
-			location, ok := locations[blockSHA]
-			if !ok {
-				return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task media Workspace block is unavailable")
+	if liveDirectory {
+		currentFile, exists := workspaceFileByPath(liveSnapshot.files, artifactPath)
+		if !exists {
+			mode := mediaFile.Mode
+			if mode == 0 {
+				mode = 0644
 			}
-			block := make([]byte, location.size)
-			if _, err := temp.ReadAt(block, location.offset); err != nil {
-				return nil, fmt.Errorf("read private Task media Workspace block: %w", err)
+			if err := e.workspaces.currentDirectory.WriteRegularFileFrom(ctx, taskWorkspaceOwner(current), current.WorkspaceID,
+				artifactPath, io.NewSectionReader(temp, 0, media.SizeBytes), media.SizeBytes, digest, mode, ""); err != nil {
+				if errors.Is(err, workspacecurrent.ErrWriteConflict) {
+					return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceConflict, "generated media path changed before write")
+				}
+				return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceUnavailable, "generated media could not be written to the live Workspace")
 			}
-			return block, nil
-		})
+		} else if currentFile.Kind != workspace.FileKindRegular || currentFile.SizeBytes != media.SizeBytes || currentFile.SHA256 != digest {
+			return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeWorkspaceConflict, "generated media path changed before write")
+		}
+		liveSnapshot, err = readWorkspaceLiveSnapshot(ctx, e.workspaces.currentDirectory, taskWorkspaceOwner(current), current.WorkspaceID, e.workspaces.maxOwnerBytes)
+		if err != nil {
+			return TaskMediaSavedArtifact{}, err
+		}
+		receipt, err = e.workspaces.CommitTaskWorkspacePublishDirect(ctx, command, liveSnapshot.files, liveSnapshot.emptyDirectories,
+			liveSnapshot.directories, liveSnapshot.manifestSHA256, func(_ context.Context, blockSHA string) ([]byte, error) {
+				return liveSnapshot.readBlock(e.workspaces.currentDirectory, taskWorkspaceOwner(current), current.WorkspaceID, blockSHA)
+			})
+	} else {
+		receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, directories, manifestSHA,
+			func(_ context.Context, blockSHA string) ([]byte, error) {
+				location, ok := locations[blockSHA]
+				if !ok {
+					return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task media Workspace block is unavailable")
+				}
+				block := make([]byte, location.size)
+				if _, err := temp.ReadAt(block, location.offset); err != nil {
+					return nil, fmt.Errorf("read private Task media Workspace block: %w", err)
+				}
+				return block, nil
+			})
+	}
 	if err != nil {
 		if domain.CodeOf(err) == domain.CodeWorkspaceConflict || domain.CodeOf(err) == domain.CodeQuotaExceeded {
 			err = e.discardTaskMediaAfterPublishFailure(ctx, current.ID, operationID, err)

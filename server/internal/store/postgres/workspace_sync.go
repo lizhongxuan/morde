@@ -1287,6 +1287,19 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 }
 
 func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string, idempotency app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
+	return s.commitWorkspaceSyncSession(ctx, workspaceID, sessionID, idempotency, nil)
+}
+
+func (s *Store) CommitWorkspaceSyncSessionDirect(ctx context.Context, workspaceID, sessionID string, idempotency app.IdempotencyRecord,
+	apply app.WorkspaceSyncDirectCommitCallback) (workspace.SyncSession, bool, error) {
+	if apply == nil {
+		return workspace.SyncSession{}, false, domain.InvalidArgument("workspace_sync", "direct Workspace commit callback is required")
+	}
+	return s.commitWorkspaceSyncSession(ctx, workspaceID, sessionID, idempotency, apply)
+}
+
+func (s *Store) commitWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string, idempotency app.IdempotencyRecord,
+	directApply app.WorkspaceSyncDirectCommitCallback) (workspace.SyncSession, bool, error) {
 	if err := validateWorkspaceSyncCommitReceipt(workspaceID, sessionID, idempotency); err != nil {
 		return workspace.SyncSession{}, false, err
 	}
@@ -1295,6 +1308,9 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 	if err := s.pool.QueryRow(ctx, `SELECT owner_id, replica_id, direction, folder_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
 		Scan(&sessionOwnerID, &expectedReplicaID, &expectedDirection, &expectedFolderID); err != nil {
 		return workspace.SyncSession{}, false, storeError("read workspace sync session before commit", "workspace sync session", err)
+	}
+	if directApply != nil && (!expectedFolderID.Valid || expectedDirection != string(workspace.SyncUpload)) {
+		return workspace.SyncSession{}, false, domain.NewError(domain.CodeForbidden, "direct Workspace commits are limited to project uploads")
 	}
 	if sessionOwnerID != idempotency.OwnerID {
 		return workspace.SyncSession{}, false, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
@@ -1364,6 +1380,15 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		}
 		if workspaceOwner != idempotency.OwnerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if directApply != nil {
+			var mappedWorkspaceID string
+			if err := tx.QueryRow(ctx, `SELECT workspace_id FROM user_agent_workspaces WHERE owner_id=$1 FOR UPDATE`, workspaceOwner).Scan(&mappedWorkspaceID); err != nil {
+				return storeError("verify Agent Workspace before direct project upload", "Agent Workspace", err)
+			}
+			if mappedWorkspaceID != workspaceID {
+				return domain.NewError(domain.CodeForbidden, "direct project upload requires the owner's current Agent Workspace")
+			}
 		}
 		if workspaceReadOnly && expectedDirection != string(workspace.SyncDownload) {
 			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
@@ -1455,7 +1480,7 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			if result.State == workspace.SyncExpired || result.State == workspace.SyncFailed {
 				return nil
 			}
-			if result.State == workspace.SyncCompleted {
+			if result.State == workspace.SyncCompleted && directApply == nil {
 				if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, workspaceID, result.TargetRevision); err != nil {
 					return err
 				}
@@ -1761,6 +1786,44 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 			rejected = err
 			return nil
 		}
+		if directApply != nil {
+			directSession, err := syncSessionDomain(ctx, tx, q, row)
+			if err != nil {
+				return err
+			}
+			directConflicts, err := directApply(ctx, app.WorkspaceSyncDirectCommitPlan{
+				Session: directSession, PinnedFiles: pinnedFiles,
+				PinnedEmptyDirectories: pinnedDirectories, PinnedDirectoryMetadata: pinnedMetadata,
+			})
+			if err != nil {
+				return err
+			}
+			if len(directConflicts) > 0 {
+				if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT workspace_sync_apply`); err != nil {
+					return fmt.Errorf("rollback Workspace revision after direct project conflict: %w", err)
+				}
+				conflicts = append(conflicts, directConflicts...)
+				conflictJSON, err := json.Marshal(nonNilConflicts(conflicts))
+				if err != nil {
+					return fmt.Errorf("encode direct project upload conflicts: %w", err)
+				}
+				if err := q.SetWorkspaceSyncSessionState(ctx, sqlcgen.SetWorkspaceSyncSessionStateParams{
+					WorkspaceID: workspaceID, ID: sessionID, State: string(workspace.SyncConflict), Stage: string(workspace.SyncStageComplete),
+					Conflicts: conflictJSON, TargetRevision: currentRevision,
+				}); err != nil {
+					return fmt.Errorf("record direct project upload conflict: %w", err)
+				}
+				finalRow, err := q.GetWorkspaceSyncSession(ctx, sqlcgen.GetWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
+				if err != nil {
+					return fmt.Errorf("read direct project upload conflict: %w", err)
+				}
+				result, err = syncSessionDomain(ctx, tx, q, finalRow)
+				if err != nil {
+					return err
+				}
+				return saveWorkspaceSyncCommitSuccess(ctx, tx, idempotency)
+			}
+		}
 		targetRevision := currentRevision
 		if len(mutations) > 0 || len(directoryMutations) > 0 || len(directoryMetadataMutations) > 0 {
 			targetRevision++
@@ -1787,7 +1850,7 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 				return err
 			}
 			projectReceiptSession.EmptyDirectories = nonNilStrings(row.EmptyDirectories)
-			if err := createWorkspaceSyncProjectUploadApplication(ctx, tx, row, *projectFolder, targetRevision, projectReceiptSession); err != nil {
+			if err := createWorkspaceSyncProjectUploadApplication(ctx, tx, row, *projectFolder, targetRevision, projectReceiptSession, directApply != nil); err != nil {
 				return err
 			}
 		}
@@ -1811,7 +1874,7 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 		if err != nil {
 			return err
 		}
-		if result.State == workspace.SyncCompleted {
+		if result.State == workspace.SyncCompleted && directApply == nil {
 			if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, workspaceID, targetRevision); err != nil {
 				return err
 			}

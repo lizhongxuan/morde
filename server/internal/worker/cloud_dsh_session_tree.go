@@ -1208,6 +1208,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return result.err
 				}
 				if result.err != nil {
+					if cloudDSHModelErrorCategory(result.err) == "provider_context_length_exceeded" {
+						if err := writeCloudDSHModelFailure(ctx, input, result.id, pending.identity); err != nil {
+							return err
+						}
+						continue
+					}
 					return cloudDSHModelResultErrorFor(result.err)
 				}
 				if pending.stream.hasVisibleText() {
@@ -1245,6 +1251,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
 				"authorization_version": rootIdentity.AuthorizationVersion, "model": value.ModelID,
 				"max_tokens": maxTokens, "tools": cloudDSHToolPayload(rootDefinitions)}
+			if models, ok := e.options.Models.(CloudDSHTaskContextWindowResolver); ok {
+				contextWindow, resolveErr := models.ResolveTaskContextWindow(ctx, value)
+				if resolveErr != nil {
+					return errors.New("dsh task model context capacity is unavailable")
+				}
+				if contextWindow != nil {
+					start["context_window_tokens"] = *contextWindow
+				}
+			}
 			seenDeliveries := make(map[string]string)
 			pending, err := e.options.Checkpoints.PendingMessages(ctx, checkpointFence(fence))
 			if err != nil {

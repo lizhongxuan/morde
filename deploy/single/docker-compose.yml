@@ -51,6 +51,12 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CH_OSB_CONFIG_FILE:-/etc/opensandbox/opensandbox.toml}:/etc/opensandbox/opensandbox.toml:ro
+      - type: bind
+        source: ${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:?Set CH_WORKSPACE_SYNC_CURRENT_FILES_DIR in /etc/cloudhost/cloudhost.env}
+        target: ${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:?Set CH_WORKSPACE_SYNC_CURRENT_FILES_DIR in /etc/cloudhost/cloudhost.env}
+        read_only: true
+        bind:
+          create_host_path: false
 
   # Deliberately opt-in: systemd starts this control plane only after the
   # dedicated Task bridge and host deny policy have been prepared.

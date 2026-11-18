@@ -21,7 +21,6 @@ struct MIFApprovalInboxRoom: View {
     @State private var actionMessage: String?
     @State private var submissionLedger = MIFApprovalSubmissionLedger()
     @State private var expiryRevision = 0
-    @Environment(\.colorScheme) private var colorScheme
 
     init(onConfirmedCount: ((MIFApprovalCountSnapshot) -> Void)? = nil, chrome: NanoMuseRoomChrome? = nil,
          onMenu: (() -> Void)? = nil, onOpenEventChain: ((String) -> Void)? = nil) {
@@ -39,16 +38,15 @@ struct MIFApprovalInboxRoom: View {
     }
 
     private var approvalSeparatorColor: Color {
-        colorScheme == .dark ? NanoMuseTones.hairline : Color(red: 239.0 / 255, green: 239.0 / 255, blue: 239.0 / 255)
+        NanoMuseTones.hairline
     }
 
     private var approvalNeutralActionFill: Color {
-        colorScheme == .dark ? NanoMuseTones.fill : Color(red: 240.0 / 255, green: 240.0 / 255, blue: 242.0 / 255)
+        NanoMuseTones.surface
     }
 
     private var approvalCanvasColor: Color {
-        guard onMenu != nil, colorScheme != .dark else { return NanoMuseTones.canvas }
-        return Color(red: 250.0 / 255, green: 250.0 / 255, blue: 250.0 / 255)
+        NanoMuseTones.canvas
     }
 
     var body: some View {
@@ -154,13 +152,13 @@ struct MIFApprovalInboxRoom: View {
                     path.addLine(to: CGPoint(x: 20 * scale, y: 9 * scale))
                     path.move(to: CGPoint(x: 4 * scale, y: 15 * scale))
                     path.addLine(to: CGPoint(x: 20 * scale, y: 15 * scale))
-                    context.stroke(path, with: .color(.primary),
+                    context.stroke(path, with: .color(NanoMuseTones.ink),
                                    style: StrokeStyle(lineWidth: 2.1 * scale, lineCap: .round))
                 }
                 .frame(width: 19, height: 19)
                 .frame(width: 38, height: 38)
                 .background(NanoMuseTones.surface, in: Circle())
-                .overlay(Circle().stroke(colorScheme == .dark ? NanoMuseTones.hairline : Color.black.opacity(0.09), lineWidth: 1))
+                .overlay(Circle().stroke(NanoMuseTones.hairline, lineWidth: 1))
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
@@ -168,12 +166,12 @@ struct MIFApprovalInboxRoom: View {
             Text(AppLocalized("Approvals"))
                 .font(.system(size: 17, weight: .semibold))
                 .tracking(-0.17)
-                .foregroundStyle(Color.primary)
+                .foregroundStyle(NanoMuseTones.ink)
                 .lineLimit(1)
             if let confirmedHeaderCountText {
                 Text(confirmedHeaderCountText)
                     .font(.system(size: 13.5, weight: .medium))
-                    .foregroundStyle(Color(red: 163.0 / 255, green: 163.0 / 255, blue: 168.0 / 255))
+                    .foregroundStyle(NanoMuseTones.secondaryText)
                     .lineLimit(1)
                     .padding(.leading, 10)
                     .accessibilityIdentifier("mif.approval.count")
@@ -233,14 +231,14 @@ struct MIFApprovalInboxRoom: View {
             Text(factLines.joined(separator: "\n"))
             .font(.system(size: 14.5))
             .lineSpacing(6)
-            .foregroundStyle(Color(red: 115.0 / 255, green: 115.0 / 255, blue: 120.0 / 255))
+            .foregroundStyle(NanoMuseTones.secondaryText)
             .padding(.top, 7)
             .fixedSize(horizontal: false, vertical: true)
 
             if let message = store.actionErrors[task.id] {
                 Text(message)
                     .font(.footnote)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(NanoMuseTones.dangerInk)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -336,9 +334,10 @@ struct MIFApprovalInboxRoom: View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 14.5, weight: .semibold))
-                .foregroundStyle(isPrimary ? NanoMuseTones.onInk : (isReject ? Color(red: 0.784, green: 0.118, blue: 0.118) : Color.primary))
+                .foregroundStyle(isPrimary ? NanoMuseTones.onInk : (isReject ? NanoMuseTones.danger : NanoMuseTones.ink))
                 .frame(maxWidth: .infinity, minHeight: 44)
-                .background(isPrimary ? Color.primary : approvalNeutralActionFill, in: Capsule().inset(by: 2))
+                .background(isPrimary ? NanoMuseTones.action : approvalNeutralActionFill, in: Capsule())
+                .overlay(Capsule().strokeBorder(isPrimary ? Color.clear : (isReject ? NanoMuseTones.danger : NanoMuseTones.brandTint), lineWidth: 1))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(isReject
@@ -354,7 +353,9 @@ struct MIFApprovalInboxRoom: View {
         .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
-            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+            .shadow(color: NanoMuseTones.action.opacity(0.18), radius: 15, y: 7)
         .accessibilityElement(children: .combine)
     }
 

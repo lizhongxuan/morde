@@ -64,6 +64,9 @@ FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&currentOwner, &state
 		if currentOwner != actorID || deleted {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
+		if err := rejectAgentWorkspaceMutation(ctx, tx, workspaceID, "transferred"); err != nil {
+			return err
+		}
 		if readOnly {
 			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
@@ -247,6 +250,9 @@ func (s *Store) StartWorkspaceOwnershipTransferAcceptance(ctx context.Context, a
 		}
 		if value.ToOwnerID != actorID {
 			return domain.NewError(domain.CodeNotFound, "workspace ownership transfer not found")
+		}
+		if err := rejectAgentWorkspaceMutation(ctx, tx, workspaceID, "transferred"); err != nil {
+			return err
 		}
 		if value.State == workspace.OwnershipTransferPending {
 			var currentOwner, state string

@@ -261,6 +261,20 @@ func (s *ModelGatewayService) TaskToolCapability(ctx context.Context, value task
 	return false, nil
 }
 
+func (s *ModelGatewayService) ResolveTaskContextWindow(ctx context.Context, value task.Task) (*int, error) {
+	if ctx == nil || !domain.ValidUserID(value.InitiatorID) || !domain.ValidModelConnectionID(value.ModelID) {
+		return nil, domain.InvalidArgument("model", "task model identity is invalid")
+	}
+	endpoint, err := s.models.ResolveGatewayEndpoint(ctx, value.InitiatorID, value.ModelID, false, false)
+	if err != nil {
+		return nil, err
+	}
+	if endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > MaxModelContextWindowTokens {
+		return nil, nil
+	}
+	return copyInt(endpoint.ContextWindowTokens), nil
+}
+
 var dshModelIdentityPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func DSHModelCallID(taskID, sessionID string, throughSequence int64) (string, error) {

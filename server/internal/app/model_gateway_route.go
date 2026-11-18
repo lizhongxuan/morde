@@ -60,7 +60,7 @@ func (s *ModelGatewayService) CompleteConversationSummaryModel(ctx context.Conte
 		!domain.ValidOperationID(fence.OperationID) || len(fence.InputSHA256) != sha256.Size ||
 		strings.TrimSpace(fence.LeaseOwner) != fence.LeaseOwner || fence.LeaseOwner == "" || fence.LeaseVersion < 1 ||
 		!dshModelIdentityPattern.MatchString(fence.SessionID) || fence.ThroughSequence < 0 || fence.ThroughSequence > 1<<53-1 ||
-		fence.ContextWindowTokens < 4096 || fence.ContextWindowTokens > 1_000_000 || fence.BaselineVersion < 0 || !domain.ValidModelConnectionID(modelID) ||
+		fence.ContextWindowTokens < 4096 || fence.ContextWindowTokens > MaxModelContextWindowTokens || fence.BaselineVersion < 0 || !domain.ValidModelConnectionID(modelID) ||
 		request.Endpoint != (ModelEndpoint{}) || len(request.Tools) != 0 || request.RequiredTool != "" || len(request.Input) == 0 || request.OnTextDelta != nil {
 		return ModelResponse{}, domain.InvalidArgument("conversation_summary_model_call", "conversation summary model identity is invalid")
 	}
@@ -156,7 +156,7 @@ func (s *ModelGatewayService) ResolveConversationSummaryModel(ctx context.Contex
 	if err != nil {
 		return "", 0, err
 	}
-	if endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > 1_000_000 {
+	if endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > MaxModelContextWindowTokens {
 		return "", 0, domain.NewError(domain.CodeUnsupported, "selected model context capacity is unavailable")
 	}
 	return modelID, *endpoint.ContextWindowTokens, nil
@@ -283,7 +283,7 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 	if err != nil {
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be encoded")
 	}
-	request.Instructions = legacyConversationRouteInstructions
+	request.Instructions = legacyConversationRouteInstructions + "\n\n" + conversationRouteAcknowledgementInstructions
 	request.Input[0].Text = string(body)
 	return request, nil
 }

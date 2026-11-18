@@ -76,9 +76,12 @@ workspace_storage:
   min_free_bytes: ${CH_WORKSPACE_MIN_FREE_BYTES}
 # Enable Syncthing only after current-files, admission, relay, and revocation barriers are verified.
 # Project upload is independently gated and also remains closed until its real end-to-end acceptance.
+# The live directory source remains closed until legacy data is audited and cut over.
 workspace_sync_node:
   enabled: false
   project_upload_enabled: false
+  agent_workspace_live_directory_source_enabled: false
+  agent_workspace_host_mount_enabled: false
   data_root: ${CH_WORKSPACE_SYNC_DATA_ROOT_DIR}
   image_digest: ${CH_WORKSPACE_SYNC_NODE_IMAGE_ID}
   relay_image_digest: ${CH_WORKSPACE_SYNC_RELAY_IMAGE_ID}

@@ -115,6 +115,12 @@ type AdminNudgePolicy struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AgentWorkspaceHistory struct {
+	WorkspaceID string             `json:"workspace_id"`
+	OwnerID     string             `json:"owner_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type AuditLog struct {
 	ID        int64              `json:"id"`
 	At        pgtype.Timestamptz `json:"at"`
@@ -368,32 +374,34 @@ type ConversationMessageAttachment struct {
 }
 
 type ConversationMessageRoute struct {
-	ServiceInstanceID       pgtype.UUID        `json:"service_instance_id"`
-	OwnerID                 string             `json:"owner_id"`
-	ActorID                 string             `json:"actor_id"`
-	ConversationID          string             `json:"conversation_id"`
-	MessageID               string             `json:"message_id"`
-	ClientMessageID         string             `json:"client_message_id"`
-	PreviousClientMessageID pgtype.Text        `json:"previous_client_message_id"`
-	ReferenceTaskID         pgtype.Text        `json:"reference_task_id"`
-	RequestHash             []byte             `json:"request_hash"`
-	RequestMetadata         []byte             `json:"request_metadata"`
-	AuthorizationSnapshot   []byte             `json:"authorization_snapshot"`
-	State                   string             `json:"state"`
-	LeaseOwner              string             `json:"lease_owner"`
-	LeaseVersion            int64              `json:"lease_version"`
-	LeaseExpiresAt          pgtype.Timestamptz `json:"lease_expires_at"`
-	FailureReason           string             `json:"failure_reason"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
-	AvailableAfter          pgtype.Timestamptz `json:"available_after"`
-	AwaitingPredecessor     bool               `json:"awaiting_predecessor"`
-	DuplicateOfMessageID    pgtype.Text        `json:"duplicate_of_message_id"`
-	RouteAttempt            int64              `json:"route_attempt"`
-	AutoRetryCount          int16              `json:"auto_retry_count"`
-	AggregationStartedAt    pgtype.Timestamptz `json:"aggregation_started_at"`
-	AggregationDeadline     pgtype.Timestamptz `json:"aggregation_deadline"`
-	AggregationState        string             `json:"aggregation_state"`
+	ServiceInstanceID        pgtype.UUID        `json:"service_instance_id"`
+	OwnerID                  string             `json:"owner_id"`
+	ActorID                  string             `json:"actor_id"`
+	ConversationID           string             `json:"conversation_id"`
+	MessageID                string             `json:"message_id"`
+	ClientMessageID          string             `json:"client_message_id"`
+	PreviousClientMessageID  pgtype.Text        `json:"previous_client_message_id"`
+	ReferenceTaskID          pgtype.Text        `json:"reference_task_id"`
+	RequestHash              []byte             `json:"request_hash"`
+	RequestMetadata          []byte             `json:"request_metadata"`
+	AuthorizationSnapshot    []byte             `json:"authorization_snapshot"`
+	State                    string             `json:"state"`
+	LeaseOwner               string             `json:"lease_owner"`
+	LeaseVersion             int64              `json:"lease_version"`
+	LeaseExpiresAt           pgtype.Timestamptz `json:"lease_expires_at"`
+	FailureReason            string             `json:"failure_reason"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	AvailableAfter           pgtype.Timestamptz `json:"available_after"`
+	AwaitingPredecessor      bool               `json:"awaiting_predecessor"`
+	DuplicateOfMessageID     pgtype.Text        `json:"duplicate_of_message_id"`
+	RouteAttempt             int64              `json:"route_attempt"`
+	AutoRetryCount           int16              `json:"auto_retry_count"`
+	AggregationStartedAt     pgtype.Timestamptz `json:"aggregation_started_at"`
+	AggregationDeadline      pgtype.Timestamptz `json:"aggregation_deadline"`
+	AggregationState         string             `json:"aggregation_state"`
+	AcknowledgementRequested bool               `json:"acknowledgement_requested"`
+	AgentAcknowledged        bool               `json:"agent_acknowledged"`
 }
 
 type ConversationMessageUpload struct {
@@ -928,6 +936,10 @@ type ModelConnection struct {
 	CapabilityMediaVideoGeneration  bool               `json:"capability_media_video_generation"`
 	CapabilityMediaSpeechGeneration bool               `json:"capability_media_speech_generation"`
 	ContextWindowTokens             pgtype.Int4        `json:"context_window_tokens"`
+	ContextWindowOverrideTokens     pgtype.Int4        `json:"context_window_override_tokens"`
+	ContextWindowSource             string             `json:"context_window_source"`
+	ContextWindowResolvedAt         pgtype.Timestamptz `json:"context_window_resolved_at"`
+	ContextWindowCatalogVersion     pgtype.Text        `json:"context_window_catalog_version"`
 }
 
 type ModelTextStreamingCapability struct {
@@ -2282,6 +2294,13 @@ type User struct {
 	MustChangePassword  bool               `json:"must_change_password"`
 	DefaultHostCpuMilli int32              `json:"default_host_cpu_milli"`
 	DefaultHostMemMib   int32              `json:"default_host_mem_mib"`
+}
+
+type UserAgentWorkspace struct {
+	OwnerID                string             `json:"owner_id"`
+	WorkspaceID            string             `json:"workspace_id"`
+	DirectoryInitializedAt pgtype.Timestamptz `json:"directory_initialized_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 }
 
 type UserInvite struct {

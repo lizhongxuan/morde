@@ -5,13 +5,59 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
+
+type taskMediaApprovedSaveStoreStub struct{ object TaskMediaStagedObject }
+
+func (s taskMediaApprovedSaveStoreStub) GetTaskMediaForApprovedSave(context.Context, string, string, string, int64, string) (TaskMediaStagedObject, error) {
+	return s.object, nil
+}
+
+type taskMediaPublishFailStore struct {
+	*syncServiceStore
+	failNext bool
+}
+
+func (s *taskMediaPublishFailStore) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File,
+	emptyDirectories []string, directories []workspace.Directory, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
+	if s.failNext {
+		s.failNext = false
+		return TaskWorkspacePublishReceipt{}, errors.New("simulated commit interruption")
+	}
+	return s.syncServiceStore.CommitTaskWorkspacePublish(ctx, value, files, emptyDirectories, directories, manifestSHA)
+}
+
+type taskMediaArtifactTaskStore struct{ *runtimeToolTaskStore }
+
+func (s *taskMediaArtifactTaskStore) RecordValidatedArtifact(_ context.Context, ownerID string, artifact task.Artifact, leaseOwner string, leaseVersion int64) (task.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ownerID != s.details.Task.OwnerID || leaseOwner != s.details.Task.Lease.Owner || leaseVersion != s.details.Task.Lease.Version {
+		return task.Artifact{}, domain.NewError(domain.CodeInvalidState, "task lease changed")
+	}
+	s.details.Artifacts = append(s.details.Artifacts, artifact)
+	return artifact, nil
+}
+
+type countingLiveWorkspaceDirectory struct {
+	cloudDSHLiveWorkspaceDirectory
+	writes int
+}
+
+func (d *countingLiveWorkspaceDirectory) WriteRegularFileFrom(ctx context.Context, ownerID, workspaceID, relative string, source io.Reader, size int64,
+	digest string, mode uint32, expectedSHA string) error {
+	d.writes++
+	return d.cloudDSHLiveWorkspaceDirectory.WriteRegularFileFrom(ctx, ownerID, workspaceID, relative, source, size, digest, mode, expectedSHA)
+}
 
 func TestTaskMediaSaveIdentityAndPath(t *testing.T) {
 	const operationID = "o1234567"
@@ -99,6 +145,80 @@ func TestApprovedTaskMediaWorkspaceConflictIsVisibleAndDiscardsPreview(t *testin
 		stagedStore.object.State != TaskMediaPreviewDiscard || receiptStore.calls != 1 {
 		t.Fatalf("media failure was not durably visible and discarded: events=%d steps=%+v staged=%+v receipt calls=%d",
 			len(store.events), store.details.Steps, stagedStore.object, receiptStore.calls)
+	}
+}
+
+func TestApprovedTaskMediaWritesLiveWorkspaceAndReplaysAfterCommitInterruption(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	current := fixture.store.details.Task
+	stepID := "s1234567"
+	operationID := "o1234567"
+	requestHash := sha256.Sum256([]byte("approved media request"))
+	media := []byte("png")
+	mediaDigest := sha256.Sum256(media)
+	runtimeSession, err := fixture.executor.runtime.Connect(context.Background(), current.HostID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeFence := AgentHostFence{RuntimeGeneration: runtimeSession.Fence.RuntimeGeneration,
+		RuntimeInstanceID: runtimeSession.Fence.RuntimeInstanceID, ControlVersion: runtimeSession.Fence.ControlVersion, AIAllowed: true}
+	runtimeSession.Close()
+	fixture.fence, fixture.fences.fence = runtimeFence, runtimeFence
+	pending := task.PendingRequest{ID: "r1234567", TaskID: current.ID, Version: 1, Kind: "approval",
+		CallID: "approved-media-call", MediaPreviewOperationID: operationID, ToolName: "morde_generate_image", RequestHash: requestHash[:],
+		RuntimeGeneration: runtimeFence.RuntimeGeneration, RuntimeInstanceID: runtimeFence.RuntimeInstanceID,
+		ControlVersion: runtimeFence.ControlVersion, Status: task.PendingRequestApproved, Decision: task.PendingDecisionApprove}
+	fixture.store.details.PendingRequest = &pending
+	fixture.store.details.Steps = []task.Step{{ID: stepID, TaskID: current.ID, Status: task.StepRunning}}
+	staged := TaskMediaStagedObject{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		OperationID: operationID, OperationKey: agentOperationKey(pending.CallID), RequestHash: requestHash[:],
+		OperationStatus: string(task.OperationSucceeded), TokenState: "settled", ReservedTokens: 1,
+		InputTokens: int64Pointer(1), OutputTokens: int64Pointer(0), MediaType: "image/png", SizeBytes: int64(len(media)),
+		SHA256: mediaDigest[:], State: TaskMediaPreviewSaving, CleanupState: TaskMediaCleanupPending}
+	stagedStore := &taskMediaPublishStagedStoreStub{object: staged}
+	service := fixture.executor.workspaces
+	baseStore, ok := service.store.(*syncServiceStore)
+	if !ok {
+		t.Fatalf("Workspace sync test store has type %T", service.store)
+	}
+	service.store = &taskMediaPublishFailStore{syncServiceStore: baseStore, failNext: true}
+	service.liveDirectorySource = true
+	liveDirectory := &countingLiveWorkspaceDirectory{cloudDSHLiveWorkspaceDirectory: cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}}
+	if err := service.SetWorkspaceCurrentDirectory(liveDirectory); err != nil {
+		t.Fatal(err)
+	}
+	fixture.executor.store = &taskMediaArtifactTaskStore{runtimeToolTaskStore: fixture.store}
+	content := taskMediaPreviewContentStub{open: func(_ context.Context, ownerID, taskID, gotOperationID string, expected TaskMediaStagedContent) (io.ReadCloser, error) {
+		if ownerID != current.OwnerID || taskID != current.ID || gotOperationID != operationID || expected.SizeBytes != int64(len(media)) ||
+			hex.EncodeToString(expected.SHA256) != hex.EncodeToString(mediaDigest[:]) {
+			t.Fatalf("approved media content request mismatch: owner=%q task=%q operation=%q expected=%#v", ownerID, taskID, gotOperationID, expected)
+		}
+		return io.NopCloser(bytes.NewReader(media)), nil
+	}}
+	mediaSave, err := NewTaskMediaSaveService(taskMediaApprovedSaveStoreStub{object: staged}, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.executor.SetTaskMediaSaveService(mediaSave, stagedStore); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.executor.SaveApprovedTaskMedia(context.Background(), current, pending, stepID); err == nil || err.Error() != "simulated commit interruption" {
+		t.Fatalf("first save error = %v; want simulated commit interruption", err)
+	}
+	filePath := filepath.Join(liveDirectory.root, "morde-media-o1234567.png")
+	if got, err := os.ReadFile(filePath); err != nil || !bytes.Equal(got, media) {
+		t.Fatalf("live media after interrupted commit = %q, %v", got, err)
+	}
+	saved, err := fixture.executor.SaveApprovedTaskMedia(context.Background(), current, pending, stepID)
+	if err != nil || saved.Path != "morde-media-o1234567.png" || saved.Revision != 1 || saved.SHA256 != hex.EncodeToString(mediaDigest[:]) {
+		t.Fatalf("replayed approved media save = %#v, %v", saved, err)
+	}
+	if liveDirectory.writes != 1 {
+		t.Fatalf("live media writes = %d, want one write across retry", liveDirectory.writes)
+	}
+	if stagedStore.object.State != TaskMediaPreviewSaved || len(fixture.store.details.Artifacts) != 1 {
+		t.Fatalf("saved media state=%q, artifacts=%d; want durable Artifact and saved staged object", stagedStore.object.State, len(fixture.store.details.Artifacts))
 	}
 }
 

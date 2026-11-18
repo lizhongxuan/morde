@@ -93,7 +93,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return migrate(ctx, path, args[1], stdout)
 	case "workspace":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: portal workspace verify [--config path] | import-legacy --workspace id [--config path]")
+			return fmt.Errorf("usage: portal workspace verify [--config path] | import-legacy --workspace id [--config path] | adopt-agent --owner id --workspace id")
 		}
 		switch args[1] {
 		case "verify":
@@ -108,8 +108,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 				return err
 			}
 			return importLegacyWorkspace(ctx, path, workspaceID, stdout)
+		case "adopt-agent":
+			return adoptAgentWorkspace(ctx, args[2:], stderr, stdout)
 		default:
-			return fmt.Errorf("usage: portal workspace verify [--config path] | import-legacy --workspace id [--config path]")
+			return fmt.Errorf("usage: portal workspace verify [--config path] | import-legacy --workspace id [--config path] | adopt-agent --owner id --workspace id")
 		}
 	default:
 		return usageError()
@@ -117,7 +119,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: portal serve|migrate up|migrate status|workspace verify|workspace import-legacy")
+	return fmt.Errorf("usage: portal serve|migrate up|migrate status|workspace verify|workspace import-legacy|workspace adopt-agent")
 }
 
 func parseWorkspaceImportFlags(args []string, stderr io.Writer) (string, string, error) {
@@ -242,7 +244,8 @@ func serve(ctx context.Context, configPath string) error {
 	defer func() { _ = workspaceCurrent.Close() }()
 	workspaceSync, err := app.NewWorkspaceSyncServiceWithOptions(
 		store, workspaceBlocks, workspace.MaxSyncManifestBytes, cfg.WorkspaceStorage.MaxOwnerBytes,
-		app.WorkspaceSyncOptions{ProjectUploadEnabled: cfg.WorkspaceSyncNode.ProjectUploadEnabled},
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: cfg.WorkspaceSyncNode.ProjectUploadEnabled,
+			LiveDirectorySourceEnabled: cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled},
 	)
 	if err != nil {
 		return err
@@ -258,6 +261,9 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	if err := workspaceSync.SetWorkspaceCurrentManifestVerifier(workspaceCurrent.MatchesManifest); err != nil {
 		return fmt.Errorf("configure Workspace current manifest verifier: %w", err)
+	}
+	if err := workspaceSync.SetWorkspaceCurrentDirectory(workspaceCurrent); err != nil {
+		return fmt.Errorf("configure Workspace live directory: %w", err)
 	}
 	workspaceOwnershipTransfers, err := app.NewWorkspaceTransferService(store, cfg.WorkspaceStorage.MaxOwnerBytes)
 	if err != nil {
@@ -407,6 +413,12 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize Workspace volume service: %w", err)
 	}
+	agentWorkspacePaths := agentWorkspaceHostPathResolver{
+		store: store, current: workspaceCurrent, hostMountEnabled: cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled,
+	}
+	if err := workspaceVolumes.SetAgentWorkspaceHostPathResolver(agentWorkspacePaths); err != nil {
+		return fmt.Errorf("configure Agent Workspace Host mount: %w", err)
+	}
 	workspaceCopies, err := app.NewWorkspaceCopyService(store, workspaceSync, workspaceBlocks, volumes, volumes,
 		serviceInstanceID, cfg.WorkspaceStorage.MaxOwnerBytes, cfg.WorkspaceStorage.MaxWorkspaceBytes)
 	if err != nil {
@@ -461,6 +473,17 @@ func serve(ctx context.Context, configPath string) error {
 	if err := workspaces.SetHostWorkspaceVolumes(workspaceVolumes); err != nil {
 		return fmt.Errorf("configure Host workspace deletion: %w", err)
 	}
+	resolveAgentWorkspacePath := func(ctx context.Context, ownerID string) (string, error) {
+		value, err := workspaces.EnsureAgentWorkspace(ctx, ownerID)
+		if err != nil {
+			return "", err
+		}
+		return workspaceCurrent.WorkspacePath(ownerID, value.ID)
+	}
+	agentWorkspaceFiles, err := app.NewAgentWorkspaceFilesService(workspaces, workspaceCurrent)
+	if err != nil {
+		return fmt.Errorf("initialize Agent Workspace file service: %w", err)
+	}
 	hosts, err := app.NewHostService(app.HostServiceOptions{
 		Hosts: store, Users: store, Workspaces: store, DefaultWorkspaces: workspaces,
 		HostWorkspaceDeleter: workspaces, WorkspaceVolumes: workspaceVolumes, Tokens: store,
@@ -478,10 +501,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	hostCopies, err := app.NewHostCopyService(hosts, workspaceCopies)
-	if err != nil {
-		return fmt.Errorf("initialize Host copy service: %w", err)
-	}
+	hostCopies := app.NewHostCopyService()
 	adminHostResources, err := app.NewAdminHostResourcesService(store, app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB}, router)
 	if err != nil {
 		return err
@@ -704,7 +724,7 @@ func serve(ctx context.Context, configPath string) error {
 		if err != nil {
 			return err
 		}
-		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
+		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync, resolveAgentWorkspacePath,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
 			hubService, workerSuffix, serviceInstanceID, dataKey, logger, registry)
@@ -771,7 +791,8 @@ func serve(ctx context.Context, configPath string) error {
 	admin := adminAdapter{users: users, audit: auditService, capacity: hosts, workspaceSyncReconciler: workspaceSyncNodeOwnerReconciler}
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, HostUsage: hostUsageService, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
-		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices, WorkspaceDiff: workspaceSync,
+		WorkspaceOps: workspaces, AgentWorkspaceFiles: agentWorkspaceFiles,
+		WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices, WorkspaceDiff: workspaceSync,
 		WorkspaceCopies: workspaceCopies, HostCopies: hostCopies, WorkspaceTransfers: workspaceOwnershipTransfers, WorkspaceShares: workspaceShares,
 		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
@@ -935,7 +956,8 @@ type cloudDSHTaskWorkerBundle struct {
 }
 
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
-	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
+	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService,
+	workspacePath func(context.Context, string) (string, error), models *app.ModelGatewayService,
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
@@ -1011,7 +1033,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	}
 	supervisor, err := worker.NewDockerCloudDSHSupervisor(worker.DockerCloudDSHSupervisorOptions{
 		DockerHost: cfg.DockerHost, Image: cfg.Image, NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath,
-		Guardian: guardian,
+		Guardian: guardian, WorkspacePath: workspacePath,
 	})
 	if err != nil {
 		return nil, err

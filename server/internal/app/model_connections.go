@@ -15,17 +15,21 @@ import (
 )
 
 type ModelConnectionRecord struct {
-	ID                  string
-	OwnerID             string
-	Name                string
-	BaseURL             string
-	ModelName           string
-	ContextWindowTokens *int
-	APIKeyCipher        []byte
-	Capabilities        ModelCapabilities
-	CheckedAt           *time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                          string
+	OwnerID                     string
+	Name                        string
+	BaseURL                     string
+	ModelName                   string
+	ContextWindowTokens         *int
+	ContextWindowOverrideTokens *int
+	ContextWindowSource         ModelContextWindowSource
+	ContextWindowResolvedAt     *time.Time
+	ContextWindowCatalogVersion *string
+	APIKeyCipher                []byte
+	Capabilities                ModelCapabilities
+	CheckedAt                   *time.Time
+	CreatedAt                   time.Time
+	UpdatedAt                   time.Time
 }
 
 type ModelConnectionStore interface {
@@ -41,17 +45,21 @@ type ModelDefaultReader interface {
 }
 
 type ModelConnectionView struct {
-	ID                  string
-	Name                string
-	BaseURL             string
-	ModelName           string
-	ContextWindowTokens *int
-	Shared              bool
-	HasAPIKey           bool
-	Capabilities        ModelCapabilities
-	CheckedAt           *time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                          string
+	Name                        string
+	BaseURL                     string
+	ModelName                   string
+	ContextWindowTokens         *int
+	ContextWindowOverrideTokens *int
+	ContextWindowSource         ModelContextWindowSource
+	ContextWindowResolvedAt     *time.Time
+	ContextWindowCatalogVersion *string
+	Shared                      bool
+	HasAPIKey                   bool
+	Capabilities                ModelCapabilities
+	CheckedAt                   *time.Time
+	CreatedAt                   time.Time
+	UpdatedAt                   time.Time
 }
 
 type ModelConfigurationStatus string
@@ -76,13 +84,29 @@ func ModelConnectionsConfigurationStatus(items []ModelConnectionView) ModelConfi
 }
 
 type ModelConnectionCommand struct {
-	Name                string
-	BaseURL             string
-	ModelName           string
-	ContextWindowTokens *int
-	APIKey              string
-	Shared              bool
+	Name                         string
+	BaseURL                      string
+	ModelName                    string
+	ContextWindowOverrideTokens  *int
+	ContextWindowOverridePresent bool
+	LegacyContextWindowTokens    *int
+	LegacyContextWindowPresent   bool
+	APIKey                       string
+	Shared                       bool
 }
+
+type ModelContextWindowSource string
+
+const MaxModelContextWindowTokens = 2_000_000
+
+const (
+	ModelContextWindowUnknown          ModelContextWindowSource = "unknown"
+	ModelContextWindowOverride         ModelContextWindowSource = "override"
+	ModelContextWindowLegacyManual     ModelContextWindowSource = "legacy_manual"
+	ModelContextWindowProviderMetadata ModelContextWindowSource = "provider_metadata"
+	ModelContextWindowModelCatalog     ModelContextWindowSource = "model_catalog"
+	ModelContextWindowProviderError    ModelContextWindowSource = "provider_error"
+)
 
 type ModelConnectionService struct {
 	store       ModelConnectionStore
@@ -166,6 +190,15 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if err := validateModelConnectionCommand(command, s.allowedHost, true); err != nil {
 		return ModelConnectionView{}, err
 	}
+	override, source, err := explicitContextWindowOverride(command)
+	if err != nil {
+		return ModelConnectionView{}, err
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(command.BaseURL), "/")
+	modelName := strings.TrimSpace(command.ModelName)
+	if err := rejectDefaultModelContextOverride(baseURL, modelName, override); err != nil {
+		return ModelConnectionView{}, err
+	}
 	id, err := domain.NewModelConnectionID()
 	if err != nil {
 		return ModelConnectionView{}, fmt.Errorf("generate model connection id: %w", err)
@@ -178,10 +211,13 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if command.Shared {
 		ownerID = ""
 	}
-	record, err := s.store.CreateModelConnection(ctx, ModelConnectionRecord{
-		ID: id, OwnerID: ownerID, Name: strings.TrimSpace(command.Name), BaseURL: strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"),
-		ModelName: strings.TrimSpace(command.ModelName), ContextWindowTokens: copyInt(command.ContextWindowTokens), APIKeyCipher: ciphertext,
-	})
+	record := ModelConnectionRecord{
+		ID: id, OwnerID: ownerID, Name: strings.TrimSpace(command.Name), BaseURL: baseURL,
+		ModelName: modelName, ContextWindowTokens: copyInt(override),
+		ContextWindowOverrideTokens: copyInt(override), ContextWindowSource: source, APIKeyCipher: ciphertext,
+	}
+	applyModelContextCapacity(&record, time.Now().UTC())
+	record, err = s.store.CreateModelConnection(ctx, record)
 	if err != nil {
 		return ModelConnectionView{}, err
 	}
@@ -206,7 +242,8 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 	if err := validateModelConnectionCommand(command, s.allowedHost, false); err != nil {
 		return ModelConnectionView{}, err
 	}
-	changedEndpoint := strings.TrimRight(strings.TrimSpace(command.BaseURL), "/") != current.BaseURL || strings.TrimSpace(command.ModelName) != current.ModelName
+	routeChanged := strings.TrimRight(strings.TrimSpace(command.BaseURL), "/") != current.BaseURL || strings.TrimSpace(command.ModelName) != current.ModelName
+	keyChanged := command.APIKey != ""
 	if command.APIKey != "" {
 		if err := validateAPIKey(command.APIKey); err != nil {
 			return ModelConnectionView{}, err
@@ -215,19 +252,44 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 		if err != nil {
 			return ModelConnectionView{}, fmt.Errorf("encrypt model API key: %w", err)
 		}
-		changedEndpoint = true
+	}
+	requestedOverride, requestedSource, err := explicitContextWindowOverride(command)
+	if err != nil {
+		return ModelConnectionView{}, err
+	}
+	if command.ContextWindowOverridePresent || command.LegacyContextWindowPresent {
+		if err := rejectDefaultModelContextOverride(strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"), strings.TrimSpace(command.ModelName), requestedOverride); err != nil {
+			return ModelConnectionView{}, err
+		}
 	}
 	current.Name = strings.TrimSpace(command.Name)
 	current.BaseURL = strings.TrimRight(strings.TrimSpace(command.BaseURL), "/")
 	current.ModelName = strings.TrimSpace(command.ModelName)
-	if command.ContextWindowTokens != nil {
-		current.ContextWindowTokens = copyInt(command.ContextWindowTokens)
-	} else if changedEndpoint {
+	switch {
+	case command.ContextWindowOverridePresent || command.LegacyContextWindowPresent:
+		current.ContextWindowOverrideTokens = copyInt(requestedOverride)
+		current.ContextWindowTokens = copyInt(requestedOverride)
+		current.ContextWindowSource = requestedSource
+		current.ContextWindowResolvedAt = nil
+		current.ContextWindowCatalogVersion = nil
+	case routeChanged:
+		current.ContextWindowOverrideTokens = nil
 		current.ContextWindowTokens = nil
+		current.ContextWindowSource = ModelContextWindowUnknown
+		current.ContextWindowResolvedAt = nil
+		current.ContextWindowCatalogVersion = nil
+	case keyChanged && current.ContextWindowOverrideTokens == nil:
+		current.ContextWindowTokens = nil
+		current.ContextWindowSource = ModelContextWindowUnknown
+		current.ContextWindowResolvedAt = nil
+		current.ContextWindowCatalogVersion = nil
 	}
-	if changedEndpoint {
+	if routeChanged || keyChanged {
 		current.Capabilities = ModelCapabilities{ModelID: current.ID}
 		current.CheckedAt = nil
+	}
+	if routeChanged || keyChanged || command.ContextWindowOverridePresent || command.LegacyContextWindowPresent {
+		applyModelContextCapacity(&current, time.Now().UTC())
 	}
 	updated, err := s.store.UpdateModelConnection(ctx, current)
 	if err != nil {
@@ -475,10 +537,16 @@ func canManageModelConnection(principal identity.Principal, record ModelConnecti
 }
 
 func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {
+	source := record.ContextWindowSource
+	if source == "" {
+		source = ModelContextWindowUnknown
+	}
 	return ModelConnectionView{
 		ID: record.ID, Name: record.Name, BaseURL: record.BaseURL, ModelName: record.ModelName,
-		ContextWindowTokens: copyInt(record.ContextWindowTokens),
-		Shared:              record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
+		ContextWindowTokens: copyInt(record.ContextWindowTokens), ContextWindowOverrideTokens: copyInt(record.ContextWindowOverrideTokens),
+		ContextWindowSource: source, ContextWindowResolvedAt: copyTime(record.ContextWindowResolvedAt),
+		ContextWindowCatalogVersion: copyString(record.ContextWindowCatalogVersion),
+		Shared:                      record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
 		Capabilities: record.Capabilities, CheckedAt: record.CheckedAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
 }
@@ -491,9 +559,50 @@ func copyInt(value *int) *int {
 	return &copy
 }
 
+func copyString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func explicitContextWindowOverride(command ModelConnectionCommand) (*int, ModelContextWindowSource, error) {
+	if command.ContextWindowOverridePresent && command.LegacyContextWindowPresent {
+		return nil, ModelContextWindowUnknown, domain.InvalidArgument("context_window_override_tokens", "provide only one context window field")
+	}
+	if command.ContextWindowOverridePresent {
+		if command.ContextWindowOverrideTokens != nil && (*command.ContextWindowOverrideTokens < 4096 || *command.ContextWindowOverrideTokens > MaxModelContextWindowTokens) {
+			return nil, ModelContextWindowUnknown, domain.InvalidArgument("context_window_override_tokens", "context window must be between 4096 and 2000000 tokens")
+		}
+		if command.ContextWindowOverrideTokens == nil {
+			return nil, ModelContextWindowUnknown, nil
+		}
+		return copyInt(command.ContextWindowOverrideTokens), ModelContextWindowOverride, nil
+	}
+	if command.LegacyContextWindowPresent {
+		if command.LegacyContextWindowTokens != nil && (*command.LegacyContextWindowTokens < 4096 || *command.LegacyContextWindowTokens > MaxModelContextWindowTokens) {
+			return nil, ModelContextWindowUnknown, domain.InvalidArgument("context_window_tokens", "context window must be between 4096 and 2000000 tokens")
+		}
+		if command.LegacyContextWindowTokens == nil {
+			return nil, ModelContextWindowUnknown, nil
+		}
+		return copyInt(command.LegacyContextWindowTokens), ModelContextWindowLegacyManual, nil
+	}
+	return nil, ModelContextWindowUnknown, nil
+}
+
 func validateModelConnectionCommand(command ModelConnectionCommand, allowed map[string]struct{}, requireKey bool) error {
-	if command.ContextWindowTokens != nil && (*command.ContextWindowTokens < 4096 || *command.ContextWindowTokens > 1_000_000) {
-		return domain.InvalidArgument("model_connection", "context window must be between 4096 and 1000000 tokens")
+	if _, _, err := explicitContextWindowOverride(command); err != nil {
+		return err
 	}
 	name := strings.TrimSpace(command.Name)
 	modelName := strings.TrimSpace(command.ModelName)

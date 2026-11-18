@@ -47,6 +47,20 @@ type WorkspaceCurrentMaterializer func(context.Context, string, string, int64, [
 type WorkspaceCurrentRevisionReader func(string, string) (int64, bool, error)
 type WorkspaceCurrentManifestVerifier func(context.Context, string, string, []workspace.File, []string, []workspace.Directory) (bool, error)
 
+type WorkspaceCurrentDirectory interface {
+	ReadDirectory(string, string, string) ([]workspace.DirectoryEntry, error)
+	OpenRegularFile(string, string, string) (*os.File, os.FileInfo, error)
+	ReadSymbolicLink(string, string, string) (string, error)
+	StatPath(string, string, string) (os.FileInfo, error)
+	WriteRegularFile(context.Context, string, string, string, []byte, uint32, string) error
+	WriteRegularFileFrom(context.Context, string, string, string, io.Reader, int64, string, uint32, string) error
+	CreateDirectory(context.Context, string, string, string, uint32) error
+	RemoveEmptyDirectory(context.Context, string, string, string) error
+	RemoveRegularFile(context.Context, string, string, string, string) error
+	WriteSymbolicLink(context.Context, string, string, string, string, string) error
+	RemoveSymbolicLink(context.Context, string, string, string, string) error
+}
+
 type WorkspaceCurrentMaterializationStore interface {
 	ListWorkspaceCurrentMaterializations(context.Context, string, int32) ([]WorkspaceCurrentMaterialization, error)
 	MarkWorkspaceCurrentMaterialized(context.Context, string, int64) error
@@ -61,15 +75,30 @@ type WorkspaceCurrentMaterializationLockStore interface {
 	TryWorkspaceCurrentMaterializationLock(context.Context, string) (LeaderLock, bool, error)
 }
 
+type WorkspaceSyncDirectCommitPlan struct {
+	Session                 workspace.SyncSession
+	PinnedFiles             []workspace.File
+	PinnedEmptyDirectories  []string
+	PinnedDirectoryMetadata []workspace.Directory
+}
+
+type WorkspaceSyncDirectCommitCallback func(context.Context, WorkspaceSyncDirectCommitPlan) ([]workspace.Conflict, error)
+
+type workspaceSyncDirectCommitter interface {
+	CommitWorkspaceSyncSessionDirect(context.Context, string, string, IdempotencyRecord, WorkspaceSyncDirectCommitCallback) (workspace.SyncSession, bool, error)
+}
+
 type WorkspaceSyncService struct {
 	store                WorkspaceSyncStore
 	blocks               WorkspaceBlockStore
 	maxManifestBytes     int64
 	maxOwnerBytes        int64
 	projectUploadEnabled bool
+	liveDirectorySource  bool
 	materializeCurrent   WorkspaceCurrentMaterializer
 	currentRevision      WorkspaceCurrentRevisionReader
 	verifyCurrent        WorkspaceCurrentManifestVerifier
+	currentDirectory     WorkspaceCurrentDirectory
 	nodeObserver         WorkspaceSyncNodeObserver
 }
 
@@ -97,7 +126,8 @@ type workspaceOwnershipTransferManifestReader interface {
 // WorkspaceSyncOptions contains release gates for newly introduced sync flows.
 // Project uploads are closed unless explicitly enabled by the server.
 type WorkspaceSyncOptions struct {
-	ProjectUploadEnabled bool
+	ProjectUploadEnabled       bool
+	LiveDirectorySourceEnabled bool
 }
 
 func NewWorkspaceSyncService(store WorkspaceSyncStore, blocks WorkspaceBlockStore, maxManifestBytes, maxOwnerBytes int64) (*WorkspaceSyncService, error) {
@@ -115,7 +145,7 @@ func NewWorkspaceSyncServiceWithOptions(store WorkspaceSyncStore, blocks Workspa
 	}
 	return &WorkspaceSyncService{
 		store: store, blocks: blocks, maxManifestBytes: maxManifestBytes, maxOwnerBytes: maxOwnerBytes,
-		projectUploadEnabled: options.ProjectUploadEnabled,
+		projectUploadEnabled: options.ProjectUploadEnabled, liveDirectorySource: options.LiveDirectorySourceEnabled,
 	}, nil
 }
 
@@ -132,6 +162,41 @@ func (s *WorkspaceSyncService) ProjectUploadEnabled() bool {
 	return s != nil && s.projectUploadEnabled
 }
 
+func (s *WorkspaceSyncService) LiveDirectorySourceEnabled() bool {
+	return s != nil && s.liveDirectorySource && s.currentDirectory != nil
+}
+
+func (s *WorkspaceSyncService) UsesLiveDirectorySource(ctx context.Context, ownerID, workspaceID string) (bool, error) {
+	if !s.LiveDirectorySourceEnabled() {
+		return false, nil
+	}
+	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return false, domain.InvalidArgument("workspace", "Workspace identity is invalid")
+	}
+	lookup, ok := s.store.(interface {
+		GetAgentWorkspace(context.Context, string) (workspace.Workspace, bool, error)
+	})
+	if !ok {
+		return false, domain.NewError(domain.CodeWorkspaceUnavailable, "Agent Workspace identity cannot be verified")
+	}
+	value, found, err := lookup.GetAgentWorkspace(ctx, ownerID)
+	if err != nil {
+		return false, err
+	}
+	return found && value.ID == workspaceID, nil
+}
+
+func (s *WorkspaceSyncService) rejectRevisionWorkspaceWrite(ctx context.Context, ownerID, workspaceID string) error {
+	liveDirectory, err := s.UsesLiveDirectorySource(ctx, ownerID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if liveDirectory {
+		return domain.NewError(domain.CodeWorkspaceUnavailable, "revision-based Workspace writes are disabled while the live directory is authoritative")
+	}
+	return nil
+}
+
 func (s *WorkspaceSyncService) SetWorkspaceCurrentRevisionReader(reader WorkspaceCurrentRevisionReader) error {
 	if s == nil || reader == nil {
 		return errors.New("workspace current revision reader is required")
@@ -145,6 +210,14 @@ func (s *WorkspaceSyncService) SetWorkspaceCurrentManifestVerifier(verifier Work
 		return errors.New("workspace current manifest verifier is required")
 	}
 	s.verifyCurrent = verifier
+	return nil
+}
+
+func (s *WorkspaceSyncService) SetWorkspaceCurrentDirectory(directory WorkspaceCurrentDirectory) error {
+	if s == nil || directory == nil {
+		return errors.New("Workspace current directory is required")
+	}
+	s.currentDirectory = directory
 	return nil
 }
 
@@ -240,7 +313,7 @@ func (s *WorkspaceSyncService) InitializeWorkspaceCurrent(ctx context.Context, w
 	if s == nil || s.materializeCurrent == nil {
 		return errors.New("workspace current materializer is unavailable")
 	}
-	return s.materializeWorkspaceCurrent(ctx, workspaceID)
+	return s.materializeWorkspaceCurrentForReceive(ctx, workspaceID, "")
 }
 
 func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(ctx context.Context) error {
@@ -263,6 +336,13 @@ func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(
 		if reservation.State != "reserved" && reservation.State != "aborting" {
 			continue
 		}
+		liveDirectory, err := s.UsesLiveDirectorySource(ctx, reservation.OwnerID, reservation.WorkspaceID)
+		if err != nil {
+			return err
+		}
+		if liveDirectory {
+			return fmt.Errorf("Workspace %s has an active receive reservation; resolve it before enabling the live directory source", reservation.WorkspaceID)
+		}
 		if err := s.AbortWorkspaceSyncReceive(ctx, reservation.OwnerID, reservation.ID); err != nil {
 			return fmt.Errorf("recover active Workspace %s receive reservation: %w", reservation.WorkspaceID, err)
 		}
@@ -277,6 +357,17 @@ func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(
 			return nil
 		}
 		for _, item := range pending {
+			liveDirectory, err := s.UsesLiveDirectorySource(ctx, item.OwnerID, item.WorkspaceID)
+			if err != nil {
+				return err
+			}
+			if liveDirectory {
+				if item.DesiredRevision != item.AppliedRevision {
+					return fmt.Errorf("Workspace %s has a pending revision materialization; resolve it before enabling the live directory source", item.WorkspaceID)
+				}
+				afterWorkspaceID = item.WorkspaceID
+				continue
+			}
 			if err := s.materializeWorkspaceCurrent(ctx, item.WorkspaceID); err != nil {
 				return fmt.Errorf("recover Workspace %s current revision %d: %w", item.WorkspaceID, item.DesiredRevision, err)
 			}
@@ -286,7 +377,87 @@ func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(
 }
 
 func (s *WorkspaceSyncService) materializeWorkspaceCurrent(ctx context.Context, workspaceID string) error {
+	if s == nil || s.store == nil {
+		return domain.NewError(domain.CodeWorkspaceUnavailable, "workspace service is unavailable")
+	}
+	value, err := s.store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if err := s.rejectRevisionWorkspaceWrite(ctx, value.OwnerID, workspaceID); err != nil {
+		return err
+	}
 	return s.materializeWorkspaceCurrentForReceive(ctx, workspaceID, "")
+}
+
+type workspaceCurrentManifest struct {
+	files            []workspace.File
+	emptyDirectories []string
+	directories      []workspace.Directory
+	totalBytes       int64
+}
+
+func (s *WorkspaceSyncService) readWorkspaceCurrentManifest(ctx context.Context, ownerID, workspaceID string, revision int64) (workspaceCurrentManifest, error) {
+	manifest := workspaceCurrentManifest{files: make([]workspace.File, 0), emptyDirectories: make([]string, 0), directories: make([]workspace.Directory, 0)}
+	directoryByPath := make(map[string]workspace.Directory)
+	afterPath, lastCursor := "", ""
+	totalItems := 0
+	for {
+		page, err := s.getWorkspaceManifestPage(ctx, ownerID, workspaceID, revision, "", afterPath, manifestPageLimit)
+		if err != nil {
+			return workspaceCurrentManifest{}, fmt.Errorf("read current Workspace revision %d: %w", revision, err)
+		}
+		if page.WorkspaceID != workspaceID || page.Revision != revision || len(page.Files)+len(page.EmptyDirectories) > int(manifestPageLimit) ||
+			totalItems+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles ||
+			(len(page.Files)+len(page.EmptyDirectories) == 0 && page.NextCursor != nil) {
+			return workspaceCurrentManifest{}, errors.New("current Workspace manifest identity or size is invalid")
+		}
+		pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
+		for _, file := range page.Files {
+			if file.SizeBytes < 0 || manifest.totalBytes > int64(^uint64(0)>>1)-file.SizeBytes {
+				return workspaceCurrentManifest{}, errors.New("current Workspace manifest order or size is invalid")
+			}
+			manifest.files = append(manifest.files, file)
+			pagePaths = append(pagePaths, file.Path)
+			manifest.totalBytes += file.SizeBytes
+		}
+		for _, directory := range page.EmptyDirectories {
+			if err := workspace.ValidateRelativePath(directory); err != nil {
+				return workspaceCurrentManifest{}, errors.New("current Workspace manifest contains an invalid empty directory path")
+			}
+			manifest.emptyDirectories = append(manifest.emptyDirectories, directory)
+			pagePaths = append(pagePaths, directory)
+		}
+		for _, directory := range page.Directories {
+			if err := workspace.ValidateDirectory(directory, false); err != nil {
+				return workspaceCurrentManifest{}, errors.New("current Workspace manifest contains invalid directory metadata")
+			}
+			key := strings.ToLower(directory.Path)
+			if prior, exists := directoryByPath[key]; exists && !workspace.SameDirectoryMetadata(prior, directory) {
+				return workspaceCurrentManifest{}, errors.New("current Workspace manifest contains inconsistent directory metadata")
+			}
+			if _, exists := directoryByPath[key]; !exists {
+				directoryByPath[key] = directory
+				manifest.directories = append(manifest.directories, directory)
+			}
+		}
+		sort.Strings(pagePaths)
+		for _, itemPath := range pagePaths {
+			if itemPath <= afterPath {
+				return workspaceCurrentManifest{}, errors.New("current Workspace manifest order or size is invalid")
+			}
+			afterPath = itemPath
+		}
+		totalItems += len(pagePaths)
+		if page.NextCursor == nil {
+			return manifest, nil
+		}
+		cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
+		if err != nil || cursor.Revision != revision || cursor.Prefix != "" || cursor.After != afterPath || cursor.After == "" || cursor.After <= lastCursor {
+			return workspaceCurrentManifest{}, errors.New("current Workspace manifest cursor is invalid or did not advance")
+		}
+		lastCursor = cursor.After
+	}
 }
 
 func (s *WorkspaceSyncService) materializeWorkspaceCurrentForReceive(ctx context.Context, workspaceID, allowedReservationID string) (retErr error) {
@@ -325,86 +496,44 @@ func (s *WorkspaceSyncService) materializeWorkspaceCurrentForReceive(ctx context
 		if err != nil {
 			return err
 		}
-		files := make([]workspace.File, 0)
-		emptyDirectories := make([]string, 0)
-		directories := make([]workspace.Directory, 0)
-		directoryByPath := make(map[string]workspace.Directory)
-		afterPath := ""
-		lastCursor := ""
-		var totalBytes int64
-		totalItems := 0
-		for {
-			page, err := s.getWorkspaceManifestPage(ctx, value.OwnerID, workspaceID, value.Revision, "", afterPath, manifestPageLimit)
-			if err != nil {
-				return fmt.Errorf("read current Workspace revision: %w", err)
-			}
-			if page.WorkspaceID != workspaceID || page.Revision != value.Revision || len(page.Files)+len(page.EmptyDirectories) > int(manifestPageLimit) || totalItems+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
-				return errors.New("current Workspace manifest identity or size is invalid")
-			}
-			if len(page.Files)+len(page.EmptyDirectories) == 0 && page.NextCursor != nil {
-				return errors.New("current Workspace manifest cursor did not advance")
-			}
-			pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
-			for _, file := range page.Files {
-				if file.SizeBytes < 0 || totalBytes > int64(^uint64(0)>>1)-file.SizeBytes {
-					return errors.New("current Workspace manifest order or size is invalid")
-				}
-				files = append(files, file)
-				pagePaths = append(pagePaths, file.Path)
-				totalBytes += file.SizeBytes
-			}
-			for _, directory := range page.EmptyDirectories {
-				if err := workspace.ValidateRelativePath(directory); err != nil {
-					return errors.New("current Workspace manifest contains an invalid empty directory path")
-				}
-				emptyDirectories = append(emptyDirectories, directory)
-				pagePaths = append(pagePaths, directory)
-			}
-			for _, directory := range page.Directories {
-				if err := workspace.ValidateDirectory(directory, false); err != nil {
-					return errors.New("current Workspace manifest contains invalid directory metadata")
-				}
-				key := strings.ToLower(directory.Path)
-				if prior, exists := directoryByPath[key]; exists && !workspace.SameDirectoryMetadata(prior, directory) {
-					return errors.New("current Workspace manifest contains inconsistent directory metadata")
-				}
-				if _, exists := directoryByPath[key]; !exists {
-					directoryByPath[key] = directory
-					directories = append(directories, directory)
-				}
-			}
-			sort.Strings(pagePaths)
-			for _, itemPath := range pagePaths {
-				if itemPath <= afterPath {
-					return errors.New("current Workspace manifest order or size is invalid")
-				}
-				afterPath = itemPath
-			}
-			totalItems += len(pagePaths)
-			if page.NextCursor == nil {
-				break
-			}
-			cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
-			if err != nil || cursor.Revision != value.Revision || cursor.Prefix != "" || cursor.After != afterPath || cursor.After == "" || cursor.After <= lastCursor {
-				return errors.New("current Workspace manifest cursor is invalid or did not advance")
-			}
-			lastCursor = cursor.After
+		manifest, err := s.readWorkspaceCurrentManifest(ctx, value.OwnerID, workspaceID, value.Revision)
+		if err != nil {
+			return err
 		}
-		if totalBytes != value.UsedBytes {
+		if manifest.totalBytes != value.UsedBytes {
 			return domain.NewError(domain.CodeWorkspaceConflict, "current Workspace manifest does not match its committed usage")
 		}
-		if allowedReservationID == "" && s.currentRevision != nil && s.verifyCurrent != nil {
+		if s.currentRevision != nil && s.verifyCurrent != nil {
 			currentRevision, exists, err := s.currentRevision(value.OwnerID, workspaceID)
 			if err != nil {
 				return fmt.Errorf("inspect Workspace %s current revision: %w", workspaceID, err)
 			}
-			if exists && currentRevision == value.Revision {
-				matches, err := s.verifyCurrent(ctx, value.OwnerID, workspaceID, files, emptyDirectories, directories)
-				if err != nil {
-					return fmt.Errorf("verify Workspace %s current revision: %w", workspaceID, err)
+			if exists && currentRevision > value.Revision {
+				return domain.NewError(domain.CodeWorkspaceConflict, "current Workspace directory is ahead of its committed revision")
+			}
+			if !exists && value.Revision != 0 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "current Workspace directory has no verified base revision")
+			}
+			if exists {
+				base := manifest
+				if currentRevision < value.Revision {
+					base, err = s.readWorkspaceCurrentManifest(ctx, value.OwnerID, workspaceID, currentRevision)
+					if err != nil {
+						return fmt.Errorf("read applied Workspace revision %d: %w", currentRevision, err)
+					}
 				}
-				if matches {
-					return state.MarkWorkspaceCurrentMaterialized(ctx, workspaceID, value.Revision)
+				matches, err := s.verifyCurrent(ctx, value.OwnerID, workspaceID, base.files, base.emptyDirectories, base.directories)
+				if err != nil {
+					return fmt.Errorf("verify Workspace %s current directory: %w", workspaceID, err)
+				}
+				if !matches {
+					return domain.NewError(domain.CodeWorkspaceConflict, "current Workspace directory contains changes outside its committed revision")
+				}
+				if currentRevision == value.Revision {
+					if allowedReservationID == "" {
+						return state.MarkWorkspaceCurrentMaterialized(ctx, workspaceID, value.Revision)
+					}
+					return barrier.MarkWorkspaceCurrentMaterializedForReceive(ctx, workspaceID, value.Revision, allowedReservationID)
 				}
 			}
 		}
@@ -413,7 +542,7 @@ func (s *WorkspaceSyncService) materializeWorkspaceCurrentForReceive(ctx context
 				return err
 			}
 		}
-		if err := s.materializeCurrent(ctx, value.OwnerID, workspaceID, value.Revision, files, emptyDirectories, directories); err != nil {
+		if err := s.materializeCurrent(ctx, value.OwnerID, workspaceID, value.Revision, manifest.files, manifest.emptyDirectories, manifest.directories); err != nil {
 			return fmt.Errorf("publish current Workspace directory: %w", err)
 		}
 		if hasBarrier && allowedReservationID != "" {
@@ -438,6 +567,23 @@ func (s *WorkspaceSyncService) materializeWorkspaceCurrentForReceive(ctx context
 func (s *WorkspaceSyncService) finishWorkspaceSyncCommit(ctx context.Context, result workspace.SyncSession) (workspace.SyncSession, error) {
 	if result.State != workspace.SyncCompleted && result.State != workspace.SyncConflict {
 		return result, nil
+	}
+	value, err := s.store.GetWorkspace(ctx, result.WorkspaceID)
+	if err != nil {
+		return workspace.SyncSession{}, err
+	}
+	liveDirectory, err := s.UsesLiveDirectorySource(ctx, value.OwnerID, result.WorkspaceID)
+	if err != nil {
+		return workspace.SyncSession{}, err
+	}
+	if liveDirectory {
+		if result.Direction == workspace.SyncDownload {
+			return result, nil
+		}
+		if result.FolderID != "" && result.Direction == workspace.SyncUpload {
+			return result, nil
+		}
+		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "revision-based Workspace writes are disabled while the live directory is authoritative")
 	}
 	if err := s.materializeWorkspaceCurrent(ctx, result.WorkspaceID); err != nil {
 		if ctx.Err() != nil {
@@ -603,6 +749,11 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 	value, err := s.authorize(ctx, principal, workspaceID)
 	if err != nil {
 		return workspace.SyncSession{}, err
+	}
+	if command.Direction != workspace.SyncDownload {
+		if err := s.rejectRevisionWorkspaceWrite(ctx, value.OwnerID, workspaceID); err != nil {
+			return workspace.SyncSession{}, err
+		}
 	}
 	if command.TaskID != "" || command.TaskHubOperationKey != "" {
 		if principal.Kind != identity.KindDevice || !domain.ValidTaskID(command.TaskID) || command.TaskHubOperationKey == "" ||
@@ -834,6 +985,19 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
+	directProjectUpload := false
+	if session.Direction != workspace.SyncDownload {
+		liveDirectory, err := s.UsesLiveDirectorySource(ctx, value.OwnerID, workspaceID)
+		if err != nil {
+			return workspace.SyncSession{}, err
+		}
+		directProjectUpload = liveDirectory && session.FolderID != "" && session.Direction == workspace.SyncUpload
+		if !directProjectUpload {
+			if err := s.rejectRevisionWorkspaceWrite(ctx, value.OwnerID, workspaceID); err != nil {
+				return workspace.SyncSession{}, err
+			}
+		}
+	}
 	if session.FolderID != "" && !s.projectUploadEnabled {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "project upload is unavailable")
 	}
@@ -865,7 +1029,7 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 	}
 	if session.State == workspace.SyncCompleted || session.State == workspace.SyncConflict || session.State == workspace.SyncCancelled ||
 		session.State == workspace.SyncExpired || session.State == workspace.SyncFailed {
-		updated, _, err := s.store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, record)
+		updated, err := s.commitWorkspaceSyncSession(ctx, directProjectUpload, workspaceID, sessionID, record)
 		if err != nil {
 			return workspace.SyncSession{}, err
 		}
@@ -900,11 +1064,25 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 		}
 		return workspace.SyncSession{}, err
 	}
-	updated, _, err := s.store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, record)
+	updated, err := s.commitWorkspaceSyncSession(ctx, directProjectUpload, workspaceID, sessionID, record)
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
 	return s.finishWorkspaceSyncCommit(ctx, updated)
+}
+
+func (s *WorkspaceSyncService) commitWorkspaceSyncSession(ctx context.Context, directProjectUpload bool, workspaceID, sessionID string,
+	record IdempotencyRecord) (workspace.SyncSession, error) {
+	if !directProjectUpload {
+		updated, _, err := s.store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, record)
+		return updated, err
+	}
+	committer, ok := s.store.(workspaceSyncDirectCommitter)
+	if !ok {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "direct project upload commit is unavailable")
+	}
+	updated, _, err := committer.CommitWorkspaceSyncSessionDirect(ctx, workspaceID, sessionID, record, s.applyLiveProjectUpload)
+	return updated, err
 }
 
 func (s *WorkspaceSyncService) CancelSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID, idempotencyKey string) (workspace.SyncSession, error) {

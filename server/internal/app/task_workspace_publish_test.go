@@ -39,6 +39,11 @@ func TestValidateTaskWorkspacePublishCommandKeepsHostlessAndHostBoundFencesSepar
 	if err := ValidateTaskWorkspacePublishCommand(hostBound); err != nil {
 		t.Fatalf("host-bound publish command was rejected: %v", err)
 	}
+	directHostBound := hostBound
+	directHostBound.DirectDirectorySource = true
+	if err := ValidateTaskWorkspacePublishCommand(directHostBound); err != nil {
+		t.Fatalf("direct Host-bound publish command was rejected: %v", err)
+	}
 	hostless := hostBound
 	hostless.HostID, hostless.BindingVersion, hostless.HostFence, hostless.ViewID = "", 0, AgentHostFence{}, ""
 	if err := ValidateTaskWorkspacePublishCommand(hostless); err != nil {
@@ -100,6 +105,24 @@ func TestTaskWorkspacePublishPersistsOutputAndReplaysReceipt(t *testing.T) {
 	})
 	if err != nil || replayed != receipt || reads != 1 {
 		t.Fatalf("idempotent CommitTaskWorkspacePublish() = %#v, reads=%d, err=%v", replayed, reads, err)
+	}
+}
+
+func TestRevisionTaskWorkspacePublishIsRejectedWhenLiveDirectoryIsAuthoritative(t *testing.T) {
+	store := newSyncServiceStore()
+	blocks := newSyncBlockMemory()
+	service, command, file, data := taskWorkspacePublishFixture(t, store, blocks)
+	service.liveDirectorySource = true
+	service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	manifestSHA, err := workspace.ManifestSHA256([]workspace.File{file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, nil, nil, manifestSHA,
+		func(context.Context, string) ([]byte, error) { return data, nil })
+	if domain.CodeOf(err) != domain.CodeWorkspaceUnavailable || store.workspace.Revision != 0 || len(store.taskWorkspacePublishReceipts) != 0 || len(blocks.data) != 0 {
+		t.Fatalf("revision publish = %v, revision=%d receipts=%d blocks=%d; want fail before writing", err,
+			store.workspace.Revision, len(store.taskWorkspacePublishReceipts), len(blocks.data))
 	}
 }
 

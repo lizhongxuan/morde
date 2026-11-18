@@ -200,41 +200,48 @@ func (s *Store) CreateWorkspace(ctx context.Context, value workspace.Workspace, 
 			replayed = true
 			return nil
 		}
-		row, err := sqlcgen.New(tx).CreateWorkspace(ctx, sqlcgen.CreateWorkspaceParams{
-			ID: value.ID, OwnerID: value.OwnerID, Name: value.Name, State: string(value.State),
-			Revision: value.Revision, UsedBytes: value.UsedBytes, QuotaBytes: value.QuotaBytes, LastError: value.LastError,
-		})
+		created, err = createWorkspaceInTx(ctx, tx, value)
 		if err != nil {
-			return fmt.Errorf("create workspace: %w", err)
+			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO workspace_ownership_history (workspace_id,owner_id,transfer_id)
-VALUES ($1,$2,NULL)`, value.ID, value.OwnerID); err != nil {
-			return fmt.Errorf("record initial workspace owner: %w", err)
-		}
-		if err := sqlcgen.New(tx).CreateWorkspaceRevision(ctx, sqlcgen.CreateWorkspaceRevisionParams{
-			WorkspaceID: value.ID, Revision: 0, FileCount: 0, TotalBytes: 0,
-		}); err != nil {
-			return fmt.Errorf("create initial workspace revision: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO workspace_revision_directories
-(workspace_id,valid_from_revision,directory_path,folded_path,metadata_known) VALUES ($1,0,'.','.',true)`, value.ID); err != nil {
-			return fmt.Errorf("create initial Workspace root metadata: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO workspace_current_materializations
-(workspace_id, desired_revision, applied_revision) VALUES ($1, 0, -1)`, value.ID); err != nil {
-			return fmt.Errorf("create initial Workspace current materialization: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO workspace_volumes (workspace_id, owner_id, provisioned_owner_id, state, volume_name)
-VALUES ($1, $2, $2, 'pending', $3)`, value.ID, value.OwnerID, app.WorkspaceNamedVolumeName(value.ID)); err != nil {
-			return fmt.Errorf("register pending workspace volume: %w", err)
-		}
-		created = workspaceDomain(row)
 		return nil
 	})
 	if err != nil {
 		return workspace.Workspace{}, false, err
 	}
 	return created, replayed, nil
+}
+
+func createWorkspaceInTx(ctx context.Context, tx pgx.Tx, value workspace.Workspace) (workspace.Workspace, error) {
+	row, err := sqlcgen.New(tx).CreateWorkspace(ctx, sqlcgen.CreateWorkspaceParams{
+		ID: value.ID, OwnerID: value.OwnerID, Name: value.Name, State: string(value.State),
+		Revision: value.Revision, UsedBytes: value.UsedBytes, QuotaBytes: value.QuotaBytes, LastError: value.LastError,
+	})
+	if err != nil {
+		return workspace.Workspace{}, fmt.Errorf("create workspace: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO workspace_ownership_history (workspace_id,owner_id,transfer_id)
+VALUES ($1,$2,NULL)`, value.ID, value.OwnerID); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("record initial workspace owner: %w", err)
+	}
+	if err := sqlcgen.New(tx).CreateWorkspaceRevision(ctx, sqlcgen.CreateWorkspaceRevisionParams{
+		WorkspaceID: value.ID, Revision: 0, FileCount: 0, TotalBytes: 0,
+	}); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("create initial workspace revision: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO workspace_revision_directories
+(workspace_id,valid_from_revision,directory_path,folded_path,metadata_known) VALUES ($1,0,'.','.',true)`, value.ID); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("create initial Workspace root metadata: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO workspace_current_materializations
+(workspace_id, desired_revision, applied_revision) VALUES ($1, 0, -1)`, value.ID); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("create initial Workspace current materialization: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO workspace_volumes (workspace_id, owner_id, provisioned_owner_id, state, volume_name)
+VALUES ($1, $2, $2, 'pending', $3)`, value.ID, value.OwnerID, app.WorkspaceNamedVolumeName(value.ID)); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("register pending workspace volume: %w", err)
+	}
+	return workspaceDomain(row), nil
 }
 
 func (s *Store) GetUserByID(ctx context.Context, id string) (identity.User, error) {

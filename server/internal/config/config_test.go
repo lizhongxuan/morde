@@ -78,7 +78,7 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	}
 }
 
-func TestLoadProjectUploadGateDefaultsClosedAndOpensExplicitly(t *testing.T) {
+func TestLoadWorkspaceFeatureGatesDefaultClosedAndOpenExplicitly(t *testing.T) {
 	workbenchDir := t.TempDir()
 	t.Setenv("T02_TEST_INSTANCE", "test-instance")
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -90,11 +90,11 @@ func TestLoadProjectUploadGateDefaultsClosedAndOpensExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.WorkspaceSyncNode.ProjectUploadEnabled {
-		t.Fatal("project upload gate must default to closed")
+	if cfg.WorkspaceSyncNode.ProjectUploadEnabled || cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled {
+		t.Fatal("Workspace project upload, direct directory source, and Host mount gates must default to closed")
 	}
 
-	data = strings.Replace(data, "site_storage:\n", "workspace_sync_node:\n  project_upload_enabled: true\nsite_storage:\n", 1)
+	data = strings.Replace(data, "site_storage:\n", "workspace_sync_node:\n  project_upload_enabled: true\n  agent_workspace_host_mount_enabled: true\n  agent_workspace_live_directory_source_enabled: true\nsite_storage:\n", 1)
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +102,25 @@ func TestLoadProjectUploadGateDefaultsClosedAndOpensExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.WorkspaceSyncNode.ProjectUploadEnabled {
-		t.Fatal("explicit project_upload_enabled=true was not loaded")
+	if !cfg.WorkspaceSyncNode.ProjectUploadEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled {
+		t.Fatal("explicit Workspace feature gate values were not loaded")
+	}
+
+	data = strings.Replace(data, "agent_workspace_host_mount_enabled: true", "agent_workspace_host_mount_enabled: false", 1)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("live Workspace directory source loaded without the required Host mount gate")
+	}
+
+	data = strings.Replace(data, "agent_workspace_host_mount_enabled: false", "agent_workspace_host_mount_enabled: true", 1)
+	data = strings.Replace(data, "agent_workspace_live_directory_source_enabled: true", "agent_workspace_live_directory_source_enabled: false", 1)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Host Workspace mount loaded without the required live directory source gate")
 	}
 }
 

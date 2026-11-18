@@ -70,9 +70,12 @@ export function AdminHostDetail() {
     const error = hardError;
     return <FloatingError className="error-card" role="alert">{errorDetails(error).message}<button className="button button-secondary" type="button" onClick={() => { void hosts.refetch(); void users.refetch(); }}>重试</button></FloatingError>;
   }
-  const host = hosts.data.items.find((item) => item.id === id);
+  const hostData = hosts.data;
+  const userData = users.data;
+  if (!hostData || !userData) return <div className="loading-card" role="status">正在读取电脑信息…</div>;
+  const host = hostData.items.find((item) => item.id === id);
   if (!host) return <div className="empty-card"><h2>找不到这台电脑</h2><p>电脑可能已被移除，或当前账号无权查看。</p><Link className="button button-secondary" to="/admin/hosts">返回电脑列表</Link></div>;
-  const owner = users.data.items.find((user) => user.id === host.owner_id);
+  const owner = userData.items.find((user) => user.id === host.owner_id);
 
   return <section>
     <section className="design-panel">

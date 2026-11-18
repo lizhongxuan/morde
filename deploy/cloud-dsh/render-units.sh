@@ -60,7 +60,7 @@ fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 shopt -s nullglob
-templates=("$script_dir"/*.service.in "$script_dir"/*.json.in)
+templates=("$script_dir"/*.service.in "$script_dir"/*.json.in "$script_dir"/*.dropin.in)
 ((${#templates[@]} > 0)) || die 'no service or JSON templates found'
 
 output_names=()

@@ -70,7 +70,39 @@ type projectTaskWorkspacePublishGuard interface {
 	WithProjectTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, func(context.Context) error) error
 }
 
+type taskWorkspacePublishConflictRejector interface {
+	RejectTaskWorkspacePublishConflict(context.Context, TaskWorkspacePublishCommand) error
+}
+
+func (s *WorkspaceSyncService) RejectTaskWorkspacePublishConflict(ctx context.Context, value TaskWorkspacePublishCommand) error {
+	if err := ValidateTaskWorkspacePublishCommand(value); err != nil {
+		return err
+	}
+	rejector, ok := s.store.(taskWorkspacePublishConflictRejector)
+	if !ok {
+		return domain.NewError(domain.CodeWorkspaceUnavailable, "Workspace operation conflict cannot be recorded")
+	}
+	return rejector.RejectTaskWorkspacePublishConflict(ctx, value)
+}
+
 func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (TaskWorkspacePublishReceipt, error) {
+	ownerID := value.WorkspaceOwnerID
+	if ownerID == "" {
+		ownerID = value.OwnerID
+	}
+	if value.DirectDirectorySource {
+		liveDirectory, err := s.UsesLiveDirectorySource(ctx, ownerID, value.WorkspaceID)
+		if err != nil {
+			return TaskWorkspacePublishReceipt{}, err
+		}
+		if !liveDirectory {
+			return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceUnavailable, "direct Workspace publish requires the live Agent Workspace")
+		}
+	} else {
+		if err := s.rejectRevisionWorkspaceWrite(ctx, ownerID, value.WorkspaceID); err != nil {
+			return TaskWorkspacePublishReceipt{}, err
+		}
+	}
 	guard, ok := s.store.(projectTaskWorkspacePublishGuard)
 	if !ok {
 		if value.ProjectID != "" {
@@ -85,6 +117,14 @@ func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, v
 		return err
 	})
 	return receipt, err
+}
+
+// CommitTaskWorkspacePublishDirect records a historical revision and durable
+// Task receipt for a write already applied to the shared Workspace directory.
+func (s *WorkspaceSyncService) CommitTaskWorkspacePublishDirect(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File,
+	emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (TaskWorkspacePublishReceipt, error) {
+	value.DirectDirectorySource = true
+	return s.CommitTaskWorkspacePublish(ctx, value, files, emptyDirectories, directories, manifestSHA, readBlock)
 }
 
 func (s *WorkspaceSyncService) commitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
@@ -222,6 +262,9 @@ func (s *WorkspaceSyncService) finishTaskWorkspacePublish(ctx context.Context, w
 	result, err := taskWorkspacePublishReceiptResult(receipt)
 	if err != nil {
 		return result, err
+	}
+	if receipt.DirectDirectorySource {
+		return result, nil
 	}
 	if err := s.materializeWorkspaceCurrent(ctx, workspaceID); err != nil {
 		if ctx.Err() != nil {

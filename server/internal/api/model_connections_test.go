@@ -99,13 +99,31 @@ func TestModelConnectionAPIAllowsClientPersonalCreateAndNeverReturnsAPIKey(t *te
 		!strings.Contains(response.Body.String(), `"context_window_tokens":32768`) {
 		t.Fatalf("create response = %d %s", response.Code, response.Body)
 	}
-	if manager.calls != 1 || manager.command.APIKey != "secret-model-key" || manager.command.ContextWindowTokens == nil ||
-		*manager.command.ContextWindowTokens != window || manager.principal.Kind != identity.KindClient || manager.command.Shared {
+	if manager.calls != 1 || manager.command.APIKey != "secret-model-key" || !manager.command.LegacyContextWindowPresent || manager.command.LegacyContextWindowTokens == nil ||
+		*manager.command.LegacyContextWindowTokens != window || manager.principal.Kind != identity.KindClient || manager.command.Shared {
 		t.Fatalf("create command not forwarded: calls=%d command=%+v", manager.calls, manager.command)
 	}
 
+	newContract := request(router, http.MethodPost, "/api/model-connections", `{"name":"OpenAI 2","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_override_tokens":32768,"api_key":"secret-model-key","shared":false}`, "Bearer "+clientCredential, "")
+	if newContract.Code != http.StatusCreated || manager.calls != 2 || !manager.command.ContextWindowOverridePresent || manager.command.ContextWindowOverrideTokens == nil ||
+		*manager.command.ContextWindowOverrideTokens != window {
+		t.Fatalf("new override contract = %d %s calls=%d command=%+v", newContract.Code, newContract.Body, manager.calls, manager.command)
+	}
+	conflictingFields := request(router, http.MethodPost, "/api/model-connections", `{"name":"OpenAI 3","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_tokens":32768,"context_window_override_tokens":32768,"api_key":"secret-model-key","shared":false}`, "Bearer "+clientCredential, "")
+	if conflictingFields.Code != http.StatusBadRequest || manager.calls != 2 {
+		t.Fatalf("conflicting capacity fields = %d %s calls=%d", conflictingFields.Code, conflictingFields.Body, manager.calls)
+	}
+	cleared := request(router, http.MethodPut, "/api/model-connections/p1234567", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_override_tokens":null}`, "Bearer "+clientCredential, "")
+	if cleared.Code != http.StatusOK || manager.calls != 3 || !manager.command.ContextWindowOverridePresent || manager.command.ContextWindowOverrideTokens != nil {
+		t.Fatalf("null override did not reach update command: %d %s calls=%d command=%+v", cleared.Code, cleared.Body, manager.calls, manager.command)
+	}
+	omitted := request(router, http.MethodPut, "/api/model-connections/p1234567", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test"}`, "Bearer "+clientCredential, "")
+	if omitted.Code != http.StatusOK || manager.calls != 4 || manager.command.ContextWindowOverridePresent || manager.command.LegacyContextWindowPresent {
+		t.Fatalf("omitted override was not distinguishable: %d %s calls=%d command=%+v", omitted.Code, omitted.Body, manager.calls, manager.command)
+	}
+
 	unknown := request(router, http.MethodPost, "/api/model-connections", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","api_key":"secret-model-key","unknown":true}`, "Bearer "+clientCredential, "")
-	if unknown.Code != http.StatusBadRequest || manager.calls != 1 {
+	if unknown.Code != http.StatusBadRequest || manager.calls != 4 {
 		t.Fatalf("unknown field response = %d %s, calls=%d", unknown.Code, unknown.Body, manager.calls)
 	}
 

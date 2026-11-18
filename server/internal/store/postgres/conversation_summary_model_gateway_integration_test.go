@@ -132,7 +132,7 @@ func TestConversationSummaryModelGatewayPersonalModelNeedsNoPlatformBudget(t *te
 	contextWindow := 32_768
 	created, err := models.Create(context.Background(), principal, app.ModelConnectionCommand{
 		Name: "summary personal model", BaseURL: "https://model.example/v1", ModelName: "personal-summary-model", APIKey: "synthetic-key",
-		ContextWindowTokens: &contextWindow,
+		ContextWindowOverrideTokens: &contextWindow, ContextWindowOverridePresent: true,
 	})
 	if err != nil {
 		t.Fatal(err)

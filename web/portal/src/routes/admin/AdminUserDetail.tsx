@@ -315,7 +315,9 @@ export function AdminUserDetail() {
   }
   const user = userQuery.data;
   if (!user) return <div className="empty-card"><h2>找不到这个用户</h2><p>用户可能已被移除，或当前账号无权查看。</p><Link className="button button-secondary" to="/admin/users">返回用户列表</Link></div>;
-  const ownedHosts = hosts.data.items.filter((host) => host.owner_id === user.id);
+  const hostData = hosts.data;
+  if (!hostData) return <div className="loading-card" role="status">正在读取用户信息…</div>;
+  const ownedHosts = hostData.items.filter((host) => host.owner_id === user.id);
 
   return <section>
     <section className="design-panel">

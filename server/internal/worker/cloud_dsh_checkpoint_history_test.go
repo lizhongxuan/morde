@@ -87,6 +87,166 @@ func TestCloudDSHCheckpointHistoryRejectsInvalidSystemReplacement(t *testing.T) 
 	}
 }
 
+func TestCloudDSHCheckpointHistoryAcceptsVerifiedCompactionReplacement(t *testing.T) {
+	compactionID := "compact_1"
+	preamble := cloudDSHCompactionPreamble + "\n\n<compacted-summary>"
+	replacement := cloudDSHCheckpointEvent{Sequence: 6, Type: "user/message", SurfaceOp: map[string]any{
+		"op": "replace", "startSeq": 2, "endSeq": 3}, SourceEventSeqs: []int64{4, 5, 2, 3}, Data: map[string]any{
+		"role": "user", "source": map[string]any{"kind": "compact-checkpoint", "compactionId": compactionID},
+		"content": []any{map[string]any{"type": "text", "text": preamble}, map[string]any{"type": "text", "text": "verified summary"},
+			map[string]any{"type": "text", "text": "</compacted-summary>"}},
+	}}
+	events := []cloudDSHCheckpointEvent{
+		{Sequence: 0, Type: "system/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "system"}}},
+		checkpointTurnStart(1, "turn/start", map[string]any{"turn": 1}),
+		{Sequence: 2, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "user"}}},
+		checkpointAssistantText(3, "older assistant answer"),
+		{Sequence: 4, Type: "compaction/start", Data: map[string]any{"compactionId": compactionID, "turn": 1}},
+		{Sequence: 5, Type: "compaction/summary", Data: map[string]any{
+			"compactionId": compactionID, "summary": []any{map[string]any{"type": "text", "text": "verified summary"}},
+			"shadowedRange": map[string]any{"start": 2, "end": 3}, "shadowedSeqs": []int64{2, 3}, "shadowedTokenCount": 100,
+			"provider": "morde", "model": "test-model", "maxTokens": 256,
+		}},
+		replacement,
+		{Sequence: 7, Type: "compaction/end", Data: map[string]any{"compactionId": compactionID, "turn": 1}},
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0, events...), 0, 7); err != nil {
+		t.Fatalf("verified DSH compaction was rejected: %v", err)
+	}
+	if _, active := history.surfaceNodes[2]; active {
+		t.Fatal("shadowed source remained in the active surface")
+	}
+	if _, active := history.surfaceNodes[6]; !active || !history.compactions[compactionID].ended {
+		t.Fatal("verified replacement or compaction end was not recorded")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryAcceptsDirectUserMessagePayload(t *testing.T) {
+	history := newCloudDSHCheckpointHistory("session_1")
+	err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		cloudDSHCheckpointEvent{Sequence: 0, Type: "user/message", SurfaceOp: "append", Data: map[string]any{
+			"role": "user", "content": []any{map[string]any{"type": "text", "text": "message"}},
+		}}), 0, 0)
+	if err != nil {
+		t.Fatalf("DSH user message payload was rejected: %v", err)
+	}
+	if _, active := history.surfaceNodes[0]; !active {
+		t.Fatal("direct user message was not added to the active surface")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsUnprovenCompactionReplacement(t *testing.T) {
+	compactionID := "compact_2"
+	events := []cloudDSHCheckpointEvent{
+		{Sequence: 0, Type: "system/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "system"}}},
+		checkpointTurnStart(1, "turn/start", map[string]any{"turn": 1}),
+		{Sequence: 2, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "user"}}},
+		checkpointAssistantText(3, "older assistant answer"),
+		{Sequence: 4, Type: "compaction/start", Data: map[string]any{"compactionId": compactionID, "turn": 1}},
+		{Sequence: 5, Type: "compaction/summary", Data: map[string]any{
+			"compactionId": compactionID, "summary": []any{map[string]any{"type": "text", "text": "verified summary"}},
+			"shadowedRange": map[string]any{"start": 2, "end": 3}, "shadowedSeqs": []int64{2, 3}, "shadowedTokenCount": 100,
+			"provider": "morde", "model": "test-model", "maxTokens": 256,
+		}},
+		{Sequence: 6, Type: "user/message", SurfaceOp: map[string]any{"op": "replace", "startSeq": 2, "endSeq": 3},
+			SourceEventSeqs: []int64{4, 5, 3, 2}, Data: map[string]any{"message": map[string]any{
+				"role": "user", "source": map[string]any{"kind": "compact-checkpoint", "compactionId": compactionID},
+				"content": []any{map[string]any{"type": "text", "text": cloudDSHCompactionPreamble + "\n\n<compacted-summary>"},
+					map[string]any{"type": "text", "text": "verified summary"}, map[string]any{"type": "text", "text": "</compacted-summary>"}},
+			}}},
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0, events...), 0, 6); err == nil {
+		t.Fatal("compaction with a reordered source proof was accepted")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryAcceptsVerifiedToolResultPrune(t *testing.T) {
+	callID := "call_prune_1"
+	original := strings.Repeat("tool output ", 900)
+	pruned := cloudDSHPrunedToolResultText(original)
+	replacement := checkpointToolResult(5, callID, pruned, 3)
+	replacement.SurfaceOp = map[string]any{"op": "replace", "startSeq": 3, "endSeq": 3}
+	replacement.SourceEventSeqs = []int64{3}
+	events := []cloudDSHCheckpointEvent{
+		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+		checkpointAssistantCall(1, callID),
+		checkpointToolCall(2, callID),
+		checkpointToolResult(3, callID, original, 2),
+		{Sequence: 4, Type: "compaction/prune", Data: map[string]any{
+			"shadowedRange": map[string]any{"start": 3, "end": 3}, "shadowedSeqs": []int64{3}, "shadowedTokenCount": 10_000,
+		}},
+		replacement,
+		checkpointAssistantText(6, "done"),
+		{Sequence: 7, Type: "step/end", Data: map[string]any{"turn": 1, "step": 1}},
+		checkpointTurnEnd(8, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0, events...), 0, 8); err != nil {
+		t.Fatalf("verified DSH tool-result prune was rejected: %v", err)
+	}
+	if _, active := history.surfaceNodes[3]; active {
+		t.Fatal("full tool-result source remained active after the verified replacement")
+	}
+	if _, active := history.surfaceNodes[5]; !active || history.calls[callID].surfaceResultSeq != 5 || history.calls[callID].resultText != original {
+		t.Fatal("pruned projection replaced the durable tool result or was not activated")
+	}
+	if err := history.noteToolResult(callID, "file_write", []byte(checkpointToolArguments), app.AgentToolSucceeded, original, nil); err != nil {
+		t.Fatalf("original tool result no longer reconciles against the operation ledger: %v", err)
+	}
+	if len(history.inputs) != 2 || history.inputs[1].Output != original {
+		t.Fatal("completion inputs did not retain the full reconciled tool output")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsUnprovenToolResultPrune(t *testing.T) {
+	callID := "call_prune_2"
+	original := strings.Repeat("tool output ", 900)
+	for _, test := range []struct {
+		name        string
+		replacement func() cloudDSHCheckpointEvent
+		intervene   bool
+	}{
+		{name: "wrong source", replacement: func() cloudDSHCheckpointEvent {
+			event := checkpointToolResult(5, callID, cloudDSHPrunedToolResultText(original), 3)
+			event.SurfaceOp = map[string]any{"op": "replace", "startSeq": 3, "endSeq": 3}
+			event.SourceEventSeqs = []int64{2}
+			return event
+		}},
+		{name: "unexpected content", replacement: func() cloudDSHCheckpointEvent {
+			event := checkpointToolResult(5, callID, strings.Repeat("x", 7000), 3)
+			event.SurfaceOp = map[string]any{"op": "replace", "startSeq": 3, "endSeq": 3}
+			event.SourceEventSeqs = []int64{3}
+			return event
+		}},
+		{name: "nonadjacent replacement", intervene: true, replacement: func() cloudDSHCheckpointEvent {
+			event := checkpointToolResult(6, callID, cloudDSHPrunedToolResultText(original), 3)
+			event.SurfaceOp = map[string]any{"op": "replace", "startSeq": 3, "endSeq": 3}
+			event.SourceEventSeqs = []int64{3}
+			return event
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := []cloudDSHCheckpointEvent{
+				checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+				checkpointAssistantCall(1, callID), checkpointToolCall(2, callID), checkpointToolResult(3, callID, original, 2),
+				{Sequence: 4, Type: "compaction/prune", Data: map[string]any{
+					"shadowedRange": map[string]any{"start": 3, "end": 3}, "shadowedSeqs": []int64{3}, "shadowedTokenCount": 10_000,
+				}},
+			}
+			if test.intervene {
+				events = append(events, checkpointAssistantText(5, "unrelated event"))
+			}
+			events = append(events, test.replacement())
+			last := events[len(events)-1].Sequence
+			if err := newCloudDSHCheckpointHistory("session_1").append(cloudDSHCheckpointPayload("session_1", 0, events...), 0, last); err == nil {
+				t.Fatal("invalid DSH tool-result prune was accepted")
+			}
+		})
+	}
+}
+
 func TestCloudDSHCheckpointHistoryKeepsToolResultAppendRequirement(t *testing.T) {
 	for _, op := range []any{json.RawMessage(`null`), "replace", map[string]any{"op": "replace", "startSeq": 0, "endSeq": 0}} {
 		history := newCloudDSHCheckpointHistory("session_1")

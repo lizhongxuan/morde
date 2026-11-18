@@ -452,6 +452,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me/agent-workspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get or initialize the current user's stable Agent Workspace
+         * @description Portal Session only. Returns the user's one stable Agent Workspace and its logical root path even when no cloud computer is running. The server filesystem path is never exposed.
+         */
+        get: operations["getMyAgentWorkspace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/me/task-approvals": {
         parameters: {
             query?: never;
@@ -708,7 +728,7 @@ export interface paths {
         put?: never;
         /**
          * Create a host
-         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. The server creates and assigns a new private persistent workspace directory to this Host; clients cannot select or reuse another Host's storage. Reuse the Idempotency-Key only to retry the exact normalized request.
+         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. The server binds this Host to the user's stable Agent Workspace at ~/workspace; clients cannot bind another Workspace. The same Agent Workspace can be used when the user switches to a replacement computer. If the verified direct-mount gate is closed, Host creation fails before persistence and leaves the Agent Workspace available. Reuse the Idempotency-Key only to retry the exact normalized request.
          */
         post: operations["createHost"];
         delete?: never;
@@ -735,7 +755,7 @@ export interface paths {
         post?: never;
         /**
          * Delete a host
-         * @description Permanently deletes this Host and its exclusively assigned ~/workspace directory after explicit confirmation. Requires confirm_delete_workspace=true. The request is accepted asynchronously; poll GET /api/hosts/{id} until deleted. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
+         * @description Permanently deletes this Host and releases its compute resources after explicit confirmation. The stable Agent Workspace remains on the server and can be mounted by a replacement Host. Requires confirm_delete_workspace=true (legacy parameter name). The request is accepted asynchronously; poll GET /api/hosts/{id} until deleted. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
          */
         delete: operations["deleteHost"];
         options?: never;
@@ -755,8 +775,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Create an independent Host from a stopped Host
-         * @description Portal owner sessions only. The source must be safely stopped and have exactly one healthy Workspace binding at the requested confirmed revision, with no unresolved conflicts or in-flight writers. Morde copies that Workspace revision and atomically creates a new Host bound to the copy. The new Host receives fresh runtime identity and credentials; source runtime/profile/apps, tasks, credentials, and sync device/folder associations are not copied. Ambiguous metadata or copy outcomes fail closed and preserve the reservation for idempotent recovery.
+         * Reject independent Host copies
+         * @deprecated
+         * @description Deprecated. Portal owner sessions only. A cloud computer must use its owner's stable Agent Workspace, so an independent Host copy and Workspace copy are unavailable. Valid requests return 409 before any copy reservation, Workspace creation, volume operation, or Host creation.
          */
         post: operations["copyHost"];
         delete?: never;
@@ -1425,6 +1446,51 @@ export interface paths {
         post?: never;
         /** Delete a workspace */
         delete: operations["deleteWorkspace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/entries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List entries in the current user's live Agent Workspace
+         * @description Portal Session only. The Workspace ID must equal the current user's stable Agent Workspace. Paths are relative; symlinks are listed as symlinks and never followed. Results are sorted by entry name and paginated using next_cursor.
+         */
+        get: operations["listAgentWorkspaceEntries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/files/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                path: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Download a file from the current user's live Agent Workspace
+         * @description Portal Session only. The Workspace ID must equal the current user's stable Agent Workspace. Symlinks and paths outside the Workspace are rejected; the server filesystem path is never exposed.
+         */
+        get: operations["downloadAgentWorkspaceFile"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -6407,8 +6473,13 @@ export interface components {
              */
             base_url: string;
             model_name: string;
-            /** @description Verified model context capacity from the provider's model documentation; omitted means unknown and disables compaction. */
-            context_window_tokens?: number;
+            /**
+             * @deprecated
+             * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
+             */
+            context_window_tokens?: number | null;
+            /** @description Optional advanced override for custom model routes; null clears the override. System presets use Morde-maintained capacity metadata and cannot be overridden. */
+            context_window_override_tokens?: number | null;
             api_key: string;
             /**
              * @description Shared connections require an administrator; authorization is checked by the server.
@@ -6424,8 +6495,13 @@ export interface components {
              */
             base_url: string;
             model_name: string;
-            /** @description Verified model context capacity from the provider's model documentation; omitted preserves it only when the endpoint is unchanged. */
-            context_window_tokens?: number;
+            /**
+             * @deprecated
+             * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
+             */
+            context_window_tokens?: number | null;
+            /** @description Optional advanced override for custom model routes; null clears the override. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied. System presets use Morde-maintained capacity metadata and cannot be overridden. */
+            context_window_override_tokens?: number | null;
             /** @description Omit or send an empty string to keep the current key; a non-empty value replaces it. */
             api_key?: string;
         };
@@ -6449,8 +6525,15 @@ export interface components {
             /** Format: uri */
             base_url: string;
             model_name: string;
-            /** @description Unknown until the owner or administrator supplies a verified model capacity. */
-            context_window_tokens?: number | null;
+            /** @description Effective capacity for the configured route */
+            context_window_tokens: number | null;
+            /** @description Explicit advanced override for custom routes only. */
+            context_window_override_tokens: number | null;
+            /** @enum {string} */
+            context_window_source: "unknown" | "override" | "legacy_manual" | "provider_metadata" | "model_catalog" | "provider_error";
+            /** Format: date-time */
+            context_window_resolved_at: string | null;
+            context_window_catalog_version: string | null;
             shared: boolean;
             has_api_key: boolean;
             capabilities: components["schemas"]["ModelConnectionCapabilities"];
@@ -7086,6 +7169,36 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        AgentWorkspace: {
+            id: components["schemas"]["WorkspaceId"];
+            /**
+             * @description Logical path only; no server absolute paths are returned.
+             * @enum {string}
+             */
+            root_path: "~/workspace";
+            /** @enum {string} */
+            state: "ready";
+        };
+        AgentWorkspaceEntry: {
+            name: string;
+            /** @description Clean relative POSIX path beneath the Workspace root. */
+            path: string;
+            /** @enum {string} */
+            kind: "file" | "directory" | "symlink" | "other";
+            /**
+             * Format: int64
+             * @description Regular-file size; zero for directories
+             */
+            size_bytes: number;
+            /** Format: date-time */
+            modified_at: string;
+        };
+        AgentWorkspaceEntryPage: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            path: string;
+            entries: components["schemas"]["AgentWorkspaceEntry"][];
+            next_cursor?: string;
+        };
         CreateWorkspaceShareRequest: {
             /** Format: int64 */
             expected_current_revision: number;
@@ -7360,24 +7473,6 @@ export interface components {
             name: string;
             /** Format: int64 */
             expected_current_revision: number;
-        };
-        HostCopyResult: {
-            source_host_id: components["schemas"]["HostId"];
-            source_workspace_id: components["schemas"]["WorkspaceId"];
-            host: components["schemas"]["Host"];
-            workspace: {
-                id: components["schemas"]["WorkspaceId"];
-                name: string;
-                /** Format: int64 */
-                revision: number;
-                /** @enum {string} */
-                state: "ready";
-            };
-            /** Format: int64 */
-            source_revision: number;
-            /** @enum {string} */
-            state: "completed";
-            replayed: boolean;
         };
         WorkspaceFileOperationRequest: {
             /** @enum {string} */
@@ -8859,6 +8954,8 @@ export interface components {
             routing_status?: "pending" | "processing" | "routed" | "waiting_user" | "waiting_adjustment" | "failed";
             /** @enum {string} */
             routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
+            /** @description True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. */
+            agent_acknowledged?: boolean;
             /**
              * @description Status of a persisted streamed assistant message.
              * @enum {string}
@@ -11154,6 +11251,30 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getMyAgentWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stable Agent Workspace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentWorkspace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
     listMyTaskApprovals: {
         parameters: {
             query?: {
@@ -11564,6 +11685,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             413: components["responses"]["RequestTooLarge"];
+            503: components["responses"]["ServiceUnavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -11596,7 +11718,7 @@ export interface operations {
     deleteHost: {
         parameters: {
             query: {
-                /** @description Must be true to confirm permanent deletion of the Host and its workspace directory. */
+                /** @description Must be true to confirm permanent deletion of the Host. The Agent Workspace files are retained. */
                 confirm_delete_workspace: true;
             };
             header?: never;
@@ -11641,28 +11763,9 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Completed Host copy returned for an idempotent replay */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HostCopyResult"];
-                };
-            };
-            /** @description New Host and its independent copied Workspace */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HostCopyResult"];
-                };
-            };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
@@ -12694,6 +12797,69 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAgentWorkspaceEntries: {
+        parameters: {
+            query?: {
+                path?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Live directory entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentWorkspaceEntryPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    downloadAgentWorkspaceFile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read-only file stream */
+            200: {
+                headers: {
+                    "Content-Disposition"?: string;
+                    "X-Content-Type-Options"?: "nosniff";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
             default: components["responses"]["Error"];
         };
     };
