@@ -7,7 +7,6 @@ import { ToastNoticeCenter, ToastProvider } from './app/toast';
 import { PortalLayout, PortalNavigationHistoryProvider } from './components/PortalLayout';
 import { AccountSettings } from './routes/AccountSettings';
 import { GoalsAndSchedules } from './routes/GoalsAndSchedules';
-import { ApiKeys } from './routes/ApiKeys';
 import { Assistant } from './routes/Assistant';
 import { Connections } from './routes/Connections';
 import { Clients } from './routes/Clients';
@@ -113,7 +112,7 @@ function UserRoutes() {
         <Route path="notifications" element={<Notifications />} />
         <Route path="workspaces" element={<LegacyWorkspaceRedirect />} />
         <Route path="connections" element={<Connections />} />
-        <Route path="apikeys" element={<ApiKeys />} />
+        <Route path="apikeys" element={<Navigate to="/hosts?view=apikeys" replace />} />
         <Route path="clients" element={<Clients />} />
         <Route path="settings" element={<AccountSettings />} />
         <Route path="settings/sync" element={<LegacySettingsSyncRedirect />} />

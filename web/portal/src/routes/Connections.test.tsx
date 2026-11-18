@@ -560,6 +560,32 @@ describe('Connections', () => {
     expect(screen.queryByText('private-test-secret')).not.toBeInTheDocument();
   });
 
+  it('refreshes the model list after an uncertain save failure to avoid duplicate submissions', async () => {
+    const user = userEvent.setup();
+    const personal: ModelConnection = { ...model, id: 'p7654321', name: 'DeepSeek Flash', shared: false, checked_at: null };
+    let rows: ModelConnection[] = [];
+    const list = vi.spyOn(portalApi, 'modelConnections').mockImplementation(async () => ({
+      items: [...rows], configuration_status: rows.length ? 'configured' : 'not_configured',
+    }));
+    vi.spyOn(portalApi, 'createModelConnection').mockImplementation(async () => {
+      rows = [{ ...personal, has_api_key: true }];
+      throw new ApiError({ code: 'internal', status: 503, message: 'service unavailable' });
+    });
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /添加个人模型/ }));
+    await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'deepseek-flash');
+    await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
+    await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('保存结果尚未确认，请先核对模型列表');
+    expect(screen.getByRole('alert')).not.toHaveTextContent('请重新输入后重试');
+    expect(screen.getByLabelText('API 密钥')).toHaveValue('');
+    expect(await screen.findByRole('heading', { name: 'DeepSeek Flash', level: 3 })).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText('private-test-secret')).not.toBeInTheDocument();
+  });
+
   it('edits an existing personal model without exposing or replacing its saved key unless requested', async () => {
     const user = userEvent.setup();
     const personal: ModelConnection = { ...model, id: 'p7654321', name: '我的模型', shared: false };

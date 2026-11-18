@@ -53,7 +53,7 @@ describe('PortalLayout', () => {
   });
 
   it('groups setting pages in the settings sidebar', () => {
-    renderPortalLayout('/apikeys');
+    renderPortalLayout('/hosts?view=apikeys');
     const settingsNavigation = screen.getByRole('navigation', { name: '设置与授权分类' });
     expect(screen.getByRole('complementary', { name: '设置与授权子菜单' })).toContainElement(settingsNavigation);
     expect(within(settingsNavigation).getByText('连接与设备')).toBeInTheDocument();
@@ -61,7 +61,8 @@ describe('PortalLayout', () => {
     expect(within(settingsNavigation).getByRole('link', { name: '模型与工具' })).toHaveAttribute('href', '/connections');
     expect(within(settingsNavigation).getByRole('link', { name: '文件同步' })).toHaveAttribute('href', '/hosts?sync=1');
     expect(within(settingsNavigation).queryByRole('link', { name: '客户端' })).not.toBeInTheDocument();
-    expect(within(settingsNavigation).getByRole('link', { name: 'API Key' })).toHaveAttribute('aria-current', 'page');
+    expect(within(settingsNavigation).getByRole('link', { name: '云端电脑' })).toHaveAttribute('aria-current', 'page');
+    expect(within(settingsNavigation).queryByRole('link', { name: 'API Key' })).not.toBeInTheDocument();
     expect(within(settingsNavigation).getByRole('link', { name: '账户' })).toHaveAttribute('href', '/settings');
     for (const [section, label] of [['profile', '个人资料'], ['soul', 'AI 个性'], ['memory', '记忆'], ['library', '资源库']]) {
       expect(within(settingsNavigation).getByRole('link', { name: label })).toHaveAttribute('href', `/personal?section=${section}`);

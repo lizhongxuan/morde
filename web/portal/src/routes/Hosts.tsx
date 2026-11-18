@@ -13,6 +13,7 @@ import { HostControlPanel } from '../components/HostControlPanel';
 import { HostMemberManager } from '../components/HostMemberManager';
 import { MordeIcon } from '../components/MordeIcon';
 import { ScreenPagination } from '../components/ScreenPagination';
+import { ApiKeys } from './ApiKeys';
 import './Hosts.css';
 import { FloatingError } from '../components/FloatingError';
 
@@ -37,13 +38,15 @@ export function Hosts() {
   const location = useLocation();
   const { user } = useAuth();
   const { notify } = useToast();
-  const [listSelection, setListSelection] = useState<{ mode: 'owned' | 'shared'; hash: string } | null>(null);
+  const requestedView = new URLSearchParams(location.search).get('view');
+  const isApiKeyView = requestedView === 'apikeys';
   const hosts = useQuery({
     queryKey: ['hosts'], queryFn: portalApi.hosts,
+    enabled: !isApiKeyView,
     refetchInterval: (query) => query.state.data?.items.some((host) => unsettled.has(host.state)) ? 3000 : query.state.data?.items.length ? 12000 : false,
     refetchIntervalInBackground: false,
   });
-  const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences, retry: false });
+  const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences, retry: false, enabled: !isApiKeyView });
   const ownedHosts = useMemo(() => hosts.data?.items.filter((host) => host.owner_id === user?.id) ?? [], [hosts.data?.items, user?.id]);
   const defaultHost = ownedHosts.find((host) => host.id === preferences.data?.default_host_id);
   const setDefaultHost = useMutation({
@@ -107,18 +110,17 @@ export function Hosts() {
     catch (error) { notify(errorDetails(error).message, 'error'); }
   };
 
-  const sharedHosts = useQuery({ queryKey: ['shared-hosts'], queryFn: portalApi.sharedHosts });
+  const sharedHosts = useQuery({ queryKey: ['shared-hosts'], queryFn: portalApi.sharedHosts, enabled: !isApiKeyView });
   const displayedSharedHosts = useMemo(() => prioritizeHostForHash(sharedHosts.data?.items ?? [], hashHostID), [sharedHosts.data?.items, hashHostID]);
-  const listMode = listSelection?.hash === location.hash ? listSelection.mode
+  const listMode = requestedView === 'owned' ? 'owned' : requestedView === 'shared' ? 'shared'
     : hashHostID && sharedHosts.data?.items.some((host) => host.id === hashHostID) ? 'shared'
       : hashHostID && ownedHosts.some((host) => host.id === hashHostID) ? 'owned'
-      : hosts.isSuccess && !ownedHosts.length && sharedHosts.data?.items.length ? 'shared' : 'owned';
+        : hosts.isSuccess && !ownedHosts.length && sharedHosts.data?.items.length ? 'shared' : 'owned';
   useNetworkReadNotice([
     { failed: listMode === 'owned' && hosts.isError, error: hosts.error, retry: hosts.refetch },
     { failed: listMode === 'owned' && preferences.isError, error: preferences.error, retry: preferences.refetch },
     { failed: listMode === 'shared' && sharedHosts.isError, error: sharedHosts.error, retry: sharedHosts.refetch },
   ], '云端电脑信息读取失败，已保留当前内容。');
-  const selectList = (mode: 'owned' | 'shared') => setListSelection({ mode, hash: location.hash });
   const enterShared = async (host: Awaited<ReturnType<typeof portalApi.sharedHosts>>['items'][number], entryTarget: 'desktop' | 'terminal' | 'workspace') => {
     try { enterHostInNewTab(host.id, entryTarget); }
     catch (error) { notify(errorDetails(error).message, 'error'); }
@@ -126,14 +128,17 @@ export function Hosts() {
 
   return <section className="hosts-page">
     <header className="hosts-page-heading">
-      {listMode === 'owned' ? <><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑、文件和运行状态。</p></div><div className="inline-actions">{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></>
+      {isApiKeyView ? <div><h2 id="api-keys-title">API Key</h2><p>连接 AI 对话工具并管理密钥。</p></div>
+        : listMode === 'owned' ? <><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑、文件和运行状态。</p></div><div className="inline-actions">{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></>
         : <div><h2 id="shared-hosts-title">共享给我的电脑</h2><p>查看其他人共享给你的云端电脑。</p></div>}
     </header>
     <nav className="inline-actions hosts-list-toggle" aria-label="云端电脑视图">
-      <button type="button" className={`button ${listMode === 'owned' ? 'button-primary' : 'button-secondary'}`} aria-pressed={listMode === 'owned'} onClick={() => selectList('owned')}>我的电脑</button>
-      <button type="button" className={`button ${listMode === 'shared' ? 'button-primary' : 'button-secondary'}`} aria-pressed={listMode === 'shared'} onClick={() => selectList('shared')}>共享给我的</button>
+      <Link className={`button ${!isApiKeyView && listMode === 'owned' ? 'button-primary' : 'button-secondary'}`} aria-current={!isApiKeyView && listMode === 'owned' ? 'page' : undefined} to="/hosts?view=owned">我的电脑</Link>
+      <Link className={`button ${!isApiKeyView && listMode === 'shared' ? 'button-primary' : 'button-secondary'}`} aria-current={!isApiKeyView && listMode === 'shared' ? 'page' : undefined} to="/hosts?view=shared">共享给我的</Link>
+      <Link className={`button ${isApiKeyView ? 'button-primary' : 'button-secondary'}`} aria-current={isApiKeyView ? 'page' : undefined} to="/hosts?view=apikeys">API Key</Link>
     </nav>
-    {listMode === 'owned' ? <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
+    {isApiKeyView ? <div className="hosts-api-keys"><ApiKeys /></div>
+      : listMode === 'owned' ? <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
     <h3 className="hosts-list-title">电脑列表</h3>
     {hosts.isSuccess && <div className="host-default-settings" aria-label="默认云端电脑设置">
       <label htmlFor="default-cloud-host">默认云端电脑
@@ -212,7 +217,7 @@ export function Hosts() {
                 {canViewDesktop && <button type="button" className="button button-primary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'desktop')}>{host.state === 'running' ? '查看桌面' : '主机运行后可查看'}</button>}
                 {canControlTerminal && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'terminal')}>{host.state === 'running' ? '打开终端' : '主机运行后可打开终端'}</button>}
                 {canReadWorkspace && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'workspace')}>{host.state === 'running' ? '查看电脑文件' : '电脑运行后可查看文件'}</button>}
-                {host.permissions.includes('mcp:control') && <Link className="button button-secondary" to="/apikeys">配置 MCP API Key</Link>}
+                {host.permissions.includes('mcp:control') && <Link className="button button-secondary" to="/hosts?view=apikeys">配置 MCP API Key</Link>}
               </div>
               {canViewDesktop && host.state === 'running' && <HostControlDisclosure
                 host={host}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { components } from '../api/schema';
@@ -33,17 +33,21 @@ const controlFailureLabels: Record<string, string> = {
   invalid_action: '当前控制操作无效，请刷新主机状态。',
 };
 
-export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact = false }: {
+export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact = false, actionReady = true, onBeforeAction }: {
   host: { id: string; name?: string; control_state?: Host['control_state'] };
   canControl: boolean;
   canReleaseAnyLease: boolean;
   compact?: boolean;
+  actionReady?: boolean;
+  onBeforeAction?: () => Promise<boolean>;
 }) {
   const queryClient = useQueryClient();
   const { user } = useAuth();
   const { notify } = useToast();
   const [confirmAction, setConfirmAction] = useState<ControlActionRequest | null>(null);
   const [pendingOperationCount, setPendingOperationCount] = useState(0);
+  const [compactActionPreparing, setCompactActionPreparing] = useState(false);
+  const compactActionPreparingRef = useRef(false);
   const control = useQuery({
     queryKey: ['host-control', host.id],
     queryFn: () => portalApi.hostControl(host.id),
@@ -111,6 +115,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         : state === 'taking_over' ? '正在接管电脑' : '正在交还 Morde';
 
   useEffect(() => {
+    if (compact) return;
     if (state !== 'user' || !status?.control_lease_active || !status.control_lease_held_by_me) return;
     let renewing = false;
     const timer = window.setInterval(() => {
@@ -122,7 +127,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         .finally(() => { renewing = false; });
     }, 10_000);
     return () => window.clearInterval(timer);
-  }, [host.id, queryClient, refetchControl, state, status?.control_lease_active, status?.control_lease_held_by_me, status?.control_version]);
+  }, [compact, host.id, queryClient, refetchControl, state, status?.control_lease_active, status?.control_lease_held_by_me, status?.control_version]);
 
   const startAction = (action: ControlActionRequest['action']) => {
     if (!status) return;
@@ -136,6 +141,54 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
       expected_control_version: transition.expected_control_version,
     });
   };
+
+  const runCompactAction = async (action: ControlActionRequest['action']) => {
+    if (!status || updateControl.isPending || !canControl || compactActionPreparingRef.current) return;
+    compactActionPreparingRef.current = true;
+    setCompactActionPreparing(true);
+    try {
+      if (onBeforeAction && !(await onBeforeAction())) return;
+      const resumable = transition?.action === action && Boolean(transition.failure_reason);
+      setCompactActionPreparing(false);
+      await updateControl.mutateAsync(resumable && transition ? {
+        action: transition.action,
+        request_id: transition.request_id,
+        expected_control_version: transition.expected_control_version,
+      } : { action, request_id: newIdempotencyKey(), expected_control_version: status.control_version });
+    } catch {
+      // The mutation reports its failure and refreshes the server state.
+    } finally {
+      compactActionPreparingRef.current = false;
+      setCompactActionPreparing(false);
+    }
+  };
+
+  if (compact) {
+    const action = state === 'ai' ? 'take_over' : state === 'user' ? 'release' : null;
+    const enabled = actionReady && canControl && !compactActionPreparing && !control.isPending && !control.isFetching && !control.isError && !!status &&
+      !updateControl.isPending && (action === 'take_over' ? !transitioning
+        : action === 'release' ? canRelease && !transitioning
+          : Boolean(transition && transition.failure_reason));
+    const label = compactActionPreparing ? '正在锁定工作台…'
+      : updateControl.isPending ? action === 'release' ? '正在交还…' : '正在接管…'
+      : control.isPending || (!status && !control.isError) ? '正在确认…'
+        : control.isError ? '状态不可用'
+          : !actionReady ? '工作台未就绪'
+          : !canControl ? '无接管权限'
+            : transition ? transition.failure_reason ? transition.action === 'take_over' ? '继续接管' : '继续交还'
+              : transition.action === 'take_over' ? '正在接管…' : '正在交还…'
+              : state === 'ai' ? '接管电脑'
+                : state === 'user' ? status?.control_lease_active
+                  ? status.control_lease_held_by_me ? '交还 AI' : '他人控制中'
+                  : '租约已失效' : '状态不可用';
+    const nextAction = transition?.failure_reason ? transition.action : action;
+    return <section className="host-control host-control-compact computer-panel-control" aria-label="云端电脑控制">
+      <button type="button" className="button button-primary" disabled={!enabled || !nextAction}
+        aria-label={label} title={label} onClick={() => nextAction && void runCompactAction(nextAction)}>
+        {label}
+      </button>
+    </section>;
+  }
 
   return <section className={`host-control${compact ? ' host-control-compact computer-panel-control' : ''}`} aria-label={`电脑控制状态 ${host.name || host.id}`}>
     <div className="host-control-summary">

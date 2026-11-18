@@ -410,8 +410,11 @@ describe('Assistant durable tasks', () => {
     expect(await within(sidebar).findByText('旁聊历史暂不可用')).toBeInTheDocument();
   });
 
-  it('connects an authorized cloud computer to the selected conversation through a one-time form ticket', async () => {
+  it('automatically connects the selected conversation through a one-time read-only desktop ticket', async () => {
     mockCommon({ conversations: [conversation], hosts: [targetHost] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue({ host_id: targetHost.id, control_state: 'user', control_version: 2,
+      control_actor_user_id: authUser.id, control_lease_expires_at: timestamp, control_lease_active: true,
+      control_lease_held_by_me: true, active_transition: null });
     vi.spyOn(portalApi, 'issueHostEmbedTicket').mockResolvedValue({
       exchange_url: `${targetHost.url}/__ch/embed-auth`, ticket: 'A'.repeat(43), embed_nonce: 'B'.repeat(32),
       targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'], expires_at: '2026-11-12T03:00:00.000Z',
@@ -427,7 +430,8 @@ describe('Assistant durable tasks', () => {
     await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
-    await user.click(within(sidebar).getByRole('button', { name: '打开云端电脑浏览器' }));
+    expect(document.querySelector('.assistant-layout')).toHaveClass('assistant-layout-with-computer-panel');
+    expect(document.querySelector('.assistant-layout')).not.toHaveClass('assistant-layout-computer-focused');
 
     await waitFor(() => expect(submit).toHaveBeenCalledOnce());
     expect(portalApi.issueHostEmbedTicket).toHaveBeenCalledWith(targetHost.id, {
@@ -451,17 +455,39 @@ describe('Assistant durable tasks', () => {
     act(() => window.dispatchEvent(new MessageEvent('message', {
       origin: new URL(targetHost.url).origin, source: frame.contentWindow,
       data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
-        control_state: 'user', control_lease_active: true, control_lease_held_by_me: true },
+        active_target: 'browser', remote_desktop: 'connected', control_state: 'user', control_lease_active: true,
+        control_lease_held_by_me: true, control_version: 2, control_locked: true, lock_seq: 0, selection_seq: 0 },
     })));
-    expect(within(sidebar).queryByText('工作台已就绪')).not.toBeInTheDocument();
     expect(within(sidebar).getByTitle('当前会话云端电脑工作台')).toBeInTheDocument();
     expect(document.querySelector('.assistant-layout')).toHaveClass('assistant-layout-computer-expanded');
 
-    await user.click(within(sidebar).getByRole('button', { name: '文件' }));
-    expect(postMessage).toHaveBeenLastCalledWith({ ...handshake, type: 'visibility', visible: false }, new URL(targetHost.url).origin);
+    await waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'control_lock', locked: false }), new URL(targetHost.url).origin));
+    const unlock = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>).reverse()
+      .find((message) => message.type === 'control_lock' && message.locked === false)!;
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+        active_target: 'browser', remote_desktop: 'connected', control_state: 'user', control_lease_active: true,
+        control_lease_held_by_me: true, control_version: 2, control_locked: false, lock_seq: unlock.seq, selection_seq: 0 },
+    })));
+    const dock = within(sidebar).getByRole('group', { name: '云端电脑功能' });
+    await waitFor(() => expect(within(dock).getByRole('button', { name: '终端' })).toBeEnabled());
+    await user.click(within(dock).getByRole('button', { name: '终端' }));
+    expect(postMessage).toHaveBeenLastCalledWith({ ...handshake, type: 'select_target', target: 'terminal', seq: 1 }, new URL(targetHost.url).origin);
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+        active_target: 'terminal', selection_seq: 1, remote_desktop: 'connected', control_state: 'user', control_lease_active: true,
+        control_lease_held_by_me: true, control_version: 2, control_locked: false, lock_seq: unlock.seq },
+    })));
+    await waitFor(() => expect(within(dock).getByRole('button', { name: '终端' })).toHaveAttribute('aria-pressed', 'true'));
+
+    const sidebarTabs = within(sidebar).getByRole('navigation', { name: '侧边栏内容' });
+    await user.click(within(sidebarTabs).getByRole('button', { name: '文件' }));
+    expect(postMessage).toHaveBeenLastCalledWith({ ...handshake, type: 'visibility', conversation_id: conversation.id, visible: false }, new URL(targetHost.url).origin);
     expect(document.querySelector('.assistant-layout')).not.toHaveClass('assistant-layout-computer-expanded');
-    await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
-    expect(postMessage).toHaveBeenLastCalledWith({ ...handshake, type: 'visibility', visible: true }, new URL(targetHost.url).origin);
+    await user.click(within(sidebarTabs).getByRole('button', { name: '云端电脑' }));
+    expect(postMessage).toHaveBeenLastCalledWith({ ...handshake, type: 'visibility', conversation_id: conversation.id, visible: true }, new URL(targetHost.url).origin);
     expect(document.querySelector('.assistant-layout')).toHaveClass('assistant-layout-computer-expanded');
     act(() => window.dispatchEvent(new MessageEvent('message', {
       origin: new URL(targetHost.url).origin, source: frame.contentWindow,
@@ -469,6 +495,109 @@ describe('Assistant durable tasks', () => {
         control_state: 'ai', control_lease_active: false, control_lease_held_by_me: false },
     })));
     expect(document.querySelector('.assistant-layout')).not.toHaveClass('assistant-layout-computer-expanded');
+  });
+
+  it('locks the workbench before takeover and enables its four functions only after the current lease is confirmed', async () => {
+    mockCommon({ conversations: [conversation], hosts: [targetHost] });
+    vi.spyOn(portalApi, 'issueHostEmbedTicket').mockResolvedValue({
+      exchange_url: `${targetHost.url}/__ch/embed-auth`, ticket: 'A'.repeat(43), embed_nonce: 'B'.repeat(32),
+      targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'], expires_at: '2026-11-12T03:00:00.000Z',
+    });
+    vi.spyOn(HTMLFormElement.prototype, 'submit').mockImplementation(() => undefined);
+    let controlStatus: Awaited<ReturnType<typeof portalApi.hostControl>> = {
+      host_id: targetHost.id, control_state: 'ai', control_version: 2, control_actor_user_id: '',
+      control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null,
+    };
+    vi.spyOn(portalApi, 'hostControl').mockImplementation(async () => controlStatus);
+    const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockImplementation(async (hostID, _body) => {
+      controlStatus = { ...controlStatus, host_id: hostID, control_state: 'user', control_actor_user_id: authUser.id,
+        control_lease_expires_at: timestamp, control_lease_active: true, control_lease_held_by_me: true };
+      return { ...controlStatus, pending_operation_ids: [], active_transition: null };
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
+    const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
+    await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
+    expect(portalApi.issueHostEmbedTicket).toHaveBeenCalledWith(targetHost.id, expect.objectContaining({ target: 'browser' }));
+    const frame = await within(sidebar).findByTitle('当前会话云端电脑工作台') as HTMLIFrameElement;
+    expect(within(sidebar).queryByRole('group', { name: '云端电脑功能' })).not.toBeInTheDocument();
+    expect(within(sidebar).queryByRole('button', { name: '接管电脑' })).not.toBeInTheDocument();
+    const postMessage = vi.spyOn(frame.contentWindow!, 'postMessage');
+    const handshake = { channel: 'morde.workbench.embed', version: 1, nonce: 'B'.repeat(32) };
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'ready' },
+    })));
+    expect(within(sidebar).queryByRole('group', { name: '云端电脑功能' })).not.toBeInTheDocument();
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+        active_target: 'browser', remote_desktop: 'disconnected', control_state: 'ai', control_version: 2,
+        control_lease_active: false, control_lease_held_by_me: false, control_locked: true, lock_seq: 0, selection_seq: 0 },
+    })));
+    expect(within(sidebar).queryByRole('group', { name: '云端电脑功能' })).not.toBeInTheDocument();
+    expect(within(sidebar).queryByRole('button', { name: '接管电脑' })).not.toBeInTheDocument();
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+        active_target: 'browser', remote_desktop: 'connected', control_state: 'ai', control_version: 2,
+        control_lease_active: false, control_lease_held_by_me: false, control_locked: true, lock_seq: 0, selection_seq: 0 },
+    })));
+    const dock = within(sidebar).getByRole('group', { name: '云端电脑功能' });
+    for (const label of ['远程桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeDisabled();
+    const takeOver = within(sidebar).getByRole('button', { name: '接管电脑' });
+    await waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'control_lock', locked: true }), new URL(targetHost.url).origin));
+    const lock = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>).reverse()
+      .find((message) => message.type === 'control_lock' && message.locked === true)!;
+    await waitFor(() => expect(takeOver).toBeEnabled());
+    await user.dblClick(takeOver);
+    expect(takeOver).toBeDisabled();
+    expect(controlAction).not.toHaveBeenCalled();
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+        active_target: 'browser', remote_desktop: 'connected', control_state: 'ai', control_version: 2,
+        control_lease_active: false, control_lease_held_by_me: false, control_locked: true, lock_seq: lock.seq, selection_seq: 0 },
+    })));
+    await waitFor(() => expect(controlAction).toHaveBeenCalledWith(targetHost.id, expect.objectContaining({ action: 'take_over', expected_control_version: 2 })));
+    expect(controlAction).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(await screen.findByText('接管已完成，现在可以操作电脑。')).toBeInTheDocument();
+    const release = within(sidebar).getByRole('button', { name: '交还 AI' });
+    expect(release).toBeEnabled();
+    await waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'control_lock', locked: false }), new URL(targetHost.url).origin));
+    const unlock = postMessage.mock.calls.map(([message]) => message as Record<string, unknown>).reverse()
+      .find((message) => message.type === 'control_lock' && message.locked === false)!;
+    act(() => window.dispatchEvent(new MessageEvent('message', {
+      origin: new URL(targetHost.url).origin, source: frame.contentWindow,
+      data: { ...handshake, type: 'state', conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+        active_target: 'browser', remote_desktop: 'connected', control_state: 'user', control_version: 2,
+        control_lease_active: true, control_lease_held_by_me: true, control_locked: false, lock_seq: unlock.seq, selection_seq: 0 },
+    })));
+    await waitFor(() => {
+      for (const label of ['远程桌面', '终端', '文件', 'VS Code']) expect(within(dock).getByRole('button', { name: label })).toBeEnabled();
+    });
+  });
+
+  it('shows a retry button below the cloud desktop connection error and retries opening it', async () => {
+    mockCommon({ conversations: [conversation], hosts: [targetHost] });
+    const openHostWorkbenchEmbed = vi.fn().mockRejectedValue(new Error('无法连接指定云端电脑，请重试。'));
+    Object.defineProperty(window, 'morde', { configurable: true, value: { openHostWorkbenchEmbed } });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
+    const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
+    await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
+
+    const error = await within(sidebar).findByRole('alert');
+    const retry = within(error).getByRole('button', { name: '重试连接' });
+    expect(error.lastElementChild).toBe(retry);
+    await user.click(retry);
+    await waitFor(() => expect(openHostWorkbenchEmbed).toHaveBeenCalledTimes(2));
+    expect(await within(sidebar).findByRole('button', { name: '重试连接' })).toBeInTheDocument();
   });
 
   it('opens the Host Workbench in a top-level native view with a nonce-scoped state bridge', async () => {
@@ -495,7 +624,6 @@ describe('Assistant durable tasks', () => {
     await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
-    await user.click(within(sidebar).getByRole('button', { name: '打开云端电脑浏览器' }));
 
     await waitFor(() => expect(openHostWorkbenchEmbed).toHaveBeenCalledWith({ hostID: targetHost.id, conversationID: conversation.id,
       initialTarget: 'browser', targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'], shared: false }));
@@ -507,19 +635,30 @@ describe('Assistant durable tasks', () => {
     })));
     expect(sendHostWorkbenchCommand).toHaveBeenCalledWith(nonce, { type: 'init', conversation_id: conversation.id, visible: true });
 
-    act(() => receive?.({ type: 'ready', nonce }));
     act(() => receive?.({ type: 'state', nonce, conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
-      control_state: 'user', control_lease_active: true, control_lease_held_by_me: true }));
-    expect(within(sidebar).queryByText('工作台已就绪')).not.toBeInTheDocument();
-    await user.click(within(sidebar).getByRole('button', { name: '文件' }));
+      active_target: 'browser', remote_desktop: 'connected', control_state: 'ai', control_lease_active: false,
+      control_lease_held_by_me: false, control_version: 2, control_locked: true, lock_seq: 0, selection_seq: 0 }));
+    await waitFor(() => expect(sendHostWorkbenchCommand).toHaveBeenCalledWith(nonce, { type: 'control_lock', locked: true, seq: 1 }));
+    act(() => receive?.({ type: 'state', nonce, conversation_id: conversation.id, host_id: targetHost.id, workbench_ready: true,
+      active_target: 'browser', remote_desktop: 'connected', control_state: 'ai', control_lease_active: false,
+      control_lease_held_by_me: false, control_version: 2, control_locked: true, lock_seq: 1, selection_seq: 0 }));
+    const sidebarTabs = within(sidebar).getByRole('navigation', { name: '侧边栏内容' });
+    await user.click(within(sidebarTabs).getByRole('button', { name: '文件' }));
     expect(sendHostWorkbenchCommand).toHaveBeenLastCalledWith(nonce, { type: 'visibility', conversation_id: conversation.id, visible: false });
     await waitFor(() => expect(setHostWorkbenchBounds).toHaveBeenLastCalledWith(nonce, { x: 0, y: 0, width: 0, height: 0 }));
+    await user.click(within(sidebarTabs).getByRole('button', { name: '云端电脑' }));
+    expect(sendHostWorkbenchCommand).toHaveBeenLastCalledWith(nonce, { type: 'visibility', conversation_id: conversation.id, visible: true });
     unmount();
     expect(closeHostWorkbenchEmbed).toHaveBeenCalledWith(nonce);
   });
 
   it('shows availability for the configured default without a computer selector', async () => {
     mockCommon({ conversations: [conversation], hosts: [targetHost], defaultHostID: targetHost.id });
+    vi.spyOn(portalApi, 'issueHostEmbedTicket').mockResolvedValue({
+      exchange_url: `${targetHost.url}/__ch/embed-auth`, ticket: 'A'.repeat(43), embed_nonce: 'B'.repeat(32),
+      targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'], expires_at: '2026-11-12T03:00:00.000Z',
+    });
+    vi.spyOn(HTMLFormElement.prototype, 'submit').mockImplementation(() => undefined);
     const user = userEvent.setup();
     renderPage();
 
@@ -527,7 +666,7 @@ describe('Assistant durable tasks', () => {
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
 
-    expect(within(sidebar).getByRole('status')).toHaveTextContent('已连接');
+    expect(within(sidebar).getByRole('status')).toHaveTextContent(/正在(连接|加载)云端电脑/);
     expect(within(sidebar).queryByRole('combobox')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
   });
@@ -547,8 +686,8 @@ describe('Assistant durable tasks', () => {
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
 
-    expect(within(sidebar).getByRole('status')).toHaveTextContent('未配置云端电脑');
-    expect(within(sidebar).getByRole('link', { name: '设置默认电脑' })).toHaveAttribute('href', '/hosts');
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('尚未配置默认云端电脑');
+    expect(within(sidebar).queryByRole('link', { name: '设置默认电脑' })).not.toBeInTheDocument();
     expect(within(sidebar).queryByRole('combobox')).not.toBeInTheDocument();
     expect(issueTicket).not.toHaveBeenCalled();
   });

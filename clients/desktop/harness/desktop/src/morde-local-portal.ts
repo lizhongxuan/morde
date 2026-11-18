@@ -1,8 +1,8 @@
 import { createReadStream, promises as fs } from "node:fs";
-import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const blockedPaths = ["/admin", "/admin/", "/app", "/app/"];
@@ -52,7 +52,8 @@ function cookieForPortal(value: string | undefined): string | undefined {
   return cookie;
 }
 
-function proxyRequest(request: IncomingMessage, response: ServerResponse, service: URL, origin: string, localURL: URL): void {
+function proxyRequest(request: IncomingMessage, response: ServerResponse, service: URL, origin: string, localURL: URL,
+  proxyFetch: typeof fetch): void {
   const headers: Record<string, string | string[] | undefined> = {};
   for (const [name, value] of Object.entries(request.headers)) {
     if (hopHeaders.has(name.toLowerCase()) || name.toLowerCase() === "cookie" || name.toLowerCase() === "origin" || name.toLowerCase() === "referer") continue;
@@ -69,25 +70,36 @@ function proxyRequest(request: IncomingMessage, response: ServerResponse, servic
   }
 
   const upstreamURL = new URL(`${localURL.pathname}${localURL.search}`, service);
-  const transport = upstreamURL.protocol === "https:" ? httpsRequest : httpRequest;
-  const upstream = transport(upstreamURL, { method: request.method, headers }, (upstreamResponse) => {
+  const fetchHeaders = new Headers();
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    for (const part of Array.isArray(value) ? value : [value]) fetchHeaders.append(name, part);
+  }
+  const method = request.method ?? "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(request) as unknown as BodyInit;
+  void proxyFetch(upstreamURL.href, {
+    method, headers: fetchHeaders, redirect: "manual",
+    ...(body ? { body, duplex: "half" as const } : {}),
+  }).then(async (upstreamResponse) => {
     const responseHeaders: Record<string, string | string[] | undefined> = {};
-    for (const [name, value] of Object.entries(upstreamResponse.headers)) {
-      if (!hopHeaders.has(name.toLowerCase())) responseHeaders[name] = value;
-    }
-    response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
-    void pipeline(upstreamResponse, response).catch(() => {
+    upstreamResponse.headers.forEach((value, name) => {
+      if (!hopHeaders.has(name.toLowerCase()) && name.toLowerCase() !== "set-cookie") responseHeaders[name] = value;
+    });
+    const setCookies = upstreamResponse.headers.getSetCookie();
+    if (setCookies.length) responseHeaders["set-cookie"] = setCookies;
+    response.writeHead(upstreamResponse.status, responseHeaders);
+    if (!upstreamResponse.body) { response.end(); return; }
+    await pipeline(Readable.fromWeb(upstreamResponse.body as unknown as import("node:stream/web").ReadableStream<Uint8Array>), response).catch(() => {
       if (!response.destroyed) response.destroy();
     });
-  });
-  upstream.on("error", () => {
+  }).catch(() => {
     if (!response.headersSent) writeError(response, 502, "Morde service is unavailable");
     else response.destroy();
   });
-  request.pipe(upstream);
 }
 
-export async function startLocalPortalServer(directory: string, serviceOrigin: string, hostFrameSource?: string, port = 0): Promise<LocalPortalServer> {
+export async function startLocalPortalServer(directory: string, serviceOrigin: string, hostFrameSource?: string, port = 0,
+  proxyFetch: typeof fetch = (...args) => fetch(...args)): Promise<LocalPortalServer> {
   if (!isAbsolute(directory)) throw new Error("Portal asset directory must be absolute");
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("Invalid local Portal port");
   const service = new URL(serviceOrigin);
@@ -111,7 +123,7 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
     if (url.pathname === "/api" || url.pathname.startsWith("/api/") || url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") ||
       url.pathname === "/downloads" || url.pathname.startsWith("/downloads/")) {
       if (request.method !== "GET" && request.method !== "HEAD" && requestOrigin !== origin) { writeError(response, 403, "Origin required"); return; }
-      proxyRequest(request, response, service, origin, url);
+      proxyRequest(request, response, service, origin, url, proxyFetch);
       return;
     }
 

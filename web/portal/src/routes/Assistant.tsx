@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -72,15 +72,27 @@ type ComputerEmbedSession = {
   native?: boolean;
   targets: HostEmbedTicket['targets'];
   status: 'requesting' | 'submitting' | 'loading' | 'ready' | 'error';
+  remoteDesktop: 'connecting' | 'connected' | 'disconnected' | 'failed';
+  activeTarget: 'browser' | 'terminal' | 'files' | 'vscode' | null;
+  controlLocked: boolean;
+  controlVersion: number | null;
+  selectionSeq: number | null;
+  lockSeq: number | null;
   error?: string;
 };
+type ComputerEmbedCommand =
+  | { type: 'init'; conversation_id: string; visible: boolean }
+  | { type: 'visibility'; conversation_id: string; visible: boolean }
+  | { type: 'select_target'; target: 'browser' | 'terminal' | 'files' | 'vscode'; seq: number }
+  | { type: 'control_lock'; locked: boolean; seq: number };
 type NativeWorkbenchBridge = {
   openHostWorkbenchEmbed?: (request: { hostID: string; conversationID: string; initialTarget: string; targets: string[]; shared: boolean }) => Promise<unknown>;
   setHostWorkbenchBounds?: (nonce: string, bounds: { x: number; y: number; width: number; height: number }) => Promise<unknown>;
-  sendHostWorkbenchCommand?: (nonce: string, command: { type: 'init' | 'visibility'; conversation_id: string; visible: boolean }) => Promise<unknown>;
+  sendHostWorkbenchCommand?: (nonce: string, command: ComputerEmbedCommand) => Promise<unknown>;
   closeHostWorkbenchEmbed?: (nonce: string) => Promise<unknown>;
   onHostWorkbenchMessage?: (listener: (value: unknown) => void) => () => void;
 };
+type ComputerLockAck = { nonce: string; seq: number; locked: boolean; resolve: (acknowledged: boolean) => void; promise: Promise<boolean>; timer: number };
 function nativeWorkbenchBridge(): NativeWorkbenchBridge | undefined {
   return (window as Window & { morde?: NativeWorkbenchBridge }).morde;
 }
@@ -232,13 +244,8 @@ function hostEmbedTargetPlan(host: ComputerHostOption): HostEmbedTicketRequest['
   return targets;
 }
 
-function hostEmbedInitialTarget(targets: HostEmbedTicketRequest['targets']): HostEmbedTicketRequest['target'] | null {
-  return targets.includes('browser') ? 'browser' : targets.includes('terminal') ? 'terminal'
-    : targets.includes('workspace') ? 'workspace' : null;
-}
-
-const computerQuickActions: { target: HostEmbedTicketRequest['target']; label: string; icon: 'browser' | 'terminal' | 'files' | 'vscode' }[] = [
-  { target: 'browser', label: '浏览器', icon: 'browser' },
+const computerQuickActions: { target: 'browser' | 'terminal' | 'files' | 'vscode'; label: string; icon: 'browser' | 'terminal' | 'files' | 'vscode' }[] = [
+  { target: 'browser', label: '远程桌面', icon: 'browser' },
   { target: 'terminal', label: '终端', icon: 'terminal' },
   { target: 'files', label: '文件', icon: 'files' },
   { target: 'vscode', label: 'VS Code', icon: 'vscode' },
@@ -931,18 +938,69 @@ export function Assistant() {
   const computerRequestGeneration = useRef(0);
   const submittedEmbedNonce = useRef<string | null>(null);
   const initializedEmbedNonce = useRef<string | null>(null);
+  const computerCommandSequences = useRef({ selection: 0, lock: 0 });
+  const computerAutoConnectKey = useRef('');
+  const computerControlReport = useRef('');
+  const computerLockAck = useRef<ComputerLockAck | null>(null);
+  const computerLockRequested = useRef<{ nonce: string; locked: boolean; seq: number } | null>(null);
   useLayoutEffect(() => { computerEmbedRef.current = computerEmbed; }, [computerEmbed]);
+  const sendComputerCommand = useCallback(async (session: ComputerEmbedSession, command: ComputerEmbedCommand): Promise<boolean> => {
+    if (session.native) {
+      const send = nativeWorkbenchBridge()?.sendHostWorkbenchCommand;
+      if (!send) return false;
+      try {
+        const result = await send(session.nonce, command);
+        return Boolean(result && typeof result === 'object' && (result as { sent?: unknown }).sent === true);
+      } catch { return false; }
+    }
+    const target = computerFrame.current?.contentWindow;
+    if (!target) return false;
+    target.postMessage({ channel: 'morde.workbench.embed', version: 1, nonce: session.nonce, ...command }, session.hostOrigin);
+    return true;
+  }, []);
+  const setComputerControlLock = useCallback(async (locked: boolean, waitForAck = false): Promise<boolean> => {
+    const session = computerEmbedRef.current;
+    if (!session || session.status !== 'ready' || initializedEmbedNonce.current !== session.nonce) return false;
+    const pending = computerLockAck.current;
+    if (pending?.nonce === session.nonce && pending.locked === locked) {
+      return waitForAck ? pending.promise : true;
+    }
+    if (computerLockRequested.current?.nonce === session.nonce && computerLockRequested.current.locked === locked) {
+      return session.controlLocked === locked && session.lockSeq === computerLockRequested.current.seq || !waitForAck;
+    }
+    if (pending) {
+      window.clearTimeout(pending.timer);
+      pending.resolve(false);
+      computerLockAck.current = null;
+    }
+    const seq = ++computerCommandSequences.current.lock;
+    let resolveAck: (acknowledged: boolean) => void = () => undefined;
+    const acknowledged = new Promise<boolean>((resolve) => { resolveAck = resolve; });
+    const timer = window.setTimeout(() => {
+      if (computerLockAck.current?.seq !== seq) return;
+      computerLockAck.current = null;
+      resolveAck(false);
+    }, 2500);
+    computerLockAck.current = { nonce: session.nonce, seq, locked, resolve: resolveAck, promise: acknowledged, timer };
+    computerLockRequested.current = { nonce: session.nonce, locked, seq };
+    const sent = await sendComputerCommand(session, { type: 'control_lock', locked, seq });
+    if (!sent) {
+      const current = computerLockAck.current;
+      if (current?.seq === seq) {
+        window.clearTimeout(current.timer);
+        computerLockAck.current = null;
+        current.resolve(false);
+      }
+      computerLockRequested.current = null;
+      return false;
+    }
+    return waitForAck ? acknowledged : true;
+  }, [sendComputerCommand]);
   const postComputerVisibility = useCallback((visible: boolean) => {
     const session = computerEmbedRef.current;
     if (!session || initializedEmbedNonce.current !== session.nonce) return;
-    if (session.native) {
-      void Promise.resolve(nativeWorkbenchBridge()?.sendHostWorkbenchCommand?.(session.nonce, { type: 'visibility', conversation_id: session.conversationID, visible })).catch(() => undefined);
-      return;
-    }
-    computerFrame.current?.contentWindow?.postMessage({
-      channel: 'morde.workbench.embed', version: 1, type: 'visibility', nonce: session.nonce, visible,
-    }, session.hostOrigin);
-  }, []);
+    void sendComputerCommand(session, { type: 'visibility', conversation_id: session.conversationID, visible });
+  }, [sendComputerCommand]);
   const taskCardButtons = useRef(new Map<string, HTMLButtonElement>());
   const [sideConversationsOpen, setSideConversationsOpen] = useState(false);
   const [conversationSearch, setConversationSearch] = useState('');
@@ -1500,31 +1558,44 @@ export function Assistant() {
   const cloudTasksAvailable = capabilities.isSuccess
     ? capabilities.data.supported_features.includes('cloud_tasks')
     : undefined;
-  const conversationAutoRoutingAvailable = capabilities.isSuccess
-    ? capabilities.data.supported_features.includes('conversation_auto_routing_v1')
-    : undefined;
-  const hostItems = hosts.data?.items ?? [];
+  const hostItems = useMemo(() => hosts.data?.items ?? [], [hosts.data?.items]);
   const preferredHostID = preferences.data?.default_host_id || (hostItems.length === 1 ? hostItems[0]?.id : '') || '';
   const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
-  const computerHostOptions: ComputerHostOption[] = [
+  const computerHostOptions = useMemo<ComputerHostOption[]>(() => [
     ...hostItems.map((host) => ({ id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: true, permissions: [], control_state: host.control_state })),
     ...(sharedHosts.data?.items ?? []).map((host) => ({
       id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: false, permissions: host.permissions,
     })),
-  ];
-  const selectedComputerHost = preferredHostID ? computerHostOptions.find((host) => host.id === preferredHostID) : undefined;
-  const selectedComputerTargets = selectedComputerHost ? hostEmbedTargetPlan(selectedComputerHost) : [];
-  const selectedComputerInitialTarget = hostEmbedInitialTarget(selectedComputerTargets);
+  ], [hostItems, sharedHosts.data?.items]);
+  const selectedComputerHost = useMemo(() => preferredHostID ? computerHostOptions.find((host) => host.id === preferredHostID) : undefined,
+    [computerHostOptions, preferredHostID]);
+  const selectedComputerTargets = useMemo(() => selectedComputerHost ? hostEmbedTargetPlan(selectedComputerHost) : [], [selectedComputerHost]);
+  const computerControl = useQuery({
+    queryKey: ['host-control', selectedComputerHost?.id ?? ''],
+    queryFn: () => portalApi.hostControl(selectedComputerHost!.id),
+    enabled: Boolean(selectedComputerHost),
+  });
+  const computerControlHeldByMe = computerControl.data?.control_state === 'user'
+    && computerControl.data.control_lease_active && computerControl.data.control_lease_held_by_me
+    && !computerControl.isFetching && !computerControl.isError;
   const computerEmbedFailed = computerEmbed?.status === 'error' && computerEmbed.conversationID === conversationID
     && computerEmbed.hostID === selectedComputerHost?.id;
-  const requestComputerEmbed = async (requestedTarget?: HostEmbedTicketRequest['target']) => {
-    const target = requestedTarget ?? selectedComputerInitialTarget;
-    if (!selectedComputerHost || !conversationID || !target || !selectedComputerTargets.includes(target) || computerConnecting) {
-      if (!conversationID) setComputerPanelError('先发送一条消息创建当前旁聊，再连接云端电脑。');
-      else if (!selectedComputerHost) setComputerPanelError('请先在云端电脑设置中配置默认电脑。');
-      else if (!target || !selectedComputerTargets.includes(target)) setComputerPanelError('当前账号没有此电脑的可用工作台权限。');
-      return;
+  const computerEmbedReady = computerEmbed?.status === 'ready';
+  const requestComputerEmbed = useCallback(async (requestedTarget?: HostEmbedTicketRequest['target']) => {
+    const target = requestedTarget ?? 'browser';
+    if (!conversationID) { setComputerPanelError('先发送一条消息创建当前旁聊，再连接云端电脑。'); return; }
+    if (!selectedComputerHost) { setComputerPanelError('请先在云端电脑设置中配置默认电脑。'); return; }
+    if (selectedComputerHost.state !== 'running') { setComputerPanelError('此电脑当前未运行，启动后才能连接。'); return; }
+    if (!selectedComputerTargets.includes(target)) { setComputerPanelError('当前账号没有此电脑的可用工作台权限。'); return; }
+    if (computerConnecting) return;
+    if (computerLockAck.current) {
+      window.clearTimeout(computerLockAck.current.timer);
+      computerLockAck.current.resolve(false);
+      computerLockAck.current = null;
     }
+    computerCommandSequences.current = { selection: 0, lock: 0 };
+    computerLockRequested.current = null;
+    computerControlReport.current = '';
     const generation = ++computerRequestGeneration.current;
     setComputerConnecting(true);
     setComputerPanelError('');
@@ -1548,7 +1619,9 @@ export function Assistant() {
           throw new Error('桌面客户端返回了无效的工作台状态。');
         }
         setComputerEmbed({ conversationID, hostID: selectedComputerHost.id, hostOrigin: opened.hostOrigin, nonce: opened.nonce,
-          targets: opened.targets as HostEmbedTicket['targets'], native: true, status: 'loading' });
+          targets: opened.targets as HostEmbedTicket['targets'], native: true, status: 'loading', remoteDesktop: 'connecting',
+          activeTarget: target === 'workspace' ? 'files' : target as ComputerEmbedSession['activeTarget'],
+          controlLocked: true, controlVersion: null, selectionSeq: null, lockSeq: null });
         return;
       }
       const issued = await portalApi.issueHostEmbedTicket(selectedComputerHost.id, {
@@ -1568,14 +1641,123 @@ export function Assistant() {
       setComputerEmbed({
         conversationID, hostID: selectedComputerHost.id, hostOrigin: hostURL.origin,
         exchangeURL: exchangeURL.toString(), nonce: issued.embed_nonce, ticket: issued.ticket,
-        targets: issued.targets, status: 'submitting', native: false,
+        targets: issued.targets, status: 'submitting', native: false, remoteDesktop: 'connecting',
+        activeTarget: target === 'workspace' ? 'files' : target as ComputerEmbedSession['activeTarget'],
+        controlLocked: true, controlVersion: null, selectionSeq: null, lockSeq: null,
       });
     } catch (error) {
-      if (generation === computerRequestGeneration.current) notify(errorDetails(error).message || '连接云端电脑失败，请重试。', 'error');
+      if (generation === computerRequestGeneration.current) {
+        setComputerEmbed({ conversationID, hostID: selectedComputerHost.id, hostOrigin: selectedComputerHost.url,
+          nonce: `failed-${generation}`, targets: selectedComputerTargets, status: 'error', remoteDesktop: 'connecting',
+          activeTarget: null, controlLocked: true, controlVersion: null, selectionSeq: null, lockSeq: null,
+          error: errorDetails(error).message || '连接云端电脑失败。' });
+      }
     } finally {
       if (generation === computerRequestGeneration.current) setComputerConnecting(false);
     }
-  };
+  }, [computerConnecting, conversationID, selectedComputerHost, selectedComputerTargets]);
+  const applyComputerWorkbenchState = useCallback((nonce: string, message: Record<string, unknown>) => {
+    const current = computerEmbedRef.current;
+    if (!current || current.nonce !== nonce) return;
+    if (typeof message.control_state === 'string' && typeof message.control_lease_active === 'boolean' &&
+      typeof message.control_lease_held_by_me === 'boolean' &&
+      (typeof message.control_version === 'number' || message.control_version === null)) {
+      const signature = [nonce, message.control_state, message.control_version, message.control_lease_active,
+        message.control_lease_held_by_me, message.control_lease_expires_at].join(':');
+      if (computerControlReport.current !== signature) {
+        computerControlReport.current = signature;
+        void client.invalidateQueries({ queryKey: ['host-control', current.hostID] });
+      }
+    }
+    const remoteDesktop = ['connecting', 'connected', 'disconnected', 'failed'].includes(String(message.remote_desktop))
+      ? message.remote_desktop as ComputerEmbedSession['remoteDesktop'] : current.remoteDesktop;
+    const incomingSelectionSeq = Number.isSafeInteger(message.selection_seq) && Number(message.selection_seq) >= 0
+      ? Number(message.selection_seq) : null;
+    const incomingLockSeq = Number.isSafeInteger(message.lock_seq) && Number(message.lock_seq) >= 0
+      ? Number(message.lock_seq) : null;
+    const selectionIsCurrent = incomingSelectionSeq !== null &&
+      (current.selectionSeq === null || incomingSelectionSeq >= current.selectionSeq);
+    const lockIsCurrent = incomingLockSeq !== null &&
+      (current.lockSeq === null || incomingLockSeq >= current.lockSeq);
+    const activeTarget = selectionIsCurrent && ['browser', 'terminal', 'files', 'vscode'].includes(String(message.active_target))
+      ? message.active_target as ComputerEmbedSession['activeTarget'] : current.activeTarget;
+    const controlLocked = lockIsCurrent && typeof message.control_locked === 'boolean'
+      ? message.control_locked : current.controlLocked;
+    const controlVersion = typeof message.control_version === 'number' && Number.isSafeInteger(message.control_version) && message.control_version >= 0
+      ? message.control_version : message.control_version === null ? null : current.controlVersion;
+    const next: ComputerEmbedSession = {
+      ...current,
+      status: message.workbench_ready === true ? 'ready' : current.status,
+      remoteDesktop, activeTarget, controlLocked, controlVersion,
+      selectionSeq: selectionIsCurrent ? incomingSelectionSeq : current.selectionSeq,
+      lockSeq: lockIsCurrent ? incomingLockSeq : current.lockSeq,
+    };
+    computerEmbedRef.current = next;
+    setComputerEmbed(next);
+    if (message.control_state === 'user' && message.control_lease_active === true && message.control_lease_held_by_me === true) {
+      setComputerControlExpanded(true);
+    } else if (message.control_state === 'ai' && message.control_lease_active === false && message.control_lease_held_by_me === false) {
+      setComputerControlExpanded(false);
+    }
+    const pending = computerLockAck.current;
+    if (pending && pending.nonce === nonce && incomingLockSeq === pending.seq && message.control_locked === pending.locked) {
+      window.clearTimeout(pending.timer);
+      computerLockAck.current = null;
+      computerLockRequested.current = { nonce, locked: pending.locked, seq: pending.seq };
+      pending.resolve(true);
+    }
+  }, [client]);
+  const selectComputerTarget = useCallback(async (requested: 'browser' | 'terminal' | 'files' | 'vscode') => {
+    const session = computerEmbedRef.current;
+    if (!conversationID || !selectedComputerHost || selectedComputerHost.state !== 'running') return;
+    if (!computerControlHeldByMe || session?.controlLocked !== false) return;
+    const target: HostEmbedTicketRequest['target'] = requested === 'files' && !selectedComputerTargets.includes('files') && selectedComputerTargets.includes('workspace')
+      ? 'workspace' : requested;
+    if (!selectedComputerTargets.includes(target)) {
+      setComputerPanelError('当前账号没有此电脑的可用工作台权限。');
+      return;
+    }
+    setComputerPanelError('');
+    if (!session || session.conversationID !== conversationID || session.hostID !== selectedComputerHost.id || session.status === 'error') {
+      await requestComputerEmbed(target);
+      return;
+    }
+    if (session.status !== 'ready' || initializedEmbedNonce.current !== session.nonce) return;
+    const seq = ++computerCommandSequences.current.selection;
+    const sent = await sendComputerCommand(session, { type: 'select_target', target: requested, seq });
+    if (!sent) setComputerPanelError('工作台尚未确认功能切换，请重试。');
+  }, [computerControlHeldByMe, conversationID, requestComputerEmbed, selectedComputerHost, selectedComputerTargets, sendComputerCommand]);
+  const prepareComputerControlAction = useCallback(async () => {
+    const ready = await setComputerControlLock(true, true);
+    if (!ready) notify('工作台尚未确认已锁定输入，控制权请求没有发送。', 'error');
+    return ready;
+  }, [notify, setComputerControlLock]);
+  useEffect(() => {
+    if (!taskPanelOpen || taskPanelTab !== 'computer') {
+      computerAutoConnectKey.current = '';
+      return;
+    }
+    if (!conversationID || !selectedComputerHost) return;
+    const key = `${conversationID}:${selectedComputerHost.id}`;
+    const existing = computerEmbed?.conversationID === conversationID && computerEmbed.hostID === selectedComputerHost.id;
+    if (existing && computerEmbed?.status !== 'error') return;
+    if (computerAutoConnectKey.current === key) return;
+    if (computerConnecting) return;
+    if (selectedComputerHost.state !== 'running' || !selectedComputerTargets.includes('browser')) return;
+    const timer = window.setTimeout(() => {
+      computerAutoConnectKey.current = key;
+      void requestComputerEmbed('browser');
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [computerConnecting, computerEmbed?.conversationID, computerEmbed?.hostID, computerEmbed?.status, conversationID, requestComputerEmbed,
+    selectedComputerHost, selectedComputerTargets, taskPanelOpen, taskPanelTab]);
+  useEffect(() => {
+    if (!computerEmbedReady || !computerControl.data) return;
+    const status = computerControl.data;
+    const locked = !(status.control_state === 'user' && status.control_lease_active && status.control_lease_held_by_me
+      && !computerControl.isFetching && !computerControl.isError);
+    void setComputerControlLock(locked);
+  }, [computerControl.data, computerControl.isError, computerControl.isFetching, computerEmbed?.nonce, computerEmbedReady, setComputerControlLock]);
   async function openTaskObservation(task: Task, host: Host) {
     if (taskObservationRequest) return;
     const popup = window.open('about:blank', 'morde-task-observation');
@@ -2583,15 +2765,12 @@ export function Assistant() {
         const message = value as Record<string, unknown>;
         if (message.nonce !== nativeSession.nonce) return;
         if (message.type === 'error' && typeof message.error === 'string') {
-          setComputerEmbed((current) => current?.nonce === nativeSession.nonce ? { ...current, status: 'error', error: message.error as string } : current);
+          void Promise.resolve(bridge.closeHostWorkbenchEmbed?.(nativeSession.nonce)).catch(() => undefined);
+          setComputerEmbed((current) => current?.nonce === nativeSession.nonce
+            ? { ...current, native: false, status: 'error', error: message.error as string } : current);
         } else if (message.type === 'state' && message.conversation_id === nativeSession.conversationID &&
-          message.host_id === nativeSession.hostID && message.workbench_ready === true) {
-          if (message.control_state === 'user' && message.control_lease_active === true && message.control_lease_held_by_me === true) {
-            setComputerControlExpanded(true);
-          } else if (message.control_state === 'ai' && message.control_lease_active === false && message.control_lease_held_by_me === false) {
-            setComputerControlExpanded(false);
-          }
-          setComputerEmbed((current) => current?.nonce === nativeSession.nonce ? { ...current, status: 'ready' } : current);
+          message.host_id === nativeSession.hostID && typeof message.workbench_ready === 'boolean') {
+          applyComputerWorkbenchState(nativeSession.nonce, message);
         }
       });
       if (initializedEmbedNonce.current === nativeSession.nonce) {
@@ -2604,7 +2783,7 @@ export function Assistant() {
     const send = (type: 'init' | 'visibility', visible: boolean) => {
       computerFrame.current?.contentWindow?.postMessage({
         channel: 'morde.workbench.embed', version: 1, type, nonce: session.nonce,
-        ...(type === 'init' ? { conversation_id: session.conversationID } : {}), visible,
+        conversation_id: session.conversationID, visible,
       }, session.hostOrigin);
     };
     const onMessage = (event: MessageEvent<unknown>) => {
@@ -2615,20 +2794,18 @@ export function Assistant() {
       if (message.type === 'ready') {
         initializedEmbedNonce.current = session.nonce;
         send('init', taskPanelOpen && taskPanelTab === 'computer');
+      } else if (message.type === 'error' && typeof message.error === 'string') {
+        setComputerEmbed((current) => current?.nonce === session.nonce
+          ? { ...current, status: 'error', error: message.error as string } : current);
       } else if (message.type === 'state' && message.conversation_id === session.conversationID &&
-        message.host_id === session.hostID && message.workbench_ready === true) {
-        if (message.control_state === 'user' && message.control_lease_active === true && message.control_lease_held_by_me === true) {
-          setComputerControlExpanded(true);
-        } else if (message.control_state === 'ai' && message.control_lease_active === false && message.control_lease_held_by_me === false) {
-          setComputerControlExpanded(false);
-        }
-        setComputerEmbed((current) => current?.nonce === session.nonce ? { ...current, status: 'ready' } : current);
+        message.host_id === session.hostID && typeof message.workbench_ready === 'boolean') {
+        applyComputerWorkbenchState(session.nonce, message);
       }
     };
     window.addEventListener('message', onMessage);
     if (initializedEmbedNonce.current === session.nonce) send('visibility', taskPanelOpen && taskPanelTab === 'computer');
     return () => window.removeEventListener('message', onMessage);
-  }, [computerEmbed, taskPanelOpen, taskPanelTab]);
+  }, [applyComputerWorkbenchState, computerEmbed, taskPanelOpen, taskPanelTab]);
   const nativeEmbedNonce = computerEmbed?.native ? computerEmbed.nonce : null;
   const nativeEmbedConversationID = computerEmbed?.native ? computerEmbed.conversationID : null;
   useEffect(() => {
@@ -2682,8 +2859,11 @@ export function Assistant() {
   useEffect(() => {
     if (!computerEmbed || computerEmbed.status !== 'loading') return;
     const nonce = computerEmbed.nonce;
-    const timer = window.setTimeout(() => setComputerEmbed((current) => current?.nonce === nonce && current.status === 'loading'
-      ? { ...current, status: 'error', error: '工作台没有在预期时间内就绪，请重试或在独立窗口打开。' } : current), 30_000);
+    const timer = window.setTimeout(() => {
+      if (computerEmbed.native) void Promise.resolve(nativeWorkbenchBridge()?.closeHostWorkbenchEmbed?.(nonce)).catch(() => undefined);
+      setComputerEmbed((current) => current?.nonce === nonce && current.status === 'loading'
+        ? { ...current, native: false, status: 'error', error: '工作台连接超时，请关闭并重新打开云端电脑面板。' } : current);
+    }, 30_000);
     return () => window.clearTimeout(timer);
   }, [computerEmbed]);
   useEffect(() => {
@@ -3159,6 +3339,23 @@ export function Assistant() {
       event.preventDefault();
     }
   };
+  const computerSessionMatches = Boolean(computerEmbed && computerEmbed.conversationID === conversationID &&
+    computerEmbed.hostID === selectedComputerHost?.id);
+  const computerSession = computerSessionMatches ? computerEmbed : null;
+  const computerViewportMessage = computerEmbedFailed ? computerEmbed?.error || '无法连接云端电脑。'
+    : computerPanelError || (!conversationID ? '发送一条消息后连接当前会话的云端电脑。'
+      : preferences.isPending ? '正在读取云端电脑设置…'
+        : !selectedComputerHost ? preferredHostID && hosts.isPending ? '正在检查默认云端电脑…' : '尚未配置默认云端电脑。'
+          : selectedComputerHost.state !== 'running' ? `云端电脑当前${hostStateLabel[selectedComputerHost.state] || '不可用'}。`
+            : !selectedComputerTargets.includes('browser') ? '当前账号没有查看此电脑桌面的权限。'
+              : computerConnecting || !computerSession ? '正在连接云端电脑…'
+                : computerSession.status === 'error' ? computerSession.error || '工作台连接失败。'
+                  : !computerSession.native && computerSession.status !== 'ready' ? '正在加载云端电脑工作台…' : '');
+  const computerViewportConnectionError = Boolean(computerEmbedFailed || computerSession &&
+    computerSession.activeTarget === 'browser' && ['disconnected', 'failed'].includes(computerSession.remoteDesktop));
+  const computerWorkbenchReady = Boolean(computerSession?.status === 'ready');
+  const computerDesktopConnected = Boolean(computerWorkbenchReady && !computerConnecting && !computerViewportConnectionError &&
+    computerSession?.remoteDesktop === 'connected');
 
   return <section className="assistant-page">
     <div ref={assistantLayoutRef} style={{ '--pc-context-sidebar-width': `${contextSidebarWidth}px`,
@@ -3579,69 +3776,51 @@ export function Assistant() {
               </article>} />}
         </div>}
         <section className="task-panel-list task-panel-computer" aria-label="当前会话云端电脑" hidden={taskPanelTab !== 'computer'}>
-          {(!computerEmbed || computerEmbed.conversationID !== conversationID || computerEmbed.status === 'error') ? <div className="computer-panel-welcome">
-            <div className="computer-panel-toolbar">
-              <div className="computer-panel-availability" role="status" aria-live="polite">
-                <span className={`computer-panel-availability-dot${computerEmbedFailed ? ' is-error' : selectedComputerHost?.state === 'running' ? ' is-ready' : ''}`} aria-hidden="true" />
-                <strong>{computerEmbedFailed ? '工作台未就绪'
-                  : selectedComputerHost?.state === 'running' ? '云端电脑运行中'
-                  : !preferredHostID && preferences.isPending ? '正在读取设置…'
-                    : preferredHostID && hosts.isPending ? '正在检查云端电脑…'
-                      : preferredHostID && !selectedComputerHost ? '云端电脑暂不可用'
-                        : selectedComputerHost ? hostStateLabel[selectedComputerHost.state] || '暂不可用' : '未配置云端电脑'}</strong>
-                {selectedComputerHost && <small>{selectedComputerHost.name}</small>}
-                {!selectedComputerHost && <Link to="/hosts">设置默认电脑</Link>}
-              </div>
+          <div ref={computerFrameBounds} className={`computer-panel-frame${computerViewportConnectionError ? ' is-connection-error' : ''}`}
+            data-remote-desktop={computerSession?.remoteDesktop ?? 'connecting'}>
+            {computerSession && !computerSession.native && computerSession.status !== 'error' &&
+              <iframe key={computerSession.nonce} ref={computerFrame} name={`morde-cloud-${computerSession.nonce}`} title="当前会话云端电脑工作台"
+                src="about:blank" allow="fullscreen" onError={() => setComputerEmbed((current) => current?.nonce === computerSession.nonce
+                  ? { ...current, status: 'error', error: '工作台页面加载失败。' } : current)} />}
+            {computerViewportMessage && <div className={`computer-panel-message${computerViewportConnectionError ? ' is-error' : ''}`}
+              role={computerViewportConnectionError ? 'alert' : 'status'} aria-live="polite">
+              {computerConnecting && <span className="computer-panel-spinner" aria-hidden="true" />}
+              <span>{computerViewportMessage}</span>
+              {computerViewportConnectionError && <button type="button" className="button button-primary computer-panel-retry"
+                onClick={() => void requestComputerEmbed('browser')}>重试连接</button>}
+            </div>}
+          </div>
+          {computerDesktopConnected && <div className="computer-panel-dock">
+            <div className="computer-panel-actions" role="group" aria-label="云端电脑功能">
+              {computerQuickActions.map((action) => {
+                const ticketTarget = action.target === 'files' && !selectedComputerTargets.includes('files') && selectedComputerTargets.includes('workspace')
+                  ? 'workspace' : action.target;
+                const allowed = selectedComputerTargets.includes(ticketTarget);
+                const disabled = !conversationID || !selectedComputerHost || selectedComputerHost.state !== 'running' || !allowed ||
+                  !computerControlHeldByMe || !computerWorkbenchReady || computerSession?.controlLocked !== false || computerConnecting;
+                const reason = !conversationID ? '发送一条消息后连接当前会话'
+                  : !selectedComputerHost ? '尚未配置默认云端电脑'
+                    : selectedComputerHost.state !== 'running' ? '云端电脑当前不可用'
+                      : !allowed ? '此功能未获授权'
+                        : !computerControlHeldByMe ? '接管电脑后可使用'
+                          : !computerWorkbenchReady ? '工作台尚未就绪'
+                            : computerSession?.controlLocked !== false ? '工作台输入仍处于锁定状态' : action.label;
+                const selected = computerSession?.activeTarget === action.target || action.target === 'files' && computerSession?.activeTarget === 'files';
+                return <button key={action.icon} type="button" className={`computer-panel-action computer-panel-action-${action.icon}${selected ? ' is-active' : ''}`}
+                  aria-label={action.label} aria-pressed={selected} title={reason} disabled={disabled}
+                  onClick={() => void selectComputerTarget(action.target)}>
+                  <ComputerActionIcon icon={action.icon} /><span>{action.label}</span>
+                </button>;
+              })}
             </div>
-            {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
-              <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
-            {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
-            {!conversationID && <p className="muted">发送第一条消息后，才能把电脑连接到该会话。</p>}
-            {selectedComputerHost && selectedComputerHost.state !== 'running' && <p className="muted">此电脑当前未运行，启动后才能连接。</p>}
-            {selectedComputerHost && !selectedComputerTargets.length && <p className="muted">此电脑没有可嵌入的授权功能。</p>}
-            <div className="computer-panel-preview" aria-label="云端电脑快捷入口">
-              <strong className="computer-panel-brand">MORDE CLOUD</strong>
-              <div className="computer-panel-actions" role="group" aria-label="打开云端电脑功能">
-                {computerQuickActions.map((action) => {
-                  const target = action.target === 'files' && !selectedComputerTargets.includes('files') && selectedComputerTargets.includes('workspace')
-                    ? 'workspace' : action.target;
-                  const allowed = selectedComputerTargets.includes(target);
-                  const disabled = computerConnecting || !conversationID || !selectedComputerHost || selectedComputerHost.state !== 'running' || !allowed;
-                  const reason = !conversationID ? '发送第一条消息后才能连接此会话'
-                    : !selectedComputerHost ? '请先设置默认云端电脑'
-                      : selectedComputerHost.state !== 'running' ? '云端电脑运行后才能连接'
-                        : !allowed ? '此电脑未授权此功能' : undefined;
-                  return <button key={action.icon} type="button" className={`computer-panel-action computer-panel-action-${action.icon}`}
-                    aria-label={`打开云端电脑${action.label}`} title={reason ?? action.label} disabled={disabled}
-                    onClick={() => void requestComputerEmbed(target)}>
-                    <ComputerActionIcon icon={action.icon} />
-                  </button>;
-                })}
-              </div>
-            </div>
-            {selectedComputerHost && <HostControlPanel host={selectedComputerHost}
+            {selectedComputerHost ? <HostControlPanel host={selectedComputerHost}
               canControl={selectedComputerHost.owned || selectedComputerHost.permissions.includes('desktop:control')}
-              canReleaseAnyLease={selectedComputerHost.owned} compact />}
-          </div> : <>
-            <div className="computer-panel-toolbar">
-              <div className="computer-panel-availability" role="status" aria-live="polite">
-                <span className={`computer-panel-availability-dot${selectedComputerHost?.state === 'running' ? ' is-ready' : ''}`} aria-hidden="true" />
-                <strong>{selectedComputerHost?.state === 'running' ? '已连接'
-                  : selectedComputerHost ? hostStateLabel[selectedComputerHost.state] || '暂不可用' : '云端电脑暂不可用'}</strong>
-                {selectedComputerHost && <small>{selectedComputerHost.name}</small>}
-              </div>
-            </div>
-            {sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) && <FloatingError className="error-inline" role="alert">共享电脑列表暂不可用。
-              <button type="button" className="button button-small button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
-            {computerPanelError && <FloatingError role="alert">{computerPanelError}</FloatingError>}
-            {computerEmbed?.conversationID === conversationID && <>
-              <div ref={computerFrameBounds} className="computer-panel-frame">
-                {!computerEmbed.native && <iframe key={computerEmbed.nonce} ref={computerFrame} name={`morde-cloud-${computerEmbed.nonce}`} title="当前会话云端电脑工作台"
-                  src="about:blank" allow="fullscreen" onError={() => setComputerEmbed((current) => current?.nonce === computerEmbed.nonce
-                    ? { ...current, status: 'error', error: '工作台页面加载失败，请重试。' } : current)} />}
-              </div>
-            </>}
-          </>}
+              canReleaseAnyLease={selectedComputerHost.owned} compact actionReady={computerWorkbenchReady}
+              onBeforeAction={prepareComputerControlAction} /> : <section className="host-control host-control-compact computer-panel-control"
+                aria-label="云端电脑控制"><button type="button" className="button button-primary" disabled>
+                {preferredHostID && hosts.isPending ? '正在确认…' : '未配置电脑'}
+              </button></section>}
+          </div>}
         </section>
       </aside>}
     </div>

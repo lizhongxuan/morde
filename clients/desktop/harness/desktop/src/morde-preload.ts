@@ -9,6 +9,10 @@ const listen = (channel: string, listener: (value: unknown) => void) => {
 };
 
 const mode = process.argv.find((argument) => argument.startsWith("--morde-preload-mode="))?.slice("--morde-preload-mode=".length);
+type HostWorkbenchCommand =
+  | { type: "init" | "visibility"; conversation_id: string; visible: boolean }
+  | { type: "select_target"; target: "browser" | "terminal" | "files" | "vscode"; seq: number }
+  | { type: "control_lock"; locked: boolean; seq: number };
 
 if (mode === "codex") {
   contextBridge.exposeInMainWorld("morde", {
@@ -28,7 +32,7 @@ if (mode === "codex") {
     projectUploadTargets: () => call("morde:portal-project-upload-targets"),
     openHostWorkbenchEmbed: (request: { hostID: string; conversationID: string; initialTarget: string; targets: string[]; shared: boolean }) => call("morde:portal-workbench-open", request),
     setHostWorkbenchBounds: (nonce: string, bounds: { x: number; y: number; width: number; height: number }) => call("morde:portal-workbench-bounds", nonce, bounds),
-    sendHostWorkbenchCommand: (nonce: string, command: { type: "init" | "visibility"; conversation_id: string; visible: boolean }) => call("morde:portal-workbench-command", nonce, command),
+    sendHostWorkbenchCommand: (nonce: string, command: HostWorkbenchCommand) => call("morde:portal-workbench-command", nonce, command),
     closeHostWorkbenchEmbed: (nonce: string) => call("morde:portal-workbench-close", nonce),
     onHostWorkbenchMessage: (listener: (value: unknown) => void) => listen("morde:portal-workbench-message", listener),
     selectProjectDirectory: (hostId: string, workspaceId: string) => call("morde:portal-project-select-directory", hostId, workspaceId),

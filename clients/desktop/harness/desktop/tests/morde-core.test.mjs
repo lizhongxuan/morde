@@ -72,6 +72,16 @@ test('account login sends one password request and receives separate Client, Syn
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('Morde API uses the injected network stack for remote calls', async () => {
+  const calls = [];
+  const api = new MordeAPI(() => credentials, () => '', async (url, options) => {
+    calls.push({ url, options });
+    return json({ default_host_id: 'h1234567' });
+  });
+  assert.deepEqual(await api.userPreferences({ credential: 'web-secret', expiresAt: future }), { defaultHostID: 'h1234567' });
+  assert.equal(calls[0].url, 'https://portal.example/api/me/preferences');
+});
+
 test('project sync reads the account default computer through its short-lived Portal session', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayControl, type GatewayHost } from '../api/gateway';
@@ -41,10 +41,14 @@ function mockWorkbenchApi() {
 }
 
 function showEmbeddedWorkbench(nonce: string) {
+  sendEmbeddedMessage(nonce, { type: 'init', conversation_id: 'c1234567', visible: true });
+}
+
+function sendEmbeddedMessage(nonce: string, message: Record<string, unknown>) {
   act(() => window.dispatchEvent(new MessageEvent('message', {
     origin: 'https://portal.example.test',
     source: window,
-    data: { channel: 'morde.workbench.embed', version: 1, type: 'init', nonce, conversation_id: 'c1234567', visible: true },
+    data: { channel: 'morde.workbench.embed', version: 1, nonce, ...message },
   })));
 }
 
@@ -165,7 +169,95 @@ describe('Workbench MVP navigation', () => {
     await waitFor(() => expect(gatewayApi.control).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(sendState).toHaveBeenCalledWith(expect.objectContaining({
       type: 'state', nonce, conversation_id: 'c1234567', host_id: host.id, workbench_ready: true,
+      active_target: 'browser', control_version: control.control_version, control_locked: true,
+      selection_seq: null, lock_seq: null,
     })));
+  });
+
+  it('requires a current user lease to switch the four embedded targets and preserves both file views', async () => {
+    const nonce = 'g'.repeat(32);
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${nonce}&tab=browser`);
+    const ready = vi.fn().mockResolvedValue({ ready: true });
+    const sendState = vi.fn().mockResolvedValue({ accepted: true });
+    const terminal = vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({ state: 'ready', url: '/terminal' });
+    let receive: ((value: unknown) => void) | undefined;
+    Object.defineProperty(window, 'morde', { configurable: true, value: {
+      hostWorkbenchReady: ready,
+      sendHostWorkbenchState: sendState,
+      onHostWorkbenchMessage: (listener: (value: unknown) => void) => { receive = listener; return () => { receive = undefined; }; },
+    } });
+    render(<Workbench />);
+    await waitFor(() => expect(ready).toHaveBeenCalledWith(nonce));
+    const send = (message: Record<string, unknown>) => act(() => receive?.({
+      channel: 'morde.workbench.embed', version: 1, nonce, ...message,
+    }));
+    const latestState = () => sendState.mock.calls.map(([value]) => value as Record<string, unknown>)
+      .filter((value) => value.type === 'state').at(-1);
+
+    send({ type: 'init', conversation_id: 'c1234567', visible: true });
+    await waitFor(() => expect(gatewayApi.control).toHaveBeenCalled());
+    const callsBeforeSelection = vi.mocked(gatewayApi.control).mock.calls.length;
+    vi.mocked(gatewayApi.control).mockResolvedValue(control);
+    send({ type: 'select_target', target: 'terminal', seq: 1 });
+    await waitFor(() => expect(gatewayApi.control).toHaveBeenCalledTimes(callsBeforeSelection + 1));
+    expect(screen.queryByTitle('主机终端')).not.toBeInTheDocument();
+    await waitFor(() => expect(latestState()).toMatchObject({ active_target: 'browser', selection_seq: null }));
+
+    send({ type: 'control_lock', locked: false, seq: 1 });
+    await waitFor(() => expect(latestState()).toMatchObject({ control_locked: true, lock_seq: 1 }));
+    vi.mocked(gatewayApi.control).mockResolvedValue(userControl);
+    send({ type: 'control_lock', locked: false, seq: 2 });
+    await waitFor(() => expect(latestState()).toMatchObject({ control_locked: false, control_version: userControl.control_version, lock_seq: 2 }));
+
+    send({ type: 'select_target', target: 'browser', seq: 2 });
+    await waitFor(() => expect(latestState()).toMatchObject({ active_target: 'browser', selection_seq: 2 }));
+    send({ type: 'select_target', target: 'terminal', seq: 3 });
+    expect(await screen.findByTitle('主机终端')).toBeVisible();
+    expect(terminal).toHaveBeenCalledOnce();
+    await waitFor(() => expect(latestState()).toMatchObject({ active_target: 'terminal', selection_seq: 3 }));
+
+    send({ type: 'select_target', target: 'files', seq: 4 });
+    const fileView = await screen.findByRole('group', { name: '文件视图' });
+    expect(fileView).toBeVisible();
+    expect(within(fileView).getByRole('button', { name: '主机文件' })).toHaveAttribute('aria-pressed', 'true');
+    await waitFor(() => expect(latestState()).toMatchObject({ active_target: 'files', selection_seq: 4 }));
+    fireEvent.click(within(fileView).getByRole('button', { name: 'Workspace' }));
+    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
+    const workspaceView = screen.getByRole('group', { name: '文件视图' });
+    expect(within(workspaceView).getByRole('button', { name: 'Workspace' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(within(workspaceView).getByRole('button', { name: '主机文件' }));
+    await waitFor(() => expect(within(screen.getByRole('group', { name: '文件视图' }))
+      .getByRole('button', { name: '主机文件' })).toHaveAttribute('aria-pressed', 'true'));
+
+    send({ type: 'select_target', target: 'vscode', seq: 5 });
+    expect(await screen.findByTitle('VSCode')).toBeVisible();
+    await waitFor(() => expect(latestState()).toMatchObject({ active_target: 'vscode', selection_seq: 5 }));
+    send({ type: 'control_lock', locked: true, seq: 3 });
+    await waitFor(() => expect(latestState()).toMatchObject({ control_locked: true, lock_seq: 3 }));
+    expect(screen.queryByTitle('VSCode')).not.toBeInTheDocument();
+  });
+
+  it('shows an embedded connection spinner, then a black disconnected viewport without a retry button', async () => {
+    const nonce = 'd'.repeat(32);
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
+    window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${nonce}&tab=browser`);
+    const { container } = render(<Workbench />);
+    showEmbeddedWorkbench(nonce);
+    const frame = await screen.findByTitle('远程桌面') as HTMLIFrameElement;
+    expect(await screen.findByText('正在连接远程桌面…')).toBeVisible();
+    expect(container.querySelector('.connection-spinner')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新连接' })).not.toBeInTheDocument();
+
+    const remoteRoot = document.createElement('html');
+    Object.defineProperty(frame, 'contentDocument', { configurable: true, value: { documentElement: remoteRoot } });
+    fireEvent.load(frame);
+    act(() => remoteRoot.classList.add('noVNC_connected'));
+    await waitFor(() => expect(container.querySelector('.tab-panel-browser')).toHaveAttribute('data-connection-state', 'connected'));
+    act(() => remoteRoot.classList.remove('noVNC_connected'));
+    expect(await screen.findByText('远程桌面连接已断开。')).toBeVisible();
+    expect(container.querySelector('.tab-panel-browser')).toHaveAttribute('data-connection-state', 'disconnected');
+    expect(screen.getByRole('alert')).toHaveTextContent('远程桌面连接已断开。');
+    expect(screen.queryByRole('button', { name: '重新连接' })).not.toBeInTheDocument();
   });
 
   it('hides embedded navigation and falls back to the first authorized target', async () => {
@@ -185,9 +277,13 @@ describe('Workbench MVP navigation', () => {
   it('opens the requested Workspace directly without embedded navigation', async () => {
     Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://portal.example.test/assistant' });
     vi.mocked(gatewayApi.host).mockResolvedValue({ ...host, embed_targets: ['browser', 'workspace', 'files'] });
+    vi.mocked(gatewayApi.control).mockResolvedValue(userControl);
     window.history.replaceState({}, '', `/__ch/wb/?embed=1&embed_nonce=${'w'.repeat(32)}&tab=workspace`);
-    render(<Workbench />);
+    const { container } = render(<Workbench />);
     showEmbeddedWorkbench('w'.repeat(32));
+    await waitFor(() => expect(gatewayApi.host).toHaveBeenCalledOnce());
+    await waitFor(() => expect(container.querySelector('.tab-panel-workspace')).not.toBeNull());
+    sendEmbeddedMessage('w'.repeat(32), { type: 'control_lock', locked: false, seq: 1 });
 
     expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
     expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
@@ -203,9 +299,9 @@ describe('Workbench MVP navigation', () => {
     showEmbeddedWorkbench('s'.repeat(32));
 
     expect(screen.queryByRole('navigation', { name: '工作台功能' })).not.toBeInTheDocument();
-    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
+    expect(await screen.findByText('此会话未授权访问云端电脑文件。')).toBeVisible();
     expect(gatewayApi.control).not.toHaveBeenCalled();
-    await waitFor(() => expect(gatewayApi.workspaces).toHaveBeenCalledOnce());
+    expect(gatewayApi.workspaces).not.toHaveBeenCalled();
   });
 
   it('keeps renewing the current user lease while the embedded panel is hidden', async () => {
@@ -230,6 +326,8 @@ describe('Workbench MVP navigation', () => {
     })));
     expect(new URL(remoteFrame!.src).searchParams.get('view_only')).toBe('true');
     await act(async () => { completeResume(userControl); await Promise.resolve(); await Promise.resolve(); });
+    sendEmbeddedMessage('h'.repeat(32), { type: 'control_lock', locked: false, seq: 1 });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect(new URL(remoteFrame!.src).searchParams.get('view_only')).toBe('false');
     act(() => window.dispatchEvent(new MessageEvent('message', {
       origin: 'https://portal.example.test', source: window,

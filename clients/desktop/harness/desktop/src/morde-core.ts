@@ -217,12 +217,13 @@ function meetsMinimumVersion(current: unknown, minimum: unknown): boolean {
 }
 
 export class MordeAPI {
-  constructor(private readonly credentials: () => Credentials | null, private readonly clientVersion: () => string = () => "") {}
+  constructor(private readonly credentials: () => Credentials | null, private readonly clientVersion: () => string = () => "",
+    private readonly fetcher: typeof fetch = (...args) => fetch(...args)) {}
 
   private async checkCapabilities(origin: string): Promise<{ serviceInstanceID: string; supportedFeatures: string[] }> {
     let response: Response;
     try {
-      response = await fetch(`${origin}/api/capabilities`, {
+      response = await this.fetcher(`${origin}/api/capabilities`, {
         headers: { accept: "application/json" }, cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
       });
     } catch { throw new Error("无法确认 Morde 服务版本，请检查网络和服务地址后重试。未发送账号信息。"); }
@@ -287,7 +288,7 @@ export class MordeAPI {
     const renewalInstallationID = renewal?.serviceInstanceID === serviceInstanceID ? renewal.installationID : undefined;
     let response: Response;
     try {
-      response = await fetch(`${origin}/api/auth/client-login`, {
+      response = await this.fetcher(`${origin}/api/auth/client-login`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json", "Idempotency-Key": attempt.idempotencyKey },
         body: (() => {
@@ -332,7 +333,7 @@ export class MordeAPI {
   private async request(path: string, method = "GET", body?: unknown, idempotencyKey?: string): Promise<unknown> {
     const auth = this.credentials();
     if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
-    const response = await fetch(`${auth.origin}${path}`, {
+    const response = await this.fetcher(`${auth.origin}${path}`, {
       method, headers: {
         authorization: `Bearer ${auth.clientCredential}`, accept: "application/json",
         ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -525,7 +526,7 @@ export class MordeAPI {
     if (!session || typeof session.credential !== "string" || !session.credential || credentialExpired(session.expiresAt)) {
       throw new Error("Portal session expired; retry the operation");
     }
-    const response = await fetch(`${auth.origin}${path}`, {
+    const response = await this.fetcher(`${auth.origin}${path}`, {
       method, headers: {
         cookie: `ch_portal=${session.credential}`, accept: "application/json",
         ...(requestOrigin ? { origin: requestOrigin } : {}),

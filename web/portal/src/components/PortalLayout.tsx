@@ -16,7 +16,6 @@ const primaryLinks: { to: string; label: string; icon: MordeIconName; end?: bool
 const settingLinks: { to: string; label: string; icon: MordeIconName }[] = [
   { to: '/connections', label: '模型与工具', icon: 'link' },
   { to: '/hosts', label: '云端电脑', icon: 'monitor' },
-  { to: '/apikeys', label: 'API Key', icon: 'key' },
   { to: '/settings', label: '账户', icon: 'user' },
 ];
 const settingsEntry = { to: '/connections', label: '设置', icon: 'settings' as const };
@@ -77,11 +76,10 @@ const personalSections: Array<[string, string, MordeIconName]> = [
 const connectionNavigationLinks: PageNavigationItem[] = [
   ...settingLinks.slice(0, 2),
   { label: '文件同步', icon: 'folder', to: '/hosts?sync=1', query: ['sync', '1'] },
-  ...settingLinks.slice(2, 3),
 ];
 const settingsNavigationLinks: PageNavigationItem[] = [
   ...connectionNavigationLinks,
-  ...settingLinks.slice(3),
+  ...settingLinks.slice(2),
   ...personalSections.map(([section, label, icon]) => ({ label, icon, to: `/personal?section=${section}`, query: ['section', section] as [string, string] })),
 ];
 

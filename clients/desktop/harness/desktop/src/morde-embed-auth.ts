@@ -6,7 +6,8 @@ export type ExchangedHostEmbedSession = {
 };
 
 export async function exchangeHostEmbedTicket(exchangeURLInput: string, expectedHostOrigin: string, portalOriginInput: string,
-  ticket: string, nonce: string, initialTarget: HostEmbedTarget, targets: HostEmbedTarget[]): Promise<ExchangedHostEmbedSession> {
+  ticket: string, nonce: string, initialTarget: HostEmbedTarget, targets: HostEmbedTarget[],
+  fetcher: typeof fetch = (...args) => fetch(...args)): Promise<ExchangedHostEmbedSession> {
   const exchangeURL = new URL(exchangeURLInput);
   const expectedHost = new URL(expectedHostOrigin);
   if (exchangeURL.origin !== expectedHost.origin || exchangeURL.pathname !== "/__ch/embed-auth" || exchangeURL.search || exchangeURL.hash ||
@@ -16,7 +17,7 @@ export async function exchangeHostEmbedTicket(exchangeURLInput: string, expected
   }
   let response: Response;
   try {
-    response = await fetch(exchangeURL, {
+    response = await fetcher(exchangeURL, {
       method: "POST", redirect: "manual", signal: AbortSignal.timeout(15_000),
       headers: { origin: portalOriginInput, accept: "text/html", "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ ticket, embed_nonce: nonce }),

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, Tray, WebContentsView, type MessageBoxOptions, type Session, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, safeStorage, session, shell, Tray, WebContentsView, type MessageBoxOptions, type Session, type WebContents } from "electron";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import { access, lstat, realpath } from "node:fs/promises";
@@ -16,6 +16,7 @@ app.setName("Morde");
 const userData = mordeUserDataDirectory(app.getPath("appData"), process.env.MORDE_TEST_USER_DATA);
 mkdirSync(userData, { recursive: true, mode: 0o700 });
 app.setPath("userData", userData);
+const systemFetch: typeof fetch = (input, init) => net.fetch(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, init);
 const zh = (app.getLocale() || "").toLowerCase().startsWith("zh");
 let mainWindow: BrowserWindow | null = null;
 let codexWindow: BrowserWindow | null = null;
@@ -134,6 +135,10 @@ type NativeWorkbenchEmbed = {
   attached: boolean;
   initialized: boolean;
   visible: boolean;
+  selectionCommandSeq: number;
+  lockCommandSeq: number;
+  selectionStateSeq: number;
+  lockStateSeq: number;
 };
 let nativeWorkbenchEmbed: NativeWorkbenchEmbed | null = null;
 let localPortalServer: LocalPortalServer | null = null;
@@ -155,7 +160,7 @@ const hostWindows = new Set<BrowserWindow>();
 const hostWorkbenchReturnHandlers = new Map<WebContents, () => boolean>();
 const guardedWebSessions = new WeakSet<Session>();
 const webLogoutWatchers = new WeakSet<Session>();
-const api = new MordeAPI(() => credentials, () => app.getVersion());
+const api = new MordeAPI(() => credentials, () => app.getVersion(), systemFetch);
 const codex = new MordeCodexRuntime(api, {
   load: () => {
     if (!activeProfile) throw new Error("Codex profile is unavailable");
@@ -1708,7 +1713,7 @@ async function readProjectHostApplication(auth: Credentials, mapping: ProjectMap
     const workspaceID = checkedId("workspace", mapping.workspaceId);
     if (!/^p[a-z0-9]{7}$/.test(sessionID)) return unknownProjectHostApplication();
     const validSessionID = sessionID;
-    const response = await fetch(`${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/${validSessionID}`, {
+    const response = await systemFetch(`${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/${validSessionID}`, {
       headers: { authorization: `Bearer ${auth.syncCredential}`, accept: "application/json" },
       cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
     });
@@ -2051,7 +2056,7 @@ async function ensureLocalPortalServer(serviceOrigin: string, hostFrameSource?: 
     ? join(process.resourcesPath, "portal")
     : resolve(__dirname, "../../../../../web/portal/dist"));
   const savedPort = readLocalPortalPort();
-  const server = await startLocalPortalServer(directory, serviceOrigin, hostFrameSource, savedPort ?? 0);
+  const server = await startLocalPortalServer(directory, serviceOrigin, hostFrameSource, savedPort ?? 0, systemFetch);
   if (savedPort === null) {
     try { savePrivate("portal-local-origin.json", JSON.stringify({ version: 1, port: Number(new URL(server.origin).port) })); }
     catch (error) { await server.close(); throw error; }
@@ -2290,7 +2295,7 @@ async function openNativeWorkbenchEmbed(input: unknown): Promise<{ hostID: strin
     throw new Error("Host authorization targets changed; refresh and reconnect");
   }
   const exchanged = await exchangeHostEmbedTicket(ticket.exchangeURL, host, auth.origin, ticket.ticket, ticket.embedNonce,
-    initialTarget as HostEmbedTarget, ticket.targets);
+    initialTarget as HostEmbedTarget, ticket.targets, systemFetch);
   if (credentials !== auth || !webView || !mainWindow || mainWindow.isDestroyed()) throw new Error("Morde authorization changed; reconnect the computer");
   const partition = session.fromPartition(`morde-workbench-${profileID(auth)}`);
   let content: WebContentsView | undefined;
@@ -2308,7 +2313,8 @@ async function openNativeWorkbenchEmbed(input: unknown): Promise<{ hostID: strin
     workbenchView.setBorderRadius(12);
     const nextEmbed: NativeWorkbenchEmbed = { auth, hostID, hostOrigin: host, conversationID, nonce: ticket.embedNonce,
       targets: ticket.targets, initialTarget: initialTarget as HostEmbedTarget, parent: webView.webContents, view: workbenchView,
-      partition, attached: false, initialized: false, visible: false };
+      partition, attached: false, initialized: false, visible: false, selectionCommandSeq: 0, lockCommandSeq: 0,
+      selectionStateSeq: 0, lockStateSeq: 0 };
     embed = nextEmbed;
     installDownloadAndClipboard(partition, auth.origin);
     mainWindow.contentView.addChildView(workbenchView);
@@ -2371,16 +2377,29 @@ function sendNativeWorkbenchCommand(nonce: unknown, value: unknown): { sent: boo
   if (typeof nonce !== "string" || !embed || nonce !== embed.nonce || credentials !== embed.auth ||
     !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Host Workbench command");
   const message = value as Record<string, unknown>;
+  if (embed.view.webContents.isDestroyed() || !trustedNativeWorkbenchPage(embed.view.webContents.getURL(), embed)) return { sent: false };
+  let forwarded: Record<string, unknown>;
   if (message.type === "init" && message.conversation_id === embed.conversationID && typeof message.visible === "boolean") {
     embed.initialized = true;
     embed.visible = message.visible;
+    forwarded = { type: message.type, conversation_id: embed.conversationID, visible: embed.visible };
   } else if (message.type === "visibility" && embed.initialized && typeof message.visible === "boolean") {
     embed.visible = message.visible;
+    forwarded = { type: message.type, conversation_id: embed.conversationID, visible: embed.visible };
+  } else if (message.type === "select_target" && embed.initialized &&
+    ["browser", "terminal", "files", "vscode"].includes(String(message.target)) &&
+    Number.isSafeInteger(message.seq) && message.seq === embed.selectionCommandSeq + 1 &&
+    (message.target === "files" ? embed.targets.includes("files") || embed.targets.includes("workspace")
+      : embed.targets.includes(message.target as HostEmbedTarget))) {
+    embed.selectionCommandSeq = message.seq as number;
+    forwarded = { type: message.type, target: message.target, seq: embed.selectionCommandSeq };
+  } else if (message.type === "control_lock" && embed.initialized && typeof message.locked === "boolean" &&
+    Number.isSafeInteger(message.seq) && message.seq === embed.lockCommandSeq + 1) {
+    embed.lockCommandSeq = message.seq as number;
+    forwarded = { type: message.type, locked: message.locked, seq: embed.lockCommandSeq };
   } else throw new Error("Invalid Host Workbench command");
-  if (embed.view.webContents.isDestroyed() || !trustedNativeWorkbenchPage(embed.view.webContents.getURL(), embed)) return { sent: false };
   embed.view.webContents.send("morde:host-workbench-message", {
-    channel: "morde.workbench.embed", version: 1, nonce: embed.nonce, type: message.type,
-    conversation_id: embed.conversationID, visible: embed.visible,
+    channel: "morde.workbench.embed", version: 1, nonce: embed.nonce, ...forwarded,
   });
   return { sent: true };
 }
@@ -2402,15 +2421,29 @@ function notifyNativeWorkbenchState(event: { sender: WebContents; senderFrame: {
   if (!embed || event.sender !== embed.view.webContents || event.senderFrame !== event.sender.mainFrame || credentials !== embed.auth ||
     !trustedNativeWorkbenchPage(event.sender.getURL(), embed) || !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Host Workbench sender");
   const message = value as Record<string, unknown>;
+  const activeTarget = message.active_target;
+  const stateTargets: HostEmbedTarget[] = ["browser", "terminal", "files", "vscode"];
+  const activeTargetAllowed = activeTarget === null || typeof activeTarget === "string" && stateTargets.includes(activeTarget as HostEmbedTarget) &&
+    (activeTarget === "files" ? embed.targets.includes("files") || embed.targets.includes("workspace") : embed.targets.includes(activeTarget as HostEmbedTarget));
+  const validSequence = (sequence: unknown, latestCommand: number, lastState: number) => sequence === null
+    ? lastState === 0
+    : Number.isSafeInteger(sequence) && (sequence as number) >= Math.max(1, lastState) && (sequence as number) <= latestCommand;
   if (message.nonce !== embed.nonce || message.type !== "state" || message.conversation_id !== embed.conversationID || message.host_id !== embed.hostID ||
     typeof message.workbench_ready !== "boolean" || !["connecting", "connected", "disconnected", "failed"].includes(String(message.remote_desktop)) ||
-    !["ai", "user", "unknown"].includes(String(message.control_state)) || typeof message.control_lease_active !== "boolean" ||
-    typeof message.control_lease_held_by_me !== "boolean") throw new Error("Invalid Host Workbench state");
+    !["ai", "taking_over", "user", "returning", "unknown"].includes(String(message.control_state)) || typeof message.control_lease_active !== "boolean" ||
+    typeof message.control_lease_held_by_me !== "boolean" || !activeTargetAllowed ||
+    !(message.control_version === null || Number.isSafeInteger(message.control_version) && (message.control_version as number) >= 0) ||
+    typeof message.control_locked !== "boolean" || !validSequence(message.selection_seq, embed.selectionCommandSeq, embed.selectionStateSeq) ||
+    !validSequence(message.lock_seq, embed.lockCommandSeq, embed.lockStateSeq)) throw new Error("Invalid Host Workbench state");
+  if (typeof message.selection_seq === "number") embed.selectionStateSeq = message.selection_seq;
+  if (typeof message.lock_seq === "number") embed.lockStateSeq = message.lock_seq;
   embed.parent.send("morde:portal-workbench-message", {
     type: "state", nonce: embed.nonce, conversation_id: embed.conversationID, host_id: embed.hostID,
     workbench_ready: message.workbench_ready, remote_desktop: message.remote_desktop,
     control_state: message.control_state, control_lease_active: message.control_lease_active,
     control_lease_held_by_me: message.control_lease_held_by_me,
+    active_target: activeTarget, control_version: message.control_version, control_locked: message.control_locked,
+    selection_seq: message.selection_seq, lock_seq: message.lock_seq,
   });
   return { accepted: true };
 }
@@ -2627,6 +2660,8 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
     content.webContents.on("did-navigate-in-page", (_event, value) => {
       const target = sameOriginURL(value, appOrigin);
       if (credentials !== auth) return;
+      const embed = nativeWorkbenchEmbed;
+      if (embed?.parent === content.webContents && target?.pathname !== "/assistant") void closeNativeWorkbenchEmbed(embed.nonce).catch(() => undefined);
       if (target?.pathname === "/login") restoreFromLogin(target);
       if (target?.pathname.startsWith("/admin")) { void shell.openExternal(new URL(`${target.pathname}${target.search}${target.hash}`, auth.origin).href); void content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined); }
     });
@@ -2694,7 +2729,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
   } catch (error) {
     try {
       rotateClientInstanceID(normalizedOrigin, normalizedName);
-      await new MordeAPI(() => result.credentials).logout();
+      await new MordeAPI(() => result.credentials, undefined, systemFetch).logout();
     } catch { clientLoginAttemptsError = true; }
     clearAuthorization();
     activeProfile = previousProfile;
@@ -2751,7 +2786,7 @@ async function logout(): Promise<string | null> {
     try { rmSync(settingsPath("installation.json"), { force: true }); }
     catch { addWarning("本机安装信息无法清理，请检查本机存储。"); }
 
-    const remoteRevoke = new MordeAPI(() => auth).logout();
+    const remoteRevoke = new MordeAPI(() => auth, undefined, systemFetch).logout();
     let syncStopConfirmed = false;
     try {
       const stopped = await syncStop;
@@ -3325,7 +3360,7 @@ function register(): void {
       if (credentials !== auth || activeProfile !== profileID(auth) || syncCheckpoint !== checkpoint) {
         throw new Error("账号或恢复点已变化；恢复点已保留");
       }
-      const response = await fetch(sessionID ? sessionURL() : `${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/recover`, {
+      const response = await systemFetch(sessionID ? sessionURL() : `${auth.origin}/api/workspaces/${workspaceID}/sync-sessions/recover`, {
         method: sessionID ? "GET" : "POST",
         headers: {
           authorization: `Bearer ${auth.syncCredential}`, accept: "application/json",
@@ -3391,7 +3426,7 @@ function register(): void {
       projectUploadInProgress || childMayStillRun(checkpoint)) throw new Error("账号、页面或恢复点状态已变化；恢复点已保留");
 
     if (!terminal(session)) {
-      const response = await fetch(`${sessionURL()}/cancel`, {
+      const response = await systemFetch(`${sessionURL()}/cancel`, {
         method: "POST",
         headers: { authorization: `Bearer ${auth.syncCredential}`, accept: "application/json", "Idempotency-Key": randomUUID() },
         cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),

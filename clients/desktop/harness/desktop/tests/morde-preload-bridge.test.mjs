@@ -56,9 +56,13 @@ test('Portal preload exposes project and restricted local recovery operations', 
   const embedRequest = { hostID: 'h1234567', conversationID: 'c1234567', initialTarget: 'browser', targets: ['browser'], shared: false };
   const bounds = { x: 10, y: 20, width: 640, height: 480 };
   const command = { type: 'visibility', conversation_id: 'c1234567', visible: true };
+  const selectTarget = { type: 'select_target', target: 'terminal', seq: 1 };
+  const controlLock = { type: 'control_lock', locked: true, seq: 1 };
   await bridge.exposed.value.openHostWorkbenchEmbed(embedRequest);
   await bridge.exposed.value.setHostWorkbenchBounds('nonce-1', bounds);
   await bridge.exposed.value.sendHostWorkbenchCommand('nonce-1', command);
+  await bridge.exposed.value.sendHostWorkbenchCommand('nonce-1', selectTarget);
+  await bridge.exposed.value.sendHostWorkbenchCommand('nonce-1', controlLock);
   await bridge.exposed.value.closeHostWorkbenchEmbed('nonce-1');
   assert.deepEqual(bridge.calls, [
     ['morde:portal-project-upload-targets'],
@@ -73,6 +77,8 @@ test('Portal preload exposes project and restricted local recovery operations', 
     ['morde:portal-workbench-open', embedRequest],
     ['morde:portal-workbench-bounds', 'nonce-1', bounds],
     ['morde:portal-workbench-command', 'nonce-1', command],
+    ['morde:portal-workbench-command', 'nonce-1', selectTarget],
+    ['morde:portal-workbench-command', 'nonce-1', controlLock],
     ['morde:portal-workbench-close', 'nonce-1'],
   ]);
 

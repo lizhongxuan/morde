@@ -36,7 +36,11 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
   const serviceOrigin = `http://127.0.0.1:${address.port}`;
   let portal;
   try {
-    portal = await startLocalPortalServer(root, serviceOrigin, 'https://*.hosts.example.test');
+    let proxyFetches = 0;
+    portal = await startLocalPortalServer(root, serviceOrigin, 'https://*.hosts.example.test', 0, (...args) => {
+      proxyFetches++;
+      return fetch(...args);
+    });
     const stablePort = Number(new URL(portal.origin).port);
     const page = await fetch(`${portal.origin}/assistant`);
     assert.equal(page.status, 200);
@@ -104,6 +108,7 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
     const rejected = await fetch(`${portal.origin}/api/test`, { method: 'POST', headers: { origin: 'https://attacker.example' }, body: '{}' });
     assert.equal(rejected.status, 403);
     assert.equal(upstreamRequests.length, beforeRejectedOrigin);
+    assert.equal(proxyFetches, 3);
     portal.setHostFrameSource('https://*.updated-hosts.example.test');
     assert.match((await fetch(`${portal.origin}/settings`)).headers.get('content-security-policy'), /updated-hosts\.example\.test/);
     await portal.close();

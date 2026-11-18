@@ -269,181 +269,92 @@ body { font-size: 13px; line-height: 1.55; -webkit-font-smoothing: antialiased; 
   .workbench-app.is-workspace-only .workbench-content { grid-column: 1; grid-row: 1; padding: 8px; border-radius: 0; background: var(--bg); }
 }
 
-.workbench-app.is-embedded { height: 100%; min-height: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); background: radial-gradient(ellipse at 78% -12%, #e3f2f0 0, transparent 38%), var(--bg); }
-.workbench-app.is-embedded .top-bar { grid-column: 1; grid-row: 1; min-height: 42px; padding: 6px 12px; flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; }
-.workbench-app.is-embedded .host-summary { flex: 1; flex-direction: row; align-items: center; gap: 8px; }
-.workbench-app.is-embedded .control-state { min-height: 27px; padding: 4px 8px; font-size: 11px; }
-.workbench-app.is-embedded .control-state-full,
-.workbench-app.is-embedded .host-renew-button { display: none; }
-.workbench-app.is-embedded .control-state-compact { display: inline; }
-.workbench-app.is-embedded .top-actions { display: flex; gap: 6px; }
-.workbench-app.is-embedded .top-actions .button { width: auto; min-height: 30px; padding: 5px 9px; font-size: 11px; }
-.workbench-app.is-embedded .workbench-tabs { position: absolute; z-index: 4; left: 50%; bottom: 12px; width: max-content; max-width: calc(100% - 24px); min-height: 0; padding: 5px; display: flex; flex-direction: row; align-items: center; gap: 5px; overflow: visible; transform: translateX(-50%); border: 1px solid rgb(255 255 255 / 55%); border-radius: 13px; background: rgb(230 243 244 / 88%); box-shadow: 0 4px 14px rgb(45 82 91 / 14%); backdrop-filter: blur(12px); }
-.workbench-app.is-embedded .primary-tabs { width: auto; display: flex; align-items: center; gap: 4px; }
-.workbench-app.is-embedded .tab-button { width: 36px; min-height: 36px; padding: 4px; display: grid; place-items: center; border-radius: 9px; }
-.workbench-app.is-embedded .tab-label-desktop,
-.workbench-app.is-embedded .tab-label-mobile { display: none; }
-.workbench-app.is-embedded .tab-icon { width: 23px; height: 23px; display: grid; place-items: center; color: #465d76; }
-.workbench-app.is-embedded .tab-icon svg { width: 21px; height: 21px; }
-.workbench-app.is-embedded .tab-button.is-active { background: #fff; box-shadow: 0 1px 4px rgb(35 55 80 / 16%); }
-.workbench-app.is-embedded .browser-actions { position: absolute; right: 0; bottom: calc(100% + 7px); width: max-content; max-width: min(640px, calc(100vw - 24px)); margin: 0; padding: 6px; display: flex; align-items: center; flex-direction: row; flex-wrap: wrap; gap: 5px; border: 1px solid var(--border); border-radius: 10px; background: rgb(255 255 255 / 94%); box-shadow: 0 5px 18px rgb(24 35 56 / 13%); }
-.workbench-app.is-embedded .browser-actions .button { width: auto; min-height: 28px; padding: 4px 7px; font-size: 10px; }
-.workbench-app.is-embedded .mobile-browser-action { display: inline-flex; }
-.workbench-app.is-embedded .browser-connection { font-size: 10px; }
-.workbench-app.is-embedded .workbench-content { grid-column: 1; grid-row: 2; min-width: 0; padding: 12px; }
-.workbench-app.is-embedded .tab-panel { border-radius: 18px; }
-.workbench-app.is-embedded .mobile-status-badge { display: none; }
-.workbench-app.is-embedded .mobile-context-menu { position: absolute; z-index: 5; inset: auto auto calc(100% + 7px) 50%; width: min(210px, calc(100vw - 32px)); max-height: min(60dvh, 320px); display: grid; transform: translateX(-50%); }
-.workbench-app.is-embedded .mobile-context-menu button { min-height: 36px; }
-.workbench-app.is-embedded .mobile-control-footer { display: none; }
-.workbench-app.is-embedded .page-message { grid-column: 1; grid-row: 2; }
-.workbench-app.is-embedded-hidden { visibility: hidden; }
-
-@media (max-width: 760px) {
-  .workbench-app.is-embedded { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); padding: 0; border-radius: 0; background: var(--bg); }
-  .workbench-app.is-embedded .top-bar { grid-column: 1; grid-row: 1; min-height: 38px; padding: 4px 8px; flex-direction: row; align-items: center; border: 0; }
-  .workbench-app.is-embedded .host-summary { width: auto; flex: 1; flex-direction: row; align-items: center; }
-  .workbench-app.is-embedded .top-actions { display: flex; }
-  .workbench-app.is-embedded .top-actions .button { min-height: 28px; padding: 4px 7px; font-size: 10px; }
-  .workbench-app.is-embedded .workbench-tabs { left: 50%; bottom: 10px; padding: 4px; }
-  .workbench-app.is-embedded .tab-button { width: 34px; min-height: 34px; }
-  .workbench-app.is-embedded .tab-icon { width: 21px; height: 21px; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
-  .workbench-app.is-embedded .tab-icon svg { width: 19px; height: 19px; }
-  .workbench-app.is-embedded .tab-button.is-active .tab-icon { border: 0; background: transparent; }
-  .workbench-app.is-embedded .browser-actions { right: 50%; bottom: calc(100% + 6px); width: min(100vw - 20px, 460px); justify-content: center; transform: translateX(50%); }
-  .workbench-app.is-embedded .workbench-content { grid-column: 1; grid-row: 2; padding: 6px; border-radius: 0; background: var(--bg); }
-  .workbench-app.is-embedded .tab-panel { border-radius: 9px; }
-}
-
 .workbench-app.is-embedded {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: block;
   overflow: hidden;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
   background: #fff;
 }
 .workbench-app.is-embedded .top-bar,
-.workbench-app.is-embedded .workbench-tabs { display: none; }
+.workbench-app.is-embedded .workbench-tabs,
+.workbench-app.is-embedded .browser-actions,
+.workbench-app.is-embedded .mobile-status-badge,
+.workbench-app.is-embedded .mobile-control-footer { display: none; }
 .workbench-app.is-embedded .workbench-content {
-  position: relative;
-  grid-column: 1;
-  grid-row: 1;
-  min-height: 0;
-  padding: 18px 20px;
-  place-items: center;
-  background: transparent;
-}
-.workbench-app.is-embedded .tab-panel::before {
   position: absolute;
-  z-index: 2;
-  top: 25px;
-  right: 30px;
-  color: rgb(255 255 255 / 82%);
-  content: 'MORDE CLOUD';
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: .08em;
-  pointer-events: none;
+  inset: 0;
+  display: block;
+  min-height: 0;
+  padding: 0;
+  background: transparent;
 }
 .workbench-app.is-embedded .tab-panel {
-  position: relative;
-  width: min(100%, 684px);
-  height: auto;
-  max-height: min(100%, 430px);
-  align-self: center;
-  aspect-ratio: 16 / 10;
-  border: 1px solid rgb(255 255 255 / 72%);
-  border-radius: 15px;
-  background: linear-gradient(123deg, #4bb5eb 0%, #2082e1 52%, #0e56ca 100%);
-  box-shadow: 0 16px 35px rgb(29 65 112 / 20%);
-}
-.workbench-app.is-embedded .tab-panel-browser { background: transparent; }
-.workbench-app.is-embedded .connection-overlay {
-  background: transparent;
-}
-.workbench-app.is-embedded .connection-overlay p {
-  color: rgb(255 255 255 / 88%);
-  text-shadow: 0 1px 3px rgb(9 43 100 / 32%);
-}
-.workbench-app.is-embedded .connection-overlay .button { border-color: #d8e1f2; }
-.workbench-app.is-embedded .workbench-tabs {
-  z-index: 4;
-  bottom: 24px;
-  padding: 6px;
-  border-color: rgb(255 255 255 / 48%);
-  border-radius: 16px;
-  background: rgb(109 165 233 / 54%);
-  box-shadow: 0 5px 18px rgb(8 47 110 / 18%);
-}
-.workbench-app.is-embedded .tab-button {
-  width: 42px;
-  min-height: 42px;
-  border-radius: 11px;
-}
-.workbench-app.is-embedded .tab-button.is-active { background: rgb(255 255 255 / 18%); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 20%); }
-.workbench-app.is-embedded .tab-icon { color: #fff; }
-.workbench-app.is-embedded .tab-button[data-tab="browser"] { background: #4d8bea; }
-.workbench-app.is-embedded .tab-button[data-tab="terminal"] { background: #7489a4; }
-.workbench-app.is-embedded .tab-button[data-tab="files"] { background: #4bbbd9; }
-.workbench-app.is-embedded .tab-button[data-tab="vscode"] { background: #1685cf; }
-.workbench-app.is-embedded .tab-button:disabled { opacity: .55; }
-.workbench-app.is-embedded .browser-actions { display: none; }
-.workbench-app.is-embedded .top-bar {
-  z-index: 5;
-  grid-column: 1;
-  grid-row: 2;
-  width: max-content;
-  max-width: calc(100% - 24px);
-  min-height: 50px;
-  margin: 0 auto 18px;
-  padding: 4px;
-  align-items: center;
-  flex-direction: row;
-  flex-wrap: nowrap;
-  justify-content: center;
-  gap: 0;
-  overflow: visible;
-  border: 1px solid #e1e6ee;
-  border-radius: 999px;
-  background: #fff;
-  box-shadow: 0 5px 18px rgb(29 45 68 / 8%);
-}
-.workbench-app.is-embedded .host-summary { width: auto; flex: 0 0 auto; align-items: center; flex-direction: row; gap: 0; }
-.workbench-app.is-embedded .control-state {
-  min-height: 40px;
-  padding: 8px 17px;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  aspect-ratio: auto;
   border: 0;
-  border-radius: 999px 0 0 999px;
-  color: #4c5665;
-  background: transparent;
-  font-size: 13px;
+  border-radius: 0;
+  background: #fff;
+  box-shadow: none;
 }
-.workbench-app.is-embedded .control-state-full { display: inline; }
-.workbench-app.is-embedded .control-state-compact,
-.workbench-app.is-embedded .control-lease { display: none; }
-.workbench-app.is-embedded .top-actions { display: flex; gap: 0; }
-.workbench-app.is-embedded .top-actions .button {
-  min-height: 40px;
-  padding: 7px 17px;
-  border-color: #262a32;
-  border-radius: 999px;
+.workbench-app.is-embedded .tab-panel-browser { background: #363b46; }
+.workbench-app.is-embedded .tab-panel-browser[data-connection-state="failed"],
+.workbench-app.is-embedded .tab-panel-browser[data-connection-state="disconnected"] { background: #111318; }
+.workbench-app.is-embedded .tab-panel-browser iframe { background: #111318; }
+.workbench-app.is-embedded .connection-overlay {
+  background: #363b46;
   color: #fff;
-  background: #262a32;
-  font-size: 13px;
 }
-.workbench-app.is-embedded .top-bar.is-human { border-color: #4267ed; background: #4267ed; }
-.workbench-app.is-embedded .top-bar.is-human .control-state { color: #fff; }
-.workbench-app.is-embedded .top-bar.is-human .top-actions .button-secondary { border-color: #3156cc; background: #3156cc; }
-.workbench-app.is-embedded .workbench-notice-region { position: fixed; z-index: 10; top: 12px; left: 50%; width: min(560px, calc(100vw - 24px)); margin: 0; transform: translateX(-50%); }
-.workbench-app.is-embedded.workbench-error-app .page-message { grid-row: 1 / -1; }
+.workbench-app.is-embedded .tab-panel-browser[data-connection-state="failed"] .connection-overlay,
+.workbench-app.is-embedded .tab-panel-browser[data-connection-state="disconnected"] .connection-overlay { background: #111318; }
+.workbench-app.is-embedded .connection-overlay p { color: #f4f6fa; font-size: 15px; }
+.connection-spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgb(255 255 255 / 38%);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: workbench-spin .85s linear infinite;
+}
+@keyframes workbench-spin { to { transform: rotate(360deg); } }
+.embedded-file-switch {
+  position: sticky;
+  z-index: 3;
+  top: 12px;
+  width: fit-content;
+  margin: 12px 12px 0 auto;
+  padding: 3px;
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 94%);
+  box-shadow: 0 2px 8px rgb(24 35 56 / 8%);
+}
+.embedded-file-switch button {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+.embedded-file-switch button[aria-pressed="true"] { color: var(--primary); background: #eef2ff; font-weight: 650; }
+.embedded-file-switch button:disabled { cursor: not-allowed; opacity: .5; }
+.workbench-app.is-embedded .tab-panel-files > .file-manager,
+.workbench-app.is-embedded .workspace-browser { min-height: calc(100% - 48px); }
+.workbench-app.is-embedded .page-message { grid-column: 1; grid-row: 1; }
+.workbench-app.is-embedded-hidden { visibility: hidden; }
+.workbench-app.is-embedded.workbench-error-app .page-message { grid-row: 1; }
 
 @media (max-width: 760px) {
-  .workbench-app.is-embedded { grid-template-rows: minmax(0, 1fr); }
-  .workbench-app.is-embedded .workbench-content { grid-column: 1; grid-row: 1; padding: 8px; }
-  .workbench-app.is-embedded .tab-panel::before { top: 20px; right: 24px; font-size: 10px; }
-  .workbench-app.is-embedded .tab-panel { border-radius: 14px; }
-  .workbench-app.is-embedded .workbench-tabs { bottom: 14px; padding: 4px; }
-  .workbench-app.is-embedded .tab-button { width: 36px; min-height: 36px; }
-  .workbench-app.is-embedded .top-bar { grid-column: 1; grid-row: 2; min-height: 42px; margin-bottom: 10px; padding: 3px; }
-  .workbench-app.is-embedded .control-state,
-  .workbench-app.is-embedded .top-actions .button { min-height: 34px; padding: 5px 10px; font-size: 11px; }
+  .workbench-app.is-embedded { height: 100dvh; }
+  .workbench-app.is-embedded .embedded-file-switch { top: 6px; margin: 6px 6px 0 auto; }
 }

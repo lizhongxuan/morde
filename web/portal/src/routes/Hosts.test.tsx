@@ -69,14 +69,26 @@ describe('Hosts', () => {
 
     await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` });
     expect(screen.queryByRole('link', { name: '文件同步' })).not.toBeInTheDocument();
-    expect(screen.getByRole('navigation', { name: '云端电脑视图' })).toHaveTextContent('我的电脑共享给我的');
+    expect(screen.getByRole('navigation', { name: '云端电脑视图' })).toHaveTextContent('我的电脑共享给我的API Key');
     expect(screen.getByRole('heading', { name: '我的电脑', level: 2 })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '＋ 创建电脑' })).toHaveAttribute('href', '/hosts/new');
+    expect(screen.getByRole('link', { name: 'API Key' })).toHaveAttribute('href', '/hosts?view=apikeys');
 
-    await user.click(screen.getByRole('button', { name: '共享给我的' }));
+    await user.click(screen.getByRole('link', { name: '共享给我的' }));
     expect(screen.getByRole('heading', { name: '共享给我的电脑', level: 2 })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '共享给我的' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('link', { name: '共享给我的' })).toHaveAttribute('aria-current', 'page');
     expect(screen.queryByRole('link', { name: '＋ 创建电脑' })).not.toBeInTheDocument();
+  });
+
+  it('shows API Key as a cloud-computer tab', async () => {
+    vi.spyOn(portalApi, 'apiKeys').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={['/hosts?view=apikeys']}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(screen.getByRole('heading', { name: 'API Key', level: 2 })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'API Key' })).toHaveAttribute('aria-current', 'page');
+    expect(await screen.findByText('尚未创建 API Key。')).toBeInTheDocument();
   });
 
   it('keeps the confirmed host list visible and reports a transient refresh failure in a popup', async () => {
@@ -209,7 +221,7 @@ describe('Hosts', () => {
 
     expect(await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeEnabled();
     expect(document.getElementById(`host-${ownedHost.id}`)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '我的电脑' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('link', { name: '我的电脑' })).toHaveAttribute('aria-current', 'page');
   });
 
   it('opens a shared host deep link in the shared list without page scrolling', async () => {
@@ -219,7 +231,7 @@ describe('Hosts', () => {
     render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByRole('button', { name: '查看桌面' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: '共享给我的' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('link', { name: '共享给我的' })).toHaveAttribute('aria-current', 'page');
   });
 
   it('paginates long owner and shared host lists within fixed screen areas', async () => {
@@ -248,7 +260,7 @@ describe('Hosts', () => {
     await user.click(within(ownerPagination).getByRole('button', { name: '下一页' }));
     expect(screen.getByRole('button', { name: '查看云端电脑 我的电脑 7' })).toBeDisabled();
 
-    await user.click(screen.getByRole('button', { name: '共享给我的' }));
+    await user.click(screen.getByRole('link', { name: '共享给我的' }));
     const sharedPagination = await screen.findByRole('navigation', { name: '共享给我的电脑分页' });
     expect(screen.getAllByRole('button', { name: '打开终端' }).every((button) => !button.hasAttribute('disabled'))).toBe(true);
     for (let page = 1; page < sharedItems.length; page += 1) {

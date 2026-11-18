@@ -545,9 +545,9 @@ describe('PersonalData', () => {
     renderPage();
     await screen.findByText(/保存后自动更新云端/);
     await user.click(screen.getByRole('link', { name: 'AI 个性' }));
-    expect(screen.getByText('当前使用系统默认的 Morde 人格。保存后会为你的个人对话创建覆盖版本。')).toBeInTheDocument();
-    await user.type(screen.getByLabelText('SOUL 内容'), '简洁回答；先检查现有信息再提问。');
-    await user.click(screen.getByRole('button', { name: '保存个人人格' }));
+    expect(screen.getByText('当前使用 Morde 默认人格，仅影响个人对话。')).toBeInTheDocument();
+    await user.type(screen.getByLabelText('个性偏好'), '简洁回答；先检查现有信息再提问。');
+    await user.click(screen.getByRole('button', { name: '保存偏好' }));
     await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
       'soul', 'default', 0,
       { name: 'Morde', lang: 'zh-CN', content: '简洁回答；先检查现有信息再提问。' },
@@ -565,7 +565,7 @@ describe('PersonalData', () => {
     renderPage();
     await screen.findByText(/保存后自动更新云端/);
     await user.click(screen.getByRole('link', { name: 'AI 个性' }));
-    expect(screen.getByLabelText('SOUL 内容')).toHaveValue('Use short answers.');
+    expect(screen.getByLabelText('个性偏好')).toHaveValue('Use short answers.');
     await user.click(screen.getByRole('button', { name: '删除个人人格' }));
     await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith(
       'soul', 'default', 3, expect.any(String), 'service-personal-test', currentUser.id,

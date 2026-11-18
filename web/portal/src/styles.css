@@ -1502,6 +1502,37 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .workspace-list .workspace-bind-actions select { min-height: 24px; padding-block: 3px; font-size: 10px; }
 }
 
+@media (max-width: 1280px) {
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel {
+    grid-template-columns: var(--pc-context-sidebar-width, 210px) minmax(0, 1fr) var(--pc-workspace-panel-width, 380px);
+  }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel > .assistant-task-panel {
+    position: static;
+    inset: auto;
+    grid-column: 3;
+    grid-row: 1;
+    width: auto;
+    border: 0;
+    border-left: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel {
+    grid-template-columns: minmax(0, 1fr) var(--pc-workspace-panel-width, 380px);
+  }
+  .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel > .assistant-task-panel { grid-column: 2; }
+}
+@media (max-width: 1100px) {
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel {
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 46vw);
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel > .assistant-sidebar,
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel > .assistant-context-resizer { display: none; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel > .assistant-main { grid-column: 1; grid-row: 1; }
+  .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-layout-with-computer-panel > .assistant-task-panel { grid-column: 2; grid-row: 1; }
+}
+
 .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .computer-panel-brand { color: rgb(255 255 255 / 82%); }
 .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .computer-panel-control.host-control { margin: 0 auto; padding: 0; border: 0; background: transparent; }
 .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .computer-panel-control .host-control-summary .button-primary,
@@ -1832,7 +1863,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .task-panel-heading { display: none; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .task-panel-list { padding: 12px; background: var(--surface, #fff); }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .task-panel-computer { padding: 12px; }
-.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .computer-panel-frame { min-height: 0; flex: 1 1 auto; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-task-panel .computer-panel-frame { min-height: 0; flex: 0 1 auto; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout { grid-template-columns: minmax(0, 1fr); }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-sidebar { display: none; }
 .morde-shell:not(.morde-admin-shell).morde-shell-context-collapsed:has(.assistant-page) .assistant-page .assistant-layout-with-task-panel { grid-template-columns: minmax(0, 1fr) var(--pc-workspace-panel-width); }
@@ -1872,38 +1903,34 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-layout-with-task-panel:not(.assistant-layout-with-computer-panel) > .assistant-workspace-resizer { right: calc(var(--pc-workspace-panel-width) - 18px); }
 }
 
-.assistant-page .task-panel-computer { overflow-y: auto; padding: 24px; }
-.assistant-page .computer-panel-welcome { width: min(100%, 684px); min-height: 100%; margin: auto; display: flex; flex-direction: column; align-items: stretch; justify-content: center; gap: 24px; }
-.assistant-page .computer-panel-welcome > .computer-panel-toolbar { min-height: 34px; flex: 0 0 auto; justify-content: center; }
-.assistant-page .computer-panel-preview { position: relative; width: 100%; max-height: 430px; min-height: 220px; aspect-ratio: 1.6; flex: 0 1 auto; overflow: hidden; border: 1px solid rgb(255 255 255 / 72%); border-radius: 15px; background: linear-gradient(123deg, #4bb5eb 0%, #2082e1 52%, #0e56ca 100%); box-shadow: 0 16px 35px rgb(29 65 112 / 20%); }
-.assistant-page .computer-panel-brand { position: absolute; top: 25px; right: 30px; color: rgb(255 255 255 / 82%); font-size: 12px; font-weight: 600; letter-spacing: .08em; }
-.assistant-page .computer-panel-actions { position: absolute; right: 0; bottom: 24px; left: 0; width: fit-content; max-width: calc(100% - 24px); margin: 0 auto; padding: 7px; display: flex; align-items: center; gap: 8px; border: 1px solid rgb(255 255 255 / 35%); border-radius: 20px; background: rgb(255 255 255 / 19%); box-shadow: inset 0 1px 0 rgb(255 255 255 / 12%); }
-.assistant-page .computer-panel-action { width: 54px; height: 54px; padding: 13px; flex: 0 1 54px; display: grid; place-items: center; border: 1px solid rgb(255 255 255 / 12%); border-radius: 12px; color: #eaf5ff; background: rgb(99 159 240 / 62%); cursor: pointer; }
-.assistant-page .computer-panel-action-terminal { background: rgb(52 128 222 / 55%); }
-.assistant-page .computer-panel-action-files { background: rgb(61 182 222 / 66%); }
-.assistant-page .computer-panel-action-vscode { background: rgb(29 139 205 / 68%); }
-.assistant-page .computer-panel-action:disabled { opacity: .45; cursor: not-allowed; }
-.assistant-page .computer-panel-action svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.assistant-page .computer-panel-control.host-control { width: fit-content; max-width: 100%; margin: 0 auto; padding: 0; gap: 8px; border: 0; background: transparent; }
-.assistant-page .computer-panel-control .host-control-summary { min-height: 54px; padding: 6px; gap: 0; border: 1px solid #e3e6eb; border-radius: 999px; background: #fff; box-shadow: 0 6px 20px rgb(32 52 78 / 5%); }
-.assistant-page .computer-panel-control .host-control-summary > div { padding: 0 14px; }
-.assistant-page .computer-panel-control .host-control-summary strong { color: #535963; font-size: 13px; font-weight: 500; white-space: nowrap; }
-.assistant-page .computer-panel-control .host-control-summary .button { min-height: 40px; padding: 8px 19px; border: 0; border-radius: 999px; color: #fff; background: #292d35; white-space: nowrap; }
-.assistant-page .task-panel-computer > .computer-panel-toolbar { min-height: 42px; flex: 0 0 auto; justify-content: center; }
-.assistant-page .task-panel-computer > .computer-panel-status { flex: 0 0 auto; text-align: center; }
-.assistant-page .task-panel-computer > .computer-panel-status small { display: block; margin-top: 4px; }
-.assistant-page .task-panel-computer > .computer-panel-frame { min-height: 0; flex: 1 1 auto; border: 0; border-radius: 0; background: transparent; }
-.assistant-page .task-panel-computer > .computer-panel-frame iframe { min-height: 0; flex: 1 1 auto; background: #fff; }
+.assistant-page .task-panel-computer { min-width: 0; min-height: 0; overflow: hidden; padding: 12px; display: flex; flex-direction: column; gap: 0; background: var(--surface, #fff); }
+.assistant-page .task-panel-computer[hidden] { display: none; }
+.assistant-page .computer-panel-frame { position: relative; width: min(100%, 1500px); aspect-ratio: 4 / 3; min-width: 0; min-height: 0; max-height: 100%; margin: auto; flex: 0 1 auto; display: grid; place-items: center; overflow: hidden; border: 1px solid #e1e6ee; border-radius: 14px; background: #f3f5f9; }
+.assistant-page .computer-panel-frame.is-connection-error { border-color: transparent; background: #292e38; }
+.assistant-page .computer-panel-frame iframe { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 0; display: block; border: 0; background: transparent; }
+.assistant-page .computer-panel-message { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; color: #65758d; font-size: 14px; text-align: center; }
+.assistant-page .computer-panel-message.is-error { color: #f5f6f8; }
+.assistant-page .computer-panel-spinner { width: 18px; height: 18px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: computer-panel-spin .8s linear infinite; }
+@keyframes computer-panel-spin { to { transform: rotate(360deg); } }
+.assistant-page .computer-panel-dock { min-height: 58px; padding: 8px 4px 0; flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px; border-top: 1px solid #e7ebf1; }
+.assistant-page .computer-panel-actions { min-width: 0; display: flex; align-items: center; gap: 4px; }
+.assistant-page .computer-panel-action { min-width: 74px; min-height: 42px; padding: 7px 10px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 9px; color: #616d80; background: transparent; font: inherit; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.assistant-page .computer-panel-action:hover:not(:disabled) { background: #f4f6f9; }
+.assistant-page .computer-panel-action.is-active { border-color: #dce6ff; color: #315fda; background: #edf2ff; font-weight: 650; }
+.assistant-page .computer-panel-action:disabled { opacity: .52; cursor: not-allowed; }
+.assistant-page .computer-panel-action svg { width: 19px; height: 19px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.assistant-page .computer-panel-action:focus-visible,
+.assistant-page .computer-panel-control .button:focus-visible { outline: 2px solid #4777ec; outline-offset: 2px; }
+.assistant-page .computer-panel-control.host-control { min-width: 0; margin: 0; padding: 0; flex: 0 0 auto; border: 0; background: transparent; }
+.assistant-page .computer-panel-control .button { min-height: 40px; padding: 8px 16px; border: 0; border-radius: 9px; color: #fff; background: #292d35; font: inherit; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.assistant-page .computer-panel-control .button:hover:not(:disabled) { background: #1f232a; }
+.assistant-page .computer-panel-control .button:disabled { color: #737b88; background: #e8ebf0; cursor: not-allowed; }
 
-@media (max-width: 620px) {
-  .assistant-page .task-panel-computer { padding: 16px; }
-  .assistant-page .computer-panel-welcome { gap: 18px; }
-  .assistant-page .computer-panel-preview { min-height: 190px; }
-  .assistant-page .computer-panel-actions { bottom: 18px; gap: 5px; padding: 6px; }
-  .assistant-page .computer-panel-action { width: 48px; height: 48px; flex-basis: 48px; padding: 12px; }
-  .assistant-page .computer-panel-control .host-control-summary > div { padding-inline: 9px; }
-  .assistant-page .computer-panel-control .host-control-summary strong { font-size: 11px; }
-  .assistant-page .computer-panel-control .host-control-summary .button { min-height: 36px; padding-inline: 13px; font-size: 11px; }
+@media (max-width: 760px) {
+  .assistant-page .task-panel-computer { padding: 8px; }
+  .assistant-page .computer-panel-dock { flex-wrap: wrap; justify-content: center; gap: 8px; }
+  .assistant-page .computer-panel-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+  .assistant-page .computer-panel-action { min-width: 0; min-height: 48px; padding: 5px; flex-direction: column; gap: 2px; font-size: 10px; }
 }
 
 .morde-shell:not(.morde-admin-shell).morde-shell-settings-navigation { --pc-page-sidebar-width: 230px; }

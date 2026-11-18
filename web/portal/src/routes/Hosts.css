@@ -91,6 +91,10 @@
 .hosts-page .screen-pagination__item--overflow::-webkit-scrollbar { width: 8px; }
 .hosts-page .screen-pagination__item--overflow::-webkit-scrollbar-thumb { border: 2px solid #f2f5f8; border-radius: 8px; background: #aab7c8; }
 
+.hosts-api-keys { min-width: 0; min-height: 0; flex: 1 1 0; overflow: auto; }
+.hosts-api-keys > section { display: grid; gap: 0; }
+.hosts-api-keys .connection-section, .hosts-api-keys .design-panel { margin: 0 0 12px; }
+
 .hosts-page .host-card-compact {
   display: grid;
   gap: 6px;

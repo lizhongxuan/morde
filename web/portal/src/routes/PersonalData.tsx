@@ -564,7 +564,7 @@ export function PersonalData() {
     </section>}
 
     {state && !remoteLoading && activeSection === 'soul' && <section className="connection-section" aria-labelledby="personal-soul-title">
-      <div className="connection-section-heading"><div><h2 id="personal-soul-title" className="sr-only">AI 个性</h2><p className="muted">Morde 默认人格由系统提供。这里可以为个人对话设置专属偏好；项目对话不会读取个人 SOUL。删除个人版本会恢复系统默认人格。</p></div></div>
+      <h2 id="personal-soul-title" className="sr-only">AI 个性</h2>
       <SoulEditor key={`${soulObject?.revision ?? 0}:${JSON.stringify(soulObject?.body ?? null)}`} value={soulObject}
         hasConflict={conflicts.some((item) => item.objectType === 'soul' && item.objectID === 'default')}
         onSave={(body) => void saveObject('soul', 'default', body as unknown as PersonalObjectBody)}
@@ -576,13 +576,13 @@ export function PersonalData() {
       <label className="checkbox-row"><input type="checkbox" checked={memoryEnabled}
         disabled={!state.snapshotComplete || syncing || memorySettingPending}
         onChange={(event) => void saveObject('skill_setting', 'builtin_memory', { enabled: event.target.checked })} />允许 AI 使用个人记忆</label>
-      <p className="muted">{memorySettingPending ? '设置正在同步，服务端确认后生效。' : '默认开启；关闭后，个人对话不会读取历史片段或已保存记忆。修改和删除在服务端同步成功后生效。'}</p>
+      <p className="muted">{memorySettingPending ? '同步中，服务端确认后生效。' : '默认开启，仅用于个人对话；关闭后不再读取历史片段或已存记忆。'}</p>
       <form className="form-card form-stack" onSubmit={addMemory}>
         <label>新增记忆<textarea value={memoryContent} maxLength={65536} required onChange={(event) => setMemoryContent(event.target.value)} /></label>
         <label>分类（可选）<input value={memoryCategory} maxLength={64} onChange={(event) => setMemoryCategory(event.target.value)} /></label>
         <button className="button button-primary" type="submit">保存记忆</button>
       </form>
-      {memoryObjects.length === 0 ? <p className="empty-card">还没有记忆。</p> : <ScreenPagination
+      {memoryObjects.length === 0 ? <p className="muted">暂无记忆。</p> : <ScreenPagination
         items={memoryObjects} getKey={(item) => item.object_id} estimatedItemHeight={156} height={300}
         ariaLabel="已保存记忆" className="personal-data-pager"
         renderItem={(item) => <MemoryRow key={`${storeScope}:${item.object_id}:${item.revision}:${JSON.stringify(item.body)}`} item={item}
@@ -648,17 +648,17 @@ export function PersonalData() {
 
     {state && !remoteLoading && activeSection === 'library' && <section className="connection-section" aria-labelledby="personal-library-title">
       <div className="connection-section-heading"><div><h2 id="personal-library-title" className="sr-only">资源库</h2><p className="muted">附件字节保存在本机离线队列；联网后按 4 MiB 分块上传。</p></div></div>
-      {quota && <p className="notice notice-info" role="status">附件空间已用 {formatBytes(quota.used_bytes)} / {formatBytes(quota.quota_bytes)}，剩余 {formatBytes(quota.remaining_bytes)}；单个附件上限 {formatBytes(quota.max_attachment_bytes)}。</p>}
+      {quota && <p className="muted" role="status">附件空间：已用 {formatBytes(quota.used_bytes)} / {formatBytes(quota.quota_bytes)} · 剩余 {formatBytes(quota.remaining_bytes)} · 单文件 ≤ {formatBytes(quota.max_attachment_bytes)}</p>}
       {quotaError && <FloatingError className="error-inline" role="alert">无法读取附件空间：{quotaError}<button type="button" className="button button-small button-secondary" onClick={() => void sync()}>重试</button></FloatingError>}
       <form className="form-card form-stack" onSubmit={(event) => event.preventDefault()}>
-        <label>资源类型<select value={libraryKind} onChange={(event) => setLibraryKind(event.target.value as LibraryBody['kind'])}><option value="artifact">文档/产物</option><option value="media">媒体</option></select></label>
-        <label>上传新资源<input type="file" onChange={(event) => {
+        <label>类型<select value={libraryKind} onChange={(event) => setLibraryKind(event.target.value as LibraryBody['kind'])}><option value="artifact">文档/产物</option><option value="media">媒体</option></select></label>
+        <label>添加文件<input type="file" onChange={(event) => {
           const file = event.currentTarget.files?.[0];
           if (file) void chooseFile(file);
           event.currentTarget.value = '';
         }} /></label>
       </form>
-      {libraryObjects.length === 0 ? <p className="empty-card">资源库还是空的。可以先添加本机文件。</p> : <ScreenPagination
+      {libraryObjects.length === 0 ? <p className="muted">暂无资源。</p> : <ScreenPagination
         items={libraryObjects} getKey={(item) => item.object_id} estimatedItemHeight={96} height={300}
         ariaLabel="个人资源库" className="personal-data-pager"
         renderItem={(item) => {
@@ -722,23 +722,19 @@ function SoulEditor({ value, hasConflict, onSave, onDelete, onInvalid }: {
   onDelete: () => void;
   onInvalid: (message: string) => void;
 }) {
-  const [name, setName] = useState(asString(value?.body.name) || 'Morde');
   const [content, setContent] = useState(asString(value?.body.content));
   const save = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const normalizedName = name.trim();
     const normalizedContent = content.trim();
-    if (!normalizedName) { onInvalid('人格名称不能为空。'); return; }
     if (!normalizedContent) { onInvalid('人格内容不能为空。'); return; }
-    onSave({ name: normalizedName, lang: 'zh-CN', content: normalizedContent });
+    onSave({ name: asString(value?.body.name) || 'Morde', lang: 'zh-CN', content: normalizedContent });
   };
   return <>
-    {!value && <p className="empty-card">当前使用系统默认的 Morde 人格。保存后会为你的个人对话创建覆盖版本。</p>}
+    <p className="muted">{value ? '仅影响个人对话；删除个人人格可恢复默认。' : '当前使用 Morde 默认人格，仅影响个人对话。'}</p>
     <form className="form-card form-stack" onSubmit={save}>
-      <label>人格名称<input value={name} maxLength={80} required onChange={(event) => setName(event.target.value)} /></label>
-      <label>SOUL 内容<textarea value={content} maxLength={65536} required onChange={(event) => setContent(event.target.value)} placeholder="写下希望 Morde 长期遵循的交流风格和做事原则" /></label>
+      <label>个性偏好<textarea value={content} maxLength={65536} required onChange={(event) => setContent(event.target.value)} placeholder="例如：回答简洁，先检查已有信息再提问" /></label>
       <div className="inline-actions">
-        <button type="submit" className="button button-primary">{hasConflict ? '基于远端版本保存' : value ? '保存 AI 个性' : '保存个人人格'}</button>
+        <button type="submit" className="button button-primary">{hasConflict ? '基于远端版本保存' : '保存偏好'}</button>
         {value && <button type="button" className="button button-secondary" onClick={onDelete}>删除个人人格</button>}
       </div>
     </form>

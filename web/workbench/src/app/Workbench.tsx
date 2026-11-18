@@ -18,6 +18,7 @@ import { isTransientNetworkError } from './aio';
 import { useWorkbenchNotice } from './notice';
 
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
+type EmbedTarget = 'browser' | 'terminal' | 'files' | 'vscode';
 type MobileMenu = 'browser' | 'terminal' | 'files' | null;
 type EmbedContext = { origin: string; nonce: string };
 type NativeWorkbenchBridge = {
@@ -35,6 +36,7 @@ const primaryTabs: { id: Tab; label: string }[] = [
   { id: 'vscode', label: 'VS Code' },
 ];
 const tabIDs = new Set(primaryTabs.map((tab) => tab.id));
+const embedTargetIDs = new Set<EmbedTarget>(['browser', 'terminal', 'files', 'vscode']);
 
 function requestedEmbedTab(search: string): Tab | null {
   const values = new URLSearchParams(search).getAll('tab');
@@ -45,9 +47,24 @@ function authorizedEmbedTargets(host: GatewayHost | null): Set<Tab> {
   return new Set((host?.embed_targets ?? []).filter((target): target is Tab => tabIDs.has(target as Tab)));
 }
 
+function embedTabAllowed(targets: Set<Tab>, tab: Tab): boolean {
+  return targets.has(tab) || (tab === 'files' && targets.has('workspace')) || (tab === 'workspace' && targets.has('files'));
+}
+
+function embedTargetForTab(tab: Tab, targets: Set<Tab>): EmbedTarget | null {
+  if (tab === 'workspace' || tab === 'files') return embedTabAllowed(targets, tab) ? 'files' : null;
+  return embedTargetIDs.has(tab as EmbedTarget) && targets.has(tab) ? tab as EmbedTarget : null;
+}
+
+function visibleEmbeddedTab(active: Tab, initial: Tab | null, targets: Set<Tab>): Tab | null {
+  if (embedTabAllowed(targets, active)) return active;
+  return initial && embedTabAllowed(targets, initial) ? initial : null;
+}
+
 function initialEmbedTab(targets: Set<Tab>, requested: Tab | null): Tab | null {
-  if (requested && targets.has(requested)) return requested;
-  return primaryTabs.find((tab) => targets.has(tab.id))?.id ?? null;
+  if (requested && embedTabAllowed(targets, requested)) return requested;
+  return (['browser', 'terminal', 'files', 'workspace', 'vscode'] as Tab[])
+    .find((tab) => embedTabAllowed(targets, tab)) ?? null;
 }
 
 function hasEmbedControlTarget(targets: Set<Tab>): boolean {
@@ -108,6 +125,7 @@ export default function Workbench() {
   const initialTab = initialEmbedTab(embedTargets, requestedTab);
   const hostID = host?.id ?? null;
   const [control, setControl] = useState<GatewayControl | null>(null);
+  const controlRef = useRef<GatewayControl | null>(null);
   const [controlLoading, setControlLoading] = useState(!hostSessionOnly && !embedded);
   const [controlError, setControlError] = useState('');
   const [controlNetworkUnavailable, setControlNetworkUnavailable] = useState(false);
@@ -121,6 +139,10 @@ export default function Workbench() {
   const [embedVisible, setEmbedVisible] = useState(!embedded);
   const [embedConversationID, setEmbedConversationID] = useState<string | null>(null);
   const [active, setActive] = useState<Tab>(() => hostSessionOnly ? 'workspace' : requestedTab ?? 'browser');
+  const [controlLocked, setControlLocked] = useState(embedded);
+  const [selectionSeq, setSelectionSeq] = useState<number | null>(null);
+  const [lockSeq, setLockSeq] = useState<number | null>(null);
+  const [filePanel, setFilePanel] = useState<'files' | 'workspace'>(() => requestedTab === 'workspace' ? 'workspace' : 'files');
   const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(hostSessionOnly ? ['workspace'] : embedded ? [] : ['browser']));
   const loadedTabs = useMemo(() => initialTab ? new Set([...loaded, initialTab]) : loaded, [initialTab, loaded]);
   const [browserStatus, setBrowserStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'failed'>('connecting');
@@ -144,6 +166,11 @@ export default function Workbench() {
   const browserConnectTimeoutRef = useRef<number | undefined>(undefined);
   const browserConnectedRef = useRef(false);
   const controlRequestRef = useRef<GatewayControlRequest | null>(null);
+  const controlLockedRef = useRef(embedded);
+  const selectionSeqRef = useRef(-1);
+  const selectionCommandSeqRef = useRef(-1);
+  const lockSeqRef = useRef(-1);
+  const activeRef = useRef<Tab>(hostSessionOnly ? 'workspace' : requestedTab ?? 'browser');
   const embedInitializedRef = useRef(false);
   const embedVisibleRef = useRef(!embedded);
   const leaseRenewalRef = useRef(false);
@@ -154,6 +181,7 @@ export default function Workbench() {
   const suppressTabClickTimerRef = useRef<number | undefined>(undefined);
 
   const applyControl = useCallback((value: GatewayControl) => {
+    controlRef.current = value;
     setControl(value);
     setControlError('');
     setControlNetworkUnavailable(false);
@@ -169,6 +197,11 @@ export default function Workbench() {
       setControlActionError('');
     }
   }, []);
+
+  function setEmbeddedControlLocked(locked: boolean) {
+    controlLockedRef.current = locked;
+    setControlLocked(locked);
+  }
 
   const handleControlReadFailure = useCallback((error: unknown) => {
     setControlError(messageOf(error));
@@ -191,6 +224,44 @@ export default function Workbench() {
     }
   }, [applyControl, embedTargets, embedded, handleControlReadFailure]);
 
+  const selectEmbeddedTab = useCallback(async (tab: Tab, sequence?: number, forceFileTab = false) => {
+    if (!embedded) return;
+    if (sequence !== undefined) {
+      if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence <= selectionCommandSeqRef.current) return;
+      selectionCommandSeqRef.current = sequence;
+    }
+    const target = embedTargetForTab(tab, embedTargets);
+    if (!target || !hasEmbedControlTarget(embedTargets)) return;
+
+    let currentControl: GatewayControl;
+    try {
+      currentControl = await gatewayApi.control();
+      applyControl(currentControl);
+    } catch (error) {
+      handleControlReadFailure(error);
+      return;
+    }
+    if ((sequence !== undefined && sequence !== selectionCommandSeqRef.current) || controlLockedRef.current ||
+      controlActionPending || currentControl.control_state !== 'user' || !currentControl.control_lease_active ||
+      !currentControl.control_lease_held_by_me) return;
+
+    const nextTab = target === 'files'
+      ? tab === 'workspace' && embedTargets.has('workspace')
+        ? 'workspace'
+        : !forceFileTab && tab === 'files' && activeRef.current === 'workspace' && embedTargets.has('workspace')
+          ? 'workspace'
+          : embedTargets.has('files') ? 'files' : 'workspace'
+      : tab;
+    activeRef.current = nextTab;
+    setActive(nextTab);
+    if (sequence !== undefined) {
+      selectionSeqRef.current = sequence;
+      setSelectionSeq(sequence);
+    }
+    if (target === 'files') setFilePanel(nextTab === 'workspace' ? 'workspace' : 'files');
+    setLoaded((previous) => new Set(previous).add(nextTab));
+  }, [applyControl, controlActionPending, embedTargets, embedded, handleControlReadFailure]);
+
   useEffect(() => {
     if (!embedContext) return;
     const onMessage = (message: Record<string, unknown>) => {
@@ -207,6 +278,34 @@ export default function Workbench() {
         embedVisibleRef.current = message.visible;
         setEmbedVisible(message.visible);
         if (message.visible && !wasVisible) void reloadControl();
+      } else if (embedInitializedRef.current && message.type === 'select_target' &&
+        typeof message.target === 'string' && embedTargetIDs.has(message.target as EmbedTarget) &&
+        typeof message.seq === 'number') {
+        const target = message.target as EmbedTarget;
+        void selectEmbeddedTab(target === 'files' && embedTargets.has('files') &&
+          activeRef.current === 'workspace' && embedTargets.has('workspace') ? 'workspace' : target, message.seq);
+      } else if (embedInitializedRef.current && message.type === 'control_lock' &&
+        typeof message.locked === 'boolean' && typeof message.seq === 'number' &&
+        Number.isSafeInteger(message.seq) && message.seq >= 0 && message.seq > lockSeqRef.current) {
+        lockSeqRef.current = message.seq;
+        setLockSeq(message.seq);
+        if (message.locked) {
+          setEmbeddedControlLocked(true);
+        } else if (!hasEmbedControlTarget(embedTargets)) {
+          setEmbeddedControlLocked(true);
+        } else {
+          const requestedSeq = message.seq;
+          void gatewayApi.control().then((value) => {
+            applyControl(value);
+            if (lockSeqRef.current === requestedSeq && value.control_state === 'user' &&
+              value.control_lease_active && value.control_lease_held_by_me) {
+              setEmbeddedControlLocked(false);
+            } else if (lockSeqRef.current === requestedSeq) setEmbeddedControlLocked(true);
+          }).catch((error: unknown) => {
+            if (lockSeqRef.current === requestedSeq) setEmbeddedControlLocked(true);
+            handleControlReadFailure(error);
+          });
+        }
       }
     };
     if (nativeBridge) {
@@ -224,7 +323,7 @@ export default function Workbench() {
     window.addEventListener('message', onWindowMessage);
     window.parent.postMessage({ channel: embedChannel, version: embedProtocolVersion, type: 'ready', nonce: embedContext.nonce }, embedContext.origin);
     return () => window.removeEventListener('message', onWindowMessage);
-  }, [embedContext, nativeBridge, reloadControl]);
+  }, [applyControl, embedContext, embedTargets, handleControlReadFailure, nativeBridge, reloadControl, selectEmbeddedTab]);
 
   useEffect(() => {
     if (!embedContext) return;
@@ -240,11 +339,23 @@ export default function Workbench() {
       control_state: controlError ? 'unknown' : control?.control_state ?? 'unknown',
       control_lease_active: controlError ? false : control?.control_lease_active ?? false,
       control_lease_held_by_me: controlError ? false : control?.control_lease_held_by_me ?? false,
+      active_target: embedded
+        ? (() => {
+          const visibleTab = visibleEmbeddedTab(active, initialTab, embedTargets);
+          const target = visibleTab ? embedTargetForTab(visibleTab, embedTargets) : null;
+          return target === 'files' && !hasEmbedControlTarget(embedTargets) ? null : target;
+        })()
+        : null,
+      control_version: controlError ? null : control?.control_version ?? null,
+      control_locked: controlLocked,
+      selection_seq: selectionSeq,
+      lock_seq: lockSeq,
     };
     if (nativeBridge) void Promise.resolve(nativeBridge.sendHostWorkbenchState?.(message)).catch(() => undefined);
     else window.parent.postMessage(message, embedContext.origin);
   }, [browserStatus, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_state,
-    controlError, controlLoading, embedContext, embedConversationID, embedded, hostID, hostSessionOnly, initialTab, nativeBridge, pageError]);
+    control?.control_version, controlError, controlLoading, controlLocked, embedContext, embedConversationID, embedded,
+    embedTargets, hostID, hostSessionOnly, initialTab, lockSeq, nativeBridge, pageError, selectionSeq, active]);
 
   useEffect(() => {
     if (hostSessionOnly) return;
@@ -357,7 +468,7 @@ export default function Workbench() {
   }, [mobileMenu]);
 
   const leaseHeldByMe = control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
-  const terminalAvailable = !controlLoading && !controlError && !controlActionPending && leaseHeldByMe;
+  const terminalAvailable = !controlLoading && !controlError && !controlActionPending && leaseHeldByMe && (!embedded || !controlLocked);
 
   useEffect(() => {
     if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalCreationUncertain || terminalRequestRef.current || terminalReplacementRef.current) return;
@@ -467,6 +578,7 @@ export default function Workbench() {
   function selectTab(tab: Tab) {
     if (embedded && !embedTargets.has(tab)) return;
     if (tab === 'vscode' && !vscodeAvailable) return;
+    activeRef.current = tab;
     setActive(tab);
     setLoaded((previous) => new Set(previous).add(tab));
   }
@@ -719,8 +831,8 @@ export default function Workbench() {
   }
 
   const failedTransition = control?.active_transition?.failure_reason ? control.active_transition : null;
-  const vscodeAvailable = !controlLoading && !controlError && leaseHeldByMe && !controlActionPending;
-  const browserViewOnly = controlLoading || !!controlError || !leaseHeldByMe;
+  const vscodeAvailable = !controlLoading && !controlError && leaseHeldByMe && !controlActionPending && (!embedded || !controlLocked);
+  const browserViewOnly = controlLoading || !!controlError || !leaseHeldByMe || (embedded && controlLocked);
   const retryControlRequest = controlRequest ?? (failedTransition ? {
     action: failedTransition.action,
     request_id: failedTransition.request_id,
@@ -739,12 +851,21 @@ export default function Workbench() {
           : control?.control_state === 'user' ? '他人正在操作'
             : control?.control_state === 'taking_over' ? '正在接管'
               : control?.control_state === 'returning' ? '正在交还' : '控制状态未知';
-  const authorizedActive = embedded && !embedTargets.has(active) ? initialTab ?? active : active;
+  const authorizedActive = embedded && !embedTabAllowed(embedTargets, active) ? initialTab ?? active : active;
   const visibleActive = authorizedActive === 'vscode' && !vscodeAvailable && !embedded ? 'browser' : authorizedActive;
   const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace')
     : embedded ? host ? primaryTabs.filter((tab) => tab.id !== 'workspace' && (tab.id === 'files'
-      ? embedTargets.has('files') || embedTargets.has('workspace')
+      ? embedTabAllowed(embedTargets, 'files')
       : embedTargets.has(tab.id))) : [] : primaryTabs;
+  const showEmbeddedFileSwitch = embedded && embedTargets.has('files') && embedTargets.has('workspace');
+  const embeddedFileSwitch = () => showEmbeddedFileSwitch ? (
+    <div className="embedded-file-switch" role="group" aria-label="文件视图">
+      <button type="button" aria-pressed={filePanel === 'files'} disabled={!vscodeAvailable}
+        onClick={() => void selectEmbeddedTab('files', undefined, true)}>主机文件</button>
+      <button type="button" aria-pressed={filePanel === 'workspace'} disabled={!vscodeAvailable}
+        onClick={() => void selectEmbeddedTab('workspace', undefined, true)}>Workspace</button>
+    </div>
+  ) : null;
   if (taskObservationOnly) return <TaskObservation key={taskObservationID} taskID={taskObservationID} />;
   return (
     <main className={`workbench-app${workspaceOnly ? ' is-workspace-only' : ''}${embedded ? ' is-embedded' : ''}${embedded && !embedVisible ? ' is-embedded-hidden' : ''}`}
@@ -880,18 +1001,25 @@ export default function Workbench() {
             )}
           </nav>}
             {loadedTabs.has('browser') && (
-              <div ref={browserPanelRef} className="tab-panel tab-panel-browser" aria-hidden={visibleActive !== 'browser'} inert={visibleActive !== 'browser'}>
+              <div ref={browserPanelRef} className="tab-panel tab-panel-browser" data-connection-state={browserStatus}
+                aria-hidden={visibleActive !== 'browser'} inert={visibleActive !== 'browser'}>
                 {browserStatus !== 'connected' && (
                   <div className="connection-overlay" role={browserStatus === 'failed' || browserStatus === 'disconnected' ? 'alert' : 'status'}>
-                    <p>
-                      <span className="connection-message-desktop">{browserStatus === 'failed' ? '远程桌面没有返回连接状态，请确认主机正在运行后重试。'
-                        : browserStatus === 'disconnected' ? '远程桌面连接已中断，可以重新连接当前主机。'
-                          : '正在连接远程桌面…'}</span>
-                      <span className="connection-message-mobile">{browserStatus === 'failed' ? '连接失败'
-                        : browserStatus === 'disconnected' ? '连接已断开'
-                          : '正在连接…'}</span>
+                    {browserStatus === 'connecting' && embedded && <span className="connection-spinner" aria-hidden="true" />}
+                    <p>{embedded
+                      ? browserStatus === 'connecting' ? '正在连接远程桌面…'
+                        : browserStatus === 'disconnected' ? '远程桌面连接已断开。'
+                          : '远程桌面连接失败。'
+                      : <>
+                        <span className="connection-message-desktop">{browserStatus === 'failed' ? '远程桌面没有返回连接状态，请确认主机正在运行后重试。'
+                          : browserStatus === 'disconnected' ? '远程桌面连接已中断，可以重新连接当前主机。'
+                            : '正在连接远程桌面…'}</span>
+                        <span className="connection-message-mobile">{browserStatus === 'failed' ? '连接失败'
+                          : browserStatus === 'disconnected' ? '连接已断开'
+                            : '正在连接…'}</span>
+                      </>}
                     </p>
-                    {(browserStatus === 'failed' || browserStatus === 'disconnected') && (
+                    {!embedded && (browserStatus === 'failed' || browserStatus === 'disconnected') && (
                       <button className="button button-secondary" type="button" onClick={reconnectBrowser}>
                         重新连接
                       </button>
@@ -961,7 +1089,10 @@ export default function Workbench() {
             )}
             {loadedTabs.has('files') && (
               <div className="tab-panel tab-panel-files" aria-hidden={visibleActive !== 'files'} inert={visibleActive !== 'files'}>
-                {vscodeAvailable
+                {embeddedFileSwitch()}
+                {embedded && !hasEmbedControlTarget(embedTargets)
+                  ? <p className="panel-loading" role="status">此会话未授权访问云端电脑文件。</p>
+                  : vscodeAvailable
                   ? <FileManager />
                   : controlError
                     ? controlNetworkUnavailable
@@ -972,7 +1103,16 @@ export default function Workbench() {
             )}
             {loadedTabs.has('workspace') && (
               <div className="tab-panel tab-panel-workspace" aria-hidden={visibleActive !== 'workspace'} inert={visibleActive !== 'workspace'}>
-                <WorkspaceBrowser active={visibleActive === 'workspace'} />
+                {embeddedFileSwitch()}
+                {embedded && !hasEmbedControlTarget(embedTargets)
+                  ? <p className="panel-loading" role="status">此会话未授权访问云端电脑文件。</p>
+                  : embedded && !vscodeAvailable
+                  ? controlError
+                    ? controlNetworkUnavailable
+                      ? <p className="panel-loading" role="status">正在重新确认电脑控制状态…</p>
+                      : <FloatingError>控制状态暂不可用：{controlError}</FloatingError>
+                    : <p className="panel-loading" role="status">请先接管电脑后使用 Workspace。</p>
+                  : <WorkspaceBrowser active={visibleActive === 'workspace'} />}
               </div>
             )}
             {loadedTabs.has('vscode') && (

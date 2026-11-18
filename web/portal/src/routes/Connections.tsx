@@ -111,7 +111,9 @@ export function Connections() {
         notify('个人模型已更新。', 'success');
       }
     } catch (error) {
-      notify(`${modelConnectionSaveErrorMessage(error)}${apiKey ? ' 密钥已清除，请重新输入后重试。' : ''}`, 'error');
+      const outcomeUnknown = isTransientNetworkError(error);
+      void refreshModels();
+      notify(`${outcomeUnknown ? '服务暂时不可用，保存结果尚未确认，请先核对模型列表。' : modelConnectionSaveErrorMessage(error)}${apiKey && !outcomeUnknown ? ' 密钥已清除，请重新输入后重试。' : ''}`, 'error');
     } finally {
       setSaving(false);
     }
