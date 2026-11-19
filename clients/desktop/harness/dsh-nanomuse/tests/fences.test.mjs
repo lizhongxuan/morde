@@ -50,13 +50,13 @@ test('the words around a goal match the phone, in both languages', () => {
   assert.match(goalCreationNote('health', true), /"category": "health"/)
 })
 
-test('the Ideas list is shared with Morde iOS and mobile Web, byte for byte', () => {
+test('the Ideas list is shared with Morde iOS, byte for byte', () => {
   for (const lang of ['en', 'zh']) {
     const ours = readFileSync(new URL(`../assets/ideas.${lang}.json`, here), 'utf8')
     const ios = readFileSync(new URL(`../../../../nanoMuse/android/src/ios/NanoMuse/Resources/ideas.${lang}.json`, here), 'utf8')
-    const mobile = readFileSync(new URL(`../../../../../web/mobile/src/ideas/ideas.${lang}.json`, here), 'utf8')
+    const shared = readFileSync(new URL(`../../../../../web/shared/ideas/ideas.${lang}.json`, here), 'utf8')
     assert.equal(ours, ios, `assets/ideas.${lang}.json must match the Morde iOS file`)
-    assert.equal(ours, mobile, `assets/ideas.${lang}.json must match the Morde mobile Web file`)
+    assert.equal(ours, shared, `assets/ideas.${lang}.json must match the shared source file`)
     const ideas = parseIdeas(ours)
     assert.equal(ideas.length, 24)
     assert.deepEqual([...new Set(ideas.map((i) => i.section))], ['travel', 'work', 'life', 'learn', 'family', 'more'])

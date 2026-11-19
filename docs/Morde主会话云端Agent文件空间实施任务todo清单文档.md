@@ -1,7 +1,7 @@
 # Morde 主会话云端 Agent 文件空间实施任务 TODO
 
 > 来源：[Morde主会话云端Agent文件空间设计方案.md](Morde主会话云端Agent文件空间设计方案.md)
-> 状态：T1–T5 的本地实现及 PC 文件页验收已完成；T2 实时目录开关仍默认关闭；T3 挂载开关关闭、共享 Sandbox 未验，且已要求挂载与实时目录源开关必须同时开启；T6 已新增 PC 项目上传直写共享目录、稳定目录注册和 Host 切换后来源重绑，并通过应用层、PostgreSQL 定向验收及 LinuxKit 文件存储测试；旧文件编辑/恢复、真实来源核对和生产切流仍未完成；T7 等待 T3、T6。
+> 状态：T1、T4、T5 的本地实现及 PC 文件页验收已完成；T2 实时文件工具与 T3 HostPath 实现已落地，但运行态验收未完成、两个开关默认关闭；T3 已要求挂载与实时目录源开关必须同时开启。T6 已新增 PC 项目上传直写共享目录、稳定目录注册和 Host 切换后来源重绑，并通过应用层、PostgreSQL 定向验收及 LinuxKit 文件存储测试；旧文件编辑/恢复、真实来源核对和生产切流仍未完成；T7 等待 T3、T6。
 
 ## 实施边界
 
@@ -33,7 +33,7 @@
 ## 实施任务
 
 - [x] T1 建立用户稳定 Agent Workspace 与云端电脑强绑定
-  - 修改：server/internal/app/workspace.go、host_create.go、host.go、server/internal/store/postgres、server/migrations/00209_stable_agent_workspaces.sql。每位用户唯一映射稳定 Agent Workspace；创建 Host 前幂等创建目录并只绑定此 Workspace；拒绝显式绑定其他 Workspace。Host 切换仅允许旧绑定已解除且旧 Host 已停止、终止或删除的 Agent Workspace 重绑，目录与文件不变；普通 Workspace 仍禁止跨 Host 重绑。删除 Host 只释放计算资源并保留 Agent Workspace；显式删除 Workspace 才删除数据。兼容旧 Host copy API 返回 409 且不触发复制，Portal 复制入口移除。旧 Host 若仍绑定其他 Workspace 会失败关闭，须等 T6 安全迁移。
+  - 修改：server/internal/app/workspace.go、host_create.go、host.go、server/internal/store/postgres、server/migrations/00209_stable_agent_workspaces.sql。每位用户唯一映射稳定 Agent Workspace；创建 Host 前幂等创建目录并只绑定此 Workspace；拒绝显式绑定其他 Workspace。Host 切换仅允许旧绑定已解除且旧 Host 已停止、终止或删除的 Agent Workspace 重绑，目录与文件不变；普通 Workspace 仍禁止跨 Host 重绑。删除 Host 只释放计算资源并保留 Agent Workspace；显式删除 Workspace 才删除数据。兼容旧 Host copy API 返回 409 且不触发复制，Portal 复制入口移除。遗留 Host 绑定其他 Workspace 时，恢复、进入、续期、电脑/MCP/任务授权、Runtime 副本、Host 文件读取和同步均失败关闭；仍可停止或安全删除，待 T6 核验迁移。
   - 验收：无云端电脑的用户也有可浏览的空目录；重复初始化和电脑重建仍解析到同一 Workspace 与目录；其他 Workspace 绑定被拒绝；切换 Host 后同一目录保持原文件；无法访问其他用户目录或服务端根路径。
   - 验证：`go test ./internal/app`、Host copy 的 app/API 定向测试通过；临时本机 PostgreSQL 上的 Agent Workspace 与 Host 删除、Host 停止后切换到另一 Host 并保留同一 Workspace 项目目录/来源基线的集成测试通过。Host 创建仍要求 Agent Workspace provider；仅处理既有 Host 的生命周期服务可不注入该 provider。advisory lock 依赖连接池至少 3 个连接。
 - [ ] T2（Agent 实时文件工具已改造，待 T6 切流及运行态验收，依赖 T1）让 Agent 在该目录运行
@@ -73,6 +73,8 @@
 - T3 边界补充：Agent Workspace 的错误挂载目标测试通过；仅验证模板路径约束，不代表真实 Sandbox 的跨容器共享挂载已经验收。
 - T3 双门禁：发现 Host mount 开、live directory source 关时原配置可通过；已改为两个开关必须同时启用，并补齐两个失配方向的配置测试。`go test ./internal/config -run TestLoadWorkspaceFeatureGatesDefaultClosedAndOpenExplicitly -count=1` 通过；真实 Sandbox 读写、停止重建后保留及 UID/GID/ACL 未验。
 - T3 测试机只读盘点：当前没有运行中的 Sandbox 容器，OpenSandbox Server 容器也未挂载服务端 Workspace 根目录，无法验证直接共享挂载；未读文件内容、未修改远端数据或部署代码。
+- T6 旧写入路径保护：新增 app 回归用例，确认 live directory source 开启时通用 upload、Syncthing receive、file-operation 与 restore 均在进入 Store 前失败关闭，避免 revision 物化覆盖共享目录内容。复核确认现有 file-operation/restore 数据库事务仍会排队 revision 物化并禁止活动 Host 绑定；须先补齐同目录安全变更与耐久幂等回执，才能开放这些接口。定向用例及 `go test ./internal/app -count=1` 通过；通用 receive 与旧文件编辑/恢复功能仍未改造。
+- T6 文件移动：`workspacecurrent.Store.MoveRegularFile` 使用 Linux dirfd、`O_NOFOLLOW` 和 `renameat2(RENAME_NOREPLACE)`，同时核验摘要与权限位，并只接受目标摘要及权限位均匹配的重试；PC 项目上传已用它原子移动内容与模式均未变化的重命名文件，其他变更仍按既有安全写入与删除路径处理。存储原语有 LinuxKit 非 root 测试，应用层通过替身验证重命名选择与结果；通用 file-operation 仍保持失败关闭。
 - T2/T3 共享目录用例：新增 DSH 工具直接读取实时目录、从 live tree 生成历史快照、Agent 原子写入后 Host 文件内容保持可见，以及同一路径与 Host 内容冲突时不覆盖的测试。本轮 `go test ./...` 通过，Linux `workspacecurrent` 测试包交叉编译通过；当前主机为 macOS，Linux 专属写入测试未实际运行，真实 Sandbox 挂载仍未验收。
 - 实时目录边界：工具和 revision 写入门禁按当前用户的稳定 Agent Workspace 映射判定，其他 Workspace 继续使用旧 revision 路径；启动恢复跳过已结清的 Agent Workspace 物化，并在仍有接收或物化任务时失败关闭。`go test ./...` 服务端全包通过；未运行真实云端电脑或共享 Sandbox 挂载验收。
 - T6 采用流程：`portal workspace adopt-agent` 参数边界测试、Portal/Store 编译检查通过；一次性本机 PostgreSQL 集成测试覆盖空 Agent Workspace 采用、重复采用、保留停止 Host 来源绑定并刷新绑定 revision、活动/失败 Host、未结清同步、同步冲突、过期 revision、pending/ready 卷及缺少导入审计时拒绝。未运行真实 Docker 卷导入或切流。
@@ -81,3 +83,6 @@
 - 本轮 Linux 路径操作复核：修正符号链接写入的模式校验和符号链接父路径错误映射，并修正越界测试样例。补充低权限旧目录重命名前临时提升所有者访问位、回滚时恢复原权限；实现已通过编译，但当前 Docker LinuxKit v7.0.12 在 `seccomp=unconfined` 与 privileged 容器中仍对 `openat2` 返回 `ENOSYS`，Linux 专属用例无法运行。macOS `go test ./internal/storage/workspacecurrent`、服务端 app 全包、PostgreSQL 项目上传/Host 切换定向用例、`go vet` 与 `git diff --check` 通过；Linux 测试二进制交叉编译通过。低权限目录重命名修复仍待真实 Linux 验证。
 - 本轮 LinuxKit 后续复测：交叉编译 `workspacecurrent` Linux amd64 测试二进制后，在本机 `morde-cloud-runtime:local` 容器以非 root 用户运行，整包测试 `PASS`。测试覆盖 `openat2` 返回 `ENOSYS` 时逐段 `openat`/`O_NOFOLLOW` 回退，以及 overlayfs 不支持 `AT_EMPTY_PATH` 时的目录权限回退。该结果更新此前“Linux 专属用例无法运行”的记录；真实 Sandbox 共享挂载仍未验收。
 - 本轮 T1/T5 本地验收与回归修复：实际启动源码版 `morde-pc`，连接隔离 Portal 和一次性本机 PostgreSQL 数据库；数据库确认 `hosts=0`。打开主会话“文件”页后，`GET /api/me/agent-workspace` 返回 `200`，创建并初始化唯一 Agent Workspace，UI 显示路径 `~/workspace` 与空目录；加入临时哨兵文件后 UI 可见，清理文件后 UI 恢复为空。初次运行暴露 revision 0 尚无目录时被误判为漂移并返回 409；修正 `materializeWorkspaceCurrentForReceive`，只在无现存 revision 0 目录时直接创建初始目录，现存目录继续验证；新增 `TestInitialCurrentMaterializationCreatesMissingWorkspaceDirectory`，定向 app 测试通过。所有测试数据与服务均为本地临时资源。
+- 本轮 T6 重命名上传：PC 项目上传对内容和模式均未变化的文件重命名调用 `MoveRegularFile`，避免重写文件数据；应用层重命名回归测试与 `go test ./internal/app ./internal/storage/workspacecurrent -count=1` 通过。该测试不替代真实 Linux Sandbox 共享挂载或 PC 项目同步验收。
+- 本轮重命名并发校验：底层移动和重试增加预期权限位核验，防止内容相同但权限已变的目标被误认为应用完成；Go app/storage 包测试及本机 Docker LinuxKit amd64 非 root 存储包测试通过。实际 morde-pc 当前停在登录页，本机 Portal 未运行，项目上传客户端验收未进行。
+- 本轮强绑定边界复核：统一校验 Host 唯一活动绑定必须对应所有者稳定 Agent Workspace，并覆盖 Host 恢复、进入、续期、重试同步、电脑/MCP/任务/定时任务授权、Runtime 副本及 Host 文件读取。新增遗留绑定拒绝用例；`go test ./internal/app -count=1` 与完整 `go test ./...` 通过。该保护使旧绑定 Host 在 T6 逐用户迁移或安全删除前不能继续使用。

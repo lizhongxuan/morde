@@ -19,33 +19,51 @@
 
 ## 实施任务
 
-- [ ] **W01（未开始）确定保留和可清理范围**
+- [x] **W01（完成）确定保留和可清理范围**
   - 修改：核对 `web/portal/src/App.tsx`、`web/mobile`、`web/workbench`、桌面打包与本地 Portal、iOS 工作台、`server/internal/api/static.go` 及 Gateway；在本清单记录各页面、资源、脚本和配置的调用方、用途、证据与三类归属。核对后台入口、旧版 PC 所需页面、下载入口和跨端功能；明确已有缺口，不把尚未接通的功能写成已完成。
   - 验收：每个拟删除项均记录调用方及处置，确认没有后台、PC、iOS、服务端、构建或旧 PC 过渡所需引用；专属旧测试随之调整或删除，仍有价值的测试保留。仅凭名称或搜索无结果不足以证明可删；未知依赖列为待确认并保留。
+- 盘点证据（2026-11-19）：
 
-- [ ] **W02（未开始，依赖 W01）保障后台与 PC 构建资源**
-  - 修改：按需调整 `web/portal/vite.config.ts`、入口和构建脚本，以及 `clients/desktop/harness/desktop/electron-builder.yml` 的资源输入；区分后台发布资源与 PC 安装包资源，保留双方实际使用的共享代码、图片、样式和动态依赖。修正后台产物的资源 URL 与服务端静态路径不匹配问题。
+  | 分类 | 项目及证据 | 处置 |
+  | --- | --- | --- |
+  | 继续使用 | `web/portal/src/App.tsx` 中普通用户路由由桌面 `electron-builder.yml` 内嵌的 `dist/index.html`、`assets/`、`ocr/` 加载；`morde-local-portal.ts` 明确拦截本地 `/admin` 与 `/app`。 | 保留 PC 用户界面、OCR 与共享入口；桌面改用 `build:pc`，不把后台产物放入安装包。 |
+  | 继续使用 | 后台由 `web/portal/admin/index.html`、`src/admin-main.tsx` 和 `/admin/*` 路由承载；`static.go` 只从 `admin/` 子目录读取后台文件。旧后台 HTML 引用根 `/assets/` 时，在关闭旧 PC 静态路由后会取不到资源。 | 保留后台页面、权限与 API；单独构建到 `dist/admin/assets/`，URL 使用 `/admin/assets/`。 |
+  | 继续使用 | `web/workbench`、`/__ch/wb/*`、Host 票据、Portal 账号/API、MCP 和下载接口由 PC、iOS、Gateway 或旧 PC 过渡使用；`CH_PORTAL_LEGACY_PC_ENABLED` 默认启用。 | 不删除、不改接口合同、不修改部署默认值。 |
+  | 已确认可移除 | `web/mobile/src/main.tsx` 只加载 `src/morde/App.tsx`，其四个页面是对话、云端电脑、项目和通知；相同用户入口已在 PC Portal 的 Assistant、Hosts、Workspaces、Notifications 页面中提供。`/app/*` 在 `static.go` 和本地 Portal 中始终返回 404；当前部署不构建或打包 `web/mobile`。 | 删除 Morde 手机 Web 入口、构建配置、构建产物及复制脚本/专属测试；不改服务端 `/app/*` 404 规则。 |
+  | 需保留的共享数据 | `web/mobile/src/ideas/ideas.en.json`、`ideas.zh.json` 被 `clients/desktop/harness/dsh-nanomuse/tests/fences.test.mjs` 用作 PC/iOS 灵感数据一致性校验基准。 | 迁至 `web/shared/ideas/`，PC 测试继续逐字节核验，不丢数据。 |
+  | 待保留参考 | 原 `web/mobile/MORDE.md` 标明 `src/main.tsx` 以外的 NanoMuse Web 源码只作本地参考，不进入 Morde 页面入口；源码和素材没有被服务端、PC 或 iOS 构建引用。 | 保留原参考源码与素材，移除 Morde 手机 Web 产品入口后更新为 `web/mobile/README.md`；不作为产品构建/发布输入，旧版升级或用户数据未证实，不清理。 |
+  | 已确认失效入口 | iOS `NanoMuseHub.webConsoleURL` 指向已固定 404 的 `/app/`，仅被 `NanoMuseDevicesSection` 的复制网页链接区块使用；该区块之外的本机开关、设备列表、忘记设备和跨端消息功能均保留。 | 只删除失效链接和对应文案，不改设备管理/Hub 协议。 |
+  | 已确认失效入口 | 管理侧栏和后台无权限页跳回 `/`，复用的后台登录页仍显示 PC `/download` 链接。 | 移除跳转并提供管理员账号切换；下载入口仅从普通用户 PC 登录页保留。 |
+
+- [ ] **W02（进行中，依赖 W01）保障后台与 PC 构建资源**
+  - 修改：`vite.config.ts` 只构建 PC 用户入口；新增 `vite.admin.config.ts` 将后台入口和静态依赖写入 `dist/admin/assets/`，`build` 依次生成两套产物，桌面打包脚本只调用 `build:pc`。`electron-builder.yml` 原有过滤已只包含根 `index.html`、`assets/`、`ocr/`，不包含 `admin/`，因此保留不变。修正后台产物 URL 与 `serveAdmin` 路径不匹配问题。
   - 验收：在隔离目录生成真实构建产物，核对后台 HTML 和动态加载所需资源及其 URL、产物位置；PC 安装包仍包含用户界面和工作台所需资源。关闭兼容后的实际服务端资源加载及对外范围由 W03 验证；不得仅凭构建成功认定客户端可用。
+  - 已验证：Portal TypeScript 检查通过；临时目录分别生成 PC 和后台产物，PC 入口引用 `/assets/`，后台入口引用的 JS、CSS、图片均位于 `/admin/assets/` 且文件存在。桌面资源过滤和本机 `morde-pc` 登录窗口已核对；未生成新的安装包，安装包内实际交互由 W07 继续验证。
 
-- [ ] **W03（未开始，依赖 W01、W02）收口服务端静态路由**
+- [x] **W03（完成，依赖 W01、W02）收口服务端静态路由**
   - 修改：按需调整 `server/internal/api/static.go`、相关静态路由测试和部署资源配置；只对后台实际需要的构建资源提供访问，保留下载路径及已有网关和 API。`CH_PORTAL_LEGACY_PC_ENABLED` 继续保留过渡能力，仅在本机测试两种状态，不提前关闭部署兼容。
   - 验收：兼容启用时旧 PC 所需页面和资源仍可取；关闭时用浏览器 HTML 请求验证 `/`、`/assistant`、`/login`、`/register`、`/download`、旧深链及 `/app/*` 返回 404。后台深链、实际 JS/CSS/图片、下载路径规则、业务 API 和工作台授权不受影响；只供独立用户 Web 使用的资源不对外发布，无权限及非法路径仍被拒绝。
+  - 已验证：`static.go` 保持原逻辑且未更改部署默认值。服务端 Router 用例分别通过旧 PC 兼容启用/关闭两种状态；关闭时 `/app/`、用户 Portal、根 `/assets/` 返回 404，后台 HTML 与 `/admin/assets/admin.js` 可访问，现有下载 GET、HEAD、Range、文件名限制用例通过。后台生产资源路径由 W02 的隔离构建核对。
 
-- [ ] **W04（未开始，依赖 W01）清除失效入口**
+- [ ] **W04（进行中，依赖 W01）清除失效入口**
   - 修改：核对 `web/portal/src/routes/admin/AdminLayout.tsx`、`web/portal/src/App.tsx` 的后台无权限页，以及后台复用的 `web/portal/src/routes/Login.tsx` 下载链接；移除指向已下线用户页面的引导，或改为已有且可用的 PC 获取入口。共享组件只调整受影响的后台场景，保留 PC 本机注册和下载路径。检查客户端和使用说明中同类链接；iOS 中的 `NanoMuseHub`、`NanoMuseDevicesSection` 先核实其实际目标和用途，再处理确实失效的入口。
   - 验收：在本机管理后台的登录、侧栏、无权限和退出流程检查无失效跳转，正常管理操作与角色限制不变；从实际 PC 检查共用登录、注册及本地下载入口不因后台调整损坏。iOS 原有设备功能不受影响。
+  - 已验证：本地 mock 后台总览/侧栏/退出后登录页；组件测试覆盖无权限用户返回 `/admin/login` 并可切换管理员、后台不显示 PC 下载/注册入口、普通用户登录保留 PC 下载入口。iOS `Morde` scheme 编译通过。实际 PC 登录、注册和本地安装包下载尚未对真实服务操作。
 
 - [ ] **W05（待验证，依赖 W01、W02）验证旧版过渡和状态保全**
   - 修改：复用原清单 U01、U04、U15 的旧版、安装包和升级证据；核对用户获得新版的路径、旧 PC 实际依赖、有效凭证、服务端会话及可识别草稿和待发送内容。来源或结果不明的状态保留并提示，不自动重发。
   - 验收：使用本机已有旧版和隔离数据验证升级及必要状态；旧安装包、升级渠道或用户过渡情况无法确认时保持待验证，旧入口及所需资源继续保留。不发送安装包或文件。
 
-- [ ] **W06（未开始，依赖 W01～W04；涉及旧版的项另依赖 W05）逐项清理已确认的遗留物**
+- [ ] **W06（进行中，依赖 W01～W04；涉及旧版的项另依赖 W05）逐项清理已确认的遗留物**
   - 修改：依据 W01 的证据清理独立用户 Web 专属且不再被使用的源码、资源、脚本、测试、部署配置与当前使用说明；检查 `web/portal/scripts/copy-morde-mobile.mjs`、相关测试和 `web/mobile` 的用途，不预设整个目录可以删除。旧版过渡未完成时保留其所需代码与资源，历史记录不抹除。
   - 验收：逐项检查变更差异、剩余调用方和构建引用，相关测试随调用方调整；保留或待确认的项目仍在。构建、安装与更新说明准确区分新版 PC 和旧版过渡需求，且未丢掉后台、PC、iOS 或工作台所需资源。
+  - 已清理：删除旧手机 Morde 页面入口、Morde 专属实现/测试、Vite 与 npm 构建文件、已编译 `/app` 资源、移动端复制脚本和对应测试；把两份灵感 JSON 迁至 `web/shared/ideas/`，桌面测试继续核验 PC、iOS 和共享数据逐字节一致。更新中、英、日 README 与单机部署检查。NanoMuse Web 参考源码和素材保留并标为非构建输入；PC、后台、工作台、安装包、下载、API 和 `/app/*` 404 规则未删除。
 
-- [ ] **W07（未开始，依赖 W02～W04；W06 后复验）四端回归**
+- [ ] **W07（进行中，依赖 W02～W04；W06 后复验）四端回归**
   - 修改：复用现有 Portal、桌面、iOS、服务端与 Gateway 的相关测试；仅为本次变化补充必要的回归用例。记录环境、实际操作、结果和未覆盖范围。
   - 验收：可先验证已完成的改动，W06 每轮清理后复验。在本机受控服务和内置浏览器检查后台登录、管理操作、深链和资源；启动实际 `morde-pc`，从客户端验证登录、对话/任务、项目与文件夹同步入口、云端电脑和工作台；在 iOS 原生端或模拟器验证受影响入口及同账号会话接续。检查授权隔离、任务断线恢复和不重复执行；文件传输不执行，无法实测的能力标待验证，浏览器预览和构建不能代替 PC 实测。
+  - 本轮已验证（2026-11-19）：隔离的 PC/后台生产构建与 URL；服务端旧 PC 路由两种状态和受限下载用例；Portal 受影响页面 19 项测试、改动文件 ESLint；PC/iOS Ideas 一致性 6 项测试；部署配置测试；iOS Simulator `Morde` scheme 编译成功。内置浏览器本地 MSW 模式打开后台总览并退出到 `/admin/login`，后台侧栏无 PC 切换链接，登录页无注册或下载链接。实际 `morde-pc` 已打开并显示登录页；未输入账号或密码、未登录实际服务。
+  - 未覆盖：PC 实际账号登录、对话/任务、文件夹同步与工作台联调；iOS 模拟器交互和跨端会话接续；真实服务/Gateway 授权、旧版升级与文件传输。它们需本地可用的受控服务及账号/旧版安装包；文件传输继续遵守不发送文件约束。整套 Portal lint/test 另有未触及文件的检查失败：lint 在 `Assistant.tsx`、`Codex.tsx` 报错；809 项测试中 21 项在 AdminOverview、Reviews、PersonalData、Assistant 相关文件失败，其余 788 项通过。未为这些无关失败修改代码。
 
 - [ ] **W08（阻塞，依赖 W05～W07 及原清单 U17 相关准出）最终下线与回退核对**
   - 修改：仅在本机核对关闭兼容、旧资源不再被发布及恢复兼容的完整路径；更新对应构建、安装和回退说明，保留后台、下载、API 和客户端所需工作台资源。

@@ -50,7 +50,6 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         input: {
           portal: resolve(portalRoot, "index.html"),
-          admin: resolve(portalRoot, "admin/index.html"),
         },
       },
     },

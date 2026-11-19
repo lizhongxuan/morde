@@ -163,6 +163,19 @@ func (s *credentialHosts) GetHost(_ context.Context, id string) (host.Host, erro
 	return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
 }
 
+func (s *credentialHosts) GetWorkspaceBindingsByHost(_ context.Context, hostID string) ([]workspace.Binding, error) {
+	for _, value := range s.values {
+		if value.ID == hostID {
+			return append([]workspace.Binding(nil), value.Workspaces...), nil
+		}
+	}
+	return nil, domain.NewError(domain.CodeNotFound, "host not found")
+}
+
+func (s *credentialHosts) IsAgentWorkspaceWorkspace(_ context.Context, ownerID, workspaceID string) (bool, error) {
+	return ownerID != "" && workspaceID == "w1234567", nil
+}
+
 func (s *credentialHosts) ListHostsByOwner(_ context.Context, ownerID string) ([]host.Host, error) {
 	if s.listErr != nil {
 		return nil, s.listErr

@@ -98,6 +98,10 @@ func TestHostReplicaAppliesAndActivatesOnlyCurrentBindingRevision(t *testing.T) 
 	if _, err := service.AuthenticateWorkspace(ctx, scopedCredential); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("AuthenticateWorkspace() with superseded binding credential error = %v, want workspace conflict", err)
 	}
+	workspaces.agentWorkspaceMismatch = true
+	if _, err := service.ScopeWorkspace(ctx, principal, workspaceValue.ID, binding.BindingVersion+1); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("ScopeWorkspace() after Agent Workspace mapping changes error = %v, want workspace conflict", err)
+	}
 	hostValue.State = host.StateDeleting
 	hosts.values[hostValue.ID] = hostValue
 	if _, err := service.Authenticate(ctx, hostValue.ID, hostValue.RuntimeGeneration, replicaCredential); domain.CodeOf(err) != domain.CodeUnauthenticated {
@@ -146,6 +150,42 @@ func TestHostReplicaRejectsHostWithMultipleWorkspaceBindings(t *testing.T) {
 	}
 	if _, err := service.ListBindings(ctx, principal); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("ListBindings() with multiple bindings error = %v, want workspace conflict", err)
+	}
+}
+
+func TestHostReplicaRejectsLegacyWorkspaceBinding(t *testing.T) {
+	ctx := context.Background()
+	sealer, err := NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostValue := hostServiceTestHost(host.StateRunning)
+	sealHostServiceTestKey(t, sealer, &hostValue)
+	workspaceValue := workspace.Workspace{ID: "w7654321", OwnerID: hostValue.OwnerID, State: workspace.StateReady}
+	binding := testWorkspaceBinding(hostValue.ID, hostValue.OwnerID, workspaceValue.ID, workspace.BindingActive)
+	binding.Workspace = workspaceValue
+	workspaces := &hostServiceTestWorkspaceStore{
+		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
+		bindings: map[string]workspace.Binding{hostValue.ID + "/" + workspaceValue.ID: binding},
+	}
+	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
+	service, err := NewHostReplicaService(
+		&hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}, workspaces, users, sealer,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCredential, err := sealer.Open(hostValue.RuntimeCredentialEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := service.Authenticate(ctx, hostValue.ID, hostValue.RuntimeGeneration, hostReplicaCredential(runtimeCredential))
+	clear(runtimeCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ScopeWorkspace(ctx, principal, workspaceValue.ID, binding.BindingVersion); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("ScopeWorkspace() for legacy binding = %v, want workspace conflict", err)
 	}
 }
 

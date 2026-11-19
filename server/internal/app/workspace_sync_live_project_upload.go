@@ -13,6 +13,10 @@ import (
 	"morde/server/internal/storage/workspacecurrent"
 )
 
+type workspaceCurrentRegularFileMover interface {
+	MoveRegularFile(context.Context, string, string, string, string, string, uint32) error
+}
+
 func (s *WorkspaceSyncService) readLiveProjectManifest(ctx context.Context, ownerID, workspaceID, projectRoot string) ([]workspace.File,
 	[]string, []workspace.Directory, error) {
 	live, err := readWorkspaceLiveSnapshot(ctx, s.currentDirectory, ownerID, workspaceID, s.maxOwnerBytes)
@@ -218,8 +222,47 @@ func (s *WorkspaceSyncService) applyLiveProjectUpload(ctx context.Context, plan 
 		}
 		return nil, err
 	}
+	movedSources, movedTargets := map[string]struct{}{}, map[string]struct{}{}
+	if mover, ok := s.currentDirectory.(workspaceCurrentRegularFileMover); ok {
+		deletedPaths := append([]string(nil), session.UploadDeletedPaths...)
+		sort.Strings(deletedPaths)
+		projectRoot := session.Scope[0]
+		for _, desired := range session.UploadFiles {
+			targetKey := strings.ToLower(desired.Path)
+			if _, exists := files[targetKey]; exists || workspace.CanonicalFileKind(desired.Kind) != workspace.FileKindRegular {
+				continue
+			}
+			for _, sourcePath := range deletedPaths {
+				sourceKey := strings.ToLower(sourcePath)
+				if _, moved := movedSources[sourceKey]; moved {
+					continue
+				}
+				if _, planned := deletedFiles[sourceKey]; !planned || workspaceFilePathContains(sourceKey, targetKey) || workspaceFilePathContains(targetKey, sourceKey) {
+					continue
+				}
+				source, exists := files[sourceKey]
+				base, pinned := pinnedFiles[sourceKey]
+				if !exists || !pinned || !projectPathWithinRoot(source.Path, projectRoot) || !projectPathWithinRoot(desired.Path, projectRoot) ||
+					!directProjectFilesMatch(source, base, true) || !directProjectFilesMatch(source, desired, true) {
+					continue
+				}
+				if err := mover.MoveRegularFile(ctx, ownerID, session.WorkspaceID, source.Path, desired.Path, source.SHA256, desired.Mode); err != nil {
+					if errors.Is(err, workspacecurrent.ErrWriteConflict) || errors.Is(err, workspacecurrent.ErrUnsafePath) || errors.Is(err, os.ErrExist) || errors.Is(err, os.ErrNotExist) {
+						return []workspace.Conflict{{Path: source.Path, Reason: "content_changed", LocalSHA256: stringPointer(desired.SHA256), RemoteSHA256: stringPointer(source.SHA256)}}, nil
+					}
+					return nil, err
+				}
+				movedSources[sourceKey] = struct{}{}
+				movedTargets[targetKey] = struct{}{}
+				break
+			}
+		}
+	}
 	for _, desired := range session.UploadFiles {
 		key := strings.ToLower(desired.Path)
+		if _, moved := movedTargets[key]; moved {
+			continue
+		}
 		current, exists := files[key]
 		if desiredCurrentFileMatches(current, exists, desired) {
 			continue
@@ -251,6 +294,9 @@ func (s *WorkspaceSyncService) applyLiveProjectUpload(ctx context.Context, plan 
 	}
 	for _, filePath := range session.UploadDeletedPaths {
 		key := strings.ToLower(filePath)
+		if _, moved := movedSources[key]; moved {
+			continue
+		}
 		current, exists := files[key]
 		if !exists {
 			continue

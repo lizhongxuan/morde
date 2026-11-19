@@ -452,11 +452,18 @@ class DeploymentTests(unittest.TestCase):
         ):
             self.assertIn(entry, installer)
 
-    def test_automated_portal_gate_builds_admin_ui_without_a_mobile_web_app(self):
+    def test_automated_portal_gate_builds_separate_admin_ui_without_mobile_web_bundle(self):
         gates = (ROOT / "verify/05-automated.sh").read_text()
-        package = json.loads((ROOT.parents[1] / "web/portal/package.json").read_text())
+        repository = ROOT.parents[1]
+        package = json.loads((repository / "web/portal/package.json").read_text())
         self.assertIn("npm run build", gates)
-        self.assertNotIn("web/mobile run build", package["scripts"]["build"])
+        self.assertEqual(package["scripts"]["build"], "npm run build:pc && npm run build:admin")
+        self.assertEqual(package["scripts"]["build:admin"], "vite build --config vite.admin.config.ts")
+        self.assertNotIn("copy-morde-mobile", package["scripts"]["test"])
+        self.assertFalse((repository / "web/mobile/package.json").exists())
+        self.assertFalse((repository / "web/mobile/src/main.tsx").exists())
+        desktop = json.loads((repository / "clients/desktop/harness/desktop/package.json").read_text())
+        self.assertIn("web/portal run build:pc", desktop["scripts"]["build:portal"])
 
     def test_desktop_bundles_user_portal_while_legacy_server_routes_are_gated(self):
         repository = ROOT.parents[1]

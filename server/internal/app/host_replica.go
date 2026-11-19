@@ -335,6 +335,9 @@ func (s *hostReplicaService) verifyPrincipal(ctx context.Context, principal iden
 	if user.Status != identity.StatusApproved {
 		return domain.NewError(domain.CodeUnauthenticated, "host replica owner is unavailable")
 	}
+	if _, err := requireAgentWorkspaceHostBinding(ctx, s.workspaces, principal.HostScope, principal.UserID); err != nil {
+		return err
+	}
 	return nil
 }
 

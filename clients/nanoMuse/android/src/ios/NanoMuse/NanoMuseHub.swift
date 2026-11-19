@@ -146,8 +146,6 @@ final class NanoMuseHub: ObservableObject {
         }
     }
 
-    var webConsoleURL: String { NanoMuseCloud.baseURL + "/app/" }
-
     /// The other devices of the account: never this phone, never a browser tab.
     var others: [HubDevice] { devices.filter { $0.id != deviceId && $0.kind != "web" } }
 

@@ -155,6 +155,121 @@ func removeWorkspaceCurrentRegularFile(root, relativePath, expectedSHA256 string
 	return unix.Fsync(int(parent.Fd()))
 }
 
+func moveWorkspaceCurrentRegularFile(root, sourcePath, targetPath, expectedSHA256 string, expectedMode uint32) error {
+	sourceParent, sourceName, err := openWorkspaceCurrentParent(root, sourcePath, false)
+	if errors.Is(err, unix.ENOENT) {
+		return verifyMovedWorkspaceCurrentRegularFile(root, targetPath, expectedSHA256, expectedMode)
+	}
+	if err != nil {
+		return err
+	}
+	defer sourceParent.Close()
+	targetParent, targetName, err := openWorkspaceCurrentParent(root, targetPath, false)
+	if err != nil {
+		return err
+	}
+	defer targetParent.Close()
+	sourceFD, targetFD := int(sourceParent.Fd()), int(targetParent.Fd())
+	var sourceEntry unix.Stat_t
+	if err := unix.Fstatat(sourceFD, sourceName, &sourceEntry, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
+		return verifyMovedWorkspaceCurrentRegularFileAt(targetFD, targetName, expectedSHA256, expectedMode)
+	} else if err != nil {
+		return err
+	} else if sourceEntry.Mode&unix.S_IFMT != unix.S_IFREG {
+		return ErrUnsafePath
+	}
+	var targetStat unix.Stat_t
+	if err := unix.Fstatat(targetFD, targetName, &targetStat, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		if targetStat.Mode&unix.S_IFMT != unix.S_IFREG {
+			return ErrUnsafePath
+		}
+		return ErrWriteConflict
+	} else if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	sourceStat, err := verifyWorkspaceCurrentRegularFileAt(sourceFD, sourceName, expectedSHA256, expectedMode)
+	if err != nil {
+		return err
+	}
+	var currentSource unix.Stat_t
+	if err := unix.Fstatat(sourceFD, sourceName, &currentSource, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if currentSource.Mode&unix.S_IFMT != unix.S_IFREG || currentSource.Dev != sourceStat.Dev || currentSource.Ino != sourceStat.Ino {
+		return ErrWriteConflict
+	}
+	// shortcut: Host writers do not take this lock, so same-inode writes can race the digest check; require Host-cooperative locking before promising cross-process CAS.
+	if err := unix.Renameat2(sourceFD, sourceName, targetFD, targetName, unix.RENAME_NOREPLACE); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			var targetStat unix.Stat_t
+			if statErr := unix.Fstatat(targetFD, targetName, &targetStat, unix.AT_SYMLINK_NOFOLLOW); statErr == nil && targetStat.Mode&unix.S_IFMT != unix.S_IFREG {
+				return ErrUnsafePath
+			}
+			return ErrWriteConflict
+		}
+		return err
+	}
+	if err := unix.Fsync(sourceFD); err != nil {
+		return err
+	}
+	return unix.Fsync(targetFD)
+}
+
+func verifyMovedWorkspaceCurrentRegularFile(root, relativePath, expectedSHA256 string, expectedMode uint32) error {
+	parent, name, err := openWorkspaceCurrentParent(root, relativePath, false)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return ErrWriteConflict
+		}
+		return err
+	}
+	defer parent.Close()
+	return verifyMovedWorkspaceCurrentRegularFileAt(int(parent.Fd()), name, expectedSHA256, expectedMode)
+}
+
+func verifyMovedWorkspaceCurrentRegularFileAt(parentFD int, name, expectedSHA256 string, expectedMode uint32) error {
+	_, err := verifyWorkspaceCurrentRegularFileAt(parentFD, name, expectedSHA256, expectedMode)
+	if errors.Is(err, unix.ENOENT) {
+		return ErrWriteConflict
+	}
+	return err
+}
+
+func verifyWorkspaceCurrentRegularFileAt(parentFD int, name, expectedSHA256 string, expectedMode uint32) (unix.Stat_t, error) {
+	var before unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return unix.Stat_t{}, err
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return unix.Stat_t{}, ErrUnsafePath
+	}
+	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return unix.Stat_t{}, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	hasher := sha256.New()
+	_, readErr := io.Copy(hasher, file)
+	var opened unix.Stat_t
+	statErr := unix.Fstat(fd, &opened)
+	closeErr := file.Close()
+	if readErr != nil || statErr != nil || closeErr != nil {
+		return unix.Stat_t{}, errors.Join(readErr, statErr, closeErr)
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 || uint32(opened.Mode&0777) != expectedMode ||
+		before.Dev != opened.Dev || before.Ino != opened.Ino {
+		return unix.Stat_t{}, ErrWriteConflict
+	}
+	var current unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return unix.Stat_t{}, err
+	}
+	if current.Mode&unix.S_IFMT != unix.S_IFREG || uint32(current.Mode&0777) != expectedMode || current.Dev != opened.Dev || current.Ino != opened.Ino {
+		return unix.Stat_t{}, ErrWriteConflict
+	}
+	return opened, nil
+}
+
 func writeWorkspaceCurrentSymbolicLink(root, relativePath, target, expectedTarget string) error {
 	parent, name, err := openWorkspaceCurrentParent(root, relativePath, true)
 	if err != nil {

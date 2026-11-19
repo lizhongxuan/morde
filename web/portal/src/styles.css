@@ -1098,7 +1098,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .message-retry { position: absolute; top: 7px; left: -33px; width: 22px; height: 22px; margin: 0; padding: 0; display: grid; place-items: center; border: 1px solid #f0b8b4; border-radius: 50%; color: #c72f2b; background: #fff5f4; font-size: 14px; font-weight: 800; line-height: 1; cursor: pointer; }
 .assistant-page .message-retry:hover:not(:disabled) { border-color: #d94039; background: #ffe9e7; }
 .assistant-page .message-retry:disabled { cursor: wait; opacity: .55; }
-.assistant-page .chat-message-pending { width: fit-content; max-width: min(82%, 540px); margin: 12px 0 0 auto; }
 .assistant-page .chat-message:focus-visible { outline: 2px solid #9cafff; outline-offset: 2px; }
 .assistant-reply-time { display: block; margin: 5px 0 0 2px; color: #9aa6b5; font-size: 10px; opacity: 0; transition: opacity .15s; }
 .chat-message-row-assistant:hover .assistant-reply-time, .chat-message-row-assistant:focus-within .assistant-reply-time { opacity: 1; }

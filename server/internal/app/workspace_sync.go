@@ -1398,6 +1398,9 @@ func (s *WorkspaceSyncService) authorize(ctx context.Context, principal identity
 		if err := s.store.CheckWorkspaceSyncHostReplicaAccess(ctx, principal); err != nil {
 			return workspace.Workspace{}, err
 		}
+		if err := requireAgentWorkspaceMapping(ctx, s.store, principal.UserID, workspaceID); err != nil {
+			return workspace.Workspace{}, err
+		}
 	default:
 		return workspace.Workspace{}, domain.NewError(domain.CodeForbidden, "workspace synchronization is not allowed for this credential")
 	}

@@ -269,6 +269,24 @@ func TestWorkspaceRestoreRequiresSelectedPathsAndReplaysIdempotently(t *testing.
 	}
 }
 
+func TestWorkspaceRestoreStaysDisabledWhenLiveDirectoryIsAuthoritative(t *testing.T) {
+	base := newSyncServiceStore()
+	base.workspace.Revision = 2
+	base.snapshots[1], base.snapshots[2] = []workspace.File{}, []workspace.File{}
+	store := &workspaceRestoreTestStore{syncServiceStore: base}
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.liveDirectorySource = true
+	service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	principal := identity.Principal{UserID: base.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	command := WorkspaceRestoreCommand{TargetRevision: 1, ExpectedCurrentRevision: 2, Paths: []string{"file.txt"}}
+	if _, err := service.Restore(context.Background(), principal, base.workspace.ID, command, "live-restore-01"); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable || store.restoreCalls != 0 {
+		t.Fatalf("revision restore in live mode = %v, Store calls=%d; want unavailable without mutation", err, store.restoreCalls)
+	}
+}
+
 func TestWorkspaceRestoreMaterializationFailureReturnsRetryableConflict(t *testing.T) {
 	base := newSyncServiceStore()
 	base.workspace.Revision = 2

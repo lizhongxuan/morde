@@ -448,6 +448,22 @@ func TestHostServiceAdvanceCreateRejectsStaleWorkspaceBeforeSandbox(t *testing.T
 	}
 }
 
+func TestHostServiceRestoreRejectsLegacyWorkspaceBeforeStartingComputer(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateStopped)
+	value.Workspaces[0].Workspace.ID = "w7654321"
+	value.Workspaces[0].Directory = "w7654321"
+	deps.hosts.addHost(value)
+	hostServiceTestAddBinding(deps, value)
+	if _, err := service.Restore(context.Background(), hostServiceTestPrincipal(), value.ID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("Restore() for legacy Workspace-bound computer error = %v, want workspace conflict", err)
+	}
+	stored, err := deps.hosts.GetHost(context.Background(), value.ID)
+	if err != nil || stored.State != host.StateStopped || deps.sandbox.createCalls != 0 {
+		t.Fatalf("legacy computer after rejected start = state %q, sandbox creates %d, err %v; want stopped/0", stored.State, deps.sandbox.createCalls, err)
+	}
+}
+
 func TestHostServiceAdvanceCreateRecoversMetadataAndDeletesDuplicates(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateCreating)
@@ -972,6 +988,7 @@ func TestHostServiceAPIKeyHasDynamicHostAndComputerAccess(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateRunning)
 	deps.hosts.addHost(value)
+	hostServiceTestAddBinding(deps, value)
 	principal := identity.Principal{
 		UserID: value.OwnerID, Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "t1234567",
 		HostIDs: []string{value.ID}, Scopes: []identity.Scope{identity.ScopeComputerObserve},
@@ -985,6 +1002,22 @@ func TestHostServiceAPIKeyHasDynamicHostAndComputerAccess(t *testing.T) {
 	}
 	if _, err := service.GetForComputer(context.Background(), principal, value.ID, identity.ScopeHostRead); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("GetForComputer() with non-computer scope error = %v", err)
+	}
+}
+
+func TestHostServiceComputerAccessRejectsLegacyWorkspaceBinding(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateRunning)
+	value.Workspaces[0].Workspace.ID = "w7654321"
+	value.Workspaces[0].Directory = "w7654321"
+	deps.hosts.addHost(value)
+	hostServiceTestAddBinding(deps, value)
+	principal := identity.Principal{
+		UserID: value.OwnerID, Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "t1234567",
+		HostIDs: []string{value.ID}, Scopes: []identity.Scope{identity.ScopeComputerObserve},
+	}
+	if _, err := service.GetForComputer(context.Background(), principal, value.ID, identity.ScopeComputerObserve); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("GetForComputer() for legacy Workspace binding = %v, want workspace conflict", err)
 	}
 }
 
@@ -1337,7 +1370,7 @@ func (p *hostServiceTestDefaultWorkspaceProvider) EnsureAgentWorkspace(_ context
 func (p *hostServiceTestDefaultWorkspaceProvider) IsAgentWorkspaceWorkspace(_ context.Context, ownerID, workspaceID string) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.agentHistory[workspaceID] == ownerID, nil
+	return p.agentHistory[workspaceID] == ownerID || (ownerID == "u1234567" && workspaceID == "w1234567"), nil
 }
 
 type hostServiceTestWorkspaceVolumes struct {
@@ -2038,9 +2071,10 @@ func cloneHostServiceHost(value host.Host) host.Host {
 }
 
 type hostServiceTestWorkspaceStore struct {
-	mu       sync.Mutex
-	values   map[string]workspace.Workspace
-	bindings map[string]workspace.Binding
+	mu                     sync.Mutex
+	values                 map[string]workspace.Workspace
+	bindings               map[string]workspace.Binding
+	agentWorkspaceMismatch bool
 }
 
 func (s *hostServiceTestWorkspaceStore) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
@@ -2051,6 +2085,13 @@ func (s *hostServiceTestWorkspaceStore) GetWorkspace(_ context.Context, id strin
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	return value, nil
+}
+
+func (s *hostServiceTestWorkspaceStore) IsAgentWorkspaceWorkspace(_ context.Context, ownerID, workspaceID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[workspaceID]
+	return ok && value.OwnerID == ownerID && workspaceID == "w1234567" && !s.agentWorkspaceMismatch, nil
 }
 
 func (s *hostServiceTestWorkspaceStore) ListWorkspacesByOwner(_ context.Context, ownerID string) ([]workspace.Workspace, error) {

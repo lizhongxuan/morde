@@ -160,6 +160,19 @@ func TestWorkspaceFileOperationUsesExpectedRevisionIdempotencyAndMaterialization
 	}
 }
 
+func TestWorkspaceFileOperationStaysDisabledWhenLiveDirectoryIsAuthoritative(t *testing.T) {
+	base := newSyncServiceStore()
+	store := &workspaceFileOperationTestStore{syncServiceStore: base}
+	service := newWorkspaceFileOperationTestService(t, store)
+	service.liveDirectorySource = true
+	service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	principal := identity.Principal{UserID: base.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	command := WorkspaceFileOperationCommand{Action: WorkspaceFileDelete, SourcePath: "notes.txt", ExpectedCurrentRevision: 0, WriteEnabled: true}
+	if _, err := service.ApplyFileOperation(context.Background(), principal, base.workspace.ID, command, "live-file-op-01"); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable || store.calls != 0 {
+		t.Fatalf("revision file operation in live mode = %v, Store calls=%d; want unavailable without mutation", err, store.calls)
+	}
+}
+
 func TestWorkspaceFileOperationMoveValidatesSymlinkAtNewPath(t *testing.T) {
 	file := syncServiceFile("a/b/current", []byte("../../target"))
 	file.Kind, file.SymlinkTarget, file.Mode, file.Chunks = workspace.FileKindSymlink, "../../target", 0, []workspace.Chunk{}

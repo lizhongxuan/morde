@@ -14,9 +14,9 @@ vi.mock('../app/api', () => ({
   errorDetails: (reason: Error & { code?: string }) => ({ code: reason.code, message: reason.message }),
 }));
 
-function renderRoute(path: string) {
+function renderRoute(path: string, currentUser: unknown = null) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['auth', 'me'], null);
+  client.setQueryData(['auth', 'me'], currentUser);
   render(<ToastProvider><ToastNoticeCenter autoOpenErrors overlay /><QueryClientProvider client={client}><AuthProvider><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/register" element={<Register />} />
     <Route path="/login" element={<Login />} />
@@ -118,6 +118,18 @@ describe('registration page', () => {
   it('keeps registration off the administrator login page', () => {
     renderRoute('/admin/login');
     expect(screen.queryByRole('link', { name: '注册账号' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '下载 morde-pc' })).not.toBeInTheDocument();
+  });
+
+  it('lets a non-admin switch accounts from the administrator login page', () => {
+    renderRoute('/admin/login', { id: 'u1234567', name: 'user', role: 'user' });
+    expect(screen.getByText('当前账号没有管理权限，请使用管理员账号登录。')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '用户名' })).toBeInTheDocument();
+  });
+
+  it('keeps the PC download link on the user login page', () => {
+    renderRoute('/login');
+    expect(screen.getByRole('link', { name: '下载 morde-pc' })).toHaveAttribute('href', '/download');
   });
 
   it('ignores a backslash-based cross-origin login return address', async () => {

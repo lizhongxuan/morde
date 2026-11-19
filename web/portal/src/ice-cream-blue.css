@@ -93,6 +93,12 @@
   border-color: var(--line);
   background: var(--side);
 }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell) .notice-center-panel:has(.toast-error) {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
 .morde-pc-theme .morde-shell:not(.morde-admin-shell) > .morde-topbar {
   color: var(--ink);
   border-color: var(--line);

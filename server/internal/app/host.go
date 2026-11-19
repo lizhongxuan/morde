@@ -136,11 +136,11 @@ func (s *hostService) RetryWorkspaceSync(ctx context.Context, principal identity
 	if hostValue.State != host.StateRunning {
 		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "host must be running to retry workspace sync")
 	}
-	binding, err := s.workspaces.GetWorkspaceBinding(ctx, hostID, workspaceID)
+	binding, err := requireAgentWorkspaceHostBinding(ctx, s.workspaces, hostID, principal.UserID)
 	if err != nil {
 		return workspace.Binding{}, err
 	}
-	if binding.OwnerID != principal.UserID {
+	if binding.Workspace.ID != workspaceID {
 		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
 	}
 	if binding.BindingVersion != expectedBindingVersion {
@@ -178,19 +178,28 @@ func (s *hostService) GetForComputer(ctx context.Context, principal identity.Pri
 	if err != nil {
 		return host.Host{}, err
 	}
+	binding, err := requireAgentWorkspaceHostBinding(ctx, s.workspaces, value.ID, value.OwnerID)
+	if err != nil {
+		return host.Host{}, err
+	}
+	if binding.State != workspace.BindingActive || binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil ||
+		binding.SyncState != workspace.BindingSyncHealthy {
+		return host.Host{}, domain.NewError(domain.CodeWorkspaceBusy, "Host Agent Workspace is not ready")
+	}
 	return value, nil
 }
 
 type mcpComputerHostAuthorizer struct {
-	hosts   HostStore
-	sharing HostPermissionAuthorizer
+	hosts      HostStore
+	workspaces HostAgentWorkspaceBindingStore
+	sharing    HostPermissionAuthorizer
 }
 
-func NewMCPComputerHostAuthorizer(hosts HostStore, sharing HostPermissionAuthorizer) (MCPComputerHostAuthorizer, error) {
-	if hosts == nil || sharing == nil {
+func NewMCPComputerHostAuthorizer(hosts HostStore, workspaces HostAgentWorkspaceBindingStore, sharing HostPermissionAuthorizer) (MCPComputerHostAuthorizer, error) {
+	if hosts == nil || workspaces == nil || sharing == nil {
 		return nil, fmt.Errorf("MCP Host authorization dependencies are required")
 	}
-	return &mcpComputerHostAuthorizer{hosts: hosts, sharing: sharing}, nil
+	return &mcpComputerHostAuthorizer{hosts: hosts, workspaces: workspaces, sharing: sharing}, nil
 }
 
 func (s *mcpComputerHostAuthorizer) GetForComputer(ctx context.Context, principal identity.Principal, hostID string, scope identity.Scope) (host.Host, error) {
@@ -220,6 +229,14 @@ func (s *mcpComputerHostAuthorizer) GetForComputer(ctx context.Context, principa
 		if _, err := s.sharing.Authorize(ctx, hostID, principal.UserID, host.PermissionMCPControl); err != nil {
 			return host.Host{}, err
 		}
+	}
+	binding, err := requireAgentWorkspaceHostBinding(ctx, s.workspaces, hostID, value.OwnerID)
+	if err != nil {
+		return host.Host{}, err
+	}
+	if binding.State != workspace.BindingActive || binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil ||
+		binding.SyncState != workspace.BindingSyncHealthy {
+		return host.Host{}, domain.NewError(domain.CodeWorkspaceBusy, "Host Agent Workspace is not ready")
 	}
 	return value, nil
 }
@@ -418,23 +435,11 @@ func (s *hostService) Restore(ctx context.Context, principal identity.Principal,
 }
 
 func (s *hostService) requireUsableHostWorkspace(ctx context.Context, principal identity.Principal, hostID, ownerID string) (workspace.Binding, error) {
-	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
+	active, err := requireAgentWorkspaceHostBinding(ctx, s.workspaces, hostID, ownerID)
 	if err != nil {
 		return workspace.Binding{}, err
 	}
-	var active workspace.Binding
-	count := 0
-	for _, binding := range bindings {
-		if binding.State == workspace.BindingDetached {
-			continue
-		}
-		count++
-		active = binding
-	}
-	if count != 1 {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
-	}
-	if active.OwnerID != ownerID || active.Workspace.OwnerID != ownerID || active.Workspace.State != workspace.StateReady ||
+	if active.Workspace.State != workspace.StateReady ||
 		active.Workspace.DeletedAt != nil ||
 		(active.State != workspace.BindingPreparing && active.State != workspace.BindingActive) ||
 		active.SyncState != workspace.BindingSyncHealthy {
@@ -455,6 +460,9 @@ func (s *hostService) Renew(ctx context.Context, principal identity.Principal, h
 		return host.Host{}, err
 	}
 	if err := rejectHostCredential(principal); err != nil {
+		return host.Host{}, err
+	}
+	if _, err := s.requireUsableHostWorkspace(ctx, principal, value.ID, value.OwnerID); err != nil {
 		return host.Host{}, err
 	}
 	if value.State != host.StateRunning {

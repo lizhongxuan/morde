@@ -27,7 +27,7 @@ Morde 参考 Muse 的交互理念：**从对话开始，根据需要使用工具
 | **后台 Web 端** | 管理用户与注册审核、云端电脑、工作区、模型、配置、用量和审计等，使用统一服务端和权限体系。 |
 | **服务端** | Go 服务负责账号、API、任务、数据、授权、网关和后台工作；PostgreSQL 承载业务数据，DSH 提供云端 Agent Runtime，Host Runtime 与 Workspace 同步组件支撑云端电脑和工作区。 |
 
-仓库中的云端运行环境、云端电脑工作台及共享界面代码是上述四端的实现组成，不另构成产品端。`web/mobile/` 中现存的移动 Web 代码作为并入 PC 端的整合来源，其用户功能统一由 PC 端承载，不单独定义为产品端。
+仓库中的云端运行环境、云端电脑工作台及共享界面代码是上述四端的实现组成，不另构成产品端。普通用户界面由 `morde-pc` 和原生 iOS 客户端承载；后台 Web 仅供管理员使用，不提供普通用户 Web 或手机 Web。
 
 ## 能力概览
 
@@ -103,7 +103,7 @@ flowchart TB
 | --- | --- |
 | [`clients/desktop/`](clients/desktop/) · [`web/portal/`](web/portal/) | PC 客户端、本地桥接、PC 用户界面及后台 Web 页面 |
 | [`clients/nanoMuse/`](clients/nanoMuse/) | iOS 原生工程 |
-| [`web/mobile/`](web/mobile/) · [`web/workbench/`](web/workbench/) | 待并入 PC 端的现存移动界面代码与云端电脑工作台实现，均作为 PC 端相关代码，不定义为独立产品端 |
+| [`web/workbench/`](web/workbench/) | PC 与 iOS 共用的云端电脑工作台 |
 | [`server/`](server/) · [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | Go 服务、API、Gateway、MCP、后台任务、数据库迁移及 DSH 云端 Agent Runtime |
 | [`runtime/morde-runtime/`](runtime/morde-runtime/) · [`runtime/morde-sync/`](runtime/morde-sync/) | Host Runtime 与 Workspace 同步引擎 |
 | [`images/`](images/) · [`deploy/`](deploy/) | 运行环境镜像与部署配置 |

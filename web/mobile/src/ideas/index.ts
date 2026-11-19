@@ -1,11 +1,10 @@
 /**
- * The curated Ideas catalogue (contract C5): the same `ideas.en.json` / `ideas.zh.json` the
- * Android app and the harness ship, byte for byte (a test holds them identical). It is what
- * the Ideas page shows until the model has written ideas of its own from what it knows.
+ * The curated Ideas catalogue (contract C5), sourced from the shared repository data and
+ * shipped by the native app and desktop harness byte for byte.
  */
 import type { Idea } from "../types";
-import en from "./ideas.en.json";
-import zh from "./ideas.zh.json";
+import en from "../../../shared/ideas/ideas.en.json";
+import zh from "../../../shared/ideas/ideas.zh.json";
 
 export interface CatalogueIdea {
   id: string;

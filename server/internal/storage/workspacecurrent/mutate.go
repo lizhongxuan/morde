@@ -36,6 +36,18 @@ func (s *Store) RemoveRegularFile(ctx context.Context, ownerID, workspaceID, rel
 	})
 }
 
+// MoveRegularFile atomically moves one regular file to an existing directory without replacing an existing target.
+func (s *Store) MoveRegularFile(ctx context.Context, ownerID, workspaceID, sourcePath, targetPath, expectedSHA256 string, expectedMode uint32) error {
+	if workspace.ValidateRelativePath(targetPath) != nil || sourcePath == targetPath || !validWorkspaceSHA256(expectedSHA256) || expectedMode > 0777 {
+		return errors.New("invalid Workspace current file move")
+	}
+	return s.mutate(ctx, ownerID, workspaceID, sourcePath, func(ownerHash string) error {
+		return moveWorkspaceCurrentRegularFile(s.rootPath,
+			filepath.Join(ownerHash, workspaceID, filepath.FromSlash(sourcePath)),
+			filepath.Join(ownerHash, workspaceID, filepath.FromSlash(targetPath)), expectedSHA256, expectedMode)
+	})
+}
+
 // WriteSymbolicLink creates or replaces one safe Workspace symbolic link using an expected-target check.
 func (s *Store) WriteSymbolicLink(ctx context.Context, ownerID, workspaceID, relativePath, target, expectedTarget string) error {
 	file := workspace.File{Kind: workspace.FileKindSymlink, Path: relativePath, SymlinkTarget: target,

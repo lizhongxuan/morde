@@ -44,7 +44,6 @@ export function AdminLayout() {
         {links.map(({ to, label, icon, end }) => <NavLink className="morde-nav-link" to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
       </nav>
       <div className="morde-sidebar-bottom">
-        <a className="morde-nav-link" href="/" aria-label="切换至 PC 用户端" title="切换至 PC 用户端"><MordeIcon name="link" /><span>切换至 PC 用户端</span></a>
         <div className="morde-profile"><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span><strong>{user?.name}</strong><small>管理员</small></span><button className="button button-quiet button-small" type="button" onClick={() => void logout()}>退出</button></div>
       </div>
     </aside>

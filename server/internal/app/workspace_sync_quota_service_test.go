@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"morde/server/internal/domain"
@@ -90,10 +91,32 @@ func TestWorkspaceSyncFileDeleteRequiresMissingPath(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncReceiveStaysDisabledWhenLiveDirectoryIsAuthoritative(t *testing.T) {
+	base := newSyncServiceStore()
+	store := &quotaReceiveTestStore{syncServiceStore: base}
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.liveDirectorySource = true
+	service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	request := WorkspaceSyncReceiveRequest{OwnerID: base.workspace.OwnerID, WorkspaceID: base.workspace.ID,
+		FolderID: "morde-" + strings.Repeat("a", 32), OperationID: strings.Repeat("a", 64), Path: "file.txt",
+		Operation: WorkspaceSyncReceiveUpsert, TargetBytes: 1}
+	if _, err := service.ReserveWorkspaceSyncReceive(context.Background(), request); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable || store.reserveCalls != 0 {
+		t.Fatalf("revision receive reservation in live mode = %v, Store calls=%d; want unavailable before persistence", err, store.reserveCalls)
+	}
+	if _, err := service.CommitWorkspaceSyncReceive(context.Background(), base.workspace.OwnerID, base.workspace.ID, "r1234567", nil, nil); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable || store.commitCalls != 0 {
+		t.Fatalf("revision receive commit in live mode = %v, Store calls=%d; want unavailable before persistence", err, store.commitCalls)
+	}
+}
+
 type quotaReceiveTestStore struct {
 	*syncServiceStore
 	reservation       WorkspaceSyncReceiveReservation
 	activeReceives    []WorkspaceSyncReceiveReservation
+	reserveCalls      int
+	commitCalls       int
 	beginAbortCalls   int
 	completeCalls     int
 	beginAbortErr     error
@@ -105,6 +128,7 @@ type quotaReceiveTestStore struct {
 }
 
 func (s *quotaReceiveTestStore) ReserveWorkspaceSyncReceive(context.Context, WorkspaceSyncReceiveRequest, string, []byte) (WorkspaceSyncReceiveReservation, error) {
+	s.reserveCalls++
 	return WorkspaceSyncReceiveReservation{}, errors.New("unused")
 }
 
@@ -129,6 +153,7 @@ func (s *quotaReceiveTestStore) RecordWorkspaceSyncReceiveQuotaRejection(_ conte
 }
 
 func (s *quotaReceiveTestStore) CommitWorkspaceSyncReceive(context.Context, string, string, string, *workspace.File, *string) (WorkspaceSyncReceiveReceipt, error) {
+	s.commitCalls++
 	return WorkspaceSyncReceiveReceipt{}, errors.New("unused")
 }
 

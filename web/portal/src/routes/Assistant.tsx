@@ -2957,20 +2957,20 @@ export function Assistant() {
   const renderPendingMessage = (entry: MessageOutboxEntry) => {
     const { message } = entry;
     const alreadyVisible = displayMessages.some((item) => item.client_message_id === message.request.client_message_id);
-    const failed = message.status === 'failed';
-    const retryLabel = failed ? '重试发送这条消息'
-      : message.status === 'unknown' || message.status === 'pending' ? '核对并重试'
-        : message.status === 'accepted' && message.attachments.length ? '重试附件' : null;
-    const status = message.status === 'accepted' ? (message.attachments.length ? '消息已发送，附件等待处理' : '消息已发送')
-      : message.status === 'sending' ? '正在发送' : message.status === 'unknown' ? '发送结果待确认'
-        : message.status === 'failed' ? '发送失败' : '已保存在本机，等待发送';
+    const canRetry = ['failed', 'unknown', 'pending'].includes(message.status);
+    const retryAttachments = message.status === 'accepted' && message.attachments.length > 0;
     return <div className="chat-message-row chat-message-row-user chat-message-row-pending" key={`outbox:${message.request.client_message_id}`}>
-      <article className="chat-message chat-message-user chat-message-pending" aria-label="你的消息">
-      {retryLabel && <button type="button" className="button button-small button-secondary" onClick={() => void sendMessage(entry, true)}>{retryLabel}</button>}
-      {!alreadyVisible && <><strong className="chat-message-author">你</strong><p>{message.request.content}</p></>}
-      {!failed && <small role="status">{status}{message.error ? `：${message.error}` : ''}</small>}
-      {message.attachments.length > 0 && <small>附件 · {message.attachments.length}</small>}
-      </article>
+      <div className="chat-message-body">
+        <article className="chat-message chat-message-user" aria-label="你的消息">
+          {canRetry && <button type="button" className="message-retry" aria-label="重新发送这条消息" title="重新发送"
+            onClick={() => void sendMessage(entry, true)}>!</button>}
+          {retryAttachments && <button type="button" className="button button-small button-secondary" onClick={() => void sendMessage(entry, true)}>重试附件</button>}
+          {!alreadyVisible && <p>{message.request.content}</p>}
+          {message.status === 'sending' && <small role="status">正在发送</small>}
+          {retryAttachments && <small role="status">消息已发送，附件等待处理</small>}
+          {message.attachments.length > 0 && <small className="chat-message-attachments">附件 · {message.attachments.length}</small>}
+        </article>
+      </div>
     </div>;
   };
   const renderTaskDetail = (summary: TaskSummary) => {

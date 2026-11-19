@@ -1002,7 +1002,7 @@ func TestHealthMCPAndPortalStaticRoutes(t *testing.T) {
 	assertError(t, request(router, http.MethodGet, "/mcp", "", "", ""), http.StatusUnauthorized, "unauthenticated")
 	assertError(t, requestWithCookie(router, http.MethodGet, "/mcp", &http.Cookie{Name: portalCookieName, Value: sessionCredential()}, ""), http.StatusUnauthorized, "unauthenticated")
 
-	for _, path := range []string{"/", "/assistant", "/hosts/new", "/register", "/download", "/app/hosts/" + testHostID, "/assets/app.js"} {
+	for _, path := range []string{"/", "/assistant", "/hosts/new", "/login", "/register", "/download", "/app/hosts/" + testHostID, "/assets/app.js"} {
 		if response := requestHTML(router, path); response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), "<title>portal</title>") {
 			t.Errorf("user application route %s = %d %s", path, response.Code, response.Body)
 		}
@@ -1072,6 +1072,7 @@ func TestDisabledLegacyPCStillServesOnlyDesktopDownloads(t *testing.T) {
 	options.PortalFiles = fstest.MapFS{
 		"index.html":              &fstest.MapFile{Data: []byte("<!doctype html><title>portal</title>")},
 		"admin/index.html":        &fstest.MapFile{Data: []byte("<!doctype html><title>admin</title>")},
+		"admin/assets/admin.js":   &fstest.MapFile{Data: []byte("console.log('admin')")},
 		"downloads/manifest.json": &fstest.MapFile{Data: []byte(`{"schema_version":3,"version":"1.2.3","artifacts":[]}`)},
 		"downloads/files/morde-pc-1.2.3-windows-x64.exe": &fstest.MapFile{Data: []byte("0123456789")},
 		"downloads/files/readme.txt":                     &fstest.MapFile{Data: []byte("private")},
@@ -1102,13 +1103,16 @@ func TestDisabledLegacyPCStillServesOnlyDesktopDownloads(t *testing.T) {
 	if method := request(router, http.MethodPost, filename, "", "", ""); method.Code != http.StatusMethodNotAllowed || method.Header().Get("Allow") != "GET, HEAD" {
 		t.Fatalf("installer POST = %d headers=%v", method.Code, method.Header())
 	}
-	for _, route := range []string{"/", "/assistant", "/download", "/assets/app.js", "/downloads/", "/downloads/files/readme.txt"} {
+	for _, route := range []string{"/", "/assistant", "/login", "/register", "/download", "/assets/app.js", "/app/", "/downloads/", "/downloads/files/readme.txt"} {
 		if response := requestHTML(router, route); response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), "<title>portal</title>") {
 			t.Errorf("disabled user route %s = %d %s", route, response.Code, response.Body)
 		}
 	}
 	if admin := requestHTML(router, "/admin/login"); admin.Code != http.StatusOK || !strings.Contains(admin.Body.String(), "<title>admin</title>") {
 		t.Fatalf("admin route = %d %s", admin.Code, admin.Body)
+	}
+	if asset := request(router, http.MethodGet, "/admin/assets/admin.js", "", "", ""); asset.Code != http.StatusOK || !strings.Contains(asset.Body.String(), "admin") {
+		t.Fatalf("admin asset = %d %s", asset.Code, asset.Body)
 	}
 }
 

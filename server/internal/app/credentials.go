@@ -18,6 +18,7 @@ import (
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 type CredentialOptions struct {
@@ -353,7 +354,13 @@ func (s *CredentialService) AuthorizeTaskAction(ctx context.Context, ownerID str
 		if !identity.IsScheduleTaskExecutionScopeSet(approvedScopes) || s.scheduledTasks == nil {
 			return domain.NewError(domain.CodeUnauthenticated, "scheduled task authorization is unavailable")
 		}
-		return s.scheduledTasks.AuthorizeScheduledTaskAction(ctx, ownerID, tokenID, hostID, required)
+		if err := s.scheduledTasks.AuthorizeScheduledTaskAction(ctx, ownerID, tokenID, hostID, required); err != nil {
+			return err
+		}
+		if isComputerScope(required) {
+			return s.requireHostAgentWorkspace(ctx, hostID, ownerID)
+		}
+		return nil
 	}
 	return s.authorizeHostAction(ctx, ownerID, ownerID, kind, tokenID, hostID, approvedScopes, required)
 }
@@ -409,7 +416,7 @@ func (s *CredentialService) AuthorizeTaskHostAction(ctx context.Context, value t
 		(auth.Kind == string(identity.KindClient) && !domain.ValidClientInstallationID(auth.ClientInstallationID)) {
 		return domain.NewError(domain.CodeForbidden, "task authorization does not allow this tool")
 	}
-	return nil
+	return s.requireHostAgentWorkspace(ctx, value.HostID, currentHost.OwnerID)
 }
 
 func (s *CredentialService) AuthorizeTaskExecution(ctx context.Context, principal identity.Principal, hostID string, required identity.Scope) (task.Authorization, error) {
@@ -420,6 +427,11 @@ func (s *CredentialService) AuthorizeTaskExecution(ctx context.Context, principa
 		}
 		if err := s.scheduledTasks.AuthorizeScheduledTaskAction(ctx, principal.UserID, principal.TokenID, hostID, required); err != nil {
 			return task.Authorization{}, err
+		}
+		if isComputerScope(required) {
+			if err := s.requireHostAgentWorkspace(ctx, hostID, principal.UserID); err != nil {
+				return task.Authorization{}, err
+			}
 		}
 		return task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 			Scopes: authorizationSnapshot(principal).Scopes, Version: 1}, nil
@@ -458,6 +470,26 @@ func (s *CredentialService) AuthorizeMCPRuntimeAction(ctx context.Context, hostO
 	return s.authorizeHostAction(ctx, hostOwnerID, actorID, identity.KindAPIKey, tokenID, hostID, approvedScopes, required)
 }
 
+func (s *CredentialService) requireHostAgentWorkspace(ctx context.Context, hostID, ownerID string) error {
+	store, ok := s.hosts.(HostAgentWorkspaceBindingStore)
+	if !ok {
+		return domain.NewError(domain.CodeWorkspaceUnavailable, "Agent Workspace binding cannot be verified")
+	}
+	binding, err := requireAgentWorkspaceHostBinding(ctx, store, hostID, ownerID)
+	if err != nil {
+		return err
+	}
+	if binding.State != workspace.BindingActive || binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil ||
+		binding.SyncState != workspace.BindingSyncHealthy {
+		return domain.NewError(domain.CodeWorkspaceBusy, "Host Agent Workspace is not ready")
+	}
+	return nil
+}
+
+func isComputerScope(scope identity.Scope) bool {
+	return scope == identity.ScopeComputerObserve || scope == identity.ScopeComputerOperate
+}
+
 func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID, actorID string, kind identity.Kind, tokenID, hostID string, approvedScopes []identity.Scope, required identity.Scope) error {
 	if !domain.ValidUserID(hostOwnerID) || !domain.ValidUserID(actorID) || !domain.ValidHostID(hostID) {
 		return domain.NewError(domain.CodeNotFound, "host not found")
@@ -487,6 +519,9 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 		if actorID != hostOwnerID {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 		}
+		if isComputerScope(required) {
+			return s.requireHostAgentWorkspace(ctx, hostID, hostOwnerID)
+		}
 		return nil
 	case identity.KindClient:
 		if actorID != hostOwnerID || !domain.ValidTokenID(tokenID) || !clientTaskScope(required) {
@@ -497,6 +532,9 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 			token.ClientInstallationID == "" || token.RevokedAt != nil || !token.ExpiresAt.After(time.Now()) ||
 			!s.clientInstallationActive(ctx, token.ClientInstallationID, actorID) {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+		}
+		if isComputerScope(required) {
+			return s.requireHostAgentWorkspace(ctx, hostID, hostOwnerID)
 		}
 		return nil
 	case identity.KindAPIKey:
@@ -512,6 +550,9 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 		}
 		if token.Kind != identity.KindAPIKey || token.OwnerID != actorID || token.RevokedAt != nil || !token.ExpiresAt.After(time.Now()) || len(token.HostIDs) != 0 || len(token.Scopes) != 0 {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+		}
+		if isComputerScope(required) {
+			return s.requireHostAgentWorkspace(ctx, hostID, hostOwnerID)
 		}
 		return nil
 	default:

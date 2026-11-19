@@ -10,10 +10,12 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 type taskSharedHostStore struct {
 	HostStore
+	*hostServiceTestWorkspaceStore
 	value     host.Host
 	access    host.ActorAccess
 	err       error
@@ -35,9 +37,18 @@ func (s *taskSharedHostStore) GetProjectMember(context.Context, string, string) 
 
 func TestSharedTaskHostRequiresCurrentActorCredentialAndControlGrant(t *testing.T) {
 	ctx := context.Background()
-	store := &taskSharedHostStore{value: host.Host{ID: "h1234567", OwnerID: "u7654321", State: host.StateRunning,
-		ControlState: host.ControlAI, RuntimeGeneration: 3, RuntimeInstanceID: "runtime-1", ControlVersion: 4},
-		access: host.ActorAccess{OwnerID: "u7654321", Permissions: []host.Permission{host.PermissionDesktopControl}}}
+	workspaceValue := workspace.Workspace{ID: "w1234567", OwnerID: "u7654321", State: workspace.StateReady}
+	workspaceBinding := testWorkspaceBinding("h1234567", "u7654321", workspaceValue.ID, workspace.BindingActive)
+	workspaceBinding.Workspace = workspaceValue
+	store := &taskSharedHostStore{
+		hostServiceTestWorkspaceStore: &hostServiceTestWorkspaceStore{
+			values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
+			bindings: map[string]workspace.Binding{"h1234567/" + workspaceValue.ID: workspaceBinding},
+		},
+		value: host.Host{ID: "h1234567", OwnerID: "u7654321", State: host.StateRunning,
+			ControlState: host.ControlAI, RuntimeGeneration: 3, RuntimeInstanceID: "runtime-1", ControlVersion: 4},
+		access: host.ActorAccess{OwnerID: "u7654321", Permissions: []host.Permission{host.PermissionDesktopControl}},
+	}
 	users := &credentialUsers{values: map[string]identity.User{"u1234567": {ID: "u1234567", Status: identity.StatusApproved}}}
 	tokens := &credentialTokens{values: map[string]identity.Token{"t1234567": {ID: "t1234567", OwnerID: "u1234567",
 		Kind: identity.KindSession, ExpiresAt: time.Now().Add(time.Hour)}}}

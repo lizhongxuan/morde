@@ -60802,61 +60802,61 @@
         }
       }
     },
-    "Every device signed in to this account is a Muse: this iPhone, your computers running morde Desktop, the web console. Each can ask the others for things, on any network, through morde Cloud. On iOS the others can open links here and send notifications; the iPhone's own Muse works on the iPhone." : {
+    "Every device signed in to this account is a Muse: this iPhone, your computers running morde Desktop. Each can ask the others for things, on any network, through morde Cloud. On iOS the others can open links here and send notifications; the iPhone's own Muse works on the iPhone." : {
       "extractionState" : "manual",
       "localizations" : {
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Jedes bei diesem Konto angemeldete Gerät ist eine Muse: dieses iPhone, deine Computer mit morde Desktop, die Web-Konsole. Jedes kann die anderen um etwas bitten, in jedem Netz, über morde Cloud. Unter iOS können die anderen hier Links öffnen und Benachrichtigungen senden; die eigene Muse des iPhones arbeitet auf dem iPhone."
+            "value" : "Jedes bei diesem Konto angemeldete Gerät ist eine Muse: dieses iPhone, deine Computer mit morde Desktop. Jedes kann die anderen um etwas bitten, in jedem Netz, über morde Cloud. Unter iOS können die anderen hier Links öffnen und Benachrichtigungen senden; die eigene Muse des iPhones arbeitet auf dem iPhone."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Every device signed in to this account is a Muse: this iPhone, your computers running morde Desktop, the web console. Each can ask the others for things, on any network, through morde Cloud. On iOS the others can open links here and send notifications; the iPhone's own Muse works on the iPhone."
+            "value" : "Every device signed in to this account is a Muse: this iPhone, your computers running morde Desktop. Each can ask the others for things, on any network, through morde Cloud. On iOS the others can open links here and send notifications; the iPhone's own Muse works on the iPhone."
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cada dispositivo con sesión en esta cuenta es un Muse: este iPhone, tus computadoras con morde Desktop, la consola web. Cada uno puede pedir cosas a los demás, en cualquier red, a través de morde Cloud. En iOS los demás pueden abrir enlaces aquí y enviar notificaciones; el Muse propio del iPhone trabaja en el iPhone."
+            "value" : "Cada dispositivo con sesión en esta cuenta es un Muse: este iPhone, tus computadoras con morde Desktop. Cada uno puede pedir cosas a los demás, en cualquier red, a través de morde Cloud. En iOS los demás pueden abrir enlaces aquí y enviar notificaciones; el Muse propio del iPhone trabaja en el iPhone."
           }
         },
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chaque appareil connecté à ce compte est un Muse : cet iPhone, vos ordinateurs sous morde Desktop, la console web. Chacun peut demander des choses aux autres, sur n’importe quel réseau, via morde Cloud. Sur iOS, les autres peuvent ouvrir des liens ici et envoyer des notifications ; le Muse de l’iPhone lui-même travaille sur l’iPhone."
+            "value" : "Chaque appareil connecté à ce compte est un Muse : cet iPhone, vos ordinateurs sous morde Desktop. Chacun peut demander des choses aux autres, sur n’importe quel réseau, via morde Cloud. Sur iOS, les autres peuvent ouvrir des liens ici et envoyer des notifications ; le Muse de l’iPhone lui-même travaille sur l’iPhone."
           }
         },
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "このアカウントでサインインしているすべてのデバイスが Muse です: この iPhone、morde Desktop が動いているコンピューター、ウェブコンソール。それぞれが morde Cloud を通じて、どのネットワークにいても互いに用事を頼めます。iOS では、ほかのデバイスはここでリンクを開いたり通知を送ったりできます。iPhone 自身の Muse は iPhone 上で動きます。"
+            "value" : "このアカウントでサインインしているすべてのデバイスが Muse です: この iPhone、morde Desktop が動いているコンピューター。それぞれが morde Cloud を通じて、どのネットワークにいても互いに用事を頼めます。iOS では、ほかのデバイスはここでリンクを開いたり通知を送ったりできます。iPhone 自身の Muse は iPhone 上で動きます。"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 계정으로 로그인한 모든 기기가 Muse입니다. 이 iPhone, morde Desktop을 실행하는 컴퓨터, 웹 콘솔. 각 기기는 morde Cloud를 통해 어떤 네트워크에서든 서로에게 일을 부탁할 수 있습니다. iOS에서는 다른 기기가 여기서 링크를 열고 알림을 보낼 수 있으며, iPhone 자체의 Muse는 iPhone에서 작동합니다."
+            "value" : "이 계정으로 로그인한 모든 기기가 Muse입니다. 이 iPhone, morde Desktop을 실행하는 컴퓨터. 각 기기는 morde Cloud를 통해 어떤 네트워크에서든 서로에게 일을 부탁할 수 있습니다. iOS에서는 다른 기기가 여기서 링크를 열고 알림을 보낼 수 있으며, iPhone 자체의 Muse는 iPhone에서 작동합니다."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Каждое устройство, вошедшее в этот аккаунт, является Muse: этот iPhone, ваши компьютеры с morde Desktop, веб-консоль. Каждое может просить другие о чём-то, в любой сети, через morde Cloud. На iOS другие могут открывать здесь ссылки и присылать уведомления; собственный Muse этого iPhone работает на самом iPhone."
+            "value" : "Каждое устройство, вошедшее в этот аккаунт, является Muse: этот iPhone, ваши компьютеры с morde Desktop. Каждое может просить другие о чём-то, в любой сети, через morde Cloud. На iOS другие могут открывать здесь ссылки и присылать уведомления; собственный Muse этого iPhone работает на самом iPhone."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "登录同一账号的每台设备都是一个 Muse：这台 iPhone、装了 morde 桌面版的电脑、网页控制台。它们之间可以互相交代事情，不必在同一个网络，经由 morde Cloud 传递。在 iOS 上，其他设备可以在这里打开链接、发通知；iPhone 自己的 Muse 在 iPhone 上工作。"
+            "value" : "登录同一账号的每台设备都是一个 Muse：这台 iPhone、装了 morde 桌面版的电脑。它们之间可以互相交代事情，不必在同一个网络，经由 morde Cloud 传递。在 iOS 上，其他设备可以在这里打开链接、发通知；iPhone 自己的 Muse 在 iPhone 上工作。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "登入同一帳號的每台裝置都是一個 Muse：這支 iPhone、裝了 morde 桌面版的電腦、網頁主控台。它們之間可以互相交代事情，不必在同一個網路，經由 morde Cloud 傳遞。在 iOS 上，其他裝置可以在這裡開啟連結、傳通知；iPhone 自己的 Muse 在 iPhone 上工作。"
+            "value" : "登入同一帳號的每台裝置都是一個 Muse：這支 iPhone、裝了 morde 桌面版的電腦。它們之間可以互相交代事情，不必在同一個網路，經由 morde Cloud 傳遞。在 iOS 上，其他裝置可以在這裡開啟連結、傳通知；iPhone 自己的 Muse 在 iPhone 上工作。"
           }
         }
       }
@@ -109387,64 +109387,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "打開動態的對話"
-          }
-        }
-      }
-    },
-    "Open the link in any browser, sign in with the same account, and drive your devices from there." : {
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Öffne den Link in einem beliebigen Browser, melde dich mit demselben Konto an und steuere deine Geräte von dort."
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Open the link in any browser, sign in with the same account, and drive your devices from there."
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Abre el enlace en cualquier navegador, inicia sesión con la misma cuenta y dirige tus dispositivos desde allí."
-          }
-        },
-        "fr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ouvrez le lien dans n’importe quel navigateur, connectez-vous avec le même compte, et pilotez vos appareils de là."
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "リンクを任意のブラウザーで開き、同じアカウントでサインインすると、そこからデバイスを操作できます。"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "아무 브라우저에서나 링크를 열고 같은 계정으로 로그인하면 거기서 기기를 움직일 수 있습니다."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Откройте ссылку в любом браузере, войдите с тем же аккаунтом и управляйте устройствами оттуда."
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在任何浏览器里打开这个链接，用同一账号登录，就能在网页上指挥你的设备。"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在任何瀏覽器開啟這個連結，用同一帳號登入，就能在網頁上指揮你的裝置。"
           }
         }
       }
@@ -178104,64 +178046,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "我們不收集您的數據"
-          }
-        }
-      }
-    },
-    "Web console" : {
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Web-Konsole"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Web console"
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Consola web"
-          }
-        },
-        "fr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Console web"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ウェブコンソール"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "웹 콘솔"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Веб-консоль"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "网页控制台"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "網頁主控台"
           }
         }
       }

@@ -1,9 +1,8 @@
 // nanoMuse: the account's devices on the hub, shown under the nanoMuse Cloud account —
 // this iPhone's two switches (reachable · operable), its name, the other devices with an
-// online dot (tap an offline one to forget it), and the web console's address.
+// online dot (tap an offline one to forget it).
 
 import SwiftUI
-import UIKit
 
 struct NanoMuseDevicesSection: View {
     @ObservedObject private var hub = NanoMuseHub.shared
@@ -87,21 +86,6 @@ struct NanoMuseDevicesSection: View {
             Text(AppLocalized("Take this device off the list. It comes back the next time it signs in with this account."))
         }
 
-        Section {
-            Button {
-                UIPasteboard.general.string = hub.webConsoleURL
-            } label: {
-                LabeledContent {
-                    Text(AppLocalized("Copy link")).foregroundStyle(.tint)
-                } label: {
-                    Label(AppLocalized("Web console"), systemImage: "globe")
-                    Text(hub.webConsoleURL).font(.footnote).foregroundStyle(.secondary)
-                }
-            }
-            .tint(.primary)
-        } footer: {
-            Text(AppLocalized("Open the link in any browser, sign in with the same account, and drive your devices from there."))
-        }
     }
 
     private var status: String {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
@@ -84,6 +85,62 @@ type AgentWorkspaceStore interface {
 	MarkAgentWorkspaceDirectoryInitialized(context.Context, string, string) error
 	AcquireAgentWorkspaceInitializationLock(context.Context, string) (func() error, error)
 	IsAgentWorkspaceWorkspace(context.Context, string, string) (bool, error)
+}
+
+type HostAgentWorkspaceBindingStore interface {
+	GetWorkspaceBindingsByHost(context.Context, string) ([]workspace.Binding, error)
+	IsAgentWorkspaceWorkspace(context.Context, string, string) (bool, error)
+}
+
+func requireAgentWorkspaceHostBinding(ctx context.Context, source any, hostID, ownerID string) (workspace.Binding, error) {
+	if !domain.ValidHostID(hostID) || !domain.ValidUserID(ownerID) {
+		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	store, ok := source.(HostAgentWorkspaceBindingStore)
+	if !ok || store == nil {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceUnavailable, "Agent Workspace binding cannot be verified")
+	}
+	bindings, err := store.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return workspace.Binding{}, err
+	}
+	var active workspace.Binding
+	activeCount := 0
+	for _, binding := range bindings {
+		if binding.State == workspace.BindingDetached {
+			continue
+		}
+		activeCount++
+		active = binding
+		if binding.HostID != hostID || binding.OwnerID != ownerID || binding.Workspace.OwnerID != ownerID ||
+			!domain.ValidWorkspaceID(binding.Workspace.ID) {
+			return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "Host workspace binding is inconsistent")
+		}
+	}
+	if activeCount != 1 {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
+	}
+	if err := requireAgentWorkspaceMapping(ctx, store, ownerID, active.Workspace.ID); err != nil {
+		return workspace.Binding{}, err
+	}
+	return active, nil
+}
+
+func requireAgentWorkspaceMapping(ctx context.Context, source any, ownerID, workspaceID string) error {
+	mapper, ok := source.(interface {
+		IsAgentWorkspaceWorkspace(context.Context, string, string) (bool, error)
+	})
+	if !ok {
+		return domain.NewError(domain.CodeWorkspaceUnavailable, "Agent Workspace identity cannot be verified")
+	}
+	isAgentWorkspace, err := mapper.IsAgentWorkspaceWorkspace(ctx, ownerID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if !isAgentWorkspace {
+		return domain.NewError(domain.CodeWorkspaceConflict, "computer is not bound to its owner's stable Agent Workspace")
+	}
+	return nil
 }
 
 // AgentWorkspaceDeleteStore permits only an explicit owner deletion to retire

@@ -53,6 +53,7 @@ type syncServiceStore struct {
 	sessionAccessCalls                       int
 	revokeSessionAfterAccess                 int
 	syncDeviceRevoked                        bool
+	agentWorkspaceMismatch                   bool
 	usageFinalizeCalls                       int
 }
 
@@ -300,6 +301,10 @@ func (s *syncServiceStore) GetWorkspace(_ context.Context, id string) (workspace
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	return s.workspace, nil
+}
+
+func (s *syncServiceStore) IsAgentWorkspaceWorkspace(_ context.Context, ownerID, workspaceID string) (bool, error) {
+	return !s.agentWorkspaceMismatch && ownerID == s.workspace.OwnerID && workspaceID == s.workspace.ID, nil
 }
 
 func (s *syncServiceStore) GetWorkspaceSyncFolder(_ context.Context, principal identity.Principal, workspaceID, folderID string) (workspace.SyncFolder, error) {
@@ -853,6 +858,21 @@ func TestWorkspaceSyncServiceUploadIsResumableAndWorkspaceScoped(t *testing.T) {
 	}
 	if store.blockLockAcquires != 2 || store.blockLockReleases != 1 || store.blockReadLockAcquires != 2 || store.blockReadLockReleases != 2 {
 		t.Fatalf("block-store lock counts = exclusive %d/%d shared %d/%d", store.blockLockAcquires, store.blockLockReleases, store.blockReadLockAcquires, store.blockReadLockReleases)
+	}
+}
+
+func TestWorkspaceSyncUploadStaysDisabledWhenLiveDirectoryIsAuthoritative(t *testing.T) {
+	store := newSyncServiceStore()
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.liveDirectorySource = true
+	service.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	principal := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	command := workspace.CreateSyncSession{Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0}
+	if _, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, command, "live-sync-create-01"); domain.CodeOf(err) != domain.CodeWorkspaceUnavailable || len(store.sessions) != 0 {
+		t.Fatalf("revision upload in live mode = %v, sessions=%d; want unavailable without persistence", err, len(store.sessions))
 	}
 }
 
@@ -1674,5 +1694,27 @@ func TestVerifyUploadedFilesAcceptsSymlinkMetadataWithoutContentBlocks(t *testin
 		ID: "sync-test", UploadFiles: []workspace.File{file},
 	}); err != nil {
 		t.Fatalf("verifyUploadedFiles() = %v; want link-target integrity without block reads", err)
+	}
+}
+
+func TestWorkspaceSyncRejectsLegacyWorkspaceBoundToHostReplica(t *testing.T) {
+	store := newSyncServiceStore()
+	store.hostGeneration = 3
+	store.binding = workspace.Binding{
+		HostID: "h1234567", OwnerID: store.workspace.OwnerID, Workspace: store.workspace,
+		State: workspace.BindingActive, BindingVersion: 4,
+	}
+	store.agentWorkspaceMismatch = true
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindHostReplica,
+		HostScope: store.binding.HostID, HostGeneration: store.hostGeneration,
+		ReplicaWorkspaceID: store.workspace.ID, BindingVersion: store.binding.BindingVersion,
+	}
+	if _, err := service.authorize(context.Background(), principal, store.workspace.ID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("Host replica access to legacy Workspace = %v, want workspace conflict", err)
 	}
 }

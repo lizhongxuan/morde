@@ -27,7 +27,7 @@ Morde は Muse の対話体験を参考にしています。**会話から始め
 | **管理 Web** | 共通のバックエンドと権限体系を使用し、ユーザーと登録審査、クラウドコンピューター、ワークスペース、モデル、設定、利用状況、監査などを管理します。 |
 | **サーバー** | Go サービスがアカウント、API、タスク、データ、権限、ゲートウェイ、バックグラウンド処理を担当します。PostgreSQL が業務データを保存し、DSH がクラウド Agent Runtime を、Host Runtime とワークスペース同期がクラウドコンピューターとワークスペースを支えます。 |
 
-クラウド実行環境、クラウドコンピューターのワークベンチ、共通 UI コードは4つの製品構成要素の実装であり、独立した製品ではありません。`web/mobile/` に残るコードは PC への統合元として扱い、そのユーザー機能は PC から提供します。独立したユーザークライアントとは定義しません。
+クラウド実行環境、クラウドコンピューターのワークベンチ、共通 UI コードは4つの製品構成要素の実装であり、独立した製品ではありません。一般ユーザー向け画面は `morde-pc` と iOS ネイティブクライアントが提供し、管理 Web は管理者専用です。一般ユーザー向け Web やモバイル Web は提供しません。
 
 ## 主な機能
 
@@ -103,7 +103,7 @@ flowchart TB
 | --- | --- |
 | [`clients/desktop/`](clients/desktop/) · [`web/portal/`](web/portal/) | PC クライアント、ローカルブリッジ、PC ユーザー画面、管理 Web ページ |
 | [`clients/nanoMuse/`](clients/nanoMuse/) | iOS ネイティブプロジェクト、nanoMuse の共通ソース、サードパーティーに関する表記 |
-| [`web/mobile/`](web/mobile/) · [`web/workbench/`](web/workbench/) | PC に統合予定の既存モバイル画面コードとクラウドコンピューターのワークベンチ実装。独立端末ではなく PC 関連コードとして扱います |
+| [`web/workbench/`](web/workbench/) | PC と iOS が共有するクラウドコンピューターのワークベンチ |
 | [`server/`](server/) · [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | Go サービス、API、Gateway、MCP、バックグラウンドタスク、データベースマイグレーション、DSH クラウド Agent Runtime |
 | [`runtime/morde-runtime/`](runtime/morde-runtime/) · [`runtime/morde-sync/`](runtime/morde-sync/) | Host Runtime と Workspace 同期エンジン |
 | [`images/`](images/) · [`deploy/`](deploy/) | 実行環境のイメージとデプロイ設定 |

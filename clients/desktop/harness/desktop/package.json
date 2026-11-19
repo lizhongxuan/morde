@@ -12,7 +12,7 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('out', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
-    "build:portal": "npm --prefix ../../../../web/portal run build && npm --prefix ../../../../web/workbench run build",
+    "build:portal": "npm --prefix ../../../../web/portal run build:pc && npm --prefix ../../../../web/workbench run build",
     "typecheck": "tsc --noEmit -p tsconfig.tests.json",
     "build:test": "tsc -p tsconfig.tests.json",
     "test": "npm run build:test && node --test tests/*.test.mjs",

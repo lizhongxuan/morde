@@ -511,7 +511,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize Host sharing: %w", err)
 	}
-	mcpHosts, err := app.NewMCPComputerHostAuthorizer(store, hostSharing)
+	mcpHosts, err := app.NewMCPComputerHostAuthorizer(store, store, hostSharing)
 	if err != nil {
 		return fmt.Errorf("initialize MCP Host authorization: %w", err)
 	}

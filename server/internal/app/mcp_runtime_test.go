@@ -10,6 +10,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/runtimeclient"
 )
 
@@ -23,6 +24,16 @@ func (s mcpRuntimeHostStore) GetHost(_ context.Context, hostID string) (host.Hos
 		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	return s.value, nil
+}
+
+func mcpRuntimeWorkspaceStore(hostID, ownerID string) *hostServiceTestWorkspaceStore {
+	workspaceValue := workspace.Workspace{ID: "w1234567", OwnerID: ownerID, State: workspace.StateReady}
+	binding := testWorkspaceBinding(hostID, ownerID, workspaceValue.ID, workspace.BindingActive)
+	binding.Workspace = workspaceValue
+	return &hostServiceTestWorkspaceStore{
+		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
+		bindings: map[string]workspace.Binding{hostID + "/" + workspaceValue.ID: binding},
+	}
 }
 
 type mcpRuntimeSharingAuthorizer struct {
@@ -43,7 +54,7 @@ func TestMCPComputerHostAuthorizerUsesDynamicKeyGrantAndLiveMCPShare(t *testing.
 	ownerID, actorID, hostID := "u7654321", "u1234567", "h1234567"
 	hostValue := host.Host{ID: hostID, OwnerID: ownerID, State: host.StateRunning}
 	sharing := &mcpRuntimeSharingAuthorizer{actorID: actorID, hostID: hostID, permission: host.PermissionMCPControl, allowed: true}
-	authorizer, err := NewMCPComputerHostAuthorizer(mcpRuntimeHostStore{value: hostValue}, sharing)
+	authorizer, err := NewMCPComputerHostAuthorizer(mcpRuntimeHostStore{value: hostValue}, mcpRuntimeWorkspaceStore(hostID, ownerID), sharing)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +85,32 @@ func TestMCPComputerHostAuthorizerUsesDynamicKeyGrantAndLiveMCPShare(t *testing.
 	}
 }
 
+func TestMCPComputerHostAuthorizerRejectsLegacyWorkspaceBinding(t *testing.T) {
+	const ownerID, hostID = "u1234567", "h1234567"
+	workspaceValue := workspace.Workspace{ID: "w7654321", OwnerID: ownerID, State: workspace.StateReady}
+	binding := testWorkspaceBinding(hostID, ownerID, workspaceValue.ID, workspace.BindingActive)
+	binding.Workspace = workspaceValue
+	workspaces := &hostServiceTestWorkspaceStore{
+		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
+		bindings: map[string]workspace.Binding{hostID + "/" + workspaceValue.ID: binding},
+	}
+	authorizer, err := NewMCPComputerHostAuthorizer(
+		mcpRuntimeHostStore{value: host.Host{ID: hostID, OwnerID: ownerID, State: host.StateRunning}},
+		workspaces,
+		&mcpRuntimeSharingAuthorizer{actorID: ownerID, hostID: hostID, allowed: true, permission: host.PermissionMCPControl},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{
+		UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "t1234567",
+		HostIDs: []string{hostID}, Scopes: []identity.Scope{identity.ScopeComputerObserve},
+	}
+	if _, err := authorizer.GetForComputer(context.Background(), principal, hostID, identity.ScopeComputerObserve); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("GetForComputer() for legacy Workspace binding = %v, want workspace conflict", err)
+	}
+}
+
 func TestMCPSharedMemberCanReadApplicationStatusWithObserveGrant(t *testing.T) {
 	runtime, hosts, manager, server := newRuntimeControlTest(t, 0, 0, runtimeclient.ModeBlocked, host.ControlAI, "")
 	defer func() { _ = manager.Close() }()
@@ -87,7 +124,7 @@ func TestMCPSharedMemberCanReadApplicationStatusWithObserveGrant(t *testing.T) {
 	}
 	hostValue.OwnerID = ownerID
 	hosts.addHost(hostValue)
-	authorizer, err := NewMCPComputerHostAuthorizer(hosts, sharing)
+	authorizer, err := NewMCPComputerHostAuthorizer(hosts, mcpRuntimeWorkspaceStore(hostID, ownerID), sharing)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +151,10 @@ func TestMCPSharedMemberCanReadApplicationStatusWithObserveGrant(t *testing.T) {
 func TestAuthorizeMCPRuntimeActionRevalidatesActorKeyAndOwner(t *testing.T) {
 	service, users, hosts, _, tokens, _ := newCredentialFixture(t)
 	ownerID, actorID, hostID, tokenID := "u7654321", "u1234567", "h1234567", "t1234567"
-	hosts.values = append(hosts.values, host.Host{ID: hostID, OwnerID: ownerID, State: host.StateRunning})
+	hosts.values = append(hosts.values, host.Host{
+		ID: hostID, OwnerID: ownerID, State: host.StateRunning,
+		Workspaces: []workspace.Binding{testWorkspaceBinding(hostID, ownerID, "w1234567", workspace.BindingActive)},
+	})
 	tokens.values[tokenID] = identity.Token{
 		ID: tokenID, OwnerID: actorID, Kind: identity.KindAPIKey, ExpiresAt: time.Now().Add(time.Hour),
 	}
@@ -124,6 +164,11 @@ func TestAuthorizeMCPRuntimeActionRevalidatesActorKeyAndOwner(t *testing.T) {
 	if err := check(); err != nil {
 		t.Fatalf("valid member key: %v", err)
 	}
+	hosts.values[0].Workspaces[0].Workspace.ID = "w7654321"
+	if err := check(); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("legacy Host Workspace binding = %v, want workspace conflict", err)
+	}
+	hosts.values[0].Workspaces[0].Workspace.ID = "w1234567"
 
 	key := tokens.values[tokenID]
 	now := time.Now()
@@ -199,7 +244,7 @@ func TestMCPRuntimeLeaseCancelsWhenShareOrKeyIsRevokedOrExpired(t *testing.T) {
 				token.ExpiresAt = time.Now().Add(-time.Second)
 			}
 			tokens.values[tokenID] = token
-			hostAuthorizer, err := NewMCPComputerHostAuthorizer(mcpRuntimeHostStore{value: hostValue}, sharing)
+			hostAuthorizer, err := NewMCPComputerHostAuthorizer(mcpRuntimeHostStore{value: hostValue}, mcpRuntimeWorkspaceStore(hostID, ownerID), sharing)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -27,7 +27,7 @@ Morde draws on Muse's interaction principles: **start with a conversation, use t
 | **Administration Web** | Manages users and registration reviews, cloud computers, workspaces, models, configuration, usage, and audit records through the shared backend and permission system. |
 | **Backend** | Go services handle accounts, APIs, tasks, data, authorization, gateways, and background work; PostgreSQL stores business data, DSH provides the cloud Agent Runtime, and Host Runtime and workspace synchronization support cloud computers and workspaces. |
 
-Cloud runtimes, cloud-computer workbenches, and shared UI code are implementation components of these four endpoints, not additional endpoints. Existing code under `web/mobile/` is a source for consolidating its user-facing functionality into PC; it is not a separate product endpoint.
+Cloud runtimes, cloud-computer workbenches, and shared UI code are implementation components of these four endpoints, not additional endpoints. User-facing interfaces are provided by `morde-pc` and the native iOS client; Administration Web is for administrators and does not provide a regular-user or mobile Web client.
 
 ## Capabilities
 
@@ -103,7 +103,7 @@ These are **goals and acceptance requirements**, not a list of completed feature
 | --- | --- |
 | [`clients/desktop/`](clients/desktop/) · [`web/portal/`](web/portal/) | PC client, local bridges, PC user interface, and Administration Web pages |
 | [`clients/nanoMuse/`](clients/nanoMuse/) | Native iOS project, shared nanoMuse source, and third-party notices |
-| [`web/mobile/`](web/mobile/) · [`web/workbench/`](web/workbench/) | Existing mobile UI code to consolidate into PC and cloud-computer workbench implementation, treated as PC-related code rather than separate product endpoints |
+| [`web/workbench/`](web/workbench/) | Cloud-computer workbench shared by PC and iOS |
 | [`server/`](server/) · [`runtime/morde-cloud-runtime/`](runtime/morde-cloud-runtime/) | Go services, APIs, Gateway, MCP, background tasks, database migrations, and DSH cloud Agent Runtime |
 | [`runtime/morde-runtime/`](runtime/morde-runtime/) · [`runtime/morde-sync/`](runtime/morde-sync/) | Host Runtime and Workspace synchronization engine |
 | [`images/`](images/) · [`deploy/`](deploy/) | Runtime images and deployment configuration |

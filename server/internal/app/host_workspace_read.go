@@ -37,13 +37,23 @@ func (s *WorkspaceSyncService) ListHostWorkspaceBindings(ctx context.Context, ac
 	if bindings == nil {
 		bindings = []workspace.Binding{}
 	}
+	activeCount := 0
 	for i := range bindings {
 		binding := &bindings[i]
 		if binding.HostID != hostID || !domain.ValidUserID(binding.OwnerID) ||
 			!domain.ValidWorkspaceID(binding.Workspace.ID) || binding.Workspace.OwnerID != binding.OwnerID {
 			return nil, domain.NewError(domain.CodeInternal, "workspace binding ownership is invalid")
 		}
+		if binding.State != workspace.BindingDetached {
+			activeCount++
+			if err := requireAgentWorkspaceMapping(ctx, s.store, binding.OwnerID, binding.Workspace.ID); err != nil {
+				return nil, err
+			}
+		}
 		binding.SyncConflicts = append([]string{}, binding.SyncConflicts...)
+	}
+	if activeCount > 1 {
+		return nil, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
 	}
 	return bindings, nil
 }
@@ -217,6 +227,32 @@ func (s *WorkspaceSyncService) hostWorkspaceReadBinding(ctx context.Context, act
 	if binding.HostID != hostID || binding.Workspace.ID != workspaceID || !domain.ValidUserID(binding.OwnerID) ||
 		binding.Workspace.OwnerID != binding.OwnerID {
 		return workspace.Binding{}, 0, domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	}
+	lister, ok := s.store.(hostWorkspaceBindingLister)
+	if !ok {
+		return workspace.Binding{}, 0, domain.NewError(domain.CodeWorkspaceUnavailable, "workspace service is unavailable")
+	}
+	bindings, err := lister.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return workspace.Binding{}, 0, hostWorkspaceReadFailure(err)
+	}
+	activeCount := 0
+	for _, current := range bindings {
+		if current.State != workspace.BindingDetached {
+			activeCount++
+			if current.HostID != hostID || current.OwnerID != binding.OwnerID || current.Workspace.OwnerID != current.OwnerID {
+				return workspace.Binding{}, 0, domain.NewError(domain.CodeInternal, "workspace binding ownership is invalid")
+			}
+			if current.Workspace.ID != workspaceID {
+				return workspace.Binding{}, 0, domain.NewError(domain.CodeWorkspaceConflict, "host is not bound to a single workspace")
+			}
+		}
+	}
+	if activeCount != 1 {
+		return workspace.Binding{}, 0, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
+	}
+	if err := requireAgentWorkspaceMapping(ctx, s.store, binding.OwnerID, workspaceID); err != nil {
+		return workspace.Binding{}, 0, err
 	}
 	if binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil {
 		return workspace.Binding{}, 0, domain.NewError(domain.CodeWorkspaceBusy, "workspace is not ready for Host file reads")

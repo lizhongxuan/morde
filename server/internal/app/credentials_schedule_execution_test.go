@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 )
 
@@ -35,7 +36,10 @@ func TestScheduledExecutionAuthorizesRunIDAndRetainsScopes(t *testing.T) {
 		{name: "host-bound", hostID: "h1234567", scopes: identity.ScheduleTaskExecutionScopes(), scope: identity.ScopeComputerOperate},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			service, _, _, _, _, _ := newCredentialFixture(t)
+			service, _, hosts, _, _, _ := newCredentialFixture(t)
+			if test.hostID != "" {
+				hosts.values = append(hosts.values, hostServiceTestHost(host.StateRunning))
+			}
 			stub := &scheduleExecutionAuthorizationStub{}
 			service.scheduledTasks = stub
 			principal := identity.Principal{UserID: "u1234567", Kind: identity.KindScheduleTask, TokenID: "y1234567", Scopes: test.scopes}

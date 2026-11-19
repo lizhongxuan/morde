@@ -372,3 +372,15 @@ func TestGetHostDiffRequiresOwnerAndAppliedRevisionBounds(t *testing.T) {
 		t.Fatalf("unapplied revision diff error = %v, want workspace conflict", err)
 	}
 }
+
+func TestHostWorkspaceReadsRejectLegacyWorkspaceBinding(t *testing.T) {
+	store, _, service := newHostWorkspaceReadFixture(t)
+	store.binding.Workspace.ID = "w7654321"
+	store.bindings[0] = store.binding
+	if _, err := service.ListHostWorkspaceBindings(context.Background(), hostWorkspaceReadOwner, hostWorkspaceReadHost); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("ListHostWorkspaceBindings() for legacy binding = %v, want workspace conflict", err)
+	}
+	if _, err := service.GetHostWorkspaceManifest(context.Background(), hostWorkspaceReadOwner, hostWorkspaceReadHost, "w7654321", 4, "", "", 10); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("GetHostWorkspaceManifest() for legacy binding = %v, want workspace conflict", err)
+	}
+}

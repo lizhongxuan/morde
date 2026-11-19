@@ -46,7 +46,7 @@ function NotFound() {
 }
 
 function AdminAccessDenied() {
-  return <RecoverableError title="没有管理权限" message="此账号不能查看管理后台数据。" homePath="/" homeLabel="返回 PC 用户端" />;
+  return <RecoverableError title="没有管理权限" message="此账号不能查看管理后台数据。" homePath="/admin/login" homeLabel="切换管理员账号" />;
 }
 
 function projectSyncSearch(search: string) {

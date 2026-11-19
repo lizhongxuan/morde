@@ -1826,10 +1826,10 @@ describe('Assistant durable tasks', () => {
     await user.type(await findReadyComposer(), '旧服务升级后恢复');
     await user.click(screen.getByRole('button', { name: '发送' }));
     expect(screen.queryByText(/服务尚不支持自动分流，请升级后重试/)).not.toBeInTheDocument();
-    const retry = await screen.findByRole('button', { name: '重试发送这条消息' });
+    const retry = await screen.findByRole('button', { name: '重新发送这条消息' });
     const originalRequest = accept.mock.calls[0]!;
     await user.click(retry);
-    await waitFor(() => expect(screen.queryByRole('button', { name: '重试发送这条消息' })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('button', { name: '重新发送这条消息' })).not.toBeInTheDocument());
     expect(accept).toHaveBeenCalledTimes(2);
     expect(accept.mock.calls[1]).toEqual(originalRequest);
   });
@@ -2281,12 +2281,12 @@ describe('Assistant durable tasks', () => {
     const composer = await findReadyComposer();
     await user.type(composer, '保存后断线');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    const retry = await screen.findByRole('button', { name: '核对并重试' });
+    const retry = await screen.findByRole('button', { name: '重新发送这条消息' });
     expect(screen.queryByRole('img', { name: '主 Agent 已接下，正在处理' })).not.toBeInTheDocument();
     expect(composer).toBeEnabled();
     const firstCall = submit.mock.calls[0]!;
     await user.click(retry);
-    await waitFor(() => expect(screen.queryByRole('button', { name: '核对并重试' })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('button', { name: '重新发送这条消息' })).not.toBeInTheDocument());
     expect(submit).toHaveBeenCalledTimes(2);
     expect(submit.mock.calls[1]).toEqual(firstCall);
   });
@@ -2300,7 +2300,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     await user.type(await findReadyComposer(), '第一条待确认');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    await screen.findByRole('button', { name: '核对并重试' });
+    await screen.findByRole('button', { name: '重新发送这条消息' });
     const firstCall = submit.mock.calls[0]!;
     await user.type(await findReadyComposer(), '后续消息');
     await user.click(screen.getByRole('button', { name: '发送' }));
@@ -2321,7 +2321,7 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: '发送' }));
     expect(screen.queryByText(/账号、服务或消息状态已变化，消息保留在本机/)).not.toBeInTheDocument();
     expect(accept.mock.calls[0]?.[4]).toBe(authUser.id);
-    expect(await screen.findByRole('button', { name: '重试发送这条消息' })).toBeEnabled();
+    expect(await screen.findByRole('button', { name: '重新发送这条消息' })).toBeEnabled();
     expect(screen.getByText('账号切换前的内容')).toBeInTheDocument();
   });
 
