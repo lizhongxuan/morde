@@ -319,7 +319,6 @@
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .thinking-bubble { border-color: var(--line); background: #fff; }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .thinking-dots span { background: var(--brand); animation-duration: 1.5s; }
 .morde-pc-theme .project-message-received { border-color: var(--surface); background: var(--brand-soft); }
-.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer { background: linear-gradient(to top, var(--bg) 80%, transparent); }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer form {
   color: var(--ink);
   border: 1.5px solid var(--brand-tint);
@@ -327,11 +326,26 @@
   background: #fff;
   box-shadow: var(--shadow-jelly);
 }
-.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer textarea { color: var(--ink); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer textarea {
+  height: 48px;
+  min-height: 48px;
+  max-height: 144px;
+  padding: 0 3px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 24px;
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer textarea:focus,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer textarea:focus-visible { outline: 0; box-shadow: none; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer form { padding: 10px 12px 8px; }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer-footer { gap: 6px; margin-top: 4px; }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-send {
-  width: 40px;
-  height: 40px;
-  min-height: 40px;
+  flex: 0 0 32px;
+  width: 32px;
+  min-width: 32px;
+  max-width: 32px;
+  height: 32px;
+  min-height: 32px;
   padding: 0;
   display: grid;
   place-items: center;
@@ -341,6 +355,7 @@
   box-shadow: 0 6px 16px rgb(96 165 250 / 22%);
 }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-send:hover:not(:disabled) { background: var(--brand-hover); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-send-icon { transform: translateY(-2px); }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-panel-toggle,
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-panel-tabs button.is-selected { color: var(--brand-ink); border-color: var(--brand-tint); background: var(--brand-soft); }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .task-pending-count { color: var(--warning); background: var(--warning-bg); }

@@ -236,6 +236,24 @@ describe('Assistant durable tasks', () => {
   afterEach(() => { cleanup(); server.resetHandlers(); localStorage.clear(); authUser.id = 'u1234567'; Reflect.deleteProperty(window, 'morde'); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
   afterAll(() => server.close());
 
+  it('grows the composer to six lines and scrolls longer drafts', async () => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
+    vi.spyOn(HTMLTextAreaElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLTextAreaElement) {
+      return Math.max(48, this.value.split('\n').length * 24);
+    });
+    mockCommon({ conversations: [conversation] });
+    renderPage();
+
+    const composer = await screen.findByRole('textbox', { name: '消息内容' });
+    expect(composer).toHaveStyle({ height: '48px' });
+    fireEvent.change(composer, { target: { value: '第一行\n第二行\n第三行' } });
+    expect(composer).toHaveStyle({ height: '72px', overflowY: 'hidden' });
+    fireEvent.change(composer, { target: { value: Array.from({ length: 8 }, (_, index) => `第${index + 1}行`).join('\n') } });
+    expect(composer).toHaveStyle({ height: '144px', overflowY: 'auto' });
+    fireEvent.change(composer, { target: { value: '' } });
+    expect(composer).toHaveStyle({ height: '48px', overflowY: 'hidden' });
+  });
+
   it('keeps conversation and model actions in their respective chat panels', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     renderPage();

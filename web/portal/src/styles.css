@@ -1125,6 +1125,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .assistant-task-actions { flex: 0 0 auto; }
 .assistant-page .assistant-task-actions .button { min-height: 30px; padding: 5px 10px; border-radius: 8px; font-size: 11px; }
 .assistant-page .assistant-send { min-height: 30px; padding: 0 11px; border-radius: 8px; background: #0874f9; font-size: 11px; }
+.assistant-page .assistant-send-icon { flex: none; width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2.3; stroke-linecap: round; stroke-linejoin: round; }
 .assistant-page .assistant-send:hover:not(:disabled) { background: #0065df; }
 .assistant-page .assistant-task-panel { background: #fbfcfe; }
 .assistant-page .task-panel-heading { min-height: 76px; padding: 13px 19px; }
@@ -2018,6 +2019,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   gap: 14px;
 }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row { gap: 10px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row-pending { margin-top: 14px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row-user .chat-message-body { max-width: min(82%, 520px); }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .chat-message-user {
   padding: 11px 15px;
@@ -2050,22 +2052,26 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   font-size: 14px;
   line-height: 1.6;
 }
-.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer-footer { align-items: center; flex-wrap: nowrap; gap: 8px; margin-top: 5px; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer textarea:focus,
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer textarea:focus-visible { outline: 0 !important; box-shadow: none !important; }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer-footer { align-items: center; flex-wrap: nowrap; gap: 6px; margin-top: 4px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-composer-actions { display: flex; align-items: center; gap: 6px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-attach-control,
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-voice-input { width: 30px; height: 30px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-selectors { flex: 1 1 auto; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-send {
-  width: 34px;
-  height: 34px;
-  min-height: 34px;
+  flex: 0 0 32px;
+  width: 32px;
+  min-width: 32px;
+  max-width: 32px;
+  height: 32px;
+  min-height: 32px;
   padding: 0;
   display: grid;
   place-items: center;
   border-radius: 50%;
   font-size: 0;
 }
-.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .assistant-send span { font-size: 20px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer-hint {
   width: min(100%, 760px);
   margin: 7px auto 0;

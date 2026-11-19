@@ -1044,6 +1044,7 @@ export function Assistant() {
   const activeDraftLoad = useRef<string | null>(null);
   const localConversationKeyRef = useRef<string | null>(null);
   const taskPanelToggle = useRef<HTMLButtonElement>(null);
+  const composerTextarea = useRef<HTMLTextAreaElement>(null);
   const followConversation = useRef(true);
   useEffect(() => () => {
     for (const controllers of pdfPreparationControllers.current.values()) for (const controller of controllers) controller.abort();
@@ -2949,6 +2950,30 @@ export function Assistant() {
     : message.conversationID === null && Boolean(selectedLocalDraftKey) && message.conversationCreateKey === selectedLocalDraftKey));
   const composerDraftReady = !composerDraftIdentity || hydratedComposerDraftKey === composerDraftIdentity;
   const visibleComposerContent = composerDraftReady ? content : '';
+  const resizeComposer = useCallback(() => {
+    const textarea = composerTextarea.current;
+    if (!textarea) return;
+    const lineHeight = Number.parseFloat(getComputedStyle(textarea).lineHeight) || 24;
+    const minHeight = lineHeight * 2;
+    const maxHeight = lineHeight * 6;
+    textarea.style.height = 'auto';
+    const contentHeight = textarea.scrollHeight;
+    textarea.style.height = `${Math.min(Math.max(contentHeight, minHeight), maxHeight)}px`;
+    textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+    const view = conversationView.current;
+    if (view && followConversation.current) {
+      view.scrollTop = view.scrollHeight;
+      if (conversationScrollPositionKey) conversationScrollPositions.current.set(conversationScrollPositionKey, view.scrollTop);
+    }
+  }, [conversationScrollPositionKey]);
+  useLayoutEffect(resizeComposer, [resizeComposer, visibleComposerContent]);
+  useEffect(() => {
+    const textarea = composerTextarea.current;
+    if (!textarea || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(resizeComposer);
+    observer.observe(textarea);
+    return () => observer.disconnect();
+  }, [resizeComposer]);
   const incompleteAttachmentPreparationKey = composerAttachments.filter((item) => item.needsPreparation && !item.preparationCancelled).map((item) => item.id).join(',');
   useEffect(() => {
     if (!composerDraftReady || !composerDraftID || !incompleteAttachmentPreparationKey) return;
@@ -3582,7 +3607,7 @@ export function Assistant() {
             {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
             {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
-            <textarea id="assistant-content" value={visibleComposerContent} style={{ resize: 'none' }} onChange={(event) => {
+            <textarea ref={composerTextarea} id="assistant-content" value={visibleComposerContent} style={{ resize: 'none' }} onChange={(event) => {
               composerEditRevision.current += 1;
               if (!conversationID) ensureLocalConversationKey();
               const value = event.target.value;
@@ -3673,7 +3698,8 @@ export function Assistant() {
                 }} />
                 {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
                 <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length)}>
-                  {preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
+                  {preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) ? '读取附件…' : savingMessage ? '保存中…' : '发送'}
+                  <svg className="assistant-send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5" /></svg>
                 </button>
               </div>
             </div>
