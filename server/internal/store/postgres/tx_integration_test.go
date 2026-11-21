@@ -168,8 +168,8 @@ func TestAtomicPostgresOperations(t *testing.T) {
 			t.Fatalf("parallel workspace attaches: succeeded=%d failures=%d", succeeded, len(failures))
 		}
 		for _, err := range failures {
-			if domain.CodeOf(err) != domain.CodeWorkspaceBusy {
-				t.Errorf("parallel workspace attach error = %v", err)
+			if domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+				t.Errorf("parallel workspace attach error = %v, want workspace conflict", err)
 			}
 		}
 	})
@@ -537,8 +537,8 @@ func TestFailedWorkspaceBindingRemainsExclusiveUntilRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID})); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
-		t.Fatalf("bind Workspace while previous binding is failed error = %v, want workspace busy", err)
+	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID})); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("bind Workspace while previous binding is failed error = %v, want workspace conflict", err)
 	}
 	recovered, err := store.TransitionWorkspaceBinding(ctx, first.ID, value.ID, failed.BindingVersion,
 		workspace.BindingFailed, workspace.BindingPreparing, 0, 0)
@@ -619,7 +619,10 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	created := make(chan bool, callers)
 	errors := make(chan error, callers)
 	requests := make([]app.CreateHostParams, callers)
-	defaultWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "default-host")
+	defaultWorkspace, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatalf("create stable default Agent Workspace: %v", err)
+	}
 	for index := range requests {
 		requests[index] = testCreateHostParams(t, store, owner.ID, capacity, []string{defaultWorkspace.ID})
 		requests[index].Host.State = host.StateStopped
@@ -708,7 +711,7 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	if successes != 1 || quotaFailures != 1 {
 		t.Fatalf("concurrent creates: success=%d quota_exceeded=%d", successes, quotaFailures)
 	}
-	ensureParams := testCreateHostParams(t, store, owner.ID, capacity, nil)
+	ensureParams := testCreateHostParams(t, store, owner.ID, capacity, []string{defaultWorkspace.ID})
 	ensureParams.Host.State = host.StateStopped
 	ensureParams.Host.ExpiresAt = nil
 	selected, didCreate, err := store.EnsureDefaultHost(ctx, ensureParams)
@@ -721,6 +724,32 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	selected, didCreate, err = store.EnsureDefaultHost(ctx, ensureParams)
 	if err != nil || didCreate || selected.ID != "" {
 		t.Fatalf("multiple hosts without selection = %#v, created=%t, err=%v", selected, didCreate, err)
+	}
+}
+
+func TestDefaultHostCannotReuseAHostBoundToAnotherWorkspace(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
+	owner := createTestUser(t, store, 2, 10_000, 20_000)
+	boundWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "bound-default-host")
+	requestedWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "requested-default-host")
+	params := testCreateHostParams(t, store, owner.ID, capacity, []string{boundWorkspace.ID})
+	params.Host.State = host.StateStopped
+	params.Host.ExpiresAt = nil
+	created, didCreate, err := store.EnsureDefaultHost(ctx, params)
+	if err != nil || !didCreate || len(created.Workspaces) != 1 || created.Workspaces[0].Workspace.ID != boundWorkspace.ID {
+		t.Fatalf("create default Host = %#v, created=%t, err=%v", created, didCreate, err)
+	}
+	params = testCreateHostParams(t, store, owner.ID, capacity, []string{requestedWorkspace.ID})
+	params.Host.State = host.StateStopped
+	params.Host.ExpiresAt = nil
+	if _, _, err := store.EnsureDefaultHost(ctx, params); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("reuse default Host with another Workspace = %v, want workspace conflict", err)
+	}
+	current, found, err := store.GetDefaultHostForOwner(ctx, owner.ID)
+	if err != nil || !found || current.ID != created.ID || len(current.Workspaces) != 1 || current.Workspaces[0].Workspace.ID != boundWorkspace.ID {
+		t.Fatalf("default Host after conflicting reuse = %#v, found=%t, err=%v", current, found, err)
 	}
 }
 
@@ -849,7 +878,7 @@ func createPreRetirementTestUser(t *testing.T, store *Store, quotaHosts, quotaCP
 		t.Fatalf("create test session token: %v", err)
 	}
 	// Historical execution tests need a gate that existed before migration 52.
-	result, err := store.pool.Exec(context.Background(), `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1 AND state='disabled'`, user.ID)
+	result, err := store.pool.Exec(context.Background(), `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, user.ID)
 	if err != nil || result.RowsAffected() != 1 {
 		t.Fatalf("enable historical execution for test: updated=%d err=%v", result.RowsAffected(), err)
 	}

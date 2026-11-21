@@ -15,27 +15,31 @@ import (
 )
 
 type conversationServiceStub struct {
-	created      app.CreateConversationCommand
-	createCalls  int
-	createdValue conversation.Conversation
-	replayed     bool
-	listCalls    int
-	listRequest  app.PageRequest
-	listPage     app.ConversationPage
-	getID        string
-	conversation conversation.Conversation
-	messageID    string
-	messagePage  app.MessagePage
-	lookupID     string
-	lookupCalls  int
-	lookupPage   app.MessagePage
-	mainValue    conversation.MainConversation
-	getMainCalls int
-	ensureCmd    app.EnsureMainConversationCommand
-	ensureCalls  int
-	setCmd       app.SetMainConversationCommand
-	setCalls     int
-	err          error
+	created          app.CreateConversationCommand
+	createCalls      int
+	createdValue     conversation.Conversation
+	replayed         bool
+	listCalls        int
+	listPrincipal    identity.Principal
+	listRequest      app.PageRequest
+	listPage         app.ConversationPage
+	getID            string
+	getPrincipal     identity.Principal
+	conversation     conversation.Conversation
+	messageID        string
+	messagePrincipal identity.Principal
+	messagePage      app.MessagePage
+	lookupID         string
+	lookupPrincipal  identity.Principal
+	lookupCalls      int
+	lookupPage       app.MessagePage
+	mainValue        conversation.MainConversation
+	getMainCalls     int
+	ensureCmd        app.EnsureMainConversationCommand
+	ensureCalls      int
+	setCmd           app.SetMainConversationCommand
+	setCalls         int
+	err              error
 }
 
 func (s *conversationServiceStub) Create(_ context.Context, _ identity.Principal, command app.CreateConversationCommand) (conversation.Conversation, bool, error) {
@@ -50,8 +54,9 @@ func (s *conversationServiceStub) Create(_ context.Context, _ identity.Principal
 	}, s.replayed, s.err
 }
 
-func (s *conversationServiceStub) List(_ context.Context, _ identity.Principal, page app.PageRequest) (app.ConversationPage, error) {
+func (s *conversationServiceStub) List(_ context.Context, principal identity.Principal, page app.PageRequest) (app.ConversationPage, error) {
 	s.listCalls++
+	s.listPrincipal = principal
 	s.listRequest = page
 	return s.listPage, s.err
 }
@@ -60,13 +65,15 @@ func TestConversationListPassesSearchQueryToService(t *testing.T) {
 	service := &conversationServiceStub{}
 	response := httptest.NewRecorder()
 	taskAPIRouter(nil, service).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations?q=planning%20notes&limit=2", nil))
-	if response.Code != http.StatusOK || service.listCalls != 1 || service.listRequest.Search != "planning notes" || service.listRequest.Limit != 2 {
+	if response.Code != http.StatusOK || service.listCalls != 1 || service.listRequest.Search != "planning notes" || service.listRequest.Limit != 2 ||
+		service.listPrincipal.UserID != "u1234567" || service.listPrincipal.Kind != identity.KindSession {
 		t.Fatalf("conversation list = %d %s; request=%+v calls=%d", response.Code, response.Body.String(), service.listRequest, service.listCalls)
 	}
 }
 
-func (s *conversationServiceStub) Get(_ context.Context, _ identity.Principal, id string) (conversation.Conversation, error) {
+func (s *conversationServiceStub) Get(_ context.Context, principal identity.Principal, id string) (conversation.Conversation, error) {
 	s.getID = id
+	s.getPrincipal = principal
 	if s.conversation.ID != "" {
 		return s.conversation, s.err
 	}
@@ -74,13 +81,15 @@ func (s *conversationServiceStub) Get(_ context.Context, _ identity.Principal, i
 	return conversation.Conversation{ID: id, OwnerID: "u1234567", HostID: "h1234567", CreatedAt: now, UpdatedAt: now}, s.err
 }
 
-func (s *conversationServiceStub) ListMessages(_ context.Context, _ identity.Principal, id string, _ app.PageRequest) (app.MessagePage, error) {
+func (s *conversationServiceStub) ListMessages(_ context.Context, principal identity.Principal, id string, _ app.PageRequest) (app.MessagePage, error) {
 	s.messageID = id
+	s.messagePrincipal = principal
 	return s.messagePage, s.err
 }
 
-func (s *conversationServiceStub) FindMessageByClientID(_ context.Context, _ identity.Principal, id, clientID, _ string) (app.MessagePage, error) {
+func (s *conversationServiceStub) FindMessageByClientID(_ context.Context, principal identity.Principal, id, clientID, _ string) (app.MessagePage, error) {
 	s.messageID, s.lookupID = id, clientID
+	s.lookupPrincipal = principal
 	s.lookupCalls++
 	return s.lookupPage, s.err
 }
@@ -98,6 +107,7 @@ func TestConversationMessageLookupReturnsReceiptWithoutTask(t *testing.T) {
 	request.Header.Set("X-Morde-Actor-ID", "u1234567")
 	engine.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || service.lookupCalls != 1 || service.lookupID != "client-message-001" ||
+		service.lookupPrincipal.UserID != "u1234567" ||
 		!strings.Contains(response.Body.String(), `"routing_status":"pending"`) || strings.Contains(response.Body.String(), `"task_id":`) ||
 		!strings.Contains(response.Body.String(), `"next_cursor":null`) {
 		t.Fatalf("message receipt lookup = %d %s", response.Code, response.Body.String())
@@ -242,8 +252,8 @@ func TestConversationResponsesIncludePersonalScopeAndMainIdentity(t *testing.T) 
 	if err := json.Unmarshal(get.Body.Bytes(), &single); err != nil {
 		t.Fatal(err)
 	}
-	if get.Code != http.StatusOK || single.Scope != "personal" || !single.IsMain {
-		t.Fatalf("single conversation response = %d %+v, body=%s", get.Code, single, get.Body.String())
+	if get.Code != http.StatusOK || single.Scope != "personal" || !single.IsMain || service.getPrincipal.UserID != "u1234567" {
+		t.Fatalf("single conversation response = %d %+v, principal=%+v, body=%s", get.Code, single, service.getPrincipal, get.Body.String())
 	}
 }
 
@@ -265,7 +275,8 @@ func TestConversationMessagesReturnSequence(t *testing.T) {
 	}
 	if response.Code != http.StatusOK || len(body.Items) != 2 || body.Items[0].Content != "first" || body.Items[1].Content != "second" ||
 		body.Items[0].Sequence != 1 || body.Items[1].Sequence != 2 ||
-		body.Items[0].DeliveryStatus != conversation.DeliveryPending || body.Items[1].DeliveryStatus != conversation.DeliveryApplied || service.messageID != "c1234567" {
+		body.Items[0].DeliveryStatus != conversation.DeliveryPending || body.Items[1].DeliveryStatus != conversation.DeliveryApplied || service.messageID != "c1234567" ||
+		service.messagePrincipal.UserID != "u1234567" || service.messagePrincipal.Kind != identity.KindSession {
 		t.Fatalf("status=%d messages=%#v id=%s body=%s", response.Code, body.Items, service.messageID, response.Body.String())
 	}
 }

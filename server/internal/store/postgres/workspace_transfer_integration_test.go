@@ -98,7 +98,7 @@ VALUES ($1,$2,$3,$4,'download','fill_missing','completed','complete',$5,$5,$5,0,
 	if err := store.pool.QueryRow(ctx, `SELECT allocated_bytes FROM workspace_owner_block_usage WHERE owner_id=$1`, oldOwner.ID).Scan(&oldAllocated); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT allocated_bytes FROM workspace_owner_block_usage WHERE owner_id=$1`, newOwner.ID).Scan(&newAllocated); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT COALESCE((SELECT allocated_bytes FROM workspace_owner_block_usage WHERE owner_id=$1),0)`, newOwner.ID).Scan(&newAllocated); err != nil {
 		t.Fatal(err)
 	}
 	if oldAllocated != 9 || newAllocated != 0 {

@@ -35,6 +35,7 @@ const cloudDSHJobListToolName = "dsh_job_list"
 const cloudDSHJobGetToolName = "dsh_job_get"
 const cloudDSHJobOutputToolName = "dsh_job_output"
 const cloudDSHJobCancelToolName = "dsh_job_cancel"
+const cloudDSHResultEvidenceToolName = "morde_task_result_evidence"
 
 // ErrCloudDSHCompletionPending means dsh finished, but output and Task completion
 // have not been independently verified and committed.
@@ -327,6 +328,58 @@ func cloudDSHJobTools() []app.AgentToolDefinition {
 		{ModelTool: app.ModelTool{Name: cloudDSHJobOutputToolName, Description: "Read new delegated job output after a durable event cursor.", Parameters: output}},
 		{ModelTool: app.ModelTool{Name: cloudDSHJobCancelToolName, Description: "Cancel one delegated background job and wait for safe stop confirmation.", Parameters: cancel}},
 	}
+}
+
+func cloudDSHResultEvidenceTool() app.AgentToolDefinition {
+	parameters, _ := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"claims": map[string]any{
+				"type": "array", "minItems": 1, "maxItems": 64,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"claim_id":   map[string]any{"type": "string", "minLength": 1, "maxLength": 64},
+						"start_byte": map[string]any{"type": "integer", "minimum": 0},
+						"end_byte":   map[string]any{"type": "integer", "minimum": 1},
+						"performance_comparison": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"metric":           map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+								"unit":             map[string]any{"type": "string", "minLength": 1, "maxLength": 32},
+								"before":           map[string]any{"type": "number"},
+								"after":            map[string]any{"type": "number"},
+								"environment":      map[string]any{"type": "string", "minLength": 1, "maxLength": 512},
+				"baseline_call_id": map[string]any{"type": "string", "maxLength": 128, "description": "Root-session tool call whose reconciled output is a morde.performance_measurement.v1 JSON object."},
+				"after_call_id":    map[string]any{"type": "string", "maxLength": 128, "description": "Root-session tool call whose reconciled output is a morde.performance_measurement.v1 JSON object."},
+							},
+							"required":             []string{"metric", "unit", "before", "after", "environment", "baseline_call_id", "after_call_id"},
+							"additionalProperties": false,
+						},
+						"evidence_refs": map[string]any{
+							"type": "array", "minItems": 1, "maxItems": 64,
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"kind":    map[string]any{"type": "string", "enum": []string{"source", "baseline", "action", "result", "side_effect", "before_after"}},
+									"id":      map[string]any{"type": "string", "maxLength": 128, "description": "Use current for the user request (source) or this Task's final result Step (result); other IDs are not exposed to the model."},
+									"call_id": map[string]any{"type": "string", "maxLength": 128, "description": "Use a model-visible root or child action call ID, or a verified file-write call ID for its side-effect Artifact."},
+								},
+								"required": []string{"kind"}, "additionalProperties": false,
+							},
+						},
+					},
+					"required": []string{"claim_id", "start_byte", "end_byte", "evidence_refs"}, "additionalProperties": false,
+				},
+			},
+		},
+		"required": []string{"claims"}, "additionalProperties": false,
+	})
+	return app.AgentToolDefinition{ModelTool: app.ModelTool{
+		Name:        cloudDSHResultEvidenceToolName,
+		Description: "When finishing a Task answer, attach untrusted evidence references to factual claims in the exact final answer text emitted in this same assistant message. Use UTF-8 byte offsets. Cite the current user request with source id=current, the final result Step with result id=current, root-session tool actions by call_id, child actions by call_id listed in a delegated child result's action_refs, and a verified file-write side effect by its write call_id. For a performance claim, provide same-metric before/after values, unit, environment, and root-session baseline/after tool calls. Both successful, reconciled outputs must be one morde.performance_measurement.v1 JSON object with matching metric, unit, environment, and value; the server computes the delta and binds both to same-revision Task Steps. These remain untrusted claims until independent review. A dsh_delegate call resolves to its linked child Agent Step when present. Invalid, unresolved, or mismatched mappings are discarded; this tool does not verify claims or grant a PASS verdict.",
+		Parameters:  parameters,
+	}}
 }
 
 func cloudDSHJobTool(name string) bool {

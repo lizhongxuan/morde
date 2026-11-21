@@ -140,6 +140,7 @@ type taskSummaryResponse struct {
 	Dependencies                []taskDependencyResponse  `json:"dependencies"`
 	ChildJobs                   []taskChildJobResponse    `json:"child_jobs"`
 	ResultReview                *taskResultReviewResponse `json:"result_review"`
+	Validation                  taskValidationResponse    `json:"validation"`
 	CreatedAt                   time.Time                 `json:"created_at"`
 	UpdatedAt                   time.Time                 `json:"updated_at"`
 }
@@ -168,10 +169,15 @@ type taskResultReviewResponse struct {
 	ReplyMessageID      *string `json:"reply_message_id"`
 }
 
+type taskValidationResponse struct {
+	State app.TaskValidationState `json:"state"`
+}
+
 type taskResponse struct {
 	taskSummaryResponse
 	EventSequence          int64                             `json:"event_sequence"`
 	Result                 *string                           `json:"result"`
+	ValidationDetail       *app.TaskValidationEvidenceRecord `json:"validation_detail,omitempty"`
 	CurrentRevisionStarted *bool                             `json:"current_revision_started,omitempty"`
 	ResultMessagePending   bool                              `json:"result_message_pending,omitempty"`
 	ResultMessagePublished bool                              `json:"result_message_published,omitempty"`
@@ -1129,6 +1135,7 @@ func (h *api) getTask(service TaskService) gin.HandlerFunc {
 			writeError(c, err)
 			return
 		}
+		c.Header("Cache-Control", "private, no-store")
 		c.JSON(http.StatusOK, response)
 	}
 }
@@ -1241,7 +1248,8 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,
 		}, Dependencies: make([]taskDependencyResponse, 0), ChildJobs: make([]taskChildJobResponse, 0),
-		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+		Validation: taskValidationResponse{State: app.TaskValidationPending},
+		CreatedAt:  value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 	for _, dependency := range projection.Dependencies {
 		if !domain.ValidTaskID(dependency.TaskID) || dependency.RequiredRevision < 0 || !validTaskStatusResponse(dependency.TaskStatus) {
@@ -1272,6 +1280,12 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 			SourceEventSequence: review.SourceEventSequence, TriggerMessageID: review.TriggerMessageID,
 			ReplyMessageID: review.ReplyMessageID,
 		}
+	}
+	if validation := projection.Validation; validation.State != "" {
+		if !app.ValidTaskValidationState(validation.State) {
+			return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.Validation = taskValidationResponse{State: validation.State}
 	}
 	return response, nil
 }
@@ -1336,7 +1350,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	taskSummary := value.Task
 	taskSummary.StepCount, taskSummary.CompletedStepCount = task.StepCounts(value.Steps)
 	summary, err := toTaskSummaryResponseWithK2(taskSummary, app.TaskK2Projection{
-		Dependencies: value.Dependencies, ChildJobs: value.ChildJobs, ResultReview: value.ResultReview,
+		Dependencies: value.Dependencies, ChildJobs: value.ChildJobs, ResultReview: value.ResultReview, Validation: value.Validation,
 	})
 	if err != nil {
 		return taskResponse{}, err
@@ -1357,6 +1371,13 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
 		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan, Billing: billing,
+	}
+	if evidence := value.ValidationEvidence; evidence != nil {
+		if value.Task.CurrentRevision == nil || evidence.TaskRevision != *value.Task.CurrentRevision || evidence.EventSequence > value.Task.EventSequence ||
+			value.Task.Result == "" || app.ValidateTaskValidationEvidenceRecord(value.Task.Result, *evidence) != nil {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.ValidationDetail = evidence
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
 		message := assistant.Message

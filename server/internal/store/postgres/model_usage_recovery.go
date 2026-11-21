@@ -188,7 +188,7 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, call.own
 				}
 				return fmt.Errorf("mark stale model call unknown: ledger changed")
 			}
-			if call.taskID != "" {
+			if call.taskID != "" && call.source == string(app.ModelCallTask) {
 				if err := refreshTaskModelUsageInTx(ctx, tx, call.taskID, call.ownerID); err != nil {
 					return fmt.Errorf("invalidate stale task model usage: %w", err)
 				}

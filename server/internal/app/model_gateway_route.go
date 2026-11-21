@@ -219,11 +219,12 @@ func conversationRouteCallDigest(claim ConversationRouteClaim, value Conversatio
 		MaxOutputTokens   int
 		ReasoningEffort   string `json:",omitempty"`
 		DisableThinking   bool
+		JSONMode          bool
 		History           []historyEvidence
 		Candidates        []ConversationRouteCandidate
 	}{claim.ServiceInstanceID, claim.Message.ID, claim.Message.ConversationID, claim.Message.ActorID,
 		value.ModelID, conversationRouteCallAttempt(value), conversationRouteRetryAttempt(value), request.Instructions, request.Input, request.MaxOutputTokens,
-		request.ReasoningEffort, request.DisableThinking, history, value.Candidates})
+		request.ReasoningEffort, request.DisableThinking, request.JSONMode, history, value.Candidates})
 	if err != nil {
 		return nil, "", err
 	}
@@ -264,17 +265,18 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request is invalid")
 	}
 	var input struct {
-		Summary              map[string]any               `json:"summary,omitempty"`
-		Message              string                       `json:"message"`
-		ReferenceTime        string                       `json:"reference_time,omitempty"`
-		TimeZone             string                       `json:"time_zone,omitempty"`
-		TimeZoneProvided     bool                         `json:"time_zone_provided"`
-		ReferenceTaskID      string                       `json:"reference_task_id,omitempty"`
-		ReferenceUnavailable bool                         `json:"reference_unavailable,omitempty"`
-		PreviousUnresolved   bool                         `json:"previous_unresolved,omitempty"`
-		PreviousMissing      bool                         `json:"previous_missing,omitempty"`
-		History              []ConversationRouteHistory   `json:"history"`
-		Tasks                []ConversationRouteCandidate `json:"active_tasks"`
+		Summary                map[string]any               `json:"summary,omitempty"`
+		Message                string                       `json:"message"`
+		ReferenceTime          string                       `json:"reference_time,omitempty"`
+		TimeZone               string                       `json:"time_zone,omitempty"`
+		TimeZoneProvided       bool                         `json:"time_zone_provided"`
+		ReferenceTaskID        string                       `json:"reference_task_id,omitempty"`
+		ReferenceUnavailable   bool                         `json:"reference_unavailable,omitempty"`
+		CandidateSetIncomplete bool                         `json:"candidate_set_incomplete,omitempty"`
+		PreviousUnresolved     bool                         `json:"previous_unresolved,omitempty"`
+		PreviousMissing        bool                         `json:"previous_missing,omitempty"`
+		History                []ConversationRouteHistory   `json:"history"`
+		Tasks                  []ConversationRouteCandidate `json:"active_tasks"`
 	}
 	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be decoded")
@@ -284,6 +286,13 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be encoded")
 	}
 	request.Instructions = legacyConversationRouteInstructions + "\n\n" + conversationRouteAcknowledgementInstructions
+	request.Instructions += "\n\n" + conversationRouteJSONModeExample
+	if value.PreviousUnresolved {
+		request.Instructions += "\n\n" + conversationRouteUnresolvedReplyInstructions
+	}
+	if value.CandidateSetIncomplete {
+		request.Instructions += "\n\n" + conversationRouteIncompleteCandidatesInstructions
+	}
 	request.Input[0].Text = string(body)
 	return request, nil
 }
@@ -424,6 +433,7 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	if err != nil || len(request.Tools) != 0 || len(request.Input) == 0 {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "coordinator model request must be text-only and have no tools")
 	}
+	request.JSONMode = true
 	for _, item := range request.Input {
 		if len(item.Images) != 0 {
 			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "coordinator model request cannot include images")
@@ -465,9 +475,10 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		ThroughSequence   int64
 		Authorization     int64
 		ModelID           string
+		JSONMode          bool
 		RequestDigest     []byte
 	}{string(ModelCallRoute), claim.ServiceInstanceID, claim.Message.ID, claim.Message.ConversationID, claim.Message.ActorID,
-		sessionID, throughSequence, claim.Authorization.Version, value.ModelID, rawDigest[:]})
+		sessionID, throughSequence, claim.Authorization.Version, value.ModelID, request.JSONMode, rawDigest[:]})
 	if err != nil {
 		return ModelResponse{}, err
 	}

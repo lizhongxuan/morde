@@ -30,19 +30,20 @@ func TestPostgresTaskK2Projection(t *testing.T) {
 		}
 		return created
 	}
-	readProjection := func(taskID string, revision int64) ([]app.Dependency, []app.ChildJob, *app.ResultReview) {
+	readProjection := func(taskID string, revision int64) ([]app.Dependency, []app.ChildJob, *app.ResultReview, app.TaskValidationSummary) {
 		t.Helper()
 		var dependencies []app.Dependency
 		var childJobs []app.ChildJob
 		var review *app.ResultReview
+		var validation app.TaskValidationSummary
 		if err := store.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 			var err error
-			dependencies, childJobs, review, err = loadTaskK2Projection(ctx, tx, taskID, revision)
+			dependencies, childJobs, review, validation, err = loadTaskK2Projection(ctx, tx, taskID, revision)
 			return err
 		}); err != nil {
 			t.Fatalf("load K2 projection: %v", err)
 		}
-		return dependencies, childJobs, review
+		return dependencies, childJobs, review, validation
 	}
 
 	completed := createTask("k2-dependency-complete")
@@ -66,9 +67,9 @@ func TestPostgresTaskK2Projection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dependencies, childJobs, review := readProjection(parent.Task.ID, 2)
-	if dependencies == nil || len(dependencies) != 0 || childJobs == nil || len(childJobs) != 0 || review != nil {
-		t.Fatalf("empty K2 projection = dependencies %#v, child jobs %#v, review %#v", dependencies, childJobs, review)
+	dependencies, childJobs, review, validation := readProjection(parent.Task.ID, 2)
+	if dependencies == nil || len(dependencies) != 0 || childJobs == nil || len(childJobs) != 0 || review != nil || validation.State != app.TaskValidationPending {
+		t.Fatalf("empty K2 projection = dependencies %#v, child jobs %#v, review %#v, validation %#v", dependencies, childJobs, review, validation)
 	}
 	for _, dependency := range []struct {
 		taskID           string
@@ -147,7 +148,7 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 	}
 	insertBatchAndSource(batchID, 2, 4, "pending", "pending", triggerMessageID)
 
-	dependencies, childJobs, review = readProjection(parent.Task.ID, 2)
+	dependencies, childJobs, review, validation = readProjection(parent.Task.ID, 2)
 	if len(dependencies) != 4 || len(childJobs) != 2 || review == nil {
 		t.Fatalf("K2 projection counts = dependencies %d, child jobs %d, review %#v", len(dependencies), len(childJobs), review)
 	}
@@ -193,6 +194,7 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 		}
 		projection, ok := page.K2Projections[parent.Task.ID]
 		if !foundTask || !ok || len(projection.Dependencies) != 4 || len(projection.ChildJobs) != 2 || projection.ResultReview == nil ||
+			projection.Validation.State != app.TaskValidationPending ||
 			projection.ResultReview.State != "pending" || projection.ResultReview.SourceTaskID != parent.Task.ID ||
 			projection.ResultReview.SourceTaskRevision != 2 || projection.ResultReview.SourceEventSequence != 4 ||
 			projection.ResultReview.TriggerMessageID == nil || *projection.ResultReview.TriggerMessageID != triggerMessageID {
@@ -216,24 +218,24 @@ VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,1)`, messageID, owner.ID, conver
 	if _, err := store.pool.Exec(ctx, `UPDATE conversation_result_sources SET state='published' WHERE task_id=$1 AND task_revision=2`, parent.Task.ID); err != nil {
 		t.Fatal(err)
 	}
-	_, _, review = readProjection(parent.Task.ID, 2)
+	_, _, review, _ = readProjection(parent.Task.ID, 2)
 	if review == nil || review.State != "published" || review.TriggerMessageID == nil || *review.TriggerMessageID != triggerMessageID ||
 		review.ReplyMessageID == nil || *review.ReplyMessageID != batchID {
 		t.Fatalf("published result review = %#v", review)
 	}
-	_, _, review = readProjection(parent.Task.ID, 3)
+	_, _, review, _ = readProjection(parent.Task.ID, 3)
 	if review != nil {
 		t.Fatalf("older revision review leaked into a new revision = %#v", review)
 	}
 
 	supersededBatchID := mustID(t, domain.NewMessageID)
 	insertBatchAndSource(supersededBatchID, 3, 5, "superseded", "superseded", "")
-	_, _, review = readProjection(parent.Task.ID, 3)
+	_, _, review, _ = readProjection(parent.Task.ID, 3)
 	if review != nil {
 		t.Fatalf("latest superseded result review = %#v, want nil", review)
 	}
 
-	_, olderRevisionChildren, _ := readProjection(parent.Task.ID, 1)
+	_, olderRevisionChildren, _, _ := readProjection(parent.Task.ID, 1)
 	if len(olderRevisionChildren) != 1 || olderRevisionChildren[0].JobID != childValues[2].sessionID ||
 		olderRevisionChildren[0].TaskRevision != 1 || olderRevisionChildren[0].Status != task.StepSucceeded {
 		t.Fatalf("older revision child projection = %#v", olderRevisionChildren)
@@ -269,7 +271,7 @@ VALUES ($1,$2,$3,$4,0)`, scopeParent.Task.ID, owner.ID, projectConversation.ID, 
 			t.Fatalf("insert scoped dependency %s: %v", dependencyID, err)
 		}
 	}
-	scopedDependencies, _, _ := readProjection(scopeParent.Task.ID, 0)
+	scopedDependencies, _, _, _ := readProjection(scopeParent.Task.ID, 0)
 	if len(scopedDependencies) != 1 || scopedDependencies[0].TaskID != sameInitiator.Task.ID {
 		t.Fatalf("dependency projection crossed initiator scope: %#v", scopedDependencies)
 	}

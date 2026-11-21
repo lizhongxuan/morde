@@ -18,12 +18,13 @@ func (s *Store) GetTaskStepDetail(ctx context.Context, actorID, taskID, stepID s
 		if err != nil {
 			return err
 		}
-		err = tx.QueryRow(ctx, `SELECT t.id,t.owner_id,st.id,t.event_seq,d.task_revision,d.payload_ciphertext,d.payload_sha256,d.payload_size_bytes,d.truncated
+		err = tx.QueryRow(ctx, `SELECT t.id,t.owner_id,st.id,t.event_seq,d.task_revision,d.payload_ciphertext,d.payload_sha256,
+d.content_evidence_sha256,d.payload_size_bytes,d.truncated
 FROM tasks t JOIN task_steps st ON st.task_id=t.id AND st.id=$3
 JOIN task_step_details d ON d.task_id=st.task_id AND d.step_id=st.id
 WHERE t.id=$1 AND t.owner_id=$2`, taskID, ownerID, stepID).Scan(
 			&result.TaskID, &result.OwnerID, &result.StepID, &result.EventSequence, &result.TaskRevision,
-			&result.Ciphertext, &result.SHA256, &result.SizeBytes, &result.Truncated)
+			&result.Ciphertext, &result.SHA256, &result.ContentEvidenceSHA256, &result.SizeBytes, &result.Truncated)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "task step detail not found")
 		}

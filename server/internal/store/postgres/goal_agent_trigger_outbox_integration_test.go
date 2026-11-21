@@ -12,6 +12,9 @@ func TestPostgresGoalAgentFollowupOutboxRespectsOptInAndCurrentGoal(t *testing.T
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 4, 20_000, 40_000)
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='disabled',epoch=epoch+1 WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatalf("disable owner execution for opt-in test: %v", err)
+	}
 	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
 	goalID := "goal-auto-followup-1"
 

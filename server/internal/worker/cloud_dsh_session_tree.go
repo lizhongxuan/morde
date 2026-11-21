@@ -651,14 +651,6 @@ func (e *CloudDSHExecutor) cloudDSHRecoverSettledPersonalChildren(ctx context.Co
 				if !validCloudDSHBackgroundHandle(call.resultText, child.SessionID) {
 					return nil, nil, errors.New("personal child job handle changed")
 				}
-			} else {
-				result := strings.TrimSpace(child.Step.Summary)
-				if result == "" {
-					result = "Child agent completed."
-				}
-				if call.resultText != result {
-					return nil, nil, errors.New("personal child result differs from its settlement")
-				}
 			}
 		}
 	}
@@ -685,6 +677,24 @@ func (e *CloudDSHExecutor) cloudDSHRecoverSettledPersonalChildren(ctx context.Co
 			confirmed[sessionID] = sessionWrites
 		}
 		histories[child.SessionID] = childHistory
+	}
+	for callID, call := range rootHistory.calls {
+		if call.name != cloudDSHDelegateToolName || !call.resultSeen {
+			continue
+		}
+		child := bySpawnKey[callID]
+		if child.Background {
+			continue
+		}
+		result := strings.TrimSpace(child.Step.Summary)
+		if result == "" {
+			result = "Child agent completed."
+		}
+		refs := cloudDSHChildActionRefs(child.TaskID, child.SessionID, histories[child.SessionID])
+		linkedResult, err := cloudDSHChildResultText(result, refs)
+		if err != nil || call.resultText != result && call.resultText != linkedResult {
+			return nil, nil, errors.New("personal child result differs from its settlement")
+		}
 	}
 	return histories, confirmed, nil
 }
@@ -914,7 +924,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}
 	rootDefinitions := append([]app.AgentToolDefinition(nil), baseDefinitions...)
 	for _, definition := range baseDefinitions {
-		if definition.Name == cloudDSHDelegateToolName || cloudDSHJobTool(definition.Name) {
+		if definition.Name == cloudDSHDelegateToolName || cloudDSHJobTool(definition.Name) || definition.Name == cloudDSHResultEvidenceToolName {
 			return errors.New("dsh tool definitions use a reserved name")
 		}
 	}
@@ -930,6 +940,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		if canDelegate && len(rootDefinitions) < 64 {
 			rootDefinitions = append(rootDefinitions, cloudDSHDelegateTool(baseDefinitions))
 		}
+	}
+	if toolsAllowed && e.options.Tools != nil && len(baseDefinitions) > 0 && len(rootDefinitions) < 64 {
+		rootDefinitions = append(rootDefinitions, cloudDSHResultEvidenceTool())
 	}
 	if !validCloudDSHToolDefinitions(rootDefinitions) {
 		return errors.New("dsh tool definitions are unavailable")
@@ -1744,8 +1757,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				settled.CheckpointThrough != state.through || !bytes.Equal(settled.CheckpointDigest, state.checkpointDigest) {
 				return errors.New("dsh child Agent settlement was not durably confirmed")
 			}
+			toolOutput := summary
 			if !state.background {
-				if err := recordCloudDSHChildToolResult(states[state.parentSessionID], frame.CallID, settled); err != nil {
+				var err error
+				toolOutput, err = recordCloudDSHChildToolResult(states[state.parentSessionID], frame.CallID, settled, state.history)
+				if err != nil {
 					return err
 				}
 			}
@@ -1753,13 +1769,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "child_settle_ack", "call_id": frame.CallID,
 				"task_id": state.identity.TaskID, "owner_id": state.identity.OwnerID, "agent_id": state.identity.AgentID,
 				"generation": state.identity.Generation, "authorization_version": state.identity.AuthorizationVersion,
-				"session_id": state.identity.SessionID, "ok": true, "status": status, "summary": summary}); err != nil {
+				"session_id": state.identity.SessionID, "ok": true, "status": status, "summary": summary,
+				"output": toolOutput}); err != nil {
 				return err
 			}
 		case "tool_call":
 			if (e.options.Tools == nil && !cloudDSHJobTool(frame.Name)) || frame.Through == nil || *frame.Through != state.through || state.through < 0 ||
 				!cloudDSHID.MatchString(frame.ID) || frame.CallID == "" || len(frame.CallID) > 256 || !cloudDSHID.MatchString(frame.Name) ||
-				!cloudDSHToolAllowed(state.definitions, frame.Name) || frame.Name == cloudDSHDelegateToolName || !validCloudDSHJSONObject(frame.Arguments) {
+				!cloudDSHToolAllowed(state.definitions, frame.Name) || frame.Name == cloudDSHDelegateToolName ||
+				frame.Name == cloudDSHResultEvidenceToolName && state.identity.SessionID != rootIdentity.SessionID ||
+				!validCloudDSHJSONObject(frame.Arguments) {
 				return errors.New("dsh tool call frame is invalid")
 			}
 			retryCall := value.StepRetry != nil && state.identity.SessionID == rootIdentity.SessionID && frame.CallID == value.StepRetry.RetryCallID
@@ -1807,7 +1826,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 			}
 			var result app.AgentToolResult
-			if cloudDSHJobTool(frame.Name) {
+			if frame.Name == cloudDSHResultEvidenceToolName {
+				result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
+			} else if cloudDSHJobTool(frame.Name) {
 				if state.identity.SessionID != rootIdentity.SessionID || e.options.Children == nil {
 					return errors.New("dsh job tool is unavailable to this session")
 				}
@@ -1957,7 +1978,11 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 			return errors.New("dsh background job handle was not durably reconciled")
 		}
 	} else if child.Step.Status == task.StepSucceeded || child.Step.Status == task.StepFailed {
-		if err := recordCloudDSHChildToolResult(parent, frame.CallID, child); err != nil {
+		var childHistory *cloudDSHCheckpointHistory
+		if childState := states[child.SessionID]; childState != nil {
+			childHistory = childState.history
+		}
+		if _, err := recordCloudDSHChildToolResult(parent, frame.CallID, child, childHistory); err != nil {
 			return err
 		}
 	}
@@ -1983,13 +2008,57 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		"checkpoint_sha256": hex.EncodeToString(child.CheckpointDigest), "step_status": child.Step.Status, "summary": child.Step.Summary})
 }
 
-func recordCloudDSHChildToolResult(parent *cloudDSHSessionState, callID string, child app.AgentChildSession) error {
+type cloudDSHChildActionRef struct {
+	CallID string `json:"call_id"`
+	Tool   string `json:"tool"`
+}
+
+func cloudDSHChildActionRefs(taskID, sessionID string, history *cloudDSHCheckpointHistory) []cloudDSHChildActionRef {
+	if history == nil || history.sessionID != sessionID {
+		return nil
+	}
+	callIDs := make([]string, 0, len(history.calls))
+	for callID, call := range history.calls {
+		if call != nil && call.callSeen && call.resultSeen && call.name != cloudDSHDelegateToolName && call.name != cloudDSHResultEvidenceToolName {
+			callIDs = append(callIDs, callID)
+		}
+	}
+	sort.Slice(callIDs, func(i, j int) bool {
+		left, right := history.calls[callIDs[i]], history.calls[callIDs[j]]
+		if left.callSeq != right.callSeq {
+			return left.callSeq < right.callSeq
+		}
+		return callIDs[i] < callIDs[j]
+	})
+	refs := make([]cloudDSHChildActionRef, 0, len(callIDs))
+	for _, callID := range callIDs {
+		call := history.calls[callID]
+		refs = append(refs, cloudDSHChildActionRef{CallID: cloudDSHNamespacedToolCallID(taskID, sessionID, callID), Tool: call.name})
+	}
+	return refs
+}
+
+func cloudDSHChildResultText(summary string, refs []cloudDSHChildActionRef) (string, error) {
+	if len(refs) == 0 {
+		return summary, nil
+	}
+	encoded, err := json.Marshal(struct {
+		Summary    string                   `json:"summary"`
+		ActionRefs []cloudDSHChildActionRef `json:"action_refs"`
+	}{Summary: summary, ActionRefs: refs})
+	if err != nil {
+		return "", errors.New("dsh child Agent evidence references could not be encoded")
+	}
+	return string(encoded), nil
+}
+
+func recordCloudDSHChildToolResult(parent *cloudDSHSessionState, callID string, child app.AgentChildSession, childHistory *cloudDSHCheckpointHistory) (string, error) {
 	if parent == nil || parent.history == nil {
-		return errors.New("dsh child Agent parent history is unavailable")
+		return "", errors.New("dsh child Agent parent history is unavailable")
 	}
 	call := parent.history.calls[callID]
 	if call == nil || call.name != cloudDSHDelegateToolName || !call.callSeen {
-		return errors.New("dsh child Agent result does not match a checkpointed delegation")
+		return "", errors.New("dsh child Agent result does not match a checkpointed delegation")
 	}
 	var status app.AgentToolResultStatus
 	output := strings.TrimSpace(child.Step.Summary)
@@ -2005,7 +2074,22 @@ func recordCloudDSHChildToolResult(parent *cloudDSHSessionState, callID string, 
 			output = "Child agent failed."
 		}
 	default:
-		return errors.New("dsh child Agent result is not terminal")
+		return "", errors.New("dsh child Agent result is not terminal")
 	}
-	return parent.history.noteToolResult(callID, cloudDSHDelegateToolName, call.arguments, status, output, nil)
+	if call.resultSeen {
+		output = call.resultText
+		if status == app.AgentToolFailed {
+			output = strings.TrimPrefix(output, "Tool failed: ")
+		}
+	} else {
+		linkedResult, err := cloudDSHChildResultText(output, cloudDSHChildActionRefs(child.TaskID, child.SessionID, childHistory))
+		if err != nil {
+			return "", err
+		}
+		output = linkedResult
+	}
+	if err := parent.history.noteToolResult(callID, cloudDSHDelegateToolName, call.arguments, status, output, nil); err != nil {
+		return "", err
+	}
+	return output, nil
 }

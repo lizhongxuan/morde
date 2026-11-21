@@ -16,6 +16,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/project"
 )
 
@@ -91,6 +92,57 @@ func (s *Store) ResolveConversationRouteModel(ctx context.Context, claim app.Con
 	return selected, err
 }
 
+func conversationRouteCandidateSubset[T any](all, included []T) bool {
+	index := 0
+	for _, candidate := range all {
+		if index < len(included) && reflect.DeepEqual(candidate, included[index]) {
+			index++
+		}
+	}
+	return index == len(included)
+}
+
+func conversationRouteRequestCandidateSubset(all, included []app.ConversationRouteRequestCandidate) bool {
+	byID := make(map[string]app.ConversationRouteRequestCandidate, len(all))
+	for _, candidate := range all {
+		byID[candidate.MessageID] = candidate
+	}
+	for _, candidate := range included {
+		current, ok := byID[candidate.MessageID]
+		if !ok || !sameConversationRouteRequestIdentity(current, candidate) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameConversationRouteRequestIdentity(first, second app.ConversationRouteRequestCandidate) bool {
+	for _, candidate := range []*app.ConversationRouteRequestCandidate{&first, &second} {
+		candidate.RoutingStatus = ""
+		candidate.TaskID, candidate.TaskStatus = "", ""
+		candidate.DirectReply, candidate.AggregationWaiting, candidate.AggregationClosed = false, false, false
+	}
+	return reflect.DeepEqual(first, second)
+}
+
+func normalizeConversationRouteRequestCandidate(candidate app.ConversationRouteRequestCandidate) app.ConversationRouteRequestCandidate {
+	candidate.RoutingStatus = app.NormalizeConversationRouteStatusForClassification(candidate.RoutingStatus)
+	if candidate.RoutingStatus == conversation.RoutingPending {
+		candidate.DirectReply = false
+	}
+	return candidate
+}
+
+func conversationRouteSnapshotsMatch(first, second app.ConversationRouteSnapshot) bool {
+	for _, snapshot := range []*app.ConversationRouteSnapshot{&first, &second} {
+		snapshot.Context.RequestCandidates = append([]app.ConversationRouteRequestCandidate(nil), snapshot.Context.RequestCandidates...)
+		for index := range snapshot.Context.RequestCandidates {
+			snapshot.Context.RequestCandidates[index] = normalizeConversationRouteRequestCandidate(snapshot.Context.RequestCandidates[index])
+		}
+	}
+	return reflect.DeepEqual(first, second)
+}
+
 func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.ConversationRouteModelFence, modelID string) error {
 	claim, value := fence.Claim, fence.Context
 	if value.ActorID != claim.Message.ActorID || value.ReferenceTaskID != claim.Input.ReferenceTaskID ||
@@ -124,6 +176,46 @@ func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.
 	} else {
 		expected.SummaryVersion, expected.SummarySHA256, expected.SummarySourcesSHA256, expected.SummaryText = 0, nil, nil, ""
 	}
+	if !conversationRouteCandidateSubset(expected.Candidates, value.Candidates) {
+		return domain.NewError(domain.CodeConflict, "authorized route tasks changed")
+	}
+	if !conversationRouteRequestCandidateSubset(expected.RequestCandidates, value.RequestCandidates) {
+		return domain.NewError(domain.CodeConflict, "authorized route requests changed")
+	}
+	if !conversationRouteCandidateSubset(expected.AggregationCandidates, value.AggregationCandidates) {
+		return domain.NewError(domain.CodeConflict, "authorized route aggregation candidates changed")
+	}
+	candidatesOmitted := len(value.Candidates) < len(expected.Candidates) ||
+		len(value.RequestCandidates) < len(expected.RequestCandidates) ||
+		len(value.AggregationCandidates) < len(expected.AggregationCandidates)
+	if value.CandidateSetIncomplete != (expected.CandidateSetIncomplete || candidatesOmitted) {
+		return domain.NewError(domain.CodeConflict, "authorized route candidate completeness changed")
+	}
+	containsTask := func(items []app.ConversationRouteCandidate, id string) bool {
+		for _, item := range items {
+			if item.TaskID == id {
+				return true
+			}
+		}
+		return false
+	}
+	containsRequest := func(items []app.ConversationRouteRequestCandidate, id string) bool {
+		for _, item := range items {
+			if item.MessageID == id {
+				return true
+			}
+		}
+		return false
+	}
+	if (containsTask(expected.Candidates, expected.ReferenceTaskID) && !containsTask(value.Candidates, expected.ReferenceTaskID)) ||
+		(containsTask(expected.Candidates, expected.PreviousTaskID) && !containsTask(value.Candidates, expected.PreviousTaskID)) ||
+		(containsRequest(expected.RequestCandidates, expected.PreviousMessageID) && !containsRequest(value.RequestCandidates, expected.PreviousMessageID)) {
+		return domain.NewError(domain.CodeConflict, "explicit route candidate was omitted")
+	}
+	expected.Candidates = value.Candidates
+	expected.RequestCandidates = value.RequestCandidates
+	expected.AggregationCandidates = value.AggregationCandidates
+	expected.CandidateSetIncomplete = value.CandidateSetIncomplete
 	if snapshot.PreviousCycle || !reflect.DeepEqual(expected, value) {
 		return domain.NewError(domain.CodeConflict, "authorized route context changed")
 	}

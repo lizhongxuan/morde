@@ -60,7 +60,7 @@ func TestZAICompletePreservesReasoningToolsAndUsage(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&wire); err != nil {
 			t.Fatal(err)
 		}
-		return jsonResponse(http.StatusOK, `{"choices":[{"index":0,"message":{"role":"assistant","content":"正在搜索","reasoning_content":"next private thought","tool_calls":[{"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"ai\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":37,"completion_tokens":9}}`), nil
+		return jsonResponse(http.StatusOK, `{"model":"glm-5.1-provider-reported","choices":[{"index":0,"message":{"role":"assistant","content":"正在搜索","reasoning_content":"next private thought","tool_calls":[{"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"ai\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":37,"completion_tokens":9}}`), nil
 	}))
 	request := app.ModelRequest{Endpoint: zaiTestEndpoint(), Instructions: "Morde persona", MaxOutputTokens: 256,
 		Input: []app.ModelInput{
@@ -84,14 +84,15 @@ func TestZAICompletePreservesReasoningToolsAndUsage(t *testing.T) {
 	}
 	if response.Text != "正在搜索" || response.Reasoning != "next private thought" || response.StopReason != "tool_calls" ||
 		len(response.ToolCalls) != 1 || response.ToolCalls[0].Arguments != `{"q":"ai"}` ||
-		!response.Usage.Known || response.Usage.InputTokens != 37 || response.Usage.OutputTokens != 9 {
+		!response.Usage.Known || response.Usage.InputTokens != 37 || response.Usage.OutputTokens != 9 ||
+		response.ProviderReportedModel != "glm-5.1-provider-reported" {
 		t.Fatalf("unexpected Z.ai response: %#v", response)
 	}
 }
 
 func TestZAIStreamKeepsReasoningPrivateAndAssemblesToolCalls(t *testing.T) {
 	stream := strings.Join([]string{
-		`data: {"choices":[{"index":0,"delta":{"reasoning_content":"private thought"},"finish_reason":null}]}`,
+		`data: {"model":"glm-5.1-stream-reported","choices":[{"index":0,"delta":{"reasoning_content":"private thought"},"finish_reason":null}]}`,
 		"",
 		`data: {"choices":[{"index":0,"delta":{"content":"搜索中"},"finish_reason":null}]}`,
 		"",
@@ -120,8 +121,34 @@ func TestZAIStreamKeepsReasoningPrivateAndAssemblesToolCalls(t *testing.T) {
 	}
 	if visible.String() != "搜索中" || response.Text != "搜索中" || response.Reasoning != "private thought" ||
 		response.StopReason != "tool_calls" || len(response.ToolCalls) != 1 || response.ToolCalls[0].Arguments != `{"q":"ai"}` ||
-		!response.Usage.Known || response.Usage.InputTokens != 10 || response.Usage.OutputTokens != 4 {
+		!response.Usage.Known || response.Usage.InputTokens != 10 || response.Usage.OutputTokens != 4 ||
+		response.ProviderReportedModel != "glm-5.1-stream-reported" {
 		t.Fatalf("unexpected streamed result: visible=%q response=%#v", visible.String(), response)
+	}
+}
+
+func TestZAICompleteLeavesReportedModelEmptyWhenProviderOmitsIt(t *testing.T) {
+	client := zaiTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`), nil
+	}))
+	response, err := client.Complete(context.Background(), app.ModelRequest{Endpoint: zaiTestEndpoint(), MaxOutputTokens: 32,
+		Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}})
+	if err != nil || response.ProviderReportedModel != "" {
+		t.Fatalf("reported model = %q, err = %v; want empty when provider omits it", response.ProviderReportedModel, err)
+	}
+}
+
+func TestZAIStreamRejectsChangingReportedModel(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"model":"glm-a","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`,
+		"",
+		`data: {"model":"glm-b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	if _, err := readZAIStream(strings.NewReader(stream), func(string) error { return nil }); err == nil {
+		t.Fatal("stream with changing provider-reported model was accepted")
 	}
 }
 

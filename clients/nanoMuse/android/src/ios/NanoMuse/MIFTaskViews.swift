@@ -86,6 +86,70 @@ enum MIFTaskActionRules {
     }
 }
 
+enum MIFTaskValidationState: Equatable {
+    case pending
+    case pass
+    case passWithNotes
+    case fail
+    case unknown
+
+    init(serverValue: String?) {
+        switch serverValue {
+        case nil, .some("pending"): self = .pending
+        case .some("PASS"): self = .pass
+        case .some("PASS+NOTES"): self = .passWithNotes
+        case .some("FAIL"): self = .fail
+        default: self = .unknown
+        }
+    }
+}
+
+enum MIFTaskValidationPresentation {
+    static func state(for validation: MordeTask.Validation?) -> MIFTaskValidationState {
+        MIFTaskValidationState(serverValue: validation?.state)
+    }
+
+    static func label(for validation: MordeTask.Validation?) -> String {
+        switch state(for: validation) {
+        case .pending: AppLocalized("Pending verification")
+        case .pass: AppLocalized("PASS")
+        case .passWithNotes: AppLocalized("PASS+NOTES")
+        case .fail: AppLocalized("FAIL")
+        case .unknown: AppLocalized("Status unknown")
+        }
+    }
+
+    static func explanation(for validation: MordeTask.Validation?) -> String {
+        switch state(for: validation) {
+        case .pending: AppLocalized("Validation is pending independent review.")
+        case .pass: AppLocalized("Required checks passed with supporting evidence.")
+        case .passWithNotes: AppLocalized("Required checks passed with non-blocking notes.")
+        case .fail: AppLocalized("Validation did not pass. Review the blocking checks.")
+        case .unknown: AppLocalized("Validation status is unknown and cannot be treated as passed.")
+        }
+    }
+
+    static func foregroundColor(for state: MIFTaskValidationState) -> Color {
+        switch state {
+        case .pending: NanoMuseTones.warning
+        case .pass: NanoMuseTones.successInk
+        case .passWithNotes: NanoMuseTones.actionText
+        case .fail: NanoMuseTones.dangerInk
+        case .unknown: NanoMuseTones.secondaryText
+        }
+    }
+
+    static func backgroundColor(for state: MIFTaskValidationState) -> Color {
+        switch state {
+        case .pending: NanoMuseTones.warningFill
+        case .pass: NanoMuseTones.successFill
+        case .passWithNotes: NanoMuseTones.brandSoft
+        case .fail: NanoMuseTones.dangerFill
+        case .unknown: NanoMuseTones.side
+        }
+    }
+}
+
 enum MIFTaskPresentation {
     static func headerMood(for task: MordeTask?) -> NanoMuseMood {
         switch task?.status {
@@ -1272,6 +1336,7 @@ struct MIFTaskDetailView: View {
                 MIFTaskInlineError(message: detailError)
             }
             taskSummary(task)
+            taskValidation(task)
             MIFTaskQueuePrioritySection(task: task, busy: isPerformingAction || store.actionInFlight || isLoadingDetail || detailError != nil) { priority in
                 Task { await changeQueuePriority(priority, taskID: task.id) }
             }
@@ -1317,6 +1382,33 @@ struct MIFTaskDetailView: View {
             .padding(.horizontal, 22)
             .padding(.top, 2)
             .accessibilityIdentifier("morde.task.status")
+    }
+
+    private func taskValidation(_ task: MordeTask) -> some View {
+        let state = MIFTaskValidationPresentation.state(for: task.validation)
+        return MIFTaskSection(title: AppLocalized("Task validation")) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(MIFTaskValidationPresentation.label(for: task.validation))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(MIFTaskValidationPresentation.foregroundColor(for: state))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(MIFTaskValidationPresentation.backgroundColor(for: state), in: Capsule())
+                    .accessibilityIdentifier("morde.task.validation.state")
+                Text(MIFTaskValidationPresentation.explanation(for: task.validation))
+                    .font(.footnote)
+                    .foregroundStyle(taskSecondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("morde.task.validation.explanation")
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(NanoMuseTones.hairline))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("morde.task.validation")
+        }
     }
 
     @ViewBuilder
@@ -1671,6 +1763,7 @@ struct MIFTaskDetailView: View {
                 }
             }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("morde.task.agentGroup.\(group.id)")
     }
 

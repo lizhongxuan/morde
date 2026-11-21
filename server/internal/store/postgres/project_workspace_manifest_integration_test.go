@@ -9,6 +9,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/workspace"
 )
@@ -20,13 +21,25 @@ func TestPostgresProjectWorkspaceManifestRequiresProjectAndIndependentAccess(t *
 	viewer := createTestUser(t, store, 4, 20_000, 40_000)
 	noWorkspaceAccess := createTestUser(t, store, 4, 20_000, 40_000)
 	noProjectAccess := createTestUser(t, store, 4, 20_000, 40_000)
-	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "project-file-view")
+	workspaceValue, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatalf("create stable Agent Workspace: %v", err)
+	}
 	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='running' WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET state='active' WHERE host_id=$1 AND workspace_id=$2`, hostValue.ID, workspaceValue.ID); err != nil {
 		t.Fatal(err)
+	}
+	folderService, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folderService.CreateFolder(ctx, workspaceSyncPortalPrincipal(t, store, owner.ID), hostValue.ID,
+		"manifest-project", "project-files-view-folder-01")
+	if err != nil {
+		t.Fatalf("register project folder: %v", err)
 	}
 	for _, userID := range []string{viewer.ID, noProjectAccess.ID} {
 		if _, err := store.UpsertHostMember(ctx, host.Member{
@@ -59,21 +72,33 @@ func TestPostgresProjectWorkspaceManifestRequiresProjectAndIndependentAccess(t *
 	}
 
 	files := []workspace.File{
-		syncTestFile(".ssh/id_rsa", []byte("private")),
-		syncTestFile("docs/visible.md", []byte("visible")),
-		syncTestFile("private/.env", []byte("secret")),
-		syncTestFile("notes/readme.md", []byte("read me")),
+		syncTestFile(".ssh/id_rsa", nil),
+		syncTestFile("docs/visible.md", nil),
+		syncTestFile("private/.env", nil),
+		syncTestFile("notes/readme.md", nil),
 	}
-	session := newTestSyncSession(t, workspaceValue, owner.ID, files, files, nil)
-	session.EmptyDirectories = []string{".aws", "docs/empty"}
-	session.UploadEmptyDirectories = []string{".aws", "docs/empty"}
-	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(files),
-		syncTestIdempotency(owner.ID, "workspace.sync.create", "project-files-view:create", session.ID)); err != nil {
-		t.Fatalf("create Workspace snapshot: %v", err)
+	syncService, err := app.NewWorkspaceSyncServiceWithOptions(store, workspaceTransferTestBlocks{}, workspace.MaxSyncManifestBytes, 1<<30,
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
-		syncTestIdempotency(owner.ID, "workspace.sync.commit", "project-files-view:commit", session.ID)); err != nil {
-		t.Fatalf("commit Workspace snapshot: %v", err)
+	installationID := createTestClientInstallation(t, pool, owner.ID, nil)
+	syncToken := clientTestToken(t, owner.ID, installationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, syncToken); err != nil {
+		t.Fatal(err)
+	}
+	syncClient := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: syncToken.ID, ClientInstallationID: installationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync}}
+	session, err := syncService.CreateSyncSession(ctx, syncClient, workspaceValue.ID, workspace.CreateSyncSession{
+		FolderID: folder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, Files: files,
+		EmptyDirectories: []string{".aws", "docs/empty"},
+	}, "project-files-view-upload")
+	if err != nil {
+		t.Fatalf("create project Workspace snapshot: %v", err)
+	}
+	if _, err := syncService.CommitSyncSession(ctx, syncClient, workspaceValue.ID, session.ID, "project-files-view-commit"); err != nil {
+		t.Fatalf("commit project Workspace snapshot: %v", err)
 	}
 
 	if _, err := store.GetProjectWorkspaceManifestPage(ctx, noWorkspaceAccess.ID, projectValue.ID, workspaceValue.ID, 0, "", "", 10); domain.CodeOf(err) != domain.CodeNotFound {
@@ -110,7 +135,7 @@ func TestPostgresProjectWorkspaceManifestRequiresProjectAndIndependentAccess(t *
 		}
 	}
 	sort.Strings(paths)
-	want := []string{"docs/empty", "docs/visible.md", "notes/readme.md"}
+	want := []string{"project/manifest-project/docs/empty", "project/manifest-project/docs/visible.md", "project/manifest-project/notes/readme.md"}
 	if strings.Join(paths, ",") != strings.Join(want, ",") {
 		t.Fatalf("project file paths = %v, want %v", paths, want)
 	}

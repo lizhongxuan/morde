@@ -986,8 +986,18 @@ func TestCredentialCacheCookieValidationLimiterAndHelpers(t *testing.T) {
 	if ok, _ := limiter.allow("ip", now.Add(time.Minute)); !ok {
 		t.Fatal("expired IP window not reset")
 	}
-	if got := upstreamPrefix("/v1/shell/exec"); got != "/v1" || upstreamPrefix("/other/path") != "/other" {
-		t.Fatalf("upstream prefix = %q", got)
+	for _, test := range []struct{ path, want string }{
+		{"/v1/shell/exec", "/v1"},
+		{"/v1/shell/ws", "/v1/shell/ws"},
+		{"/terminal", "/terminal"},
+		{"/code-server/api/users/ignored", "/code-server"},
+		{"/vnc/", "/vnc"},
+		{"/other/path", "/other"},
+		{"/private/user/ignored", "/other"},
+	} {
+		if got := upstreamPrefix(test.path); got != test.want {
+			t.Errorf("upstreamPrefix(%q) = %q, want %q", test.path, got, test.want)
+		}
 	}
 	if !safeRetryRequest(httptest.NewRequest(http.MethodGet, "/", nil)) || safeRetryRequest(httptest.NewRequest(http.MethodPost, "/", nil)) {
 		t.Fatal("safe retry method policy is incorrect")

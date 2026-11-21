@@ -99,12 +99,45 @@ function requestId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+async function confirmFrameResponse(url: string, frame: HTMLIFrameElement, readySelector: string, label: string) {
+  const appLabel = label === 'VS Code' ? `${label} ` : label;
+  let response: Response;
+  try {
+    response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+  } catch {
+    throw new Error(`${appLabel}无法连接云端电脑服务`);
+  }
+  if (!response.ok) throw new Error(`${appLabel}页面请求失败（HTTP ${response.status}）`);
+  // shortcut: AIO and code-server expose no readiness API; update these selectors when the pinned pages change.
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      if (frame.contentDocument?.querySelector(readySelector)) return;
+    } catch {
+      // A cross-origin or not-yet-attached frame is not ready.
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error(`${appLabel}页面已响应，但 10 秒内界面未就绪`);
+}
+
 function controlActionCompleted(control: GatewayControl, action: GatewayControlAction) {
   const leaseMatches = action === 'take_over'
     ? control.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me
     : control.control_state === 'ai' && !control.control_lease_active;
   return leaseMatches && !control.pending_operation_ids?.length &&
     (!control.active_transition || control.active_transition.phase === 'completed');
+}
+
+function controlTransitionPending(control: GatewayControl | null) {
+  return !!control && (control.control_state === 'taking_over' || control.control_state === 'returning' ||
+    !!control.pending_operation_ids?.length || !!control.active_transition && control.active_transition.phase !== 'completed');
+}
+
+function pendingControlAction(control: GatewayControl | null): GatewayControlAction | null {
+  return control?.active_transition?.action ?? (control?.control_state === 'taking_over'
+    ? 'take_over'
+    : control?.control_state === 'returning' ? 'release' : null);
 }
 
 export default function Workbench() {
@@ -153,13 +186,21 @@ export default function Workbench() {
   const [terminalSession, setTerminalSession] = useState<GatewayTerminalSession | null>(null);
   const [terminalError, setTerminalError] = useState('');
   const [terminalRetry, setTerminalRetry] = useState(0);
+  const [terminalFrameStatus, setTerminalFrameStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
+  const [terminalFrameError, setTerminalFrameError] = useState('');
+  const [terminalFrameRetry, setTerminalFrameRetry] = useState(0);
   const [terminalCreationUncertain, setTerminalCreationUncertain] = useState(false);
   const [terminalRequestPending, setTerminalRequestPending] = useState(false);
+  const [vscodeFrameStatus, setVscodeFrameStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
+  const [vscodeFrameError, setVscodeFrameError] = useState('');
+  const [vscodeFrameRetry, setVscodeFrameRetry] = useState(0);
   const [renewing, setRenewing] = useState(false);
   const [notice, setNotice] = useState('');
   const [noticeKind, setNoticeKind] = useState<'success' | 'error'>('success');
   const notifyNetwork = useWorkbenchNotice();
   const browserFrameRef = useRef<HTMLIFrameElement>(null);
+  const terminalFrameRef = useRef<HTMLIFrameElement>(null);
+  const vscodeFrameRef = useRef<HTMLIFrameElement>(null);
   const browserPanelRef = useRef<HTMLDivElement>(null);
   const workbenchTabsRef = useRef<HTMLElement>(null);
   const browserObserverRef = useRef<MutationObserver | null>(null);
@@ -242,8 +283,7 @@ export default function Workbench() {
       return;
     }
     if ((sequence !== undefined && sequence !== selectionCommandSeqRef.current) || controlLockedRef.current ||
-      controlActionPending || currentControl.control_state !== 'user' || !currentControl.control_lease_active ||
-      !currentControl.control_lease_held_by_me) return;
+      controlActionPending || !controlActionCompleted(currentControl, 'take_over')) return;
 
     const nextTab = target === 'files'
       ? tab === 'workspace' && embedTargets.has('workspace')
@@ -326,7 +366,7 @@ export default function Workbench() {
   }, [applyControl, embedContext, embedTargets, handleControlReadFailure, nativeBridge, reloadControl, selectEmbeddedTab]);
 
   useEffect(() => {
-    if (!embedContext) return;
+    if (!embedContext || !embedInitializedRef.current || !embedConversationID || !hostID) return;
     const message = {
       channel: embedChannel,
       version: embedProtocolVersion,
@@ -399,8 +439,7 @@ export default function Workbench() {
 
   useEffect(() => {
     if (controlSessionOnly) return;
-    const transition = control?.control_state === 'taking_over' || control?.control_state === 'returning';
-    const interval = (controlActionPending || (transition && !control?.active_transition?.failure_reason)) ? 1000 : 3000;
+    const interval = controlActionPending || controlTransitionPending(control) || controlRequest ? 1000 : 3000;
     let current = true;
     const refresh = async () => {
       try {
@@ -415,7 +454,7 @@ export default function Workbench() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, controlSessionOnly, handleControlReadFailure]);
+  }, [applyControl, control, controlActionPending, controlRequest, controlSessionOnly, handleControlReadFailure]);
 
   useEffect(() => {
     if (controlSessionOnly || !control?.control_lease_active || !control.control_lease_held_by_me) return;
@@ -467,8 +506,29 @@ export default function Workbench() {
     return () => document.removeEventListener('pointerdown', dismissOnOutsidePress, true);
   }, [mobileMenu]);
 
-  const leaseHeldByMe = control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
+  const leaseHeldByMe = !!control && controlActionCompleted(control, 'take_over');
+  const transitionPending = controlTransitionPending(control);
+  const transitionAction = pendingControlAction(control);
   const terminalAvailable = !controlLoading && !controlError && !controlActionPending && leaseHeldByMe && (!embedded || !controlLocked);
+  const vscodeAvailable = !controlLoading && !controlError && leaseHeldByMe && !controlActionPending && (!embedded || !controlLocked);
+
+  useEffect(() => {
+    if (terminalSession?.state !== 'ready' || terminalFrameStatus !== 'loading') return;
+    const timer = window.setTimeout(() => {
+      setTerminalFrameError('15 秒内没有收到终端页面加载事件');
+      setTerminalFrameStatus('failed');
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [terminalFrameStatus, terminalSession?.state, terminalSession?.url, terminalFrameRetry]);
+
+  useEffect(() => {
+    if (!loadedTabs.has('vscode') || !vscodeAvailable || vscodeFrameStatus !== 'loading') return;
+    const timer = window.setTimeout(() => {
+      setVscodeFrameError('15 秒内没有收到 VS Code 页面加载事件');
+      setVscodeFrameStatus('failed');
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [loadedTabs, vscodeAvailable, vscodeFrameStatus, vscodeFrameRetry]);
 
   useEffect(() => {
     if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalCreationUncertain || terminalRequestRef.current || terminalReplacementRef.current) return;
@@ -485,6 +545,10 @@ export default function Workbench() {
           }
         }
         setTerminalSession(session);
+        if (session.state === 'ready') {
+          setTerminalFrameError('');
+          setTerminalFrameStatus('loading');
+        }
       })
       .catch((error: unknown) => {
         if (!current) return;
@@ -529,6 +593,10 @@ export default function Workbench() {
         }
         stillCreating = session.state === 'creating';
         setTerminalSession(session);
+        if (session.state === 'ready') {
+          setTerminalFrameError('');
+          setTerminalFrameStatus('loading');
+        }
       } catch (error) {
         if (!current) return;
         if (isTransientNetworkError(error)) {
@@ -563,6 +631,10 @@ export default function Workbench() {
         }
       }
       setTerminalSession(session);
+      if (session.state === 'ready') {
+        setTerminalFrameError('');
+        setTerminalFrameStatus('loading');
+      }
     } catch (error) {
       if (isTransientNetworkError(error)) {
         setTerminalCreationUncertain(true);
@@ -831,7 +903,7 @@ export default function Workbench() {
   }
 
   const failedTransition = control?.active_transition?.failure_reason ? control.active_transition : null;
-  const vscodeAvailable = !controlLoading && !controlError && leaseHeldByMe && !controlActionPending && (!embedded || !controlLocked);
+  const vscodeURL = '/code-server/?folder=%2Fhome%2Fgem%2Fworkspace';
   const browserViewOnly = controlLoading || !!controlError || !leaseHeldByMe || (embedded && controlLocked);
   const retryControlRequest = controlRequest ?? (failedTransition ? {
     action: failedTransition.action,
@@ -842,15 +914,17 @@ export default function Workbench() {
     ? controlRequest.action === 'take_over' ? '接管中…' : '交回中…'
     : (controlActionError || failedTransition) && retryControlRequest
       ? retryControlRequest.action === 'take_over' ? '重试接管' : '重试交回 AI'
+      : transitionPending ? transitionAction === 'take_over' ? '接管中…'
+        : transitionAction === 'release' ? '交回中…' : '正在确认控制状态…'
       : control?.control_state === 'ai' ? '接管电脑'
         : leaseHeldByMe ? '交回 AI' : '';
   const mobileControlStatus = controlError && !controlNetworkUnavailable ? '控制不可用'
     : controlNetworkUnavailable || (controlLoading && !control) ? '正在连接'
+      : transitionPending ? transitionAction === 'take_over' ? '正在接管'
+        : transitionAction === 'release' ? '正在交还' : '正在确认控制状态'
       : control?.control_state === 'ai' ? 'AI 控制中'
         : leaseHeldByMe ? '你正在操作'
-          : control?.control_state === 'user' ? '他人正在操作'
-            : control?.control_state === 'taking_over' ? '正在接管'
-              : control?.control_state === 'returning' ? '正在交还' : '控制状态未知';
+          : control?.control_state === 'user' ? '他人正在操作' : '控制状态未知';
   const authorizedActive = embedded && !embedTabAllowed(embedTargets, active) ? initialTab ?? active : active;
   const visibleActive = authorizedActive === 'vscode' && !vscodeAvailable && !embedded ? 'browser' : authorizedActive;
   const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace')
@@ -1063,7 +1137,47 @@ export default function Workbench() {
                         </button>
                       </div>
                     )}
-                    {visibleActive === 'terminal' && <iframe title="主机终端" src={terminalSession.url} />}
+                    <iframe
+                      key={`${terminalSession.url}:${terminalFrameRetry}`}
+                      ref={terminalFrameRef}
+                      title="主机终端"
+                      src={terminalSession.url}
+                      hidden={visibleActive !== 'terminal'}
+                      onLoad={(event) => {
+                        const frame = event.currentTarget;
+                        void confirmFrameResponse(terminalSession.url, frame, '[aria-label="Terminal input"]', '终端')
+                          .then(() => {
+                            if (terminalFrameRef.current !== frame) return;
+                            setTerminalFrameError('');
+                            setTerminalFrameStatus('loaded');
+                          })
+                          .catch((error: unknown) => {
+                            if (terminalFrameRef.current !== frame) return;
+                            setTerminalFrameError(messageOf(error));
+                            setTerminalFrameStatus('failed');
+                          });
+                      }}
+                      onError={(event) => {
+                        if (terminalFrameRef.current !== event.currentTarget) return;
+                        setTerminalFrameError('终端页面加载失败');
+                        setTerminalFrameStatus('failed');
+                      }}
+                    />
+                    {terminalFrameStatus !== 'loaded' && (
+                      <div className="connection-overlay" role={terminalFrameStatus === 'failed' ? 'alert' : 'status'}>
+                        {terminalFrameStatus === 'loading' ? <>
+                          <span className="connection-spinner" aria-hidden="true" />
+                          <p>正在连接终端…</p>
+                        </> : <>
+                          <p>{terminalFrameError || '终端连接失败，请稍后重试。'}</p>
+                          <button className="button button-secondary" type="button" onClick={() => {
+                            setTerminalFrameError('');
+                            setTerminalFrameStatus('loading');
+                            setTerminalFrameRetry((value) => value + 1);
+                          }}>重新连接终端</button>
+                        </>}
+                      </div>
+                    )}
                   </>
                 ) : terminalAvailable && (terminalSession?.state === 'unknown' || terminalSession?.state === 'interrupted') ? (
                   <FloatingError>
@@ -1118,7 +1232,48 @@ export default function Workbench() {
             {loadedTabs.has('vscode') && (
               <div className="tab-panel tab-panel-vscode" aria-hidden={visibleActive !== 'vscode'} inert={visibleActive !== 'vscode'}>
                 {vscodeAvailable
-                  ? <iframe title="VSCode" src="/code-server/" />
+                  ? <>
+                    <iframe
+                      key={vscodeFrameRetry}
+                      ref={vscodeFrameRef}
+                      title="VSCode"
+                      src={vscodeURL}
+                      onLoad={(event) => {
+                        const frame = event.currentTarget;
+                        void confirmFrameResponse(vscodeURL, frame, '.monaco-workbench', 'VS Code')
+                          .then(() => {
+                            if (vscodeFrameRef.current !== frame) return;
+                            setVscodeFrameError('');
+                            setVscodeFrameStatus('loaded');
+                          })
+                          .catch((error: unknown) => {
+                            if (vscodeFrameRef.current !== frame) return;
+                            setVscodeFrameError(messageOf(error));
+                            setVscodeFrameStatus('failed');
+                          });
+                      }}
+                      onError={(event) => {
+                        if (vscodeFrameRef.current !== event.currentTarget) return;
+                        setVscodeFrameError('VS Code 页面加载失败');
+                        setVscodeFrameStatus('failed');
+                      }}
+                    />
+                    {vscodeFrameStatus !== 'loaded' && (
+                      <div className="connection-overlay" role={vscodeFrameStatus === 'failed' ? 'alert' : 'status'}>
+                        {vscodeFrameStatus === 'loading' ? <>
+                          <span className="connection-spinner" aria-hidden="true" />
+                          <p>正在连接 VS Code…</p>
+                        </> : <>
+                          <p>{vscodeFrameError || 'VS Code 连接失败，请稍后重试。'}</p>
+                          <button className="button button-secondary" type="button" onClick={() => {
+                            setVscodeFrameError('');
+                            setVscodeFrameStatus('loading');
+                            setVscodeFrameRetry((value) => value + 1);
+                          }}>重试 VS Code</button>
+                        </>}
+                      </div>
+                    )}
+                  </>
                   : controlError
                     ? controlNetworkUnavailable
                       ? <p className="panel-loading" role="status">正在重新确认电脑控制状态…</p>
@@ -1135,9 +1290,9 @@ export default function Workbench() {
                 className="button mobile-control-action"
                 type="button"
                 onClick={controlComputer}
-                disabled={controlActionPending || !!controlError}
+                disabled={controlActionPending || !!controlError || (transitionPending && !failedTransition)}
               >
-                {controlActionLabel.includes('接管') && !controlActionLabel.includes('重试') ? '接管控制权' : controlActionLabel}
+                {controlActionLabel === '接管电脑' ? '接管控制权' : controlActionLabel}
               </button>}
             </div>
           )}

@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +44,7 @@ type taskServiceStub struct {
 	approvalPage           app.TaskApprovalPage
 	approvalCalls          int
 	getID                  string
+	getPrincipal           identity.Principal
 	getDetails             *app.TaskDetails
 	stepDetail             app.TaskStepDetail
 	stepDetailCalls        int
@@ -82,6 +85,7 @@ type taskServiceStub struct {
 	clarificationKey       string
 	clarificationCalls     int
 	events                 []task.Event
+	eventPrincipal         identity.Principal
 	eventStatus            task.Status
 	eventCurrentSequence   int64
 	eventCalls             int
@@ -223,8 +227,9 @@ func (s *taskServiceStub) ListTaskApprovals(_ context.Context, _ identity.Princi
 	return s.approvalPage, s.err
 }
 
-func (s *taskServiceStub) Get(_ context.Context, _ identity.Principal, id string) (app.TaskDetails, error) {
+func (s *taskServiceStub) Get(_ context.Context, principal identity.Principal, id string) (app.TaskDetails, error) {
 	s.getID = id
+	s.getPrincipal = principal
 	if s.getDetails != nil {
 		return *s.getDetails, s.err
 	}
@@ -283,8 +288,9 @@ func (s *taskServiceStub) AnswerClarificationRequest(_ context.Context, _ identi
 	return s.err
 }
 
-func (s *taskServiceStub) ListEvents(_ context.Context, _ identity.Principal, _ string, after int64, _ int32) (app.TaskEventPage, error) {
+func (s *taskServiceStub) ListEvents(_ context.Context, principal identity.Principal, _ string, after int64, _ int32) (app.TaskEventPage, error) {
 	s.eventCalls++
+	s.eventPrincipal = principal
 	s.eventAfter = after
 	status := s.eventStatus
 	if status == "" {
@@ -1039,6 +1045,7 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 			ChildJobs:    []app.ChildJob{{JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning}},
 			ResultReview: &app.ResultReview{State: "pending", SourceTaskID: value.ID, SourceTaskRevision: 3,
 				SourceEventSequence: 9, TriggerMessageID: &triggerMessageID},
+			Validation: app.TaskValidationSummary{State: app.TaskValidationPending},
 		}},
 	}}
 	engine := taskAPIRouter(service, nil)
@@ -1054,6 +1061,7 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 			Dependencies       []taskDependencyResponse  `json:"dependencies"`
 			ChildJobs          []taskChildJobResponse    `json:"child_jobs"`
 			ResultReview       *taskResultReviewResponse `json:"result_review"`
+			Validation         taskValidationResponse    `json:"validation"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
@@ -1062,9 +1070,84 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 	if len(body.Items) != 1 || body.Items[0].StepCount != 3 || body.Items[0].CompletedStepCount != 1 ||
 		len(body.Items[0].Dependencies) != 1 || body.Items[0].Dependencies[0].TaskID != "q7654321" || !body.Items[0].Dependencies[0].Satisfied ||
 		len(body.Items[0].ChildJobs) != 1 || body.Items[0].ChildJobs[0].JobID != "dsh-child-1" ||
+		body.Items[0].Validation.State != app.TaskValidationPending ||
 		body.Items[0].ResultReview == nil || body.Items[0].ResultReview.State != "pending" || body.Items[0].ResultReview.SourceTaskID != value.ID ||
 		body.Items[0].ResultReview.TriggerMessageID == nil || *body.Items[0].ResultReview.TriggerMessageID != triggerMessageID {
 		t.Fatalf("task summary counts and K2 projection = %#v", body.Items)
+	}
+}
+
+func TestTaskValidationSummaryDefaultsPendingAndRejectsUnknownState(t *testing.T) {
+	current := apiTestTask()
+	response, err := toTaskResponse(app.TaskDetails{Task: current})
+	if err != nil || response.Validation.State != app.TaskValidationPending {
+		t.Fatalf("task validation = %#v, err=%v; want pending until trusted review exists", response.Validation, err)
+	}
+	for _, state := range []app.TaskValidationState{
+		app.TaskValidationPending, app.TaskValidationPass, app.TaskValidationPassNotes, app.TaskValidationFail,
+	} {
+		response, err := toTaskResponse(app.TaskDetails{Task: current, Validation: app.TaskValidationSummary{State: state}})
+		if err != nil || response.Validation.State != state {
+			t.Fatalf("task validation state %q = %#v, err=%v", state, response.Validation, err)
+		}
+	}
+	if _, err := toTaskResponse(app.TaskDetails{Task: current, Validation: app.TaskValidationSummary{State: "verified"}}); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("unknown task validation state err=%v, want internal error", err)
+	}
+}
+
+func TestTaskValidationEvidenceIsDetailOnlyAndBoundToResult(t *testing.T) {
+	current := apiTestTask()
+	current.Status = task.StatusCompleted
+	currentRevision, desiredRevision := int64(2), int64(2)
+	current.CurrentRevision, current.DesiredRevision = &currentRevision, &desiredRevision
+	current.EventSequence = 9
+	current.Result = "Changed file and verified it."
+	digest := sha256.Sum256([]byte(current.Result))
+	evidence := &app.TaskValidationEvidenceRecord{
+		TaskRevision: currentRevision, EventSequence: 7, ResultSHA256: hex.EncodeToString(digest[:]),
+		Claims: []app.TaskValidationEvidenceClaimRecord{{ID: "c1", StartByte: 0, EndByte: int32(len(current.Result)), EvidenceRefs: []app.TaskValidationEvidenceRefRecord{
+			{Kind: app.TaskValidationEvidenceAction, ID: "s1234567", TaskRevision: currentRevision, Sequence: 4, CallID: "call-4"},
+			{Kind: app.TaskValidationEvidenceSideEffect, ID: "a1234567", TaskRevision: currentRevision, Sequence: 5, CallID: "write-1"},
+		}}},
+	}
+	response, err := toTaskResponse(app.TaskDetails{Task: current, ValidationEvidence: evidence})
+	if err != nil || response.ValidationDetail == nil || response.ValidationDetail.EventSequence != 7 {
+		t.Fatalf("task validation evidence response = %#v, err=%v", response.ValidationDetail, err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil || !strings.Contains(string(encoded), `"validation_detail"`) || !strings.Contains(string(encoded), `"result_sha256"`) ||
+		!strings.Contains(string(encoded), `"call_id":"write-1"`) {
+		t.Fatalf("task detail omitted validation evidence: %s err=%v", encoded, err)
+	}
+	summary, err := toTaskSummaryResponseWithK2(current, app.TaskK2Projection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaryJSON, err := json.Marshal(summary)
+	if err != nil || strings.Contains(string(summaryJSON), `"validation_detail"`) {
+		t.Fatalf("Task summary unexpectedly includes evidence detail: %s err=%v", summaryJSON, err)
+	}
+	evidence.TaskRevision = 1
+	if _, err := toTaskResponse(app.TaskDetails{Task: current, ValidationEvidence: evidence}); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("stale Task validation evidence error = %v, want internal", err)
+	}
+}
+
+func TestGetTaskRouteDoesNotCacheValidationDetails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	current := apiTestTask()
+	service := &taskServiceStub{getDetails: &app.TaskDetails{Task: current}}
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set(principalKey, identity.Principal{UserID: current.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession})
+		c.Next()
+	})
+	(&api{}).registerTasks(engine.Group("/api"), service)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+current.ID, nil))
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("Task detail response status=%d cache-control=%q body=%s", response.Code, response.Header().Get("Cache-Control"), response.Body.String())
 	}
 }
 
@@ -1187,6 +1270,30 @@ func TestGetTaskIncludesSnapshotEventSequence(t *testing.T) {
 	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskValue.ID, nil))
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("negative event_sequence status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestTaskReadRoutesPassAuthenticatedPrincipal(t *testing.T) {
+	other := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t7654321"}
+	service := &taskServiceStub{err: domain.NewError(domain.CodeNotFound, "task not found")}
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set(principalKey, other)
+		c.Next()
+	})
+	(&api{}).registerTasks(engine.Group("/api"), service)
+
+	for _, path := range []string{"/api/tasks/q1234567", "/api/tasks/q1234567/events"} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("GET %s response=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+	if service.getPrincipal.UserID != other.UserID || service.getPrincipal.Kind != other.Kind || service.getPrincipal.TokenID != other.TokenID ||
+		service.eventPrincipal.UserID != other.UserID || service.eventPrincipal.Kind != other.Kind || service.eventPrincipal.TokenID != other.TokenID {
+		t.Fatalf("task read principals were not preserved: get=%+v events=%+v", service.getPrincipal, service.eventPrincipal)
 	}
 }
 
@@ -1831,10 +1938,10 @@ func TestTaskEventPayloadsExposeOnlyTypeAllowlistedFields(t *testing.T) {
 		{"operation", "task.operation", `{"operation_id":"o1234567","status":"unknown","requires_reconciliation":true,"provider_url":"https://private.invalid"}`, []string{"operation_id", "status", "requires_reconciliation"}, []string{"provider_url"}},
 		{"message", "task.message", `{"role":"assistant","message_id":"m1234567","done":true,"delta":"draft text","content":"unreviewed result"}`, []string{"role", "message_id", "done"}, []string{"delta", "content"}},
 		{"batch item", "task.batch_item", `{"batch_item_id":"b1234567","status":"failed","attempt":2,"result":"private result","error":"private error"}`, []string{"batch_item_id", "status", "attempt"}, []string{"result", "error"}},
-		{"artifact", "task.artifact", `{"artifact_id":"a1234567","path":"report.txt","sha256":"abc","data_base64":"private bytes"}`, []string{"artifact_id", "path", "sha256"}, []string{"data_base64"}},
+		{"artifact", "task.artifact", `{"artifact_id":"a1234567","path":"report.txt","sha256":"abc","source_call_id":"write-1","task_revision":7,"data_base64":"private bytes"}`, []string{"artifact_id", "path", "sha256"}, []string{"source_call_id", "task_revision", "data_base64"}},
 		{"waiting user", "task.waiting_user", `{"status":"waiting_user","reason":"approval_required","detail":{"content":"private approval"}}`, []string{"status", "reason"}, []string{"detail"}},
 		{"response", "task.response", `{"decision":"approve","status":"queued","pending_id":"r1234567","answer":"private answer"}`, []string{"decision", "status", "pending_id"}, []string{"answer"}},
-		{"result", "task.result", `{"status":"completed","reason":"done","result":"unreviewed result","error":"private error"}`, []string{"status", "reason"}, []string{"result", "error"}},
+		{"result", "task.result", `{"status":"completed","reason":"done","result":"unreviewed result","error":"private error","validation_evidence":{"claims":["private evidence"]}}`, []string{"status", "reason"}, []string{"result", "error", "validation_evidence"}},
 		{"plan", "task.plan", `{"step_id":"s1234567","sequence":4,"task_revision":2,"plan_revision":3,"plan":{"goal":"private plan"},"detail":{"call_id":"private call"}}`, []string{"step_id", "sequence", "task_revision", "plan_revision"}, []string{"goal", "call_id"}},
 		{"priority", "task.priority", `{"priority":"pinned","previous_priority":"normal","private":"never expose"}`, []string{"priority", "previous_priority"}, []string{"private"}},
 	}

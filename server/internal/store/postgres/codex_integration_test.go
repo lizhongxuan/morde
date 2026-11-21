@@ -575,6 +575,7 @@ WHERE action=$1 ORDER BY id DESC LIMIT 1`, string(audit.ActionCodexEventPageRead
 		&actorID, &actorKind, &action, &target, &detailJSON); err != nil {
 		t.Fatalf("read Codex event page audit: %v", err)
 	}
+	detail = nil
 	if err := json.Unmarshal(detailJSON, &detail); err != nil {
 		t.Fatalf("decode Codex event page audit detail: %v", err)
 	}
@@ -582,8 +583,8 @@ WHERE action=$1 ORDER BY id DESC LIMIT 1`, string(audit.ActionCodexEventPageRead
 		target != session.ID || len(detail) != 3 || detail["actor_installation_id"] != actorInstallationID ||
 		detail["after_sequence"] != float64(0) || detail["row_count"] != float64(1) ||
 		strings.Contains(string(detailJSON), privateContent) || strings.Contains(string(detailJSON), privatePath) {
-		t.Fatalf("unexpected or sensitive Codex event page audit: actor=%s/%s action=%s target=%s detail=%s",
-			actorID, actorKind, action, target, detailJSON)
+		t.Fatalf("unexpected or sensitive Codex event page audit: actor=%s/%s action=%s target=%s detail=%s want_actor=%s/%s action=%s target=%s installation=%s detail_fields=%d",
+			actorID, actorKind, action, target, detailJSON, owner.ID, audit.ActorClient, audit.ActionCodexEventPageRead, session.ID, actorInstallationID, len(detail))
 	}
 
 	if page, err := service.LiveEvents(ctx, principal, session.ID, 0, 10); err != nil || len(page.Items) != 1 {
@@ -594,6 +595,7 @@ WHERE action=$1 ORDER BY id DESC LIMIT 1`, string(audit.ActionCodexEventStreamRe
 		&actorID, &actorKind, &action, &target, &detailJSON); err != nil {
 		t.Fatalf("read Codex event stream audit: %v", err)
 	}
+	detail = nil
 	if err := json.Unmarshal(detailJSON, &detail); err != nil {
 		t.Fatalf("decode Codex event stream audit detail: %v", err)
 	}

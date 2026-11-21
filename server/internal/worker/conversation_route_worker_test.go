@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -22,20 +24,23 @@ import (
 )
 
 type routeWorkerStub struct {
-	claim        app.ConversationRouteClaim
-	snapshot     app.ConversationRouteSnapshot
-	decision     app.ConversationRouteDecision
-	modelErr     error
-	classifyErr  error
-	applyErr     error
-	applied      []app.ConversationRouteDecision
-	failures     []string
-	deferred     int
-	resolves     int
-	classifies   int
-	requeued     bool
-	requeueCalls int
-	classified   app.ConversationRouteContext
+	claim               app.ConversationRouteClaim
+	snapshot            app.ConversationRouteSnapshot
+	decision            app.ConversationRouteDecision
+	modelErr            error
+	classifyErr         error
+	applyErr            error
+	checkModelCtx       bool
+	applied             []app.ConversationRouteDecision
+	failures            []string
+	deferred            int
+	resolves            int
+	classifies          int
+	requeued            bool
+	requeueCalls        int
+	contextRequeued     bool
+	contextRequeueCalls int
+	classified          app.ConversationRouteContext
 }
 
 type routeAggregationWorkerStub struct {
@@ -83,8 +88,15 @@ func (s *routeWorkerStub) RequeueConversationRouteAfterPredecessor(context.Conte
 	s.requeueCalls++
 	return s.requeued, nil
 }
-func (s *routeWorkerStub) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
+func (s *routeWorkerStub) RequeueConversationRouteAfterContextChange(context.Context, app.ConversationRouteClaim) (bool, error) {
+	s.contextRequeueCalls++
+	return s.contextRequeued, nil
+}
+func (s *routeWorkerStub) ResolveConversationRouteModel(ctx context.Context, _ app.ConversationRouteClaim) (string, error) {
 	s.resolves++
+	if s.checkModelCtx && ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	return "p1234567", s.modelErr
 }
 func (s *routeWorkerStub) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim, value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
@@ -105,6 +117,27 @@ func newRouteWorkerTest(t *testing.T) (*ConversationRouteWorker, *routeWorkerStu
 	return worker, stub
 }
 
+func TestConversationRouteFailureLogIncludesSafeErrorCode(t *testing.T) {
+	stub := &routeWorkerStub{}
+	core, logs := observer.New(zap.WarnLevel)
+	worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: stub, Actions: stub, Models: stub,
+		WorkerID: "route-log-test", LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.New(core)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.failRoute(context.Background(), app.ConversationRouteClaim{}, "model_unavailable",
+		domain.NewError(domain.CodeUnauthenticated, "sensitive detail")); err != nil {
+		t.Fatal(err)
+	}
+	entries := logs.All()
+	if len(entries) != 1 || entries[0].ContextMap()["failure_code"] != string(domain.CodeUnauthenticated) {
+		t.Fatalf("failure log = %+v", entries)
+	}
+	if _, ok := entries[0].ContextMap()["error"]; ok {
+		t.Fatalf("failure log exposed raw error: %+v", entries[0].ContextMap())
+	}
+}
+
 func TestConversationRouteWorkerRoutesFirstMessageAfterModelClassification(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteNew}
@@ -112,6 +145,50 @@ func TestConversationRouteWorkerRoutesFirstMessageAfterModelClassification(t *te
 	if err != nil || !found || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteNew ||
 		stub.snapshot.Context.ModelID != "p1234567" || stub.classifies != 1 {
 		t.Fatalf("first route = %+v, model=%q classifications=%d found=%t err=%v", stub.applied, stub.snapshot.Context.ModelID, stub.classifies, found, err)
+	}
+}
+
+func TestConversationRouteWorkerClassifiesFollowUpWhilePredecessorRouting(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.claim.Message.Sequence = 2
+	stub.snapshot.PreviousMessageID = "m2345678"
+	stub.snapshot.PreviousSequence = 1
+	stub.snapshot.PreviousRoutingState = "processing"
+	stub.snapshot.Context.PreviousUnresolved = true
+	stub.snapshot.Context.Content = "你好"
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "你好。",
+		ModelOutput: `{"action":"reply","reply":"你好。"}`}
+
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found {
+		t.Fatalf("follow-up was not processed while its predecessor was unresolved: found=%t err=%v", found, err)
+	}
+	if stub.deferred != 0 || stub.resolves != 1 || stub.classifies != 1 || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteReply || !stub.classified.PreviousUnresolved {
+		t.Fatalf("independent reply was blocked by an unresolved predecessor: deferred=%d resolves=%d classifies=%d classified=%+v applied=%+v",
+			stub.deferred, stub.resolves, stub.classifies, stub.classified, stub.applied)
+	}
+
+	stub.applied = nil
+	stub.snapshot.Context.Content = "另外帮我查一下明天的天气"
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteNew,
+		ModelOutput: `{"action":"new","task_id":"","question":""}`}
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.deferred != 0 ||
+		stub.classifies != 2 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteNew {
+		t.Fatalf("independent Task was blocked by an unresolved predecessor: deferred=%d classifies=%d applied=%+v found=%t err=%v",
+			stub.deferred, stub.classifies, stub.applied, found, err)
+	}
+
+	stub.applied = nil
+	stub.snapshot.PreviousSequence = 3
+	stub.snapshot.PreviousRoutingState = "processing"
+	stub.snapshot.Context.PreviousUnresolved = true
+	stub.snapshot.Context.Content = "你好"
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "你好。"}
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.deferred != 0 ||
+		stub.classifies != 3 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteReply ||
+		!stub.classified.PreviousUnresolved {
+		t.Fatalf("independent message was blocked when its predecessor arrived later: deferred=%d classifies=%d applied=%+v found=%t err=%v",
+			stub.deferred, stub.classifies, stub.applied, found, err)
 	}
 }
 
@@ -282,6 +359,63 @@ func TestConversationRouteWorkerRejectsUnsafeDirectReply(t *testing.T) {
 	}
 }
 
+func TestConversationRouteWorkerRoutesWithinIncompleteCandidateSetSafely(t *testing.T) {
+	value := app.ConversationRouteContext{ActorID: "u1234567", CandidateSetIncomplete: true,
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 3}}}
+	for _, test := range []struct {
+		name     string
+		content  string
+		decision app.ConversationRouteDecision
+		want     app.ConversationRouteAction
+	}{
+		{name: "known task target", content: "继续这个任务", decision: app.ConversationRouteDecision{Action: app.ConversationRouteUpdate,
+			TaskID: "q1234567", ExpectedRevision: 3}, want: app.ConversationRouteUpdate},
+		{name: "independent work", content: "分析一份新上传的无关日志", decision: app.ConversationRouteDecision{Action: app.ConversationRouteNew}, want: app.ConversationRouteNew},
+		{name: "standalone reply", content: "你好", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "你好。"}, want: app.ConversationRouteReply},
+		{name: "unresolved control", content: "停止任务", decision: app.ConversationRouteDecision{Action: app.ConversationRouteNew}, want: app.ConversationRouteClarify},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value.Content = test.content
+			got := safeConversationRouteDecision(value, test.decision)
+			if got.Action != test.want {
+				t.Fatalf("incomplete candidate decision = %+v, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestConversationRouteWorkerFitsCandidatesWithinModelInputBudget(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	for index := 0; index < 40; index++ {
+		stub.snapshot.Context.RequestCandidates = append(stub.snapshot.Context.RequestCandidates, app.ConversationRouteRequestCandidate{
+			MessageID:     fmt.Sprintf("m%07d", index+1),
+			Sequence:      int64(index + 1),
+			Content:       strings.Repeat("x", 4096),
+			RoutingStatus: conversation.RoutingRouted,
+		})
+	}
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if stub.classifies != 1 || len(stub.classified.RequestCandidates) >= len(stub.snapshot.Context.RequestCandidates) ||
+		!stub.classified.CandidateSetIncomplete || len(stub.applied) != 1 {
+		t.Fatalf("oversized candidate context did not shrink safely: classified=%d candidates=%d/%d incomplete=%t applied=%+v",
+			stub.classifies, len(stub.classified.RequestCandidates), len(stub.snapshot.Context.RequestCandidates),
+			stub.classified.CandidateSetIncomplete, stub.applied)
+	}
+}
+
+func TestTrimConversationRouteCandidatesPreservesExplicitTargets(t *testing.T) {
+	value := app.ConversationRouteContext{ReferenceTaskID: "q1234567", PreviousTaskID: "q1234567", PreviousMessageID: "m1234567",
+		RequestCandidates: []app.ConversationRouteRequestCandidate{{MessageID: "m1234567"}, {MessageID: "m2345678"}},
+		Candidates:        []app.ConversationRouteCandidate{{TaskID: "q1234567"}, {TaskID: "q2345678"}}}
+	if !trimConversationRouteCandidates(&value) || !trimConversationRouteCandidates(&value) || !value.CandidateSetIncomplete ||
+		len(value.RequestCandidates) != 1 || value.RequestCandidates[0].MessageID != "m1234567" ||
+		len(value.Candidates) != 1 || value.Candidates[0].TaskID != "q1234567" {
+		t.Fatalf("candidate trimming lost an explicit target: %+v", value)
+	}
+}
+
 func TestConversationRouteWorkerClassifiesEveryFreeTextMessage(t *testing.T) {
 	for _, content := range []string{"帮我整理资料", "停止任务", "查看进度"} {
 		t.Run(content, func(t *testing.T) {
@@ -394,7 +528,7 @@ func TestConversationRouteWorkerClassifiesMissingPredecessorSafely(t *testing.T)
 	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteStop, TaskID: "q1234567"}
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
 		stub.classifies != 1 || stub.applied[0].Action != app.ConversationRouteClarify ||
-		stub.applied[0].Question != "前一条消息尚未确认，请先处理或重试。" {
+		stub.applied[0].Question != "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。" {
 		t.Fatalf("missing predecessor allowed a task action: applied=%v err=%v", stub.applied, err)
 	}
 	stub.applied = nil
@@ -402,6 +536,27 @@ func TestConversationRouteWorkerClassifiesMissingPredecessorSafely(t *testing.T)
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
 		stub.applied[0].Action != app.ConversationRouteNew || stub.classifies != 2 {
 		t.Fatalf("independent work could not be classified: applied=%v err=%v", stub.applied, err)
+	}
+	stub.applied = nil
+	stub.snapshot.Context.Content = "2+2 等于多少？"
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "答案是 4。"}
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteReply || stub.applied[0].Reply != "答案是 4。" {
+		t.Fatalf("independent reply was blocked: applied=%v err=%v", stub.applied, err)
+	}
+	stub.applied = nil
+	stub.snapshot.Context.Content = "继续上面的任务"
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify ||
+		stub.applied[0].Question != "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。" {
+		t.Fatalf("missing task was not clarified: applied=%v err=%v", stub.applied, err)
+	}
+	stub.applied = nil
+	stub.snapshot.Context.Content = "把上面的内容缩短"
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请提供需要缩短的原文。"}
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].Question != "请提供需要缩短的原文。" {
+		t.Fatalf("specific clarification was lost: applied=%v err=%v", stub.applied, err)
 	}
 }
 
@@ -429,12 +584,17 @@ func TestConversationRouteWorkerRequeuesOnlySafelyRecoveredPredecessorRace(t *te
 	}
 }
 
-func TestConversationRouteWorkerFailsStaleContextAfterClassification(t *testing.T) {
-	worker, stub := newRouteWorkerTest(t)
-	stub.classifyErr = domain.NewError(domain.CodeConflict, "authorized route context changed")
-	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 0 || len(stub.failures) != 1 ||
-		stub.failures[0] != "routing_context_unavailable" || len(stub.applied) != 0 {
-		t.Fatalf("stale context should become a recoverable failure: deferred=%d failures=%v applied=%v err=%v", stub.deferred, stub.failures, stub.applied, err)
+func TestConversationRouteWorkerRequeuesStaleContextAfterClassification(t *testing.T) {
+	for _, safe := range []bool{false, true} {
+		worker, stub := newRouteWorkerTest(t)
+		stub.classifyErr = domain.NewError(domain.CodeConflict, "authorized route candidates changed")
+		stub.contextRequeued = safe
+		if _, err := worker.RunOnce(context.Background()); err != nil || stub.contextRequeueCalls != 1 || stub.deferred != 0 ||
+			(safe && (len(stub.failures) != 0 || len(stub.applied) != 0)) ||
+			(!safe && (len(stub.failures) != 1 || stub.failures[0] != "routing_context_unavailable" || len(stub.applied) != 0)) {
+			t.Fatalf("stale context safe=%t requeues=%d deferred=%d failures=%v applied=%v err=%v",
+				safe, stub.contextRequeueCalls, stub.deferred, stub.failures, stub.applied, err)
+		}
 	}
 }
 
@@ -454,6 +614,17 @@ func TestConversationRouteWorkerKeepsApplyLeaseTimeoutRetry(t *testing.T) {
 	stub.applyErr = context.DeadlineExceeded
 	if _, err := worker.RunOnce(context.Background()); !errors.Is(err, context.DeadlineExceeded) || len(stub.failures) != 0 || len(stub.applied) != 0 {
 		t.Fatalf("lease timeout should remain retryable: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
+	}
+}
+
+func TestConversationRouteWorkerDefersExpiredLeaseBeforeModelResolution(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.claim.LeaseExpiresAt = time.Now().Add(900 * time.Millisecond)
+	stub.checkModelCtx = true
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.deferred != 1 ||
+		len(stub.failures) != 0 || len(stub.applied) != 0 || stub.classifies != 0 {
+		t.Fatalf("expired pre-dispatch lease should defer safely: found=%t deferred=%d failures=%v applied=%v classifications=%d err=%v",
+			found, stub.deferred, stub.failures, stub.applied, stub.classifies, err)
 	}
 }
 
@@ -492,11 +663,15 @@ func TestConversationRouteWorkerPreservesLongMessagesAndExplainsOversizedInput(t
 	stub.failures = nil
 	stub.snapshot.Context.Content = strings.Repeat("a", 64<<10)
 	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1, Objective: strings.Repeat("b", 64<<10)}}
-	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != "message_too_long" || stub.classifies != 0 {
-		t.Fatalf("oversized routing context should fail before model dispatch: failures=%v classifications=%d err=%v", stub.failures, stub.classifies, err)
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || stub.classifies != 1 ||
+		len(stub.classified.Candidates) != 0 || !stub.classified.CandidateSetIncomplete || len(stub.applied) != 1 {
+		t.Fatalf("oversized candidate should be dropped before model dispatch: failures=%v classifications=%d context=%+v err=%v",
+			stub.failures, stub.classifies, stub.classified, err)
 	}
 	stub.failures = nil
 	stub.snapshot.Context.Candidates[0].Objective = "short"
+	stub.classifies = 0
+	stub.applied = nil
 	stub.classifyErr = domain.NewError(domain.CodeResultTooLarge, "input exceeds limit")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != "message_too_long" {
 		t.Fatalf("gateway input limit was not surfaced: failures=%v err=%v", stub.failures, err)

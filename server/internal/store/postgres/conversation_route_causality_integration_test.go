@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/worker"
 )
 
 func receiveCausalMessage(t *testing.T, store *Store, claim app.ConversationRouteClaim, clientID, previousID, content string, reference ...string) conversation.Message {
@@ -62,6 +65,105 @@ func classifyCausalMessage(t *testing.T, store *Store, gateway *app.ModelGateway
 		t.Fatalf("classify causal message: %v", err)
 	}
 	return snapshot, decision
+}
+
+func TestConversationRouteAppliesIndependentReplyWhilePredecessorIsProcessing(t *testing.T) {
+	ctx := context.Background()
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"你好。"}`}
+	store, gateway, _, predecessor, _ := routeModelFixture(t, false, client)
+	followup := receiveCausalMessage(t, store, predecessor, "causal-independent-reply-001", predecessor.Message.ClientMessageID, "你好")
+	claim := claimCausalMessage(t, store, followup.ID)
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil || !snapshot.Context.PreviousUnresolved || snapshot.PreviousRoutingState != "processing" {
+		t.Fatalf("follow-up snapshot = %+v, err=%v; want processing predecessor", snapshot, err)
+	}
+	modelID, err := gateway.ResolveConversationRouteModel(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = modelID
+	decision, err := gateway.ClassifyConversationRoute(ctx, claim, snapshot.Context)
+	if err != nil || decision.Action != app.ConversationRouteReply {
+		t.Fatalf("independent reply classification = %+v, err=%v", decision, err)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatalf("apply independent reply before predecessor route settles: %v", err)
+	}
+	var predecessorState, followupState string
+	var replies int
+	if err := store.pool.QueryRow(ctx, `SELECT
+ (SELECT state FROM conversation_message_routes WHERE message_id=$1),
+ (SELECT state FROM conversation_message_routes WHERE message_id=$2),
+ (SELECT count(*) FROM conversation_messages WHERE conversation_id=$3 AND role='assistant' AND content='你好。')`,
+		predecessor.Message.ID, followup.ID, predecessor.Message.ConversationID).Scan(&predecessorState, &followupState, &replies); err != nil {
+		t.Fatal(err)
+	}
+	if predecessorState != "processing" || followupState != "routed" || replies != 1 {
+		t.Fatalf("route states/replies = %q/%q/%d; want processing/routed/1", predecessorState, followupState, replies)
+	}
+}
+
+func TestConversationRouteAppliesIndependentTaskWhilePredecessorIsProcessing(t *testing.T) {
+	ctx := context.Background()
+	client := &routeModelClientTest{reply: `{"action":"new","task_id":"","question":""}`}
+	store, gateway, _, predecessor, _ := routeModelFixture(t, false, client)
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, predecessor.Message.ActorID); err != nil {
+		t.Fatal(err)
+	}
+	followup := receiveCausalMessage(t, store, predecessor, "causal-independent-task-001", predecessor.Message.ClientMessageID, "另外整理一份短报告")
+	claim := claimCausalMessage(t, store, followup.ID)
+	snapshot, decision := classifyCausalMessage(t, store, gateway, claim)
+	if !snapshot.Context.PreviousUnresolved || snapshot.PreviousRoutingState != "processing" || decision.Action != app.ConversationRouteNew {
+		t.Fatalf("independent task snapshot=%+v decision=%+v; want processing predecessor and new task", snapshot, decision)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatalf("apply independent task before predecessor route settles: %v", err)
+	}
+	var predecessorState, followupState, taskID string
+	if err := store.pool.QueryRow(ctx, `SELECT
+ (SELECT state FROM conversation_message_routes WHERE message_id=$1),
+ (SELECT state FROM conversation_message_routes WHERE message_id=$2),
+ (SELECT COALESCE(task_id,'') FROM conversation_messages WHERE id=$2)`,
+		predecessor.Message.ID, followup.ID).Scan(&predecessorState, &followupState, &taskID); err != nil {
+		t.Fatal(err)
+	}
+	if predecessorState != "processing" || followupState != "routed" || taskID == "" {
+		t.Fatalf("route states/task = %q/%q/%q; want processing/routed/non-empty", predecessorState, followupState, taskID)
+	}
+}
+
+func TestConversationRouteWorkerProcessesIndependentReplyWhenPredecessorArrivesLater(t *testing.T) {
+	ctx := context.Background()
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"你好。"}`}
+	store, gateway, _, firstClaim, _ := routeModelFixture(t, false, client)
+	const latePredecessorID = "causal-late-predecessor-001"
+	followup := receiveCausalMessage(t, store, firstClaim, "causal-out-of-order-followup-001", latePredecessorID, "你好")
+	predecessor := receiveCausalMessage(t, store, firstClaim, latePredecessorID, firstClaim.Message.ClientMessageID, "独立工作")
+
+	routeWorker, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+		Queue: store, Actions: store, Models: gateway, WorkerID: "causal-order-worker",
+		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := routeWorker.RunOnce(ctx)
+	if err != nil || !found {
+		t.Fatalf("route worker did not process out-of-order independent message: found=%t err=%v", found, err)
+	}
+	var followupState, predecessorState string
+	var replies int
+	if err := store.pool.QueryRow(ctx, `SELECT
+ (SELECT state FROM conversation_message_routes WHERE message_id=$1),
+ (SELECT state FROM conversation_message_routes WHERE message_id=$2),
+ (SELECT count(*) FROM conversation_messages WHERE conversation_id=$3 AND role='assistant' AND content='你好。')`,
+		followup.ID, predecessor.ID, firstClaim.Message.ConversationID).Scan(&followupState, &predecessorState, &replies); err != nil {
+		t.Fatal(err)
+	}
+	if followupState != "routed" || predecessorState != "pending" || replies != 1 || client.calls.Load() != 1 {
+		t.Fatalf("out-of-order route states/replies/model calls = %q/%q/%d/%d; want routed/pending/1/1",
+			followupState, predecessorState, replies, client.calls.Load())
+	}
 }
 
 func TestConversationRouteLatePredecessorResumesWithSeparateAccountedClassification(t *testing.T) {
@@ -188,6 +290,60 @@ func TestConversationRouteMissingPredecessorAllowsOnlyVerifiedIndependentWork(t 
 	}
 }
 
+func TestConversationRouteMissingPredecessorPublishesOnlySettledIndependentReply(t *testing.T) {
+	ctx := context.Background()
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"答案是 4。"}`}
+	store, gateway, _, fixture, _ := routeModelFixture(t, false, client)
+	if err := store.FailConversationRoute(ctx, fixture, "routing_action_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	message := receiveCausalMessage(t, store, fixture, "causal-reply-001", "causal-reply-never-arrived", "2+2 等于多少？")
+	claim := claimCausalMessage(t, store, message.ID)
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil || !snapshot.PreviousMissing {
+		t.Fatalf("missing predecessor snapshot=%+v err=%v", snapshot, err)
+	}
+	snapshot.Context.ModelID = claim.Input.ModelID
+	unverified := app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "答案是 4。"}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, unverified); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("unverified independent reply was allowed: %v", err)
+	}
+
+	snapshot, decision := classifyCausalMessage(t, store, gateway, claim)
+	if decision.Action != app.ConversationRouteReply || decision.Reply != "答案是 4。" {
+		t.Fatalf("valid independent reply was not classified: %+v", decision)
+	}
+	_, replayed := classifyCausalMessage(t, store, gateway, claim)
+	if replayed.Action != decision.Action || replayed.Reply != decision.Reply || client.calls.Load() != 1 {
+		t.Fatalf("independent reply was not safely replayed: %+v calls=%d", replayed, client.calls.Load())
+	}
+	modified := decision
+	modified.Reply = "答案是 5。"
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, modified); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("modified independent reply was allowed: %v", err)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("independent reply could be applied twice: %v", err)
+	}
+
+	var state, delivery, taskID, answer string
+	var answers, tasks int
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,m.delivery_status,COALESCE(m.task_id,''),
+COALESCE((SELECT max(a.content) FROM conversation_messages a WHERE a.variant_group_id=m.id AND a.role='assistant'),''),
+(SELECT count(*) FROM conversation_messages a WHERE a.variant_group_id=m.id AND a.role='assistant'),
+(SELECT count(*) FROM tasks t WHERE t.conversation_id=m.conversation_id)
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, message.ID).
+		Scan(&state, &delivery, &taskID, &answer, &answers, &tasks); err != nil || state != "routed" || delivery != "applied" ||
+		taskID != "" || answer != "答案是 4。" || answers != 1 || tasks != 0 {
+		t.Fatalf("independent reply was not persisted once without a Task: route=%s delivery=%s task=%q answer=%q answers=%d tasks=%d err=%v",
+			state, delivery, taskID, answer, answers, tasks, err)
+	}
+}
+
 func TestConversationRouteRejectsCyclicPredecessors(t *testing.T) {
 	ctx := context.Background()
 	store, _, _, fixture, _ := routeModelFixture(t, false, &routeModelClientTest{})
@@ -213,6 +369,58 @@ func TestConversationRouteRejectsCyclicPredecessors(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT state,awaiting_predecessor FROM conversation_message_routes WHERE message_id=$1`, first.ID).
 		Scan(&state, &awaiting); err != nil || state != "waiting_user" || awaiting {
 		t.Fatalf("cycle state=%q awaiting=%t err=%v", state, awaiting, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed'
+WHERE client_message_id='causal-cycle-second' AND conversation_id=$1`, fixture.Message.ConversationID); err != nil {
+		t.Fatal(err)
+	}
+	descendant := receiveCausalMessage(t, store, fixture, "causal-cycle-descendant", "causal-cycle-first", "循环链之后的消息")
+	descendantClaim := claimCausalMessage(t, store, descendant.ID)
+	descendantSnapshot, err := store.LoadConversationRouteSnapshot(ctx, descendantClaim)
+	if err != nil || !descendantSnapshot.PreviousCycle {
+		t.Fatalf("cycle inside predecessor history was not detected: %+v %v", descendantSnapshot, err)
+	}
+}
+
+func TestConversationRouteAcceptsLongAcyclicPredecessorChain(t *testing.T) {
+	ctx := context.Background()
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"你好，答案是 4。"}`}
+	store, gateway, _, fixture, _ := routeModelFixture(t, false, client)
+	if err := store.FailConversationRoute(ctx, fixture, "routing_action_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	previousID := ""
+	const chainLength = 130
+	for sequence := 1; sequence <= chainLength; sequence++ {
+		clientID := fmt.Sprintf("causal-long-chain-%03d", sequence)
+		receiveCausalMessage(t, store, fixture, clientID, previousID, fmt.Sprintf("历史消息 %03d", sequence))
+		previousID = clientID
+	}
+	message := receiveCausalMessage(t, store, fixture, "causal-long-chain-current", previousID, "2+2 等于多少？")
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed'
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3
+ AND client_message_id LIKE 'causal-long-chain-%' AND client_message_id<>$4`,
+		fixture.ServiceInstanceID, fixture.Message.ActorID, fixture.Message.ConversationID, "causal-long-chain-current"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_messages SET created_at=clock_timestamp()-interval '31 minutes'
+WHERE id IN (SELECT message_id FROM conversation_message_routes
+ WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3
+  AND client_message_id LIKE 'causal-long-chain-%' AND client_message_id<>$4)`,
+		fixture.ServiceInstanceID, fixture.Message.ActorID, fixture.Message.ConversationID, "causal-long-chain-current"); err != nil {
+		t.Fatal(err)
+	}
+	claim := claimCausalMessage(t, store, message.ID)
+	snapshot, decision := classifyCausalMessage(t, store, gateway, claim)
+	if snapshot.PreviousCycle {
+		t.Fatal("a long acyclic predecessor chain was classified as a cycle")
+	}
+	if decision.Action != app.ConversationRouteReply || decision.Reply != "你好，答案是 4。" {
+		t.Fatalf("long conversation did not reach direct reply routing: %+v", decision)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatalf("apply direct reply after long acyclic chain: %v", err)
 	}
 }
 
@@ -416,6 +624,52 @@ FROM conversation_message_routes r WHERE r.message_id=$1`, message.ID, call.Call
 			}
 			if !wantRequeued && (routeState != "processing" || calls != 1 || account != 1 || projectCalls != 1) {
 				t.Fatalf("dispatched evidence was discarded: state=%s route=%d account=%d project=%d", routeState, calls, account, projectCalls)
+			}
+		})
+	}
+}
+
+func TestConversationRouteContextChangeRequeuesOnlyBeforeDispatch(t *testing.T) {
+	for _, scenario := range []string{"no_call", "reserved", "dispatched", "unknown"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			client := &routeModelClientTest{}
+			store, _, _, claim, value := routeModelFixture(t, false, client)
+			var call app.ModelCallReservation
+			if scenario != "no_call" {
+				call = prepareRouteTestReservation(t, store, claim, value)
+				if scenario == "dispatched" || scenario == "unknown" {
+					if err := store.BeginConversationRouteModelCall(ctx, call); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if scenario == "unknown" {
+					if err := store.SettleConversationRouteModelCall(ctx, call, nil, app.ModelUsage{}, true); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			requeued, err := store.RequeueConversationRouteAfterContextChange(ctx, claim)
+			wantRequeued := scenario == "no_call" || scenario == "reserved"
+			if err != nil || requeued != wantRequeued {
+				t.Fatalf("context-change requeue=%t want=%t err=%v", requeued, wantRequeued, err)
+			}
+			var state string
+			var routeAttempt int64
+			var routeCalls, ledgerCalls int
+			if err := store.pool.QueryRow(ctx, `SELECT r.state,r.route_attempt,
+ (SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id),
+ (SELECT count(*) FROM model_call_ledger l WHERE l.source='route' AND l.call_id=$2)
+FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID, call.CallID).
+				Scan(&state, &routeAttempt, &routeCalls, &ledgerCalls); err != nil {
+				t.Fatal(err)
+			}
+			if wantRequeued && (state != "pending" || routeAttempt != claim.RouteAttempt+1 || (scenario == "reserved" && (routeCalls != 0 || ledgerCalls != 0))) {
+				t.Fatalf("safe context requeue state=%s attempt=%d routeCalls=%d ledgerCalls=%d", state, routeAttempt, routeCalls, ledgerCalls)
+			}
+			if !wantRequeued && (state != "processing" || routeAttempt != claim.RouteAttempt || routeCalls != 1 || ledgerCalls != 1) {
+				t.Fatalf("dispatched evidence changed state=%s attempt=%d routeCalls=%d ledgerCalls=%d", state, routeAttempt, routeCalls, ledgerCalls)
 			}
 		})
 	}

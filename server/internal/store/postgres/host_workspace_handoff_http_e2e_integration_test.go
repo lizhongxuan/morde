@@ -40,7 +40,13 @@ func TestHostWorkspaceStorageCannotMoveToAnotherComputer(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
-	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "host-handoff-http-e2e")
+	workspaceValue, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatalf("create stable Agent Workspace: %v", err)
+	}
+	if err := store.MarkAgentWorkspaceDirectoryInitialized(ctx, owner.ID, workspaceValue.ID); err != nil {
+		t.Fatalf("mark Agent Workspace directory initialized: %v", err)
+	}
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	sealer, err := app.NewSealer(make([]byte, 32))
 	if err != nil {

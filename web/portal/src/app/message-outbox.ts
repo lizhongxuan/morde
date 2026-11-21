@@ -19,6 +19,7 @@ export type PendingConversationMessage = {
   serviceInstanceID?: string;
   conversationID: string | null;
   conversationCreateKey?: string;
+  conversationCreateTitle?: string | null;
   projectID?: string;
   conversationOwnerID?: string;
   messageID?: string;
@@ -39,6 +40,18 @@ function resolvedTimeline(ordering: OutboxOrdering, key: string): string {
   return ordering.aliases[key] ?? key;
 }
 
+export function conversationTitleFromText(content?: string): string | null {
+  const normalized = content?.replace(/\s+/gu, ' ').trim();
+  if (!normalized) return null;
+  const characters = Array.from(normalized);
+  return characters.length > 42 ? `${characters.slice(0, 42).join('')}…` : normalized;
+}
+
+export function firstOutboxConversationMessage(items: PendingConversationMessage[], message: PendingConversationMessage) {
+  return items.find((item) => item.actorID === message.actorID && item.projectID === message.projectID &&
+    item.conversationCreateKey === message.conversationCreateKey) ?? message;
+}
+
 /** Select the predecessor and persist both the message and timeline head in one storage transaction. */
 export async function enqueueOutboxMessage(
   storage: MessageOutboxStorage, scope: string, message: PendingConversationMessage, serverPredecessor?: string,
@@ -47,11 +60,21 @@ export async function enqueueOutboxMessage(
   await storage.update(scope, (items, ordering) => {
     const existing = items.find((item) => item.request.client_message_id === message.request.client_message_id);
     if (existing) throw new Error('消息编号已存在，原消息已保留。');
-    const timeline = resolvedTimeline(ordering, timelineKey(message));
+    const key = timelineKey(message);
+    const timeline = resolvedTimeline(ordering, key);
     const lastPending = items.filter((item) => resolvedTimeline(ordering, timelineKey(item)) === timeline).at(-1)?.request.client_message_id;
     const predecessor = ordering.heads[timeline] ?? lastPending ?? serverPredecessor;
     if (predecessor === message.request.client_message_id) throw new Error('消息前序编号无效，输入已保留。');
+    const first = !message.conversationID && message.conversationCreateKey ? firstOutboxConversationMessage(items, message) : null;
     saved = { ...message, request: { ...message.request, ...(predecessor ? { previous_client_message_id: predecessor } : {}) } };
+    if (timeline !== key) {
+      const [, , target] = JSON.parse(timeline) as [string, string | null, string];
+      saved.conversationID = target.slice('conversation:'.length);
+    } else if (first) {
+      // Identical creation requests must replay the idempotency key even after a restart.
+      saved.conversationCreateTitle = first.conversationCreateTitle === undefined
+        ? conversationTitleFromText(first.request.content) : first.conversationCreateTitle;
+    }
     ordering.heads[timeline] = saved.request.client_message_id;
     return [...items, saved];
   });

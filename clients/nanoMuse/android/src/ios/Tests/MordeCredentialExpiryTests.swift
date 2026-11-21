@@ -1256,8 +1256,9 @@ enum MordeCredentialExpiryTests {
                                                        modelID: nil, attachmentIDs: [])
         let delayed = try! wireOutbox.messages(scope: scope)
         precondition(delayed.map(\.id) == [wireFirst.id, wireSecond.id, wireLong.id, otherConversation.id])
-        precondition(MordeOutboxScheduling.readyIDs(delayed, scope: scope, inFlight: [wireFirst.id]) == [otherConversation.id])
-        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: delayed) == "Waiting for the previous message to be received.")
+        precondition(MordeOutboxScheduling.readyIDs(delayed, scope: scope, inFlight: [wireFirst.id]) ==
+            [wireSecond.id, wireLong.id, otherConversation.id])
+        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: delayed) == nil)
         precondition(MordeOutboxScheduling.readyIDs(delayed, scope: otherAccountScope, inFlight: []).isEmpty)
 
         try! wireOutbox.update(id: wireFirst.id, scope: scope) {
@@ -1266,7 +1267,7 @@ enum MordeCredentialExpiryTests {
         }
         let firstReceived = try! wireOutbox.messages(scope: scope)
         precondition(MordeOutboxScheduling.readyIDs(firstReceived, scope: scope, inFlight: [wireFirst.id]) ==
-            [wireSecond.id, otherConversation.id])
+            [wireSecond.id, wireLong.id, otherConversation.id])
         precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: firstReceived) == nil)
         try! wireOutbox.update(id: wireSecond.id, scope: scope) {
             $0.state = .accepted
@@ -1281,20 +1282,21 @@ enum MordeCredentialExpiryTests {
         failedFirst.state = .failed
         failedFirst.confirmedNotAccepted = true
         let failedQueue = [failedFirst, wireSecond, wireLong, otherConversation]
-        precondition(MordeOutboxScheduling.readyIDs(failedQueue, scope: scope, inFlight: []) == [otherConversation.id])
-        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: failedQueue) ==
-            "The previous message failed to send. Please handle it first.")
+        precondition(MordeOutboxScheduling.readyIDs(failedQueue, scope: scope, inFlight: []) ==
+            [wireSecond.id, wireLong.id, otherConversation.id])
+        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: failedQueue) == nil)
         var unverifiedFirst = failedFirst
         unverifiedFirst.confirmedNotAccepted = nil
-        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: [unverifiedFirst, wireSecond]) ==
-            "The previous message’s delivery could not be verified. Retry or check it first.")
+        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: [unverifiedFirst, wireSecond]) == nil)
         var unknownFirst = delayed[0]
         unknownFirst.state = .unknown
         let uncertainQueue = [unknownFirst, wireSecond, wireLong, otherConversation]
         precondition(MordeOutboxScheduling.readyIDs(uncertainQueue, scope: scope, inFlight: []) ==
-            [wireFirst.id, otherConversation.id])
-        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: uncertainQueue) ==
-            "The previous message’s delivery could not be verified. Retry or check it first.")
+            [wireSecond.id, wireLong.id, otherConversation.id])
+        unknownFirst.state = .sending
+        precondition(MordeOutboxScheduling.readyIDs([unknownFirst, wireSecond, wireLong, otherConversation],
+            scope: scope, inFlight: []) == [wireFirst.id, wireSecond.id, wireLong.id, otherConversation.id])
+        precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: uncertainQueue) == nil)
         for code in [400, 403, 404, 413, 422] {
             precondition(MordeOutboxFailurePolicy.confirmsRejection(submissionBegan: true, firstSubmission: true,
                 hadUncertainSubmission: false, domain: "Morde", code: code))
@@ -1395,20 +1397,24 @@ enum MordeCredentialExpiryTests {
         precondition(detached[1].previousClientMessageID == prior.id && detached[2].previousClientMessageID == independent.id)
         precondition(detached[1].bypassedPredecessorIDs == [rejected.id])
         precondition(MordeConversationMessagePayload.direct(detached[1])["previous_client_message_id"] as? String == prior.id)
-        precondition(MordeOutboxScheduling.readyIDs(detached, scope: scope, inFlight: []) == [independent.id])
+        precondition(MordeOutboxScheduling.readyIDs(detached, scope: scope, inFlight: []) ==
+            [independent.id, following.id])
         precondition(MordeOutboxScheduling.waitingForEarlierMessage(detached[1], in: detached) == nil)
-        precondition(MordeOutboxScheduling.waitingForEarlierMessage(detached[2], in: detached) != nil)
+        precondition(MordeOutboxScheduling.waitingForEarlierMessage(detached[2], in: detached) == nil)
         try! branchOutbox.update(id: rejected.id, scope: scope) { $0.state = .unknown }
         let retryWhileLaterInFlight = try! branchOutbox.messages(scope: scope)
-        precondition(MordeOutboxScheduling.readyIDs(retryWhileLaterInFlight, scope: scope, inFlight: []) == [independent.id])
+        precondition(MordeOutboxScheduling.readyIDs(retryWhileLaterInFlight, scope: scope, inFlight: []) ==
+            [independent.id, following.id])
         precondition(MordeOutboxScheduling.waitingForEarlierMessage(retryWhileLaterInFlight[0], in: retryWhileLaterInFlight) ==
             "Retry will wait until the independent message is received.")
-        precondition(MordeOutboxScheduling.readyIDs(retryWhileLaterInFlight, scope: scope, inFlight: [independent.id]).isEmpty)
+        precondition(MordeOutboxScheduling.readyIDs(retryWhileLaterInFlight, scope: scope, inFlight: [independent.id]) ==
+            [following.id])
         try! branchOutbox.update(id: independent.id, scope: scope) {
             $0.state = .accepted; $0.serverMessageID = "m4567890"
         }
         let independentAccepted = try! branchReopened.messages(scope: scope)
-        precondition(MordeOutboxScheduling.readyIDs(independentAccepted, scope: scope, inFlight: [independent.id]) == [rejected.id])
+        precondition(MordeOutboxScheduling.readyIDs(independentAccepted, scope: scope, inFlight: [independent.id]) ==
+            [following.id])
         try! branchOutbox.update(id: rejected.id, scope: scope) { $0.state = .failed }
         let afterAcceptance = try! branchReopened.messages(scope: scope)
         precondition(MordeOutboxScheduling.readyIDs(afterAcceptance, scope: scope, inFlight: [independent.id]) == [following.id])

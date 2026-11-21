@@ -7,12 +7,66 @@ final class MIFTaskViewsTests: XCTestCase {
         let pending = #"{"id":"q1234567","conversation_id":"c1234567","objective":"demo","status":"completed","step_count":0,"completed_step_count":0,"updated_at":"2026-11-04T00:00:00Z","result_message_pending":true,"result_message_published":false}"#
         let oldTask = try JSONDecoder().decode(MordeTask.self, from: Data(legacy.utf8))
         let newTask = try JSONDecoder().decode(MordeTask.self, from: Data(pending.utf8))
+        XCTAssertNil(oldTask.validation)
         XCTAssertNil(oldTask.result_message_pending)
         XCTAssertNil(oldTask.result_message_published)
         XCTAssertEqual(newTask.result_message_pending, true)
         XCTAssertEqual(newTask.result_message_published, false)
         let missingCounts = #"{"id":"q1234567","conversation_id":"c1234567","objective":"demo","status":"completed","updated_at":"2026-11-04T00:00:00Z"}"#
         XCTAssertThrowsError(try JSONDecoder().decode(MordeTask.self, from: Data(missingCounts.utf8)))
+    }
+
+    func testTaskValidationDefaultsPendingAndMapsUnknownWithoutUsingResultReview() throws {
+        func decodeTask(validationState: String? = nil, includeValidation: Bool = true,
+                        resultReviewState: String? = nil) throws -> MordeTask {
+            var payload: [String: Any] = [
+                "id": "q1234567", "conversation_id": "c1234567", "objective": "demo",
+                "status": "completed", "step_count": 0, "completed_step_count": 0,
+                "updated_at": "2026-11-04T00:00:00Z",
+            ]
+            if includeValidation {
+                payload["validation"] = validationState.map { ["state": $0] } ?? [:]
+            }
+            if let resultReviewState {
+                payload["result_review"] = [
+                    "state": resultReviewState, "source_task_id": "q2345678",
+                    "source_task_revision": 1, "source_event_sequence": 2,
+                    "reply_message_id": NSNull(),
+                ]
+            }
+            return try JSONDecoder().decode(MordeTask.self,
+                from: JSONSerialization.data(withJSONObject: payload))
+        }
+
+        let missing = try decodeTask(includeValidation: false)
+        XCTAssertEqual(MIFTaskValidationPresentation.state(for: missing.validation), .pending)
+        XCTAssertEqual(MIFTaskValidationPresentation.label(for: missing.validation),
+                       AppLocalized("Pending verification"))
+        XCTAssertEqual(MIFTaskValidationPresentation.explanation(for: missing.validation),
+                       AppLocalized("Validation is pending independent review."))
+
+        let emptyValidation = try decodeTask()
+        XCTAssertEqual(MIFTaskValidationPresentation.state(for: emptyValidation.validation), .pending)
+
+        let publishedResultReview = try decodeTask(includeValidation: false, resultReviewState: "published")
+        XCTAssertEqual(MIFTaskValidationPresentation.state(for: publishedResultReview.validation), .pending,
+                       "Result review state is not the independent validation verdict.")
+
+        let knownStates: [(String, MIFTaskValidationState, String)] = [
+            ("PASS", .pass, "PASS"),
+            ("PASS+NOTES", .passWithNotes, "PASS+NOTES"),
+            ("FAIL", .fail, "FAIL"),
+        ]
+        for (serverState, expectedState, labelKey) in knownStates {
+            let task = try decodeTask(validationState: serverState)
+            XCTAssertEqual(MIFTaskValidationPresentation.state(for: task.validation), expectedState)
+            XCTAssertEqual(MIFTaskValidationPresentation.label(for: task.validation), AppLocalized(labelKey))
+            XCTAssertFalse(MIFTaskValidationPresentation.explanation(for: task.validation).isEmpty)
+        }
+
+        let unknown = try decodeTask(validationState: "future-state")
+        XCTAssertEqual(MIFTaskValidationPresentation.state(for: unknown.validation), .unknown)
+        XCTAssertEqual(MIFTaskValidationPresentation.label(for: unknown.validation), AppLocalized("Status unknown"))
     }
 
     func testCurrentTaskPlanIsRevisionFenced() throws {
@@ -450,7 +504,7 @@ final class MIFTaskViewsTests: XCTestCase {
                   step_count: stepCount, completed_step_count: completedStepCount,
                   budget: nil, usage: nil, billing: nil, pending_request: nil,
                   clarification_request: nil, batch_items: batchItems, dependencies: nil,
-                  child_jobs: nil, result_review: nil, plan: nil,
+                  child_jobs: nil, result_review: nil, validation: nil, plan: nil,
                   steps: steps, agents: nil, artifacts: nil,
                   updated_at: "2026-11-04T00:00:00Z", assistant_message: nil)
     }

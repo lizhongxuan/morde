@@ -57,14 +57,15 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "workspace-sync")
 	postgresRoot := filepath.Join(t.TempDir(), "postgres-data")
 	blocksRoot := filepath.Join(root, "blocks")
-	data := strings.Replace(validConfigYAML(workbenchDir), "root_dir: /var/lib/morde/workspaces", "root_dir: "+blocksRoot, 1) + fmt.Sprintf("workspace_sync_node:\n"+
-		"  enabled: true\n  data_root: %q\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
+	data := strings.Replace(validConfigYAML(workbenchDir), "root_dir: /var/lib/morde/workspaces", "root_dir: "+blocksRoot, 1)
+	data = strings.Replace(data, "workspace_sync_node:\n  enabled: false\n", fmt.Sprintf("workspace_sync_node:\n"+
+		"  data_root: %q\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
 		"  relay_public_address: 8.8.8.8:22067\n  relay_bind_address: 172.18.141.222\n"+
 		"  relay_token: %s\n  relay_state_root: %q\n  state_root: %q\n  workspace_root: %q\n"+
 		"  quota_socket_root: %q\n  protected_storage_roots: [%q]\n"+
 		"  relay_container_name: morde-sync-relay\n",
 		root, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64),
-		filepath.Join(root, "relay"), filepath.Join(root, "state"), filepath.Join(root, "files"), filepath.Join(root, "quota"), postgresRoot)
+		filepath.Join(root, "relay"), filepath.Join(root, "state"), filepath.Join(root, "files"), filepath.Join(root, "quota"), postgresRoot), 1)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
@@ -78,11 +79,11 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	}
 }
 
-func TestLoadWorkspaceFeatureGatesDefaultClosedAndOpenExplicitly(t *testing.T) {
+func TestLoadFeatureRuntimeGatesDefaultEnabledAndCanBeDisabled(t *testing.T) {
 	workbenchDir := t.TempDir()
 	t.Setenv("T02_TEST_INSTANCE", "test-instance")
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := validConfigYAML(workbenchDir)
+	data := validEnabledFeatureConfigYAML(t, workbenchDir)
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -90,11 +91,17 @@ func TestLoadWorkspaceFeatureGatesDefaultClosedAndOpenExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.WorkspaceSyncNode.ProjectUploadEnabled || cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled {
-		t.Fatal("Workspace project upload, direct directory source, and Host mount gates must default to closed")
+	if !cfg.CloudDSH.Enabled || !cfg.CloudDSH.BuiltinSearch.Enabled || !cfg.WorkspaceSyncNode.Enabled ||
+		!cfg.WorkspaceSyncNode.ProjectUploadEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled ||
+		!cfg.MCP.Enabled || cfg.CloudDSH.MaxConcurrentRoutes != 16 || cfg.CloudDSH.MaxConcurrentTasks != 4 ||
+		cfg.CloudDSH.MaxConcurrentPerOwner != 4 || cfg.CloudDSH.BuiltinSearch.MaxConcurrent != 4 {
+		t.Fatalf("config feature defaults are not enabled: DSH=%+v Workspace=%+v MCP=%+v", cfg.CloudDSH, cfg.WorkspaceSyncNode, cfg.MCP)
 	}
 
-	data = strings.Replace(data, "site_storage:\n", "workspace_sync_node:\n  project_upload_enabled: true\n  agent_workspace_host_mount_enabled: true\n  agent_workspace_live_directory_source_enabled: true\nsite_storage:\n", 1)
+	data = strings.Replace(data, "cloud_dsh:\n", "cloud_dsh:\n  enabled: false\n", 1)
+	data = strings.Replace(data, "  builtin_search:\n", "  builtin_search:\n    enabled: false\n", 1)
+	data = strings.Replace(data, "workspace_sync_node:\n", "workspace_sync_node:\n  enabled: false\n  project_upload_enabled: false\n  agent_workspace_host_mount_enabled: false\n  agent_workspace_live_directory_source_enabled: false\n", 1)
+	data += "\nmcp:\n  enabled: false\n"
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -102,32 +109,40 @@ func TestLoadWorkspaceFeatureGatesDefaultClosedAndOpenExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.WorkspaceSyncNode.ProjectUploadEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled {
-		t.Fatal("explicit Workspace feature gate values were not loaded")
+	if cfg.CloudDSH.Enabled || cfg.CloudDSH.BuiltinSearch.Enabled || cfg.WorkspaceSyncNode.Enabled || cfg.WorkspaceSyncNode.ProjectUploadEnabled ||
+		cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled || cfg.MCP.Enabled {
+		t.Fatalf("explicit feature opt-out was ignored: DSH=%+v Workspace=%+v MCP=%+v", cfg.CloudDSH, cfg.WorkspaceSyncNode, cfg.MCP)
 	}
+}
 
-	data = strings.Replace(data, "agent_workspace_host_mount_enabled: true", "agent_workspace_host_mount_enabled: false", 1)
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("live Workspace directory source loaded without the required Host mount gate")
-	}
-
-	data = strings.Replace(data, "agent_workspace_host_mount_enabled: false", "agent_workspace_host_mount_enabled: true", 1)
-	data = strings.Replace(data, "agent_workspace_live_directory_source_enabled: true", "agent_workspace_live_directory_source_enabled: false", 1)
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("Host Workspace mount loaded without the required live directory source gate")
-	}
+func validEnabledFeatureConfigYAML(t *testing.T, workbenchDir string) string {
+	t.Helper()
+	workspaceRoot := filepath.Join(t.TempDir(), "workspace-sync")
+	postgresRoot := filepath.Join(t.TempDir(), "postgres-data")
+	blocksRoot := filepath.Join(workspaceRoot, "blocks")
+	data := strings.Replace(validConfigYAML(workbenchDir), "root_dir: /var/lib/morde/workspaces", "root_dir: "+blocksRoot, 1)
+	data = strings.Replace(data, "cloud_dsh:\n  enabled: false\n  builtin_search:\n    enabled: false\n", fmt.Sprintf("cloud_dsh:\n"+
+		"  docker_host: unix:///run/morde-dsh/docker.sock\n  image: morde-cloud-runtime@sha256:%s\n"+
+		"  node_path: /usr/local/bin/node\n  script_path: /opt/morde-cloud-runtime/bin.mjs\n"+
+		"  supervisor_id: dsh-supervisor-1\n  supervisor_key_file: /etc/morde/dsh-supervisor.key\n"+
+		"  guardian_socket: /run/morde/dsh-guardian.sock\n  guardian_public_key_file: /etc/morde/dsh-guardian.pub\n"+
+		"  builtin_search:\n    node_path: /usr/bin/node\n    script_path: /opt/morde-search/cli.js\n"+
+		"    searxng_url: http://127.0.0.1:8189\n",
+		strings.Repeat("a", 64)), 1)
+	return strings.Replace(data, "workspace_sync_node:\n  enabled: false\n", fmt.Sprintf("workspace_sync_node:\n"+
+		"  data_root: %q\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
+		"  relay_public_address: 8.8.8.8:22067\n  relay_bind_address: 172.18.141.222\n"+
+		"  relay_token: %s\n  relay_state_root: %q\n  state_root: %q\n  workspace_root: %q\n"+
+		"  quota_socket_root: %q\n  protected_storage_roots: [%q]\n  relay_container_name: morde-sync-relay\n",
+		workspaceRoot, strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 32),
+		filepath.Join(workspaceRoot, "relay"), filepath.Join(workspaceRoot, "state"), filepath.Join(workspaceRoot, "files"),
+		filepath.Join(workspaceRoot, "quota"), postgresRoot), 1)
 }
 
 func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.CloudDSH = CloudDSH{
-		Enabled: true, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 2,
+		Enabled: true, MaxConcurrentRoutes: 16, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 4,
 		DockerHost: "unix:///run/morde-dsh/docker.sock", Image: "morde-dsh@sha256:" + strings.Repeat("a", 64),
 		NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", SupervisorID: "dsh-supervisor-1",
 		SupervisorKeyFile: "/etc/morde/dsh-supervisor.key", GuardianSocket: "/run/morde/dsh-guardian.sock",
@@ -188,7 +203,7 @@ func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 func TestBuiltinSearchRequiresFixedLoopbackEndpointAndBounds(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.CloudDSH = CloudDSH{
-		Enabled: true, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 2,
+		Enabled: true, MaxConcurrentRoutes: 16, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 4,
 		DockerHost: "unix:///run/morde-dsh/docker.sock", Image: "morde-dsh@sha256:" + strings.Repeat("a", 64),
 		NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", SupervisorID: "dsh-supervisor-1",
 		SupervisorKeyFile: "/etc/morde/dsh-supervisor.key", GuardianSocket: "/run/morde/dsh-guardian.sock",
@@ -647,8 +662,9 @@ func validConfigYAML(workbenchDir string) string {
 		"capacity:\n  cpu_milli: 4000\n  mem_mib: 8192\n"+
 		"reconciler:\n  interval: 1m\n  renew_before: 5m\n  activity_flush_interval: 10s\n"+
 		"storage:\n  driver: docker\n  docker_host: unix:///var/run/docker.sock\n  docker_data_dir: /var/lib/docker\n  min_free_bytes: 10737418240\n"+
-		"cloud_dsh:\n  enabled: false\n"+
+		"cloud_dsh:\n  enabled: false\n  builtin_search:\n    enabled: false\n"+
 		"workspace_storage:\n  root_dir: /var/lib/morde/workspaces\n  max_workspace_bytes: 10737418240\n  max_owner_bytes: 53687091200\n  min_free_bytes: 10737418240\n"+
+		"workspace_sync_node:\n  enabled: false\n"+
 		"site_storage:\n  root_dir: %q\n  max_release_bytes: 10737418240\n  max_owner_bytes: 53687091200\n  min_free_bytes: 10737418240\n"+
 		"gateway:\n  workbench_dir: %q\n  upstream_cache_ttl: 1m\n  credential_cache_ttl: 1m\n  preview_port_min: 1024\n  max_body_bytes: 1048576\n"+
 		"portal_web:\n  dir: web\n"+

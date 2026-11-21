@@ -63,7 +63,8 @@ func (s *Store) WorkspacePath(ownerID, workspaceID string) (string, error) {
 		return "", err
 	}
 	relativePath := filepath.Join(ownerHash, workspaceID)
-	directory, err := openWorkspaceCurrentFile(s.rootPath, relativePath)
+	// Host bind mounts need a verified path; the Portal does not need to read the directory.
+	directory, err := openWorkspaceCurrentDirectory(s.rootPath, relativePath)
 	if err != nil {
 		return "", fmt.Errorf("open Workspace current directory: %w", err)
 	}

@@ -73,6 +73,53 @@ func (f routeActionsTestFixture) receiveInConversation(t *testing.T, conversatio
 	return claim
 }
 
+func TestConversationRouteSnapshotBoundsCandidateSetsWithoutBlockingRouting(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	var oldest app.ConversationRouteClaim
+	var oldestTaskID string
+	for index := 0; index < 65; index++ {
+		clientID := fmt.Sprintf("route-overflow-task-%03d", index)
+		claim := f.receive(t, clientID, fmt.Sprintf("Create independent work item %d", index), app.ConversationRoutingInput{})
+		if index == 0 {
+			oldest = claim
+		}
+		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+		if err != nil {
+			t.Fatalf("load task snapshot %d: %v", index, err)
+		}
+		snapshot.Context.ModelID = "p1234567"
+		if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+			t.Fatalf("create task %d: %v", index, err)
+		}
+		if index == 0 {
+			if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, claim.Message.ID).Scan(&oldestTaskID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for index := 0; index < 36; index++ {
+		f.receive(t, fmt.Sprintf("route-overflow-pending-%03d", index), "Another independent request", app.ConversationRoutingInput{})
+	}
+	claim := f.receive(t, "route-overflow-final", "Continue my oldest request", app.ConversationRoutingInput{
+		ReferenceTaskID: oldestTaskID, PreviousClientMessageID: "route-overflow-task-000",
+	})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatalf("overflow snapshot failed the route instead of returning bounded context: %v", err)
+	}
+	if !snapshot.Context.CandidateSetIncomplete || len(snapshot.Context.Candidates) != 64 || len(snapshot.Context.RequestCandidates) != 100 {
+		t.Fatalf("candidate bounds/incomplete marker = tasks:%d requests:%d incomplete:%t", len(snapshot.Context.Candidates),
+			len(snapshot.Context.RequestCandidates), snapshot.Context.CandidateSetIncomplete)
+	}
+	if snapshot.Context.Candidates[0].TaskID != oldestTaskID {
+		t.Fatalf("explicit task reference was omitted from bounded active candidates: %+v", snapshot.Context.Candidates[0])
+	}
+	if snapshot.Context.RequestCandidates[0].MessageID != oldest.Message.ID {
+		t.Fatalf("explicit predecessor was omitted from bounded prior requests: %+v", snapshot.Context.RequestCandidates[0])
+	}
+}
+
 func TestConversationRouteCreatesOneHostlessTaskAndRecordsRevisionIntent(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
@@ -257,7 +304,7 @@ lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, taskID); er
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := recordTaskRevisionStartedInTx(ctx, tx, taskID); err != nil {
 		t.Fatal(err)
 	}
@@ -625,6 +672,96 @@ WHERE route.message_id=$1`, duplicate.Message.ID).Scan(&duplicateOf, &duplicateT
 			t.Fatalf("duplicate %d was not linked to the single root: duplicate_of=%q duplicate_task=%q err=%v",
 				index, duplicateOf, duplicateTaskID, err)
 		}
+	}
+}
+
+func TestConversationRouteConcurrentIdenticalNewDecisionsCreateSingleTask(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	first := f.receive(t, "route-concurrent-identical-1", "分析 Morde 项目", app.ConversationRoutingInput{})
+	secondInput := app.ConversationRoutingInput{PreviousClientMessageID: first.Message.ClientMessageID}
+	second := f.receive(t, "route-concurrent-identical-2", "分析 Morde 项目", secondInput)
+
+	claims := []app.ConversationRouteClaim{first, second}
+	snapshots := make([]app.ConversationRouteSnapshot, len(claims))
+	for index, claim := range claims {
+		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+		if err != nil {
+			t.Fatalf("load route snapshot %d: %v", index, err)
+		}
+		snapshot.Context.ModelID = "p1234567"
+		snapshots[index] = snapshot
+	}
+	if len(snapshots[1].Context.RequestCandidates) != 1 ||
+		!snapshots[1].Context.RequestCandidates[0].SameExecutionScope ||
+		!app.ValidConversationRouteJoinTarget(first.Message.ID, snapshots[1].Context.RequestCandidates) {
+		t.Fatalf("second message cannot join the identical in-flight request: %+v", snapshots[1].Context.RequestCandidates)
+	}
+
+	start := make(chan struct{})
+	errorsByIndex := make(chan error, len(claims))
+	for index, claim := range claims {
+		go func(index int, claim app.ConversationRouteClaim) {
+			<-start
+			errorsByIndex <- f.store.ApplyConversationRoute(ctx, claim, snapshots[index], app.ConversationRouteDecision{Action: app.ConversationRouteNew})
+		}(index, claim)
+	}
+	close(start)
+	for range claims {
+		if err := <-errorsByIndex; err != nil {
+			t.Fatalf("apply concurrent new route: %v", err)
+		}
+	}
+
+	var taskCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1`, f.conversation.ID).Scan(&taskCount); err != nil || taskCount != 1 {
+		t.Fatalf("concurrent identical messages created %d tasks, err=%v", taskCount, err)
+	}
+	var duplicateOf, taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(duplicate_of_message_id,''),COALESCE(task_id,'')
+FROM conversation_message_routes route JOIN conversation_messages message ON message.id=route.message_id
+WHERE route.message_id=$1`, second.Message.ID).Scan(&duplicateOf, &taskID); err != nil || duplicateOf != first.Message.ID || taskID != "" {
+		t.Fatalf("second message was not linked to the first: duplicate_of=%q task=%q err=%v", duplicateOf, taskID, err)
+	}
+}
+
+func TestConversationRouteLinksExactDuplicateAfterAggregationWindowExpires(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	first := f.receive(t, "route-expired-aggregate-1", "分析 Morde 项目", app.ConversationRoutingInput{})
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET
+aggregation_started_at=aggregation_started_at-interval '10 seconds',
+aggregation_deadline=aggregation_started_at-interval '10 seconds'
+WHERE message_id=$1`, first.Message.ID); err != nil {
+		t.Fatal(err)
+	}
+	second := f.receive(t, "route-expired-aggregate-2", "分析 Morde 项目",
+		app.ConversationRoutingInput{PreviousClientMessageID: first.Message.ClientMessageID})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, second)
+	if err != nil || len(snapshot.Context.RequestCandidates) != 1 {
+		t.Fatalf("load expired aggregate snapshot=%+v err=%v", snapshot, err)
+	}
+	candidate := snapshot.Context.RequestCandidates[0]
+	if candidate.MessageID != first.Message.ID || !candidate.AggregationClosed ||
+		app.ValidConversationRouteJoinTarget(first.Message.ID, snapshot.Context.RequestCandidates) ||
+		!app.ValidConversationRouteExactDuplicateTarget(first.Message.ID, second.Message.Content, snapshot.Context.RequestCandidates) {
+		t.Fatalf("expired aggregation did not expose exact duplicate eligibility: %+v", candidate)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, second, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("link exact duplicate after aggregation window: %v", err)
+	}
+	var duplicateOf, taskID, state string
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(route.duplicate_of_message_id,''),COALESCE(message.task_id,''),route.state
+FROM conversation_message_routes route JOIN conversation_messages message ON message.id=route.message_id
+WHERE route.message_id=$1`, second.Message.ID).Scan(&duplicateOf, &taskID, &state); err != nil ||
+		duplicateOf != first.Message.ID || taskID != "" || state != "routed" {
+		t.Fatalf("expired exact duplicate was not linked without a second Task: duplicate_of=%q task=%q state=%q err=%v",
+			duplicateOf, taskID, state, err)
+	}
+	var taskCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1`, f.conversation.ID).Scan(&taskCount); err != nil || taskCount != 0 {
+		t.Fatalf("exact duplicate created %d Tasks, err=%v", taskCount, err)
 	}
 }
 

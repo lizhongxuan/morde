@@ -31,8 +31,10 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	domainTemplate "morde/server/internal/domain/template"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 )
 
@@ -58,6 +60,109 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 	store, pool := newF01TemporaryStore(t)
 	owner := createF01User(t, ctx, store)
 	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
+	blocks, err := workspacefs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close test Workspace blocks: %v", err)
+		}
+	}()
+	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditService, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRoot, err := filepath.EvalSymlinks(cacheRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentDirectory, err := workspacecurrent.Open(filepath.Join(currentRoot, "workspace-current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := currentDirectory.Close(); err != nil {
+			t.Errorf("close Host restore Workspace directory fixture: %v", err)
+		}
+	})
+	if err := syncService.SetWorkspaceCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64,
+		files []workspace.File, emptyDirectories []string, directories []workspace.Directory) error {
+		return currentDirectory.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, directories, blocks)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncService.SetWorkspaceCurrentRevisionReader(currentDirectory.CurrentRevision); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncService.SetWorkspaceCurrentManifestVerifier(currentDirectory.MatchesManifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncService.SetWorkspaceCurrentDirectory(currentDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncService.InitializeWorkspaceCurrent(ctx, workspaceValue.ID); err != nil {
+		t.Fatalf("initialize current Agent Workspace before first revision: %v", err)
+	}
+	workspaceService, err := app.NewWorkspaceService(store, blocks, currentDirectory, f01ReleaseNoopCapacity{}, auditService, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspaceService.SetWorkspaceCurrentInitializer(syncService.InitializeWorkspaceCurrent); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionCredential := createF01Session(t, ctx, store, owner.ID)
+	principal, err := credentials.VerifySession(ctx, sessionCredential)
+	if err != nil || principal.UserID != owner.ID || principal.Kind != identity.KindSession {
+		t.Fatalf("verify Workspace seeding session: principal=%#v err=%v", principal, err)
+	}
+	content := []byte("This committed Workspace file remains readable after Host release.\n")
+	chunkDigest := sha256.Sum256(content)
+	digest := hex.EncodeToString(chunkDigest[:])
+	fileModTime, rootModTime, reportsModTime := int64(1), int64(1), int64(1)
+	rootMode, reportsMode := uint32(0o755), uint32(0o755)
+	file := workspace.File{
+		Kind: workspace.FileKindRegular, Path: "reports/release-readback.txt", SizeBytes: int64(len(content)), SHA256: digest, Mode: 0o644,
+		ModTimeNS: &fileModTime, MetadataKnown: true,
+		Chunks: []workspace.Chunk{{SHA256: digest, SizeBytes: int64(len(content))}},
+	}
+	uploadSession, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{file},
+		Directories: []workspace.Directory{
+			{Path: ".", Mode: &rootMode, ModTimeNS: &rootModTime, MetadataKnown: true},
+			{Path: "reports", Mode: &reportsMode, ModTimeNS: &reportsModTime, MetadataKnown: true},
+		},
+	}, "f01-release-readback-upload")
+	if err != nil {
+		t.Fatalf("create initial Workspace upload session: %v", err)
+	}
+	if written, err := syncService.PutSyncBlock(ctx, principal, workspaceValue.ID, uploadSession.ID, digest, bytes.NewReader(content)); err != nil || written != int64(len(content)) {
+		t.Fatalf("upload initial Workspace content block: written=%d err=%v", written, err)
+	}
+	committed, err := syncService.CommitSyncSession(ctx, principal, workspaceValue.ID, uploadSession.ID, "f01-release-readback-commit")
+	if err != nil || committed.State != workspace.SyncCompleted {
+		t.Fatalf("commit initial Workspace file before Host binding: state=%q err=%v", committed.State, err)
+	}
+	workspaceBefore, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil || workspaceBefore.Revision <= 0 || workspaceBefore.State != workspace.StateReady {
+		t.Fatalf("Workspace after initial upload = state %q revision %d, err=%v", workspaceBefore.State, workspaceBefore.Revision, err)
+	}
+	downloadSession, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
+	}, "f01-release-readback-download")
+	if err != nil || downloadSession.ID == "" {
+		t.Fatalf("create Workspace readback session before Host binding: session=%#v err=%v", downloadSession, err)
+	}
 	sealer, err := app.NewSealer(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -98,46 +203,15 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 		volumes.delegate = localOpenSandbox.volumes
 	}
 	sandboxes := f01ReleaseSandboxRouter{client: sandbox}
-	binding := hostValue.Workspaces[0]
-	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
-		workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sessionCredential := createF01Session(t, ctx, store, owner.ID)
-
-	blocks, err := workspacefs.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := blocks.Close(); err != nil {
-			t.Errorf("close test Workspace blocks: %v", err)
-		}
-	}()
-	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<30)
-	if err != nil {
-		t.Fatal(err)
-	}
 	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	auditService, err := app.NewAuditService(store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	credentials, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
-		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
-	}, f01DefaultHosts{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	hostService, err := app.NewHostService(app.HostServiceOptions{
 		Hosts: store, Users: store, Workspaces: store, Tokens: store,
-		WorkspaceVolumes: f01ReleaseReadbackWorkspaceVolumes{},
-		Sandboxes:        sandboxes,
-		Volumes:          volumes, DiskCapacity: f01ReleaseNoopCapacity{},
+		WorkspaceVolumes: f01ReleaseReadbackWorkspaceVolumes{}, DefaultWorkspaces: workspaceService,
+		Sandboxes: sandboxes,
+		Volumes:   volumes, DiskCapacity: f01ReleaseNoopCapacity{},
 		Probe: f01ReleaseNoopProbe{}, Runtime: f01ReleaseNoopRuntime{}, Audit: auditService,
 		CreateLocks: store, Sealer: sealer,
 		Templates:         map[string]domainTemplate.Template{"f01-local-template": template},
@@ -176,59 +250,6 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 	defer portal.Close()
 	client := portal.Client()
 
-	content := []byte("This committed Workspace file remains readable after Host release.\n")
-	chunkDigest := sha256.Sum256(content)
-	digest := hex.EncodeToString(chunkDigest[:])
-	file := workspace.File{
-		Kind: workspace.FileKindRegular, Path: "reports/release-readback.txt", SizeBytes: int64(len(content)), SHA256: digest, Mode: 0o644,
-		Chunks: []workspace.Chunk{{SHA256: digest, SizeBytes: int64(len(content))}},
-	}
-	createUpload, err := json.Marshal(workspace.CreateSyncSession{
-		Direction: workspace.SyncUpload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{file},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var uploadSession workspace.SyncSession
-	responseBody := f01ReleaseReadbackRequest(t, ctx, client, portal.URL, sessionCredential, http.MethodPost,
-		"/api/workspaces/"+workspaceValue.ID+"/sync-sessions", createUpload, "application/json", "f01-release-readback-upload", http.StatusCreated)
-	if err := json.Unmarshal(responseBody, &uploadSession); err != nil || uploadSession.ID == "" {
-		t.Fatalf("decode Workspace upload session = %#v, err=%v", uploadSession, err)
-	}
-	f01ReleaseReadbackRequest(t, ctx, client, portal.URL, sessionCredential, http.MethodPut,
-		fmt.Sprintf("/api/workspaces/%s/sync-sessions/%s/blocks/%s", workspaceValue.ID, uploadSession.ID, digest),
-		content, "application/octet-stream", "", http.StatusNoContent)
-	responseBody = f01ReleaseReadbackRequest(t, ctx, client, portal.URL, sessionCredential, http.MethodPost,
-		fmt.Sprintf("/api/workspaces/%s/sync-sessions/%s/commit", workspaceValue.ID, uploadSession.ID),
-		nil, "", "f01-release-readback-commit", http.StatusOK)
-	var committed workspace.SyncSession
-	if err := json.Unmarshal(responseBody, &committed); err != nil || committed.State != workspace.SyncCompleted {
-		t.Fatalf("Workspace upload commit = state %q, err=%v", committed.State, err)
-	}
-	workspaceBefore, err := store.GetWorkspace(ctx, workspaceValue.ID)
-	if err != nil || workspaceBefore.Revision <= 0 || workspaceBefore.State != workspace.StateReady {
-		t.Fatalf("Workspace after committed upload = state %q revision %d, err=%v", workspaceBefore.State, workspaceBefore.Revision, err)
-	}
-	bindingBeforeRelease, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
-	if err != nil || bindingBeforeRelease.State != workspace.BindingActive || bindingBeforeRelease.DesiredRevision != workspaceBefore.Revision {
-		t.Fatalf("Host Workspace binding before release = %#v, err=%v; Workspace revision %d", bindingBeforeRelease, err, workspaceBefore.Revision)
-	}
-
-	// Create a download transfer for the committed revision so the Morde block
-	// readback uses the same manifest and binary-block Portal API as a replica.
-	createDownload, err := json.Marshal(workspace.CreateSyncSession{
-		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var downloadSession workspace.SyncSession
-	responseBody = f01ReleaseReadbackRequest(t, ctx, client, portal.URL, sessionCredential, http.MethodPost,
-		"/api/workspaces/"+workspaceValue.ID+"/sync-sessions", createDownload, "application/json", "f01-release-readback-download", http.StatusCreated)
-	if err := json.Unmarshal(responseBody, &downloadSession); err != nil || downloadSession.ID == "" {
-		t.Fatalf("decode Workspace download session = %#v, err=%v", downloadSession, err)
-	}
-
 	manifestBefore := f01ReleaseReadbackManifest(t, ctx, client, portal.URL, sessionCredential, workspaceValue.ID)
 	if manifestBefore.Revision != workspaceBefore.Revision || len(manifestBefore.Files) != 1 || !reflect.DeepEqual(manifestBefore.Files[0], file) {
 		t.Fatalf("Workspace manifest before Host release = %#v; expected revision %d with committed file %#v", manifestBefore, workspaceBefore.Revision, file)
@@ -265,9 +286,13 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 		syncBinding.BindingVersion, initialDownload.Session.ID, initialDownload.Session.TargetRevision); err != nil {
 		t.Fatalf("record Host Workspace baseline: %v", err)
 	}
-	bindingBeforeRelease, err = store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
-	if err != nil {
-		t.Fatalf("read Host Workspace binding after baseline sync: %v", err)
+	if err := f01ActivateBinding(client, portal.URL, hostValue, replicaCredential, workspaceValue.ID, syncBinding.BindingVersion); err != nil {
+		t.Fatalf("activate Workspace binding after verified Host baseline: %v", err)
+	}
+	syncCredential, syncBinding = f01BindingCredential(t, client, portal.URL, hostValue, replicaCredential, workspaceValue.ID)
+	if syncBinding.State != string(workspace.BindingActive) || syncBinding.DesiredRevision != workspaceBefore.Revision ||
+		syncBinding.AppliedRevision != workspaceBefore.Revision {
+		t.Fatalf("Host Workspace binding before release = %#v; Workspace revision %d", syncBinding, workspaceBefore.Revision)
 	}
 	var offline atomic.Bool
 	refused := make(chan struct{}, 1)
@@ -366,9 +391,9 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 			workspaceAfter.State, workspaceAfter.Revision, err, workspaceBefore.State, workspaceBefore.Revision)
 	}
 	bindingAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
-	if err != nil || bindingAfter.State != bindingBeforeRelease.State || bindingAfter.DesiredRevision != bindingBeforeRelease.DesiredRevision ||
-		bindingAfter.AppliedRevision != bindingBeforeRelease.AppliedRevision {
-		t.Fatalf("Host Workspace binding after release = %#v, err=%v; before release %#v", bindingAfter, err, bindingBeforeRelease)
+	if err != nil || string(bindingAfter.State) != syncBinding.State || bindingAfter.DesiredRevision != syncBinding.DesiredRevision ||
+		bindingAfter.AppliedRevision != syncBinding.AppliedRevision {
+		t.Fatalf("Host Workspace binding after release = %#v, err=%v; before release %#v", bindingAfter, err, syncBinding)
 	}
 	manifestAfter := f01ReleaseReadbackManifest(t, ctx, client, portal.URL, sessionCredential, workspaceValue.ID)
 	if manifestAfter.Revision != manifestBefore.Revision || !reflect.DeepEqual(manifestAfter.Files, manifestBefore.Files) {
@@ -491,23 +516,15 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 		pendingFile.SHA256 != hex.EncodeToString(pendingDigest[:]) {
 		t.Fatalf("Workspace after restored morde-sync = %#v, pending file %#v", manifestFinal, pendingFile)
 	}
-	finalDownload, err := json.Marshal(workspace.CreateSyncSession{
-		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
-	})
+	pendingBlock, err := blocks.Open(workspaceValue.ID, pendingFile.SHA256)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read restored Workspace content block: %v", err)
 	}
-	responseBody = f01ReleaseReadbackRequest(t, ctx, client, portal.URL, sessionCredential, http.MethodPost,
-		"/api/workspaces/"+workspaceValue.ID+"/sync-sessions", finalDownload, "application/json", "f01-release-readback-final-download", http.StatusCreated)
-	var finalDownloadSession workspace.SyncSession
-	if err := json.Unmarshal(responseBody, &finalDownloadSession); err != nil || finalDownloadSession.ID == "" {
-		t.Fatalf("decode final Workspace download session = %#v, err=%v", finalDownloadSession, err)
-	}
-	readbackPath := fmt.Sprintf("/api/workspaces/%s/sync-sessions/%s/blocks/%s", workspaceValue.ID, finalDownloadSession.ID, pendingFile.SHA256)
-	pendingReadback := f01ReleaseReadbackRequest(t, ctx, client, portal.URL, sessionCredential, http.MethodGet,
-		readbackPath, nil, "", "", http.StatusOK)
-	if !bytes.Equal(pendingReadback, pendingContent) || len(volumes.deleted) != 0 {
-		t.Fatalf("restored Workspace file readback = %q, want %q; deleted volumes %v", pendingReadback, pendingContent, volumes.deleted)
+	pendingReadback, readbackErr := io.ReadAll(pendingBlock)
+	closeErr := pendingBlock.Close()
+	if readbackErr != nil || closeErr != nil || !bytes.Equal(pendingReadback, pendingContent) || len(volumes.deleted) != 0 {
+		t.Fatalf("restored Workspace content block = %q, want %q; read err %v, close err %v, deleted volumes %v",
+			pendingReadback, pendingContent, readbackErr, closeErr, volumes.deleted)
 	}
 }
 

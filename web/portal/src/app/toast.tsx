@@ -32,8 +32,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
   const notify = useCallback((message: string, kind: Toast['kind'] = 'info', action?: ToastAction) => {
     const id = Date.now() + Math.random();
-    setItems((current) => [...current, { id, message, kind, action }]);
-    if (!action) window.setTimeout(() => dismiss(id), 6000);
+    setItems((current) => [...(kind === 'error' ? current.filter((item) => item.kind !== 'error') : current), { id, message, kind, ...(kind === 'error' || !action ? {} : { action }) }]);
+    if (kind !== 'error' && !action) window.setTimeout(() => dismiss(id), 6000);
     return id;
   }, [dismiss]);
   const modalTarget = modalTargets.at(-1) ?? null;
@@ -41,26 +41,23 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return <ToastContext.Provider value={value}>{children}</ToastContext.Provider>;
 }
 
-export function ToastNoticeCenter({ autoOpenErrors = false, overlay = false }: { autoOpenErrors?: boolean; overlay?: boolean } = {}) {
-  const { items, dismiss, noticeDetails, noticesOpen, setNoticesOpen, modalTarget, openNotices } = useToast();
-  const openedErrorIDs = useRef(new Set<number>());
-  useEffect(() => {
-    const newError = items.some((item) => item.kind === 'error' && !openedErrorIDs.current.has(item.id));
-    for (const item of items) if (item.kind === 'error') openedErrorIDs.current.add(item.id);
-    if (autoOpenErrors && newError) openNotices();
-  }, [autoOpenErrors, items, openNotices, noticeDetails]);
-  const errors = items.filter((item) => item.kind === 'error').length;
-  const notices = items.length - errors;
-  const label = errors && notices ? '错误与状态' : errors ? '错误提示' : '状态提示';
-  const center = <div className={`notice-center${overlay || modalTarget ? ' notice-center-overlay' : ''}`} hidden={!items.length}>
-    <details ref={noticeDetails} open={noticesOpen} onToggle={(event) => setNoticesOpen(event.currentTarget.open)}><summary aria-label={`${label}，${items.length} 条`}><span aria-live="polite">{label}</span><span aria-live="polite">{items.length}</span></summary>
-      <div className="notice-center-panel">{items.map((item) => <div className={`toast-notice toast-${item.kind}`} key={item.id} role={item.kind === 'error' ? 'alert' : 'status'}>
+export function ToastNoticeCenter({ overlay = false }: { autoOpenErrors?: boolean; overlay?: boolean } = {}) {
+  const { items, dismiss, noticeDetails, noticesOpen, setNoticesOpen, modalTarget } = useToast();
+  const error = items.find((item) => item.kind === 'error');
+  const notices = items.filter((item) => item.kind !== 'error');
+  const label = '状态提示';
+  const center = <div className={`notice-center${overlay || modalTarget ? ' notice-center-overlay' : ''}`} hidden={!notices.length}>
+    <details ref={noticeDetails} open={noticesOpen} onToggle={(event) => setNoticesOpen(event.currentTarget.open)}><summary aria-label={`${label}，${notices.length} 条`}><span aria-live="polite">{label}</span><span aria-live="polite">{notices.length}</span></summary>
+      <div className="notice-center-panel">{notices.map((item) => <div className={`toast-notice toast-${item.kind}`} key={item.id} role="status">
         {item.message}{item.action && <button type="button" className="button button-small button-secondary" onClick={item.action.onClick}>{item.action.label}</button>}
         <button type="button" className="icon-button" aria-label="关闭通知" onClick={() => dismiss(item.id)}>×</button>
       </div>)}</div>
     </details>
   </div>;
-  return modalTarget ? createPortal(center, modalTarget) : center;
+  const errorOverlay = error && <div className="error-notice-overlay"><div className="toast-notice toast-error" role="alert">
+    {error.message}<button type="button" className="icon-button" aria-label="关闭错误提示" onClick={() => dismiss(error.id)}>×</button>
+  </div></div>;
+  return <>{errorOverlay}{modalTarget ? createPortal(center, modalTarget) : center}</>;
 }
 
 export function useModalNoticeTarget(ref: RefObject<HTMLElement | null>) {
@@ -74,4 +71,8 @@ export function useToast() {
   const value = useContext(ToastContext);
   if (!value) throw new Error('useToast 必须在 ToastProvider 内使用');
   return value;
+}
+
+export function useOptionalToast() {
+  return useContext(ToastContext);
 }

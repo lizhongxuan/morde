@@ -11,6 +11,8 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +26,8 @@ import (
 
 type cloudDSHBrokerTaskStore struct {
 	*runtimeToolTaskStore
-	events []task.Event
+	events    []task.Event
+	toolCalls []TaskToolCallProgress
 }
 
 func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) {
@@ -340,6 +343,11 @@ func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progre
 		current.Lease = task.Lease{}
 	}
 	s.events = append(s.events, event)
+	if progress.ToolCall != nil {
+		toolCall := *progress.ToolCall
+		toolCall.DetailCiphertext = append([]byte(nil), progress.ToolCall.DetailCiphertext...)
+		s.toolCalls = append(s.toolCalls, toolCall)
+	}
 	return event, nil
 }
 
@@ -737,8 +745,8 @@ func TestCloudDSHToolBrokerSensitiveApprovalResumesExactCallOnce(t *testing.T) {
 	if pending == nil || pending.Status != task.PendingRequestPending || pending.CallID != call.CallID || pending.ToolName != call.Name {
 		t.Fatalf("sensitive call was not bound to a pending approval: %#v", pending)
 	}
-	if strings.Contains(pending.Object+pending.Content+pending.Impact, "echo approved") {
-		t.Fatalf("approval text contains raw tool arguments: %#v", pending)
+	if !strings.Contains(pending.Content, `"command":"echo approved"`) || strings.Contains(pending.Content, `"workspace_id"`) {
+		t.Fatalf("approval text does not show the bounded exact-action preview: %#v", pending)
 	}
 	resumeCloudDSHApproval(fixture, store, task.PendingRequestApproved, task.PendingDecisionApprove)
 	result, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
@@ -749,6 +757,77 @@ func TestCloudDSHToolBrokerSensitiveApprovalResumesExactCallOnce(t *testing.T) {
 	if store.details.Task.Usage.ToolCalls != 1 || fixture.handlers["shell.exec"].calls.Load() != 1 {
 		t.Fatalf("approved resume was not once-only: usage=%+v dispatches=%d", store.details.Task.Usage,
 			fixture.handlers["shell.exec"].calls.Load())
+	}
+}
+
+func TestCloudDSHToolBrokerReconcilesApprovedActionAfterLostRuntimeReceipt(t *testing.T) {
+	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
+	var dropped, operationPosts int
+	fixture.wrap = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodPost && request.URL.Path == "/runtime/v1/operations" {
+				operationPosts++
+			}
+			if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/runtime/v1/operations/") && dropped == 0 {
+				dropped++
+				recorded := httptest.NewRecorder()
+				next.ServeHTTP(recorded, request)
+				http.Error(writer, "simulated lost runtime receipt", http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+	first, err := broker.Execute(context.Background(), store.details.Task, call)
+	if err != nil || first.Status != AgentToolNeedsUser || operationPosts != 0 {
+		t.Fatalf("initial approval = %#v, %v; posts=%d; want pause before dispatch", first, err, operationPosts)
+	}
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	unknown, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || unknown.Status != AgentToolUnknown || store.details.Task.Status != task.StatusWaitingUser ||
+		store.operation.Status != task.OperationUnknown || fixture.handlers["shell.exec"].calls.Load() != 1 || operationPosts != 1 {
+		t.Fatalf("lost receipt result = %#v, %v; task=%#v operation=%#v calls=%d posts=%d; want one executed action and unknown receipt",
+			unknown, err, store.details.Task, store.operation, fixture.handlers["shell.exec"].calls.Load(), operationPosts)
+	}
+
+	// ClaimTask advances unknown operation lease versions while retaining the original Runtime lease.
+	expires := time.Now().Add(time.Minute).UTC()
+	store.mu.Lock()
+	store.details.Task.Status = task.StatusRunning
+	store.details.Task.WaitingReason = ""
+	store.details.Task.Lease = task.Lease{Owner: "worker-3", Version: 3, ExpiresAt: &expires}
+	claimed := store.details.Task
+	operation := store.operations[agentOperationKey(call.CallID)]
+	operation.LeaseVersion = claimed.Lease.Version
+	store.operations[operation.Key] = operation
+	store.operation = operation
+	store.mu.Unlock()
+
+	recovered, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || recovered.Status != AgentToolSucceeded || store.operation.Status != task.OperationSucceeded ||
+		store.operation.RuntimeLeaseVersion != 2 || fixture.handlers["shell.exec"].calls.Load() != 1 || operationPosts != 1 {
+		t.Fatalf("reconciled approved action = %#v, %v; operation=%#v calls=%d posts=%d; want journal result without redispatch",
+			recovered, err, store.operation, fixture.handlers["shell.exec"].calls.Load(), operationPosts)
+	}
+}
+
+func TestCloudDSHToolBrokerChangedApprovedPayloadDoesNotDispatch(t *testing.T) {
+	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
+	first, err := broker.Execute(context.Background(), store.details.Task, call)
+	if err != nil || first.Status != AgentToolNeedsUser {
+		t.Fatalf("initial sensitive call = %#v, %v; want approval pause", first, err)
+	}
+	approvedHash := append([]byte(nil), store.details.PendingRequest.RequestHash...)
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	call.Arguments = `{"workspace_id":"w1234567","command":"rm -rf ~/workspace/project"}`
+	result, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || result.Status != AgentToolFailed || !strings.Contains(result.Output, "no longer matches this exact action") {
+		t.Fatalf("changed approved payload = %#v, %v; want an exact-action mismatch", result, err)
+	}
+	if store.details.Task.Usage.ToolCalls != 1 || fixture.handlers["shell.exec"].calls.Load() != 0 || len(fixture.store.operations) != 0 ||
+		!bytes.Equal(store.details.PendingRequest.RequestHash, approvedHash) {
+		t.Fatalf("changed approved payload crossed dispatch or changed the approval: usage=%+v dispatches=%d operations=%d pending=%#v",
+			store.details.Task.Usage, fixture.handlers["shell.exec"].calls.Load(), len(fixture.store.operations), store.details.PendingRequest)
 	}
 }
 

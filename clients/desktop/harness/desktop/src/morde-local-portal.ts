@@ -7,6 +7,8 @@ import { pipeline } from "node:stream/promises";
 
 const blockedPaths = ["/admin", "/admin/", "/app", "/app/"];
 const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
+// shortcut: proxy request bodies cap at 16 MiB, raise this when a supported API payload needs more.
+const maxProxyRequestBytes = 16 << 20;
 
 export type LocalPortalServer = {
   origin: string;
@@ -52,11 +54,33 @@ function cookieForPortal(value: string | undefined): string | undefined {
   return cookie;
 }
 
+async function readProxyRequestBody(request: IncomingMessage): Promise<Buffer | null> {
+  if (Number(request.headers["content-length"] ?? 0) > maxProxyRequestBytes) {
+    request.resume();
+    return null;
+  }
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let tooLarge = false;
+  for await (const chunk of request) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.byteLength;
+    if (size > maxProxyRequestBytes) {
+      tooLarge = true;
+      chunks.length = 0;
+      continue;
+    }
+    if (!tooLarge) chunks.push(bytes);
+  }
+  return tooLarge ? null : Buffer.concat(chunks, size);
+}
+
 function proxyRequest(request: IncomingMessage, response: ServerResponse, service: URL, origin: string, localURL: URL,
   proxyFetch: typeof fetch): void {
   const headers: Record<string, string | string[] | undefined> = {};
   for (const [name, value] of Object.entries(request.headers)) {
-    if (hopHeaders.has(name.toLowerCase()) || name.toLowerCase() === "cookie" || name.toLowerCase() === "origin" || name.toLowerCase() === "referer") continue;
+    if (hopHeaders.has(name.toLowerCase()) || name.toLowerCase() === "content-length" || name.toLowerCase() === "cookie" ||
+      name.toLowerCase() === "origin" || name.toLowerCase() === "referer") continue;
     headers[name] = value;
   }
   const cookie = cookieForPortal(request.headers.cookie);
@@ -76,11 +100,15 @@ function proxyRequest(request: IncomingMessage, response: ServerResponse, servic
     for (const part of Array.isArray(value) ? value : [value]) fetchHeaders.append(name, part);
   }
   const method = request.method ?? "GET";
-  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(request) as unknown as BodyInit;
-  void proxyFetch(upstreamURL.href, {
-    method, headers: fetchHeaders, redirect: "manual",
-    ...(body ? { body, duplex: "half" as const } : {}),
-  }).then(async (upstreamResponse) => {
+  void (async () => {
+    const body = method === "GET" || method === "HEAD" ? undefined : await readProxyRequestBody(request);
+    if (body === null) {
+      writeError(response, 413, "Request body exceeds the local proxy limit");
+      return;
+    }
+    const upstreamResponse = await proxyFetch(upstreamURL.href, {
+      method, headers: fetchHeaders, redirect: "manual", ...(body === undefined ? {} : { body: new Uint8Array(body) }),
+    });
     const responseHeaders: Record<string, string | string[] | undefined> = {};
     upstreamResponse.headers.forEach((value, name) => {
       if (!hopHeaders.has(name.toLowerCase()) && name.toLowerCase() !== "set-cookie") responseHeaders[name] = value;
@@ -92,7 +120,7 @@ function proxyRequest(request: IncomingMessage, response: ServerResponse, servic
     await pipeline(Readable.fromWeb(upstreamResponse.body as unknown as import("node:stream/web").ReadableStream<Uint8Array>), response).catch(() => {
       if (!response.destroyed) response.destroy();
     });
-  }).catch(() => {
+  })().catch(() => {
     if (!response.headersSent) writeError(response, 502, "Morde service is unavailable");
     else response.destroy();
   });

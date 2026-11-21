@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -180,11 +181,20 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		var priorInput, priorOutput *int64
 		var accountReserved int64
 		var accountDigest []byte
-		err = tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),model_id,reserved_tokens,input_tokens,output_tokens,request_digest FROM model_call_ledger
+		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration *int64
+		var reviewResultSHA256 []byte
+		err = tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),model_id,reserved_tokens,input_tokens,output_tokens,request_digest,
+review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation FROM model_call_ledger
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, command.OwnerID, string(command.Source), command.CallID).
-			Scan(&state, &taskID, &modelID, &accountReserved, &priorInput, &priorOutput, &accountDigest)
+			Scan(&state, &taskID, &modelID, &accountReserved, &priorInput, &priorOutput, &accountDigest,
+				&reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration)
 		if err != nil {
 			return storeError("lock model usage", "model call", err)
+		}
+		if command.Source == app.ModelCallReview && (taskID == "" || reviewTaskRevision == nil || reviewResultSequence == nil ||
+			reviewClaimGeneration == nil || *reviewTaskRevision < 0 || *reviewResultSequence <= 0 || *reviewClaimGeneration <= 0 ||
+			len(reviewResultSHA256) != 32) {
+			return domain.NewError(domain.CodeInvalidState, "Task validation review model attribution is unavailable")
 		}
 		var taskOwnerID, taskProjectID string
 		switch command.Source {
@@ -289,8 +299,8 @@ WHERE o.actor_id=$1 AND o.model_call_id=$2 AND h.service_instance_id=o.service_i
 				return domain.NewError(domain.CodeInvalidState, "personal Task actor does not match its owner")
 			}
 			if observedProject != "" {
-				if command.Source != app.ModelCallTask {
-					return domain.NewError(domain.CodeInvalidState, "project usage cannot be reconciled from a non-Task ledger")
+				if command.Source != app.ModelCallTask && command.Source != app.ModelCallReview {
+					return domain.NewError(domain.CodeInvalidState, "project usage cannot be reconciled from this ledger")
 				}
 				if err := lockProjectByIDInTx(ctx, tx, observedProject); err != nil {
 					return err
@@ -302,6 +312,18 @@ WHERE o.actor_id=$1 AND o.model_call_id=$2 AND h.service_instance_id=o.service_i
 			}
 			if taskOwnerID != observedOwner || taskProjectID != observedProject || location != "server" {
 				return domain.NewError(domain.CodeInvalidState, "task attribution changed during model usage reconciliation")
+			}
+			if command.Source == app.ModelCallReview {
+				var reviewOwnerID string
+				var reviewRevision, reviewSequence, reviewGeneration int64
+				var reviewDigest []byte
+				if err := tx.QueryRow(ctx, `SELECT owner_id,task_revision,result_event_sequence,result_sha256,claim_generation
+FROM task_validation_reviews WHERE task_id=$1 AND task_revision=$2 FOR SHARE`, taskID, *reviewTaskRevision).
+					Scan(&reviewOwnerID, &reviewRevision, &reviewSequence, &reviewDigest, &reviewGeneration); err != nil ||
+					reviewOwnerID != taskOwnerID || reviewRevision != *reviewTaskRevision || reviewSequence != *reviewResultSequence ||
+					!bytes.Equal(reviewDigest, reviewResultSHA256) || reviewGeneration < *reviewClaimGeneration {
+					return domain.NewError(domain.CodeInvalidState, "Task validation review ledger attribution does not match its Task")
+				}
 			}
 		}
 		var projectCall *modelUsageProjectCall
@@ -413,7 +435,7 @@ actual_micros=NULL,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$
 				return err
 			}
 		}
-		if taskID != "" {
+		if taskID != "" && command.Source == app.ModelCallTask {
 			if err := refreshTaskModelUsageInTx(ctx, tx, taskID, command.OwnerID); err != nil {
 				return err
 			}

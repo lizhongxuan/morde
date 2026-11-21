@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -60,6 +62,44 @@ func TestTaskToolInputSummaryShowsOnlyValidatedSearchQuery(t *testing.T) {
 	}
 }
 
+func TestTaskToolContentEvidenceCapturesBoundedPublicWebResult(t *testing.T) {
+	full := strings.Repeat("网页来源证据", 1200)
+	encoded, err := json.Marshal(cloudDSHMCPOutput{Text: []string{full}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := taskToolContentEvidence(cloudDSHWebReadToolName, AgentToolResult{Status: AgentToolSucceeded, Output: string(encoded)})
+	digest := sha256.Sum256([]byte(full))
+	if evidence == nil || evidence.SHA256 != hex.EncodeToString(digest[:]) || !evidence.Truncated ||
+		len(evidence.Preview) > maxTaskStepContentEvidencePreviewBytes || !utf8.ValidString(evidence.Preview) ||
+		!strings.HasPrefix(full, evidence.Preview) {
+		t.Fatalf("bounded web content evidence = %+v", evidence)
+	}
+	credential := "sk-proj-" + strings.Repeat("A", 40)
+	secret, err := json.Marshal(cloudDSHMCPOutput{Text: []string{"public result contains " + credential}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range []AgentToolResult{
+		{Status: AgentToolSucceeded, Output: string(secret)},
+		{Status: AgentToolFailed, Output: string(encoded)},
+	} {
+		if taskToolContentEvidence(cloudDSHWebReadToolName, result) != nil {
+			t.Fatal("failed or credential-bearing web output produced review content")
+		}
+	}
+	if taskToolContentEvidence("morde_mcp_private_connector", AgentToolResult{Status: AgentToolSucceeded, Output: string(encoded)}) != nil {
+		t.Fatal("private connector output was copied into review evidence")
+	}
+}
+
+func TestTaskToolContentEvidenceExcludesWorkspaceReads(t *testing.T) {
+	result := AgentToolResult{Status: AgentToolSucceeded, Output: `{"content":"private Workspace bytes"}`}
+	if taskToolContentEvidence(cloudDSHWorkspaceReadToolName, result) != nil {
+		t.Fatal("Workspace file content must not enter the independent review package")
+	}
+}
+
 func TestTaskToolCallProgressSealsValidatedSearchQuery(t *testing.T) {
 	sealer, err := NewSealer(bytes.Repeat([]byte{5}, 32))
 	if err != nil {
@@ -77,6 +117,12 @@ func TestTaskToolCallProgressSealsValidatedSearchQuery(t *testing.T) {
 			LeaseVersion: leaseVersion, AgentInstanceID: agentID, AgentGeneration: generation, AgentSessionID: sessionID,
 			AuthorizationVersion: authorizationVersion}}
 	activityContext := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	webOutput, err := json.Marshal(cloudDSHMCPOutput{Text: []string{"Example public source: https://example.com; relevant passage."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activityContext = withTaskToolContentEvidence(activityContext, call.Name,
+		AgentToolResult{Status: AgentToolSucceeded, Output: string(webOutput)})
 	activity, ok := cloudDSHToolActivityFromContext(activityContext)
 	if !ok {
 		t.Fatal("valid fenced search call did not produce task activity")
@@ -90,8 +136,57 @@ func TestTaskToolCallProgressSealsValidatedSearchQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var detail TaskStepDetailDocument
-	if err := json.Unmarshal(plain, &detail); err != nil || detail.Input != "Search query: AI news (time range: week)." {
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.Input != "Search query: AI news (time range: week)." ||
+		detail.ContentEvidence == nil || !strings.Contains(detail.ContentEvidence.Preview, "Example public source") {
 		t.Fatalf("sealed search detail = %+v, err=%v", detail, err)
+	}
+}
+
+func TestTaskToolCallProgressStoresOnlySafeShellExecutionEvidence(t *testing.T) {
+	sealer, err := NewSealer(bytes.Repeat([]byte{8}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ownerID, taskID, stepID = "u1234567", "q1234567", "s1234567"
+	const leaseOwner, agentID, sessionID = "lease-owner", "agent_1", "session_1"
+	const leaseVersion, generation, authorizationVersion, revision int64 = 4, 2, 3, 5
+	current := task.Task{ID: taskID, OwnerID: ownerID, InitiatorID: ownerID, AgentInstanceID: agentID,
+		AgentGeneration: generation, AgentSessionID: sessionID, CurrentRevision: int64Pointer(revision),
+		Authorization: task.Authorization{Version: authorizationVersion}, Lease: task.Lease{Owner: leaseOwner, Version: leaseVersion}}
+	call := ModelToolCall{CallID: "shell-call-1", Name: runtimeToolShellExec, Arguments: `{"command":"go test ./... --token=private-command-value"}`,
+		TaskFence: &ModelTaskFence{TaskID: taskID, OwnerID: ownerID, InitiatorID: ownerID, LeaseOwner: leaseOwner,
+			LeaseVersion: leaseVersion, AgentInstanceID: agentID, AgentGeneration: generation, AgentSessionID: sessionID,
+			AuthorizationVersion: authorizationVersion}}
+	result := AgentToolResult{Status: AgentToolFailed, Output: `{"exit_code":1,"timed_out":false,"stdout":"private-stdout-value","stderr":"private-stderr-value","stdout_truncated":false,"stderr_truncated":true}`}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, result)
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		t.Fatal("valid fenced shell call did not produce task activity")
+	}
+	progress, err := taskToolCallProgress(activity, task.Step{ID: stepID, Status: task.StepFailed, Summary: "Shell failed."})
+	if err != nil || progress == nil || progress.DetailState != "available" {
+		t.Fatalf("shell task activity = %+v, err=%v", progress, err)
+	}
+	plain, err := sealer.OpenWithAAD(progress.DetailCiphertext, taskStepDetailAAD(ownerID, taskID, stepID, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.ShellExecution == nil ||
+		*detail.ShellExecution != (TaskStepShellExecutionEvidence{ExitCode: 1, StdoutBytes: len("private-stdout-value"),
+			StderrBytes: len("private-stderr-value"), StderrTruncated: true}) {
+		t.Fatalf("sealed shell evidence = %+v, err=%v", detail.ShellExecution, err)
+	}
+	for _, private := range []string{"private-command-value", "private-stdout-value", "private-stderr-value"} {
+		if strings.Contains(string(plain), private) {
+			t.Fatalf("sealed shell evidence exposed private text %q", private)
+		}
+	}
+	if taskToolShellExecutionEvidence(runtimeToolShellExec, AgentToolResult{Status: AgentToolSucceeded, Output: result.Output}) != nil ||
+		taskToolShellExecutionEvidence(runtimeToolShellExec, AgentToolResult{Status: AgentToolFailed, Output: strings.TrimSuffix(result.Output, "}")}) != nil ||
+		taskToolShellExecutionEvidence("file_read", result) != nil {
+		t.Fatal("invalid, status-mismatched, or non-shell result produced shell evidence")
 	}
 }
 
@@ -256,5 +351,81 @@ func TestTaskServiceStepDetailHidesWorkspaceDataAfterProjectAccessRevocation(t *
 	if err != nil || len(masked.Steps) != 1 || masked.Steps[0].Title != "Workspace action" ||
 		masked.Steps[0].Summary != "The Workspace resource is not available with the current permissions." || masked.Steps[0].DetailState != "restricted" {
 		t.Fatalf("revoked project Task projection = %+v, err=%v", masked.Steps, err)
+	}
+}
+
+func TestTaskServiceKeepsShellEvidenceInternalButAvailableToReviewers(t *testing.T) {
+	const ownerID, taskID, stepID = "u1234567", "q1234567", "s1234567"
+	const revision = int64(3)
+	sealer, err := NewSealer(bytes.Repeat([]byte{10}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := &TaskStepShellExecutionEvidence{ExitCode: 0, StdoutBytes: 12}
+	document := TaskStepDetailDocument{Object: runtimeToolShellExec,
+		Input: "Tool request; raw parameters and output are omitted for safety.", Result: "Shell completed.", ShellExecution: evidence}
+	ciphertext, digest, size, err := sealTaskStepDetail(sealer, ownerID, taskID, stepID, revision, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionValue := revision
+	store := &taskStepDetailStoreStub{
+		details: TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID},
+			Steps: []task.Step{{ID: stepID, ToolName: runtimeToolShellExec, TaskRevision: &revisionValue, DetailState: "available"}}},
+		record: TaskStepDetailRecord{TaskID: taskID, OwnerID: ownerID, StepID: stepID, TaskRevision: revision,
+			Ciphertext: ciphertext, SHA256: digest, SizeBytes: size},
+	}
+	authorizer := &taskAuthorizerStub{}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
+	if err := service.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
+	if err != nil || detail.ShellExecution == nil || *detail.ShellExecution != *evidence {
+		t.Fatalf("shell evidence available to internal reviewer = %+v, err=%v", detail.ShellExecution, err)
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil || bytes.Contains(encoded, []byte("shell_execution")) || bytes.Contains(encoded, []byte("content_evidence")) {
+		t.Fatalf("public TaskStepDetail exposed review-only evidence: %s, err=%v", encoded, err)
+	}
+}
+
+func TestTaskServiceBindsWebContentEvidenceAndKeepsItInternal(t *testing.T) {
+	const ownerID, taskID, stepID = "u1234567", "q1234567", "s1234567"
+	const revision = int64(3)
+	sealer, err := NewSealer(bytes.Repeat([]byte{11}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentDigest := sha256.Sum256([]byte("source passage"))
+	contentEvidence := &TaskStepContentEvidence{SHA256: hex.EncodeToString(contentDigest[:]), Preview: "source passage"}
+	document := TaskStepDetailDocument{Object: cloudDSHWebReadToolName, Input: "Read authorized source.", Result: "Read completed.", ContentEvidence: contentEvidence}
+	ciphertext, digest, size, err := sealTaskStepDetail(sealer, ownerID, taskID, stepID, revision, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionValue := revision
+	store := &taskStepDetailStoreStub{
+		details: TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID},
+			Steps: []task.Step{{ID: stepID, ToolName: cloudDSHWebReadToolName, Status: task.StepSucceeded, TaskRevision: &revisionValue, DetailState: "available"}}},
+		record: TaskStepDetailRecord{TaskID: taskID, OwnerID: ownerID, StepID: stepID, TaskRevision: revision,
+			Ciphertext: ciphertext, SHA256: digest, ContentEvidenceSHA256: contentDigest[:], SizeBytes: size},
+	}
+	authorizer := &taskAuthorizerStub{}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
+	if err := service.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
+	if err != nil || detail.ContentEvidence == nil || *detail.ContentEvidence != *contentEvidence {
+		t.Fatalf("web content evidence available to internal reviewer = %+v, err=%v", detail.ContentEvidence, err)
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil || bytes.Contains(encoded, []byte("content_evidence")) || bytes.Contains(encoded, []byte("source passage")) {
+		t.Fatalf("public TaskStepDetail exposed review-only content: %s, err=%v", encoded, err)
+	}
+	store.record.ContentEvidenceSHA256 = make([]byte, sha256.Size)
+	if _, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("mismatched content evidence identity error = %v, want invalid state", err)
 	}
 }

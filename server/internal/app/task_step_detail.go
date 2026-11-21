@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -29,6 +30,16 @@ func validTaskStepDetailDocument(value TaskStepDetailDocument) bool {
 			return false
 		}
 	}
+	if evidence := value.ShellExecution; evidence != nil &&
+		(evidence.ExitCode < 0 || evidence.ExitCode > 255 || evidence.StdoutBytes < 0 || evidence.StderrBytes < 0 ||
+			evidence.StderrBytes > maxAgentToolOutputBytes || evidence.StdoutBytes > maxAgentToolOutputBytes-evidence.StderrBytes) {
+		return false
+	}
+	if evidence := value.ContentEvidence; evidence != nil &&
+		(!validSyncDigest(evidence.SHA256) || evidence.Preview == "" || len(evidence.Preview) > maxTaskStepContentEvidencePreviewBytes ||
+			!utf8.ValidString(evidence.Preview) || strings.ContainsRune(evidence.Preview, '\x00')) {
+		return false
+	}
 	return true
 }
 
@@ -51,12 +62,16 @@ func sealTaskStepDetail(sealer *Sealer, ownerID, taskID, stepID string, revision
 type cloudDSHToolActivityKey struct{}
 
 type cloudDSHToolActivity struct {
-	call          ModelToolCall
-	current       task.Task
-	digest        []byte
-	sealer        *Sealer
-	displayObject string
+	call            ModelToolCall
+	current         task.Task
+	digest          []byte
+	sealer          *Sealer
+	displayObject   string
+	shellExecution  *TaskStepShellExecutionEvidence
+	contentEvidence *TaskStepContentEvidence
 }
+
+const maxTaskStepContentEvidencePreviewBytes = 4096
 
 func withCloudDSHToolActivity(ctx context.Context, current task.Task, call ModelToolCall, sealer *Sealer) context.Context {
 	if call.TaskFence == nil || call.TaskFence.TaskID != current.ID || call.TaskFence.OwnerID != current.OwnerID ||
@@ -83,6 +98,95 @@ func cloudDSHToolActivityFromContext(ctx context.Context) (cloudDSHToolActivity,
 	return value, ok
 }
 
+func withTaskToolShellExecutionEvidence(ctx context.Context, name string, result AgentToolResult) context.Context {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	activity.shellExecution = taskToolShellExecutionEvidence(name, result)
+	return context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
+}
+
+func withTaskToolContentEvidence(ctx context.Context, name string, result AgentToolResult) context.Context {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	activity.contentEvidence = taskToolContentEvidence(name, result)
+	return context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
+}
+
+func taskToolContentEvidence(name string, result AgentToolResult) *TaskStepContentEvidence {
+	if (name != cloudDSHWebSearchToolName && name != cloudDSHWebReadToolName) || result.Status != AgentToolSucceeded ||
+		len(result.Output) == 0 || len(result.Output) > maxAgentToolOutputBytes || !utf8.ValidString(result.Output) {
+		return nil
+	}
+	var output cloudDSHMCPOutput
+	if json.Unmarshal([]byte(result.Output), &output) != nil || output.IsError || output.UnsupportedContent ||
+		len(output.Text) > 256 || len(output.Images) != 0 ||
+		(len(output.StructuredContent) > 0 && (len(output.StructuredContent) > 64<<10 || !validCloudDSHMCPJSON(output.StructuredContent))) {
+		return nil
+	}
+	var content strings.Builder
+	for _, text := range output.Text {
+		if len(text) > 64<<10 || !utf8.ValidString(text) || strings.ContainsRune(text, '\x00') {
+			return nil
+		}
+		if content.Len() > 0 {
+			content.WriteByte('\n')
+		}
+		content.WriteString(text)
+	}
+	if len(output.StructuredContent) > 0 {
+		if !validCloudDSHMCPJSON(output.StructuredContent) {
+			return nil
+		}
+		if content.Len() > 0 {
+			content.WriteByte('\n')
+		}
+		content.Write(output.StructuredContent)
+	}
+	full := content.String()
+	if full == "" || cloudDSHHistoryCredentialPattern.MatchString(full) {
+		return nil
+	}
+	preview := full
+	truncated := len(preview) > maxTaskStepContentEvidencePreviewBytes
+	if truncated {
+		preview = preview[:maxTaskStepContentEvidencePreviewBytes]
+		for !utf8.ValidString(preview) {
+			preview = preview[:len(preview)-1]
+		}
+	}
+	digest := sha256.Sum256([]byte(full))
+	return &TaskStepContentEvidence{SHA256: hex.EncodeToString(digest[:]), Preview: preview, Truncated: truncated}
+}
+
+func taskToolShellExecutionEvidence(name string, result AgentToolResult) *TaskStepShellExecutionEvidence {
+	if name != runtimeToolShellExec || (result.Status != AgentToolSucceeded && result.Status != AgentToolFailed) {
+		return nil
+	}
+	var shell struct {
+		ExitCode        int    `json:"exit_code"`
+		TimedOut        bool   `json:"timed_out"`
+		Stdout          string `json:"stdout"`
+		Stderr          string `json:"stderr"`
+		StdoutTruncated bool   `json:"stdout_truncated"`
+		StderrTruncated bool   `json:"stderr_truncated"`
+	}
+	if decodeStrictRuntimeResult([]byte(result.Output), &shell) != nil || shell.ExitCode < 0 || shell.ExitCode > 255 ||
+		(result.Status == AgentToolSucceeded) == (shell.ExitCode != 0 || shell.TimedOut) {
+		return nil
+	}
+	stdoutBytes, stderrBytes := len(shell.Stdout), len(shell.Stderr)
+	if stdoutBytes > maxAgentToolOutputBytes-stderrBytes || stderrBytes > maxAgentToolOutputBytes {
+		return nil
+	}
+	return &TaskStepShellExecutionEvidence{ExitCode: shell.ExitCode, TimedOut: shell.TimedOut,
+		StdoutBytes: stdoutBytes, StderrBytes: stderrBytes, StdoutTruncated: shell.StdoutTruncated,
+		StderrTruncated: shell.StderrTruncated}
+}
+
 func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskToolCallProgress, error) {
 	fence := activity.call.TaskFence
 	if fence == nil || len(activity.digest) != sha256.Size || activity.current.CurrentRevision == nil || step.ID == "" {
@@ -92,8 +196,8 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 	if activity.displayObject != "" {
 		object = activity.displayObject
 	}
-	detail := TaskStepDetailDocument{Object: object,
-		Input: taskToolInputSummary(activity.call.Name, activity.call.Arguments), Result: taskToolResultSummary(step)}
+	detail := TaskStepDetailDocument{Object: object, Input: taskToolInputSummary(activity.call.Name, activity.call.Arguments),
+		Result: taskToolResultSummary(step), ShellExecution: activity.shellExecution, ContentEvidence: activity.contentEvidence}
 	truncated := false
 	detail.Object, truncated = truncateTaskDetail(detail.Object, truncated)
 	detail.Input, truncated = truncateTaskDetail(detail.Input, truncated)
@@ -107,6 +211,13 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		TaskRevision: *activity.current.CurrentRevision, CallKey: activity.call.CallID, ToolName: activity.call.Name,
 		RequestDigest: append([]byte(nil), activity.digest...), Phase: phase, DetailState: "not_recorded",
 		Truncated: truncated}
+	if activity.contentEvidence != nil {
+		contentDigest, err := hex.DecodeString(activity.contentEvidence.SHA256)
+		if err != nil || len(contentDigest) != sha256.Size {
+			return nil, fmt.Errorf("task tool content evidence digest is invalid")
+		}
+		progress.ContentEvidenceSHA256 = contentDigest
+	}
 	if step.Status == task.StepFailed && phase == "prepare" {
 		progress.FailureReason, progress.Retryable = "not_dispatched", true
 	}

@@ -81,6 +81,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static let taskDetailLateDeliveryFixtureLaunchArgument = "-morde.localTaskDetailLateDeliveryFixture"
     static let taskPagesApprovalRefreshPendingFixtureLaunchArgument = "-morde.localTaskPagesApprovalRefreshPendingFixture"
     static let taskPagesTimelineRecoveryFixtureLaunchArgument = "-morde.localTaskPagesTimelineRecoveryFixture"
+    static let taskPagesTimelineNoContentRecoveryFixtureLaunchArgument = "-morde.localTaskPagesTimelineNoContentRecoveryFixture"
     static let taskPagesTimelinePermissionFixtureLaunchArgument = "-morde.localTaskPagesTimelinePermissionFixture"
     static let taskPagesTimelineUnconfirmedFixtureLaunchArgument = "-morde.localTaskPagesTimelineUnconfirmedFixture"
     static let taskFileFetchFixtureLaunchArgument = "-morde.localTaskFileFetchFixture"
@@ -1383,7 +1384,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
                                   "reply_message_id": NSNull()]
         first["result_message_pending"] = true
         first["result_message_published"] = false
-        first["steps"] = []
+        first["steps"] = [[
+            "id": "s0000201", "sequence": 1, "kind": "agent", "status": "running",
+            "title": "Synthetic hidden task step", "summary": "Visible only in task details.",
+            "created_at": "2026-11-04T00:00:01Z",
+        ]]
         first["artifacts"] = []
 
         let taskBStopped = taskK2StoppedTaskIDSnapshot == "q0000202"
@@ -1397,6 +1402,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
         second["child_jobs"] = [["job_id": "child-result-b", "task_step_id": "s0000202",
                                  "title": "Check local references", "task_revision": 1, "status": "succeeded"]]
         second["result_review"] = NSNull()
+        second["validation"] = ["state": "PASS"]
         second["steps"] = []
         second["artifacts"] = []
         return [first, second]
@@ -1463,6 +1469,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
             }
             task["result"] = isFailed ? NSNull() :
                 (isCompleted ? "Local completed result" : "Local cancelled result")
+            // Synthetic UI-only validation states; production availability is not implied.
+            task["validation"] = ["state": isCompleted ? "PASS" : (isFailed ? "FAIL" : "pending")]
             task["current_step"] = isFailed ? (stepRetryAccepted ? "Retrying failed operation" : "Review failed output") : NSNull()
             task["waiting_reason"] = NSNull()
             task["stop_request"] = NSNull()
@@ -1570,6 +1578,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
         }
         if id == "q0000101" {
             let decision = taskPagesApprovalDecisionSnapshot
+            let isNoContentRecoveryFixture = ProcessInfo.processInfo.arguments.contains(
+                Self.taskPagesTimelineNoContentRecoveryFixtureLaunchArgument)
+            let hasRecoveredAfterNoContent = isNoContentRecoveryFixture && Self.taskFixtureEventCountSnapshot >= 3
             let isOtherWaitReasonFixture = ProcessInfo.processInfo.arguments.contains(
                 Self.taskPagesOtherWaitReasonFixtureLaunchArgument)
             let isEventChainTimelineFixture = ProcessInfo.processInfo.arguments.contains(Self.taskPagesEventChainTimelineFixtureLaunchArgument) ||
@@ -1580,15 +1591,18 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 ProcessInfo.processInfo.arguments.contains(Self.eventChainNetworkFailureFixtureLaunchArgument)
             let isTimelineFixture = ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineRecoveryFixtureLaunchArgument) ||
                 ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelinePermissionFixtureLaunchArgument) ||
+                isNoContentRecoveryFixture ||
                 ProcessInfo.processInfo.arguments.contains(Self.eventChainNetworkFailureFixtureLaunchArgument)
             if isTimelineFixture || isEventChainTimelineFixture || isEventChainVisualFixture {
-                var task = taskPagesSummary(id: id, status: isEventChainWaitingFixture ? "waiting_user" : "running",
+                var task = taskPagesSummary(id: id, status: isEventChainWaitingFixture ? "waiting_user"
+                    : (hasRecoveredAfterNoContent ? "completed" : "running"),
                                             objective: ProcessInfo.processInfo.arguments.contains(
                                                 Self.taskPagesEventChainEmptyTimelineFixtureLaunchArgument)
                                                 ? "本地事件链验收" : "Local task timeline fixture")
                 task["conversation_id"] = "c7654321"
-                task["event_sequence"] = ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineRecoveryFixtureLaunchArgument) ||
-                    isEventChainTimelineFixture ? 8 : 1
+                task["event_sequence"] = isNoContentRecoveryFixture ? (hasRecoveredAfterNoContent ? 9 : 8)
+                    : (ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineRecoveryFixtureLaunchArgument) ||
+                       isEventChainTimelineFixture ? 8 : 1)
                 task["result"] = NSNull()
                 task["current_step"] = "Waiting for local task events"
                 task["waiting_reason"] = isEventChainWaitingFixture ? "approval_required" : NSNull()
@@ -2865,6 +2879,28 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   ProcessInfo.processInfo.arguments.contains(Self.eventChainNetworkFailureFixtureLaunchArgument) {
             statusCode = 503
             body = Data(#"{"error":{"code":"unavailable","message":"Synthetic task event outage"}}"#.utf8)
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000101/events", request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument),
+                  ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineNoContentRecoveryFixtureLaunchArgument) {
+            let requestCount = Self.markTaskFixtureEvent()
+            let after = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems?
+                .first(where: { $0.name == "after" })?.value
+            if requestCount == 1 {
+                statusCode = 200
+                let event = #"{"task_id":"q0000101","sequence":8,"type":"task.step","created_at":"2026-11-04T00:00:08Z","payload":{"kind":"agent","status":"succeeded","title":"Event before empty response","summary":"The client has advanced its cursor to sequence 8."}}"#
+                body = Data("id: 8\nevent: task.step\ndata: \(event)\n\n".utf8)
+            } else if requestCount == 2 && after == "8" {
+                // Defensive fixture: 204 is terminal by contract, but the following snapshot stays active.
+                statusCode = 204
+                body = Data()
+            } else if requestCount >= 3 && after == "8" {
+                statusCode = 200
+                let event = #"{"task_id":"q0000101","sequence":9,"type":"task.step","created_at":"2026-11-04T00:00:09Z","payload":{"kind":"agent","status":"succeeded","title":"Recovered after 204","summary":"The event arrived after an empty response."}}"#
+                body = Data("id: 9\nevent: task.step\ndata: \(event)\n\n".utf8)
+            } else {
+                statusCode = 204
+                body = Data()
+            }
         } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000001/events", request.httpMethod == "GET",
                   ProcessInfo.processInfo.arguments.contains(Self.eventChainAccountIsolationFixtureLaunchArgument) {
             let after = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems?
@@ -3916,6 +3952,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 items = [task]
             } else if status == nil, cursor == nil,
                       ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineRecoveryFixtureLaunchArgument) ||
+                        ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelineNoContentRecoveryFixtureLaunchArgument) ||
                         ProcessInfo.processInfo.arguments.contains(Self.taskPagesTimelinePermissionFixtureLaunchArgument) {
                 var task = Self.taskPagesSummary(id: "q0000101", status: "running", objective: "Local task timeline fixture")
                 task["conversation_id"] = "c7654321"
@@ -4785,6 +4822,10 @@ struct MordeTask: Decodable, Identifiable {
         let state: String; let source_task_id: String; let source_task_revision: Int64
         let source_event_sequence: Int64; let reply_message_id: String?
     }
+    struct Validation: Decodable {
+        // Preserve unknown server values so the UI can display an explicit unknown state.
+        let state: String?
+    }
     struct Plan: Decodable, Equatable {
         struct Step: Decodable, Equatable, Identifiable {
             let id: String; let title: String; let description: String; let depends_on: [String]
@@ -4817,6 +4858,7 @@ struct MordeTask: Decodable, Identifiable {
     let pending_request: Pending?
     let clarification_request: Clarification?; let batch_items: [MordeBatchItem]?
     let dependencies: [Dependency]?; let child_jobs: [ChildJob]?; let result_review: ResultReview?
+    let validation: Validation?
     let plan: Plan?
     let steps: [Step]?; let agents: [MordeTaskAgentExecution]?; let artifacts: [Artifact]?; let updated_at: String
     let assistant_message: MordeClientMessage?
@@ -6349,6 +6391,7 @@ private struct MordeIndependentSendTarget {
     @Published private(set) var variantOperationErrors: [String: String] = [:]
     @Published private(set) var selectedVariantVersions: [String: Int64] = [:]
     private var outboxInFlight: Set<String> = []
+    private var outboxExplicitRetryIDs: Set<String> = []
     private var outboxRetryScheduled: Set<String> = []
     private var outboxRetryAttempts: [String: Int] = [:]
     private var pendingConversationCreations: [String: Task<MordeConversation, Error>] = [:]
@@ -7476,15 +7519,19 @@ private struct MordeIndependentSendTarget {
 
     func retryPendingMessage(_ id: String) {
         guard let scope = currentDataScope else { return }
+        if outboxInFlight.contains(id) {
+            outboxExplicitRetryIDs.insert(id)
+            return
+        }
         do {
             outboxRetryAttempts[id] = 0
             try messageOutbox.update(id: id, scope: scope) {
                 if $0.serverMessageID != nil { $0.state = .accepted }
-                else if $0.state == .failed { $0.state = .unknown }
+                else if $0.state == .failed || $0.state == .unknown { $0.state = .sending }
                 $0.error = nil
             }
             refreshPendingMessages(scope: scope)
-            schedulePendingMessages()
+            startPendingMessage(id: id, scope: scope, allowSubmissionAfterReconciliation: true)
         } catch { self.error = "无法重试本机消息：\(error.localizedDescription)" }
     }
 
@@ -7752,10 +7799,22 @@ private struct MordeIndependentSendTarget {
             }
             if changed { refreshPendingMessages(scope: scope) }
         }
+        for id in MordeOutboxScheduling.reconciliationIDs(pendingMessages, scope: scope, inFlight: outboxInFlight) {
+            startPendingMessage(id: id, scope: scope, allowSubmissionAfterReconciliation: false)
+        }
         for id in MordeOutboxScheduling.readyIDs(pendingMessages, scope: scope, inFlight: outboxInFlight,
                                                   allowsNewSubmissions: allowsNewSubmissions) {
-            outboxInFlight.insert(id)
-            Task { @MainActor in await processPendingMessage(id: id, scope: scope) }
+            startPendingMessage(id: id, scope: scope, allowSubmissionAfterReconciliation: true)
+        }
+    }
+
+    private func startPendingMessage(id: String, scope: MordeClientDataScope,
+                                     allowSubmissionAfterReconciliation: Bool) {
+        guard !outboxInFlight.contains(id) else { return }
+        outboxInFlight.insert(id)
+        Task { @MainActor in
+            await processPendingMessage(id: id, scope: scope,
+                                        allowSubmissionAfterReconciliation: allowSubmissionAfterReconciliation)
         }
     }
 
@@ -8244,7 +8303,8 @@ private struct MordeIndependentSendTarget {
         return conversation.id
     }
 
-    private func processPendingMessage(id: String, scope: MordeClientDataScope) async {
+    private func processPendingMessage(id: String, scope: MordeClientDataScope,
+                                       allowSubmissionAfterReconciliation: Bool) async {
         var scheduleAfterFailure = false
         defer {
             outboxInFlight.remove(id)
@@ -8312,6 +8372,15 @@ private struct MordeIndependentSendTarget {
             }
             if queued.serverMessageID == nil && received == nil {
                 guard signedIn, currentDataScope?.hasSameAccount(as: scope) == true else { return }
+                let explicitlyRetried = outboxExplicitRetryIDs.remove(id) != nil
+                guard allowSubmissionAfterReconciliation || explicitlyRetried else {
+                    queued = try messageOutbox.update(id: id, scope: scope) {
+                        $0.state = .unknown
+                        $0.error = "发送结果待确认。确认服务端未收到后，可手动重试。"
+                    }
+                    refreshPendingMessages(scope: scope)
+                    return
+                }
                 // nanoMuse: Unknown or still-loading configuration is not evidence that no model exists.
                 if definitelyNoModelConfigured {
                     queued = try messageOutbox.update(id: id, scope: scope) {
@@ -8334,6 +8403,7 @@ private struct MordeIndependentSendTarget {
                 received = try await submitPendingMessage(queued, base: base, scope: scope)
             }
             if let received {
+                outboxExplicitRetryIDs.remove(id)
                 guard MordeConversationMessageReceiptPolicy.matches(received, clientMessageID: id,
                       conversationID: queued.conversationID, content: queued.content),
                       (received.attachment_ids ?? []).allSatisfy({ attachmentID in
@@ -13313,21 +13383,29 @@ private struct MordeIndependentSendTarget {
                     return
                 }
                 if http.statusCode == 204 {
+                    let snapshot: MordeTask
                     if updatesCurrentConversation {
-                        let snapshot: MordeTask = try await call("/api/tasks/\(taskID)")
+                        snapshot = try await call("/api/tasks/\(taskID)")
                         guard snapshot.id == taskID, snapshot.conversation_id == selectedConversationID,
                               snapshot.event_sequence.map({ $0 >= max(initialSequence, cursor.afterSequence) }) == true,
                               selectedTaskIsCurrent() else { throw URLError(.cannotParseResponse) }
                         try await refreshConversationSnapshot(snapshot, scope: taskScope)
                     } else {
-                        _ = try await task(id: taskID,
-                                           minimumEventSequence: cursor.afterSequence > 0 ? cursor.afterSequence : nil)
+                        snapshot = try await task(id: taskID,
+                                                  minimumEventSequence: cursor.afterSequence > 0 ? cursor.afterSequence : nil)
                     }
-                    if cursor.queryValue == nil && (taskTimelineEvents[taskID] ?? []).isEmpty {
+                    guard !Task.isCancelled, taskScope == currentDataScope else { return }
+                    let isTerminal = ["completed", "failed", "cancelled"].contains(snapshot.status)
+                    if isTerminal, cursor.queryValue == nil, (taskTimelineEvents[taskID] ?? []).isEmpty {
                         taskTimelineNoHistory.insert(taskID)
                     }
                     taskTimelineLoading.remove(taskID)
-                    return
+                    taskTimelineErrors.removeValue(forKey: taskID)
+                    if isTerminal { return }
+                    // The contract reserves 204 for terminal tasks. If the refreshed snapshot is still
+                    // active, retain the cursor and reconnect in case the stream closed prematurely.
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    continue
                 }
                 guard http.statusCode == 200 else { throw URLError(.badServerResponse) }
                 taskTimelineErrors.removeValue(forKey: taskID)
@@ -18233,14 +18311,18 @@ private struct MordeRoot: View {
                 Text(task.statusLabel).font(.footnote).foregroundStyle(NanoMuseTones.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            let validationState = MIFTaskValidationPresentation.state(for: task.validation)
+            Text(MIFTaskValidationPresentation.label(for: task.validation))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(MIFTaskValidationPresentation.foregroundColor(for: validationState))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(MIFTaskValidationPresentation.backgroundColor(for: validationState), in: Capsule())
+                .accessibilityIdentifier("morde.chat.task.validation.\(task.id)")
             Text((task.isWaitingForRevisionStart ? task.objective : task.displayedCurrentStep) ??
                  (conversationResultAlreadyDisplayed(task) ? nil : task.result) ?? task.objective)
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
-            ForEach(MIFTaskPresentation.visibleSteps(task.steps, waitingForRevisionStart: task.isWaitingForRevisionStart)) { step in
-                Text(MIFTaskPresentation.stepDescription(step)).font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
-            }
-            conversationTaskRelations(task)
             NavigationLink {
                 MIFTaskDetailView(taskID: task.id)
             } label: {
@@ -18255,6 +18337,7 @@ private struct MordeRoot: View {
         .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(NanoMuseTones.hairline))
         .shadow(color: NanoMuseTones.brand.opacity(0.18), radius: 15, y: 7)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("morde.chat.taskSummary")
     }
 
@@ -19361,6 +19444,7 @@ private struct MIFMordeMessageBubble: View {
                                 if pending.state == .failed || pending.state == .unknown || pending.error != nil {
                                     Button(AppLocalized("Retry"), action: onRetry)
                                         .font(.caption.weight(.medium))
+                                        .accessibilityIdentifier("morde.chat.message.retry.\(pending.id)")
                                 }
                             }
                             if let error = pending.error { Text(verbatim: error).font(.caption).foregroundStyle(NanoMuseTones.secondaryText) }

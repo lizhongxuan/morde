@@ -159,6 +159,35 @@ func (s *ModelConnectionService) List(ctx context.Context, principal identity.Pr
 	return views, nil
 }
 
+// SelectIndependentTaskValidationReviewModel chooses a configured text model
+// whose catalog-verified family differs from the Task's execution family.
+func (s *ModelConnectionService) SelectIndependentTaskValidationReviewModel(ctx context.Context, ownerID string,
+	execution TaskValidationReviewModel) (string, error) {
+	if ctx == nil || !domain.ValidUserID(ownerID) || !validTaskValidationReviewModel(execution) {
+		return "", domain.InvalidArgument("task_validation_review_model", "Task validation review model selection is invalid")
+	}
+	records, err := s.store.ListModelConnections(ctx, ownerID)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if (records[i].OwnerID == "") != (records[j].OwnerID == "") {
+			return records[i].OwnerID == ""
+		}
+		return records[i].ID < records[j].ID
+	})
+	for _, record := range records {
+		if !canUseModelConnection(identity.Principal{UserID: ownerID}, record) || record.CheckedAt == nil || !record.Capabilities.Text {
+			continue
+		}
+		identity, ok := ResolveTaskValidationModelIdentity(record.BaseURL, record.ModelName, record.ModelName)
+		if ok && identity.CatalogVersion == execution.Identity.CatalogVersion && identity.Family != execution.Identity.Family {
+			return record.ID, nil
+		}
+	}
+	return "", domain.NewError(domain.CodeUnsupported, "no catalog-verified independent reviewer model is available")
+}
+
 func validateModelListPrincipal(principal identity.Principal) error {
 	return validateModelAccountPrincipal(principal)
 }

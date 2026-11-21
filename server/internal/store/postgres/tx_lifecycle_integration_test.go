@@ -210,7 +210,8 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		if _, err := store.ReserveWorkspaceSyncCommit(ctx, commitWorkspace.ID, commitSession.ID, commitKey); err != nil {
 			t.Fatalf("reserve pending Host commit: %v", err)
 		}
-		portalSession := newTestSyncSession(t, commitWorkspace, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+		portalWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "deactivated-portal-session")
+		portalSession := newTestSyncSession(t, portalWorkspace, owner.ID, []workspace.File{}, []workspace.File{}, nil)
 		portalKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "deactivated-portal-commit:"+portalSession.ID, portalSession.ID)
 		if _, _, err := createTestWorkspaceSyncSession(ctx, store, portalSession, nil,
 			syncTestIdempotency(owner.ID, "workspace.sync.create", "deactivated-portal-create:"+portalSession.ID, portalSession.ID)); err != nil {
@@ -249,7 +250,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		if _, _, err := store.CommitWorkspaceSyncSession(ctx, commitWorkspace.ID, commitSession.ID, commitKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
 			t.Fatalf("Host sync commit after owner deactivation = %v, want unauthenticated", err)
 		}
-		if _, _, err := store.CommitWorkspaceSyncSession(ctx, commitWorkspace.ID, portalSession.ID, portalKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		if _, _, err := store.CommitWorkspaceSyncSession(ctx, portalWorkspace.ID, portalSession.ID, portalKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
 			t.Fatalf("Portal sync commit after owner deactivation = %v, want unauthenticated", err)
 		}
 		committedSession, err := store.GetWorkspaceSyncSession(ctx, commitWorkspace.ID, commitSession.ID)
@@ -266,7 +267,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		if err := store.AckWorkspaceSyncDownloadAction(ctx, commitWorkspace.ID, commitSession.ID, "receipt.txt", workspace.ChangeDelete, "", 0); domain.CodeOf(err) != domain.CodeUnauthenticated {
 			t.Fatalf("Host download action acknowledgement after owner deactivation = %v, want unauthenticated", err)
 		}
-		if err := store.AckWorkspaceSyncBlock(ctx, commitWorkspace.ID, portalSession.ID, digest, 0, 40_000); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		if err := store.AckWorkspaceSyncBlock(ctx, portalWorkspace.ID, portalSession.ID, digest, 0, 40_000); domain.CodeOf(err) != domain.CodeUnauthenticated {
 			t.Fatalf("Portal upload acknowledgement after owner deactivation = %v, want unauthenticated", err)
 		}
 		if _, err := store.ReserveWorkspaceSyncCommit(ctx, commitWorkspace.ID, commitSession.ID, commitKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
@@ -755,6 +756,8 @@ func TestBeginHostReleaseRequiresAppliedWorkspaceRevisionAndSettledDirectoryUplo
 			prepare: func(t *testing.T, store *Store, ctx context.Context, ownerID string, value workspace.Workspace, hostValue host.Host, binding workspace.Binding) {
 				file := syncTestFile("pending.txt", []byte("new Workspace revision"))
 				session := newTestSyncSession(t, value, ownerID, []workspace.File{file}, []workspace.File{file}, nil)
+				session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, value.ID, binding.BindingVersion)
+				session.Direction = workspace.SyncBidirectional
 				if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
 					syncTestIdempotency(ownerID, "workspace.sync.create", "release-checkpoint:create", session.ID)); err != nil {
 					t.Fatal(err)

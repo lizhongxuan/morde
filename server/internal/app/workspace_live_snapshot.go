@@ -179,7 +179,7 @@ func (snapshot workspaceLiveSnapshot) readBlock(directory WorkspaceCurrentDirect
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if source.offset < 0 || source.size < 1 || info.Size() < source.offset+source.size {
 		return nil, domain.NewError(domain.CodeWorkspaceConflict, "live Workspace file changed while storing its snapshot")
 	}

@@ -19,7 +19,7 @@ func taskModelResponseFixture(t *testing.T) (*Sealer, ModelCallReservation) {
 	}
 	digest := sha256.Sum256([]byte("request"))
 	reservation := ModelCallReservation{Source: ModelCallTask, Task: fence, OwnerID: fence.InitiatorID, ModelID: "p1234567",
-		ProviderModel: "test-model", ConnectionVersion: time.Unix(1, 0), CallID: callID, RequestDigest: digest[:]}
+		ProviderEndpoint: "https://api.example.test/v1", ProviderModel: "test-model", ConnectionVersion: time.Unix(1, 0), CallID: callID, RequestDigest: digest[:]}
 	sealer, err := NewSealer(bytes.Repeat([]byte{0x5a}, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -30,15 +30,20 @@ func taskModelResponseFixture(t *testing.T) (*Sealer, ModelCallReservation) {
 func TestTaskModelResponseSealOpenAndRejectsChangedFence(t *testing.T) {
 	sealer, reservation := taskModelResponseFixture(t)
 	want := ModelResponse{Reasoning: "private reasoning", ToolCalls: []ModelToolCall{{CallID: "tool-1", Name: "lookup", Arguments: `{"query":"x"}`}},
-		Usage: ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}, StopReason: "tool_calls"}
+		Usage: ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}, StopReason: "tool_calls", ProviderReportedModel: "provider-snapshot-3"}
 	record, err := SealTaskModelResponse(sealer, reservation, want)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := OpenTaskModelResponse(sealer, record, reservation)
 	if err != nil || got.Reasoning != want.Reasoning || got.Text != want.Text || got.StopReason != want.StopReason ||
-		got.Usage != want.Usage || len(got.ToolCalls) != 1 || got.ToolCalls[0] != want.ToolCalls[0] {
+		got.Usage != want.Usage || got.ProviderReportedModel != want.ProviderReportedModel || len(got.ToolCalls) != 1 || got.ToolCalls[0] != want.ToolCalls[0] {
 		t.Fatalf("response round trip = %#v, err=%v", got, err)
+	}
+	invalidReportedModel := want
+	invalidReportedModel.ProviderReportedModel = "provider-model\nspoof"
+	if ValidDSHModelResponse(invalidReportedModel) {
+		t.Fatal("invalid provider-reported model identity crossed the Task response boundary")
 	}
 
 	changed := reservation

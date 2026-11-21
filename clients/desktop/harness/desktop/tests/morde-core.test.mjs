@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, mordeUserDataDirectory, portalOrigin } from '../out/morde-core.js';
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, mordeUserDataDirectory, portalOrigin, withTimeout } from '../out/morde-core.js';
 
 const future = '2099-01-01T00:00:00Z';
 const serviceInstanceID = '12345678-1234-4234-8234-123456789abc';
@@ -42,6 +42,13 @@ test('expiry, origins, IDs and Host ticket URLs reject malformed values', () => 
   assert.throws(() => gatewayURL('http://h1234567.hosts.localhost/__ch/auth?t=one-time', 'https://portal.example'));
   assert.throws(() => gatewayURL('http://evil.hosts.localhost/__ch/auth?t=one-time', 'http://localhost'));
   for (const value of ['https://evil.example/__ch/auth?ticket=wrong', 'http://h1234567.example/__ch/auth?t=one-time', 'https://h1234567.example/__ch/auth?t=one&t=two', 'https://h1234567.example/__ch/auth?t=one&next=%2F%5Cevil.example']) assert.throws(() => gatewayURL(value));
+});
+
+test('withTimeout stops a hanging operation when its deadline expires', async () => {
+  let stopped = false;
+  await assert.rejects(withTimeout(new Promise(() => {}), 1, () => { stopped = true; }), /timed out/i);
+  assert.equal(stopped, true);
+  await assert.rejects(withTimeout(new Promise(() => {}), 1, () => { throw new Error('stop unavailable'); }), /timed out/i);
 });
 
 test('account login sends one password request and receives separate Client, Sync and Web credentials', async () => {
@@ -293,6 +300,33 @@ test('API failures include the request route without exposing credentials', asyn
       assert.equal(error.message, 'Morde returned HTTP 404 (GET /api/hosts/h1234567/sync-folders)');
       assert.equal(error.message.includes(credentials.clientCredential), false);
       assert.equal(error.message.includes('portal-cookie-secret'), false);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('API failures include only UUID request IDs for log correlation', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestID = '12345678-1234-4234-8234-123456789abc';
+  globalThis.fetch = async () => new Response('forbidden', { status: 403, headers: { 'x-request-id': requestID } });
+  try {
+    const api = new MordeAPI(() => credentials);
+    await assert.rejects(() => api.workspaces(), (error) => {
+      assert.equal(error.message, `Morde returned HTTP 403 (GET /api/workspaces); request ID ${requestID}`);
+      assert.equal(error.message.includes(credentials.clientCredential), false);
+      return true;
+    });
+    await assert.rejects(() => api.issueHostEmbedTicket('h1234567', 'c1234567', 'browser', ['browser'],
+      { credential: 'portal-cookie-secret', expiresAt: future, hostFrameSource: 'https://*.hosts.example.test' }), (error) => {
+      assert.equal(error.message, `Morde returned HTTP 403 (POST /api/hosts/h1234567/embed-tickets); request ID ${requestID}`);
+      assert.equal(error.message.includes('portal-cookie-secret'), false);
+      return true;
+    });
+
+    globalThis.fetch = async () => new Response('forbidden', { status: 403, headers: { 'x-request-id': 'gateway-auth-rejected' } });
+    await assert.rejects(() => api.workspaces(), (error) => {
+      assert.equal(error.message, 'Morde returned HTTP 403 (GET /api/workspaces)');
+      assert.equal(error.message.includes('gateway-auth-rejected'), false);
       return true;
     });
   } finally { globalThis.fetch = originalFetch; }

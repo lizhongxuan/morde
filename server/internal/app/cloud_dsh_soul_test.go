@@ -19,7 +19,8 @@ func TestMordeSoulInstructionsAddsCanonicalSoulWhenDSHDoesNot(t *testing.T) {
 	got := mordeSoulInstructions("runtime preface")
 	base := strings.TrimSpace(mordeSoulFile)
 	if strings.Count(got, base) != 1 || !strings.Contains(got, "Additional trusted runtime instructions:\nruntime preface") ||
-		!strings.Contains(got, agentInstructions) {
+		!strings.Contains(got, agentInstructions) ||
+		!strings.Contains(got, "state any material assumption in the user-visible result") {
 		t.Fatalf("fallback Morde SOUL or task policy is missing: %q", got)
 	}
 }

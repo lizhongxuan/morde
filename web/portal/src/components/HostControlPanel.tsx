@@ -47,18 +47,20 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
   const [confirmAction, setConfirmAction] = useState<ControlActionRequest | null>(null);
   const [pendingOperationCount, setPendingOperationCount] = useState(0);
   const [compactActionPreparing, setCompactActionPreparing] = useState(false);
+  const [controlActionPending, setControlActionPending] = useState(false);
   const compactActionPreparingRef = useRef(false);
   const control = useQuery({
     queryKey: ['host-control', host.id],
     queryFn: () => portalApi.hostControl(host.id),
     refetchInterval: (query) => {
       const value = query.state.data;
-      return value && (value.active_transition || value.control_state === 'taking_over' || value.control_state === 'returning') ? 1500 : false;
+      return controlActionPending || (value && (value.active_transition || value.control_state === 'taking_over' || value.control_state === 'returning')) ? 1500 : false;
     },
   });
   useNetworkReadNotice([{ failed: control.isError, error: control.error, retry: control.refetch }], '电脑控制状态读取失败，已保留当前内容。');
   const updateControl = useMutation({
     mutationFn: (body: ControlActionRequest) => portalApi.hostControlAction(host.id, body),
+    onMutate: () => setControlActionPending(true),
     onSuccess: async (result, body) => {
       setPendingOperationCount(result.pending_operation_ids.length);
       queryClient.setQueryData<ControlStatus>(['host-control', host.id], {
@@ -84,6 +86,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         notify('控制状态已更新，正在核对主机状态。', 'info');
       }
     },
+    onSettled: () => setControlActionPending(false),
     onError: (error) => {
       const details = errorDetails(error);
       if (details.code === 'conflict') {
@@ -106,7 +109,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
     : '未知';
   const leaseHeldByMe = state === 'user' && status?.control_lease_active === true && status.control_lease_held_by_me;
   const canRelease = canControl && state === 'user' && !!status
-    && (compact ? status.control_lease_held_by_me : canReleaseAnyLease || status.control_lease_held_by_me);
+    && (status.control_lease_held_by_me || (!status.control_lease_active && canReleaseAnyLease));
   const compactLabel = control.isError ? '控制权状态暂不可用'
     : !status ? '正在确认控制权…'
       : state === 'ai' ? 'Morde 拥有控制权'
@@ -116,7 +119,6 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         : state === 'taking_over' ? '正在接管电脑' : '正在交还 Morde';
 
   useEffect(() => {
-    if (compact) return;
     if (state !== 'user' || !status?.control_lease_active || !status.control_lease_held_by_me) return;
     let renewing = false;
     const timer = window.setInterval(() => {
@@ -128,7 +130,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         .finally(() => { renewing = false; });
     }, 10_000);
     return () => window.clearInterval(timer);
-  }, [compact, host.id, queryClient, refetchControl, state, status?.control_lease_active, status?.control_lease_held_by_me, status?.control_version]);
+  }, [host.id, queryClient, refetchControl, state, status?.control_lease_active, status?.control_lease_held_by_me, status?.control_version]);
 
   const startAction = (action: ControlActionRequest['action']) => {
     if (!status) return;
@@ -167,7 +169,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
   if (compact) {
     const resumableTransition = Boolean(transition?.failure_reason && canControl &&
       (transition.action === 'take_over' || status?.control_lease_held_by_me));
-    const action = state === 'ai' ? 'take_over' : leaseHeldByMe ? 'release' : null;
+    const action = state === 'ai' ? 'take_over' : canRelease ? 'release' : null;
     const nextAction = resumableTransition && transition ? transition.action : action;
     const enabled = actionReady && canControl && !compactActionPreparing && !control.isPending && !control.isFetching && !control.isError && !!status &&
       !updateControl.isPending && Boolean(nextAction) && (!transitioning || resumableTransition) &&
@@ -178,14 +180,14 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         : control.isError ? '状态不可用'
             : resumableTransition ? nextAction === 'take_over' ? '重试接管控制权' : '重试归还控制权'
               : transitioning ? state === 'taking_over' ? '正在接管控制权…' : '正在归还控制权…'
-                : leaseHeldByMe ? '归还控制权' : '接管控制权';
+                : nextAction === 'release' ? leaseHeldByMe ? '归还控制权' : '恢复 AI 控制' : '接管控制权';
     const reason = control.isError ? '控制权状态暂不可用'
       : !status ? '正在确认控制权状态'
         : !canControl ? '当前账号没有控制权限'
           : !actionReady ? '工作台尚未就绪'
             : transitioning ? '控制权正在切换'
               : state === 'user' && status.control_lease_active && !status.control_lease_held_by_me ? '其他成员正在控制电脑'
-                : state === 'user' && !status.control_lease_active ? '控制租约已失效，正在核实状态'
+                : state === 'user' && !status.control_lease_active ? canReleaseAnyLease ? '控制租约已失效，可恢复 AI 控制' : '控制租约已失效，仅电脑所有者可恢复'
                   : !nextAction ? '当前控制操作不可用' : '';
     return <section className="host-control host-control-compact computer-panel-control" aria-label="云端电脑控制">
       <button type="button" className="button button-primary" disabled={!enabled || !nextAction}

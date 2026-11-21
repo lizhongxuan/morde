@@ -1091,8 +1091,62 @@ function hostsByState() {
   }, {});
 }
 
+const localBlindPackID = '10000000000000000000000000000001';
+const localBlindPack: components['schemas']['BlindPack'] = {
+  id: localBlindPackID, suite_version: 'suite-v1',
+  rubric: [{ id: 'H01', name: '结论与行为正确', hard_gate: true }, { id: 'H02', name: '结论有可核查证据', hard_gate: true }],
+  cases: [{ case_id: 'AIC-H-01', priority: 'P0', tags: ['synthetic', 'evidence'], input: '验证回复是否有证据支持。',
+    expected_behavior: '先给结论，并引用真实证据；没有证据时明确说明。',
+    applicability: [{ criterion_id: 'H01', applicable: true }, { criterion_id: 'H02', applicable: true }],
+    candidates: [
+      { label: 'blind-aaaaaaaaaaaaaaaa', output: '结论：来源明确支持这个结果。', evidence: [{ id: 'source-1', kind: 'content', sha256: 'a'.repeat(64), excerpt: '合成来源摘录，包含可核对的事实。' }] },
+      { label: 'blind-bbbbbbbbbbbbbbbb', output: '我觉得答案应该正确。', evidence: [] },
+    ],
+  }],
+};
+const localArbitrationReviews: components['schemas']['BlindArbitrationReview'][] = [
+  { reviewer: '审阅者1', candidate: 'blind-aaaaaaaaaaaaaaaa', cases: [{ case_id: 'AIC-H-01', judgments: [
+    { criterion_id: 'H01', score: '1', rationale: '回答给出了结论。', evidence: [{ kind: 'output_span', start_byte: 0, end_byte: 6 }] },
+    { criterion_id: 'H02', score: '1', rationale: '引用了已登记来源。', evidence: [{ kind: 'evidence_id', id: 'source-1', start_byte: 0, end_byte: 0 }] },
+  ] }] },
+  { reviewer: '审阅者2', candidate: 'blind-aaaaaaaaaaaaaaaa', cases: [{ case_id: 'AIC-H-01', judgments: [
+    { criterion_id: 'H01', score: '0', rationale: '结论没有先说明证据边界。', evidence: [{ kind: 'output_span', start_byte: 0, end_byte: 6 }] },
+    { criterion_id: 'H02', score: '1', rationale: '引用了已登记来源。', evidence: [{ kind: 'evidence_id', id: 'source-1', start_byte: 0, end_byte: 0 }] },
+  ] }] },
+];
+const localBlindReviews = new Map<string, components['schemas']['BlindReviewResponse'][]>();
+const localBlindArbitrations = new Map<string, components['schemas']['BlindArbitrationResult'][]>();
+
 export const handlers = [
   sessionGuard,
+  http.get('/api/evaluation-batches/:pack_id/review', ({ params, cookies }) => {
+    if (params.pack_id !== localBlindPackID || !sessionUser(cookies)) return failure('not_found', '盲测批次不存在或无权访问', 404);
+    return json({ pack: localBlindPack, reviews: localBlindReviews.get(localBlindPackID) ?? [] });
+  }),
+  http.post('/api/evaluation-batches/:pack_id/reviews', async ({ params, request, cookies }) => {
+    if (params.pack_id !== localBlindPackID || !sessionUser(cookies)) return failure('not_found', '盲测批次不存在或无权访问', 404);
+    const body = await request.json().catch(() => null) as components['schemas']['SubmitBlindReviewRequest'] | null;
+    if (!body?.candidate || !body.cases) return failure('invalid_argument', '评分内容无效', 400);
+    const submittedAt = now();
+    const reviews = localBlindReviews.get(localBlindPackID) ?? [];
+    if (!reviews.some((review) => review.candidate === body.candidate)) {
+      reviews.push({ candidate: body.candidate, submitted_at: submittedAt, cases: body.cases });
+      localBlindReviews.set(localBlindPackID, reviews);
+    }
+    return json({ candidate: body.candidate, submitted_at: submittedAt });
+  }),
+  http.get('/api/evaluation-batches/:pack_id/arbitration', ({ params, cookies }) => {
+    if (params.pack_id !== localBlindPackID || !sessionUser(cookies)) return failure('not_found', '盲测批次不存在或无权访问', 404);
+    return json({ pack: localBlindPack, expected_reviews_per_candidate: 2, reviews: localArbitrationReviews,
+      arbitrations: localBlindArbitrations.get(localBlindPackID) ?? [] });
+  }),
+  http.post('/api/evaluation-batches/:pack_id/arbitrations', async ({ params, request, cookies }) => {
+    if (params.pack_id !== localBlindPackID || !sessionUser(cookies)) return failure('not_found', '盲测批次不存在或无权访问', 404);
+    const body = await request.json().catch(() => null) as components['schemas']['SubmitBlindArbitrationRequest'] | null;
+    if (!body?.candidate || !body.reason || !body.cases) return failure('invalid_argument', '仲裁内容无效', 400);
+    localBlindArbitrations.set(localBlindPackID, [{ candidate: body.candidate, reason: body.reason, cases: body.cases }]);
+    return json({ candidate: body.candidate, resolved_at: now() });
+  }),
   http.post("/api/auth/register", async ({ request }) => {
     const body = await request.json().catch(() => ({})) as { name?: string; password?: string; invite_code?: unknown };
     const name = body.name?.trim();

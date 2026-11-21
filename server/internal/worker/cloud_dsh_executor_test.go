@@ -658,6 +658,34 @@ func cloudDSHReadTool() app.AgentToolDefinition {
 	}}
 }
 
+func cloudDSHExpectedRootDefinitions(base []app.AgentToolDefinition) []app.AgentToolDefinition {
+	if len(base) == 0 {
+		return nil
+	}
+	return append(append([]app.AgentToolDefinition(nil), base...), cloudDSHResultEvidenceTool())
+}
+
+func TestCloudDSHResultEvidenceToolIsRootOnly(t *testing.T) {
+	definition := cloudDSHResultEvidenceTool()
+	if definition.Name != cloudDSHResultEvidenceToolName || !validCloudDSHToolDefinitions([]app.AgentToolDefinition{definition}) {
+		t.Fatalf("result evidence tool definition is invalid: %+v", definition)
+	}
+	if !bytes.Contains(definition.Parameters, []byte(`"enum":["source","baseline","action","result","side_effect","before_after"]`)) ||
+		!bytes.Contains(definition.Parameters, []byte(`"baseline_call_id"`)) || !bytes.Contains(definition.Parameters, []byte(`"after_call_id"`)) ||
+		!bytes.Contains(definition.Parameters, []byte(`verified file-write call ID`)) ||
+		!strings.Contains(definition.Description, "result id=current") || !strings.Contains(definition.Description, "linked child Agent Step") ||
+		!strings.Contains(definition.Description, "same-revision Task Steps") {
+		t.Fatalf("result evidence tool omits final-result or delegated-step references: %s", definition.Description)
+	}
+	base := []app.AgentToolDefinition{cloudDSHReadTool()}
+	if cloudDSHToolAllowed(base, definition.Name) {
+		t.Fatal("child tool set includes the root-only evidence tool")
+	}
+	if _, _, err := validateCloudDSHDelegateArguments([]byte(`{"title":"Review","objective":"Map the answer","tool_names":["morde_task_result_evidence"]}`), base); err == nil {
+		t.Fatal("child Agent selected the root-only evidence tool")
+	}
+}
+
 func cloudDSHAttachmentTestTools() *cloudDSHTestTools {
 	return &cloudDSHTestTools{definitions: []app.AgentToolDefinition{{ModelTool: app.ModelTool{
 		Name: "morde_read_task_attachment", Description: "Read a task attachment.",
@@ -1653,6 +1681,42 @@ func TestCloudDSHChildSuccessRequiresReconciledHistory(t *testing.T) {
 	}
 }
 
+func TestCloudDSHChildToolResultExposesOnlySafeActionReferences(t *testing.T) {
+	childHistory := newCloudDSHCheckpointHistory("child_session")
+	childHistory.calls["search_call"] = &cloudDSHToolCall{name: "search", callSeq: 3, callSeen: true, resultSeen: true}
+	childHistory.calls["pending_call"] = &cloudDSHToolCall{name: "lookup", callSeq: 4, callSeen: true}
+	child := app.AgentChildSession{TaskID: "q1234567", SessionID: "child_session", Step: task.Step{
+		Status: task.StepSucceeded, Summary: "Found two useful sources.",
+	}}
+	parent := &cloudDSHSessionState{history: newCloudDSHCheckpointHistory("root_session")}
+	parent.history.calls["delegate_call"] = &cloudDSHToolCall{name: cloudDSHDelegateToolName, arguments: []byte(`{}`), callSeen: true}
+
+	if _, err := recordCloudDSHChildToolResult(parent, "delegate_call", child, childHistory); err != nil {
+		t.Fatal(err)
+	}
+	var output struct {
+		Summary    string                   `json:"summary"`
+		ActionRefs []cloudDSHChildActionRef `json:"action_refs"`
+	}
+	if err := json.Unmarshal([]byte(parent.history.calls["delegate_call"].output), &output); err != nil ||
+		output.Summary != child.Step.Summary || len(output.ActionRefs) != 1 ||
+		output.ActionRefs[0].CallID != cloudDSHNamespacedToolCallID(child.TaskID, child.SessionID, "search_call") ||
+		output.ActionRefs[0].Tool != "search" {
+		t.Fatalf("child result output = %+v err=%v", output, err)
+	}
+
+	legacyParent := &cloudDSHSessionState{history: newCloudDSHCheckpointHistory("root_session")}
+	legacyCall := &cloudDSHToolCall{name: cloudDSHDelegateToolName, arguments: []byte(`{}`), callSeen: true,
+		resultSeen: true, resultText: child.Step.Summary}
+	legacyParent.history.calls["delegate_call"] = legacyCall
+	if _, err := recordCloudDSHChildToolResult(legacyParent, "delegate_call", child, childHistory); err != nil {
+		t.Fatal(err)
+	}
+	if legacyCall.output != child.Step.Summary {
+		t.Fatalf("legacy checkpoint result changed during replay: %q", legacyCall.output)
+	}
+}
+
 func TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCall(t *testing.T) {
 	executor, supervisor, _, _, models, value := cloudDSHFixture(t)
 	tool := cloudDSHReadTool()
@@ -1670,8 +1734,8 @@ func TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCal
 		t.Fatalf("tool run = %v", err)
 	}
 	if len(tools.calls) != 1 || tools.calls[0].CallID != "call_read_1" || tools.calls[0].Name != tool.Name ||
-		len(models.calls) != 2 || !validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, []app.AgentToolDefinition{tool}) ||
-		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, []app.AgentToolDefinition{tool}) {
+		len(models.calls) != 2 || !validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})) ||
+		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})) {
 		t.Fatalf("tool calls=%#v model calls=%d", tools.calls, len(models.calls))
 	}
 	if models.calls[0].Task == nil || tools.calls[0].TaskFence == nil {
@@ -2388,7 +2452,13 @@ func TestCloudDSHPersonalRecoveryAllowsSettledChildWithWriteReceipt(t *testing.T
 		}
 	}
 	delegation := rootHistory.calls["delegate_memory_child"]
-	if delegation == nil || !delegation.resultSeen || delegation.resultText != children.child.Step.Summary {
+	var childResult struct {
+		Summary    string                   `json:"summary"`
+		ActionRefs []cloudDSHChildActionRef `json:"action_refs"`
+	}
+	if delegation == nil || !delegation.resultSeen || json.Unmarshal([]byte(delegation.resultText), &childResult) != nil ||
+		childResult.Summary != children.child.Step.Summary || len(childResult.ActionRefs) != 1 ||
+		childResult.ActionRefs[0].CallID != tools.expectedCallID || childResult.ActionRefs[0].Tool != definition.Name {
 		t.Fatalf("settled child result was not linked to its parent checkpoint: %#v", delegation)
 	}
 
@@ -2466,7 +2536,7 @@ func TestCloudDSHExecutorCarriesScreenshotAcrossNodeIPCWithoutCheckpointBytes(t 
 	if len(tools.calls) != 1 || len(models.calls) != 2 {
 		t.Fatalf("screenshot calls=%#v models=%d", tools.calls, len(models.calls))
 	}
-	if models.calls[1].ImageResolver == nil || !validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, []app.AgentToolDefinition{tool}) {
+	if models.calls[1].ImageResolver == nil || !validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})) {
 		t.Fatalf("screenshot model request or resolver is invalid: resolver=%v", models.calls[1].ImageResolver != nil)
 	}
 	var request struct {

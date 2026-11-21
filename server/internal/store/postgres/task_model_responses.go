@@ -29,7 +29,9 @@ type taskModelResponseRow struct {
 	engineVersion        string
 	profileVersion       string
 	modelID              string
+	providerEndpoint     string
 	providerModel        string
+	providerReportedModel string
 	connectionVersion    time.Time
 	requestDigest        []byte
 	ciphertext           []byte
@@ -81,7 +83,8 @@ FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2 FOR UP
 			row.personalModel != request.PersonalModel || row.agentSessionID != request.Task.AgentSessionID ||
 			row.agentRootSessionID != request.Task.AgentRootSessionID || row.authorizationVersion != request.Task.AuthorizationVersion ||
 			row.throughSequence != request.Task.ThroughSequence || row.engineVersion != request.Task.EngineVersion ||
-			row.profileVersion != request.Task.ProfileVersion || row.modelID != request.ModelID || row.providerModel != request.ProviderModel ||
+			row.profileVersion != request.Task.ProfileVersion || row.modelID != request.ModelID ||
+			row.providerEndpoint != "" && row.providerEndpoint != request.ProviderEndpoint || row.providerModel != request.ProviderModel ||
 			!row.connectionVersion.Equal(request.ConnectionVersion) || !bytes.Equal(row.requestDigest, request.RequestDigest) ||
 			row.agentGeneration < 1 || row.agentGeneration > request.Task.AgentGeneration || len(row.ciphertext) == 0 ||
 			len(row.ciphertext) > app.MaxTaskModelResponseCiphertext || len(row.digest) != 32 ||
@@ -104,6 +107,7 @@ FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2 FOR UP
 			}
 		}
 		recovered = app.TaskModelResponseRecord{AgentInstanceID: row.agentInstanceID, AgentGeneration: row.agentGeneration,
+			ProviderEndpoint: row.providerEndpoint, ProviderReportedModel: row.providerReportedModel,
 			Ciphertext: append([]byte(nil), row.ciphertext...), Digest: append([]byte(nil), row.digest...)}
 		found = true
 		return nil
@@ -115,12 +119,13 @@ func readTaskModelResponseInTx(ctx context.Context, tx pgx.Tx, ownerID, callID s
 	var row taskModelResponseRow
 	err := tx.QueryRow(ctx, `SELECT task_owner_id,initiator_id,project_id,personal_model,agent_instance_id,agent_generation,
 agent_session_id,agent_root_session_id,lease_owner,lease_version,authorization_version,through_sequence,engine_version,
-profile_version,model_id,provider_model,connection_version,request_digest,response_ciphertext,response_digest
+profile_version,model_id,COALESCE(provider_endpoint,''),provider_model,COALESCE(provider_reported_model,''),
+connection_version,request_digest,response_ciphertext,response_digest
 FROM task_model_call_responses WHERE owner_id=$1 AND source='task' AND call_id=$2 FOR UPDATE`, ownerID, callID).
 		Scan(&row.taskOwnerID, &row.initiatorID, &row.projectID, &row.personalModel, &row.agentInstanceID, &row.agentGeneration,
 			&row.agentSessionID, &row.agentRootSessionID, &row.leaseOwner, &row.leaseVersion, &row.authorizationVersion,
-			&row.throughSequence, &row.engineVersion, &row.profileVersion, &row.modelID, &row.providerModel,
-			&row.connectionVersion, &row.requestDigest, &row.ciphertext, &row.digest)
+			&row.throughSequence, &row.engineVersion, &row.profileVersion, &row.modelID, &row.providerEndpoint, &row.providerModel,
+			&row.providerReportedModel, &row.connectionVersion, &row.requestDigest, &row.ciphertext, &row.digest)
 	if err != nil {
 		return taskModelResponseRow{}, err
 	}
@@ -146,7 +151,8 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2)`, settlement.OwnerID, settle
 	}
 	if request.Source != app.ModelCallTask || request.Task == nil || request.OwnerID != settlement.OwnerID ||
 		request.CallID != settlement.CallID || len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext ||
-		len(settlement.ResponseDigest) != 32 || !settlement.Usage.Known {
+		len(settlement.ResponseDigest) != 32 || !settlement.Usage.Known || !app.ValidProviderReportedModel(settlement.ProviderReportedModel) ||
+		request.ProviderEndpoint == "" {
 		return false, domain.InvalidArgument("task_model_response", "Task model response settlement is invalid")
 	}
 	var state, taskID, modelID, providerModel, projectID string
@@ -176,13 +182,13 @@ WHERE id=$1 AND owner_id=$2 AND initiator_id=$3`, request.Task.TaskID, request.T
 	_, err := tx.Exec(ctx, `INSERT INTO task_model_call_responses
 (owner_id,source,call_id,task_id,task_owner_id,initiator_id,project_id,personal_model,agent_instance_id,agent_generation,
  agent_session_id,agent_root_session_id,lease_owner,lease_version,authorization_version,through_sequence,engine_version,
- profile_version,model_id,provider_model,connection_version,request_digest,response_ciphertext,response_digest)
-VALUES ($1,'task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+ profile_version,model_id,provider_endpoint,provider_model,provider_reported_model,connection_version,request_digest,response_ciphertext,response_digest)
+VALUES ($1,'task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		request.OwnerID, request.CallID, request.Task.TaskID, request.Task.OwnerID, request.OwnerID, request.ProjectID, request.PersonalModel,
 		request.Task.AgentInstanceID, request.Task.AgentGeneration, request.Task.AgentSessionID, request.Task.AgentRootSessionID,
 		request.Task.LeaseOwner, request.Task.LeaseVersion, request.Task.AuthorizationVersion, request.Task.ThroughSequence,
-		request.Task.EngineVersion, request.Task.ProfileVersion, request.ModelID, request.ProviderModel,
-		request.ConnectionVersion, request.RequestDigest, settlement.ResponseCiphertext, settlement.ResponseDigest)
+		request.Task.EngineVersion, request.Task.ProfileVersion, request.ModelID, request.ProviderEndpoint, request.ProviderModel,
+		settlement.ProviderReportedModel, request.ConnectionVersion, request.RequestDigest, settlement.ResponseCiphertext, settlement.ResponseDigest)
 	if err != nil {
 		return false, fmt.Errorf("persist Task model response: %w", err)
 	}
@@ -217,7 +223,8 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2)`, settlement.OwnerID, settle
 		row.agentRootSessionID != request.Task.AgentRootSessionID || row.leaseOwner != request.Task.LeaseOwner ||
 		row.leaseVersion != request.Task.LeaseVersion || row.authorizationVersion != request.Task.AuthorizationVersion ||
 		row.throughSequence != request.Task.ThroughSequence || row.engineVersion != request.Task.EngineVersion ||
-		row.profileVersion != request.Task.ProfileVersion || row.modelID != request.ModelID || row.providerModel != request.ProviderModel ||
+		row.profileVersion != request.Task.ProfileVersion || row.modelID != request.ModelID || row.providerEndpoint != request.ProviderEndpoint ||
+		row.providerModel != request.ProviderModel || row.providerReportedModel != settlement.ProviderReportedModel ||
 		!row.connectionVersion.Equal(request.ConnectionVersion) || !bytes.Equal(row.requestDigest, request.RequestDigest) ||
 		!bytes.Equal(row.digest, settlement.ResponseDigest) || len(row.ciphertext) == 0 {
 		return domain.NewError(domain.CodeIdempotencyConflict, "Task model response was already recorded differently")

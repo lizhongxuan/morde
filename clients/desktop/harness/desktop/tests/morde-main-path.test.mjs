@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { homedir, tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mordeUserDataDirectory } from '../out/morde-core.js';
+import { mordeUserDataDirectory, withTimeout } from '../out/morde-core.js';
 import { createRequire } from 'node:module';
 
 process.env.MORDE_TEST_PORTAL_ASSETS = fileURLToPath(new URL('./portal-fixture', import.meta.url));
@@ -158,6 +158,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
   const core = {
     MordeAPI: FakeMordeAPI,
     mordeUserDataDirectory,
+    withTimeout,
     checkedId: (_kind, value) => {
       if (typeof value !== 'string' || !/^w[a-z0-9]{7}$/.test(value)) throw new Error('Invalid Workspace ID');
       return value;

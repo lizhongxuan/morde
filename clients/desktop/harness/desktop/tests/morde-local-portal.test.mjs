@@ -39,6 +39,11 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
     let proxyFetches = 0;
     portal = await startLocalPortalServer(root, serviceOrigin, 'https://*.hosts.example.test', 0, (...args) => {
       proxyFetches++;
+      if (args[1]?.method === 'POST' && args[1]?.body !== undefined) {
+        assert.ok(args[1].body instanceof Uint8Array);
+        assert.equal(Buffer.isBuffer(args[1].body), false);
+        assert.equal(args[1].headers.get('content-length'), null);
+      }
       return fetch(...args);
     });
     const stablePort = Number(new URL(portal.origin).port);
@@ -84,6 +89,28 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
       path: '/api/test?take=1', origin: serviceOrigin, referer: `${serviceOrigin}/assistant`, cookie: 'ch_portal=synthetic-session',
     });
 
+    const chunkedResponse = await new Promise((resolve, reject) => {
+      const request = httpRequest(new URL(`${portal.origin}/api/chunked`), {
+        method: 'POST', headers: { origin: portal.origin, 'content-type': 'application/json' },
+      }, (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      request.once('error', reject);
+      request.write('{"message":');
+      request.end('"chunked"}');
+    });
+    assert.equal(chunkedResponse.status, 200);
+    assert.deepEqual(JSON.parse(chunkedResponse.body), { path: '/api/chunked', body: '{"message":"chunked"}' });
+
+    const beforeOversize = upstreamRequests.length;
+    const oversized = await fetch(`${portal.origin}/api/too-large`, {
+      method: 'POST', headers: { origin: portal.origin, 'content-type': 'application/octet-stream' }, body: new Uint8Array((16 << 20) + 1),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(upstreamRequests.length, beforeOversize);
+
     const stream = await fetch(`${portal.origin}/api/events`, { headers: { origin: portal.origin } });
     assert.equal(stream.headers.get('content-type'), 'text/event-stream');
     const reader = stream.body.getReader();
@@ -108,7 +135,7 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
     const rejected = await fetch(`${portal.origin}/api/test`, { method: 'POST', headers: { origin: 'https://attacker.example' }, body: '{}' });
     assert.equal(rejected.status, 403);
     assert.equal(upstreamRequests.length, beforeRejectedOrigin);
-    assert.equal(proxyFetches, 3);
+    assert.equal(proxyFetches, 4);
     portal.setHostFrameSource('https://*.updated-hosts.example.test');
     assert.match((await fetch(`${portal.origin}/settings`)).headers.get('content-security-policy'), /updated-hosts\.example\.test/);
     await portal.close();

@@ -35,4 +35,4 @@ Ubuntu 26.04 / Docker Engine 29.9.1 实测发现，启动 `bridge=none` 的第�
 
 Guardian 异常退出后可能遗留 Unix socket 路径。重启只会在该路径仍为原 socket、连接明确被拒绝且文件身份未变化时清理它；有活动监听或路径变成普通文件时启动失败，交给管理员检查。
 
-本包不创建用户/组、不修改 Portal unit、不自动启用服务、不上传文件、不 push 镜像，也不部署到远程主机。安装前必须在目标 Linux 上确认运行架构、Docker/cgroup 行为、Guardian socket 权限、到期销毁和重启恢复；这些条件未验证前，`cloud_dsh.enabled` 必须保持 `false`。
+本包不创建用户/组、不修改 Portal unit、不上传文件、不 push 镜像，也不部署到远程主机。Portal 配置默认启用 Cloud DSH；启动前仍须在目标 Linux 安装并核对专用 Docker daemon、固定摘要镜像、Guardian socket 权限、到期销毁和重启恢复。缺少这些必需组件时 Portal 会启动失败，不能通过把配置开关关闭来掩盖部署缺口。

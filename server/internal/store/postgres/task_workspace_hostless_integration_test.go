@@ -75,7 +75,11 @@ func TestHostBoundAgentWorkspaceTaskPublishRecordsDirectDirectorySnapshot(t *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = blocks.Close() })
-	directory, err := workspacecurrent.Open(filepath.Join(t.TempDir(), "current"))
+	currentRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := workspacecurrent.Open(currentRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +91,10 @@ func TestHostBoundAgentWorkspaceTaskPublishRecordsDirectDirectorySnapshot(t *tes
 	}
 	if err := service.SetWorkspaceCurrentDirectory(directory); err != nil {
 		t.Fatal(err)
+	}
+	liveDirectory, err := service.UsesLiveDirectorySource(ctx, owner.ID, workspaceValue.ID)
+	if err != nil || !liveDirectory {
+		t.Fatalf("direct publish fixture is not the initialized Agent Workspace: live=%t err=%v", liveDirectory, err)
 	}
 	content := []byte("shared Agent Workspace report")
 	file := syncTestFile("report.txt", content)
@@ -131,7 +139,13 @@ func TestHostlessWorkspaceTaskSubmitPublishReceiptAndRecovery(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
-	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "hostless-task-workspace")
+	workspaceValue, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatalf("create stable Agent Workspace: %v", err)
+	}
+	if err := store.MarkAgentWorkspaceDirectoryInitialized(ctx, owner.ID, workspaceValue.ID); err != nil {
+		t.Fatalf("mark Agent Workspace directory initialized: %v", err)
+	}
 	initialPage, err := store.GetWorkspaceManifestPageForOwner(ctx, owner.ID, workspaceValue.ID, workspaceValue.Revision, "", "", 100)
 	if err != nil {
 		t.Fatalf("read initial owner-scoped Workspace manifest: %v", err)
@@ -227,6 +241,23 @@ func TestHostlessWorkspaceTaskSubmitPublishReceiptAndRecovery(t *testing.T) {
 	if err != nil || replayed != committed {
 		t.Fatalf("restart receipt replay = %#v, %v; original=%#v", replayed, err, committed)
 	}
+	currentRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := workspacecurrent.Open(currentRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = directory.Close() })
+	directService, err := app.NewWorkspaceSyncServiceWithOptions(store, blocks, workspace.MaxSyncManifestBytes, syncTestOwnerQuotaBytes,
+		app.WorkspaceSyncOptions{LiveDirectorySourceEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := directService.SetWorkspaceCurrentDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
 
 	directContent := []byte("shared directory result")
 	directDigest := sha256.Sum256(directContent)
@@ -245,11 +276,11 @@ func TestHostlessWorkspaceTaskSubmitPublishReceiptAndRecovery(t *testing.T) {
 	directCommand.OperationKey = "agent:hostless-direct-write-001"
 	directCommand.RequestHash = directHash[:]
 	directCommand.DirectDirectorySource = true
-	directReserved, err := service.ReserveTaskWorkspacePublish(ctx, directCommand)
+	directReserved, err := directService.ReserveTaskWorkspacePublish(ctx, directCommand)
 	if err != nil || directReserved.State != app.TaskWorkspacePublishPending {
 		t.Fatalf("reserve direct Workspace write receipt = %#v, %v", directReserved, err)
 	}
-	directCommitted, err := service.CommitTaskWorkspacePublishDirect(ctx, directCommand, directFiles, initialPage.EmptyDirectories, directDirectories, directManifest,
+	directCommitted, err := directService.CommitTaskWorkspacePublishDirect(ctx, directCommand, directFiles, initialPage.EmptyDirectories, directDirectories, directManifest,
 		func(_ context.Context, digest string) ([]byte, error) {
 			if digest == directSHA {
 				return append([]byte(nil), directContent...), nil

@@ -31,6 +31,7 @@ const (
 	ModelCallProbe      ModelCallSource = "probe"
 	ModelCallRoute      ModelCallSource = "route"
 	ModelCallCompaction ModelCallSource = "compaction"
+	ModelCallReview     ModelCallSource = "review"
 )
 
 type ModelTaskFence struct {
@@ -59,6 +60,7 @@ type ModelCall struct {
 	Source        ModelCallSource
 	Principal     identity.Principal
 	Task          *ModelTaskFence
+	Review        *TaskValidationReviewModelFence
 	Summary       *ConversationSummaryModelFence
 	ModelID       string
 	CallID        string
@@ -71,12 +73,14 @@ type ModelCallReservation struct {
 	Source            ModelCallSource
 	Principal         identity.Principal
 	Task              *ModelTaskFence
+	Review            *TaskValidationReviewModelFence
 	Summary           *ConversationSummaryModelFence
 	Route             *ConversationRouteModelFence
 	ProjectID         string
 	PersonalModel     bool
 	OwnerID           string
 	ModelID           string
+	ProviderEndpoint  string
 	ProviderModel     string
 	ConnectionVersion time.Time
 	NeedsTools        bool
@@ -89,16 +93,19 @@ type ModelCallReservation struct {
 }
 
 type ModelCallSettlement struct {
-	Source             ModelCallSource
-	OwnerID            string
-	CallID             string
-	Usage              ModelUsage
-	Unknown            bool
-	Summary            *ConversationSummaryModelFence
-	TaskCall           *ModelCallReservation
-	ResponseCiphertext []byte
-	ResponseDigest     []byte
-	ResponseInvalid    bool
+	Source                ModelCallSource
+	OwnerID               string
+	CallID                string
+	Usage                 ModelUsage
+	ProviderReportedModel string
+	Unknown               bool
+	Summary               *ConversationSummaryModelFence
+	TaskCall              *ModelCallReservation
+	ReviewCall            *ModelCallReservation
+	ResponseCiphertext    []byte
+	ResponseDigest        []byte
+	ResponseTextDigest    []byte
+	ResponseInvalid       bool
 }
 
 type ModelUsageObservation struct {
@@ -290,7 +297,7 @@ func ValidDSHModelToolCallID(value string) bool { return dshModelIdentityPattern
 
 // ValidDSHModelResponse reports whether a model response can safely cross the DSH IPC boundary.
 func ValidDSHModelResponse(response ModelResponse) bool {
-	if !response.Usage.Known || response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
+	if !ValidProviderReportedModel(response.ProviderReportedModel) || !response.Usage.Known || response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
 		response.Usage.InputTokens > maxDSHModelResponseTokenCount || response.Usage.OutputTokens > maxDSHModelResponseTokenCount ||
 		!utf8.ValidString(response.Reasoning) || len(response.Reasoning) > MaxDSHModelResponseTextBytes ||
 		!utf8.ValidString(response.Text) || len(response.Text) > MaxDSHModelResponseTextBytes ||
@@ -322,7 +329,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
 	}
 	call.Task = normalizedModelTaskFence(call.Task)
-	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask) && s.responseSealer == nil {
+	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask || call.Source == ModelCallReview) && s.responseSealer == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "model response encryption is unavailable")
 	}
 	if call.Source == ModelCallTask {
@@ -336,6 +343,10 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		request.Instructions = mordeSoulInstructions(request.Instructions)
 		request.OnTextDelta = call.Request.OnTextDelta
 		call.Request = request
+	}
+	if call.Source == ModelCallReview && (call.Review == nil || call.Task != nil || call.Summary != nil ||
+		len(call.Request.Tools) != 0 || call.Request.RequiredTool != "") {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "invalid Task validation review model call")
 	}
 	ownerID, digest, reserve, err := validateModelCall(call)
 	if err != nil {
@@ -364,6 +375,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		if err != nil {
 			return ModelResponse{}, err
 		}
+	} else if call.Source == ModelCallReview {
+		resolver, ok := s.store.(TaskValidationReviewModelProjectResolver)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "Task validation review project scope is unavailable")
+		}
+		projectID, err = resolver.ModelTaskProjectIDForReview(ctx, *call.Review)
+		if err != nil {
+			return ModelResponse{}, err
+		}
 	} else if call.Source == ModelCallCompaction && call.Summary != nil {
 		projectID = call.Summary.Claim.Input.ProjectID
 	}
@@ -385,9 +405,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
-	if call.Source == ModelCallTask || call.Source == ModelCallCompaction {
+	if call.Source == ModelCallTask || call.Source == ModelCallCompaction || call.Source == ModelCallReview {
 		request := call.Request
-		s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, call.Source == ModelCallTask)
+		s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, call.Source != ModelCallCompaction)
 		call.Request = request
 		ownerID, digest, reserve, err = validateModelCall(call)
 		if err != nil {
@@ -402,9 +422,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
 	reservation := ModelCallReservation{
-		Source: call.Source, Principal: call.Principal, Task: call.Task, Summary: call.Summary, OwnerID: ownerID,
+		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review, Summary: call.Summary, OwnerID: ownerID,
 		ProjectID: projectID, PersonalModel: endpoint.Personal,
-		ModelID: call.ModelID, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
+		ModelID: call.ModelID, ProviderEndpoint: endpoint.Endpoint.BaseURL, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
 		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
 	}
 	if call.Source == ModelCallCompaction {
@@ -444,12 +464,37 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return response, nil
 		}
 	}
+	if call.Source == ModelCallReview {
+		recovery, ok := s.store.(TaskValidationReviewModelResponseStore)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "Task validation review model recovery is unavailable")
+		}
+		stored, found, err := recovery.RecoverTaskValidationReviewModelResponse(ctx, reservation)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+		if found {
+			response, err := OpenTaskValidationReviewModelResponse(s.responseSealer, stored, reservation)
+			if err != nil {
+				return ModelResponse{}, err
+			}
+			model, err := taskValidationReviewModelFromResponse(call.ModelID, endpoint.Version, endpoint.Endpoint.BaseURL,
+				endpoint.Endpoint.ModelID, response.ProviderReportedModel, call.CallID, stored.Digest)
+			if err != nil {
+				return ModelResponse{}, err
+			}
+			response.TaskValidationReview = &model
+			return response, nil
+		}
+	}
 	projectCall := projectID != "" && !endpoint.Personal
 	if projectCall {
 		usage := projectUsageReservation(call.Request, reserve)
 		var reserveErr error
 		if call.Source == ModelCallCompaction {
 			_, _, reserveErr = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
+		} else if call.Source == ModelCallReview {
+			_, _, reserveErr = s.projectBudget.reserveTaskValidationReviewModelCall(ctx, projectID, reservation, usage)
 		} else {
 			_, _, reserveErr = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
 		}
@@ -535,13 +580,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	response, callErr := s.client.Complete(providerCtx, request)
 	finishProvider()
 	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
-		Unknown: callErr != nil || !response.Usage.Known, Summary: call.Summary}
+		ProviderReportedModel: response.ProviderReportedModel,
+		Unknown:               callErr != nil || !response.Usage.Known, Summary: call.Summary}
 	if response.Usage.Known && (response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 || response.Usage.InputTokens > math.MaxInt64-response.Usage.OutputTokens) {
 		settlement.Unknown = true
 		settlement.Usage = ModelUsage{}
 		callErr = &ModelClientError{Kind: ModelErrorInvalidResponse}
 	}
 	var summaryOutputErr error
+	var reviewOutputErr error
 	if call.Source == ModelCallCompaction && !settlement.Unknown {
 		if response.StopReason != "stop" || len(response.ToolCalls) != 0 || strings.TrimSpace(response.Text) == "" ||
 			!utf8.ValidString(response.Text) || strings.ContainsRune(response.Text, '\x00') || len(response.Text) > MaxConversationSummaryBytes {
@@ -554,6 +601,22 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			if err != nil {
 				settlement.ResponseInvalid = true
 				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely")
+			}
+		}
+	}
+	if call.Source == ModelCallReview && !settlement.Unknown {
+		if !validTaskValidationReviewModelResponse(response) {
+			settlement.ResponseInvalid = true
+			reviewOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid Task validation review response")
+		} else {
+			stored, sealErr := SealTaskValidationReviewModelResponse(s.responseSealer, reservation, response)
+			if sealErr != nil {
+				settlement.ResponseInvalid = true
+				reviewOutputErr = domain.NewError(domain.CodeInvalidState, "Task validation review model result could not be stored safely")
+			} else {
+				settlement.ReviewCall = &reservation
+				settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+				settlement.ResponseTextDigest = stored.TextDigest
 			}
 		}
 	}
@@ -583,14 +646,29 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		settleErr = s.projectBudget.SettleModelCall(settleCtx, SettleProjectModelCallCommand{
 			ProjectID: projectID, Source: call.Source, CallID: call.CallID,
 			Usage: project.Usage{InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens}, Unknown: settlement.Unknown,
-			Summary: call.Summary, TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
-			ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
+			ProviderReportedModel: settlement.ProviderReportedModel,
+			Summary:               call.Summary, TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
+			ReviewCall: settlement.ReviewCall, ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
+			ResponseTextDigest: settlement.ResponseTextDigest,
 		})
 	} else {
 		settleErr = s.store.SettleModelCall(settleCtx, settlement)
 	}
 	if settleErr != nil {
-		if call.Source == ModelCallCompaction && !projectCall {
+		if call.Source == ModelCallReview && projectCall && !settlement.Unknown {
+			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelUnknown()
+			unknownErr := s.projectBudget.SettleModelCall(unknownCtx, SettleProjectModelCallCommand{
+				ProjectID: projectID, Source: call.Source, CallID: call.CallID, Unknown: true,
+			})
+			if unknownErr != nil {
+				return ModelResponse{}, errors.Join(fmt.Errorf("settle project review model call: %w", settleErr),
+					fmt.Errorf("preserve unknown project review model usage: %w", unknownErr))
+			}
+			s.observeModelUsage(ModelCallSettlement{Source: call.Source, Unknown: true})
+			return ModelResponse{}, fmt.Errorf("settle project review model call: %w", settleErr)
+		}
+		if (call.Source == ModelCallCompaction || call.Source == ModelCallReview) && !projectCall {
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.store.SettleModelCall(unknownCtx, ModelCallSettlement{Source: call.Source, OwnerID: ownerID,
@@ -620,6 +698,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	if summaryOutputErr != nil {
 		return ModelResponse{}, summaryOutputErr
+	}
+	if reviewOutputErr != nil {
+		return ModelResponse{}, reviewOutputErr
 	}
 	if taskOutputErr != nil {
 		return ModelResponse{}, taskOutputErr
@@ -658,6 +739,14 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, domain.NewError(domain.CodeUpstreamError, "model provider returned a tool call not allowed by the request")
 		}
 	}
+	if call.Source == ModelCallReview {
+		model, err := taskValidationReviewModelFromResponse(call.ModelID, endpoint.Version, endpoint.Endpoint.BaseURL,
+			endpoint.Endpoint.ModelID, response.ProviderReportedModel, call.CallID, settlement.ResponseDigest)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+		response.TaskValidationReview = &model
+	}
 	return response, nil
 }
 
@@ -677,14 +766,14 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	ownerID := call.Principal.UserID
 	switch call.Source {
 	case ModelCallClient, ModelCallChat, ModelCallProbe:
-		if call.Task != nil || call.Summary != nil {
+		if call.Task != nil || call.Review != nil || call.Summary != nil {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid user model call")
 		}
 		if err := validateClientAccountPrincipal(call.Principal); err != nil {
 			return "", empty, 0, err
 		}
 	case ModelCallTask:
-		if call.Task == nil || !domain.ValidUserID(call.Task.OwnerID) || !domain.ValidUserID(call.Task.InitiatorID) || call.Task.LeaseOwner == "" || call.Task.LeaseVersion < 1 ||
+		if call.Task == nil || call.Review != nil || call.Summary != nil || !domain.ValidUserID(call.Task.OwnerID) || !domain.ValidUserID(call.Task.InitiatorID) || call.Task.LeaseOwner == "" || call.Task.LeaseVersion < 1 ||
 			call.Task.AgentInstanceID == "" || call.Task.AgentGeneration < 1 || call.Task.AuthorizationVersion < 1 ||
 			!dshModelIdentityPattern.MatchString(call.Task.AgentRootSessionID) ||
 			invalidCheckpointLabel(call.Task.EngineVersion, 128) || invalidCheckpointLabel(call.Task.ProfileVersion, 128) {
@@ -695,8 +784,34 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
 		}
 		ownerID = call.Task.InitiatorID
+	case ModelCallReview:
+		if call.Review == nil || call.Task != nil || call.Summary != nil || call.Principal.UserID != "" ||
+			call.Principal.TokenID != "" || call.Principal.ClientInstallationID != "" || len(call.Request.Tools) != 0 ||
+			call.Request.RequiredTool != "" || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid Task validation review model fence")
+		}
+		if err := func() error {
+			for _, input := range call.Request.Input {
+				if input.Type != "message" || len(input.Images) != 0 || input.CallID != "" || input.Name != "" || input.Arguments != "" || input.Output != "" {
+					return domain.InvalidArgument("model_call", "Task validation review model call must be text-only")
+				}
+				for _, part := range input.Parts {
+					if part.Type == "image" || part.Image != nil {
+						return domain.InvalidArgument("model_call", "Task validation review model call must be text-only")
+					}
+				}
+			}
+			return nil
+		}(); err != nil {
+			return "", empty, 0, err
+		}
+		id, err := DSHTaskValidationReviewModelCallID(*call.Review)
+		if err != nil || id != call.CallID {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid Task validation review model call identity")
+		}
+		ownerID = call.Review.InitiatorID
 	case ModelCallCompaction:
-		if call.Task != nil || call.Summary == nil || ownerID != call.Summary.Claim.Message.ActorID ||
+		if call.Task != nil || call.Review != nil || call.Summary == nil || ownerID != call.Summary.Claim.Message.ActorID ||
 			call.Summary.Identity.ActorID != ownerID || call.Summary.BaselineVersion < 0 ||
 			len(call.Summary.InputSHA256) != sha256.Size || len(call.Request.Tools) != 0 || call.Request.RequiredTool != "" {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid conversation summary model fence")

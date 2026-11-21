@@ -107,6 +107,17 @@ WHERE workspace_id=$1 AND owner_id=$2 AND folder_kind='project' FOR UPDATE`, wor
 					rows.Close()
 					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace already has a project folder with this name")
 				}
+				rows.Close()
+				var alreadyRegisteredOnHost bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_sync_folder_registration_requests
+WHERE owner_id=$1 AND host_id=$2 AND workspace_id=$3 AND folder_id=$4
+)`, principal.UserID, hostID, workspaceID, existingID).Scan(&alreadyRegisteredOnHost); err != nil {
+					return fmt.Errorf("check existing Workspace folder registration for Host: %w", err)
+				}
+				if alreadyRegisteredOnHost {
+					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace already has a project folder with this name")
+				}
 				existingFolderID = existingID
 				break
 			}

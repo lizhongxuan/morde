@@ -103,6 +103,7 @@ describe('outbox message ordering', () => {
     ]);
     expect(byConversation.request.previous_client_message_id).toBe('draft-001');
     expect(byDraft.request.previous_client_message_id).toBe('conversation-002');
+    expect(byDraft.conversationID).toBe('c1234567');
     await bindOutboxConversation(storage, 'account-service', draft.actorID, 'create-001', 'c1234567');
     expect((await storage.read('account-service')).every((item) => item.conversationID === 'c1234567')).toBe(true);
   });

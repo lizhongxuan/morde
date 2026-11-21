@@ -21,51 +21,45 @@ function ModalWithNotice() {
 describe('ToastProvider', () => {
   afterEach(cleanup);
 
-  it('opens a user error popup without placing it inside page content when enabled', async () => {
+  it('shows a single error in the top-left overlay outside page content', async () => {
     const user = userEvent.setup();
     render(<ToastProvider><ToastNoticeCenter autoOpenErrors /><main data-testid="page-layout"><TriggerActionToast action={vi.fn()} /></main></ToastProvider>);
 
     await user.click(screen.getByRole('button', { name: '显示错误' }));
 
     const alert = await screen.findByRole('alert');
-    expect(alert.closest('details')).toHaveAttribute('open');
-    expect(alert.closest('.notice-center-panel')?.closest('main')).toBeNull();
+    expect(alert.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(screen.getByTestId('page-layout')).not.toContainElement(alert);
+    expect(within(alert).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
   });
 
-  it('keeps action notifications in the notice center and page notices inline', async () => {
+  it('keeps the latest error in the overlay and page notices inline', async () => {
     const user = userEvent.setup();
     const retry = vi.fn();
     render(<ToastProvider><ToastNoticeCenter /><main data-testid="page-layout"><TriggerActionToast action={retry} /><FloatingNotice>云端状态待确认</FloatingNotice></main></ToastProvider>);
 
     await user.click(screen.getByRole('button', { name: '显示错误' }));
-    const summary = await screen.findByLabelText('错误提示，1 条');
-    expect(summary.closest('details')).not.toHaveAttribute('open');
-    await user.click(summary);
     const alert = screen.getByRole('alert');
-    expect(alert.closest('.notice-center-panel')).toBeInTheDocument();
+    expect(alert.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('云端状态待确认');
     expect(screen.getByTestId('page-layout')).toContainElement(screen.getByRole('status'));
     expect(document.querySelector('.toast-region')).toBeNull();
     expect(screen.getByTestId('page-layout')).not.toContainElement(alert);
-    await user.click(screen.getByRole('button', { name: '重试' }));
-
-    expect(retry).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
     expect(screen.getByRole('alert')).toHaveTextContent('网络暂不可用');
   });
 
-  it('keeps an open notice accessible when a modal opens and closes', async () => {
+  it('keeps the global error overlay outside a modal', async () => {
     const user = userEvent.setup();
     render(<ToastProvider><ToastNoticeCenter autoOpenErrors /><ModalWithNotice /></ToastProvider>);
     await user.click(screen.getByRole('button', { name: '显示错误' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('网络暂不可用');
 
     await user.click(screen.getByRole('button', { name: '打开弹窗' }));
-    const dialog = screen.getByRole('dialog', { name: '测试弹窗' });
-    expect(within(dialog).getByRole('alert')).toHaveTextContent('网络暂不可用');
-    await user.click(within(dialog).getByRole('button', { name: '关闭' }));
-    expect(screen.getByRole('alert').closest('details')).toHaveAttribute('open');
-    await user.click(screen.getByRole('button', { name: '关闭通知' }));
+    expect(screen.getByRole('alert').closest('.error-notice-overlay')).toBeInTheDocument();
+    await user.click(within(screen.getByRole('dialog', { name: '测试弹窗' })).getByRole('button', { name: '关闭' }));
+    await user.click(screen.getByRole('button', { name: '关闭错误提示' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

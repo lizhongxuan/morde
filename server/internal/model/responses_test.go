@@ -73,7 +73,7 @@ func TestCompleteEncodesMessagesToolsAndImagesAndParsesCallsAndUsage(t *testing.
 		if _, leaked := requestBody["api_key"]; leaked {
 			t.Fatal("API key was included in the request body")
 		}
-		return jsonResponse(http.StatusOK, `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Done"}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"weather\"}"}],"usage":{"input_tokens":21,"output_tokens":7}}`), nil
+		return jsonResponse(http.StatusOK, `{"status":"completed","model":"provider-model-v2","output":[{"type":"message","content":[{"type":"output_text","text":"Done"}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"weather\"}"}],"usage":{"input_tokens":21,"output_tokens":7}}`), nil
 	}))
 	request := app.ModelRequest{
 		Endpoint:     testEndpoint(),
@@ -90,7 +90,8 @@ func TestCompleteEncodesMessagesToolsAndImagesAndParsesCallsAndUsage(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Text != "Done" || got.StopReason != "tool_calls" || !got.Usage.Known || got.Usage.InputTokens != 21 || got.Usage.OutputTokens != 7 {
+	if got.Text != "Done" || got.StopReason != "tool_calls" || !got.Usage.Known || got.Usage.InputTokens != 21 || got.Usage.OutputTokens != 7 ||
+		got.ProviderReportedModel != "provider-model-v2" {
 		t.Fatalf("response = %#v", got)
 	}
 	if len(got.ToolCalls) != 1 || got.ToolCalls[0] != (app.ModelToolCall{CallID: "call_1", Name: "lookup", Arguments: `{"query":"weather"}`}) {
@@ -214,6 +215,40 @@ func TestEncodeRequestDisablesDeepSeekThinkingForNamedToolProbe(t *testing.T) {
 	}
 }
 
+func TestEncodeRequestEnablesJSONModeOnlyForDeepSeek(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint app.ModelEndpoint
+		want     bool
+	}{
+		{"DeepSeek", app.ModelEndpoint{BaseURL: "https://api.deepseek.com/v1", ModelID: "deepseek-flash"}, true},
+		{"other provider", testEndpoint(), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := encodeRequest(app.ModelRequest{
+				Endpoint: test.endpoint, Input: []app.ModelInput{{Type: "message", Role: "user", Text: "return json"}},
+				MaxOutputTokens: 64, JSONMode: true,
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				Text *struct {
+					Format struct {
+						Type string `json:"type"`
+					} `json:"format"`
+				} `json:"text"`
+			}
+			if err := json.Unmarshal(payload, &got); err != nil {
+				t.Fatal(err)
+			}
+			if (got.Text != nil) != test.want || test.want && got.Text.Format.Type != "json_object" {
+				t.Fatalf("text format = %+v; want JSON mode %t", got.Text, test.want)
+			}
+		})
+	}
+}
+
 func TestEncodeRequestUsesMaxReasoningOnlyForFirstPartyGPT6Luna(t *testing.T) {
 	payload, err := encodeRequest(app.ModelRequest{
 		Endpoint: app.ModelEndpoint{BaseURL: "https://api.openai.com/v1", ModelID: "gpt-6-luna"},
@@ -268,7 +303,7 @@ func TestCompleteStreamsOnlyUserVisibleTextDeltasAndReturnsFinalResponse(t *test
 		`data: {"type":"response.output_text.delta","delta":"world."}`,
 		"",
 		"event: response.completed",
-		`data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hello world."}]},{"type":"function_call","call_id":"call_stream","name":"lookup","arguments":"{\"query\":\"provider-only\"}"}],"usage":{"input_tokens":3,"output_tokens":4}}}`,
+		`data: {"type":"response.completed","response":{"status":"completed","model":"provider-stream-v3","output":[{"type":"message","content":[{"type":"output_text","text":"Hello world."}]},{"type":"function_call","call_id":"call_stream","name":"lookup","arguments":"{\"query\":\"provider-only\"}"}],"usage":{"input_tokens":3,"output_tokens":4}}}`,
 		"",
 	}, "\n")
 	var requestPayload struct {
@@ -294,7 +329,8 @@ func TestCompleteStreamsOnlyUserVisibleTextDeltasAndReturnsFinalResponse(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !requestPayload.Stream || response.Text != "Hello world." || response.StopReason != "tool_calls" || !response.Usage.Known || response.Usage.InputTokens != 3 {
+	if !requestPayload.Stream || response.Text != "Hello world." || response.StopReason != "tool_calls" || !response.Usage.Known || response.Usage.InputTokens != 3 ||
+		response.ProviderReportedModel != "provider-stream-v3" {
 		t.Fatalf("request stream=%t response=%#v", requestPayload.Stream, response)
 	}
 	if strings.Join(deltas, "") != response.Text || len(deltas) != 2 || deltas[0] != "Hello " || deltas[1] != "world." {
@@ -318,7 +354,7 @@ func TestCompleteReturnsIncompleteStreamAndRejectsMissingTerminalResponse(t *tes
 		Endpoint: testEndpoint(), Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10,
 		OnTextDelta: func(string) error { return nil },
 	})
-	if err != nil || response.StopReason != "length" || response.Text != "Partial" {
+	if err != nil || response.StopReason != "length" || response.Text != "Partial" || response.ProviderReportedModel != "" {
 		t.Fatalf("incomplete response = %#v, %v", response, err)
 	}
 
@@ -360,6 +396,8 @@ func TestParseResponseMapsRefusalAndRejectsInvalidProviderResults(t *testing.T) 
 	for _, result := range []responseBodyJSON{
 		{Status: "failed"},
 		{Output: []responseOutputItem{{Type: "function_call", CallID: "c1", Name: "lookup", Arguments: "not-json"}}},
+		{Status: "completed", Model: strings.Repeat("m", app.MaxProviderReportedModelBytes+1)},
+		{Status: "completed", Model: "model\nname"},
 	} {
 		if _, err := parseResponse(result); err == nil {
 			t.Fatalf("parseResponse(%#v) unexpectedly succeeded", result)
@@ -374,8 +412,19 @@ func TestParseResponseMapsRefusalAndRejectsInvalidProviderResults(t *testing.T) 
 		t.Fatalf("filtered response = %#v, %v", filtered, err)
 	}
 	unknown, err := parseResponse(responseBodyJSON{Status: "incomplete", IncompleteDetails: &incompleteDetails{Reason: "provider-secret"}, Usage: &responseUsage{InputTokens: int64Pointer(-1), OutputTokens: int64Pointer(0)}})
-	if err != nil || unknown.StopReason != "incomplete" || unknown.Usage.Known {
+	if err != nil || unknown.StopReason != "incomplete" || unknown.Usage.Known || unknown.ProviderReportedModel != "" {
 		t.Fatalf("unknown incomplete response = %#v, %v", unknown, err)
+	}
+}
+
+func TestCompleteLeavesReportedModelEmptyWhenProviderOmitsIt(t *testing.T) {
+	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Done"}]}]}`), nil
+	}))
+	response, err := client.Complete(context.Background(), app.ModelRequest{Endpoint: testEndpoint(), MaxOutputTokens: 32,
+		Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}})
+	if err != nil || response.ProviderReportedModel != "" {
+		t.Fatalf("reported model = %q, err = %v; want empty when provider omits it", response.ProviderReportedModel, err)
 	}
 }
 

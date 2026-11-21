@@ -12,7 +12,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { ApiError } from '../api/client';
 import { portalApi } from '../app/api';
 import type { components } from '../api/schema';
-import { messageOutbox } from '../app/message-outbox';
+import { messageOutbox, messageOutboxScope } from '../app/message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import { messageVariantOutbox } from '../app/message-variant-outbox';
 import type { PendingMessageVariantOperation } from '../app/message-variant-outbox';
@@ -269,7 +269,7 @@ describe('Assistant durable tasks', () => {
     expect(within(composer).queryByLabelText('选择目标 Workspace')).not.toBeInTheDocument();
     expect(within(composer).getByLabelText('选择 AI 模型')).toBeInTheDocument();
     expect(within(composer).getByLabelText('消息内容')).toBeInTheDocument();
-    expect(Array.from(composer.children, (child) => child.tagName)).toEqual(['FORM']);
+    expect(composer.querySelector('form')).toBeInTheDocument();
   });
 
   it('updates a queued task priority with the observed event sequence', async () => {
@@ -378,6 +378,7 @@ describe('Assistant durable tasks', () => {
     const sidebar = await screen.findByRole('complementary', { name: '对话' });
     const composer = await findReadyComposer();
     await user.type(composer, '保留中的草稿');
+    await user.click(within(sidebar).getByRole('button', { name: '搜索会话' }));
     const search = within(sidebar).getByRole('searchbox', { name: '搜索旁聊标题' });
     await user.type(search, '旧');
     await waitFor(() => expect(finishOlderSearch).toBeDefined());
@@ -415,6 +416,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const sidebar = await screen.findByRole('complementary', { name: '对话' });
+    await user.click(within(sidebar).getByRole('button', { name: '搜索会话' }));
     const search = within(sidebar).getByRole('searchbox', { name: '搜索旁聊标题' });
     await user.type(search, '分页');
     expect(await within(sidebar).findByRole('button', { name: /分页项目 5/ })).toBeInTheDocument();
@@ -713,6 +715,35 @@ describe('Assistant durable tasks', () => {
     expect(closeHostWorkbenchEmbed).toHaveBeenCalledWith(nonce);
   });
 
+  it('reports and closes a native embed when window bounds cannot be applied', async () => {
+    mockCommon({ conversations: [conversation], hosts: [targetHost] });
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(private readonly callback: () => void) {}
+      observe() { this.callback(); }
+      disconnect() {}
+    });
+    const nonce = 'N'.repeat(32);
+    const openHostWorkbenchEmbed = vi.fn().mockResolvedValue({ hostID: targetHost.id, hostOrigin: targetHost.url,
+      conversationID: conversation.id, nonce, targets: ['browser', 'terminal', 'workspace', 'files', 'vscode'] });
+    const setHostWorkbenchBounds = vi.fn().mockRejectedValue(new Error('native view unavailable'));
+    const closeHostWorkbenchEmbed = vi.fn().mockResolvedValue({ closed: true });
+    Object.defineProperty(window, 'morde', { configurable: true, value: {
+      openHostWorkbenchEmbed, setHostWorkbenchBounds, sendHostWorkbenchCommand: vi.fn().mockResolvedValue({ sent: true }),
+      closeHostWorkbenchEmbed, onHostWorkbenchMessage: () => () => undefined,
+    } });
+    const user = userEvent.setup();
+    const { unmount } = renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
+    const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
+    await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
+
+    expect(await within(sidebar).findByText('云端电脑窗口布局失败，请关闭并重新打开云端电脑面板。')).toBeInTheDocument();
+    expect(openHostWorkbenchEmbed).toHaveBeenCalledOnce();
+    await waitFor(() => expect(closeHostWorkbenchEmbed).toHaveBeenCalledWith(nonce));
+    unmount();
+  });
+
   it('shows availability for the configured default without a computer selector', async () => {
     mockCommon({ conversations: [conversation], hosts: [targetHost], defaultHostID: targetHost.id });
     vi.spyOn(portalApi, 'issueHostEmbedTicket').mockResolvedValue({
@@ -727,7 +758,7 @@ describe('Assistant durable tasks', () => {
     const sidebar = await screen.findByRole('complementary', { name: '当前会话侧边栏' });
     await user.click(within(sidebar).getByRole('button', { name: '云端电脑' }));
 
-    expect(within(sidebar).getByRole('status')).toHaveTextContent(/正在(连接|加载)云端电脑/);
+    expect(await within(sidebar).findByText(/正在(连接|加载)云端电脑/)).toBeInTheDocument();
     expect(within(sidebar).queryByRole('combobox')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('选择目标电脑')).not.toBeInTheDocument();
   });
@@ -770,6 +801,119 @@ describe('Assistant durable tasks', () => {
     const activity = await findTaskActivity(task.id);
     expect(messageList!.querySelector('.task-activity')).not.toBeInTheDocument();
     expect(activity).toHaveTextContent('进行中');
+  });
+
+  it('treats a missing validation state as pending even when result review is published', async () => {
+    const taskWithoutValidation = { ...task, result_review: { state: 'published' as const, source_task_id: task.id,
+      source_task_revision: 1, source_event_sequence: 0, reply_message_id: reply.id } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithoutValidation);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const taskCard = document.querySelector<HTMLElement>(`.task-activity-card[data-task-id="${task.id}"]`)!;
+    expect(taskCard).not.toHaveTextContent('服务端校验已通过');
+    expect(taskCard).toHaveTextContent('校验：待校验');
+
+    const validation = within(activity).getByRole('region', { name: '任务校验' });
+    expect(validation).toHaveTextContent('待校验');
+    expect(validation).toHaveTextContent('尚未收到可确认的校验结论。');
+    expect(validation).not.toHaveTextContent('通过');
+  });
+
+  it.each([
+    { state: 'pending', label: '待校验', explanation: '尚未收到可确认的校验结论。' },
+    { state: 'PASS', label: '通过', explanation: '服务端校验已通过。' },
+    { state: 'PASS+NOTES', label: '通过（有备注）', explanation: '校验已通过，包含非阻塞备注。' },
+    { state: 'FAIL', label: '未通过', explanation: '服务端校验未通过。' },
+    { state: 'FUTURE_STATE', label: '未知状态', explanation: '服务端返回了无法识别的校验状态。' },
+  ])('shows only the overall $state validation state on the Task card and a short detail explanation', async ({ state, label, explanation }) => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, validation: { state } } as Task);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const taskCard = document.querySelector<HTMLElement>(`.task-activity-card[data-task-id="${task.id}"]`)!;
+    expect(taskCard).toHaveTextContent(`校验：${label}`);
+    expect(taskCard).not.toHaveTextContent(explanation);
+    expect(taskCard).not.toHaveTextContent('H01');
+    expect(taskCard).not.toHaveTextContent('证据引用');
+
+    const validation = within(activity).getByRole('region', { name: '任务校验' });
+    expect(validation).toHaveTextContent(label);
+    expect(validation).toHaveTextContent(explanation);
+    expect(validation).not.toHaveTextContent('H01');
+    expect(validation).not.toHaveTextContent('证据引用');
+  });
+
+  it('shows current-revision result evidence and loads linked step details only when opened', async () => {
+    const result = '响应时间改善：从 200ms 降至 100ms。';
+    const excerpt = '从 200ms 降至 100ms';
+    const startByte = new TextEncoder().encode(result.slice(0, result.indexOf(excerpt))).length;
+    const excerptBytes = new TextEncoder().encode(excerpt).length;
+    const baselineStepID = 's1111111';
+    const actionStepID = 's2222222';
+    const steps: Task['steps'] = [
+      { id: baselineStepID, sequence: 1, attempt: 1, retryable: false, kind: 'verification', status: 'succeeded', title: '采集基线', summary: '', created_at: timestamp, task_revision: 1 },
+      { id: actionStepID, sequence: 2, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded', title: '运行性能测试', summary: '', created_at: timestamp, task_revision: 1 },
+    ];
+    const currentTask: Task = { ...task, event_sequence: 4, current_revision: 1, desired_revision: 1, result, steps,
+      validation_detail: {
+        task_revision: 1, event_sequence: 4, result_sha256: 'a'.repeat(64),
+        claims: [{ claim_id: 'claim-1', start_byte: startByte, end_byte: startByte + excerptBytes, evidence_refs: [
+          { kind: 'source', id: message.id, task_revision: 1, sequence: message.sequence },
+          { kind: 'baseline', id: baselineStepID, task_revision: 1, sequence: 1 },
+          { kind: 'action', id: actionStepID, task_revision: 1, sequence: 2 },
+          { kind: 'before_after', id: actionStepID, task_revision: 1, sequence: 2 },
+        ], performance_comparison: { metric: '响应时间', unit: 'ms', before: 200, after: 100, delta: -100, environment: '测试机',
+          baseline_ref: { kind: 'baseline', id: baselineStepID, task_revision: 1, sequence: 1 },
+          after_ref: { kind: 'before_after', id: actionStepID, task_revision: 1, sequence: 2 } } }],
+      } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
+    const read = vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: actionStepID,
+      event_sequence: 4, tool_name: 'benchmark', detail_state: 'available', object: 'benchmark', input: 'run', result: '100ms', truncated: false });
+    const user = userEvent.setup();
+    renderPage();
+
+    const evidence = within(await findTaskActivity(task.id)).getByRole('region', { name: '结果与证据对应关系' });
+    expect(evidence).toHaveTextContent(excerpt);
+    expect(evidence).toHaveTextContent('只读证据索引，不代表独立校验通过。');
+    expect(within(evidence).getByRole('link', { name: '查看来源消息' })).toHaveAttribute('href', `#conversation-message-${message.id}`);
+    expect(evidence).toHaveTextContent(/响应时间，200 ms → 100 ms，\s*变化 -100 ms；环境：测试机/);
+    expect(read).not.toHaveBeenCalled();
+
+    await user.click(within(evidence).getAllByText('查看步骤详情：运行性能测试')[0]!);
+    await waitFor(() => expect(read).toHaveBeenCalledWith(task.id, actionStepID));
+    expect(await within(evidence).findByText('100ms')).toBeInTheDocument();
+  });
+
+  it.each([
+    { name: '旧修订', taskRevision: 0, eventSequence: 4 },
+    { name: '未来事件', taskRevision: 1, eventSequence: 5 },
+  ])('hides validation evidence bound to $name', async ({ taskRevision, eventSequence }) => {
+    const currentTask: Task = { ...task, event_sequence: 4, current_revision: 1, desired_revision: 1,
+      validation_detail: { task_revision: taskRevision, event_sequence: eventSequence, result_sha256: 'b'.repeat(64),
+        claims: [{ claim_id: 'claim-1', start_byte: 0, end_byte: 2, evidence_refs: [] }] } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    expect(within(activity).queryByRole('region', { name: '结果与证据对应关系' })).not.toBeInTheDocument();
+  });
+
+  it('does not render an invalid UTF-8 byte range from validation evidence', async () => {
+    const currentTask: Task = { ...task, event_sequence: 4, current_revision: 1, desired_revision: 1, result: '你好',
+      validation_detail: { task_revision: 1, event_sequence: 4, result_sha256: 'c'.repeat(64),
+        claims: [{ claim_id: 'claim-1', start_byte: 1, end_byte: 3, evidence_refs: [] }] } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
+    renderPage();
+
+    const evidence = within(await findTaskActivity(task.id)).getByRole('region', { name: '结果与证据对应关系' });
+    expect(evidence).toHaveTextContent('结果文本范围无效或暂不可用。');
+    expect(evidence).not.toHaveTextContent('你');
   });
 
   it('shows PC file-fetch progress without tickets and refreshes the deletion receipt', async () => {
@@ -948,7 +1092,8 @@ describe('Assistant durable tasks', () => {
     await user.selectOptions(screen.getByRole('combobox', { name: '选择 AI 模型' }), model.id);
     await waitFor(() => expect([...assistantDraftRecords.values()].some((draft) => draft.content === '乙会话草稿')).toBe(true));
 
-    await user.click(screen.getByText('旁聊'));
+    const sidebar = await screen.findByRole('complementary', { name: '对话' });
+    await user.click(within(sidebar).getByText('旁聊'));
     await user.click(await screen.findByRole('button', { name: '恢复草稿：甲会话草稿' }));
     await waitFor(() => expect(composer).toHaveValue('甲会话草稿'));
     expect(screen.getByRole('combobox', { name: '选择 AI 模型' })).toHaveValue(otherModel.id);
@@ -1181,70 +1326,66 @@ describe('Assistant durable tasks', () => {
     expect(commitUpload).not.toHaveBeenCalled();
   });
 
-  it('keeps model errors and retry controls in the scrollable conversation rather than the input area', async () => {
+  it('shows model errors in the top-left notice without retry controls', async () => {
     mockCommon();
     vi.mocked(portalApi.modelConnections).mockRejectedValueOnce(new Error('读取失败')).mockResolvedValue({ items: [model], configuration_status: 'configured' });
-    const user = userEvent.setup();
-    renderPage();
+    const view = renderPage();
 
-    const error = await screen.findByText(/无法读取模型：读取失败/);
+    const error = await screen.findByRole('alert');
     const composer = screen.getByRole('region', { name: '发送对话消息' });
+    expect(error).toHaveTextContent(/无法读取模型：读取失败/);
+    expect(error.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(composer).not.toContainElement(error);
-    expect(Array.from(composer.children, (child) => child.tagName)).toEqual(['FORM']);
-    await user.click(within(error).getByRole('button', { name: '重试' }));
+    expect(composer.querySelector('form')).toBeInTheDocument();
+    expect(within(error).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    await act(async () => { await view.client.invalidateQueries({ queryKey: ['model-connections'] }); });
     await waitFor(() => expect(screen.queryByText(/无法读取模型：读取失败/)).not.toBeInTheDocument());
   });
 
-  it('shows one consolidated retry notification when several assistant reads fail with network errors', async () => {
+  it('shows one consolidated top-left error when several assistant reads fail with network errors', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const networkFailure = () => Promise.reject(new SyntaxError('服务器响应格式异常'));
     vi.spyOn(portalApi, 'capabilities').mockImplementation(networkFailure);
     vi.spyOn(portalApi, 'conversations').mockImplementation(networkFailure);
     vi.spyOn(portalApi, 'modelConnections').mockImplementation(networkFailure);
-    vi.spyOn(portalApi, 'mcpConnectors').mockImplementation(networkFailure);
     vi.spyOn(portalApi, 'preferences').mockImplementation(networkFailure);
     vi.spyOn(portalApi, 'hosts').mockImplementation(networkFailure);
     renderPage();
 
     const error = await screen.findByRole('alert');
     expect(error).toHaveTextContent('网络异常，部分对话数据暂时无法读取。');
+    expect(error.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(error.closest('.assistant-page')).toBeNull();
-    expect(screen.getAllByRole('alert')).toHaveLength(1);
-    expect(within(error).getByRole('button', { name: '重试' })).toBeInTheDocument();
-    expect(screen.queryByText('工具连接暂不可用')).not.toBeInTheDocument();
+    expect(within(error).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    expect(screen.getAllByText('网络异常，部分对话数据暂时无法读取。')).toHaveLength(1);
     expect(screen.queryByText(/无法读取模型：/)).not.toBeInTheDocument();
   });
 
-  it('keeps the assistant page intact and opens a popup for one network read failure', async () => {
+  it('does not turn a transient tool-connector failure into a chat-data failure', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     vi.spyOn(portalApi, 'mcpConnectors').mockRejectedValue(new TypeError('Failed to fetch'));
     renderPage(null, true);
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('网络异常，部分对话数据暂时无法读取。');
-    expect(alert.closest('.notice-center-panel')?.closest('.assistant-page')).toBeNull();
-    expect(alert.closest('details')).toHaveAttribute('open');
-    expect(screen.queryByText('工具连接暂不可用')).not.toBeInTheDocument();
-    expect(screen.getByText('你好')).toBeInTheDocument();
+    const connectorError = await screen.findByText('工具连接暂不可用');
+    expect(connectorError).toBeVisible();
+    expect(screen.queryByText('网络异常，部分对话数据暂时无法读取。')).not.toBeInTheDocument();
     expect(await findReadyComposer()).toHaveValue('');
   });
 
-  it('shows main conversation initialization failures in a popup and retries with the same key', async () => {
+  it('shows main conversation initialization failures without a retry button', async () => {
     mockCommon({ mainConversation: { status: 'uninitialized', conversation_id: null, version: 0 } });
     const ensure = vi.mocked(portalApi.ensureMainConversation);
     ensure.mockRejectedValueOnce(new ApiError({ message: '服务暂不可用', code: 'service_unavailable', status: 503 }))
       .mockResolvedValue({ status: 'ready', conversation_id: conversation.id, version: 1 });
-    const user = userEvent.setup();
     renderPage(null, true);
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('服务暂不可用');
+    expect(alert.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(screen.getByText('正在初始化主会话…')).toBeInTheDocument();
     expect(screen.queryByText('初始化失败 · 可重试')).not.toBeInTheDocument();
-    await user.click(within(alert).getByRole('button', { name: '重试' }));
-    await waitFor(() => expect(ensure).toHaveBeenCalledTimes(2));
-    expect(ensure.mock.calls[0]?.[0]).toBe(ensure.mock.calls[1]?.[0]);
-    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(within(alert).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    expect(ensure).toHaveBeenCalledOnce();
   });
 
   it('keeps a main-conversation API error in the welcome state without service-status UI', async () => {
@@ -1255,10 +1396,10 @@ describe('Assistant durable tasks', () => {
     const user = userEvent.setup();
     renderPage();
 
-    expect(await screen.findByRole('heading', { name: '主会话暂不可用' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '暂时无法连接' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /查看服务状态/ })).not.toBeInTheDocument();
     expect(document.querySelector('.assistant-service-status-panel')).toBeNull();
-    await user.click(screen.getByRole('button', { name: '重试读取主会话' }));
+    await user.click(within(document.querySelector('.assistant-welcome')!).getByRole('button', { name: '重试读取主会话' }));
     await waitFor(() => expect(mainConversation).toHaveBeenCalledTimes(2));
     expect(await screen.findByRole('heading', { name: '选择主会话' })).toBeInTheDocument();
   });
@@ -1525,7 +1666,7 @@ describe('Assistant durable tasks', () => {
     expect(ensure.mock.calls[0]?.[0]).toMatch(/[A-Za-z0-9._~-]{8,128}/);
   });
 
-  it('keeps the main conversation placeholder and retries initialization from the popup while a side chat is selected', async () => {
+  it('keeps the main conversation placeholder and side chat available without a retry button', async () => {
     mockCommon({ mainConversation: { status: 'uninitialized', conversation_id: null, version: 0 } });
     const ensure = vi.mocked(portalApi.ensureMainConversation);
     ensure.mockRejectedValueOnce(new Error('offline'))
@@ -1534,16 +1675,17 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const sidebar = screen.getByRole('complementary', { name: '对话' });
-    const retry = await screen.findByRole('alert');
+    const error = await screen.findByRole('alert');
+    expect(error.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(within(sidebar).getByText('正在初始化…')).toBeInTheDocument();
     expect(within(sidebar).getByText('主会话')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '新建旁聊' }));
     expect(await screen.findByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
 
-    await user.click(within(retry).getByRole('button', { name: '重试' }));
-    expect(await within(sidebar).findByRole('button', { name: /主会话/ })).toBeInTheDocument();
+    expect(within(error).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    expect(within(sidebar).getByText('主会话')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '新旁聊' })).toBeInTheDocument();
-    expect(ensure).toHaveBeenCalledTimes(2);
+    expect(ensure).toHaveBeenCalledOnce();
   });
 
   it('keeps side conversations separate until the user explicitly chooses one as main', async () => {
@@ -1612,6 +1754,78 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
     expect(create).toHaveBeenCalledWith({ title: '新会话' }, expect.any(String), clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
     expect(accept.mock.calls[0]?.[1].time_zone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  });
+
+  it('reuses the first creation request while two messages in a new side conversation send independently', async () => {
+    mockCommon({ conversations: [{ ...conversation, id: 'cmain001' }] });
+    let finishCreate!: (value: Conversation) => void;
+    const creation = new Promise<Conversation>((resolve) => { finishCreate = resolve; });
+    const create = vi.spyOn(portalApi, 'createConversation').mockImplementation(() => creation);
+    let finishFirstMessage!: () => void;
+    const accept = vi.mocked(portalApi.acceptConversationMessage).mockImplementation(async (conversationID, body) => {
+      if (body.content === '第一条消息') await new Promise<void>((resolve) => { finishFirstMessage = resolve; });
+      return acceptedReceipt(conversationID, body);
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByRole('heading', { name: '主会话' });
+    await user.click(screen.getByRole('button', { name: '新建旁聊' }));
+    const composer = await findReadyComposer();
+    await user.type(composer, '第一条消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(create).toHaveBeenCalledOnce());
+    await waitFor(() => expect(composer).toHaveValue(''));
+    await user.type(composer, '第二条消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+    expect(create.mock.calls[0]?.[0]).toEqual({ title: '第一条消息' });
+    expect(create.mock.calls[1]).toEqual(create.mock.calls[0]);
+    expect(accept).not.toHaveBeenCalled();
+
+    await act(async () => finishCreate(conversation));
+    await waitFor(() => expect(accept).toHaveBeenCalledTimes(2));
+    const first = accept.mock.calls.find(([, body]) => body.content === '第一条消息');
+    const second = accept.mock.calls.find(([, body]) => body.content === '第二条消息');
+    expect(first?.[0]).toBe(conversation.id);
+    expect(second?.[0]).toBe(conversation.id);
+    expect(second?.[1].previous_client_message_id).toBe(first?.[1].client_message_id);
+    expect(second?.[1].client_message_id).not.toBe(first?.[1].client_message_id);
+    await act(async () => finishFirstMessage());
+  });
+
+  it('recovers a pending side conversation after remount and only sends on explicit retry', async () => {
+    mockCommon({ conversations: [{ ...conversation, id: 'cmain001' }] });
+    const create = vi.spyOn(portalApi, 'createConversation')
+      .mockRejectedValueOnce(new ApiError({ message: '连接中断', code: 'network_error', status: 503 }))
+      .mockResolvedValue(conversation);
+    const accept = vi.mocked(portalApi.acceptConversationMessage);
+    const user = userEvent.setup();
+    const view = renderPage();
+    const service = clientContract.capabilities.cloud_execution.service_instance_id;
+    const scope = messageOutboxScope(authUser.id, service);
+    await screen.findByRole('heading', { name: '主会话' });
+    await user.click(screen.getByRole('button', { name: '新建旁聊' }));
+    await user.type(await findReadyComposer(), '刷新后要重试的消息');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(async () => expect((await messageOutbox.read(scope))[0]?.status).toBe('unknown'));
+    const [pending] = await messageOutbox.read(scope);
+    expect(pending?.conversationID).toBeNull();
+    expect(pending?.conversationCreateKey).toBe(create.mock.calls[0]?.[1]);
+    expect(await findReadyComposer()).toHaveValue('');
+    view.unmount();
+
+    renderPage();
+    const sidebar = await screen.findByRole('complementary', { name: '对话' });
+    await user.click(within(sidebar).getByText('旁聊'));
+    await user.click(await within(sidebar).findByRole('button', { name: '恢复待发送消息：刷新后要重试的消息' }));
+    expect(await findReadyComposer()).toHaveValue('');
+    expect(within(screen.getByRole('article', { name: '你的消息' })).getByText('刷新后要重试的消息')).toBeInTheDocument();
+    expect(create).toHaveBeenCalledOnce();
+    expect(accept).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '重新发送这条消息' }));
+    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+    expect(create.mock.calls[1]).toEqual(create.mock.calls[0]);
+    expect(accept.mock.calls[0]?.slice(0, 3)).toEqual([conversation.id, pending?.request, pending?.request.client_message_id]);
   });
 
   it('does not recreate the local draft after it migrates to a new conversation', async () => {
@@ -1828,6 +2042,80 @@ describe('Assistant durable tasks', () => {
     expect(accept.mock.calls[0]![1].content).toBe('旧服务中的待发送消息');
   });
 
+  it('keeps text chat available and enables cloud execution only after confirmation', async () => {
+    mockCommon({ conversations: [conversation] });
+    vi.mocked(portalApi.execution).mockResolvedValue({ owner_id: authUser.id, state: 'disabled', epoch: 4, pending_task_count: 0,
+      runtime: { state: 'stopped', runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: timestamp });
+    const enabled = { owner_id: authUser.id, state: 'enabled' as const, epoch: 5, pending_task_count: 0,
+      runtime: { state: 'running' as const, runtime_id: 'rt1234567', runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: timestamp };
+    let resolveEnable!: (state: Awaited<ReturnType<typeof portalApi.enableExecution>>) => void;
+    const enable = vi.spyOn(portalApi, 'enableExecution').mockImplementation(() => new Promise((resolve) => { resolveEnable = resolve; }));
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByText(/云端任务尚未启用/)).toBeInTheDocument();
+    await user.type(await findReadyComposer(), '权限关闭时仍可对话');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+
+    await user.click(screen.getByRole('button', { name: '启用云端任务' }));
+    expect(await screen.findByRole('dialog', { name: '启用云端任务' })).toBeInTheDocument();
+    expect(enable).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '确认启用' }));
+    await waitFor(() => expect(enable).toHaveBeenCalledOnce());
+    expect(enable).toHaveBeenCalledWith(4, expect.any(String));
+    expect(screen.getByRole('button', { name: '处理中…' })).toBeDisabled();
+    resolveEnable(enabled);
+    await waitFor(() => expect(screen.queryByText(/云端任务尚未启用/)).not.toBeInTheDocument());
+  });
+
+  it('rechecks the epoch after a conflict and uses a new idempotency key', async () => {
+    const disabledAtEpoch4 = { owner_id: authUser.id, state: 'disabled' as const, epoch: 4, pending_task_count: 0,
+      runtime: { state: 'stopped' as const, runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: timestamp };
+    const disabledAtEpoch5 = { ...disabledAtEpoch4, epoch: 5 };
+    const enabledAtEpoch6 = { ...disabledAtEpoch4, state: 'enabled' as const, epoch: 6,
+      runtime: { state: 'running' as const, runtime_id: 'rt1234567', runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 } };
+    mockCommon();
+    vi.mocked(portalApi.execution).mockResolvedValueOnce(disabledAtEpoch4).mockResolvedValue(disabledAtEpoch5);
+    const enable = vi.spyOn(portalApi, 'enableExecution')
+      .mockRejectedValueOnce(new ApiError({ message: 'execution epoch conflict', code: 'execution_epoch_conflict', status: 409 }))
+      .mockResolvedValue(enabledAtEpoch6);
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: '启用云端任务' }));
+    await user.click(screen.getByRole('button', { name: '确认启用' }));
+    await waitFor(() => expect(enable).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/execution epoch conflict/)).toBeInTheDocument();
+    await waitFor(() => expect(portalApi.execution).toHaveBeenCalledTimes(2));
+
+    await user.click(screen.getByRole('button', { name: '确认启用' }));
+    await waitFor(() => expect(enable).toHaveBeenCalledTimes(2));
+    expect(enable).toHaveBeenNthCalledWith(1, 4, expect.any(String));
+    expect(enable).toHaveBeenNthCalledWith(2, 5, expect.any(String));
+    expect(enable.mock.calls[0]?.[1]).not.toBe(enable.mock.calls[1]?.[1]);
+    await waitFor(() => expect(screen.queryByText(/云端任务尚未启用/)).not.toBeInTheDocument());
+  });
+
+  it('refreshes execution status after an unknown enable response instead of blindly retrying', async () => {
+    const disabled = { owner_id: authUser.id, state: 'disabled' as const, epoch: 4, pending_task_count: 0,
+      runtime: { state: 'stopped' as const, runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: timestamp };
+    const enabled = { ...disabled, state: 'enabled' as const, epoch: 5,
+      runtime: { state: 'running' as const, runtime_id: 'rt1234567', runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 } };
+    mockCommon();
+    vi.mocked(portalApi.execution).mockResolvedValueOnce(disabled).mockResolvedValueOnce(enabled);
+    const enable = vi.spyOn(portalApi, 'enableExecution').mockRejectedValueOnce(new TypeError('connection lost'));
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: '启用云端任务' }));
+    await user.click(screen.getByRole('button', { name: '确认启用' }));
+
+    await waitFor(() => expect(portalApi.execution).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '启用云端任务' })).not.toBeInTheDocument());
+    expect(enable).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/云端任务尚未启用/)).not.toBeInTheDocument();
+  });
+
   it('rechecks service capability and retries the same locally saved message after an upgrade', async () => {
     const ready = clientContract.capabilities.cloud_execution;
     const legacy = { ...ready, supported_features: ready.supported_features.filter((feature) => feature !== 'conversation_auto_routing_v1') };
@@ -1843,7 +2131,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     await user.type(await findReadyComposer(), '旧服务升级后恢复');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    expect(screen.queryByText(/服务尚不支持自动分流，请升级后重试/)).not.toBeInTheDocument();
+    expect(await screen.findByText(/服务尚不支持自动分流，请升级后重试/)).toBeInTheDocument();
     const retry = await screen.findByRole('button', { name: '重新发送这条消息' });
     const originalRequest = accept.mock.calls[0]!;
     await user.click(retry);
@@ -2092,6 +2380,26 @@ describe('Assistant durable tasks', () => {
     expect(await findTaskActivity(secondTask.id)).toHaveTextContent('修订 1 / 1');
   });
 
+  it('hides the obsolete predecessor warning on supplemental task messages', async () => {
+    const running = { ...task, status: 'running' as const, result: null, finished_at: null };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(running);
+    vi.spyOn(portalApi, 'acceptConversationMessage').mockRejectedValue(
+      new ApiError({ message: '前一条消息尚未确认，请先核对后重试。', code: 'legacy_predecessor_error', status: 400 }),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    const activity = await findTaskActivity(running.id);
+    await user.click(within(activity).getByRole('button', { name: '补充任务' }));
+    const form = within(activity).getByRole('form', { name: '补充任务' });
+    await user.type(within(form).getByRole('textbox', { name: '补充任务内容' }), '继续检查');
+    await user.click(within(form).getByRole('button', { name: '发送补充任务' }));
+
+    expect(await within(activity).findByText(/补充消息：发送失败/)).toBeInTheDocument();
+    expect(within(activity).queryByText(/前一条消息尚未确认，请先核对后重试/)).not.toBeInTheDocument();
+  });
+
   it('lets the user choose an authorized Workspace and resume a waiting document Task', async () => {
     const workspace = {
       id: 'w7654321', name: '设计文档工作区', revision: 4, used_bytes: 0, quota_bytes: 10_000,
@@ -2162,7 +2470,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.getByRole('heading', { name: other.title })).toBeInTheDocument();
   });
 
-  it('recovers the current conversation sidebar after recent task loading fails', async () => {
+  it('shows recent task read errors globally without retry controls', async () => {
     mockCommon({ conversations: [conversation] });
     let recentReads = 0;
     const readTasks = vi.mocked(portalApi.conversationTasks).mockImplementation(async (_id, options) => {
@@ -2170,11 +2478,14 @@ describe('Assistant durable tasks', () => {
       return { items: [], next_cursor: null, pending_count: 0 };
     });
     const user = userEvent.setup();
-    renderPage();
+    const { client } = renderPage();
 
     await user.click(await screen.findByRole('button', { name: '打开侧边栏' }));
-    const recentError = await screen.findByText('已结束任务暂不可用。');
-    await user.click(within(recentError.parentElement!).getByRole('button', { name: '重试' }));
+    const recentError = await screen.findByRole('alert');
+    expect(recentError).toHaveTextContent('已结束任务暂不可用。');
+    expect(recentError.closest('.error-notice-overlay')).toBeInTheDocument();
+    expect(within(recentError).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    await act(async () => { await client.invalidateQueries({ queryKey: ['conversation-tasks', conversation.id, 'recent'] }); });
     await waitFor(() => expect(screen.queryByText('已结束任务暂不可用。')).not.toBeInTheDocument());
     expect(readTasks).toHaveBeenCalledWith(conversation.id, { view: 'recent' });
     expect(readTasks.mock.calls.filter(([, options]) => options?.view === 'recent')).toHaveLength(2);
@@ -2309,7 +2620,33 @@ describe('Assistant durable tasks', () => {
     expect(submit.mock.calls[1]).toEqual(firstCall);
   });
 
-  it('waits to route a later message until the earlier message receipt is confirmed', async () => {
+  it('reconciles a lost acceptance response by receipt without posting the message twice', async () => {
+    mockCommon({ conversations: [conversation] });
+    const submit = vi.spyOn(portalApi, 'acceptConversationMessage')
+      .mockRejectedValueOnce(new ApiError({ message: '连接中断', code: 'network_error', status: 503 }));
+    vi.mocked(portalApi.conversationMessages).mockImplementation(async (id, _cursor, clientMessageID) => {
+      const sent = submit.mock.calls[0];
+      return sent && sent[0] === id && sent[1].client_message_id === clientMessageID
+        ? { items: [acceptedReceipt(id, sent[1]).message], next_cursor: null }
+        : { items: [], next_cursor: null };
+    });
+    const serviceInstanceID = clientContract.capabilities.cloud_execution.service_instance_id;
+    const scope = messageOutboxScope(authUser.id, serviceInstanceID);
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(await findReadyComposer(), '回执丢失后自动核对');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => expect(portalApi.conversationMessages).toHaveBeenCalledWith(
+      conversation.id, undefined, expect.any(String), serviceInstanceID, authUser.id,
+    ));
+    await waitFor(async () => expect(await messageOutbox.read(scope)).toHaveLength(0));
+    expect(submit).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: '重新发送这条消息' })).not.toBeInTheDocument();
+    expect(screen.queryByText('前一条消息尚未确认，请先核对后重试。')).not.toBeInTheDocument();
+  });
+
+  it('sends a later message while its predecessor receipt is unknown', async () => {
     mockCommon({ conversations: [conversation] });
     const submit = vi.spyOn(portalApi, 'acceptConversationMessage')
       .mockRejectedValueOnce(new ApiError({ message: '连接中断', code: 'network_error', status: 503 }))
@@ -2322,10 +2659,32 @@ describe('Assistant durable tasks', () => {
     const firstCall = submit.mock.calls[0]!;
     await user.type(await findReadyComposer(), '后续消息');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
     expect(submit.mock.calls[0]).toEqual(firstCall);
-    expect(await screen.findByText(/前一条消息尚未确认/)).toBeInTheDocument();
-    expect(screen.getByText('后续消息')).toBeInTheDocument();
+    expect(submit.mock.calls[0]![1].content).toBe('第一条待确认');
+    expect(submit.mock.calls[1]![1]).toMatchObject({
+      content: '后续消息', previous_client_message_id: firstCall[1].client_message_id,
+    });
+    expect(screen.queryByText('前一条消息尚未确认，请先核对后重试。')).not.toBeInTheDocument();
+  });
+
+  it('clears the obsolete predecessor warning from messages already saved in the outbox', async () => {
+    mockCommon({ conversations: [conversation] });
+    const serviceInstanceID = clientContract.capabilities.cloud_execution.service_instance_id;
+    const scope = messageOutboxScope(authUser.id, serviceInstanceID);
+    const legacyError = '前一条消息尚未确认，请先核对后重试。';
+    const legacyMessage: PendingConversationMessage = {
+      actorID: authUser.id, serviceInstanceID, conversationID: conversation.id, attachments: [], status: 'sending',
+      error: legacyError, createdAt: Date.now(),
+      request: { client_message_id: 'legacy-msg-0001', content: '旧待发消息', previous_client_message_id: 'prior-msg-0001' },
+    };
+    await messageOutbox.update(scope, () => [legacyMessage]);
+    renderPage();
+
+    expect(await screen.findByText('旧待发消息')).toBeInTheDocument();
+    await waitFor(async () => expect((await messageOutbox.read(scope))[0]?.error).toBeUndefined());
+    expect((await messageOutbox.read(scope))[0]?.status).toBe('unknown');
+    expect(screen.queryByText(legacyError)).not.toBeInTheDocument();
   });
 
   it('keeps a message locally when the server detects a different authenticated account', async () => {
@@ -2337,7 +2696,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     await user.type(await findReadyComposer(), '账号切换前的内容');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    expect(screen.queryByText(/账号、服务或消息状态已变化，消息保留在本机/)).not.toBeInTheDocument();
+    expect(await screen.findByText(/账号、服务或消息状态已变化，消息保留在本机/)).toBeInTheDocument();
     expect(accept.mock.calls[0]?.[4]).toBe(authUser.id);
     expect(await screen.findByRole('button', { name: '重新发送这条消息' })).toBeEnabled();
     expect(screen.getByText('账号切换前的内容')).toBeInTheDocument();
@@ -2386,6 +2745,52 @@ describe('Assistant durable tasks', () => {
     expect(commit.mock.calls[0]?.slice(2)).toEqual([serviceID, authUser.id]);
     expect(associate).toHaveBeenCalledWith(conversation.id, expect.any(String), expect.any(String),
       'pa_0123456789abcdef0123456789abcdef', serviceID, authUser.id);
+  });
+
+  it('resumes an attachment upload from the server-reported missing chunks', async () => {
+    vi.stubGlobal('crypto', webcrypto);
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const submit = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    const replace = vi.spyOn(portalApi, 'replacePersonalObject').mockResolvedValue({
+      object_type: 'library_item', object_id: 'chat-large-upload', result_revision: 1, account_change_sequence: 1, replay: false,
+    });
+    const upload = vi.spyOn(portalApi, 'createPersonalAttachmentUpload')
+      .mockResolvedValueOnce({ upload_id: 'pu_0123456789abcdef0123456789abcdef', state: 'active', chunk_count: 2,
+        received_sequences: [], replay: false })
+      .mockResolvedValueOnce({ upload_id: 'pu_0123456789abcdef0123456789abcdef', state: 'active', chunk_count: 2,
+        received_sequences: [0], replay: true });
+    let interrupted = false;
+    const chunk = vi.spyOn(portalApi, 'putPersonalAttachmentChunk').mockImplementation(async (_uploadID, sequence) => {
+      if (sequence === 1 && !interrupted) {
+        interrupted = true;
+        throw new Error('synthetic chunk interruption');
+      }
+      return { upload_id: 'pu_0123456789abcdef0123456789abcdef', sequence, replay: false };
+    });
+    vi.spyOn(portalApi, 'commitPersonalAttachment').mockResolvedValue({
+      attachment_id: 'pa_0123456789abcdef0123456789abcdef', object_type: 'library_item', object_id: 'chat-large-upload',
+      result_revision: 2, account_change_sequence: 2, replay: false,
+    });
+    const associate = vi.spyOn(portalApi, 'associateConversationAttachment').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    renderPage();
+
+    const bytes = new Uint8Array(4 * 1024 * 1024 + 7);
+    await user.upload(await screen.findByLabelText('添加附件'), new File([bytes], 'large.docx', {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    }));
+    await user.type(await findReadyComposer(), '读取大文件');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    const retry = await screen.findByRole('button', { name: '重试附件' });
+    expect(await screen.findByText(/synthetic chunk interruption/)).toBeInTheDocument();
+    expect(submit).toHaveBeenCalledOnce();
+
+    await user.click(retry);
+    await waitFor(() => expect(associate).toHaveBeenCalledOnce());
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(upload.mock.calls[1]?.[1]).toBe(upload.mock.calls[0]?.[1]);
+    expect(chunk.mock.calls.map((call) => call[1])).toEqual([0, 1, 1]);
+    expect(replace.mock.calls[1]?.[4]).toBe(replace.mock.calls[0]?.[4]);
   });
 
   it('extracts PDF text locally and uploads only the bounded text derivative to the Task', async () => {
@@ -2606,10 +3011,11 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText('已保存，等待接收')).not.toBeInTheDocument();
   });
 
-  it.each([
-    ['pending', null], ['processing', null],
-    ['waiting_user', null], ['failed', null],
-  ] as const)('keeps routine routing label %s out of the user message', async (routingStatus, label) => {
+  const routingStatusCases: Array<[NonNullable<ConversationMessage['routing_status']>, string | null]> = [
+    ['pending', null], ['processing', null], ['waiting_user', null], ['failed', '处理暂时不可用'],
+  ];
+
+  it.each(routingStatusCases)('keeps routine routing label %s out of the user message', async (routingStatus, label) => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined, routing_status: routingStatus, delivery_status: 'pending' }] });
     renderPage();
     if (routingStatus === 'waiting_user') {
@@ -2620,7 +3026,6 @@ describe('Assistant durable tasks', () => {
       expect(status.closest('.chat-message')).toBeNull();
     }
     else if (routingStatus === 'failed') {
-      expect(screen.queryByText('消息处理失败')).not.toBeInTheDocument();
       expect(await screen.findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
     } else {
       expect(screen.queryByText('此消息 · 已受理，等待处理')).not.toBeInTheDocument();
@@ -2702,7 +3107,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText(/等待你补充任务信息/)).not.toBeInTheDocument();
   });
 
-  it('shows duplicate association and original Task status without asking for confirmation', async () => {
+  it('hides duplicate association text without asking for confirmation', async () => {
     const duplicate = { ...message, id: 'm2345678', sequence: 2, task_id: undefined,
       duplicate_of_message_id: 'm7654321', related_task_id: 'q7654321',
       routing_status: 'waiting_user' as const, delivery_status: 'pending' as const };
@@ -2711,7 +3116,8 @@ describe('Assistant durable tasks', () => {
     vi.mocked(portalApi.task).mockResolvedValue(relatedTask);
     renderPage();
 
-    expect(await screen.findByText(`重复请求 · 原消息 m7654321 · 关联任务“${task.objective}” · 进行中`)).toBeInTheDocument();
+    await screen.findByText(message.content);
+    expect(screen.queryByText(/重复请求 · 原消息 m7654321/)).not.toBeInTheDocument();
     expect(screen.queryByText(/等待你补充任务信息/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
@@ -2723,7 +3129,7 @@ describe('Assistant durable tasks', () => {
       .mockRejectedValueOnce(new Error('连接中断')).mockResolvedValueOnce(undefined);
     const user = userEvent.setup();
     renderPage();
-    expect(screen.queryByText('模型暂时不可用或用量待核对')).not.toBeInTheDocument();
+    expect(await screen.findByText('模型暂时不可用或用量待核对')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
     await screen.findByText('连接中断');
     await user.click(screen.getByRole('button', { name: '重新处理这条消息' }));
@@ -2740,15 +3146,82 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
-  it('keeps an oversized failed message visible without inline failure details', async () => {
+  it('reuses an accepted processing retry key after remount while the server still reports failure', async () => {
+    mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined,
+      routing_status: 'failed', routing_failure_reason: 'model_unavailable', delivery_status: 'pending' }] });
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    const firstView = renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    await screen.findByText('正在重新处理消息');
+    const key = retry.mock.calls[0]![2];
+    firstView.unmount();
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    expect(retry.mock.calls[1]![2]).toBe(key);
+  });
+
+  it('rotates the processing retry key after the server confirms routing progress', async () => {
+    let currentMessage: ConversationMessage = { ...message, task_id: undefined, routing_status: 'failed',
+      routing_failure_reason: 'model_unavailable', delivery_status: 'pending' };
+    mockCommon({ conversations: [conversation], messages: [currentMessage] });
+    vi.mocked(portalApi.conversationMessages).mockImplementation(async () => ({ items: [currentMessage], next_cursor: null }));
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    const { client } = renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    const firstKey = retry.mock.calls[0]![2];
+
+    currentMessage = { ...currentMessage, routing_status: 'processing', routing_failure_reason: undefined };
+    await act(async () => { await client.invalidateQueries({ queryKey: ['conversation-messages', conversation.id] }); });
+    await waitFor(() => expect(screen.queryByText('正在重新处理消息')).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+
+    currentMessage = { ...currentMessage, routing_status: 'failed', routing_failure_reason: 'model_unavailable' };
+    await act(async () => { await client.invalidateQueries({ queryKey: ['conversation-messages', conversation.id] }); });
+    await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    expect(retry.mock.calls[1]![2]).not.toBe(firstKey);
+  });
+
+  it('keeps result review retry idempotency scoped to the task until review progress is persisted', async () => {
+    const failedReviewTask: Task = { ...task, status: 'completed', result_review: {
+      state: 'failed', source_task_id: task.id, source_task_revision: 1, source_event_sequence: 1,
+      reply_message_id: null, trigger_message_id: message.id,
+    } };
+    mockCommon({ conversations: [conversation], messages: [{ ...message, routing_status: 'routed' }] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(failedReviewTask);
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    const firstView = renderPage();
+
+    const firstDetail = await findTaskActivity(task.id);
+    await user.click(within(firstDetail).getByRole('button', { name: '重试结果整理' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    const key = retry.mock.calls[0]![2];
+    firstView.unmount();
+
+    renderPage();
+    const secondDetail = await findTaskActivity(task.id);
+    await user.click(within(secondDetail).getByRole('button', { name: '重试结果整理' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    expect(retry.mock.calls[1]![2]).toBe(key);
+  });
+
+  it('explains why an oversized failed message needs a shorter retry', async () => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined,
       routing_status: 'failed', routing_failure_reason: 'message_too_long', delivery_status: 'pending' }] });
     renderPage();
     await screen.findByText(message.content);
     const article = document.querySelector<HTMLElement>('.chat-message-row-user .chat-message')!;
     expect(within(article).getByText(message.content)).toBeInTheDocument();
-    expect(within(article).queryByText('消息处理失败')).not.toBeInTheDocument();
-    expect(within(article).queryByText(/超过当前模型输入上限/)).not.toBeInTheDocument();
+    expect(screen.getByText('消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
@@ -4068,7 +4541,7 @@ describe('Assistant durable tasks', () => {
     await user.type(composer, '等待服务身份');
     expect(screen.getByRole('button', { name: '发送' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '发送' }));
-    expect(await screen.findByText(/已保存在本机，等待发送/)).toBeInTheDocument();
+    expect(await screen.findByText(/等待确认原服务和账号/)).toBeInTheDocument();
     expect(screen.queryByRole('img', { name: '主 Agent 已接下，正在处理' })).not.toBeInTheDocument();
     expect(within(screen.getByRole('article', { name: '你的消息' })).getByRole('status'))
       .toHaveTextContent(/等待确认原服务和账号/);

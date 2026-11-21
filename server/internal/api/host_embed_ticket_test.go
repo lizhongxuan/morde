@@ -65,6 +65,27 @@ func TestHostEmbedTicketEndpointBindsTrustedContextAndIsNoStore(t *testing.T) {
 	}
 }
 
+func TestHostEmbedTicketEndpointRejectsSessionThatMustChangePassword(t *testing.T) {
+	services := newServices()
+	services.verifier = verifierStub{mustChange: true}
+	deps := services.deps()
+	sharing := &embedTicketHostSharing{}
+	deps.HostSharing = sharing
+	deps.Conversations = &conversationServiceStub{}
+	options := validOptions()
+	options.ServiceInstanceID = "11111111-1111-4111-8111-111111111111"
+	router, err := New(deps, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := requestWithCookieBody(router, http.MethodPost, "/api/hosts/"+testHostID+"/embed-tickets",
+		`{"conversation_id":"c1234567","target":"browser","targets":["browser"]}`,
+		&http.Cookie{Name: portalCookieName, Value: sessionCredential()}, "https://portal.example.test")
+	if response.Code != http.StatusForbidden || sharing.calls != 0 {
+		t.Fatalf("issue embed ticket before required password change = %d %s, calls=%d", response.Code, response.Body.String(), sharing.calls)
+	}
+}
+
 func TestHostEmbedTicketEndpointRejectsUntrustedOrIncompleteRequests(t *testing.T) {
 	services := newServices()
 	deps := services.deps()

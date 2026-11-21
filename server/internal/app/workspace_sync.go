@@ -215,7 +215,7 @@ func (s *WorkspaceSyncService) SetWorkspaceCurrentManifestVerifier(verifier Work
 
 func (s *WorkspaceSyncService) SetWorkspaceCurrentDirectory(directory WorkspaceCurrentDirectory) error {
 	if s == nil || directory == nil {
-		return errors.New("Workspace current directory is required")
+		return errors.New("workspace current directory is required")
 	}
 	s.currentDirectory = directory
 	return nil
@@ -341,7 +341,7 @@ func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(
 			return err
 		}
 		if liveDirectory {
-			return fmt.Errorf("Workspace %s has an active receive reservation; resolve it before enabling the live directory source", reservation.WorkspaceID)
+			return fmt.Errorf("workspace %s has an active receive reservation; resolve it before enabling the live directory source", reservation.WorkspaceID)
 		}
 		if err := s.AbortWorkspaceSyncReceive(ctx, reservation.OwnerID, reservation.ID); err != nil {
 			return fmt.Errorf("recover active Workspace %s receive reservation: %w", reservation.WorkspaceID, err)
@@ -363,7 +363,7 @@ func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(
 			}
 			if liveDirectory {
 				if item.DesiredRevision != item.AppliedRevision {
-					return fmt.Errorf("Workspace %s has a pending revision materialization; resolve it before enabling the live directory source", item.WorkspaceID)
+					return fmt.Errorf("workspace %s has a pending revision materialization; resolve it before enabling the live directory source", item.WorkspaceID)
 				}
 				afterWorkspaceID = item.WorkspaceID
 				continue

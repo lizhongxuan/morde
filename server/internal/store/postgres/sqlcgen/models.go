@@ -903,20 +903,24 @@ type ModelAccountBudget struct {
 }
 
 type ModelCallLedger struct {
-	OwnerID        string             `json:"owner_id"`
-	Source         string             `json:"source"`
-	CallID         string             `json:"call_id"`
-	RequestDigest  []byte             `json:"request_digest"`
-	ModelID        string             `json:"model_id"`
-	ProviderModel  string             `json:"provider_model"`
-	TaskID         pgtype.Text        `json:"task_id"`
-	ReservedTokens int64              `json:"reserved_tokens"`
-	State          string             `json:"state"`
-	InputTokens    pgtype.Int8        `json:"input_tokens"`
-	OutputTokens   pgtype.Int8        `json:"output_tokens"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	SettledAt      pgtype.Timestamptz `json:"settled_at"`
-	PersonalModel  bool               `json:"personal_model"`
+	OwnerID                   string             `json:"owner_id"`
+	Source                    string             `json:"source"`
+	CallID                    string             `json:"call_id"`
+	RequestDigest             []byte             `json:"request_digest"`
+	ModelID                   string             `json:"model_id"`
+	ProviderModel             string             `json:"provider_model"`
+	TaskID                    pgtype.Text        `json:"task_id"`
+	ReservedTokens            int64              `json:"reserved_tokens"`
+	State                     string             `json:"state"`
+	InputTokens               pgtype.Int8        `json:"input_tokens"`
+	OutputTokens              pgtype.Int8        `json:"output_tokens"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	SettledAt                 pgtype.Timestamptz `json:"settled_at"`
+	PersonalModel             bool               `json:"personal_model"`
+	ReviewTaskRevision        pgtype.Int8        `json:"review_task_revision"`
+	ReviewResultEventSequence pgtype.Int8        `json:"review_result_event_sequence"`
+	ReviewResultSha256        []byte             `json:"review_result_sha256"`
+	ReviewClaimGeneration     pgtype.Int8        `json:"review_claim_generation"`
 }
 
 type ModelConnection struct {
@@ -1973,31 +1977,33 @@ type TaskMediaStagedObject struct {
 }
 
 type TaskModelCallResponse struct {
-	OwnerID              string             `json:"owner_id"`
-	Source               string             `json:"source"`
-	CallID               string             `json:"call_id"`
-	TaskID               string             `json:"task_id"`
-	TaskOwnerID          string             `json:"task_owner_id"`
-	InitiatorID          string             `json:"initiator_id"`
-	ProjectID            string             `json:"project_id"`
-	PersonalModel        bool               `json:"personal_model"`
-	AgentInstanceID      string             `json:"agent_instance_id"`
-	AgentGeneration      int64              `json:"agent_generation"`
-	AgentSessionID       string             `json:"agent_session_id"`
-	AgentRootSessionID   string             `json:"agent_root_session_id"`
-	LeaseOwner           string             `json:"lease_owner"`
-	LeaseVersion         int64              `json:"lease_version"`
-	AuthorizationVersion int64              `json:"authorization_version"`
-	ThroughSequence      int64              `json:"through_sequence"`
-	EngineVersion        string             `json:"engine_version"`
-	ProfileVersion       string             `json:"profile_version"`
-	ModelID              string             `json:"model_id"`
-	ProviderModel        string             `json:"provider_model"`
-	ConnectionVersion    pgtype.Timestamptz `json:"connection_version"`
-	RequestDigest        []byte             `json:"request_digest"`
-	ResponseCiphertext   []byte             `json:"response_ciphertext"`
-	ResponseDigest       []byte             `json:"response_digest"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	OwnerID               string             `json:"owner_id"`
+	Source                string             `json:"source"`
+	CallID                string             `json:"call_id"`
+	TaskID                string             `json:"task_id"`
+	TaskOwnerID           string             `json:"task_owner_id"`
+	InitiatorID           string             `json:"initiator_id"`
+	ProjectID             string             `json:"project_id"`
+	PersonalModel         bool               `json:"personal_model"`
+	AgentInstanceID       string             `json:"agent_instance_id"`
+	AgentGeneration       int64              `json:"agent_generation"`
+	AgentSessionID        string             `json:"agent_session_id"`
+	AgentRootSessionID    string             `json:"agent_root_session_id"`
+	LeaseOwner            string             `json:"lease_owner"`
+	LeaseVersion          int64              `json:"lease_version"`
+	AuthorizationVersion  int64              `json:"authorization_version"`
+	ThroughSequence       int64              `json:"through_sequence"`
+	EngineVersion         string             `json:"engine_version"`
+	ProfileVersion        string             `json:"profile_version"`
+	ModelID               string             `json:"model_id"`
+	ProviderModel         string             `json:"provider_model"`
+	ConnectionVersion     pgtype.Timestamptz `json:"connection_version"`
+	RequestDigest         []byte             `json:"request_digest"`
+	ResponseCiphertext    []byte             `json:"response_ciphertext"`
+	ResponseDigest        []byte             `json:"response_digest"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	ProviderEndpoint      pgtype.Text        `json:"provider_endpoint"`
+	ProviderReportedModel pgtype.Text        `json:"provider_reported_model"`
 }
 
 type TaskOperation struct {
@@ -2150,16 +2156,17 @@ type TaskStep struct {
 }
 
 type TaskStepDetail struct {
-	TaskID            string             `json:"task_id"`
-	OwnerID           string             `json:"owner_id"`
-	StepID            string             `json:"step_id"`
-	TaskRevision      int64              `json:"task_revision"`
-	PayloadCiphertext []byte             `json:"payload_ciphertext"`
-	PayloadSha256     []byte             `json:"payload_sha256"`
-	PayloadSizeBytes  int32              `json:"payload_size_bytes"`
-	Truncated         bool               `json:"truncated"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	TaskID                string             `json:"task_id"`
+	OwnerID               string             `json:"owner_id"`
+	StepID                string             `json:"step_id"`
+	TaskRevision          int64              `json:"task_revision"`
+	PayloadCiphertext     []byte             `json:"payload_ciphertext"`
+	PayloadSha256         []byte             `json:"payload_sha256"`
+	PayloadSizeBytes      int32              `json:"payload_size_bytes"`
+	Truncated             bool               `json:"truncated"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	ContentEvidenceSha256 []byte             `json:"content_evidence_sha256"`
 }
 
 type TaskStepRetryIntent struct {
@@ -2207,6 +2214,67 @@ type TaskStopRequest struct {
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
+type TaskValidationReview struct {
+	TaskID                     string             `json:"task_id"`
+	OwnerID                    string             `json:"owner_id"`
+	TaskRevision               int64              `json:"task_revision"`
+	ResultEventSequence        int64              `json:"result_event_sequence"`
+	ResultSha256               []byte             `json:"result_sha256"`
+	State                      string             `json:"state"`
+	Attempts                   int32              `json:"attempts"`
+	ClaimGeneration            int64              `json:"claim_generation"`
+	AvailableAt                pgtype.Timestamptz `json:"available_at"`
+	LeaseOwner                 pgtype.Text        `json:"lease_owner"`
+	LeaseExpiresAt             pgtype.Timestamptz `json:"lease_expires_at"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	ReviewerSessionID          pgtype.Text        `json:"reviewer_session_id"`
+	ExecutionModelID           pgtype.Text        `json:"execution_model_id"`
+	ExecutionConnectionVersion pgtype.Timestamptz `json:"execution_connection_version"`
+	ExecutionEndpoint          pgtype.Text        `json:"execution_endpoint"`
+	ExecutionConfiguredModel   pgtype.Text        `json:"execution_configured_model"`
+	ExecutionReportedModel     pgtype.Text        `json:"execution_reported_model"`
+	ExecutionModelFamily       pgtype.Text        `json:"execution_model_family"`
+	ExecutionCatalogVersion    pgtype.Text        `json:"execution_catalog_version"`
+	ReviewerModelID            pgtype.Text        `json:"reviewer_model_id"`
+	ReviewerConnectionVersion  pgtype.Timestamptz `json:"reviewer_connection_version"`
+	ReviewerEndpoint           pgtype.Text        `json:"reviewer_endpoint"`
+	ReviewerConfiguredModel    pgtype.Text        `json:"reviewer_configured_model"`
+	ReviewerReportedModel      pgtype.Text        `json:"reviewer_reported_model"`
+	ReviewerModelFamily        pgtype.Text        `json:"reviewer_model_family"`
+	ReviewerCatalogVersion     pgtype.Text        `json:"reviewer_catalog_version"`
+	ReviewReport               []byte             `json:"review_report"`
+	ReviewedAt                 pgtype.Timestamptz `json:"reviewed_at"`
+	ExecutionModelCallID       pgtype.Text        `json:"execution_model_call_id"`
+	ValidationState            string             `json:"validation_state"`
+}
+
+type TaskValidationReviewModelResponse struct {
+	OwnerID               string             `json:"owner_id"`
+	Source                string             `json:"source"`
+	CallID                string             `json:"call_id"`
+	TaskID                string             `json:"task_id"`
+	TaskRevision          int64              `json:"task_revision"`
+	ResultEventSequence   int64              `json:"result_event_sequence"`
+	ResultSha256          []byte             `json:"result_sha256"`
+	ClaimGeneration       int64              `json:"claim_generation"`
+	LeaseOwner            string             `json:"lease_owner"`
+	SessionID             string             `json:"session_id"`
+	ThroughSequence       int64              `json:"through_sequence"`
+	ModelID               string             `json:"model_id"`
+	ProviderModel         string             `json:"provider_model"`
+	ConnectionVersion     pgtype.Timestamptz `json:"connection_version"`
+	ProjectID             string             `json:"project_id"`
+	PersonalModel         bool               `json:"personal_model"`
+	RequestDigest         []byte             `json:"request_digest"`
+	ResponseCiphertext    []byte             `json:"response_ciphertext"`
+	ResponseDigest        []byte             `json:"response_digest"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	ResponseTextSha256    []byte             `json:"response_text_sha256"`
+	ProviderEndpoint      pgtype.Text        `json:"provider_endpoint"`
+	ProviderReportedModel pgtype.Text        `json:"provider_reported_model"`
+}
+
 type TaskWorkbenchObservationTicket struct {
 	TicketHash        []byte             `json:"ticket_hash"`
 	NonceHash         []byte             `json:"nonce_hash"`
@@ -2236,17 +2304,18 @@ type TaskWorkspaceGrantFence struct {
 }
 
 type TaskWorkspacePublishReceipt struct {
-	TaskID            string             `json:"task_id"`
-	OwnerID           string             `json:"owner_id"`
-	WorkspaceID       string             `json:"workspace_id"`
-	OperationKey      string             `json:"operation_key"`
-	RequestHash       []byte             `json:"request_hash"`
-	BaseRevision      int64              `json:"base_revision"`
-	State             string             `json:"state"`
-	ManifestSha256    pgtype.Text        `json:"manifest_sha256"`
-	PublishedRevision pgtype.Int8        `json:"published_revision"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	TaskID                string             `json:"task_id"`
+	OwnerID               string             `json:"owner_id"`
+	WorkspaceID           string             `json:"workspace_id"`
+	OperationKey          string             `json:"operation_key"`
+	RequestHash           []byte             `json:"request_hash"`
+	BaseRevision          int64              `json:"base_revision"`
+	State                 string             `json:"state"`
+	ManifestSha256        pgtype.Text        `json:"manifest_sha256"`
+	PublishedRevision     pgtype.Int8        `json:"published_revision"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	DirectDirectorySource bool               `json:"direct_directory_source"`
 }
 
 type TaskWorkspaceViewDeletion struct {

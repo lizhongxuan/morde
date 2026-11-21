@@ -16,10 +16,12 @@ import (
 const MaxTaskModelResponseCiphertext = 8 << 20
 
 type TaskModelResponseRecord struct {
-	AgentInstanceID string
-	AgentGeneration int64
-	Ciphertext      []byte
-	Digest          []byte
+	AgentInstanceID       string
+	AgentGeneration       int64
+	ProviderEndpoint      string
+	ProviderReportedModel string
+	Ciphertext            []byte
+	Digest                []byte
 }
 
 type TaskModelResponseStore interface {
@@ -47,11 +49,13 @@ type taskModelResponseIdentity struct {
 }
 
 type taskModelResponseBody struct {
-	Reasoning  string          `json:"reasoning"`
-	Text       string          `json:"text"`
-	ToolCalls  []taskModelCall `json:"tool_calls"`
-	Usage      ModelUsage      `json:"usage"`
-	StopReason string          `json:"stop_reason"`
+	Reasoning             string          `json:"reasoning"`
+	Text                  string          `json:"text"`
+	ToolCalls             []taskModelCall `json:"tool_calls"`
+	Usage                 ModelUsage      `json:"usage"`
+	StopReason            string          `json:"stop_reason"`
+	ProviderEndpoint      string          `json:"provider_endpoint,omitempty"`
+	ProviderReportedModel string          `json:"provider_reported_model,omitempty"`
 }
 
 type taskModelCall struct {
@@ -70,7 +74,7 @@ type taskModelResponseEnvelope struct {
 func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseIdentity, []byte, error) {
 	if reservation.Source != ModelCallTask || reservation.Task == nil || reservation.OwnerID != reservation.Task.InitiatorID ||
 		!domain.ValidUserID(reservation.OwnerID) || !domain.ValidUserID(reservation.Task.OwnerID) || !domain.ValidTaskID(reservation.Task.TaskID) ||
-		!domain.ValidModelConnectionID(reservation.ModelID) || len(reservation.RequestDigest) != sha256.Size ||
+		!domain.ValidModelConnectionID(reservation.ModelID) || taskValidationModelIdentityRouteKey(reservation.ProviderEndpoint) == "" || len(reservation.RequestDigest) != sha256.Size ||
 		len(reservation.ProviderModel) == 0 || len(reservation.ProviderModel) > 256 || reservation.ConnectionVersion.IsZero() ||
 		reservation.Task.AgentGeneration < 1 || reservation.Task.AgentInstanceID == "" || len(reservation.Task.AgentInstanceID) > 128 ||
 		!dshModelIdentityPattern.MatchString(reservation.Task.AgentSessionID) ||
@@ -107,7 +111,9 @@ func SealTaskModelResponse(sealer *Sealer, reservation ModelCallReservation, res
 	if sealer == nil || !ValidDSHModelResponse(response) {
 		return TaskModelResponseRecord{}, domain.InvalidArgument("task_model_response", "task model response is invalid")
 	}
-	body := taskModelResponseBody{Reasoning: response.Reasoning, Text: response.Text, Usage: response.Usage, StopReason: response.StopReason}
+	body := taskModelResponseBody{Reasoning: response.Reasoning, Text: response.Text, Usage: response.Usage,
+		StopReason: response.StopReason, ProviderEndpoint: reservation.ProviderEndpoint,
+		ProviderReportedModel: response.ProviderReportedModel}
 	if len(response.ToolCalls) != 0 {
 		body.ToolCalls = make([]taskModelCall, len(response.ToolCalls))
 		for index, call := range response.ToolCalls {
@@ -128,7 +134,8 @@ func SealTaskModelResponse(sealer *Sealer, reservation ModelCallReservation, res
 	}
 	digest := sha256.Sum256(plain)
 	return TaskModelResponseRecord{AgentInstanceID: reservation.Task.AgentInstanceID,
-		AgentGeneration: reservation.Task.AgentGeneration, Ciphertext: ciphertext, Digest: append([]byte(nil), digest[:]...)}, nil
+		AgentGeneration: reservation.Task.AgentGeneration, ProviderEndpoint: reservation.ProviderEndpoint,
+		ProviderReportedModel: response.ProviderReportedModel, Ciphertext: ciphertext, Digest: append([]byte(nil), digest[:]...)}, nil
 }
 
 func OpenTaskModelResponse(sealer *Sealer, record TaskModelResponseRecord, reservation ModelCallReservation) (ModelResponse, error) {
@@ -138,6 +145,10 @@ func OpenTaskModelResponse(sealer *Sealer, record TaskModelResponseRecord, reser
 		record.AgentGeneration == reservation.Task.AgentGeneration && record.AgentInstanceID != reservation.Task.AgentInstanceID ||
 		len(record.Ciphertext) == 0 || len(record.Ciphertext) > MaxTaskModelResponseCiphertext || len(record.Digest) != sha256.Size {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "stored task model response identity is invalid")
+	}
+	if record.ProviderEndpoint != "" && record.ProviderEndpoint != reservation.ProviderEndpoint ||
+		record.ProviderReportedModel != "" && !ValidProviderReportedModel(record.ProviderReportedModel) {
+		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "stored task model response provider identity is invalid")
 	}
 	plain, err := sealer.openWithAAD(record.Ciphertext, aad)
 	if err != nil {
@@ -160,7 +171,8 @@ func OpenTaskModelResponse(sealer *Sealer, record TaskModelResponseRecord, reser
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "stored task model response has trailing data")
 	}
 	response := ModelResponse{Reasoning: envelope.Response.Reasoning, Text: envelope.Response.Text,
-		Usage: envelope.Response.Usage, StopReason: envelope.Response.StopReason}
+		Usage: envelope.Response.Usage, StopReason: envelope.Response.StopReason,
+		ProviderReportedModel: envelope.Response.ProviderReportedModel}
 	if len(envelope.Response.ToolCalls) != 0 {
 		response.ToolCalls = make([]ModelToolCall, len(envelope.Response.ToolCalls))
 		for index, call := range envelope.Response.ToolCalls {
@@ -169,6 +181,10 @@ func OpenTaskModelResponse(sealer *Sealer, record TaskModelResponseRecord, reser
 	}
 	if !ValidDSHModelResponse(response) {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "stored task model response is invalid")
+	}
+	if record.ProviderReportedModel != "" && record.ProviderReportedModel != response.ProviderReportedModel ||
+		record.ProviderEndpoint != "" && envelope.Response.ProviderEndpoint != record.ProviderEndpoint {
+		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "stored task model response provider identity changed")
 	}
 	return response, nil
 }

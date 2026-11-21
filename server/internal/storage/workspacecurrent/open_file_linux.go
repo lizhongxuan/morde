@@ -12,16 +12,28 @@ import (
 )
 
 func openWorkspaceCurrentFile(root, relativePath string) (*os.File, error) {
+	return openWorkspaceCurrentPath(root, relativePath, unix.O_RDONLY)
+}
+
+func openWorkspaceCurrentDirectory(root, relativePath string) (*os.File, error) {
+	return openWorkspaceCurrentPath(root, relativePath, unix.O_PATH|unix.O_DIRECTORY)
+}
+
+func openWorkspaceCurrentPath(root, relativePath string, flags int) (*os.File, error) {
 	rootFD, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
+	openFlags := flags | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	if flags&unix.O_PATH == 0 {
+		openFlags |= unix.O_NONBLOCK
+	}
 	fd, err := unix.Openat2(rootFD, filepath.ToSlash(relativePath), &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
+		Flags:   uint64(openFlags),
 		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if errors.Is(err, unix.ENOSYS) {
-		fd, err = openWorkspaceCurrentFileWithoutOpenat2(rootFD, relativePath)
+		fd, err = openWorkspaceCurrentPathWithoutOpenat2(rootFD, relativePath, flags)
 	}
 	closeErr := unix.Close(rootFD)
 	if err != nil {
@@ -33,7 +45,7 @@ func openWorkspaceCurrentFile(root, relativePath string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), relativePath), nil
 }
 
-func openWorkspaceCurrentFileWithoutOpenat2(rootFD int, relativePath string) (int, error) {
+func openWorkspaceCurrentPathWithoutOpenat2(rootFD int, relativePath string, finalFlags int) (int, error) {
 	if relativePath == "" || filepath.IsAbs(relativePath) {
 		return -1, ErrUnsafePath
 	}
@@ -46,11 +58,14 @@ func openWorkspaceCurrentFileWithoutOpenat2(rootFD int, relativePath string) (in
 			}
 			return -1, ErrUnsafePath
 		}
-		flags := unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
+		flags := unix.O_CLOEXEC | unix.O_NOFOLLOW
 		if index < len(components)-1 {
 			flags |= unix.O_PATH | unix.O_DIRECTORY
 		} else {
-			flags |= unix.O_RDONLY
+			flags |= finalFlags
+		}
+		if flags&unix.O_PATH == 0 {
+			flags |= unix.O_NONBLOCK
 		}
 		fd, err := unix.Openat(parentFD, component, flags, 0)
 		if parentOwned {

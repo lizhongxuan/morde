@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"unicode/utf8"
 
@@ -20,23 +21,26 @@ const (
 )
 
 type cloudDSHCheckpointHistory struct {
-	sessionID         string
-	nextSeq           int64
-	inputs            []app.ModelInput
-	calls             map[string]*cloudDSHToolCall
-	fileWrites        map[string]struct{}
-	systemNodes       map[int64]struct{}
-	surfaceNodes      map[int64]struct{}
-	compactions       map[string]*cloudDSHCompactionProof
-	pendingPrune      *cloudDSHToolResultPruneProof
-	result            string
-	resultTurn        int64
-	activeTurn        int64
-	completedTurn     int64
-	assistantOutputs  []cloudDSHAssistantOutput
-	bytes             int
-	restoring         bool
-	lastTurnCompleted bool
+	sessionID          string
+	nextSeq            int64
+	inputs             []app.ModelInput
+	calls              map[string]*cloudDSHToolCall
+	fileWrites         map[string]struct{}
+	systemNodes        map[int64]struct{}
+	surfaceNodes       map[int64]struct{}
+	compactions        map[string]*cloudDSHCompactionProof
+	pendingPrune       *cloudDSHToolResultPruneProof
+	result             string
+	resultTurn         int64
+	resultEvidenceText string
+	resultEvidenceTurn int64
+	resultEvidence     []app.TaskResultClaim
+	activeTurn         int64
+	completedTurn      int64
+	assistantOutputs   []cloudDSHAssistantOutput
+	bytes              int
+	restoring          bool
+	lastTurnCompleted  bool
 }
 
 type cloudDSHAssistantOutput struct {
@@ -103,6 +107,14 @@ type cloudDSHToolCall struct {
 	resultSeen        bool
 	reconciled        bool
 	outputRecorded    bool
+}
+
+type cloudDSHMeasurementOutput struct {
+	Type        string   `json:"type"`
+	Metric      string   `json:"metric"`
+	Unit        string   `json:"unit"`
+	Value       *float64 `json:"value"`
+	Environment string   `json:"environment"`
 }
 
 func newCloudDSHCheckpointHistory(sessionID string) *cloudDSHCheckpointHistory {
@@ -307,6 +319,9 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 			h.completedTurn = 0
 			h.result = ""
 			h.resultTurn = 0
+			h.resultEvidenceText = ""
+			h.resultEvidenceTurn = 0
+			h.resultEvidence = nil
 		}
 		if h.bytes > cloudDSHCompletionInputLimit {
 			return errors.New("dsh file write history exceeds its limit")
@@ -634,6 +649,8 @@ func (h *cloudDSHCheckpointHistory) appendAssistantMessage(sequence int64, data 
 		return errors.New("dsh assistant checkpoint is invalid")
 	}
 	var text strings.Builder
+	var evidenceArguments []byte
+	evidenceCallCount := 0
 	for _, block := range event.Message.Content {
 		if block.Type == "text" {
 			text.WriteString(block.Text)
@@ -656,6 +673,10 @@ func (h *cloudDSHCheckpointHistory) appendAssistantMessage(sequence int64, data 
 		if _, exists := h.calls[block.ID]; exists || len(h.calls) >= 100 {
 			return errors.New("dsh checkpoint tool call identity is repeated or over budget")
 		}
+		if block.Name == cloudDSHResultEvidenceToolName {
+			evidenceCallCount++
+			evidenceArguments = canonical
+		}
 		call := &cloudDSHToolCall{name: block.Name, arguments: canonical, turn: event.Turn, step: event.Step,
 			callSeq: -1, resultSeq: -1, surfaceResultSeq: -1, assistantSeq: sequence, historical: h.restoring}
 		h.calls[block.ID] = call
@@ -673,10 +694,62 @@ func (h *cloudDSHCheckpointHistory) appendAssistantMessage(sequence int64, data 
 	}
 	h.result = text.String()
 	h.resultTurn = event.Turn
+	if evidenceCallCount > 0 {
+		h.resultEvidenceText = ""
+		h.resultEvidenceTurn = 0
+		h.resultEvidence = nil
+		if evidenceCallCount == 1 && h.result != "" {
+			var candidate struct {
+				Claims []app.TaskResultClaim `json:"claims"`
+			}
+			decoder := json.NewDecoder(bytes.NewReader(evidenceArguments))
+			decoder.DisallowUnknownFields()
+			if decoder.Decode(&candidate) == nil && decoder.Decode(new(any)) == io.EOF &&
+				app.ValidateTaskResultClaims(h.result, candidate.Claims) == nil && cloudDSHPerformanceComparisonsMatch(candidate.Claims, h.calls) {
+				h.resultEvidenceText = h.result
+				h.resultEvidenceTurn = event.Turn
+				h.resultEvidence = candidate.Claims
+			}
+		}
+	}
 	if h.result != "" {
 		h.assistantOutputs = append(h.assistantOutputs, cloudDSHAssistantOutput{sequence: sequence, text: h.result})
 	}
 	return nil
+}
+
+// shortcut: measurements must use root-session tools because child outputs are redacted; add an explicit child-reference contract before supporting them.
+func cloudDSHPerformanceComparisonsMatch(claims []app.TaskResultClaim, calls map[string]*cloudDSHToolCall) bool {
+	for _, claim := range claims {
+		comparison := claim.PerformanceComparison
+		if comparison == nil {
+			continue
+		}
+		baseline, baselineOK := cloudDSHParsePerformanceMeasurement(calls[comparison.BaselineCallID])
+		after, afterOK := cloudDSHParsePerformanceMeasurement(calls[comparison.AfterCallID])
+		if !baselineOK || !afterOK || baseline.Type != "morde.performance_measurement.v1" ||
+			after.Type != baseline.Type || baseline.Metric != comparison.Metric || after.Metric != baseline.Metric ||
+			baseline.Unit != comparison.Unit || after.Unit != baseline.Unit || baseline.Environment != comparison.Environment ||
+			after.Environment != baseline.Environment || *baseline.Value != comparison.Before || *after.Value != comparison.After {
+			return false
+		}
+	}
+	return true
+}
+
+func cloudDSHParsePerformanceMeasurement(call *cloudDSHToolCall) (cloudDSHMeasurementOutput, bool) {
+	var measurement cloudDSHMeasurementOutput
+	if call == nil || !call.callSeen || !call.resultSeen || !call.reconciled || call.status != app.AgentToolSucceeded ||
+		len(call.output) == 0 || !uniqueCloudDSHJSON([]byte(call.output)) {
+		return measurement, false
+	}
+	decoder := json.NewDecoder(strings.NewReader(call.output))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&measurement) != nil || decoder.Decode(new(any)) != io.EOF {
+		return measurement, false
+	}
+	return measurement, measurement.Type != "" && measurement.Metric != "" && measurement.Unit != "" &&
+		measurement.Value != nil && measurement.Environment != "" && strings.TrimSpace(measurement.Environment) == measurement.Environment
 }
 
 func (h *cloudDSHCheckpointHistory) outputAfter(after int64, maxBytes int) (string, int64, error) {
@@ -1029,10 +1102,15 @@ func (h *cloudDSHCheckpointHistory) completion(fence app.AgentInstanceFence, thr
 	if !h.allCallsReconciled() {
 		return app.CloudDSHTaskCompletion{}, errors.New("dsh tool call is not reconciled against the runtime ledger")
 	}
-	return app.CloudDSHTaskCompletion{
+	completion := app.CloudDSHTaskCompletion{
 		AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
 		AuthorizationVersion: fence.AuthorizationVersion, AgentSessionID: fence.AgentSessionID,
 		CheckpointThroughSequence: through, CheckpointDigest: append([]byte(nil), digest...),
 		Result: h.result, Inputs: append([]app.ModelInput(nil), h.inputs...),
-	}, nil
+	}
+	if h.resultEvidenceTurn == h.completedTurn && h.resultEvidenceText == h.result &&
+		app.ValidateTaskResultClaims(h.result, h.resultEvidence) == nil {
+		completion.ValidationClaims = append([]app.TaskResultClaim(nil), h.resultEvidence...)
+	}
+	return completion, nil
 }

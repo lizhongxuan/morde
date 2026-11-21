@@ -5627,6 +5627,151 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/evaluation-batches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Freeze synthetic candidate runs into an anonymous review batch
+         * @description Stores the anonymous pack separately from candidate mappings and run manifests. Only an administrator may create a batch; participant identities are checked by the service and database.
+         */
+        post: operations["createBlindEvaluationBatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/evaluation-batches/{pack_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read review batch readiness without revealing candidate mapping */
+        get: operations["getBlindEvaluationPanel"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/evaluation-batches/{pack_id}/mapping": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the private candidate-to-run mapping */
+        get: operations["getBlindEvaluationMapping"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/evaluation-batches/{pack_id}/manifests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read private candidate run manifests for the batch owner */
+        get: operations["getBlindEvaluationRunManifests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/evaluation-batches/{pack_id}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read an assigned anonymous review pack and the current reviewer’s submissions */
+        get: operations["getAssignedBlindReview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/evaluation-batches/{pack_id}/reviews": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit an assigned reviewer’s evidence-linked scores
+         * @description Reviewer identity comes from the authenticated user session. The request cannot supply reviewer identity or timestamps.
+         */
+        post: operations["submitBlindReview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/evaluation-batches/{pack_id}/arbitration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read an assigned arbitrator’s anonymous pack and anonymized reviews */
+        get: operations["getAssignedBlindArbitration"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/evaluation-batches/{pack_id}/arbitrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve a disagreement between independent blind reviews
+         * @description Arbitrator identity comes from the authenticated user session; unresolved batches remain not ready.
+         */
+        post: operations["submitBlindArbitration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/activity": {
         parameters: {
             query?: never;
@@ -9220,6 +9365,58 @@ export interface components {
             trigger_message_id?: components["schemas"]["MessageId"] | null;
             reply_message_id: components["schemas"]["MessageId"] | null;
         };
+        /** @description Independent review state, orthogonal to Task.status. The server emits pending until a trusted, revision-bound validation record exists; ResultReview is not a validation verdict. */
+        TaskValidationSummary: {
+            /** @enum {string} */
+            state: "pending" | "PASS" | "PASS+NOTES" | "FAIL";
+        };
+        TaskValidationEvidenceRef: {
+            /** @enum {string} */
+            kind: "source" | "baseline" | "action" | "result" | "side_effect" | "before_after";
+            id: string;
+            /** Format: int64 */
+            task_revision: number;
+            /**
+             * Format: int64
+             * @description Conversation message sequence for source messages; Task Step sequence for other evidence.
+             */
+            sequence: number;
+            /** @description Source tool call for action */
+            call_id?: string;
+        };
+        /** @description Untrusted performance measurements with server-computed delta and same-revision Task Step references; this structure does not establish a validation verdict. */
+        TaskValidationPerformanceComparison: {
+            metric: string;
+            unit: string;
+            /** Format: double */
+            before: number;
+            /** Format: double */
+            after: number;
+            /**
+             * Format: double
+             * @description Server-computed as after minus before.
+             */
+            delta: number;
+            environment: string;
+            baseline_ref: components["schemas"]["TaskValidationEvidenceRef"];
+            after_ref: components["schemas"]["TaskValidationEvidenceRef"];
+        };
+        TaskValidationEvidenceClaim: {
+            claim_id: string;
+            start_byte: number;
+            /** @description Exclusive UTF-8 byte offset into the SHA-256-bound Task result. */
+            end_byte: number;
+            evidence_refs: components["schemas"]["TaskValidationEvidenceRef"][];
+            performance_comparison?: components["schemas"]["TaskValidationPerformanceComparison"];
+        };
+        TaskValidationEvidenceDetail: {
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            event_sequence: number;
+            result_sha256: string;
+            claims: components["schemas"]["TaskValidationEvidenceClaim"][];
+        };
         TaskSummary: {
             id: components["schemas"]["TaskId"];
             owner_id: components["schemas"]["UserId"];
@@ -9267,6 +9464,8 @@ export interface components {
             dependencies: components["schemas"]["TaskDependency"][];
             child_jobs: components["schemas"]["TaskChildJob"][];
             result_review: components["schemas"]["TaskResultReview"] | null;
+            /** @description Newer servers always include this summary. Clients must treat it as optional when reading snapshots from older server versions. */
+            validation?: components["schemas"]["TaskValidationSummary"];
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -9625,6 +9824,8 @@ export interface components {
              */
             event_sequence: number;
             result: string | null;
+            /** @description Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. */
+            validation_detail?: components["schemas"]["TaskValidationEvidenceDetail"];
             /** @description True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. */
             current_revision_started?: boolean;
             /** @description A completed result is being held for a conversation reply; do not display it as a separate final message until published. */
@@ -9967,6 +10168,176 @@ export interface components {
             summary: components["schemas"]["AdminUsageSummary"];
             by_day: components["schemas"]["AdminUsageDay"][];
             by_model: components["schemas"]["AdminUsageModel"][];
+        };
+        /** @enum {string} */
+        EvaluationScore: "0" | "1" | "N/A";
+        EvaluationRubricCriterion: {
+            id: string;
+            name: string;
+            hard_gate: boolean;
+        };
+        EvaluationCaseExpectation: {
+            criterion_id: string;
+            expected: components["schemas"]["EvaluationScore"];
+            not_applicable_reason?: string;
+        };
+        EvaluationCase: {
+            id: string;
+            /** @enum {string} */
+            priority: "P0" | "P1" | "P2";
+            tags: string[];
+            input: string;
+            expected_behavior: string;
+            expectations: components["schemas"]["EvaluationCaseExpectation"][];
+        };
+        EvaluationSuite: {
+            version: string;
+            /** @enum {string} */
+            data_class: "synthetic";
+            rubric: components["schemas"]["EvaluationRubricCriterion"][];
+            cases: components["schemas"]["EvaluationCase"][];
+        };
+        EvaluationRunManifest: {
+            run_id: string;
+            suite_version: string;
+            provider: string;
+            model: string;
+            prompt_version: string;
+            skill_version: string;
+            dsh_version: string;
+            build_sha: string;
+            tool_permissions: string[];
+            parameters: {
+                [key: string]: string;
+            };
+            /** Format: date-time */
+            started_at: string;
+        };
+        EvaluationEvidence: {
+            id: string;
+            kind: string;
+            sha256: string;
+            excerpt?: string;
+        };
+        EvaluationEvidenceReference: {
+            kind: string;
+            id?: string;
+            start_byte?: number;
+            end_byte?: number;
+        };
+        EvaluationJudgment: {
+            criterion_id: string;
+            score: components["schemas"]["EvaluationScore"];
+            rationale: string;
+            evidence: components["schemas"]["EvaluationEvidenceReference"][];
+        };
+        EvaluationCaseResult: {
+            case_id: string;
+            output: string;
+            evidence: components["schemas"]["EvaluationEvidence"][];
+            judgments: components["schemas"]["EvaluationJudgment"][];
+        };
+        EvaluationRun: {
+            manifest: components["schemas"]["EvaluationRunManifest"];
+            cases: components["schemas"]["EvaluationCaseResult"][];
+        };
+        CreateBlindEvaluationRequest: {
+            suite: components["schemas"]["EvaluationSuite"];
+            runs: components["schemas"]["EvaluationRun"][];
+            implementers: string[];
+            reviewers: string[];
+            arbitrators: string[];
+        };
+        BlindApplicability: {
+            criterion_id: string;
+            applicable: boolean;
+            not_applicable_reason?: string;
+        };
+        BlindCandidate: {
+            label: string;
+            output: string;
+            evidence: components["schemas"]["EvaluationEvidence"][];
+        };
+        BlindCase: {
+            case_id: string;
+            /** @enum {string} */
+            priority: "P0" | "P1" | "P2";
+            tags: string[];
+            input: string;
+            expected_behavior: string;
+            applicability: components["schemas"]["BlindApplicability"][];
+            candidates: components["schemas"]["BlindCandidate"][];
+        };
+        BlindPack: {
+            id: string;
+            suite_version: string;
+            rubric: components["schemas"]["EvaluationRubricCriterion"][];
+            cases: components["schemas"]["BlindCase"][];
+        };
+        BlindCaseReview: {
+            case_id: string;
+            judgments: components["schemas"]["EvaluationJudgment"][];
+        };
+        SubmitBlindReviewRequest: {
+            candidate: string;
+            cases: components["schemas"]["BlindCaseReview"][];
+        };
+        BlindReviewResponse: {
+            candidate: string;
+            /** Format: date-time */
+            submitted_at: string;
+            cases: components["schemas"]["BlindCaseReview"][];
+        };
+        BlindReviewerBundle: {
+            pack: components["schemas"]["BlindPack"];
+            reviews: components["schemas"]["BlindReviewResponse"][];
+        };
+        SubmitBlindArbitrationRequest: {
+            candidate: string;
+            reason: string;
+            cases: components["schemas"]["BlindCaseReview"][];
+        };
+        BlindArbitrationReview: {
+            reviewer: string;
+            candidate: string;
+            cases: components["schemas"]["BlindCaseReview"][];
+        };
+        BlindArbitrationBundle: {
+            pack: components["schemas"]["BlindPack"];
+            expected_reviews_per_candidate: number;
+            reviews: components["schemas"]["BlindArbitrationReview"][];
+            arbitrations: components["schemas"]["BlindArbitrationResult"][];
+        };
+        BlindArbitrationResult: {
+            candidate: string;
+            reason: string;
+            cases: components["schemas"]["BlindCaseReview"][];
+        };
+        BlindReviewReceipt: {
+            candidate: string;
+            /** Format: date-time */
+            submitted_at: string;
+        };
+        BlindArbitrationReceipt: {
+            candidate: string;
+            /** Format: date-time */
+            resolved_at: string;
+        };
+        BlindAssignment: {
+            label: string;
+            run_id: string;
+            positions: number[];
+        };
+        BlindMapping: {
+            pack_id: string;
+            assignments: components["schemas"]["BlindAssignment"][];
+        };
+        BlindEvaluationPanel: {
+            pack_id: string;
+            ready: boolean;
+            pending_reason?: string;
+            review_count: number;
+            arbitration_count: number;
         };
         AdminQuality: {
             /** @enum {integer} */
@@ -20114,6 +20485,227 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createBlindEvaluationBatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateBlindEvaluationRequest"];
+            };
+        };
+        responses: {
+            /** @description Anonymous review pack; contains no candidate model or provider identity */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindPack"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getBlindEvaluationPanel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Readiness and record counts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindEvaluationPanel"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getBlindEvaluationMapping: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Private candidate mapping */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindMapping"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getBlindEvaluationRunManifests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Private run manifests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["EvaluationRunManifest"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAssignedBlindReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Assigned anonymous pack and this reviewer’s saved submissions only */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindReviewerBundle"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    submitBlindReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SubmitBlindReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Idempotent reviewer receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindReviewReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAssignedBlindArbitration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Assigned pack and peer review content without reviewer IDs or timestamps */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindArbitrationBundle"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    submitBlindArbitration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pack_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SubmitBlindArbitrationRequest"];
+            };
+        };
+        responses: {
+            /** @description Idempotent arbitration receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BlindArbitrationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

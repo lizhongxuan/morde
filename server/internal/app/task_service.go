@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -578,6 +579,7 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 			return TaskDetails{}, hideTaskAccessError(err)
 		}
 	}
+	artifactsHidden := false
 	if len(details.Artifacts) > 0 {
 		visible, err := s.taskArtifactWorkspaceVisible(ctx, principal.UserID, details.Task.WorkspaceID)
 		if err != nil {
@@ -585,6 +587,7 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 		}
 		if !visible {
 			details.Artifacts = nil
+			artifactsHidden = true
 		}
 	}
 	workspaceVisible, err := s.taskWorkspaceDetailVisible(ctx, principal, details.Task)
@@ -601,7 +604,138 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 			details.Steps[index].DetailState = "restricted"
 		}
 	}
+	details.ValidationEvidence = restrictTaskValidationEvidence(details.ValidationEvidence, details.Steps, !workspaceVisible, artifactsHidden)
 	return details, nil
+}
+
+// GetTaskValidationReviewSnapshot reads only the still-current Task result and
+// its same-revision evidence for the leased internal review worker.
+func (s *TaskService) GetTaskValidationReviewSnapshot(ctx context.Context, claim TaskValidationReviewClaim) (TaskDetails, error) {
+	if ctx == nil || !ValidTaskValidationReviewClaim(claim) {
+		return TaskDetails{}, domain.InvalidArgument("task_validation_review", "Task validation review claim is invalid")
+	}
+	details, err := s.store.GetTask(ctx, claim.TaskID, claim.InitiatorID)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	if details.Task.ID != claim.TaskID || details.Task.OwnerID != claim.OwnerID || details.Task.InitiatorID != claim.InitiatorID ||
+		details.Task.ConversationID != claim.ConversationID || details.Task.Status != task.StatusCompleted ||
+		details.Task.CurrentRevision == nil || *details.Task.CurrentRevision != claim.TaskRevision ||
+		details.Task.DesiredRevision == nil || *details.Task.DesiredRevision != claim.TaskRevision ||
+		!bytes.Equal(sha256Bytes([]byte(details.Task.Result)), claim.ResultSHA256) {
+		return TaskDetails{}, domain.NewError(domain.CodeConflict, "Task validation review result is no longer current")
+	}
+	principal := identity.Principal{UserID: claim.InitiatorID, Role: identity.RoleUser, Kind: identity.Kind(details.Task.Authorization.Kind),
+		TokenID: details.Task.Authorization.TokenID, ClientInstallationID: details.Task.Authorization.ClientInstallationID,
+		Scopes: agentScopeSnapshot(details.Task.Authorization.Scopes)}
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
+		return TaskDetails{}, hideTaskAccessError(err)
+	}
+	artifactsHidden := false
+	if len(details.Artifacts) > 0 {
+		visible, err := s.taskArtifactWorkspaceVisible(ctx, principal.UserID, details.Task.WorkspaceID)
+		if err != nil {
+			return TaskDetails{}, err
+		}
+		if !visible {
+			details.Artifacts = nil
+			artifactsHidden = true
+		}
+	}
+	workspaceVisible, err := s.taskWorkspaceDetailVisible(ctx, principal, details.Task)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	if !workspaceVisible {
+		for index := range details.Steps {
+			if strings.HasPrefix(details.Steps[index].ToolName, "morde_workspace_") {
+				details.Steps[index].Title = "Workspace action"
+				details.Steps[index].Summary = "The Workspace resource is not available with the current permissions."
+				details.Steps[index].DetailState = "restricted"
+			}
+		}
+	}
+	details.ValidationEvidence = restrictTaskValidationEvidence(details.ValidationEvidence, details.Steps, !workspaceVisible, artifactsHidden)
+	return details, nil
+}
+
+func (s *TaskService) GetTaskValidationReviewStepDetail(ctx context.Context, claim TaskValidationReviewClaim, stepID string) (TaskStepDetail, error) {
+	details, err := s.GetTaskValidationReviewSnapshot(ctx, claim)
+	if err != nil {
+		return TaskStepDetail{}, err
+	}
+	if !taskValidationReviewEvidenceContainsStep(details.ValidationEvidence, stepID) {
+		return TaskStepDetail{}, domain.NewError(domain.CodeNotFound, "task step detail not found")
+	}
+	return s.taskStepDetailFromDetails(ctx, identity.Principal{UserID: claim.InitiatorID}, details, claim.TaskID, stepID)
+}
+
+func taskValidationReviewEvidenceContainsStep(evidence *TaskValidationEvidenceRecord, stepID string) bool {
+	if evidence == nil || !domain.ValidStepID(stepID) {
+		return false
+	}
+	for _, claim := range evidence.Claims {
+		for _, ref := range claim.EvidenceRefs {
+			if ref.ID == stepID && (ref.Kind == TaskValidationEvidenceAction || ref.Kind == TaskValidationEvidenceBaseline ||
+				ref.Kind == TaskValidationEvidenceResult || ref.Kind == TaskValidationEvidenceBeforeAfter) {
+				return true
+			}
+		}
+		if comparison := claim.PerformanceComparison; comparison != nil &&
+			(comparison.BaselineRef.ID == stepID || comparison.AfterRef.ID == stepID) {
+			return true
+		}
+	}
+	return false
+}
+
+func restrictTaskValidationEvidence(value *TaskValidationEvidenceRecord, steps []task.Step, hideWorkspace, hideArtifacts bool) *TaskValidationEvidenceRecord {
+	if value == nil {
+		return nil
+	}
+	workspaceStepIDs := make(map[string]struct{})
+	if hideWorkspace {
+		for _, step := range steps {
+			if strings.HasPrefix(step.ToolName, "morde_workspace_") {
+				workspaceStepIDs[step.ID] = struct{}{}
+			}
+		}
+	}
+	result := *value
+	result.Claims = make([]TaskValidationEvidenceClaimRecord, 0, len(value.Claims))
+	for _, claim := range value.Claims {
+		filtered := claim
+		filtered.EvidenceRefs = make([]TaskValidationEvidenceRefRecord, 0, len(claim.EvidenceRefs))
+		comparisonVisible := func(ref TaskValidationEvidenceRefRecord) bool {
+			_, hidden := workspaceStepIDs[ref.ID]
+			return !(hidden && (ref.Kind == TaskValidationEvidenceBaseline || ref.Kind == TaskValidationEvidenceAction ||
+				ref.Kind == TaskValidationEvidenceResult || ref.Kind == TaskValidationEvidenceBeforeAfter))
+		}
+		for _, ref := range claim.EvidenceRefs {
+			if hideArtifacts && ref.Kind == TaskValidationEvidenceSideEffect {
+				continue
+			}
+			if !comparisonVisible(ref) {
+				continue
+			}
+			filtered.EvidenceRefs = append(filtered.EvidenceRefs, ref)
+		}
+		if comparison := claim.PerformanceComparison; comparison != nil {
+			if !comparisonVisible(comparison.BaselineRef) || !comparisonVisible(comparison.AfterRef) {
+				filtered.PerformanceComparison = nil
+			} else {
+				copy := *comparison
+				filtered.PerformanceComparison = &copy
+			}
+		}
+		if len(filtered.EvidenceRefs) > 0 {
+			result.Claims = append(result.Claims, filtered)
+		}
+	}
+	if len(result.Claims) == 0 {
+		return nil
+	}
+	return &result
 }
 
 func (s *TaskService) taskWorkspaceDetailVisible(ctx context.Context, principal identity.Principal, value task.Task) (bool, error) {
@@ -649,6 +783,10 @@ func (s *TaskService) GetStepDetail(ctx context.Context, principal identity.Prin
 	if err != nil {
 		return TaskStepDetail{}, err
 	}
+	return s.taskStepDetailFromDetails(ctx, principal, details, taskID, stepID)
+}
+
+func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal identity.Principal, details TaskDetails, taskID, stepID string) (TaskStepDetail, error) {
 	var step *task.Step
 	for i := range details.Steps {
 		if details.Steps[i].ID == stepID {
@@ -694,9 +832,21 @@ func (s *TaskService) GetStepDetail(ctx context.Context, principal identity.Prin
 	if decoder.Decode(&document) != nil || !validTaskStepDetailDocument(document) {
 		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail document is invalid")
 	}
+	if document.ContentEvidence == nil {
+		if len(record.ContentEvidenceSHA256) != 0 {
+			return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step content evidence identity is invalid")
+		}
+	} else {
+		contentDigest, digestErr := hex.DecodeString(document.ContentEvidence.SHA256)
+		if digestErr != nil || len(record.ContentEvidenceSHA256) != sha256.Size || !bytes.Equal(contentDigest, record.ContentEvidenceSHA256) ||
+			(step.ToolName != "morde_web_search" && step.ToolName != "morde_web_read") || step.Status != task.StepSucceeded {
+			return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step content evidence identity is invalid")
+		}
+	}
 	result.DetailState, result.Truncated = "available", record.Truncated
 	result.EventSequence = record.EventSequence
 	result.Object, result.Input, result.Result = &document.Object, &document.Input, &document.Result
+	result.ShellExecution, result.ContentEvidence = document.ShellExecution, document.ContentEvidence
 	return result, nil
 }
 

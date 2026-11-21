@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,42 @@ func (s *Store) withTaskSnapshot(ctx context.Context, fn func(pgx.Tx) error) err
 	return withTx(ctx, func(ctx context.Context) (pgx.Tx, error) {
 		return s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	}, fn)
+}
+
+func loadTaskValidationEvidence(ctx context.Context, tx pgx.Tx, taskID string, revision int64, result string) (*app.TaskValidationEvidenceRecord, error) {
+	var sequence int64
+	var payload []byte
+	var eventRevision pgtype.Int8
+	var resultDigest []byte
+	err := tx.QueryRow(ctx, `SELECT sequence,payload,task_revision,result_content_sha256
+FROM task_events WHERE task_id=$1 AND event_type='task.result' ORDER BY sequence DESC LIMIT 1`, taskID).
+		Scan(&sequence, &payload, &eventRevision, &resultDigest)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && (!eventRevision.Valid || eventRevision.Int64 != revision) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Task validation evidence event: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil || fields == nil {
+		return nil, domain.NewError(domain.CodeInvalidState, "task result event is invalid")
+	}
+	raw, exists := fields["validation_evidence"]
+	if !exists {
+		return nil, nil
+	}
+	var record app.TaskValidationEvidenceRecord
+	if json.Unmarshal(raw, &record) != nil || record.TaskRevision != revision || record.EventSequence != sequence || len(resultDigest) != 32 {
+		return nil, domain.NewError(domain.CodeInvalidState, "task validation evidence binding is invalid")
+	}
+	digest := sha256.Sum256([]byte(result))
+	if !bytes.Equal(resultDigest, digest[:]) || record.ResultSHA256 != hex.EncodeToString(resultDigest) {
+		return nil, domain.NewError(domain.CodeInvalidState, "task validation evidence result has changed")
+	}
+	if err := app.ValidateTaskValidationEvidenceRecord(result, record); err != nil {
+		return nil, domain.NewError(domain.CodeInvalidState, "task validation evidence record is invalid")
+	}
+	return &record, nil
 }
 
 func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetails, error) {
@@ -195,7 +232,11 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 `, row.ID, *projected[0].CurrentRevision).Scan(&resultMessagePending, &resultMessagePublished, &currentRevisionStarted); err != nil {
 			return fmt.Errorf("read pending Task result message: %w", err)
 		}
-		dependencies, childJobs, resultReview, err := loadTaskK2Projection(ctx, tx, row.ID, *projected[0].CurrentRevision)
+		dependencies, childJobs, resultReview, validation, err := loadTaskK2Projection(ctx, tx, row.ID, *projected[0].CurrentRevision)
+		if err != nil {
+			return err
+		}
+		validationEvidence, err := loadTaskValidationEvidence(ctx, tx, row.ID, *projected[0].CurrentRevision, row.Result)
 		if err != nil {
 			return err
 		}
@@ -210,6 +251,7 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		result = app.TaskDetails{
 			Task: projected[0], AssistantMessage: assistantMessage, CurrentRevisionStarted: &currentRevisionStarted,
 			Dependencies: dependencies, ChildJobs: childJobs, ResultReview: resultReview,
+			ValidationEvidence: validationEvidence, Validation: validation,
 			ResultMessagePending: resultMessagePending, ResultMessagePublished: resultMessagePublished,
 			ScheduleObservation: scheduleObservation, Steps: steps, Agents: agents,
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
@@ -1475,6 +1517,10 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 		} else if len(call.DetailCiphertext) != 0 || len(call.DetailSHA256) != 0 || call.DetailSizeBytes != 0 {
 			return task.Event{}, domain.InvalidArgument("tool_call.detail", "unavailable task tool detail must not include a payload")
 		}
+		if len(call.ContentEvidenceSHA256) != 0 && (len(call.ContentEvidenceSHA256) != 32 || call.DetailState != "available" ||
+			(progress.Steps[0].Status != task.StepSucceeded || (call.ToolName != "morde_web_search" && call.ToolName != "morde_web_read"))) {
+			return task.Event{}, domain.InvalidArgument("tool_call.content_evidence", "task tool content evidence is invalid")
+		}
 		step := progress.Steps[0]
 		taskRevision := call.TaskRevision
 		step.AgentSessionID, step.TaskRevision = call.AgentSessionID, &taskRevision
@@ -1524,6 +1570,14 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	if err != nil {
 		return task.Event{}, err
 	}
+	if len(progress.ValidationClaims) > 0 {
+		if progress.Status != task.StatusCompleted || progress.Event.Type != "task.result" {
+			return task.Event{}, domain.InvalidArgument("validation_evidence", "task result evidence requires a completed result event")
+		}
+		if err := app.ValidateTaskResultClaims(progress.Result, progress.ValidationClaims); err != nil {
+			return task.Event{}, err
+		}
+	}
 	if progress.PublishResultMessage && (progress.Status != task.StatusCompleted || progress.Event.Type != "task.result" ||
 		progress.AssistantMessage != nil || !domain.ValidStepID(progress.CurrentStep) || strings.TrimSpace(progress.Result) == "" ||
 		len(progress.Result) > app.MaxAssistantMessageBytes || !utf8.ValidString(progress.Result) || strings.ContainsRune(progress.Result, '\x00')) {
@@ -1564,6 +1618,7 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	}
 	var result task.Event
 	var authorizationDenied bool
+	var resolvedValidationClaims []app.TaskValidationEvidenceClaimRecord
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		projectWorkspaceFence, err := lockProjectTaskWorkspaceFence(ctx, tx, progress.TaskID, false)
 		if err != nil && projectWorkspaceFence.projectID != "" &&
@@ -1650,7 +1705,8 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			return domain.InvalidArgument("pending_request", "Hostless Workspace approval requires a server Task with a Workspace and no Host")
 		}
 		var leaseValid, revisionReady bool
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at > clock_timestamp(), false),current_revision=desired_revision FROM tasks WHERE id=$1`, progress.TaskID).Scan(&leaseValid, &revisionReady); err != nil {
+		var currentRevision int64
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at > clock_timestamp(), false),current_revision=desired_revision,current_revision FROM tasks WHERE id=$1`, progress.TaskID).Scan(&leaseValid, &revisionReady, &currentRevision); err != nil {
 			return fmt.Errorf("check task lease: %w", err)
 		}
 		if current.LeaseOwner != progress.LeaseOwner || current.LeaseVersion != progress.LeaseVersion || !leaseValid || !revisionReady || current.Status != string(task.StatusRunning) {
@@ -1895,6 +1951,9 @@ WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.
 				}
 			}
 		}
+		if progress.Status != task.StatusCompleted || progress.Event.Type != "task.result" {
+			progress.ValidationClaims = nil
+		}
 		switch progress.Status {
 		case task.StatusCompleted:
 			var pendingMessages bool
@@ -2004,12 +2063,14 @@ WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.seque
 				return fmt.Errorf("start encrypted Task step detail savepoint: %w", err)
 			}
 			_, detailErr := tx.Exec(ctx, `INSERT INTO task_step_details
-(task_id,owner_id,step_id,task_revision,payload_ciphertext,payload_sha256,payload_size_bytes,truncated)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+(task_id,owner_id,step_id,task_revision,payload_ciphertext,payload_sha256,payload_size_bytes,truncated,content_evidence_sha256)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 ON CONFLICT (task_id,step_id) DO UPDATE SET task_revision=EXCLUDED.task_revision,
  payload_ciphertext=EXCLUDED.payload_ciphertext,payload_sha256=EXCLUDED.payload_sha256,
- payload_size_bytes=EXCLUDED.payload_size_bytes,truncated=EXCLUDED.truncated,updated_at=clock_timestamp()`,
-				progress.TaskID, current.OwnerID, step.ID, call.TaskRevision, call.DetailCiphertext, call.DetailSHA256, call.DetailSizeBytes, call.Truncated)
+			payload_size_bytes=EXCLUDED.payload_size_bytes,truncated=EXCLUDED.truncated,
+ content_evidence_sha256=EXCLUDED.content_evidence_sha256,updated_at=clock_timestamp()`,
+				progress.TaskID, current.OwnerID, step.ID, call.TaskRevision, call.DetailCiphertext, call.DetailSHA256,
+				call.DetailSizeBytes, call.Truncated, call.ContentEvidenceSHA256)
 			if detailErr != nil {
 				if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT task_step_detail_write`); err != nil {
 					return fmt.Errorf("recover from encrypted Task step detail failure: %w", errors.Join(detailErr, err))
@@ -2019,13 +2080,22 @@ ON CONFLICT (task_id,step_id) DO UPDATE SET task_revision=EXCLUDED.task_revision
 				}
 				step.DetailState = "not_recorded"
 				progress.Steps[0] = step
-				call.DetailState, call.DetailCiphertext, call.DetailSHA256, call.DetailSizeBytes = "not_recorded", nil, nil, 0
+				call.DetailState, call.DetailCiphertext, call.DetailSHA256, call.ContentEvidenceSHA256, call.DetailSizeBytes =
+					"not_recorded", nil, nil, nil, 0
 			} else if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT task_step_detail_write`); err != nil {
 				return fmt.Errorf("release encrypted Task step detail savepoint: %w", err)
 			}
 		}
 		if len(progress.Artifacts) > 0 {
 			if err := persistTaskProgressArtifacts(ctx, tx, current.OwnerID, progress.TaskID, progress.Artifacts); err != nil {
+				return err
+			}
+		}
+		resolvedValidationClaims = nil
+		if len(progress.ValidationClaims) > 0 {
+			resolvedValidationClaims, err = resolveTaskValidationClaims(ctx, tx, current.OwnerID, progress.TaskID,
+				current.ConversationID, current.AgentSessionID, progress.CurrentStep, currentRevision, progress.ValidationClaims)
+			if err != nil {
 				return err
 			}
 		}
@@ -2111,6 +2181,20 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending')`, clarification.ID, clarification.TaskID, c
 		}
 		progress.Event.TaskID = progress.TaskID
 		progress.Event.Sequence = sequence
+		if len(resolvedValidationClaims) > 0 {
+			digest := sha256.Sum256([]byte(progress.Result))
+			record := app.TaskValidationEvidenceRecord{
+				TaskRevision: currentRevision, EventSequence: sequence, ResultSHA256: hex.EncodeToString(digest[:]),
+				Claims: resolvedValidationClaims,
+			}
+			if err := app.ValidateTaskValidationEvidenceRecord(progress.Result, record); err != nil {
+				return err
+			}
+			eventPayload, err = addTaskValidationEvidenceToResult(eventPayload, record)
+			if err != nil {
+				return err
+			}
+		}
 		progress.Event.Payload = eventPayload
 		if err := insertTaskEvent(ctx, tx, progress.Event); err != nil {
 			return err
@@ -2163,6 +2247,21 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 			}
 		}
 		variantAssistantMessageID := ""
+		reviewableResult := progress.Status == task.StatusCompleted && progress.Event.Type == "task.result" &&
+			strings.TrimSpace(progress.Result) != "" && len(progress.Result) <= app.MaxAssistantMessageBytes &&
+			utf8.ValidString(progress.Result) && !strings.ContainsRune(progress.Result, '\x00')
+		if reviewableResult {
+			if current.ExecutionLocation != "server" && progress.PublishResultMessage {
+				return domain.NewError(domain.CodeInvalidState, "completed assistant result requires server execution")
+			}
+			if _, err := tx.Exec(ctx, `UPDATE task_events SET task_revision=$3,result_content_sha256=sha256(convert_to($4::text,'UTF8'))
+WHERE task_id=$1 AND sequence=$2 AND event_type='task.result'`, progress.TaskID, sequence, currentRevision, progress.Result); err != nil {
+				return fmt.Errorf("record completed Task revision: %w", err)
+			}
+			if err := enqueueTaskValidationReviewInTx(ctx, tx, current.OwnerID, progress.TaskID, currentRevision, sequence, progress.Result); err != nil {
+				return err
+			}
+		}
 		if progress.PublishResultMessage && progress.Status == task.StatusCompleted {
 			if current.ExecutionLocation != "server" {
 				return domain.NewError(domain.CodeInvalidState, "completed assistant result requires server execution")
@@ -2174,10 +2273,6 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
  WHERE m.task_id=$1 AND m.role='user' AND r.state='routed'
 ) FROM tasks WHERE id=$1`, progress.TaskID).Scan(&taskRevision, &automaticallyRouted); err != nil {
 				return fmt.Errorf("read completed Task revision: %w", err)
-			}
-			if _, err := tx.Exec(ctx, `UPDATE task_events SET task_revision=$3,result_content_sha256=sha256(convert_to($4::text,'UTF8'))
-WHERE task_id=$1 AND sequence=$2 AND event_type='task.result'`, progress.TaskID, sequence, taskRevision, progress.Result); err != nil {
-				return fmt.Errorf("record completed Task revision: %w", err)
 			}
 			var continuationOperationID string
 			if err := tx.QueryRow(ctx, `SELECT operation_id FROM conversation_message_variants
@@ -2461,6 +2556,364 @@ func addObservationOutcomeToTaskResult(payload []byte, outcome schedule.Observat
 	encoded, err := json.Marshal(fields)
 	if err != nil {
 		return nil, fmt.Errorf("encode task result observation outcome: %w", err)
+	}
+	return encoded, nil
+}
+
+type taskValidationEvidenceSourceRecord struct {
+	ID           string
+	TaskRevision int64
+	Sequence     int64
+	CallID       string
+}
+
+func resolveTaskValidationClaims(ctx context.Context, tx pgx.Tx, ownerID, taskID, conversationID, agentSessionID, resultStepID string,
+	revision int64, claims []app.TaskResultClaim) ([]app.TaskValidationEvidenceClaimRecord, error) {
+	ids := map[app.TaskValidationEvidenceKind]map[string]struct{}{}
+	stepCallIDs := make(map[string]struct{})
+	stepCallKinds := make(map[app.TaskValidationEvidenceKind]map[string]struct{})
+	artifactCallIDs := make(map[string]struct{})
+	addStepCall := func(kind app.TaskValidationEvidenceKind, callID string) {
+		stepCallIDs[callID] = struct{}{}
+		if stepCallKinds[kind] == nil {
+			stepCallKinds[kind] = make(map[string]struct{})
+		}
+		stepCallKinds[kind][callID] = struct{}{}
+	}
+	for _, claim := range claims {
+		for _, ref := range claim.EvidenceRefs {
+			if ref.CallID != "" {
+				if ref.Kind == app.TaskValidationEvidenceSideEffect {
+					artifactCallIDs[ref.CallID] = struct{}{}
+				} else {
+					addStepCall(ref.Kind, ref.CallID)
+				}
+				continue
+			}
+			if ids[ref.Kind] == nil {
+				ids[ref.Kind] = make(map[string]struct{})
+			}
+			ids[ref.Kind][ref.ID] = struct{}{}
+		}
+		if comparison := claim.PerformanceComparison; comparison != nil {
+			addStepCall(app.TaskValidationEvidenceBaseline, comparison.BaselineCallID)
+			addStepCall(app.TaskValidationEvidenceBeforeAfter, comparison.AfterCallID)
+		}
+	}
+	rowsByKind := map[app.TaskValidationEvidenceKind]map[string]taskValidationEvidenceSourceRecord{}
+	read := func(kind app.TaskValidationEvidenceKind, query string, args ...any) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		resolved := rowsByKind[kind]
+		if resolved == nil {
+			resolved = make(map[string]taskValidationEvidenceSourceRecord, len(ids[kind]))
+		}
+		for rows.Next() {
+			var id string
+			var taskRevision pgtype.Int8
+			var value taskValidationEvidenceSourceRecord
+			if err := rows.Scan(&id, &value.Sequence, &taskRevision, &value.CallID); err != nil {
+				return err
+			}
+			if taskRevision.Valid {
+				value.TaskRevision = taskRevision.Int64
+			} else {
+				value.TaskRevision = -1
+			}
+			value.ID = id
+			resolved[id] = value
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rowsByKind[kind] = resolved
+		return nil
+	}
+	idsFor := func(kind app.TaskValidationEvidenceKind) []string {
+		result := make([]string, 0, len(ids[kind]))
+		for id := range ids[kind] {
+			result = append(result, id)
+		}
+		return result
+	}
+	sourceIDs := idsFor(app.TaskValidationEvidenceSource)
+	filteredSourceIDs := make([]string, 0, len(sourceIDs))
+	currentRequested := false
+	for _, id := range sourceIDs {
+		if id == "current" {
+			currentRequested = true
+		} else {
+			filteredSourceIDs = append(filteredSourceIDs, id)
+		}
+	}
+	if currentRequested {
+		var current taskValidationEvidenceSourceRecord
+		err := tx.QueryRow(ctx, `SELECT m.id,m.sequence FROM conversation_messages m
+WHERE m.task_id=$1 AND m.owner_id=$2 AND m.conversation_id=$3 AND m.role='user' AND m.delivery_status='applied'
+  AND COALESCE((SELECT i.expected_revision+1 FROM task_revision_intents i
+    WHERE i.task_id=m.task_id AND i.message_id=m.id AND i.state='applied'),0)=$4
+		ORDER BY m.sequence DESC LIMIT 1`, taskID, ownerID, conversationID, revision).Scan(&current.ID, &current.Sequence)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("resolve current Task source evidence: %w", err)
+		}
+		if err == nil {
+			current.TaskRevision = revision
+			if rowsByKind[app.TaskValidationEvidenceSource] == nil {
+				rowsByKind[app.TaskValidationEvidenceSource] = make(map[string]taskValidationEvidenceSourceRecord)
+			}
+			rowsByKind[app.TaskValidationEvidenceSource]["current"] = current
+		}
+	}
+	if len(filteredSourceIDs) > 0 {
+		if err := read(app.TaskValidationEvidenceSource, `SELECT m.id,m.sequence,
+CASE WHEN m.role='user' THEN COALESCE((SELECT i.expected_revision+1 FROM task_revision_intents i
+  WHERE i.task_id=m.task_id AND i.message_id=m.id AND i.state='applied'),0)
+ELSE m.output_task_revision END, ''
+FROM conversation_messages m
+WHERE m.id=ANY($1::text[]) AND m.task_id=$2 AND m.owner_id=$3 AND m.conversation_id=$4 AND m.delivery_status='applied'`,
+			filteredSourceIDs, taskID, ownerID, conversationID); err != nil {
+			return nil, fmt.Errorf("resolve Task source evidence: %w", err)
+		}
+	}
+	stepIDs := make([]string, 0)
+	currentResultRequested := false
+	for _, kind := range []app.TaskValidationEvidenceKind{app.TaskValidationEvidenceBaseline, app.TaskValidationEvidenceAction,
+		app.TaskValidationEvidenceResult, app.TaskValidationEvidenceBeforeAfter} {
+		for id := range ids[kind] {
+			if kind == app.TaskValidationEvidenceResult && id == "current" {
+				currentResultRequested = true
+				continue
+			}
+			stepIDs = append(stepIDs, id)
+		}
+	}
+	if len(stepIDs) > 0 {
+		if err := read(app.TaskValidationEvidenceAction, `SELECT id,sequence,task_revision,COALESCE(tool_call_key,'')
+FROM task_steps WHERE task_id=$1 AND id=ANY($2::text[])`, taskID, stepIDs); err != nil {
+			return nil, fmt.Errorf("resolve Task step evidence: %w", err)
+		}
+		shared := rowsByKind[app.TaskValidationEvidenceAction]
+		for _, kind := range []app.TaskValidationEvidenceKind{app.TaskValidationEvidenceBaseline,
+			app.TaskValidationEvidenceResult, app.TaskValidationEvidenceBeforeAfter} {
+			rowsByKind[kind] = shared
+		}
+	}
+	if currentResultRequested {
+		var value taskValidationEvidenceSourceRecord
+		err := tx.QueryRow(ctx, `SELECT id,sequence,$3::bigint,COALESCE(tool_call_key,'')
+FROM task_steps WHERE task_id=$1 AND id=$2 AND kind='result' AND (task_revision IS NULL OR task_revision=$3)`,
+			taskID, resultStepID, revision).Scan(&value.ID, &value.Sequence, &value.TaskRevision, &value.CallID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("resolve current Task result evidence: %w", err)
+		}
+		if err == nil {
+			if rowsByKind[app.TaskValidationEvidenceResult] == nil {
+				rowsByKind[app.TaskValidationEvidenceResult] = make(map[string]taskValidationEvidenceSourceRecord)
+			}
+			rowsByKind[app.TaskValidationEvidenceResult]["current"] = value
+		}
+	}
+	if len(stepCallIDs) > 0 {
+		rows, err := tx.Query(ctx, `SELECT st.id,st.sequence,st.task_revision,COALESCE(st.tool_call_key,''),COALESCE(st.tool_name,''),session.session_id
+FROM task_steps st
+JOIN task_agent_sessions session ON session.task_id=st.task_id AND session.session_id=st.agent_session_id AND session.owner_id=$2
+JOIN task_agent_sessions root ON root.task_id=session.task_id AND root.session_id=$3 AND root.owner_id=$2 AND root.parent_session_id IS NULL
+WHERE st.task_id=$1 AND (session.session_id=root.session_id OR session.parent_session_id=root.session_id)
+  AND session.task_revision=$4 AND st.task_revision=$4 AND st.tool_call_key IS NOT NULL`,
+			taskID, ownerID, agentSessionID, revision)
+		if err != nil {
+			return nil, fmt.Errorf("resolve Task action call evidence: %w", err)
+		}
+		if rowsByKind[app.TaskValidationEvidenceAction] == nil {
+			rowsByKind[app.TaskValidationEvidenceAction] = make(map[string]taskValidationEvidenceSourceRecord)
+		}
+		delegatedCallIDs := make([]string, 0)
+		for rows.Next() {
+			var value taskValidationEvidenceSourceRecord
+			var taskRevision pgtype.Int8
+			var toolName, sessionID string
+			if err := rows.Scan(&value.ID, &value.Sequence, &taskRevision, &value.CallID, &toolName, &sessionID); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if taskRevision.Valid {
+				value.TaskRevision = taskRevision.Int64
+			} else {
+				value.TaskRevision = -1
+			}
+			if sessionID != agentSessionID {
+				value.CallID = taskValidationNamespacedDSHCallID(taskID, sessionID, value.CallID)
+			}
+			for kind := range stepCallKinds {
+				if _, requested := stepCallKinds[kind][value.CallID]; requested {
+					if rowsByKind[kind] == nil {
+						rowsByKind[kind] = make(map[string]taskValidationEvidenceSourceRecord)
+					}
+					rowsByKind[kind]["call:"+value.CallID] = value
+				}
+			}
+			if toolName == "dsh_delegate" {
+				delegatedCallIDs = append(delegatedCallIDs, value.CallID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+		if len(delegatedCallIDs) > 0 {
+			children, err := tx.Query(ctx, `SELECT st.id,st.sequence,s.task_revision,s.spawn_key
+FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
+WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.task_revision=$4
+  AND s.spawn_key=ANY($5::text[]) AND st.kind='subagent'`,
+				taskID, ownerID, agentSessionID, revision, delegatedCallIDs)
+			if err != nil {
+				return nil, fmt.Errorf("resolve delegated child Agent evidence: %w", err)
+			}
+			for children.Next() {
+				var value taskValidationEvidenceSourceRecord
+				if err := children.Scan(&value.ID, &value.Sequence, &value.TaskRevision, &value.CallID); err != nil {
+					children.Close()
+					return nil, err
+				}
+				for kind := range stepCallKinds {
+					if _, requested := stepCallKinds[kind][value.CallID]; requested {
+						if rowsByKind[kind] == nil {
+							rowsByKind[kind] = make(map[string]taskValidationEvidenceSourceRecord)
+						}
+						rowsByKind[kind]["call:"+value.CallID] = value
+					}
+				}
+			}
+			if err := children.Err(); err != nil {
+				children.Close()
+				return nil, err
+			}
+			children.Close()
+		}
+	}
+	artifactIDs := idsFor(app.TaskValidationEvidenceSideEffect)
+	if len(artifactIDs) > 0 || len(artifactCallIDs) > 0 {
+		artifactCalls := make([]string, 0, len(artifactCallIDs))
+		for id := range artifactCallIDs {
+			artifactCalls = append(artifactCalls, id)
+		}
+		rows, err := tx.Query(ctx, `SELECT a.id,s.sequence,COALESCE((event.payload->>'task_revision')::bigint,s.task_revision),COALESCE(event.payload->>'source_call_id','')
+FROM task_artifacts a JOIN task_steps s ON s.task_id=a.task_id AND s.id=a.step_id
+LEFT JOIN LATERAL (
+  SELECT e.payload FROM task_events e
+  WHERE e.task_id=a.task_id AND e.event_type='task.artifact' AND e.payload->>'artifact_id'=a.id AND e.payload->>'step_id'=a.step_id
+  ORDER BY e.sequence DESC LIMIT 1
+) event ON TRUE
+WHERE a.task_id=$1 AND (a.id=ANY($2::text[]) OR event.payload->>'source_call_id'=ANY($3::text[]))`,
+			taskID, artifactIDs, artifactCalls)
+		if err != nil {
+			return nil, fmt.Errorf("resolve Task side-effect evidence: %w", err)
+		}
+		resolved := rowsByKind[app.TaskValidationEvidenceSideEffect]
+		if resolved == nil {
+			resolved = make(map[string]taskValidationEvidenceSourceRecord, len(artifactIDs))
+		}
+		ambiguousCalls := make(map[string]struct{})
+		for rows.Next() {
+			var value taskValidationEvidenceSourceRecord
+			var taskRevision pgtype.Int8
+			if err := rows.Scan(&value.ID, &value.Sequence, &taskRevision, &value.CallID); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if taskRevision.Valid {
+				value.TaskRevision = taskRevision.Int64
+			} else {
+				value.TaskRevision = -1
+			}
+			resolved[value.ID] = value
+			if value.CallID != "" {
+				key := "call:" + value.CallID
+				if previous, exists := resolved[key]; exists && previous.ID != value.ID {
+					delete(resolved, key)
+					ambiguousCalls[value.CallID] = struct{}{}
+				} else if _, ambiguous := ambiguousCalls[value.CallID]; !ambiguous {
+					resolved[key] = value
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+		rowsByKind[app.TaskValidationEvidenceSideEffect] = resolved
+	}
+	resolvedClaims := make([]app.TaskValidationEvidenceClaimRecord, 0, len(claims))
+	for index, claim := range claims {
+		resolved := app.TaskValidationEvidenceClaimRecord{ID: fmt.Sprintf("c%d", index+1), StartByte: claim.StartByte, EndByte: claim.EndByte,
+			EvidenceRefs: make([]app.TaskValidationEvidenceRefRecord, 0, len(claim.EvidenceRefs))}
+		seenResolved := make(map[string]struct{}, len(claim.EvidenceRefs))
+		for _, ref := range claim.EvidenceRefs {
+			lookup := ref.ID
+			if ref.CallID != "" {
+				lookup = "call:" + ref.CallID
+			}
+			source, ok := rowsByKind[ref.Kind][lookup]
+			if !ok || source.TaskRevision != revision || source.Sequence < 1 {
+				return nil, domain.InvalidArgument("validation_evidence", "evidence reference is missing or belongs to another Task revision")
+			}
+			resolvedKey := string(ref.Kind) + ":" + source.ID
+			if _, duplicate := seenResolved[resolvedKey]; duplicate {
+				return nil, domain.InvalidArgument("validation_evidence", "evidence reference is duplicated")
+			}
+			seenResolved[resolvedKey] = struct{}{}
+			resolved.EvidenceRefs = append(resolved.EvidenceRefs, app.TaskValidationEvidenceRefRecord{
+				Kind: ref.Kind, ID: source.ID, TaskRevision: revision, Sequence: source.Sequence,
+				CallID: app.SafeTaskValidationCallID(source.CallID),
+			})
+		}
+		if comparison := claim.PerformanceComparison; comparison != nil {
+			baseline, baselineOK := rowsByKind[app.TaskValidationEvidenceBaseline]["call:"+comparison.BaselineCallID]
+			after, afterOK := rowsByKind[app.TaskValidationEvidenceBeforeAfter]["call:"+comparison.AfterCallID]
+			if !baselineOK || !afterOK || baseline.TaskRevision != revision || after.TaskRevision != revision ||
+				baseline.Sequence < 1 || after.Sequence < 1 || baseline.ID == after.ID {
+				return nil, domain.InvalidArgument("validation_evidence", "performance comparison references are missing or mismatched")
+			}
+			resolved.PerformanceComparison = &app.TaskValidationPerformanceComparison{
+				Metric: comparison.Metric, Unit: comparison.Unit, Before: comparison.Before, After: comparison.After,
+				Delta: comparison.After - comparison.Before, Environment: comparison.Environment,
+				BaselineRef: app.TaskValidationEvidenceRefRecord{Kind: app.TaskValidationEvidenceBaseline, ID: baseline.ID,
+					TaskRevision: revision, Sequence: baseline.Sequence, CallID: app.SafeTaskValidationCallID(baseline.CallID)},
+				AfterRef: app.TaskValidationEvidenceRefRecord{Kind: app.TaskValidationEvidenceBeforeAfter, ID: after.ID,
+					TaskRevision: revision, Sequence: after.Sequence, CallID: app.SafeTaskValidationCallID(after.CallID)},
+			}
+		}
+		resolvedClaims = append(resolvedClaims, resolved)
+	}
+	return resolvedClaims, nil
+}
+
+func taskValidationNamespacedDSHCallID(taskID, sessionID, callID string) string {
+	digest := sha256.Sum256([]byte("morde-dsh-tool-v1\n" + taskID + "\n" + sessionID + "\n" + callID))
+	return "dsh_" + hex.EncodeToString(digest[:])
+}
+
+func addTaskValidationEvidenceToResult(payload []byte, record app.TaskValidationEvidenceRecord) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil || fields == nil {
+		return nil, domain.InvalidArgument("event.payload", "task result event payload must be an object")
+	}
+	encodedRecord, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("encode Task validation evidence: %w", err)
+	}
+	if len(encodedRecord) > app.MaxTaskValidationEvidenceBytes {
+		return nil, domain.InvalidArgument("validation_evidence", "task result evidence record exceeds the limit")
+	}
+	fields["validation_evidence"] = encodedRecord
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode task result event with evidence: %w", err)
 	}
 	return encoded, nil
 }

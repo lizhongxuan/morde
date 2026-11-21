@@ -16,6 +16,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
 )
 
@@ -47,7 +48,31 @@ func TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint(t *testing.T)
 		t.Fatal(err)
 	}
 	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
-	hostValue, _, _ := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	hostValue, _, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	binding := hostValue.Workspaces[0]
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision)
+	if err != nil {
+		t.Fatalf("activate stable Agent Workspace binding: %v", err)
+	}
+	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replicaPrincipal, err := hostReplicas.Authenticate(ctx, hostValue.ID, hostValue.RuntimeGeneration, replicaCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replicaPrincipal, err = hostReplicas.ScopeWorkspace(ctx, replicaPrincipal, workspaceValue.ID, binding.BindingVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hostReplicas.ReportWorkspaceSyncStatus(ctx, replicaPrincipal, workspace.BindingSyncHealthy, nil); err != nil {
+		t.Fatalf("report healthy empty Agent Workspace baseline: %v", err)
+	}
+	if _, err := hostReplicas.ListBindings(ctx, replicaPrincipal); err != nil {
+		t.Fatalf("record Host replica heartbeat after empty Agent Workspace baseline: %v", err)
+	}
 	const oldRuntimeInstanceID = "f01-runtime-generation-one"
 	if err := store.SetRuntimeInstanceID(ctx, hostValue.ID, hostValue.RuntimeGeneration, hostValue.ControlVersion, "", oldRuntimeInstanceID); err != nil {
 		t.Fatalf("set original persisted Host runtime identity: %v", err)

@@ -623,7 +623,7 @@ describe('Projects API integration', () => {
     expect(append).not.toHaveBeenCalled();
   });
 
-  it('stores successive project messages and accepts them in order', async () => {
+  it('accepts project messages concurrently while preserving their predecessor link', async () => {
     let finishFirst: (() => void) | undefined;
     const append = vi.mocked(projectApi.acceptProjectConversationMessage).mockImplementation(async (_id, conversationID, body) => {
       if (body.content === '第一条') await new Promise<void>((resolve) => { finishFirst = resolve; });
@@ -640,11 +640,9 @@ describe('Projects API integration', () => {
     await waitFor(() => expect(prompt).toHaveValue(''));
     await user.type(prompt, '第二条');
     await user.click(screen.getByRole('button', { name: '发送消息' }));
-    await screen.findByText('第二条');
-    expect(append).toHaveBeenCalledTimes(1);
-    finishFirst?.();
     await waitFor(() => expect(append).toHaveBeenCalledTimes(2));
     expect(append.mock.calls[1]?.[2].previous_client_message_id).toBe(append.mock.calls[0]?.[2].client_message_id);
+    await act(async () => finishFirst?.());
     expect(append.mock.calls[1]?.[2].client_message_id).not.toBe(append.mock.calls[0]?.[2].client_message_id);
     expect(prompt).toBeEnabled();
   });

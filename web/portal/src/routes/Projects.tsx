@@ -12,7 +12,6 @@ import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbo
 import { buildMessageVariantTimeline, createMessageVariant, maxMessageVariantScalars, messageVariantActionLabel, messageVariantContentTooLong } from '../app/message-variants';
 import type { MessageVariantAction, VersionableMessage } from '../app/message-variants';
 import { needsMessageUpload, uploadMessage } from '../app/message-upload';
-import { MessageReceiptOrder } from '../app/message-receipt-order';
 import { deliveryStatusText, routingFailureText, routingStatusText } from '../app/message-status';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
@@ -151,7 +150,6 @@ function UserProjects() {
   const pendingProjectSave = useRef<Promise<void>>(Promise.resolve());
   const sendingProjectMessages = useRef(new Set<string>());
   const sendingVariantOperationKeys = useRef(new Set<string>());
-  const projectReceiptOrder = useRef(new MessageReceiptOrder());
   const [localOutgoingInvitations, setLocalOutgoingInvitations] = useState<Record<string, ProjectInvitation[]>>({});
   const [pendingAction, setPendingAction] = useState('');
   const [notice, setNotice] = useState<ActionNotice | null>(null);
@@ -362,7 +360,6 @@ function UserProjects() {
     const id = message.request.client_message_id;
     if (sendingProjectMessages.current.has(id)) return;
     sendingProjectMessages.current.add(id);
-    const finishReceipt = projectReceiptOrder.current.begin(scope, id);
     try {
       if (scope === outbox.unknownScope) {
         if (!projectTaskCapabilitiesQuery.data?.service_instance_id || !reconcile) {
@@ -395,20 +392,6 @@ function UserProjects() {
         checkScope();
         const request = outboxReceiptRequest(message);
         if (request.client_attachment_ids?.length) throw new Error('项目附件上传尚未在此页面开放；原消息和附件已保留。');
-        const previousID = request.previous_client_message_id;
-        if (previousID) {
-          if (previousID === id) throw new Error('消息前序编号无效，原消息已保留。');
-          const pending = projectReceiptOrder.current.previous(scope, previousID);
-          const previousAccepted = pending ? await pending : (await projectApi.projectConversationMessages(
-            targetProjectID, targetConversationID, previousID, message.serviceInstanceID, message.actorID,
-          )).some((item) => item.conversation_id === targetConversationID && item.owner_id === message.conversationOwnerID &&
-            item.actor_id === message.actorID && item.role === 'user' && item.client_message_id === previousID);
-          checkScope();
-          if (!previousAccepted) {
-            await outbox.change(scope, id, (current) => ({ ...current, status: 'pending', error: '前一条消息尚未确认，请先核对后重试。' }));
-            return;
-          }
-        }
         receipt = needsMessageUpload(request.content)
           ? await uploadMessage<components['schemas']['ProjectConversationMessage']>(
             { projectID: targetProjectID, conversationID: targetConversationID },
@@ -421,7 +404,6 @@ function UserProjects() {
         || receipt.client_message_id !== id || receipt.content !== message.request.content || receipt.role !== 'user') {
         throw new Error('服务端消息回执与项目或发起人不一致，请核对后重试。');
       }
-      finishReceipt(true);
       queryClient.setQueryData<components['schemas']['ProjectConversationMessage'][]>(
         ['project-conversation-messages', targetProjectID, targetConversationID], (previous) => previous?.some((item) => item.id === receipt!.id)
           ? previous : [...(previous ?? []), receipt!],
@@ -438,7 +420,6 @@ function UserProjects() {
       await outbox.change(scope, id, (current) => ({ ...current, status: uploadWaiting ? 'pending' : definite ? 'failed' : 'unknown', error: details }))
         .catch(() => setNotice({ kind: 'error', message: '无法更新本地消息状态，消息将保留等待核对。' }));
     } finally {
-      finishReceipt(false);
       sendingProjectMessages.current.delete(id);
     }
   };

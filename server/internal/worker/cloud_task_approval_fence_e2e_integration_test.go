@@ -28,6 +28,7 @@ import (
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
 )
 
@@ -45,6 +46,11 @@ func TestCloudTaskApprovalIsRevalidatedAfterHostControlFenceChanges(t *testing.T
 	}
 	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
 	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	binding := hostValue.Workspaces[0]
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision); err != nil {
+		t.Fatalf("activate stable Agent Workspace binding: %v", err)
+	}
 	approvalDesktop := &f01ApprovalDesktopHandler{}
 	runtimeStore := filepath.Join(t.TempDir(), "runtime-state")
 	if err := os.MkdirAll(runtimeStore, 0o700); err != nil {

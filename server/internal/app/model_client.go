@@ -3,7 +3,10 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ModelCallTimeout bounds both dispatch authorization and the provider request.
@@ -55,6 +58,7 @@ type ModelRequest struct {
 	Temperature     *float64
 	ReasoningEffort string
 	DisableThinking bool
+	JSONMode        bool
 	OnTextDelta     func(string) error
 }
 
@@ -72,12 +76,26 @@ type ModelUsage struct {
 	Known        bool
 }
 
+const MaxProviderReportedModelBytes = 256
+
+func ValidProviderReportedModel(value string) bool {
+	if value == "" {
+		return true
+	}
+	if !utf8.ValidString(value) || len(value) > MaxProviderReportedModelBytes || strings.TrimSpace(value) != value {
+		return false
+	}
+	return !strings.ContainsFunc(value, unicode.IsControl)
+}
+
 type ModelResponse struct {
-	Reasoning  string `json:"-"`
-	Text       string
-	ToolCalls  []ModelToolCall
-	Usage      ModelUsage
-	StopReason string
+	Reasoning             string `json:"-"`
+	Text                  string
+	ToolCalls             []ModelToolCall
+	Usage                 ModelUsage
+	StopReason            string
+	ProviderReportedModel string                     `json:"-"`
+	TaskValidationReview  *TaskValidationReviewModel `json:"-"`
 }
 
 type ModelCapabilities struct {

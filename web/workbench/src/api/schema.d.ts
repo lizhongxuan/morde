@@ -46,6 +46,234 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/codex/sessions/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register an explicitly authorized native Codex thread
+         * @description Requires an active installation-bound desktop Client credential. The owner and installation come from authentication; request bodies cannot select either. profile_key must be an opaque local identifier and must not contain CODEX_HOME or an absolute path. If a profile connection exists, requested thread scopes must be a subset of its exact grant; a revoked profile tombstone blocks discovery until explicitly reconnected. For older clients without a profile connection record, discovery retains its existing per-thread grant behavior. The supplied scopes replace the selected thread grant exactly; removing scopes blocks access while preserving stored history. Session, grant, commands and normalized events have no automatic TTL and remain until explicit session or account deletion. Re-discovering a deleted thread creates a new mirror ID.
+         */
+        post: operations["discoverCodexSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Codex profile connection and sync status for one owned PC installation
+         * @description Requires an owner Portal Session or an active Client credential owned by the same user. A Client reader installation must also be active. The queried installation must belong to the owner and be an active desktop installation. Revoked profiles are omitted. session_discovery describes only local session discovery state; history_sync separately reports PC-reported session and pending event counts and does not assert that an iOS client has loaded every event.
+         */
+        get: operations["listCodexProfileConnections"];
+        put?: never;
+        /**
+         * Grant one PC installation access to a local Codex profile
+         * @description Requires the active Client credential for a desktop installation. Owner and installation are taken from authentication. profile_key is an opaque local identifier and cannot contain a path or CODEX_HOME value. The exact profile scope set must include read and live; each already discovered session for this profile has its scopes atomically replaced and its grant version advanced when changed. Future discovery requests may select only a subset of the connected profile scopes. A previously revoked profile must be explicitly reconnected before it can be discovered again.
+         */
+        post: operations["connectCodexProfile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/connections/{profile_key}/session-discovery-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Report session discovery and historical event sync counts for the active Codex profile
+         * @description Requires the active Client credential for the desktop installation that owns the profile. The authenticated installation is used; owner and installation IDs are never accepted from the body. Session discovery state and error code describe only discovery. history_sync is a separate PC-reported summary containing discovered sessions, sessions whose historical event upload is complete, and events still pending upload. It is not a claim that a mobile client has loaded all server events. Revoked profiles cannot report status.
+         */
+        put: operations["updateCodexProfileSessionDiscoveryStatus"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/connections/{profile_key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one PC installation's access to a Codex profile
+         * @description Requires the same active desktop Client installation that owns the profile connection. Revocation atomically tombstones the profile connection, revokes every discovered session grant, and marks pending commands failed or in-flight commands unknown. It blocks future discovery, event writes/reads and command access while preserving the event and command history; reconnecting explicitly may restore only newly granted scopes.
+         */
+        delete: operations["revokeCodexProfileConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List authorized Codex session mirrors for one PC installation
+         * @description Requires an owner Portal Session or owner Client credential and the read scope for each returned mirror. installation_id selects the owner's active desktop PC installation and may differ from the reader Client installation. Cursors are opaque session IDs; revoked grants are omitted, while their retained history becomes readable again only after explicit re-authorization.
+         */
+        get: operations["listCodexSessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a durable Codex event page
+         * @description Requires an owner Portal Session or owner Client credential and the session read scope. The reader Client installation may differ from the PC installation that owns the session. Sequences are strictly increasing and never gap over retained data; after_sequence greater than the current sequence is rejected. Each event is limited to 64 KiB and its normalized payload is validated against an event-kind allowlist. The history includes server-managed command_status events for durable command progress.
+         */
+        get: operations["listCodexSessionEvents"];
+        put?: never;
+        /**
+         * Persist normalized events from the bound PC installation
+         * @description Requires the same active Client installation bound to the session. Each event declares source=snapshot, live or approval and requires the matching read, live or approval grant; approval event kinds require approval scope, question events require live scope, and unsupported user_question diagnostics may be historical snapshots (read scope) or approval-sourced diagnostics (approval scope). Question IDs are opaque, preserve their exact bytes, and must be unique within one pending request. A batch is limited to 512 KiB; each event is limited to 64 KiB. The server assigns contiguous session sequence values transactionally. Repeated provider_event_id values return their original sequence without appending a second event. Source is used only for authorization and is not stored or returned as presentation data. The PC must send only allowlisted user-visible normalized fields, never raw App Server JSON-RPC, credentials or project files. command_status events are server-managed and rejected from PC batches.
+         */
+        post: operations["appendCodexSessionEvents"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}/events/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stream newly stored Codex events with SSE
+         * @description Requires an owner Portal Session or owner Client credential and both session read and live scopes. Read authorizes access to event-log contents; live authorizes the streaming transport. The reader Client installation may differ from the PC installation that owns the session. The SSE event id is the durable session sequence and data is the same CodexEvent returned by event history. Reconnect using after_sequence; disconnecting does not cancel a PC turn. SSE is a transport only, while the database event log remains authoritative.
+         */
+        get: operations["streamCodexSessionEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue an idempotent command for an authorized PC session
+         * @description Requires an owner Portal Session or owner Client credential, the session read scope, and the type-specific send, interrupt or approval grant. answer_question uses send scope. The caller's Client installation may differ from the PC installation that owns the session; the command is stored for that PC installation. Status starts as waiting_pc and its server-managed command_status event is appended in the same transaction using provider_event_id morde:command:<command-id>:<status-version>:<status>. Idempotency-Key retries return the original command without adding another event; no Hub call or cloud Task is created, and a claimed result that becomes unknown is never automatically reassigned.
+         */
+        post: operations["createCodexSessionCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/commands/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim at most one waiting command for this PC installation
+         * @description Requires the active installation-bound Client credential. The PC polls over HTTPS every two seconds. The queue is database-backed and unrelated to Hub presence. Claim uses a conditional row lock; only waiting_pc commands with a current grant version are returned. Claim appends the claimed command_status event in the same transaction. A claimed command with no result for 60 seconds becomes unknown on the next PC poll and is never returned to the queue.
+         */
+        post: operations["claimCodexCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/commands/{id}/result": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Persist a PC command result
+         * @description Requires the original active PC installation, current session grant version and session authorization. Updates are idempotent and validated against allowed state transitions; each new status transition is appended as a command_status event in the same transaction. A result of unknown is terminal and never requeued. Grant-version changes fail commands not yet claimed and mark already claimed or in-flight commands unknown.
+         */
+        post: operations["reportCodexCommandResult"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex/sessions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a Codex mirror session and its retained cloud records
+         * @description Requires the owner Portal Session. Deleting the mirror cascades to its grant, event history and queued command records. This does not claim to stop a PC turn that already began. Account deletion also cascades; no automatic TTL is applied. Grant revocation preserves history and blocks access, while this operation permanently removes the mirror data.
+         */
+        delete: operations["deleteCodexSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/model/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -216,6 +444,46 @@ export interface paths {
         };
         /** Get the current user and quota usage */
         get: operations["getMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/agent-workspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get or initialize the current user's stable Agent Workspace
+         * @description Portal Session only. Returns the user's one stable Agent Workspace and its logical root path even when no cloud computer is running. The server filesystem path is never exposed.
+         */
+        get: operations["getMyAgentWorkspace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/task-approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List approval snapshots visible to the current user
+         * @description Requires current task-control authorization to see unexpired pending approvals and task-read authorization to see handled or expired snapshots, plus current project membership. Pending approvals are actionable only while unexpired; handled approvals remain available as read-only snapshots. pending_count counts the full set of unexpired approvals the caller can handle, independent of pagination. A conversation_id filter returns only that conversation's records and count. Request hashes, tool call IDs, credentials and private runtime details are never returned.
+         */
+        get: operations["listMyTaskApprovals"];
         put?: never;
         post?: never;
         delete?: never;
@@ -460,7 +728,7 @@ export interface paths {
         put?: never;
         /**
          * Create a host
-         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host binds exactly one owned, ready Workspace. Portal Sessions may omit workspace_ids to let the server select an available Workspace; API keys and Client credentials must provide one authorized Workspace ID. Reuse the Idempotency-Key only to retry the exact normalized request.
+         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. The server binds this Host to the user's stable Agent Workspace at ~/workspace; clients cannot bind another Workspace. The same Agent Workspace can be used when the user switches to a replacement computer. If the verified direct-mount gate is closed, Host creation fails before persistence and leaves the Agent Workspace available. Reuse the Idempotency-Key only to retry the exact normalized request.
          */
         post: operations["createHost"];
         delete?: never;
@@ -487,7 +755,7 @@ export interface paths {
         post?: never;
         /**
          * Delete a host
-         * @description API keys require current account ownership of this host. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
+         * @description Permanently deletes this Host and releases its compute resources after explicit confirmation. The stable Agent Workspace remains on the server and can be mounted by a replacement Host. Requires confirm_delete_workspace=true (legacy parameter name). The request is accepted asynchronously; poll GET /api/hosts/{id} until deleted. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
          */
         delete: operations["deleteHost"];
         options?: never;
@@ -507,8 +775,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Create an independent Host from a stopped Host
-         * @description Portal owner sessions only. The source must be safely stopped and have exactly one healthy Workspace binding at the requested confirmed revision, with no unresolved conflicts or in-flight writers. Morde copies that Workspace revision and atomically creates a new Host bound to the copy. The new Host receives fresh runtime identity and credentials; source runtime/profile/apps, tasks, credentials, and sync device/folder associations are not copied. Ambiguous metadata or copy outcomes fail closed and preserve the reservation for idempotent recovery.
+         * Reject independent Host copies
+         * @deprecated
+         * @description Deprecated. Portal owner sessions only. A cloud computer must use its owner's stable Agent Workspace, so an independent Host copy and Workspace copy are unavailable. Valid requests return 409 before any copy reservation, Workspace creation, volume operation, or Host creation.
          */
         post: operations["copyHost"];
         delete?: never;
@@ -924,7 +1193,7 @@ export interface paths {
         put?: never;
         /**
          * Issue a short-lived one-time ticket for an embedded Host view
-         * @description Requires an authenticated Portal session or installation-bound native client credential (platform API keys are rejected), access to the supplied conversation, and current permission for the selected Host target. The server binds the ticket to the authenticated user, Portal credential, optional client installation, conversation, Host, target permission ceiling, current runtime generation, service instance, and exact configured Portal Origin. The exchange URL is server-generated for that Host and has no query string; the ticket is returned separately and stored hash-only. Ticket responses are not cacheable. The Gateway exchange route and embedded session are completed by the subsequent embedded-session task.
+         * @description Requires an authenticated Portal session or installation-bound native client credential (platform API keys are rejected), access to the supplied conversation, and current permission for the selected Host targets. The server binds the ticket to the authenticated user, Portal credential, optional client installation, conversation, Host, exact per-target permission ceilings, random embed nonce, current runtime generation, service instance, and exact configured Portal Origin. The exchange URL is server-generated for that Host and has no query string; the ticket is returned separately and stored hash-only. Ticket responses are not cacheable.
          */
         post: operations["issueHostEmbedTicket"];
         delete?: never;
@@ -1155,11 +1424,7 @@ export interface paths {
         /** List independent workspaces */
         get: operations["listWorkspaces"];
         put?: never;
-        /**
-         * Create an independent workspace
-         * @description Creates metadata and an empty durable file root without creating or starting a Host. Requires an idempotency key.
-         */
-        post: operations["createWorkspace"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1181,6 +1446,51 @@ export interface paths {
         post?: never;
         /** Delete a workspace */
         delete: operations["deleteWorkspace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/entries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List entries in the current user's live Agent Workspace
+         * @description Portal Session only. The Workspace ID must equal the current user's stable Agent Workspace. Paths are relative; symlinks are listed as symlinks and never followed. Results are sorted by entry name and paginated using next_cursor.
+         */
+        get: operations["listAgentWorkspaceEntries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/files/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                path: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Download a file from the current user's live Agent Workspace
+         * @description Portal Session only. The Workspace ID must equal the current user's stable Agent Workspace. Symlinks and paths outside the Workspace are rejected; the server filesystem path is never exposed.
+         */
+        get: operations["downloadAgentWorkspaceFile"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1356,7 +1666,7 @@ export interface paths {
         put?: never;
         /**
          * Create a single-recipient Workspace copy link
-         * @description Portal owner sessions only. The link expires after seven days if unclaimed. The response contains the random token once; only its SHA-256 hash is stored. A successful claim creates an independent Workspace owned by the recipient. View permission is enforced by the server and prevents Workspace writes and Host attachment.
+         * @description Portal owner sessions only and only for an independent Workspace that has never been bound to a Host. Host-bound computer storage cannot be shared or copied through this endpoint. The link expires after seven days if unclaimed. The response contains the random token once; only its SHA-256 hash is stored. A successful claim creates an independent Workspace owned by the recipient. View permission is enforced by the server and prevents Workspace writes and Host attachment.
          */
         post: operations["createWorkspaceShareLink"];
         delete?: never;
@@ -1376,7 +1686,7 @@ export interface paths {
         put?: never;
         /**
          * Preview a Workspace copy link
-         * @description Portal session only. The token is sent in the request body and responses are not cacheable. Preview does not claim or consume the link.
+         * @description Portal session only. The token is sent in the request body and responses are not cacheable. Preview does not claim or consume the link. Links whose source has since become Host-bound are unavailable.
          */
         post: operations["previewWorkspaceShareLink"];
         delete?: never;
@@ -1396,7 +1706,7 @@ export interface paths {
         put?: never;
         /**
          * Claim a Workspace copy link
-         * @description Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. The server creates the recipient-owned copy with the selected view/edit permission when it reserves the copy; neither successful nor recovery paths use ownership transfer or transfer the original Workspace or its Host bindings. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
+         * @description Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account while its source remains an independent Workspace; if the source becomes Host-bound, the link cannot be claimed or copied. The server creates the recipient-owned copy with the selected view/edit permission when it reserves the copy; neither successful nor recovery paths use ownership transfer or transfer the original Workspace or its Host bindings. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
          */
         post: operations["acceptWorkspaceShareLink"];
         delete?: never;
@@ -1418,7 +1728,7 @@ export interface paths {
         put?: never;
         /**
          * Restore selected paths from an immutable revision
-         * @description Portal owner sessions only. The current Workspace revision is checked atomically; active Host bindings, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
+         * @description Portal owner sessions only. The current Workspace revision is checked atomically; any current or historical Host binding, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
          */
         post: operations["restoreWorkspacePaths"];
         delete?: never;
@@ -1440,7 +1750,7 @@ export interface paths {
         put?: never;
         /**
          * Rename, move, or delete Workspace paths
-         * @description Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of active Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
+         * @description Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of current or historical Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
          */
         post: operations["applyWorkspaceFileOperation"];
         delete?: never;
@@ -1558,9 +1868,31 @@ export interface paths {
         put?: never;
         /**
          * Plan an upload, missing-only download, merge, or live synchronization batch
-         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion. Requests with folder_id are explicit PC-to-cloud project uploads; only the owning Portal Session or an installation-bound Sync credential (chd_) is authorized. Platform API keys and restricted Client credentials are rejected for project uploads. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
+         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; the same Idempotency-Key and canonical request return the original session, while a different request body conflicts. Omitted files never imply deletion. When folder_id is omitted, root synchronization remains available to HostReplica internal sessions and to historical unbound Workspaces; non-HostReplica sessions are rejected for any Workspace with a current or historical Host binding. Requests with folder_id are explicit PC-to-cloud project uploads and must include source_binding_id; the authenticated principal supplies the verified client installation identity. The server accepts only one complete relative source manifest, derives the cloud path and safe deletion plan, and never trusts client installation, Host, Workspace, path, scope, or delete-list claims. Old sessions and last_upload_revision values do not prove PC ownership; old project sessions receive no deletion baseline. SyncSession.state=completed confirms only server commit; Host application is tracked separately. GET exposes a session-bound host_application projection, and only a verified receipt for the recorded Host, Workspace binding version, exact target_revision and authenticated Host runtime generation can confirm application. Receipt handling rechecks the current Host generation, binding version, and authorization in the committing transaction. An applied_revision above target_revision is accepted only when the server verifies revision lineage and the affected project paths; a larger numeric revision alone never proves application. An unresolved application prevents a different destructive project upload; retries with the original idempotency key recover the original session. Only an installation-bound session/client credential is authorized. Platform API keys and credentials without a verified installation are rejected. Requests with folder_id return workspace_unavailable while the server-side project upload release gate is closed (the default).
          */
         post: operations["createWorkspaceSyncSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/sync-sessions/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Recover a resumable sync session by its idempotency key
+         * @description Call only when api/capabilities advertises workspace_sync_checkpoint_recovery. Requires an owner Portal Session or the same installation-bound Device credential used to create the session; HostReplica credentials are rejected. The caller must be authorized for the owner and Workspace. The Idempotency-Key is scoped by owner and workspace for the recovery lookup, and the stored session must also match the authenticated replica. A matching session returns the same SyncSession model as create. If no reservation exists after authorization, the server inserts an immutable tombstone under the original global idempotency primary key before returning 404, so a late in-flight create cannot commit. A key that points to another Workspace, replica, quota rejection, tombstone, or missing session returns the same 404 without revealing session data; existing idempotency rows are never overwritten. This endpoint never deletes Workspace data or sessions.
+         */
+        post: operations["recoverWorkspaceSyncSession"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1601,7 +1933,7 @@ export interface paths {
         put?: never;
         /**
          * Verify and commit the transfer plan
-         * @description Rechecks the pinned base revision and received chunks. Changed paths return conflicts; unrelated files may commit independently. Durable block acknowledgement is separate from destination application acknowledgement.
+         * @description Rechecks the pinned base revision and received chunks. A non-HostReplica root session cannot commit after its Workspace has any current or historical Host binding; use the registered project-upload contract for PC changes. Changed paths return conflicts; unrelated files may commit independently. Durable block acknowledgement is separate from destination application acknowledgement.
          */
         post: operations["commitWorkspaceSyncSession"];
         delete?: never;
@@ -1721,8 +2053,9 @@ export interface paths {
         get: operations["listHostWorkspaceBindings"];
         put?: never;
         /**
-         * Bind a ready workspace without restarting the host
-         * @description The server creates the workspace directory under the Host-level workspace root and requests the current revision. Directory paths are never accepted from the caller.
+         * Rebinding computer storage is disabled
+         * @deprecated
+         * @description A cloud computer's persistent storage is assigned at creation and cannot be rebound. This legacy endpoint always returns 403; clients should show storage readiness from the Host response instead.
          */
         post: operations["bindWorkspaceToHost"];
         delete?: never;
@@ -1767,7 +2100,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read the current workspace replica snapshot for a Host runtime */
+        /**
+         * Read the current workspace replica snapshot for a Host runtime
+         * @description Returns this authenticated Host generation's current Workspace bindings plus session-specific PC project uploads in pending_apply state. Each reference contains metadata only; the Host fetches the existing sync session and its blocks through the normal authorized transfer API. There is at most one unresolved application per registered project folder; conflict and unknown outcomes remain visible through the sync-session projection.
+         */
         get: operations["listHostReplicaBindings"];
         put?: never;
         post?: never;
@@ -1883,8 +2219,37 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Acknowledge a revision applied by a completed sync session */
+        /**
+         * Acknowledge a revision applied by a completed sync session
+         * @description Host Runtime identity is bound by host_id, runtime generation, workspace_id, and binding_version. The request must name a completed Host download/bidirectional session whose target revision equals applied_revision. This Workspace-level receipt does not acknowledge a PC project upload; a larger numeric revision alone is not proof of project application. Use the project session-specific receipt endpoint.
+         */
         post: operations["recordHostReplicaAppliedRevision"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/host-replicas/{host_id}/generations/{generation}/workspaces/{workspace_id}/bindings/{binding_version}/project-uploads/{session_id}/applied": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                workspace_id: components["schemas"]["WorkspaceId"];
+                binding_version: number;
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record application of one PC project upload
+         * @description The Host Runtime credential and path bind the authenticated Host and the generation observed with this receipt. The server rechecks that this is still the current Host generation and verifies owner authorization, Workspace, active binding version, source binding, session target revision and complete manifest digest in the committing transaction. The identical receipt is idempotent; a different receipt conflicts. Only a complete verified target may be applied; partial application remains conflict or unknown. An applied_revision above target_revision may be accepted only after server-side revision-lineage and affected-path verification; a larger number alone never confirms this session. Workspace desired/applied revision equality alone never confirms this session.
+         */
+        post: operations["recordHostProjectUploadApplication"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1949,8 +2314,9 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Unbind a workspace while retaining its server content
-         * @description The caller must stop AI tools, IDEs, and other external writers and explicitly confirm that they have stopped. The runtime then blocks new Morde operations, waits for in-flight operations, syncs and verifies a stable checkpoint, and detaches the binding. The independent server workspace is retained; the detached Host copy remains on its volume.
+         * Unbinding computer storage is disabled
+         * @deprecated
+         * @description A cloud computer's persistent storage remains assigned for its lifetime. This legacy endpoint always returns 403. Permanently deleting the Host requires the explicit confirmation query on DELETE /api/hosts/{id}.
          */
         delete: operations["unbindWorkspaceFromHost"];
         options?: never;
@@ -2454,8 +2820,8 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List visible active tasks in a shared conversation */
-        get: operations["listProjectConversationActiveTasks"];
+        /** List visible tasks in a shared conversation */
+        get: operations["listProjectConversationTasks"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2485,6 +2851,37 @@ export interface paths {
          * @description Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. Set change_task_target=true only when an instruction explicitly changes the target of a referenced Task; otherwise host_id, workspace_id, and application_id are selection hints for new work and do not retarget that Task. The Idempotency-Key must equal client_message_id.
          */
         post: operations["acceptProjectConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/variants": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create an immutable version of a shared conversation message
+         * @description expected_version must equal the group's highest accepted version. Only the source message actor may edit or regenerate it; stale requests return 409. Edit-resend preserves the source message's authorized attachments. Text regeneration uses the same DSH runtime with an empty tool set. Continue-generation is accepted only for a verified checkpoint of the same Task revision.
+         */
+        post: operations["createProjectConversationMessageVariant"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2593,7 +2990,7 @@ export interface paths {
         put?: never;
         /**
          * Retry processing of an accepted failed message
-         * @description Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+         * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryProjectConversationMessageProcessing"];
         delete?: never;
@@ -3273,9 +3670,39 @@ export interface paths {
         put?: never;
         /**
          * Retry processing of an accepted failed message
-         * @description Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+         * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryConversationMessageProcessing"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/messages/{message_id}/variants": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create an immutable version of a conversation message
+         * @description expected_version must equal the group's highest accepted version. Only the source message actor may edit or regenerate it; stale requests return 409. Edit-resend preserves the source message's authorized attachments. Text regeneration uses the same DSH runtime with an empty tool set. Continue-generation is accepted only for a verified checkpoint of the same Task revision.
+         */
+        post: operations["createConversationMessageVariant"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3422,6 +3849,72 @@ export interface paths {
         get: operations["getTask"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/artifacts/{artifact_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                artifact_id: components["schemas"]["ArtifactId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download a verified Task artifact from its pinned Workspace revision
+         * @description Portal Session only. Returns bytes only after re-authorizing the Task and verifying the immutable Workspace revision, relative path, size, and SHA-256. Missing, inaccessible, legacy unverified, or changed artifacts are not returned.
+         */
+        get: operations["getTaskArtifactContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/steps/{step_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        /** Get safe details for one task step */
+        get: operations["getTaskStepDetail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/steps/{step_id}/retries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue one verified safe retry of a Task step
+         * @description Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
+         */
+        post: operations["retryTaskStep"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3708,7 +4201,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Pause, resume, cancel, or retry one batch item */
+        /** Set queued priority, pause, resume, cancel, or retry one batch item */
         post: operations["actOnTask"];
         delete?: never;
         options?: never;
@@ -4010,7 +4503,7 @@ export interface paths {
         };
         /**
          * Read the authenticated account's personal-data quota
-         * @description Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
+         * @description Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, retained personal-memory history bodies, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
          */
         get: operations["getPersonalDataQuota"];
         put?: never;
@@ -4048,6 +4541,34 @@ export interface paths {
          * @description Requires an approved portal session or active Client credential. Deletion records a versioned tombstone; the same profile ID cannot be recreated. The body-free receipt is idempotent through Idempotency-Key.
          */
         delete: operations["deletePersonalObject"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/{type}/{id}/history": {
+        parameters: {
+            query?: {
+                /** @description Signed keyset cursor bound to the authenticated owner and memory object. */
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                type: "memory";
+                /** @description Memory ID; only the memory object type has revision history. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read revision history for a personal memory
+         * @description Requires an approved Portal Session or active Client credential. Returns current and prior memory revisions newest first. Historical bodies that were never retained are null and are never reconstructed. A body is restorable only when present and its recorded provenance is still authorized. Suppressed or invalid provenance withholds the body and all source references. Existing PUT with base_revision and Idempotency-Key is used to restore an available body. Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward personal-data quota and are purged when the memory is deleted.
+         */
+        get: operations["getPersonalMemoryHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4793,7 +5314,7 @@ export interface paths {
         };
         /**
          * Read a user's personal-data usage and limits
-         * @description Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
+         * @description Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, retained personal-memory history bodies, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
          */
         get: operations["getAdminPersonalDataQuota"];
         put?: never;
@@ -5466,6 +5987,381 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        CodexProfileConnectionRequest: {
+            /** @description Opaque stable local profile identifier. Never an absolute path or CODEX_HOME value. */
+            profile_key: string;
+            /** @description Exact profile grant; must include read and live. Other scopes are optional. */
+            scopes: ("read" | "live" | "send" | "interrupt" | "approval")[];
+        } & ({
+            scopes: unknown;
+        } & {
+            scopes: unknown;
+        });
+        CodexProfileConnection: {
+            installation_id: string;
+            profile_key: string;
+            scopes: ("read" | "live" | "send" | "interrupt" | "approval")[];
+            /** Format: int64 */
+            grant_version: number;
+            /** @enum {boolean} */
+            connected: true;
+            /** Format: date-time */
+            updated_at: string;
+            session_discovery: components["schemas"]["CodexSessionDiscoveryStatus"] | null;
+            history_sync: components["schemas"]["CodexHistorySyncProgress"] | null;
+        } & ({
+            scopes: unknown;
+        } & {
+            scopes: unknown;
+        });
+        CodexProfileConnectionList: {
+            items: components["schemas"]["CodexProfileConnection"][];
+        };
+        CodexSessionDiscoveryUpdate: {
+            /**
+             * @description Describes local session discovery only.
+             * @enum {string}
+             */
+            state: "syncing" | "synced" | "partial";
+            /** @enum {string|null} */
+            error_code?: "profile_unavailable" | "session_list_failed" | "connection_lost" | "unknown" | null;
+        } & (unknown & unknown);
+        CodexHistorySyncProgressUpdate: {
+            /**
+             * Format: int64
+             * @description Number of sessions discovered on the PC for this profile.
+             */
+            discovered_sessions: number;
+            /**
+             * Format: int64
+             * @description Number of discovered sessions whose PC-side historical event upload is complete. Must not exceed discovered_sessions.
+             */
+            history_complete_sessions: number;
+            /**
+             * Format: int64
+             * @description Number of historical events still queued for upload by the PC.
+             */
+            pending_upload_event_count: number;
+        };
+        CodexProfileSessionDiscoveryUpdate: {
+            session_discovery: components["schemas"]["CodexSessionDiscoveryUpdate"];
+            history_sync: components["schemas"]["CodexHistorySyncProgressUpdate"];
+        };
+        CodexSessionDiscoveryStatus: {
+            /**
+             * @description Describes local session discovery only.
+             * @enum {string}
+             */
+            state: "syncing" | "synced" | "partial";
+            /** @enum {string|null} */
+            error_code: "profile_unavailable" | "session_list_failed" | "connection_lost" | "unknown" | null;
+            /**
+             * Format: date-time
+             * @description Server time when this discovery state and accompanying counters were recorded.
+             */
+            updated_at: string;
+        } & (unknown & unknown);
+        CodexHistorySyncProgress: {
+            /** Format: int64 */
+            discovered_sessions: number;
+            /**
+             * Format: int64
+             * @description PC-reported count of sessions whose historical event upload has completed.
+             */
+            history_complete_sessions: number;
+            /**
+             * Format: int64
+             * @description PC-reported number of historical events still queued for upload.
+             */
+            pending_upload_event_count: number;
+        };
+        CodexDiscoverRequest: {
+            /** @description Opaque stable local profile identifier. Never an absolute path or CODEX_HOME value. */
+            profile_key: string;
+            thread_id: string;
+            title: string;
+            /** @description Display-only project label */
+            cwd_label: string;
+            /** Format: date-time */
+            updated_at?: string | null;
+            /** @enum {string} */
+            status: "idle" | "in_progress" | "waiting_approval" | "completed" | "failed" | "unknown";
+            scopes: ("read" | "live" | "send" | "interrupt" | "approval")[];
+        };
+        CodexSession: {
+            id: string;
+            installation_id: string;
+            profile_key: string;
+            thread_id: string;
+            title: string;
+            cwd_label: string;
+            /** Format: date-time */
+            updated_at: string | null;
+            /** @enum {string} */
+            status: "idle" | "in_progress" | "waiting_approval" | "completed" | "failed" | "unknown";
+            scopes: ("read" | "live" | "send" | "interrupt" | "approval")[];
+            /** Format: int64 */
+            grant_version: number;
+            /** Format: int64 */
+            last_sequence: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        CodexSessionPage: {
+            items: components["schemas"]["CodexSession"][];
+            next_cursor: string | null;
+        };
+        CodexEventInput: {
+            provider_event_id: string;
+            /** @enum {string} */
+            kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "tool_call_summary" | "tool_result_summary" | "command_summary" | "file_change" | "file_change_summary" | "child_agent" | "subagent_summary" | "question" | "approval_request" | "approval_status" | "unsupported";
+            /**
+             * @description Authorization source only; it is not stored or returned as event content. It selects the required read, live or approval grant.
+             * @enum {string}
+             */
+            source: "snapshot" | "live" | "approval";
+            /** Format: date-time */
+            occurred_at: string;
+            turn_id?: string;
+            item_id?: string;
+            parent_item_id?: string;
+            status?: string;
+            payload: {
+                text?: string;
+                segment_id?: string;
+                delta_index?: number;
+                summary?: string;
+                items?: string[];
+                explanation?: string;
+                status?: string;
+                error_code?: string;
+                tool?: string;
+                call_id?: string;
+                output?: string;
+                /** @description One UTF-8-safe tool argument chunk, at most 24 KiB encoded as UTF-8. Sent with call_id, input_part and input_parts. */
+                input?: string;
+                /**
+                 * Format: int32
+                 * @description Zero-based input chunk index.
+                 */
+                input_part?: number;
+                /**
+                 * Format: int32
+                 * @description Total number of tool input chunks.
+                 */
+                input_parts?: number;
+                /**
+                 * Format: int32
+                 * @description Zero-based output chunk or live delta index.
+                 */
+                output_part?: number;
+                /**
+                 * Format: int32
+                 * @description Total number of output chunks for snapshots; omitted for live output deltas.
+                 */
+                output_parts?: number;
+                output_summary?: string;
+                exit_code?: number;
+                path_label?: string;
+                change?: string;
+                changes?: string[];
+                agent_label?: string;
+                approval_id?: string;
+                approval_version?: string;
+                kind?: string;
+                /** @description Bounded user-visible request object; paths are reduced to display labels. */
+                object?: string;
+                /** @description Bounded operation detail or requested permission scope. */
+                detail?: string;
+                /** @description Bounded provider reason when available. */
+                impact?: string;
+                /** @description Opaque App Server user-input request identifier; preserve exact bytes */
+                question_request_id?: string;
+                /** @description Lowercase SHA-256 identity for the pending user-input request. */
+                question_version?: string;
+                /** @description Question IDs must be unique within this request and are preserved byte-for-byte without trimming. */
+                questions?: components["schemas"]["CodexUserQuestion"][];
+                provider_type?: string;
+                diagnostic?: string;
+            };
+        } & unknown;
+        CodexEventBatch: {
+            events: components["schemas"]["CodexEventInput"][];
+        };
+        CodexQuestionOption: {
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
+            label: string;
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
+            description?: string;
+        };
+        CodexUserQuestion: {
+            /** @description Opaque byte-preserved ID; server rejects blank-only values and controls. */
+            id: string;
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
+            header: string;
+            /** @description Preserves the App Server string exactly, including whitespace; maximum 4096 UTF-8 bytes. LF, CR and TAB are allowed control characters. */
+            question: string;
+            is_secret?: boolean;
+            is_other?: boolean;
+            options: components["schemas"]["CodexQuestionOption"][];
+        };
+        CodexQuestionEventPayload: {
+            /** @description Opaque request identifier preserved byte-for-byte. */
+            question_request_id: string;
+            question_version: string;
+            /** @constant */
+            status: "pending";
+            questions: components["schemas"]["CodexUserQuestion"][];
+        } | {
+            /** @description Opaque request identifier preserved byte-for-byte. */
+            question_request_id: string;
+            question_version: string;
+            /** @enum {string} */
+            status: "answered" | "stale";
+        };
+        CodexEvent: {
+            session_id: string;
+            /** Format: int64 */
+            sequence: number;
+            provider_event_id: string;
+            /** @enum {string} */
+            kind: "user_message" | "assistant_message" | "assistant_delta" | "reasoning_summary" | "plan" | "turn_started" | "turn_completed" | "turn_failed" | "turn_cancelled" | "tool_call" | "tool_result" | "tool_call_summary" | "tool_result_summary" | "command_summary" | "file_change" | "file_change_summary" | "child_agent" | "subagent_summary" | "question" | "approval_request" | "approval_status" | "command_status" | "unsupported";
+            /** Format: date-time */
+            occurred_at: string;
+            turn_id?: string;
+            item_id?: string;
+            parent_item_id?: string;
+            status?: string;
+            payload: {
+                text?: string;
+                segment_id?: string;
+                delta_index?: number;
+                summary?: string;
+                items?: string[];
+                explanation?: string;
+                status?: string;
+                error_code?: string;
+                tool?: string;
+                call_id?: string;
+                output?: string;
+                /** @description One UTF-8-safe tool argument chunk, at most 24 KiB encoded as UTF-8. Sent with call_id, input_part and input_parts. */
+                input?: string;
+                /**
+                 * Format: int32
+                 * @description Zero-based input chunk index.
+                 */
+                input_part?: number;
+                /**
+                 * Format: int32
+                 * @description Total number of tool input chunks.
+                 */
+                input_parts?: number;
+                /**
+                 * Format: int32
+                 * @description Zero-based output chunk or live delta index.
+                 */
+                output_part?: number;
+                /**
+                 * Format: int32
+                 * @description Total number of output chunks for snapshots; omitted for live output deltas.
+                 */
+                output_parts?: number;
+                output_summary?: string;
+                exit_code?: number;
+                path_label?: string;
+                change?: string;
+                changes?: string[];
+                agent_label?: string;
+                approval_id?: string;
+                approval_version?: string;
+                kind?: string;
+                object?: string;
+                detail?: string;
+                impact?: string;
+                command_id?: string;
+                /** @enum {string} */
+                type?: "send" | "interrupt" | "approval" | "answer_question";
+                result_code?: string;
+                /** @description Opaque request identifier preserved byte-for-byte. */
+                question_request_id?: string;
+                question_version?: string;
+                questions?: components["schemas"]["CodexUserQuestion"][];
+                provider_type?: string;
+                diagnostic?: string;
+            };
+            /** Format: date-time */
+            stored_at: string;
+        } & unknown;
+        CodexEventPage: {
+            items: components["schemas"]["CodexEvent"][];
+            /** Format: int64 */
+            current_sequence: number;
+            next_cursor: string | null;
+        };
+        CodexEventAck: {
+            provider_event_id: string;
+            /** Format: int64 */
+            sequence: number;
+        };
+        CodexEventBatchAck: {
+            items: components["schemas"]["CodexEventAck"][];
+            /** Format: int64 */
+            last_sequence: number;
+        };
+        CodexCommandInput: {
+            /** @constant */
+            type: "send";
+            text: string;
+        } | {
+            /** @constant */
+            type: "interrupt";
+            turn_id: string;
+        } | {
+            /** @constant */
+            type: "approval";
+            approval_id: string;
+            approval_version: string;
+            /** @enum {string} */
+            decision: "approve" | "reject";
+        } | {
+            /** @constant */
+            type: "answer_question";
+            /** @description Opaque request identifier preserved byte-for-byte. */
+            question_request_id: string;
+            question_version: string;
+            /** @description Map of opaque question IDs to 1–64 exact answer strings; IDs and accepted answer strings are preserved without trimming. */
+            answers: {
+                [key: string]: string[];
+            };
+        };
+        CodexCommand: {
+            id: string;
+            session_id: string;
+            installation_id?: string;
+            profile_key?: string;
+            thread_id?: string;
+            /** Format: int64 */
+            grant_version: number;
+            /** @enum {string} */
+            type: "send" | "interrupt" | "approval" | "answer_question";
+            /** @enum {string} */
+            status: "waiting_pc" | "claimed" | "forwarded" | "running" | "waiting_approval" | "completed" | "failed" | "unknown";
+            input: components["schemas"]["CodexCommandInput"];
+            result_code?: string;
+            provider_request_id?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            claimed_at?: string | null;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        CodexCommandResult: {
+            /** @enum {string} */
+            status: "forwarded" | "running" | "waiting_approval" | "completed" | "failed" | "unknown";
+            provider_request_id?: string;
+            result_code?: string;
+        };
         ExecutionControlMutationRequest: {
             expected_epoch: number;
         };
@@ -5577,8 +6473,13 @@ export interface components {
              */
             base_url: string;
             model_name: string;
-            /** @description Verified model context capacity from the provider's model documentation; omitted means unknown and disables compaction. */
-            context_window_tokens?: number;
+            /**
+             * @deprecated
+             * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
+             */
+            context_window_tokens?: number | null;
+            /** @description Optional advanced override for custom model routes; null clears the override. System presets use Morde-maintained capacity metadata and cannot be overridden. */
+            context_window_override_tokens?: number | null;
             api_key: string;
             /**
              * @description Shared connections require an administrator; authorization is checked by the server.
@@ -5594,8 +6495,13 @@ export interface components {
              */
             base_url: string;
             model_name: string;
-            /** @description Verified model context capacity from the provider's model documentation; omitted preserves it only when the endpoint is unchanged. */
-            context_window_tokens?: number;
+            /**
+             * @deprecated
+             * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
+             */
+            context_window_tokens?: number | null;
+            /** @description Optional advanced override for custom model routes; null clears the override. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied. System presets use Morde-maintained capacity metadata and cannot be overridden. */
+            context_window_override_tokens?: number | null;
             /** @description Omit or send an empty string to keep the current key; a non-empty value replaces it. */
             api_key?: string;
         };
@@ -5619,8 +6525,15 @@ export interface components {
             /** Format: uri */
             base_url: string;
             model_name: string;
-            /** @description Unknown until the owner or administrator supplies a verified model capacity. */
-            context_window_tokens?: number | null;
+            /** @description Effective capacity for the configured route */
+            context_window_tokens: number | null;
+            /** @description Explicit advanced override for custom routes only. */
+            context_window_override_tokens: number | null;
+            /** @enum {string} */
+            context_window_source: "unknown" | "override" | "legacy_manual" | "provider_metadata" | "model_catalog" | "provider_error";
+            /** Format: date-time */
+            context_window_resolved_at: string | null;
+            context_window_catalog_version: string | null;
             shared: boolean;
             has_api_key: boolean;
             capabilities: components["schemas"]["ModelConnectionCapabilities"];
@@ -5969,6 +6882,19 @@ export interface components {
             /** @enum {string} */
             sync_state: "healthy" | "conflict";
             sync_conflicts: string[];
+            /** @description Up to 1000 oldest-first project upload applications in pending_apply state bound to this Workspace binding. There is at most one unresolved application per registered project folder; resolved applications are omitted from this poll list, while conflict and unknown outcomes remain visible through the sync-session projection. Entries are metadata only and contain no file content; later polls expose subsequent pending work as receipts leave this list. */
+            project_upload_applications: components["schemas"]["HostProjectUploadApplicationReference"][];
+        };
+        HostProjectUploadApplicationReference: {
+            session_id: string;
+            /** Format: uuid */
+            source_binding_id: string;
+            /** @description Workspace-relative project directory derived by the server. */
+            project_path: string;
+            /** Format: int64 */
+            target_revision: number;
+            /** @description SHA-256 of the complete source manifest fixed for this session. */
+            manifest_sha256: string;
         };
         HostReplicaBindings: {
             /** Format: int64 */
@@ -6028,6 +6954,7 @@ export interface components {
             control_state: "ai" | "taking_over" | "user" | "returning";
             /** Format: uri */
             url: string;
+            /** @description Internal storage binding metadata. New Hosts have exactly one binding; clients should present its state as computer storage readiness and hide Workspace terminology. */
             workspaces: components["schemas"]["WorkspaceBinding"][];
             resources: components["schemas"]["Resources"];
             /** Format: date-time */
@@ -6242,6 +7169,36 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        AgentWorkspace: {
+            id: components["schemas"]["WorkspaceId"];
+            /**
+             * @description Logical path only; no server absolute paths are returned.
+             * @enum {string}
+             */
+            root_path: "~/workspace";
+            /** @enum {string} */
+            state: "ready";
+        };
+        AgentWorkspaceEntry: {
+            name: string;
+            /** @description Clean relative POSIX path beneath the Workspace root. */
+            path: string;
+            /** @enum {string} */
+            kind: "file" | "directory" | "symlink" | "other";
+            /**
+             * Format: int64
+             * @description Regular-file size; zero for directories
+             */
+            size_bytes: number;
+            /** Format: date-time */
+            modified_at: string;
+        };
+        AgentWorkspaceEntryPage: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            path: string;
+            entries: components["schemas"]["AgentWorkspaceEntry"][];
+            next_cursor?: string;
+        };
         CreateWorkspaceShareRequest: {
             /** Format: int64 */
             expected_current_revision: number;
@@ -6335,9 +7292,6 @@ export interface components {
             items: components["schemas"]["SiteRelease"][];
             /** @description Opaque cursor for the next page; null when exhausted. */
             next_cursor: string | null;
-        };
-        CreateWorkspaceRequest: {
-            name: string;
         };
         BindWorkspaceRequest: {
             workspace_id: components["schemas"]["WorkspaceId"];
@@ -6520,24 +7474,6 @@ export interface components {
             /** Format: int64 */
             expected_current_revision: number;
         };
-        HostCopyResult: {
-            source_host_id: components["schemas"]["HostId"];
-            source_workspace_id: components["schemas"]["WorkspaceId"];
-            host: components["schemas"]["Host"];
-            workspace: {
-                id: components["schemas"]["WorkspaceId"];
-                name: string;
-                /** Format: int64 */
-                revision: number;
-                /** @enum {string} */
-                state: "ready";
-            };
-            /** Format: int64 */
-            source_revision: number;
-            /** @enum {string} */
-            state: "completed";
-            replayed: boolean;
-        };
         WorkspaceFileOperationRequest: {
             /** @enum {string} */
             action: "rename" | "move" | "delete";
@@ -6587,8 +7523,13 @@ export interface components {
             accepted_at?: string;
         };
         CreateSyncSessionRequest: {
-            /** @description Optional registered project folder for an explicit PC-to-cloud upload. When present the client sends paths relative to its selected local folder */
+            /** @description Optional registered project folder for an explicit PC-to-cloud upload. When present */
             folder_id?: string;
+            /**
+             * Format: uuid
+             * @description Stable random source identity kept by Desktop. Required only with folder_id. The authenticated principal supplies the installation ID; this value does not claim an installation or grant a new source ownership. A different source ID for an already-bound project conflicts until explicit source migration is supported.
+             */
+            source_binding_id?: string;
             /** @enum {string} */
             direction: "upload" | "download" | "bidirectional";
             /** @enum {string} */
@@ -6610,7 +7551,7 @@ export interface components {
             deleted_directories?: string[];
             /** @description Advance this replica's durable cursor only after this session is applied and committed. */
             ack_cursor?: string | null;
-        };
+        } & unknown;
         SyncConflict: {
             path: string;
             /** @enum {string} */
@@ -6826,11 +7767,76 @@ export interface components {
             transfer_blocks: components["schemas"]["SyncTransferBlock"][];
             download_actions: components["schemas"]["WorkspaceSyncDownloadAction"][];
             conflicts: components["schemas"]["SyncConflict"][];
+            /** @description Present for project uploads with a durable Host application record. This is separate from state=completed, which confirms only server commit. */
+            host_application?: components["schemas"]["WorkspaceSyncHostApplication"];
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
         };
+        WorkspaceSyncHostApplication: {
+            /** @enum {string} */
+            status: "pending_apply" | "applied" | "conflict" | "unknown";
+            host_id: components["schemas"]["HostId"];
+            /** Format: int64 */
+            workspace_binding_version: number;
+            /**
+             * Format: int64
+             * @description Must equal the parent sync session target_revision.
+             */
+            target_revision: number;
+            /** @description SHA-256 of the complete PC source manifest recorded for this session. */
+            manifest_sha256: string;
+            /**
+             * Format: int64
+             * @description Authenticated Host runtime generation that produced a verified application receipt; null until observed and never inferred from a stale response.
+             */
+            runtime_generation?: number | null;
+            /**
+             * Format: int64
+             * @description Must be at least target_revision for status=applied. A larger revision is accepted only after the server verifies revision lineage and affected project paths; numeric ordering alone is not proof.
+             */
+            applied_revision?: number | null;
+            /**
+             * @description Current Workspace binding health observed with the receipt.
+             * @enum {string|null}
+             */
+            sync_state?: "healthy" | "conflict" | null;
+            /** @description Only affected or unverified project-relative paths; never absolute paths or a client-provided delete list. */
+            impacts: components["schemas"]["WorkspaceSyncHostApplicationImpact"][];
+        } & unknown;
+        WorkspaceSyncHostApplicationImpact: {
+            /** @description Relative to the selected project root. */
+            path: string;
+            /** @enum {string} */
+            state: "applied" | "conflict" | "unknown";
+            /** @description Bounded implementation-defined safe reason; never includes a local absolute path or user file content. */
+            reason?: string;
+        };
+        HostProjectUploadApplicationReport: {
+            /** Format: uuid */
+            source_binding_id: string;
+            /**
+             * Format: int64
+             * @description Must equal the parent session's target_revision.
+             */
+            target_revision: number;
+            /** @description Must equal the complete source manifest digest fixed for this session. */
+            manifest_sha256: string;
+            /**
+             * @description Applied requires applied_revision at least target_revision
+             * @enum {string}
+             */
+            status: "applied" | "conflict" | "unknown";
+            /**
+             * Format: int64
+             * @description Must be at least target_revision for status=applied; a larger numeric value alone is not proof and remains unconfirmed without server-side lineage and path verification.
+             */
+            applied_revision?: number | null;
+            /** @enum {string|null} */
+            sync_state?: "healthy" | "conflict" | null;
+            impacts: components["schemas"]["WorkspaceSyncHostApplicationImpact"][];
+        } & unknown;
         Template: {
             id: string;
             name: string;
@@ -7183,6 +8189,32 @@ export interface components {
             revision: number;
             body: components["schemas"]["PersonalProfile"] | components["schemas"]["PersonalMemory"] | components["schemas"]["PersonalSoul"] | components["schemas"]["PersonalDiary"] | components["schemas"]["GoalBody"] | components["schemas"]["ScheduleSyncDefinition"] | components["schemas"]["PersonalFeedPost"] | components["schemas"]["PersonalFeedPreferences"] | components["schemas"]["PersonalIdeaMark"] | components["schemas"]["PersonalLibraryItem"] | components["schemas"]["PersonalSkillSetting"] | components["schemas"]["PersonalConnectorSetting"];
         };
+        PersonalMemoryHistorySource: {
+            /** @enum {string} */
+            kind: "conversation_message" | "mutation_receipt";
+            id: string;
+            /** @description Present only for an authorized private conversation message source. */
+            conversation_id?: string;
+        };
+        PersonalMemoryRevision: {
+            /** Format: int64 */
+            revision: number;
+            /** Format: date-time */
+            changed_at: string;
+            /** @description Null when a legacy body was not retained or provenance policy requires withholding it. */
+            body: components["schemas"]["PersonalMemory"] | null;
+            /** @description True only when the complete body is available and authorized for restoration. */
+            restorable: boolean;
+            /** @enum {string} */
+            source_status: "available" | "unrecorded" | "unavailable";
+            /** @description Only currently authorized source references are returned; withheld provenance yields an empty array. */
+            sources: components["schemas"]["PersonalMemoryHistorySource"][];
+        };
+        PersonalMemoryHistoryPage: {
+            items: components["schemas"]["PersonalMemoryRevision"][];
+            /** @description Signed cursor bound to the owner and memory object; null when complete. */
+            next_cursor: string | null;
+        };
         PersonalMutationReceipt: {
             object_type: components["schemas"]["PersonalMutationObjectType"];
             object_id: components["schemas"]["PersonalObjectId"];
@@ -7384,12 +8416,15 @@ export interface components {
              * @description Desktop only
              */
             web_session_expires_at?: string;
+            /** @description Desktop only; Content Security Policy source for authorized Cloud Computer frames */
+            web_session_host_frame_source?: string;
             user: components["schemas"]["User"];
         };
         ClientWebSessionResponse: {
             web_session_credential: string;
             /** Format: date-time */
             web_session_expires_at: string;
+            web_session_host_frame_source: string;
         };
         ClientScheduleGrantResponse: {
             credential: string;
@@ -7438,8 +8473,6 @@ export interface components {
         };
         CreateHostRequest: {
             name?: string;
-            /** @description Required for API keys and Client credentials. Portal Sessions may omit it for server-side Workspace selection. */
-            workspace_ids?: components["schemas"]["WorkspaceId"][];
         };
         CreateAPIKeyRequest: {
             name: string;
@@ -7912,11 +8945,17 @@ export interface components {
             role: "user" | "assistant";
             content: string;
             task_id?: components["schemas"]["TaskId"];
+            /** @description Authorized original user message for a repeated request; the current message remains a separate timeline entry. */
+            duplicate_of_message_id?: components["schemas"]["MessageId"];
+            /** @description Task associated through the original request */
+            related_task_id?: components["schemas"]["TaskId"];
             client_message_id?: string;
             /** @enum {string} */
             routing_status?: "pending" | "processing" | "routed" | "waiting_user" | "waiting_adjustment" | "failed";
             /** @enum {string} */
             routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
+            /** @description True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. */
+            agent_acknowledged?: boolean;
             /**
              * @description Status of a persisted streamed assistant message.
              * @enum {string}
@@ -7932,6 +8971,15 @@ export interface components {
              * @description Present only after completion and identifies the corresponding Task result event.
              */
             output_result_event_sequence?: number;
+            /** @description Root user message that owns this immutable version group. */
+            variant_group_id?: components["schemas"]["MessageId"];
+            /**
+             * Format: int64
+             * @description Immutable version number within the root message group.
+             */
+            variant_version?: number;
+            /** @enum {string} */
+            variant_action?: "original" | "edit_resend" | "regenerate_text" | "continue_generation";
             /** @description Confirmed task results combined into this assistant message, in display order. */
             sources?: components["schemas"]["ConversationMessageSource"][];
             /** @enum {string} */
@@ -7985,6 +9033,27 @@ export interface components {
             message: components["schemas"]["ConversationMessage"];
             /** @description True when an identical message receipt was returned. */
             replayed: boolean;
+        };
+        CreateConversationMessageVariantRequest: {
+            /** @enum {string} */
+            action: "edit_resend" | "regenerate_text" | "continue_generation";
+            /** Format: int64 */
+            expected_version: number;
+            /** @description Required for edit_resend and forbidden for the other actions. */
+            content?: string;
+        };
+        ConversationMessageVariantOperation: {
+            operation_id: components["schemas"]["OperationId"];
+            variant_group_id: components["schemas"]["MessageId"];
+            /** Format: int64 */
+            variant_version: number;
+            /** @enum {string} */
+            action: "edit_resend" | "regenerate_text" | "continue_generation";
+            /** @enum {string} */
+            state: "accepted" | "running" | "completed" | "failed" | "unknown";
+            task_id?: components["schemas"]["TaskId"];
+            user_message_id?: components["schemas"]["MessageId"];
+            assistant_message_id?: components["schemas"]["MessageId"];
         };
         ProjectConversationAttachmentInit: {
             name: string;
@@ -8078,6 +9147,8 @@ export interface components {
         /** @enum {string} */
         TaskStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "cancelling" | "completed" | "failed" | "cancelled";
         /** @enum {string} */
+        TaskQueuePriority: "pinned" | "normal" | "background";
+        /** @enum {string} */
         TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
         TaskBudgetRequest: {
             active_seconds: number;
@@ -8093,6 +9164,34 @@ export interface components {
             active_seconds: number;
             tool_calls: number;
             model_tokens: number | null;
+        };
+        TaskCostSummary: {
+            /**
+             * @description settled uses the saved actual amount; estimated is a reservation and not a charge; unknown means reconciliation is unavailable; byok means a user-supplied model connection with no Morde charge.
+             * @enum {string}
+             */
+            state: "settled" | "estimated" | "unknown" | "byok";
+            currency?: string;
+            /** Format: int64 */
+            calls: number;
+            /** @description Rate snapshot versions used by these calls. Empty when no Morde rate applies. */
+            rate_versions: number[];
+            /**
+             * Format: int64
+             * @description Saved reservation total; for settled calls the actual amount is authoritative.
+             */
+            reserved_micros: number;
+            /**
+             * Format: int64
+             * @description Exact settled total; null unless state is settled.
+             */
+            actual_micros: number | null;
+        };
+        TaskBilling: {
+            /** Format: int64 */
+            model_calls: number;
+            /** @description Per-currency and per-state totals; groups preserve rate snapshot versions. */
+            costs: components["schemas"]["TaskCostSummary"][];
         };
         TaskDependency: {
             task_id: components["schemas"]["TaskId"];
@@ -8120,6 +9219,58 @@ export interface components {
             source_event_sequence: number;
             trigger_message_id?: components["schemas"]["MessageId"] | null;
             reply_message_id: components["schemas"]["MessageId"] | null;
+        };
+        /** @description Independent review state, orthogonal to Task.status. The server emits pending until a trusted, revision-bound validation record exists; ResultReview is not a validation verdict. */
+        TaskValidationSummary: {
+            /** @enum {string} */
+            state: "pending" | "PASS" | "PASS+NOTES" | "FAIL";
+        };
+        TaskValidationEvidenceRef: {
+            /** @enum {string} */
+            kind: "source" | "baseline" | "action" | "result" | "side_effect" | "before_after";
+            id: string;
+            /** Format: int64 */
+            task_revision: number;
+            /**
+             * Format: int64
+             * @description Conversation message sequence for source messages; Task Step sequence for other evidence.
+             */
+            sequence: number;
+            /** @description Source tool call for action */
+            call_id?: string;
+        };
+        /** @description Untrusted performance measurements with server-computed delta and same-revision Task Step references; this structure does not establish a validation verdict. */
+        TaskValidationPerformanceComparison: {
+            metric: string;
+            unit: string;
+            /** Format: double */
+            before: number;
+            /** Format: double */
+            after: number;
+            /**
+             * Format: double
+             * @description Server-computed as after minus before.
+             */
+            delta: number;
+            environment: string;
+            baseline_ref: components["schemas"]["TaskValidationEvidenceRef"];
+            after_ref: components["schemas"]["TaskValidationEvidenceRef"];
+        };
+        TaskValidationEvidenceClaim: {
+            claim_id: string;
+            start_byte: number;
+            /** @description Exclusive UTF-8 byte offset into the SHA-256-bound Task result. */
+            end_byte: number;
+            evidence_refs: components["schemas"]["TaskValidationEvidenceRef"][];
+            performance_comparison?: components["schemas"]["TaskValidationPerformanceComparison"];
+        };
+        TaskValidationEvidenceDetail: {
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            event_sequence: number;
+            result_sha256: string;
+            claims: components["schemas"]["TaskValidationEvidenceClaim"][];
         };
         TaskSummary: {
             id: components["schemas"]["TaskId"];
@@ -8150,6 +9301,8 @@ export interface components {
             model_id: string;
             objective: string;
             status: components["schemas"]["TaskStatus"];
+            /** @description User priority for queued work; tasks waiting for 15 minutes or longer are promoted into an age-ordered fairness band. */
+            queue_priority: components["schemas"]["TaskQueuePriority"];
             current_step: string | null;
             /**
              * Format: int64
@@ -8166,6 +9319,8 @@ export interface components {
             dependencies: components["schemas"]["TaskDependency"][];
             child_jobs: components["schemas"]["TaskChildJob"][];
             result_review: components["schemas"]["TaskResultReview"] | null;
+            /** @description Newer servers always include this summary. Clients must treat it as optional when reading snapshots from older server versions. */
+            validation?: components["schemas"]["TaskValidationSummary"];
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -8174,13 +9329,99 @@ export interface components {
         TaskStep: {
             id: components["schemas"]["StepId"];
             sequence: number;
+            /** Format: int64 */
+            attempt: number;
+            retry_of_step_id?: components["schemas"]["StepId"] | null;
             /** @enum {string} */
             kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "progress" | "result";
             status: components["schemas"]["TaskStepStatus"];
             title: string;
             summary: string;
+            /** @enum {string|null} */
+            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | null;
+            /** @description True only when persisted Host evidence confirms the tool attempt was not dispatched and no retry attempt has been created for this step. */
+            retryable: boolean;
+            /** @description Opaque Agent session ID that actually emitted this step. */
+            agent_id?: string;
+            /** Format: int64 */
+            task_revision?: number;
+            tool_name?: string;
+            phase?: string;
+            /** @enum {string} */
+            detail_state?: "not_recorded" | "available" | "expired" | "restricted";
             /** Format: date-time */
             created_at: string;
+        };
+        TaskPlanStep: {
+            id: string;
+            title: string;
+            description: string;
+            depends_on: string[];
+            outputs: string[];
+            completion_criteria: string[];
+            /** @enum {string} */
+            status: "pending" | "in_progress" | "completed" | "blocked";
+        };
+        TaskPlan: {
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            revision: number;
+            goal: string;
+            /**
+             * @description Cost is unknown unless an independently verified estimate is later provided.
+             * @constant
+             */
+            cost_estimate_state: "unknown";
+            steps: components["schemas"]["TaskPlanStep"][];
+            /** Format: date-time */
+            created_at?: string;
+        };
+        TaskStepRetryRequest: {
+            /** Format: int64 */
+            expected_task_revision: number;
+            /** Format: int64 */
+            expected_attempt: number;
+        };
+        TaskStepRetryResult: {
+            task_id: components["schemas"]["TaskId"];
+            source_step_id: components["schemas"]["StepId"];
+            attempt_step_id: components["schemas"]["StepId"];
+            /** Format: int64 */
+            attempt: number;
+            /** @enum {string} */
+            status: "queued";
+            replayed: boolean;
+        };
+        TaskAgentExecution: {
+            /** @description Opaque DSH Agent session identifier. */
+            id: string;
+            parent_id: string | null;
+            step_id: components["schemas"]["StepId"] | null;
+            /** Format: int64 */
+            task_revision: number;
+            /** @enum {string} */
+            role: "main" | "subagent";
+            /**
+             * @description Runtime observation only; unknown means the observation cannot be trusted as current.
+             * @enum {string}
+             */
+            status: "running" | "idle" | "unknown";
+            /** Format: date-time */
+            observed_at: string | null;
+        };
+        TaskStepDetail: {
+            task_id: components["schemas"]["TaskId"];
+            step_id: components["schemas"]["StepId"];
+            /** Format: int64 */
+            event_sequence: number;
+            tool_name: string;
+            /** @enum {string} */
+            detail_state: "available" | "not_recorded" | "expired" | "restricted";
+            object: string | null;
+            input: string | null;
+            result: string | null;
+            truncated: boolean;
         };
         TaskBatchItem: {
             id: components["schemas"]["BatchItemId"];
@@ -8219,17 +9460,55 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        /** @description Exact, versioned approval context. The latest expired request remains a read-only snapshot; approved, rejected, or cancelled requests keep the existing hidden behavior. expires_at is null unless a trusted service policy explicitly sets an expiry. */
         TaskPendingRequest: {
             id: components["schemas"]["ClarificationId"];
             version: number;
+            /** @enum {string} */
+            status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
             /** @constant */
             kind: "approval";
             title: string;
             object: string;
             content: string;
             impact: string;
+            disclosures: components["schemas"]["TaskApprovalDisclosures"];
+            /**
+             * Format: date-time
+             * @description Null unless a trusted service policy explicitly sets an expiry.
+             */
+            expires_at: string | null;
             /** @description Present only while an image */
             media_preview_operation_id?: components["schemas"]["OperationId"];
+        };
+        /** @description A known disclosure includes its evidence-backed summary. Unknown and not_applicable disclosures have a null summary. */
+        TaskApprovalTextDisclosure: {
+            /** @enum {string} */
+            state: "known" | "unknown" | "not_applicable";
+            summary: string | null;
+        };
+        /** @description A known amount includes its currency and whether it is an estimate or settled charge. Unknown and not_applicable amounts have null basis, amount_micros and currency. */
+        TaskApprovalCostDisclosure: {
+            /** @enum {string} */
+            state: "known" | "unknown" | "not_applicable";
+            /** @enum {string|null} */
+            basis: "estimate" | "settled" | null;
+            /** Format: int64 */
+            amount_micros: number | null;
+            currency: string | null;
+        };
+        /** @description Known options are substantiated alternatives. Unknown and not_applicable disclosures use an empty options array. */
+        TaskApprovalAlternativesDisclosure: {
+            /** @enum {string} */
+            state: "known" | "unknown" | "not_applicable";
+            options: string[];
+        };
+        TaskApprovalDisclosures: {
+            risk: components["schemas"]["TaskApprovalTextDisclosure"];
+            this_cost: components["schemas"]["TaskApprovalCostDisclosure"];
+            cumulative_cost: components["schemas"]["TaskApprovalCostDisclosure"];
+            alternatives: components["schemas"]["TaskApprovalAlternativesDisclosure"];
+            revocation: components["schemas"]["TaskApprovalTextDisclosure"];
         };
         TaskClarificationRequest: {
             id: components["schemas"]["ClarificationId"];
@@ -8400,6 +9679,8 @@ export interface components {
              */
             event_sequence: number;
             result: string | null;
+            /** @description Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. */
+            validation_detail?: components["schemas"]["TaskValidationEvidenceDetail"];
             /** @description True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. */
             current_revision_started?: boolean;
             /** @description A completed result is being held for a conversation reply; do not display it as a separate final message until published. */
@@ -8409,6 +9690,11 @@ export interface components {
             /** @description Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available. */
             waiting_reason: string | null;
             steps: components["schemas"]["TaskStep"][];
+            /** @description Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. */
+            plan?: components["schemas"]["TaskPlan"] | null;
+            /** @description Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown */
+            billing?: components["schemas"]["TaskBilling"];
+            agents?: components["schemas"]["TaskAgentExecution"][];
             batch_items: components["schemas"]["TaskBatchItem"][];
             artifacts: components["schemas"]["TaskArtifact"][];
             pending_request: components["schemas"]["TaskPendingRequest"] | null;
@@ -8421,6 +9707,50 @@ export interface components {
         TaskPage: {
             items: components["schemas"]["TaskSummary"][];
             next_cursor: string | null;
+        };
+        TaskApprovalPage: {
+            items: components["schemas"]["TaskApprovalItem"][];
+            next_cursor: string | null;
+            /**
+             * Format: int64
+             * @description Full current-account count of unexpired pending approvals the caller can handle in this query scope.
+             */
+            pending_count: number;
+        };
+        TaskApprovalItem: {
+            task_id: components["schemas"]["TaskId"];
+            conversation_id: components["schemas"]["ConversationId"];
+            project_id: string | null;
+            host_id: string | null;
+            task_status: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            task_event_sequence: number;
+            /** Format: date-time */
+            task_updated_at: string;
+            approval: components["schemas"]["TaskApprovalSnapshot"];
+        };
+        /** @description Authorized request context retained after approval or rejection so a conversation timeline can restore the read-only card. Expired pending requests are returned with status expired and cannot be answered. */
+        TaskApprovalSnapshot: {
+            id: components["schemas"]["ClarificationId"];
+            version: number;
+            /** @enum {string} */
+            status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
+            /** @enum {string} */
+            decision: "" | "approve" | "reject";
+            /** @constant */
+            kind: "approval";
+            title: string;
+            object: string;
+            content: string;
+            impact: string;
+            disclosures: components["schemas"]["TaskApprovalDisclosures"];
+            /** Format: date-time */
+            expires_at: string | null;
+            /** Format: date-time */
+            responded_at: string | null;
+            /** Format: date-time */
+            created_at: string;
+            media_preview_operation_id?: components["schemas"]["OperationId"];
         };
         ConversationActiveTask: components["schemas"]["TaskSummary"] & {
             /** Format: int64 */
@@ -8452,15 +9782,18 @@ export interface components {
             key: string;
             input: string;
         };
-        /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. */
+        /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. set_priority requires queue_priority and expected_event_sequence and is accepted only while the task is queued. Priority changes are idempotent and append a task.priority event. Supplying fields for a different action is invalid. */
         TaskActionRequest: {
             /** @enum {string} */
-            action: "retry_batch_item" | "pause" | "resume" | "cancel";
+            action: "retry_batch_item" | "set_priority" | "pause" | "resume" | "cancel";
             expected_status?: components["schemas"]["TaskStatus"];
             /** Format: int64 */
             expected_current_revision?: number;
             /** Format: int64 */
             expected_desired_revision?: number;
+            /** Format: int64 */
+            expected_event_sequence?: number;
+            queue_priority?: components["schemas"]["TaskQueuePriority"];
             batch_item_id?: components["schemas"]["BatchItemId"];
         };
         TaskWorkspaceViewDeletionRequest: {
@@ -8488,13 +9821,16 @@ export interface components {
             action: string;
             status: components["schemas"]["TaskStatus"];
             unsettled_operation_ids: components["schemas"]["OperationId"][];
+            queue_priority?: components["schemas"]["TaskQueuePriority"];
+            /** Format: int64 */
+            event_sequence?: number;
         };
-        /** @description Media-generation progress uses the existing task.operation and task.waiting_user events. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
+        /** @description Each payload is a type-specific allowlisted projection: task.status exposes status, reason, batch_item_id, batch_attempt; task.step exposes step_id, status, kind, phase, tool, call_id, title, summary, and detail limited to phase, status, kind, tool, usage_known, requires_reconciliation; task.operation exposes operation_id, status, reason, requires_reconciliation; task.message exposes role, message_id, turn_id, task_revision, done; task.batch_item exposes batch_item_id, key, status, attempt; task.artifact exposes artifact_id, step_id, label, media_type, path, workspace_id, revision, size_bytes, sha256, batch_item_id, batch_attempt, redacted; task.waiting_user exposes status, reason, required_revision, applied_revision; task.response exposes pending_id, pending_version, clarification_id, clarification_version, decision, reason, status, idempotency_replayed, lease_version, file_delivery_intent; task.result exposes status, reason, task_revision; task.plan exposes step_id, sequence, task_revision, and plan_revision only, with the authorized Task snapshot carrying plan content; task.priority exposes priority and previous_priority only. Unknown event types and malformed payloads project as an empty object. Streaming message content and deltas, raw results, approval content, and model/tool output are omitted from SSE. SSE is a progress and cursor signal; clients fetch authorized Task, conversation, and approval resources for their content. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
         TaskEvent: {
             task_id: components["schemas"]["TaskId"];
             sequence: number;
             /** @enum {string} */
-            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result";
+            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result" | "task.plan" | "task.priority";
             /** Format: date-time */
             created_at: string;
             payload: unknown;
@@ -8746,7 +10082,7 @@ export interface components {
         };
         AdminTaskEventCount: {
             /** @enum {string} */
-            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result";
+            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result" | "task.plan" | "task.priority";
             /** Format: int64 */
             count: number;
         };
@@ -9204,6 +10540,8 @@ export interface components {
         ProjectWorkItemId: components["schemas"]["ProjectWorkItemId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
+        CodexSessionId: string;
+        CodexCommandId: string;
         /** @description Current service instance UUID; a mismatch fails without writing. */
         ServiceInstanceID: string;
         /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
@@ -9245,7 +10583,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. workspace_sync_checkpoint_recovery means POST /api/workspaces/{id}/sync-sessions/recover is assembled; clients must require this feature before treating its 404 as a recovery miss instead of an older server's route-not-found response. On an authorized owner/workspace request, a missing idempotency record is tombstoned before the recovery miss is returned, preventing a delayed create from creating a session later. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
@@ -9276,6 +10614,381 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             503: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    discoverCodexSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexDiscoverRequest"];
+            };
+        };
+        responses: {
+            /** @description Current mirror mapping and grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        session: components["schemas"]["CodexSession"];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCodexProfileConnections: {
+        parameters: {
+            query: {
+                installation_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active Codex profile connections and the latest client-reported progress */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexProfileConnectionList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    connectCodexProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexProfileConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Current profile connection and exact grant set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexProfileConnection"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateCodexProfileSessionDiscoveryStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                profile_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexProfileSessionDiscoveryUpdate"];
+            };
+        };
+        responses: {
+            /** @description Current profile connection with the accepted discovery state and PC-reported sync counts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexProfileConnection"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeCodexProfileConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                profile_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Profile connection revoked; repeated revocation is idempotent. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCodexSessions: {
+        parameters: {
+            query: {
+                installation_id: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorized session page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexSessionPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCodexSessionEvents: {
+        parameters: {
+            query?: {
+                after_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ordered event page and current session sequence */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexEventPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    appendCodexSessionEvents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexEventBatch"];
+            };
+        };
+        responses: {
+            /** @description Committed event acknowledgements */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexEventBatchAck"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    streamCodexSessionEvents: {
+        parameters: {
+            query?: {
+                after_sequence?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent event stream; each id is a contiguous event sequence. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createCodexSessionCommand: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexCommandInput"];
+            };
+        };
+        responses: {
+            /** @description Durably accepted command */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexCommand"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    claimCodexCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Zero or one claimed command */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["CodexCommand"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reportCodexCommandResult: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexCommandId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexCommandResult"];
+            };
+        };
+        responses: {
+            /** @description Persisted command state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodexCommand"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteCodexSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["CodexSessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Mirror session and associated cloud records deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -9591,6 +11304,59 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getMyAgentWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stable Agent Workspace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentWorkspace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyTaskApprovals: {
+        parameters: {
+            query?: {
+                conversation_id?: components["schemas"]["ConversationId"];
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorized approval snapshots ordered by request creation time */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskApprovalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };
@@ -9975,6 +11741,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             413: components["responses"]["RequestTooLarge"];
+            503: components["responses"]["ServiceUnavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -10006,7 +11773,10 @@ export interface operations {
     };
     deleteHost: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Must be true to confirm permanent deletion of the Host. The Agent Workspace files are retained. */
+                confirm_delete_workspace: true;
+            };
             header?: never;
             path: {
                 id: components["parameters"]["HostId"];
@@ -10049,28 +11819,9 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Completed Host copy returned for an idempotent replay */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HostCopyResult"];
-                };
-            };
-            /** @description New Host and its independent copied Workspace */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HostCopyResult"];
-                };
-            };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
@@ -10632,10 +12383,12 @@ export interface operations {
                 "application/json": {
                     conversation_id: components["schemas"]["ConversationId"];
                     /**
-                     * @description Initial Workbench view. browser requires desktop:view (desktop:control also qualifies); terminal requires terminal:control; workspace requires workspace:file:read. The ticket permission ceiling cannot be increased by switching views.
+                     * @description Initial Workbench view; it must be included in targets.
                      * @enum {string}
                      */
-                    target: "browser" | "terminal" | "workspace";
+                    target: "browser" | "terminal" | "workspace" | "files" | "vscode";
+                    /** @description Requested tabs. The server returns only currently authorized targets; files and VS Code remain owner-only under existing Gateway rules. */
+                    targets: ("browser" | "terminal" | "workspace" | "files" | "vscode")[];
                 };
             };
         };
@@ -10657,6 +12410,10 @@ export interface operations {
                         exchange_url: string;
                         /** @description Temporary credential; submit only in the exchange request body. */
                         ticket: string;
+                        /** @description Random value bound to the ticket and used by the parent/Workbench embed handshake. */
+                        embed_nonce: string;
+                        /** @description Server-authorized target tabs bound to this ticket. */
+                        targets: ("browser" | "terminal" | "workspace" | "files" | "vscode")[];
                         /** Format: date-time */
                         expires_at: string;
                     };
@@ -11048,36 +12805,6 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    createWorkspace: {
-        parameters: {
-            query?: never;
-            header: {
-                "Idempotency-Key": string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateWorkspaceRequest"];
-            };
-        };
-        responses: {
-            /** @description Workspace created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Workspace"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
     getWorkspace: {
         parameters: {
             query?: never;
@@ -11126,6 +12853,69 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAgentWorkspaceEntries: {
+        parameters: {
+            query?: {
+                path?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Live directory entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentWorkspaceEntryPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    downloadAgentWorkspaceFile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read-only file stream */
+            200: {
+                headers: {
+                    "Content-Disposition"?: string;
+                    "X-Content-Type-Options"?: "nosniff";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -11754,6 +13544,44 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    recoverWorkspaceSyncSession: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The exact key used by the create request. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Existing owner-, Workspace-, and replica-scoped resumable session */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSession"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No recoverable session is visible for this owner, Workspace, and replica. After successful authorization, an unused key is permanently tombstoned before this response. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
     getWorkspaceSyncSession: {
         parameters: {
             query?: never;
@@ -11999,18 +13827,8 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Binding created or found idempotently */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["WorkspaceBinding"];
-                };
-            };
             401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };
@@ -12294,6 +14112,42 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    recordHostProjectUploadApplication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                workspace_id: components["schemas"]["WorkspaceId"];
+                binding_version: number;
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HostProjectUploadApplicationReport"];
+            };
+        };
+        responses: {
+            /** @description Durable session-specific Host application receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceSyncHostApplication"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
     activateHostReplicaBinding: {
         parameters: {
             query?: never;
@@ -12388,18 +14242,8 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Unbind accepted; status remains queryable from the Host binding list */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["WorkspaceBinding"];
-                };
-            };
             401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };
@@ -13348,9 +15192,11 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listProjectConversationActiveTasks: {
+    listProjectConversationTasks: {
         parameters: {
             query?: {
+                /** @description Task status view. Defaults to active; panel combines active and recent tasks with running tasks first, then update time descending and task ID descending. */
+                view?: "active" | "recent" | "panel";
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];
@@ -13447,6 +15293,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AcceptedProjectConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectConversationMessageVariant: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateConversationMessageVariantRequest"];
+            };
+        };
+        responses: {
+            /** @description Variant operation durably accepted. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageVariantOperation"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -14828,8 +16715,8 @@ export interface operations {
     listConversationTasks: {
         parameters: {
             query?: {
-                /** @description Task status view. Defaults to active. */
-                view?: "active" | "recent";
+                /** @description Task status view. Defaults to active; panel combines active and recent tasks with running tasks first, then update time descending and task ID descending. */
+                view?: "active" | "recent" | "panel";
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];
@@ -14957,6 +16844,46 @@ export interface operations {
                 content?: never;
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createConversationMessageVariant: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateConversationMessageVariantRequest"];
+            };
+        };
+        responses: {
+            /** @description Variant operation durably accepted. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageVariantOperation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -15221,6 +17148,99 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskArtifactContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                artifact_id: components["schemas"]["ArtifactId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified artifact bytes; response is private and non-cacheable. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "X-Content-Type-Options"?: "nosniff";
+                    "Content-Disposition"?: string;
+                    "X-Content-SHA256"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskStepDetail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Encrypted-at-rest, permission-checked activity projection; responses are never shared-cacheable. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepDetail"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryTaskStep: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskStepRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description A new attempt was queued, or the previously queued attempt was returned for an idempotent replay. */
+            202: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepRetryResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -16347,6 +18367,38 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalMemoryHistory: {
+        parameters: {
+            query?: {
+                /** @description Signed keyset cursor bound to the authenticated owner and memory object. */
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                type: "memory";
+                /** @description Memory ID; only the memory object type has revision history. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner-scoped memory revisions and a signed next-page cursor */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMemoryHistoryPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

@@ -2617,11 +2617,9 @@ enum MordeOutboxScheduling {
         Conversation(projectID: message.projectID, conversationID: message.conversationID)
     }
 
-    private static func dependencies(_ messages: [MordeOutboxMessage]) -> Set<Dependency> {
-        Set(messages.compactMap { message in
-            guard message.serverMessageID == nil, let previous = message.previousClientMessageID else { return nil }
-            return Dependency(conversation: conversation(message), predecessorID: previous)
-        })
+    private static func needsReceiptReconciliation(_ message: MordeOutboxMessage) -> Bool {
+        message.serverMessageID == nil &&
+            (message.state == .unknown || message.state == .sending || message.submissionUncertain == true)
     }
 
     private static func independentRetryBlocks(_ messages: [MordeOutboxMessage]) -> Set<Dependency> {
@@ -2651,22 +2649,15 @@ enum MordeOutboxScheduling {
     static func readyIDs(_ messages: [MordeOutboxMessage], scope: MordeClientDataScope,
                          inFlight: Set<String>, allowsNewSubmissions: Bool = true) -> [String] {
         let scoped = messages.filter { $0.scope.hasSameAccount(as: scope) }
-        let required = dependencies(scoped)
         let independentBlocks = independentRetryBlocks(scoped)
-        let occupied = Set(scoped.filter { $0.serverMessageID == nil && inFlight.contains($0.id) }.map(conversation))
-        var awaitingReceipt = Set<Conversation>()
         var ready: [String] = []
         for message in scoped {
-            let conversation = conversation(message)
-            // nanoMuse: Unknown prior deliveries still need reconciliation; callers may hold untouched sends only on confirmed absence.
+            // Uncertain deliveries are reconciled read-only; only an explicit retry may submit them again.
+            guard !needsReceiptReconciliation(message) else { continue }
             guard allowsNewSubmissions || message.serverMessageID != nil || message.state != .pending ||
                     message.submissionStarted != false else { continue }
             if message.serverMessageID == nil {
-                if independentBlocks.contains(Dependency(conversation: conversation, predecessorID: message.id)) { continue }
-                if message.state == .failed && !required.contains(Dependency(conversation: conversation, predecessorID: message.id)) {
-                    continue
-                }
-                if !awaitingReceipt.insert(conversation).inserted || occupied.contains(conversation) { continue }
+                if independentBlocks.contains(Dependency(conversation: conversation(message), predecessorID: message.id)) { continue }
             }
             guard message.state != .failed, !inFlight.contains(message.id) else { continue }
             ready.append(message.id)
@@ -2674,28 +2665,20 @@ enum MordeOutboxScheduling {
         return ready
     }
 
+    static func reconciliationIDs(_ messages: [MordeOutboxMessage], scope: MordeClientDataScope,
+                                  inFlight: Set<String>) -> [String] {
+        messages.filter { $0.scope.hasSameAccount(as: scope) && needsReceiptReconciliation($0) &&
+            !inFlight.contains($0.id) }.map(\.id)
+    }
+
     static func waitingForEarlierMessage(_ message: MordeOutboxMessage,
                                          in messages: [MordeOutboxMessage]) -> String? {
-        guard message.serverMessageID == nil, let index = messages.firstIndex(where: { $0.id == message.id }) else { return nil }
+        guard message.serverMessageID == nil, messages.contains(where: { $0.id == message.id }) else { return nil }
         let scoped = messages.filter { $0.scope.hasSameAccount(as: message.scope) }
         if independentRetryBlocks(scoped).contains(Dependency(conversation: conversation(message), predecessorID: message.id)) {
             return "Retry will wait until the independent message is received."
         }
-        let required = dependencies(scoped)
-        guard let earlier = messages[..<index].first(where: {
-            $0.scope.hasSameAccount(as: message.scope) && conversation($0) == conversation(message) &&
-                $0.serverMessageID == nil &&
-                ($0.state != .failed || required.contains(Dependency(conversation: conversation($0), predecessorID: $0.id)))
-        }) else { return nil }
-        if earlier.state == .unknown {
-            return "The previous message’s delivery could not be verified. Retry or check it first."
-        }
-        if earlier.state == .failed {
-            return earlier.confirmedNotAccepted == true && earlier.submissionUncertain == false
-                ? "The previous message failed to send. Please handle it first."
-                : "The previous message’s delivery could not be verified. Retry or check it first."
-        }
-        return "Waiting for the previous message to be received."
+        return nil
     }
 }
 

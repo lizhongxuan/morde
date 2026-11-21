@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -241,15 +242,18 @@ func (s *Store) ReserveProjectModelCall(ctx context.Context, reservation app.Pro
 	if reservation.Source == app.ModelCallRoute || !project.ValidID(reservation.ProjectID) || !domain.ValidUserID(reservation.ActorID) ||
 		call.PersonalModel ||
 		!validProjectBudgetSource(string(reservation.Source)) ||
-		(reservation.Source == app.ModelCallTask && !domain.ValidTaskID(reservation.TaskID)) ||
-		(reservation.Source != app.ModelCallTask && reservation.TaskID != "") ||
+		((reservation.Source == app.ModelCallTask || reservation.Source == app.ModelCallReview) && !domain.ValidTaskID(reservation.TaskID)) ||
+		(reservation.Source != app.ModelCallTask && reservation.Source != app.ModelCallReview && reservation.TaskID != "") ||
 		!validProjectIdempotencyKey(reservation.CallID) || !domain.ValidModelConnectionID(reservation.ModelID) ||
 		!validProjectTokenReservation(reservation.Usage) || reservation.ReservedTokens != reservation.Usage.InputTokens+reservation.Usage.OutputTokens ||
 		reservation.Rate.Validate() != nil || reservation.Rate.ModelID != reservation.ModelID ||
 		reservation.Rate.Currency == "" || reservation.ReservedMicros < 1 || len(reservation.RequestDigest) != 32 ||
 		call.Source != reservation.Source || call.ProjectID != reservation.ProjectID || call.OwnerID != reservation.ActorID ||
 		(reservation.Source == app.ModelCallTask && (call.Task == nil || call.Task.InitiatorID != reservation.ActorID || call.Task.TaskID != reservation.TaskID)) ||
+		(reservation.Source == app.ModelCallReview && (!validReviewModelCallReservation(call) || call.OwnerID != reservation.ActorID ||
+			call.Review.Claim.TaskID != reservation.TaskID)) ||
 		(reservation.Source != app.ModelCallTask && call.Task != nil) ||
+		(reservation.Source == app.ModelCallReview) != (call.Review != nil) ||
 		call.CallID != reservation.CallID || call.ModelID != reservation.ModelID || call.ProviderModel != reservation.Rate.Model ||
 		call.ReservedTokens != reservation.ReservedTokens || call.ProviderModel == "" || len(call.ProviderModel) > 256 ||
 		call.ReservedTokens <= 0 || len(call.RequestDigest) != 32 {
@@ -286,6 +290,15 @@ func reserveProjectBudgetLedgerInTx(ctx context.Context, tx pgx.Tx, reservation 
 			Scan(&taskOwnerID, &taskInitiatorID, &taskProjectID); err != nil || taskProjectID != reservation.ProjectID ||
 			taskInitiatorID != reservation.ActorID || taskOwnerID != reservation.AccountCall.Task.OwnerID {
 			return domain.NewError(domain.CodeUnauthenticated, "project Task attribution is unavailable")
+		}
+	} else if reservation.Source == app.ModelCallReview {
+		if reservation.AccountCall.Review == nil || reservation.AccountCall.Review.InitiatorID != reservation.ActorID ||
+			reservation.AccountCall.Review.Claim.TaskID != reservation.TaskID {
+			return domain.NewError(domain.CodeUnauthenticated, "project review Task attribution is unavailable")
+		}
+		taskProjectID, err := checkTaskValidationReviewModelFence(ctx, tx, *reservation.AccountCall.Review)
+		if err != nil || taskProjectID != reservation.ProjectID {
+			return domain.NewError(domain.CodeUnauthenticated, "project review Task attribution is unavailable")
 		}
 	} else if reservation.Source == app.ModelCallRoute {
 		if reservation.AccountCall.Route == nil || reservation.AccountCall.Route.Claim.Message.ActorID != reservation.ActorID ||
@@ -358,7 +371,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'reserved',$16)`,
 }
 
 func projectLedgerTaskID(reservation app.ProjectModelReservation) any {
-	if reservation.Source == app.ModelCallTask {
+	if reservation.Source == app.ModelCallTask || reservation.Source == app.ModelCallReview {
 		return reservation.TaskID
 	}
 	return nil
@@ -371,19 +384,34 @@ func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.Settl
 	taskCallValid := taskCall != nil && taskCall.Source == app.ModelCallTask && taskCall.Task != nil &&
 		taskCall.OwnerID != "" && taskCall.CallID == settlement.CallID && taskCall.ProjectID == settlement.ProjectID &&
 		len(taskCall.RequestDigest) == 32
+	reviewCall := settlement.ReviewCall
+	reviewCallValid := reviewCall != nil && validReviewModelCallReservation(*reviewCall) && reviewCall.OwnerID == reviewCall.Review.InitiatorID &&
+		reviewCall.CallID == settlement.CallID && reviewCall.ProjectID == settlement.ProjectID && len(reviewCall.RequestDigest) == 32
 	if ctx == nil || settlement.Source == app.ModelCallRoute || !project.ValidID(settlement.ProjectID) || !validProjectBudgetSource(string(settlement.Source)) ||
 		!validProjectIdempotencyKey(settlement.CallID) || (!settlement.Unknown && !validProjectSettlementUsage(settlement.Usage)) ||
 		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
-		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
-		settlement.TaskCall != nil && !taskCallValid ||
-		settlement.Source == app.ModelCallTask && ((len(settlement.ResponseCiphertext) == 0) != (len(settlement.ResponseDigest) == 0) ||
+		(settlement.Source == app.ModelCallReview && !settlement.Unknown && !settlement.ResponseInvalid && settlement.ReviewCall == nil) ||
+		settlement.ReviewCall != nil && !reviewCallValid ||
+		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && settlement.Source != app.ModelCallReview &&
+			(len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.ResponseInvalid) ||
+		settlement.Source == app.ModelCallReview && ((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
+			len(settlement.ResponseCiphertext) > app.MaxTaskValidationReviewModelResponseCiphertext ||
 			len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
-			len(settlement.ResponseCiphertext) != 0 && (!taskCallValid || settlement.ResponseInvalid || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext)) ||
+			len(settlement.ResponseTextDigest) != 0 && len(settlement.ResponseTextDigest) != 32 ||
+			settlement.Unknown && len(settlement.ResponseCiphertext) != 0 || settlement.ResponseInvalid && len(settlement.ResponseCiphertext) != 0 ||
+			(settlement.Unknown || settlement.ResponseInvalid) && len(settlement.ResponseTextDigest) != 0 ||
+			!settlement.Unknown && !settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseTextDigest) != 32)) ||
+		settlement.TaskCall != nil && !taskCallValid ||
+		settlement.TaskCall != nil && settlement.ReviewCall != nil ||
+		settlement.Source == app.ModelCallTask && (len(settlement.ResponseTextDigest) != 0 ||
+			((len(settlement.ResponseCiphertext) == 0) != (len(settlement.ResponseDigest) == 0) ||
+				len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
+				len(settlement.ResponseCiphertext) != 0 && (!taskCallValid || settlement.ResponseInvalid || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext))) ||
 		settlement.TaskCall != nil && len(settlement.ResponseCiphertext) == 0 ||
-		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
-		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
+		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.TaskCall != nil) ||
+		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.TaskCall != nil) ||
 		!settlement.Unknown && !settlement.ResponseInvalid && settlement.Source == app.ModelCallCompaction &&
-			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32) {
+			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32 || len(settlement.ResponseTextDigest) != 0) {
 		return domain.InvalidArgument("project_model_settlement", "invalid project model settlement")
 	}
 	var actorID string
@@ -437,16 +465,34 @@ FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3 FOR 
 		var accountState string
 		var accountTaskID *string
 		var accountReserved int64
-		if err := tx.QueryRow(ctx, `SELECT state,task_id,reserved_tokens,input_tokens,output_tokens,request_digest
+		var accountReviewSHA256 []byte
+		var accountReviewRevision, accountReviewSequence, accountReviewGeneration *int64
+		if err := tx.QueryRow(ctx, `SELECT state,task_id,reserved_tokens,input_tokens,output_tokens,request_digest,
+review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation
 FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, actorID, source, settlement.CallID).
-			Scan(&accountState, &accountTaskID, &accountReserved, &accountInput, &accountOutput, &accountRequestDigest); err != nil {
+			Scan(&accountState, &accountTaskID, &accountReserved, &accountInput, &accountOutput, &accountRequestDigest,
+				&accountReviewRevision, &accountReviewSequence, &accountReviewSHA256, &accountReviewGeneration); err != nil {
 			return storeError("lock account model settlement", "model call", err)
 		}
 		if projectActorID != actorID || accountID != actorID || source != string(settlement.Source) ||
 			(taskID.Valid != (accountTaskID != nil)) || taskID.Valid && accountTaskID != nil && *accountTaskID != taskID.String ||
+			settlement.Source == app.ModelCallReview && settlement.ReviewCall != nil && (!taskID.Valid || taskID.String != settlement.ReviewCall.Review.Claim.TaskID) ||
 			accountReserved < 1 || len(projectRequestDigest) != 32 || len(accountRequestDigest) != 32 ||
 			!domain.ValidModelConnectionID(modelID) {
 			return domain.NewError(domain.CodeInternal, "project and account model ledgers do not match")
+		}
+		if settlement.Source == app.ModelCallReview {
+			if accountTaskID == nil || accountReviewRevision == nil || accountReviewSequence == nil || accountReviewGeneration == nil {
+				return domain.NewError(domain.CodeInternal, "project and account review model ledgers do not match")
+			}
+			if settlement.ReviewCall != nil && (*accountTaskID != settlement.ReviewCall.Review.Claim.TaskID ||
+				!bytes.Equal(accountRequestDigest, settlement.ReviewCall.RequestDigest) ||
+				*accountReviewRevision != settlement.ReviewCall.Review.Claim.TaskRevision ||
+				*accountReviewSequence != settlement.ReviewCall.Review.Claim.ResultEventSequence ||
+				!bytes.Equal(accountReviewSHA256, settlement.ReviewCall.Review.Claim.ResultSHA256) ||
+				*accountReviewGeneration != settlement.ReviewCall.Review.Claim.ClaimGeneration) {
+				return domain.NewError(domain.CodeInvalidState, "Task validation review model call attribution changed")
+			}
 		}
 		if projectState == "settled" && accountState == "settled" {
 			if !settlement.Unknown && projectInput != nil && projectOutput != nil && accountInput != nil && accountOutput != nil &&
@@ -455,8 +501,18 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 				if settlement.Source == app.ModelCallTask {
 					return verifySettledTaskModelResponseInTx(ctx, tx, app.ModelCallSettlement{Source: settlement.Source,
 						OwnerID: actorID, CallID: settlement.CallID, Usage: app.ModelUsage{Known: true,
-							InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens}, TaskCall: settlement.TaskCall,
+							InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
+						ProviderReportedModel: settlement.ProviderReportedModel, TaskCall: settlement.TaskCall,
 						ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid})
+				}
+				if settlement.Source == app.ModelCallReview && settlement.ReviewCall != nil && !settlement.ResponseInvalid {
+					return verifySettledTaskValidationReviewModelResponseInTx(ctx, tx, app.ModelCallSettlement{
+						Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID,
+						Usage:      app.ModelUsage{Known: true, InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
+						ReviewCall: settlement.ReviewCall, ResponseDigest: settlement.ResponseDigest,
+						ResponseTextDigest: settlement.ResponseTextDigest, ProviderReportedModel: settlement.ProviderReportedModel,
+						ResponseInvalid: settlement.ResponseInvalid,
+					})
 				}
 				return nil
 			}
@@ -528,8 +584,9 @@ actual_micros=$6,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 
 		}
 		if settlement.Source == app.ModelCallTask {
 			responseSettlement := app.ModelCallSettlement{Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID,
-				Usage:    app.ModelUsage{Known: true, InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
-				TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
+				Usage:                 app.ModelUsage{Known: true, InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
+				ProviderReportedModel: settlement.ProviderReportedModel,
+				TaskCall:              settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
 				ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid}
 			if responseRejected == nil {
 				if _, err := recordTaskModelResponseInTx(ctx, tx, responseSettlement); err != nil {
@@ -540,7 +597,18 @@ actual_micros=$6,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 
 				}
 			}
 		}
-		if taskID.Valid {
+		if settlement.Source == app.ModelCallReview && !settlement.ResponseInvalid {
+			if _, err := recordTaskValidationReviewModelResponseInTx(ctx, tx, app.ModelCallSettlement{
+				Source: settlement.Source, OwnerID: actorID, CallID: settlement.CallID,
+				Usage:      app.ModelUsage{Known: true, InputTokens: settlement.Usage.InputTokens, OutputTokens: settlement.Usage.OutputTokens},
+				ReviewCall: settlement.ReviewCall, ResponseCiphertext: settlement.ResponseCiphertext,
+				ResponseDigest: settlement.ResponseDigest, ResponseTextDigest: settlement.ResponseTextDigest,
+				ProviderReportedModel: settlement.ProviderReportedModel, ResponseInvalid: settlement.ResponseInvalid,
+			}); err != nil {
+				return err
+			}
+		}
+		if settlement.Source == app.ModelCallTask && taskID.Valid {
 			return refreshTaskModelUsageInTx(ctx, tx, taskID.String, actorID)
 		}
 		return nil
@@ -636,8 +704,8 @@ func projectTaskString(value pgtype.Text) string {
 
 func refreshTaskModelUsageInTx(ctx context.Context, tx pgx.Tx, taskID, actorID string) error {
 	if _, err := tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=CASE WHEN EXISTS (
- SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND state='unknown') THEN NULL ELSE COALESCE((
- SELECT SUM(input_tokens::numeric+output_tokens::numeric)::bigint FROM model_call_ledger WHERE task_id=$1 AND state='settled'),0) END,
+ SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='unknown') THEN NULL ELSE COALESCE((
+ SELECT SUM(input_tokens::numeric+output_tokens::numeric)::bigint FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='settled'),0) END,
  updated_at=clock_timestamp() WHERE id=$1 AND initiator_id=$2`, taskID, actorID); err != nil {
 		return fmt.Errorf("refresh task project model usage: %w", err)
 	}
@@ -653,7 +721,7 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, actorID, source, callID); err !
 WHERE project_id=$1 AND source=$2 AND call_id=$3`, projectID, source, callID); err != nil {
 		return fmt.Errorf("hold unknown project model call: %w", err)
 	}
-	if taskID != "" {
+	if taskID != "" && source == string(app.ModelCallTask) {
 		return refreshTaskModelUsageInTx(ctx, tx, taskID, actorID)
 	}
 	return nil
@@ -802,5 +870,5 @@ func decodeProjectBudgetLedgerCursor(value, projectID string) (*projectBudgetLed
 
 func validProjectBudgetSource(value string) bool {
 	return value == string(app.ModelCallClient) || value == string(app.ModelCallChat) || value == string(app.ModelCallTask) ||
-		value == string(app.ModelCallRoute) || value == string(app.ModelCallCompaction)
+		value == string(app.ModelCallRoute) || value == string(app.ModelCallCompaction) || value == string(app.ModelCallReview)
 }

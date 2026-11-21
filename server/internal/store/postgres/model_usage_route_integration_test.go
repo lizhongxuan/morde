@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -89,7 +90,7 @@ func routeModelFixtureWithMember(t *testing.T, useProject, separateOwner bool, c
 }
 
 func routeModelFixtureWithMemberAndContent(t *testing.T, useProject, separateOwner bool, client *routeModelClientTest,
-	content string) (*Store, *app.ModelGatewayService, identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
+	content string, priorContents ...string) (*Store, *app.ModelGatewayService, identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
 	t.Helper()
 	store, _, _, principal, modelID := modelProbeFixture(t, app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1})
 	ctx := context.Background()
@@ -148,23 +149,32 @@ context_window_tokens=32768,context_window_override_tokens=32768,context_window_
 	}
 	input := app.ConversationRoutingInput{ProjectID: projectID, ModelID: modelID,
 		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000}}
-	hash, err := app.ConversationReceiptHash(value.ID, content, input)
-	if err != nil {
-		t.Fatal(err)
+	authorization := task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
+		ClientInstallationID: principal.ClientInstallationID, Scopes: scopes, Version: 1, ExpiresAt: &expires}
+	accept := func(messageContent, clientID string) conversation.Message {
+		hash, err := app.ConversationReceiptHash(value.ID, messageContent, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: value.OwnerID, ActorID: principal.UserID,
+			ConversationID: value.ID, Role: conversation.RoleUser, Content: messageContent}
+		if _, _, err := store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{Message: message,
+			ServiceInstanceID: instanceID, ClientID: clientID, Input: input, RequestHash: hash, Authorization: authorization}); err != nil {
+			t.Fatal(err)
+		}
+		return message
 	}
-	_, _, err = store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
-		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: value.OwnerID, ActorID: principal.UserID,
-			ConversationID: value.ID, Role: conversation.RoleUser, Content: content},
-		ServiceInstanceID: instanceID, ClientID: "route-client-message-01", Input: input, RequestHash: hash,
-		Authorization: task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
-			ClientInstallationID: principal.ClientInstallationID, Scopes: scopes, Version: 1, ExpiresAt: &expires},
-	})
-	if err != nil {
-		t.Fatal(err)
+	for index, priorContent := range priorContents {
+		prior := accept(priorContent, fmt.Sprintf("route-prior-%03d", index))
+		claimed, found, err := store.ClaimConversationRoute(ctx, "route-prior-worker", time.Minute)
+		if err != nil || !found || claimed.Message.ID != prior.ID {
+			t.Fatalf("claim prior route: message=%s found=%t err=%v", claimed.Message.ID, found, err)
+		}
 	}
+	message := accept(content, "route-client-message-01")
 	claim, ok, err := store.ClaimConversationRoute(ctx, "route-worker-1", time.Minute)
-	if err != nil || !ok {
-		t.Fatalf("claim route: %v", err)
+	if err != nil || !ok || claim.Message.ID != message.ID {
+		t.Fatalf("claim route: message=%s found=%t err=%v", claim.Message.ID, ok, err)
 	}
 	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
 	if err != nil {
@@ -189,6 +199,44 @@ context_window_tokens=32768,context_window_override_tokens=32768,context_window_
 		t.Fatal(err)
 	}
 	return store, gateway, principal, claim, snapshot.Context
+}
+
+func TestConversationRouteModelFenceAllowsPrunedCandidateSubset(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"可以。"}`}
+	_, gateway, _, claim, value := routeModelFixtureWithMemberAndContent(t, false, false, client,
+		"2+2 等于多少？", "first independent request", "second independent request")
+	if len(value.RequestCandidates) != 2 {
+		t.Fatalf("fixture prior requests = %d, want 2", len(value.RequestCandidates))
+	}
+	value.RequestCandidates = value.RequestCandidates[:1]
+	value.CandidateSetIncomplete = true
+	decision, err := gateway.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || client.calls.Load() != 1 {
+		t.Fatalf("bounded candidate subset was not authorized for model dispatch: decision=%+v calls=%d err=%v",
+			decision, client.calls.Load(), err)
+	}
+}
+
+func TestConversationRouteModelFenceAllowsPendingProcessingCandidateTransition(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"可以。"}`}
+	store, gateway, _, claim, value := routeModelFixtureWithMemberAndContent(t, false, false, client,
+		"帮我查一个新问题", "前一条独立请求一", "前一条独立请求二")
+	if len(value.RequestCandidates) != 2 {
+		t.Fatalf("fixture prior requests = %d, want 2", len(value.RequestCandidates))
+	}
+	value.RequestCandidates[0].DirectReply = true
+	value.RequestCandidates[0].AggregationWaiting = true
+	value.RequestCandidates[0].AggregationClosed = true
+	messageIDs := []string{value.RequestCandidates[0].MessageID, value.RequestCandidates[1].MessageID}
+	if _, err := store.pool.Exec(context.Background(), `UPDATE conversation_message_routes SET state='pending',lease_owner='',lease_expires_at=NULL
+WHERE message_id=ANY($1::text[])`, messageIDs); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := gateway.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || client.calls.Load() != 1 {
+		t.Fatalf("route model rejected equivalent unresolved candidate states: decision=%+v calls=%d err=%v",
+			decision, client.calls.Load(), err)
+	}
 }
 
 func TestRouteModelCallConcurrentDispatchAndRestartRecovery(t *testing.T) {

@@ -10,6 +10,7 @@ function showMessage(target, value, error = false) {
 function renderState(value) {
   state = value;
   $('login').hidden = value.authenticated;
+  $('connecting-page').hidden = !value.authenticated || value.view !== 'connecting';
   $('offline-page').hidden = !value.authenticated || value.view !== 'offline';
   if (value.origin && !$('origin').value) $('origin').value = value.origin;
   if (!value.authenticated && !value.storageReady) showMessage($('message'), '系统安全存储不可用，请解锁 Keychain、GNOME Keyring 或 KDE Wallet。', true);

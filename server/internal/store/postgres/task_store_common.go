@@ -221,6 +221,12 @@ func validateInitialTaskEvent(eventType string, payload []byte) ([]byte, error) 
 	if !json.Valid(payload) {
 		return nil, domain.InvalidArgument("event.payload", "event payload must be valid JSON")
 	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) == nil {
+		if _, exists := fields["validation_evidence"]; exists {
+			return nil, domain.InvalidArgument("event.payload", "task validation evidence is server managed")
+		}
+	}
 	return payload, nil
 }
 

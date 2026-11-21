@@ -1,12 +1,15 @@
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { ENGINE_VERSION, validMessageDelivery, validStart } from './engine.mjs'
+import {
+  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validMessageDelivery, validStart,
+} from './engine.mjs'
 import { MAX_FRAME_BYTES } from './ipc.mjs'
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/
 const MAX_CONCURRENT_TASKS = 16
 const MAX_CONCURRENT_COORDINATORS = 16
+const MAX_CONCURRENT_TASK_VALIDATION_REVIEWS = 16
 const MAX_COORDINATOR_MESSAGE_HISTORY = 4096
 const SHUTDOWN_TIMEOUT_MS = 5_000
 const RUNTIME_CWD = fileURLToPath(new URL('..', import.meta.url))
@@ -18,6 +21,7 @@ const TASK_START_TIMEOUT_MS = 15_000
 const TASK_STOP_TIMEOUT_MS = 2_000
 const TASK_FENCE_FIELDS = ['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
 const COORDINATOR_FENCE_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
+const TASK_VALIDATION_REVIEW_FENCE_FIELDS = TASK_VALIDATION_REVIEW_IDENTITY_FIELDS
 const RUNTIME_FIELDS = ['server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'max_concurrent_tasks']
 const RUNTIME_START_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
 const RUNTIME_SHUTDOWN_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
@@ -34,6 +38,14 @@ const COORDINATOR_START_KEYS = [
 const COORDINATOR_PROCESS_ADMIT_KEYS = [
   'type', 'server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'runtime_sequence',
   ...COORDINATOR_FENCE_FIELDS.filter(key => key !== 'owner_id'),
+]
+const TASK_VALIDATION_REVIEW_START_KEYS = [
+  'type', 'version', ...TASK_VALIDATION_REVIEW_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
+  'runtime_sequence', 'model', 'tools', 'system_prompt', 'prompt', 'max_tokens',
+]
+const TASK_VALIDATION_REVIEW_PROCESS_ADMIT_KEYS = [
+  'type', 'server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'runtime_sequence',
+  ...TASK_VALIDATION_REVIEW_FENCE_FIELDS.filter(key => key !== 'owner_id'),
 ]
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
@@ -111,6 +123,21 @@ function validCoordinatorFence(fence) {
     ['generation', 'authorization_version'].every(key => Number.isSafeInteger(fence[key]) && fence[key] > 0)
 }
 
+function taskValidationReviewFence(frame) {
+  return Object.fromEntries(TASK_VALIDATION_REVIEW_FENCE_FIELDS.map(key => [key, frame[key]]))
+}
+
+function validTaskValidationReviewFence(fence) {
+  return fence.context_role === 'task_validation_review' && fence.purpose === 'task_validation_review' &&
+    ['owner_id', 'actor_id', 'task_id', 'session_id'].every(key => typeof fence[key] === 'string' && ID.test(fence[key])) &&
+    Number.isSafeInteger(fence.task_revision) && fence.task_revision >= 0 &&
+    Number.isSafeInteger(fence.result_event_sequence) && fence.result_event_sequence > 0 &&
+    typeof fence.result_sha256 === 'string' && /^[a-f0-9]{64}$/.test(fence.result_sha256) &&
+    Number.isSafeInteger(fence.claim_generation) && fence.claim_generation > 0 &&
+    typeof fence.lease_owner === 'string' && fence.lease_owner.length > 0 && fence.lease_owner.trim() === fence.lease_owner &&
+    Buffer.byteLength(fence.lease_owner, 'utf8') <= 128
+}
+
 function coordinatorMessageKey(fence) {
   return JSON.stringify([fence.conversation_id, fence.session_id, fence.message_id])
 }
@@ -136,6 +163,77 @@ function validAccountCoordinatorStart(frame, runtime) {
     validStart(start) && Number.isSafeInteger(frame.runtime_sequence) && frame.runtime_sequence > 0 &&
     frame.owner_id === runtime.owner_id && frame.server_instance_id === runtime.server_instance_id &&
     frame.runtime_id === runtime.runtime_id && frame.runtime_generation === runtime.runtime_generation
+}
+
+function validAccountTaskValidationReviewStart(frame, runtime) {
+  const { server_instance_id: _serverInstanceID, runtime_id: _runtimeID, runtime_generation: _runtimeGeneration,
+    runtime_sequence: _runtimeSequence, ...start } = frame
+  start.type = 'start'
+  return Object.keys(frame).every(key => TASK_VALIDATION_REVIEW_START_KEYS.includes(key)) &&
+    TASK_VALIDATION_REVIEW_START_KEYS.filter(key => key !== 'max_tokens').every(key => Object.hasOwn(frame, key)) &&
+    frame.type === 'task_validation_review_start' &&
+    frame.version === 1 && validTaskValidationReviewFence(taskValidationReviewFence(frame)) && validStart(start) &&
+    Number.isSafeInteger(frame.runtime_sequence) && frame.runtime_sequence > 0 &&
+    frame.owner_id === runtime.owner_id && frame.server_instance_id === runtime.server_instance_id &&
+    frame.runtime_id === runtime.runtime_id && frame.runtime_generation === runtime.runtime_generation
+}
+
+function validTaskValidationReviewChildFrame(frame, identity) {
+  const base = ['type', ...TASK_VALIDATION_REVIEW_FENCE_FIELDS]
+  if (!validTaskValidationReviewFence(taskValidationReviewFence(frame)) ||
+      TASK_VALIDATION_REVIEW_FENCE_FIELDS.some(key => frame[key] !== identity[key])) return false
+  if (frame.type === 'checkpoint') {
+    return exactKeys(frame, [...base, 'id', 'from_seq', 'through_seq', 'payload', 'sha256']) &&
+      typeof frame.id === 'string' && frame.id.length > 0 && Number.isSafeInteger(frame.from_seq) && frame.from_seq >= 0 &&
+      Number.isSafeInteger(frame.through_seq) && frame.through_seq >= frame.from_seq && typeof frame.payload === 'string' &&
+      Buffer.byteLength(frame.payload) <= MAX_FRAME_BYTES / 2 && /^[a-f0-9]{64}$/.test(frame.sha256)
+  }
+  if (frame.type === 'checkpoint_read') {
+    return exactKeys(frame, [...base, 'id', 'from_seq']) && typeof frame.id === 'string' && frame.id.length > 0 &&
+      Number.isSafeInteger(frame.from_seq) && frame.from_seq >= 0
+  }
+  if (frame.type === 'model') {
+    return exactKeys(frame, [...base, 'id', 'through_seq', 'request', 'sha256']) && typeof frame.id === 'string' && frame.id.length > 0 &&
+      Number.isSafeInteger(frame.through_seq) && frame.through_seq >= 0 && frame.request && typeof frame.request === 'object' &&
+      !Array.isArray(frame.request) && Array.isArray(frame.request.tools) && frame.request.tools.length === 0 &&
+      /^[a-f0-9]{64}$/.test(frame.sha256)
+  }
+  if (frame.type === 'model_cancel') return exactKeys(frame, [...base, 'id']) && typeof frame.id === 'string' && frame.id.length > 0
+  if (frame.type === 'task_validation_review_settled') {
+    return exactKeys(frame, [...base, 'through_seq', 'result']) && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= 0 &&
+      typeof frame.result === 'string' && frame.result.isWellFormed() && frame.result.trim() !== '' &&
+      Buffer.byteLength(frame.result, 'utf8') <= 16 * 1024
+  }
+  if (frame.type === 'task_validation_review_cancelled') {
+    return exactKeys(frame, [...base, 'through_seq']) && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= -1
+  }
+  return false
+}
+
+function validTaskValidationReviewResponseFrame(frame, identity) {
+  const base = ['type', ...TASK_VALIDATION_REVIEW_FENCE_FIELDS]
+  if (!validTaskValidationReviewFence(taskValidationReviewFence(frame)) ||
+      TASK_VALIDATION_REVIEW_FENCE_FIELDS.some(key => frame[key] !== identity[key])) return false
+  if (frame.type === 'checkpoint_ack') {
+    return exactKeys(frame, [...base, 'id', 'ok', 'through_seq', 'sha256']) && typeof frame.id === 'string' &&
+      typeof frame.ok === 'boolean' && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= 0 && /^[a-f0-9]{64}$/.test(frame.sha256)
+  }
+  if (frame.type === 'checkpoint_page') {
+    return exactKeys(frame, [...base, 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256']) && typeof frame.id === 'string' &&
+      typeof frame.ok === 'boolean' && Number.isSafeInteger(frame.from_seq) && frame.from_seq >= 0 &&
+      Number.isSafeInteger(frame.through_seq) && frame.through_seq >= frame.from_seq && typeof frame.payload === 'string' &&
+      Buffer.byteLength(frame.payload) <= MAX_FRAME_BYTES / 2 && /^[a-f0-9]{64}$/.test(frame.sha256)
+  }
+  if (frame.type === 'model_chunk') {
+    return exactKeys(frame, [...base, 'id', 'index', 'chunk']) && typeof frame.id === 'string' &&
+      Number.isSafeInteger(frame.index) && frame.index >= 0 && frame.chunk && typeof frame.chunk === 'object' && !Array.isArray(frame.chunk)
+  }
+  if (frame.type === 'model_end') {
+    if (exactKeys(frame, [...base, 'id', 'ok'])) return typeof frame.id === 'string' && typeof frame.ok === 'boolean'
+    return exactKeys(frame, [...base, 'id', 'ok', 'failure_code']) && typeof frame.id === 'string' && frame.ok === false &&
+      frame.failure_code === 'CONTEXT_WINDOW_EXCEEDED'
+  }
+  return false
 }
 
 function validCoordinatorChildFrame(frame, identity) {
@@ -219,12 +317,15 @@ export class AccountRuntime {
     this.runtime = undefined
     this.tasks = new Map()
     this.coordinators = new Map()
+    this.taskValidationReviews = new Map()
     this.coordinatorMessages = new Map()
     this.activeTaskIDs = new Set()
     this.lastRuntimeSequence = 0
     this.lastAcceptedStart = undefined
     this.lastCoordinatorSequence = 0
     this.lastAcceptedCoordinatorStart = undefined
+    this.lastTaskValidationReviewSequence = 0
+    this.lastAcceptedTaskValidationReviewStart = undefined
     this.buffer = Buffer.alloc(0)
     this.discardingOversizedFrame = false
     this.writes = Promise.resolve()
@@ -329,6 +430,22 @@ export class AccountRuntime {
     }
     if (frame.type === 'coordinator_start') {
       await this.startCoordinator(frame)
+      return
+    }
+    if (frame.type === 'task_validation_review_process_admit') {
+      await this.admitTaskValidationReviewProcess(frame)
+      return
+    }
+    if (frame.type === 'task_validation_review_start') {
+      await this.startTaskValidationReview(frame)
+      return
+    }
+    if (frame.type === 'task_validation_review_cancel') {
+      await this.routeTaskValidationReviewFrame(frame)
+      return
+    }
+    if (frame.context_role === 'task_validation_review') {
+      await this.routeTaskValidationReviewFrame(frame)
       return
     }
     if (frame.type === 'coordinator_cancel') {
@@ -524,6 +641,130 @@ export class AccountRuntime {
       coordinator.started.resolve()
       await this.stopCoordinatorProcess(coordinator).catch(() => {})
       await timeout(coordinator.finished.promise, TASK_STOP_TIMEOUT_MS).catch(() => {})
+    }
+  }
+
+  async startTaskValidationReview(frame) {
+    if (this.stopping) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'runtime_stopping' })
+      return
+    }
+    const fence = taskValidationReviewFence(frame)
+    if (!validTaskValidationReviewFence(fence) || !validAccountTaskValidationReviewStart(frame, this.runtime)) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: frame.owner_id !== this.runtime.owner_id ? 'owner_mismatch' : 'invalid_task_validation_review_start' })
+      return
+    }
+    const key = fence.session_id
+    const digest = startDigest(frame)
+    if (frame.runtime_sequence <= this.lastTaskValidationReviewSequence) {
+      if (frame.runtime_sequence < this.lastTaskValidationReviewSequence) {
+        await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'stale_runtime_sequence' })
+        return
+      }
+      const previous = this.lastAcceptedTaskValidationReviewStart
+      if (!previous || previous.digest !== digest) {
+        await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'runtime_sequence_conflict' })
+        return
+      }
+      if (!this.taskValidationReviews.has(key)) {
+        await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_validation_review_start_already_settled' })
+        return
+      }
+      await this.send({ type: 'task_validation_review_started', ...runtimeFields(this.runtime), runtime_sequence: frame.runtime_sequence, ...fence })
+      return
+    }
+    if (this.taskValidationReviews.has(key)) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_validation_review_session_busy' })
+      return
+    }
+    if (this.taskValidationReviews.size >= MAX_CONCURRENT_TASK_VALIDATION_REVIEWS) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_validation_review_capacity_exceeded' })
+      return
+    }
+    const review = {
+      fence, key, runtimeSequence: frame.runtime_sequence, outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(),
+      ready: deferred(), started: deferred(), spawned: deferred(), closed: deferred(), finished: deferred(),
+      accepted: false, terminal: false, terminating: false, terminated: false, startFrame: frame, admitted: false,
+    }
+    this.taskValidationReviews.set(key, review)
+    try {
+      review.child = spawn(process.execPath, [fileURLToPath(new URL('../bin.mjs', import.meta.url))], {
+        cwd: this.workspaceCwd,
+        env: taskEnvironment(),
+        detached: process.platform !== 'win32',
+        stdio: ['pipe', 'pipe', 'ignore'],
+      })
+      review.child.once('spawn', () => review.spawned.resolve())
+      review.child.once('error', error => review.spawned.reject(error))
+      review.child.stdout.on('data', chunk => this.receiveTaskValidationReviewOutput(review, chunk))
+      review.child.once('close', (code, signal) => {
+        review.exit = { code, signal }
+        if (!review.readyReceived && !review.accepted) review.startFailed = true
+        review.closed.resolve(review.exit)
+        review.ready.reject(new Error('Task validation review process closed before ready'))
+        void this.finishClosedTaskValidationReview(review)
+      })
+      review.child.stdin.on('error', () => {})
+      await timeout(review.spawned.promise, TASK_START_TIMEOUT_MS)
+      this.lastTaskValidationReviewSequence = frame.runtime_sequence
+      review.startDigest = digest
+      await this.send({ type: 'task_validation_review_process_ready', ...runtimeFields(this.runtime), runtime_sequence: frame.runtime_sequence,
+        ...fence, container_pid: review.child.pid })
+    } catch {
+      review.startFailed = !review.accepted
+      review.startDispatchFailed = review.accepted
+      if (review.startDispatchFailed) {
+        review.terminating = true
+        review.terminateReason = 'task_validation_review_start_dispatch_failed'
+      }
+      review.started.resolve()
+      await this.stopTaskValidationReviewProcess(review).catch(() => {})
+      await timeout(review.finished.promise, TASK_STOP_TIMEOUT_MS).catch(() => {})
+    }
+  }
+
+  async admitTaskValidationReviewProcess(frame) {
+    const fence = taskValidationReviewFence(frame)
+    if (!exactKeys(frame, TASK_VALIDATION_REVIEW_PROCESS_ADMIT_KEYS) || !validTaskValidationReviewFence(fence) ||
+        frame.server_instance_id !== this.runtime.server_instance_id || frame.owner_id !== this.runtime.owner_id ||
+        frame.runtime_id !== this.runtime.runtime_id || frame.runtime_generation !== this.runtime.runtime_generation) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'invalid_task_validation_review_process_admission' })
+      return
+    }
+    const review = this.taskValidationReviews.get(fence.session_id)
+    if (!review || TASK_VALIDATION_REVIEW_FENCE_FIELDS.some(key => review.fence[key] !== fence[key]) ||
+        review.runtimeSequence !== frame.runtime_sequence || review.admitted || review.accepted) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_validation_review_process_admission_mismatch' })
+      return
+    }
+    review.admitted = true
+    void this.finishTaskValidationReviewStart(review).catch(() => this.terminateTaskValidationReview(review, 'task_validation_review_start_dispatch_failed'))
+  }
+
+  async finishTaskValidationReviewStart(review) {
+    try {
+      await review.spawned.promise
+      const { server_instance_id: _serverInstanceID, runtime_id: _runtimeID, runtime_generation: _runtimeGeneration,
+        runtime_sequence: _runtimeSequence, ...startFrame } = review.startFrame
+      await this.writeTaskValidationReviewInput(review, { ...startFrame, type: 'start' })
+      await timeout(review.ready.promise, TASK_START_TIMEOUT_MS)
+      if (review.exit) throw new Error('Task validation review process exited before readiness')
+      if (!this.lastAcceptedTaskValidationReviewStart || review.runtimeSequence >= this.lastAcceptedTaskValidationReviewStart.runtimeSequence) {
+        this.lastAcceptedTaskValidationReviewStart = { digest: review.startDigest, key: review.key, runtimeSequence: review.runtimeSequence }
+      }
+      review.accepted = true
+      await this.send({ type: 'task_validation_review_started', ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence, ...review.fence })
+      review.started.resolve()
+    } catch {
+      review.startFailed = !review.accepted
+      review.startDispatchFailed = review.accepted
+      if (review.startDispatchFailed) {
+        review.terminating = true
+        review.terminateReason = 'task_validation_review_start_dispatch_failed'
+      }
+      review.started.resolve()
+      await this.stopTaskValidationReviewProcess(review).catch(() => {})
+      await timeout(review.finished.promise, TASK_STOP_TIMEOUT_MS).catch(() => {})
     }
   }
 
@@ -731,6 +972,191 @@ export class AccountRuntime {
       return
     }
     await this.writeCoordinatorInput(coordinator, cleanFrame)
+  }
+
+  async routeTaskValidationReviewFrame(frame) {
+    const fence = taskValidationReviewFence(frame)
+    const accountScope = ['server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence']
+    if (!validTaskValidationReviewFence(fence)) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'task_validation_review_fence_required' })
+      return
+    }
+    if (frame.owner_id !== this.runtime.owner_id) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'owner_mismatch' })
+      return
+    }
+    if (accountScope.some(key => Object.hasOwn(frame, key)) &&
+        (frame.server_instance_id !== this.runtime.server_instance_id || frame.runtime_id !== this.runtime.runtime_id ||
+          frame.runtime_generation !== this.runtime.runtime_generation)) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'runtime_fence_mismatch' })
+      return
+    }
+    const accountKeysPresent = accountScope.filter(key => Object.hasOwn(frame, key))
+    const cleanFrame = { ...frame }
+    for (const key of accountScope) delete cleanFrame[key]
+    const validShape = accountKeysPresent.length === 0 || accountKeysPresent.length === accountScope.length
+    const review = this.taskValidationReviews.get(fence.session_id)
+    const validRuntimeSequence = accountKeysPresent.length === 0 ||
+      Number.isSafeInteger(frame.runtime_sequence) && review?.runtimeSequence === frame.runtime_sequence
+    const validFrame = frame.type === 'task_validation_review_cancel'
+      ? exactKeys(cleanFrame, ['type', ...TASK_VALIDATION_REVIEW_FENCE_FIELDS])
+      : ['checkpoint_ack', 'checkpoint_page', 'model_chunk', 'model_end'].includes(frame.type) &&
+        validTaskValidationReviewResponseFrame(cleanFrame, fence)
+    if (!validShape || !validRuntimeSequence || !validFrame) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'invalid_task_validation_review_frame' })
+      return
+    }
+    if (!review) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'unknown_task_validation_review' })
+      return
+    }
+    if (TASK_VALIDATION_REVIEW_FENCE_FIELDS.some(key => review.fence[key] !== fence[key])) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_validation_review_fence_mismatch' })
+      return
+    }
+    if (frame.type === 'task_validation_review_cancel') {
+      if (review.terminating) return
+      review.terminating = true
+      review.terminateReason = 'cancelled'
+      if (!review.accepted) {
+        void this.terminateTaskValidationReview(review, 'cancelled')
+        return
+      }
+      await this.writeTaskValidationReviewInput(review, { type: 'cancel', ...review.fence }).catch(() => {
+        void this.terminateTaskValidationReview(review, 'cancel_failed')
+      })
+      review.cancelTimer = setTimeout(() => void this.terminateTaskValidationReview(review, 'cancel_timeout'), TASK_STOP_TIMEOUT_MS)
+      review.cancelTimer.unref?.()
+      return
+    }
+    if (!review.accepted) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_validation_review_not_running' })
+      return
+    }
+    await this.writeTaskValidationReviewInput(review, cleanFrame)
+  }
+
+  async writeTaskValidationReviewInput(review, frame) {
+    if (!review.child?.stdin || review.child.stdin.destroyed || review.exit) throw new Error('Task validation review process input is unavailable')
+    await new Promise((resolve, reject) => {
+      review.child.stdin.write(frameBytes(frame), error => error ? reject(error) : resolve())
+    })
+  }
+
+  receiveTaskValidationReviewOutput(review, chunk) {
+    if (review.terminated) return
+    review.outputBuffer = Buffer.concat([review.outputBuffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)])
+    for (;;) {
+      const end = review.outputBuffer.indexOf(10)
+      if (end < 0) {
+        if (review.outputBuffer.length >= MAX_FRAME_BYTES) this.terminateTaskValidationReview(review, 'internal_frame_too_large')
+        return
+      }
+      const line = review.outputBuffer.subarray(0, end)
+      review.outputBuffer = review.outputBuffer.subarray(end + 1)
+      if (end >= MAX_FRAME_BYTES) {
+        this.terminateTaskValidationReview(review, 'internal_frame_too_large')
+        return
+      }
+      review.outputFrames = review.outputFrames.then(async () => {
+        let frame
+        try {
+          frame = JSON.parse(UTF8_DECODER.decode(line))
+        } catch {
+          return this.terminateTaskValidationReview(review, 'invalid_internal_frame')
+        }
+        if (!frame || typeof frame !== 'object' || Array.isArray(frame) || typeof frame.type !== 'string') {
+          throw new Error('invalid internal Task validation review frame')
+        }
+        if (!review.readyReceived) {
+          if (Object.keys(frame).sort().join(',') !== 'engine,engine_version,type,version' || frame.type !== 'ready' ||
+              frame.version !== 1 || frame.engine !== 'dsh' || frame.engine_version !== ENGINE_VERSION) {
+            throw new Error('invalid Task validation review readiness frame')
+          }
+          review.readyReceived = true
+          review.ready.resolve()
+          return
+        }
+        if (frame.type === 'ready') throw new Error('duplicate Task validation review readiness frame')
+        await review.started.promise
+        if (review.startDispatchFailed) return
+        if (frame.type === 'failed') {
+          if (!exactKeys(frame, ['type', 'code']) || typeof frame.code !== 'string') throw new Error('invalid review failure frame')
+          review.terminalFrame = { type: 'task_validation_review_failed', code: frame.code }
+          review.terminal = true
+          return
+        }
+        if (!validTaskValidationReviewChildFrame(frame, review.fence)) throw new Error('invalid Task validation review output fence')
+        if (['task_validation_review_settled', 'task_validation_review_cancelled'].includes(frame.type)) {
+          if (review.terminalFrame) throw new Error('duplicate Task validation review terminal frame')
+          review.terminalFrame = frame
+          review.terminal = true
+          return
+        }
+        await this.send({ ...frame, ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence, ...review.fence })
+      }).catch(() => this.terminateTaskValidationReview(review, 'output_failed'))
+    }
+  }
+
+  async finishClosedTaskValidationReview(review) {
+    if (review.finishing) return review.finished.promise
+    review.finishing = true
+    await review.outputFrames
+    clearTimeout(review.cancelTimer)
+    if (review.startFailed) {
+      await this.send({ type: 'task_validation_review_failed', ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence,
+        ...review.fence, code: 'runtime_unavailable' }).catch(() => {})
+    } else if (review.terminalFrame?.type === 'task_validation_review_settled') {
+      await this.send({ ...review.terminalFrame, state: 'completed', ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence,
+        ...review.fence }).catch(() => {})
+    } else if (review.terminalFrame?.type === 'task_validation_review_failed') {
+      await this.send({ ...review.terminalFrame, ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence,
+        ...review.fence }).catch(() => {})
+    } else if (review.terminalFrame?.type === 'task_validation_review_cancelled' || review.terminating) {
+      await this.send({ type: 'task_validation_review_terminated', ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence,
+        ...review.fence, reason: review.terminateReason ?? 'cancelled', state: 'cancelled', process_exited: true }).catch(() => {})
+    } else {
+      await this.send({ type: 'task_validation_review_failed', ...runtimeFields(this.runtime), runtime_sequence: review.runtimeSequence,
+        ...review.fence, code: 'runtime_unavailable', reason: 'child_exited_without_result', process_exited: true }).catch(() => {})
+    }
+    if (this.taskValidationReviews.get(review.key) === review) this.taskValidationReviews.delete(review.key)
+    review.terminated = true
+    review.finished.resolve()
+    this.finishShutdownIfIdle()
+  }
+
+  terminateTaskValidationReview(review, reason) {
+    if (review.terminated || review.terminating && review.stopPromise) return review.finished.promise
+    review.terminating = true
+    review.terminateReason ??= reason
+    review.stopPromise = this.stopTaskValidationReviewProcess(review).catch(() => {
+      void this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...review.fence, code: 'task_validation_review_stop_unconfirmed' }).catch(() => {})
+    })
+    return review.stopPromise
+  }
+
+  async stopTaskValidationReviewProcess(review) {
+    if (review.exit) return review.exit
+    const spawned = await Promise.race([review.spawned.promise.then(() => true), review.closed.promise.then(() => false)])
+    if (!spawned || review.exit) return review.exit
+    const signalGroup = signal => {
+      if (process.platform === 'win32') {
+        if (!review.child.kill(signal) && !review.exit) throw new Error('Task validation review process could not be signalled')
+        return
+      }
+      try {
+        process.kill(-review.child.pid, signal)
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error
+      }
+    }
+    signalGroup('SIGTERM')
+    try {
+      return await timeout(review.closed.promise, 250)
+    } catch {
+      signalGroup('SIGKILL')
+      return timeout(review.closed.promise, TASK_STOP_TIMEOUT_MS)
+    }
   }
 
   async writeCoordinatorInput(coordinator, frame) {
@@ -1016,16 +1442,26 @@ export class AccountRuntime {
         void this.terminateCoordinator(coordinator, 'runtime_shutdown')
       }
     }
+    for (const review of this.taskValidationReviews.values()) {
+      review.terminating = true
+      review.terminateReason = 'runtime_shutdown'
+      if (review.accepted) {
+        void this.writeTaskValidationReviewInput(review, { type: 'cancel', ...review.fence }).catch(() => this.terminateTaskValidationReview(review, 'cancel_failed'))
+      } else {
+        void this.terminateTaskValidationReview(review, 'runtime_shutdown')
+      }
+    }
     this.stopTimer = setTimeout(() => {
       for (const task of this.tasks.values()) void this.terminateTask(task, 'runtime_shutdown_timeout')
       for (const coordinator of this.coordinators.values()) void this.terminateCoordinator(coordinator, 'runtime_shutdown_timeout')
+      for (const review of this.taskValidationReviews.values()) void this.terminateTaskValidationReview(review, 'runtime_shutdown_timeout')
     }, SHUTDOWN_TIMEOUT_MS)
     this.stopTimer.unref?.()
     this.finishShutdownIfIdle()
   }
 
   finishShutdownIfIdle() {
-    if (!this.stopping || this.tasks.size !== 0 || this.coordinators.size !== 0 || this.stopSent) return
+    if (!this.stopping || this.tasks.size !== 0 || this.coordinators.size !== 0 || this.taskValidationReviews.size !== 0 || this.stopSent) return
     this.stopSent = true
     clearTimeout(this.stopTimer)
     void this.send({ type: 'runtime_stopped', ...runtimeFields(this.runtime), reason: this.stopReason })

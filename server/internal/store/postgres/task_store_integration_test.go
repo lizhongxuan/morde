@@ -626,6 +626,8 @@ func TestPostgresWorkspaceTaskWaitsForHostAppliedRevisionThenResumes(t *testing.
 	}
 	file := syncTestFile("task-output.txt", []byte("task output revision"))
 	upload := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	upload.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+	upload.Direction = workspace.SyncBidirectional
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, upload, syncTestBlocks(upload.UploadFiles),
 		syncTestIdempotency(owner.ID, "workspace.sync.create", "task-waiting:output", upload.ID)); err != nil {
 		t.Fatalf("create Workspace output revision: %v", err)
@@ -812,8 +814,9 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskSubmission(t *testing.T) {
 		t.Helper()
 		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, name)
 		hostValue, binding := createRunningControlHostForWorkspace(t, ctx, store, owner.ID, workspaceValue, host.ControlAI, 0)
-		if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
-			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+		binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+		if err != nil {
 			t.Fatalf("activate Workspace binding: %v", err)
 		}
 		revision := workspaceValue.Revision
@@ -824,6 +827,8 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskSubmission(t *testing.T) {
 
 		file := syncTestFile(name+".txt", []byte("committed after the task snapshot"))
 		session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+		session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+		session.Direction = workspace.SyncBidirectional
 		if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks([]workspace.File{file}),
 			syncTestIdempotency(owner.ID, "workspace.sync.create", "create:"+key, session.ID)); err != nil {
 			t.Fatalf("create Workspace sync session: %v", err)
@@ -908,7 +913,7 @@ BEFORE INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION wait_for_task_submission_te
 				syncTestIdempotency(owner.ID, "workspace.sync.commit", "commit:task-task-first", session.ID))
 			committed <- commitResult{value: value, err: err}
 		}()
-		waitForPostgresLockWait(t, waitCtx, pool, "%FROM workspaces%FOR UPDATE%", 1)
+		waitForPostgresLockWait(t, waitCtx, pool, "%FROM hosts WHERE id=$1 FOR UPDATE%", 1)
 		var unlocked bool
 		if err := advisoryConn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
 			t.Fatalf("release Task insert advisory lock: unlocked=%t err=%v", unlocked, err)
@@ -1045,6 +1050,8 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskOperationAdmission(t *test
 	}
 
 	session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+	session.Direction = workspace.SyncBidirectional
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks([]workspace.File{file}),
 		syncTestIdempotency(owner.ID, "workspace.sync.create", "admission-session", session.ID)); err != nil {
 		t.Fatalf("create external sync session: %v", err)
@@ -2655,6 +2662,8 @@ func TestPostgresWorkspaceSyncCommitWinsConcurrentTaskOperationAdmission(t *test
 	}
 	file := syncTestFile("external-update.txt", []byte("new confirmed revision"))
 	session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+	session.Direction = workspace.SyncBidirectional
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks([]workspace.File{file}),
 		syncTestIdempotency(owner.ID, "workspace.sync.create", "create:operation-commit-race", session.ID)); err != nil {
 		t.Fatal(err)
@@ -2712,7 +2721,7 @@ BEFORE INSERT ON workspace_revisions FOR EACH ROW EXECUTE FUNCTION wait_for_work
 		}, claimed.Lease.Owner)
 		operationDone <- err
 	}()
-	waitForPostgresLockWait(t, waitCtx, pool, "%FROM workspaces WHERE id=$1 FOR SHARE%", 1)
+	waitForPostgresLockWait(t, waitCtx, pool, "%FROM hosts h%FOR SHARE OF h%", 1)
 	var unlocked bool
 	if err := advisoryConn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
 		t.Fatalf("release Workspace revision test barrier: unlocked=%t err=%v", unlocked, err)
@@ -3358,11 +3367,19 @@ func TestPostgresTaskArtifactsMustMatchWorkspaceCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	artifact := addArtifactProof(task.Artifact{
-		ID: mustID(t, domain.NewArtifactID), TaskID: created.Task.ID, StepID: stepID,
+		ID: mustID(t, domain.NewArtifactID), TaskID: created.Task.ID, StepID: stepID, SourceCallID: "write-1",
 		Label: "Report", Path: "output/report.txt", MediaType: "text/plain",
 	}, proofs["output/report.txt"])
 	if _, err := store.RecordValidatedArtifact(ctx, owner.ID, artifact, claimed.Lease.Owner, claimed.Lease.Version); err != nil {
 		t.Fatalf("record artifact at initial checkpoint: %v", err)
+	}
+	var artifactPayload map[string]any
+	if err := store.pool.QueryRow(ctx, `SELECT payload FROM task_events WHERE task_id=$1 AND event_type='task.artifact' AND payload->>'artifact_id'=$2`,
+		created.Task.ID, artifact.ID).Scan(&artifactPayload); err != nil || artifactPayload["source_call_id"] != "write-1" {
+		t.Fatalf("persisted artifact source call event = %#v err=%v", artifactPayload, err)
+	}
+	if artifactPayload["task_revision"] != float64(0) {
+		t.Fatalf("persisted artifact Task revision = %#v, want current revision 0", artifactPayload["task_revision"])
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revisions (workspace_id, revision, file_count, total_bytes) VALUES ($1,1,1,5)`, workspaceValue.ID); err != nil {
 		t.Fatal(err)

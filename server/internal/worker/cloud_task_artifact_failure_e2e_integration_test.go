@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -67,21 +68,14 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
-	binding := hostValue.Workspaces[0]
-	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
-		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
-	if err != nil {
-		t.Fatalf("activate empty test Workspace binding: %v", err)
-	}
-
 	hostRoot := t.TempDir()
 	workspaceDirectory := filepath.Join(hostRoot, workspaceValue.ID)
 	if err := os.MkdirAll(workspaceDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	baselineContent := "Existing Workspace note before this task.\n"
 	content := "Persist this artifact exactly once.\n"
-	if err := os.WriteFile(filepath.Join(workspaceDirectory, "recovery-note.txt"), []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspaceDirectory, "recovery-note.txt"), []byte(baselineContent), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	workspaceFileInfo, err := os.Stat(filepath.Join(workspaceDirectory, "recovery-note.txt"))
@@ -96,6 +90,63 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	rootModTime := rootInfo.ModTime().UnixNano()
 	fileModTime := workspaceFileInfo.ModTime().UnixNano()
 	rootDirectories := []workspace.Directory{{Path: ".", Mode: &rootMode, ModTimeNS: &rootModTime, MetadataKnown: true}}
+
+	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "workspace-blocks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close Workspace blocks: %v", err)
+		}
+	}()
+	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditService, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionCredential := createF01Session(t, ctx, store, owner.ID)
+	principal, err := credentials.VerifySession(ctx, sessionCredential)
+	if err != nil || principal.UserID != owner.ID || principal.Kind != identity.KindSession {
+		t.Fatalf("verify task session: principal=%#v err=%v", principal, err)
+	}
+	contentDigest := sha256.Sum256([]byte(baselineContent))
+	contentHash := hex.EncodeToString(contentDigest[:])
+	manifestFile := workspace.File{
+		Path: "recovery-note.txt", SizeBytes: int64(len(baselineContent)), SHA256: contentHash, Mode: 0o600,
+		ModTimeNS: &fileModTime, MetadataKnown: true,
+		Chunks: []workspace.Chunk{{SHA256: contentHash, SizeBytes: int64(len(baselineContent))}},
+	}
+	initialUpload, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{manifestFile}, Directories: rootDirectories,
+	}, "f01-artifact-initial-upload")
+	if err != nil {
+		t.Fatalf("create initial Workspace upload session: %v", err)
+	}
+	if written, err := syncService.PutSyncBlock(ctx, principal, workspaceValue.ID, initialUpload.ID, contentHash, strings.NewReader(baselineContent)); err != nil || written != int64(len(baselineContent)) {
+		t.Fatalf("upload initial Workspace content block: written=%d err=%v", written, err)
+	}
+	initialCommitted, err := syncService.CommitSyncSession(ctx, principal, workspaceValue.ID, initialUpload.ID, "f01-artifact-initial-commit")
+	if err != nil || initialCommitted.State != workspace.SyncCompleted || initialCommitted.TargetRevision != 1 {
+		t.Fatalf("commit initial Workspace file: session=%#v err=%v", initialCommitted, err)
+	}
+	localWorkspaceFile, err := os.ReadFile(filepath.Join(workspaceDirectory, manifestFile.Path))
+	if err != nil || !bytes.Equal(localWorkspaceFile, []byte(baselineContent)) {
+		t.Fatalf("Host Workspace file before download receipt = %q, err=%v", localWorkspaceFile, err)
+	}
+
+	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	binding := hostValue.Workspaces[0]
+
 	taskWorkspace, err := runtimefiles.OpenTaskWorkspace(hostRoot,
 		filepath.Join(hostRoot, ".morde-task-views"), uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
@@ -141,59 +192,6 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 			t.Errorf("close Host runtime: %v", err)
 		}
 	}()
-
-	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "workspace-blocks"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := blocks.Close(); err != nil {
-			t.Errorf("close Workspace blocks: %v", err)
-		}
-	}()
-	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<40)
-	if err != nil {
-		t.Fatal(err)
-	}
-	auditService, err := app.NewAuditService(store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	credentials, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
-		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
-	}, f01DefaultHosts{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sessionCredential := createF01Session(t, ctx, store, owner.ID)
-	principal, err := credentials.VerifySession(ctx, sessionCredential)
-	if err != nil || principal.UserID != owner.ID || principal.Kind != identity.KindSession {
-		t.Fatalf("verify task session: principal=%#v err=%v", principal, err)
-	}
-	contentDigest := sha256.Sum256([]byte(content))
-	contentHash := hex.EncodeToString(contentDigest[:])
-	manifestFile := workspace.File{
-		Path: "recovery-note.txt", SizeBytes: int64(len(content)), SHA256: contentHash, Mode: 0o600,
-		ModTimeNS: &fileModTime, MetadataKnown: true,
-		Chunks: []workspace.Chunk{{SHA256: contentHash, SizeBytes: int64(len(content))}},
-	}
-	initialUpload, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
-		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{manifestFile}, Directories: rootDirectories,
-	}, "f01-artifact-initial-upload")
-	if err != nil {
-		t.Fatalf("create initial Workspace upload session: %v", err)
-	}
-	if written, err := syncService.PutSyncBlock(ctx, principal, workspaceValue.ID, initialUpload.ID, contentHash, strings.NewReader(content)); err != nil || written != int64(len(content)) {
-		t.Fatalf("upload initial Workspace content block: written=%d err=%v", written, err)
-	}
-	initialCommitted, err := syncService.CommitSyncSession(ctx, principal, workspaceValue.ID, initialUpload.ID, "f01-artifact-initial-commit")
-	if err != nil || initialCommitted.State != workspace.SyncCompleted || initialCommitted.TargetRevision != 1 {
-		t.Fatalf("commit initial Workspace file: session=%#v err=%v", initialCommitted, err)
-	}
-	localWorkspaceFile, err := os.ReadFile(filepath.Join(workspaceDirectory, manifestFile.Path))
-	if err != nil || !bytes.Equal(localWorkspaceFile, []byte(content)) {
-		t.Fatalf("Host Workspace file before download receipt = %q, err=%v", localWorkspaceFile, err)
-	}
 	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -218,9 +216,19 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil || completedDownload.State != workspace.SyncCompleted || completedDownload.TargetRevision != 1 {
 		t.Fatalf("complete Host replica download session: session=%#v err=%v", completedDownload, err)
 	}
-	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID,
-		binding.BindingVersion, completedDownload.ID, completedDownload.TargetRevision); err != nil {
+	binding, err = store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID,
+		binding.BindingVersion, completedDownload.ID, completedDownload.TargetRevision)
+	if err != nil {
 		t.Fatalf("record applied revision from Host download session: %v", err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
+	if err != nil {
+		t.Fatalf("activate Workspace binding after Host baseline download: %v", err)
+	}
+	replicaPrincipal, err = hostReplicas.ScopeWorkspace(ctx, replicaPrincipal, workspaceValue.ID, binding.BindingVersion)
+	if err != nil {
+		t.Fatalf("scope Host replica principal to active Workspace binding: %v", err)
 	}
 	if _, err := hostReplicas.ReportWorkspaceSyncStatus(ctx, replicaPrincipal, workspace.BindingSyncHealthy, nil); err != nil {
 		t.Fatalf("report healthy Host Workspace sync status: %v", err)
@@ -415,6 +423,18 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil || completedHostSync.State != workspace.SyncCompleted || completedHostSync.TargetRevision != 2 {
 		t.Fatalf("complete Host download session for published Task revision: session=%#v err=%v", completedHostSync, err)
 	}
+	publishedBlock, err := blocks.Open(workspaceValue.ID, publicationFile.SHA256)
+	if err != nil {
+		t.Fatalf("read published Task Workspace block for Host sync: %v", err)
+	}
+	publishedContent, readErr := io.ReadAll(publishedBlock)
+	closeErr := publishedBlock.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read published Task Workspace block: read err %v, close err %v", readErr, closeErr)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceDirectory, publicationFile.Path), publishedContent, os.FileMode(publicationFile.Mode)); err != nil {
+		t.Fatalf("apply Host Workspace download fixture: %v", err)
+	}
 	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID,
 		binding.BindingVersion, completedHostSync.ID, completedHostSync.TargetRevision); err != nil {
 		t.Fatalf("record Host applied revision after Task publish: %v", err)
@@ -455,8 +475,9 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 		t.Fatalf("Task Workspace file_write side effect count after completion retry = %d, want 1", fileWriteCalls.Load())
 	}
 	artifact := completed.Artifacts[0]
+	outputDigest := sha256.Sum256([]byte(content))
 	if artifact.WorkspaceID != workspaceValue.ID || artifact.Revision != 2 || artifact.Path != manifestFile.Path ||
-		artifact.SizeBytes != manifestFile.SizeBytes || artifact.SHA256 != manifestFile.SHA256 {
+		artifact.SizeBytes != int64(len(content)) || artifact.SHA256 != hex.EncodeToString(outputDigest[:]) {
 		t.Fatalf("recovered artifact metadata = %#v", artifact)
 	}
 	manifest, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, artifact.Revision, "", "", 10)

@@ -446,6 +446,17 @@ export const portalApi = {
   adminModelConnections: async () => unwrapApiResponse(await api.GET('/api/admin/model-connections')),
   adminUsage: async (days: 7 | 30 | 90) => unwrapApiResponse(await api.GET('/api/admin/usage', { params: { query: { days } } })),
   adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
+  createBlindEvaluationBatch: async (body: operations['createBlindEvaluationBatch']['requestBody']['content']['application/json']) =>
+    unwrapApiResponse(await api.POST('/api/admin/evaluation-batches', { body })),
+  blindEvaluationPanel: async (packID: string) => unwrapApiResponse(await api.GET('/api/admin/evaluation-batches/{pack_id}', { params: { path: { pack_id: packID } } })),
+  blindEvaluationMapping: async (packID: string) => unwrapApiResponse(await api.GET('/api/admin/evaluation-batches/{pack_id}/mapping', { params: { path: { pack_id: packID } } })),
+  blindEvaluationManifests: async (packID: string) => unwrapApiResponse(await api.GET('/api/admin/evaluation-batches/{pack_id}/manifests', { params: { path: { pack_id: packID } } })),
+  blindReviewBundle: async (packID: string) => unwrapApiResponse(await api.GET('/api/evaluation-batches/{pack_id}/review', { params: { path: { pack_id: packID } } })),
+  submitBlindReview: async (packID: string, body: operations['submitBlindReview']['requestBody']['content']['application/json']) =>
+    unwrapApiResponse(await api.POST('/api/evaluation-batches/{pack_id}/reviews', { params: { path: { pack_id: packID } }, body })),
+  blindArbitrationBundle: async (packID: string) => unwrapApiResponse(await api.GET('/api/evaluation-batches/{pack_id}/arbitration', { params: { path: { pack_id: packID } } })),
+  submitBlindArbitration: async (packID: string, body: operations['submitBlindArbitration']['requestBody']['content']['application/json']) =>
+    unwrapApiResponse(await api.POST('/api/evaluation-batches/{pack_id}/arbitrations', { params: { path: { pack_id: packID } }, body })),
   adminControls: async () => unwrapApiResponse(await api.GET('/api/admin/controls')),
   adminSettings: async () => unwrapApiResponse(await api.GET('/api/admin/settings')),
   updateAdminModelBudgetDefault: async (body: components['schemas']['UpdateAdminModelBudgetDefaultRequest']) => unwrapApiResponse(await api.PUT('/api/admin/settings/model-budget-default', { body })),

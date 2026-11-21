@@ -133,10 +133,6 @@ ORDER BY is_default DESC, h.created_at, h.id LIMIT 2`, params.Host.OwnerID)
 			if err := lockHost(ctx, tx, existingID); err != nil {
 				return err
 			}
-			workspaceRevisions, err := lockWorkspacesForBinding(ctx, tx, params.WorkspaceIDs, params.Host.OwnerID)
-			if err != nil {
-				return err
-			}
 			row, err := queries.GetHost(ctx, existingID)
 			if err != nil {
 				return fmt.Errorf("read locked default host: %w", err)
@@ -146,13 +142,15 @@ ORDER BY is_default DESC, h.created_at, h.id LIMIT 2`, params.Host.OwnerID)
 				return err
 			}
 			activeCount := 0
+			boundWorkspaceID := ""
 			for _, binding := range current.Workspaces {
 				if binding.State == workspace.BindingDetached {
 					continue
 				}
 				activeCount++
+				boundWorkspaceID = binding.Workspace.ID
 				if binding.OwnerID != current.OwnerID || binding.Workspace.OwnerID != current.OwnerID ||
-					binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil ||
+					binding.Workspace.State != workspace.StateReady || binding.Workspace.ReadOnly || binding.Workspace.DeletedAt != nil ||
 					(binding.State != workspace.BindingPreparing && binding.State != workspace.BindingActive) ||
 					binding.SyncState != workspace.BindingSyncHealthy {
 					return domain.NewError(domain.CodeWorkspaceBusy, "default host workspace binding is not available")
@@ -161,9 +159,16 @@ ORDER BY is_default DESC, h.created_at, h.id LIMIT 2`, params.Host.OwnerID)
 			if activeCount > 1 {
 				return domain.NewError(domain.CodeWorkspaceConflict, "default host has multiple active workspace bindings")
 			}
+			if err := verifyDefaultHostAgentWorkspace(ctx, tx, current.OwnerID, workspaceID); err != nil {
+				return err
+			}
 			if activeCount == 0 {
 				if current.State != host.StateStopped {
 					return domain.NewError(domain.CodeWorkspaceConflict, "default host is missing its workspace binding")
+				}
+				workspaceRevisions, err := lockWorkspacesForBinding(ctx, tx, params.WorkspaceIDs, params.Host.OwnerID)
+				if err != nil {
+					return err
 				}
 				if err := ensureDefaultHostWorkspaceBinding(ctx, tx, existingID, current.OwnerID, workspaceID, workspaceRevisions[workspaceID]); err != nil {
 					return err
@@ -176,6 +181,8 @@ ORDER BY is_default DESC, h.created_at, h.id LIMIT 2`, params.Host.OwnerID)
 				if err != nil {
 					return err
 				}
+			} else if boundWorkspaceID != workspaceID {
+				return domain.NewError(domain.CodeWorkspaceConflict, "default host is bound to a different Workspace")
 			}
 			result = current
 		} else {
@@ -239,6 +246,32 @@ ON CONFLICT (user_id) DO UPDATE SET default_host_id=EXCLUDED.default_host_id,
 		return host.Host{}, false, err
 	}
 	return result, created, nil
+}
+
+func verifyDefaultHostAgentWorkspace(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) error {
+	var currentWorkspaceID string
+	err := tx.QueryRow(ctx, `SELECT workspace_id FROM user_agent_workspaces WHERE owner_id=$1 FOR UPDATE`, ownerID).
+		Scan(&currentWorkspaceID)
+	if err == nil {
+		if currentWorkspaceID != workspaceID {
+			return domain.NewError(domain.CodeWorkspaceConflict, "default host request does not use the owner's current Agent Workspace")
+		}
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("read stable Agent Workspace before default Host reuse: %w", err)
+	}
+	var retired bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM agent_workspace_history WHERE owner_id=$1 AND workspace_id=$2
+)`, ownerID, workspaceID).Scan(&retired); err != nil {
+		return fmt.Errorf("check retired Agent Workspace before default Host reuse: %w", err)
+	}
+	if retired {
+		return domain.NewError(domain.CodeWorkspaceConflict, "default host cannot reuse a retired Agent Workspace")
+	}
+	// Legacy default Hosts may lack a current Agent Workspace mapping; their existing binding is validated before reuse.
+	return nil
 }
 
 func validateDefaultHostAllocation(ctx context.Context, tx pgx.Tx, value host.Host, quotaCPU, quotaMem int, capacity app.Capacity) error {

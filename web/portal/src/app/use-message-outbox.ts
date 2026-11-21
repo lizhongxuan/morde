@@ -4,6 +4,12 @@ import type { PendingConversationMessage } from './message-outbox';
 
 export type MessageOutboxEntry = { scope: string; message: PendingConversationMessage };
 
+const obsoletePredecessorReceiptError = '前一条消息尚未确认，请先核对后重试。';
+
+export function messageOutboxErrorForDisplay(error?: string): string | undefined {
+  return error === obsoletePredecessorReceiptError ? undefined : error;
+}
+
 export function useMessageOutbox(userID: string | undefined, serviceInstanceID: string | undefined) {
   const [entries, setEntries] = useState<MessageOutboxEntry[]>([]);
   const [storageError, setStorageError] = useState<string | null>(null);
@@ -19,7 +25,11 @@ export function useMessageOutbox(userID: string | undefined, serviceInstanceID: 
     try {
       const scopes = currentScope === unknownScope ? [currentScope] : [currentScope, unknownScope];
       const lists = await Promise.all(scopes.map((scope) => recover
-        ? messageOutbox.update(scope, (items) => items.map((message) => message.status === 'sending' ? { ...message, status: 'unknown' } : message))
+        ? messageOutbox.update(scope, (items) => items.map((message) => {
+          const error = messageOutboxErrorForDisplay(message.error);
+          return { ...message, ...(message.status === 'sending' ? { status: 'unknown' as const } : {}),
+            ...(error !== message.error ? { error } : {}) };
+        }))
         : messageOutbox.read(scope)));
       if (currentGeneration !== generation.current) return;
       const seen = new Set<string>();

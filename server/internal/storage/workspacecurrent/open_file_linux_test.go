@@ -38,3 +38,25 @@ func TestWorkspacePathRequiresAnExistingSafeDirectory(t *testing.T) {
 		t.Fatal("WorkspacePath() followed a symlink")
 	}
 }
+
+func TestWorkspacePathDoesNotNeedDirectoryReadPermission(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits")
+	}
+	store := openSymlinkTestStore(t)
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 0, nil, nil,
+		[]workspace.Directory{{Path: ".", MetadataKnown: true}}, noWorkspaceBlocks{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(store.rootPath, ownerHashForTest("u1234567"), "w1234567")
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o700) })
+
+	got, err := store.WorkspacePath("u1234567", "w1234567")
+	want := filepath.Join(store.rootPath, ownerHashForTest("u1234567"), "w1234567")
+	if err != nil || got != want {
+		t.Fatalf("WorkspacePath() = %q, %v; want %q", got, err, want)
+	}
+}

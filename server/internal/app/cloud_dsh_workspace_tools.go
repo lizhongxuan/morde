@@ -1166,7 +1166,7 @@ func (b *CloudDSHToolBroker) verifyHostlessWorkspaceToolHistory(ctx context.Cont
 			}
 			if existing, ok := latestByPath[arguments.Path]; !ok || receipt.PublishedRevision > existing.Revision {
 				latestByPath[arguments.Path] = AgentVerifiedArtifact{
-					Label: path.Base(arguments.Path), Path: arguments.Path, WorkspaceID: current.WorkspaceID,
+					Label: path.Base(arguments.Path), Path: arguments.Path, SourceCallID: SafeTaskValidationCallID(input.CallID), WorkspaceID: current.WorkspaceID,
 					Revision: receipt.PublishedRevision,
 				}
 			}

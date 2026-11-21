@@ -34,6 +34,14 @@ async function upload(file: File, path: string) {
   expect((await response.json() as { success: boolean }).success).toBe(true);
 }
 
+async function filePost(path: string, body: object) {
+  return resolveHandler("POST", path, new Request(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }));
+}
+
 async function listPath(path: string, showHidden = false) {
   const response = await resolveHandler("POST", "/v1/file/list", new Request(`${baseUrl}/v1/file/list`, {
     method: "POST",
@@ -286,6 +294,25 @@ describe("workbench mock file handlers", () => {
     expect(await fileDownload.text()).toBe("new contents");
   });
 
+  it("models AIO mkdir, non-overwriting move, and recursive delete", async () => {
+    const directory = `/home/gem/workspace/mock-aio-mutations-${Date.now()}`;
+    const source = `${directory}/source.txt`;
+    const occupied = `${directory}/occupied.txt`;
+    const renamed = `${directory}/renamed.txt`;
+
+    expect(await (await filePost("/v1/file/mkdir", { path: directory })).json()).toMatchObject({ success: true });
+    await upload(new File(["move me"], "source.txt"), source);
+    await upload(new File(["keep me"], "occupied.txt"), occupied);
+
+    expect(await (await filePost("/v1/file/move", { source, destination: occupied })).json()).toMatchObject({ success: false });
+    expect(await (await filePost("/v1/file/move", { source, destination: renamed })).json()).toMatchObject({ success: true });
+    expect(await (await resolveHandler("GET", "/v1/file/download", new Request(`${baseUrl}/v1/file/download?path=${encodeURIComponent(occupied)}`))).text()).toBe("keep me");
+    expect(await (await resolveHandler("GET", "/v1/file/download", new Request(`${baseUrl}/v1/file/download?path=${encodeURIComponent(renamed)}`))).text()).toBe("move me");
+
+    expect(await (await filePost("/v1/file/delete", { path: directory, recursive: true })).json()).toMatchObject({ success: true });
+    expect((await list(false)).data.files.map((entry) => entry.name)).not.toContain(directory.split("/").at(-1));
+  });
+
   it("returns nonzero for missing rm paths, existing mkdir targets, and missing mkdir parents without creating entries", async () => {
     const missingParent = "/home/gem/workspace/mock-missing-parent-for-mkdir";
     expect(await exec("rm -r -- '/home/gem/workspace/mock-missing-entry'")).toMatchObject({ success: true, data: { exit_code: 1 } });
@@ -295,7 +322,7 @@ describe("workbench mock file handlers", () => {
     expect(await exec("echo 'not implemented'")).toMatchObject({ success: true, data: { exit_code: 127 } });
   });
 
-  it("keeps the UI mkdir, mv, and recursive rm flow working", async () => {
+  it("preserves mock shell mkdir, mv, and recursive rm command behavior", async () => {
     const directory = "/home/gem/workspace/mock-ui-command-flow";
     const source = `${directory}/source.txt`;
     const target = `${directory}/renamed.txt`;

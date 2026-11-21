@@ -8,7 +8,10 @@ import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { AccountRuntime, workspaceWorkingDirectory } from '../src/account-runtime.mjs'
-import { coordinatorCompactionModelCallID, coordinatorModelCallID, ENGINE_VERSION, modelCallID, validMessageDelivery, validStart } from '../src/engine.mjs'
+import {
+  coordinatorCompactionModelCallID, coordinatorModelCallID, ENGINE_VERSION, modelCallID,
+  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, taskValidationReviewModelCallID, validMessageDelivery, validStart,
+} from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
 const start = {
@@ -29,7 +32,8 @@ function launch(onFrame, extraEnv = {}, entrypoint = 'bin.mjs') {
   lines.on('line', line => {
     const frame = JSON.parse(line)
     if (child.responseFences && ['checkpoint', 'checkpoint_read', 'model'].includes(frame.type)) {
-      child.responseFences.set(frame.id, frame.context_role === 'coordinator' ? coordinatorFence(frame) : taskFence(frame))
+      child.responseFences.set(frame.id, frame.context_role === 'coordinator' ? coordinatorFence(frame) :
+        frame.context_role === 'task_validation_review' ? taskValidationReviewFence(frame) : taskFence(frame))
     }
     frames.push(frame)
     onFrame(frame, child)
@@ -87,6 +91,28 @@ function coordinatorFence(frame) {
     .map(key => [key, frame[key]]))
 }
 
+function taskValidationReviewFence(frame) {
+  return Object.fromEntries(TASK_VALIDATION_REVIEW_IDENTITY_FIELDS.map(key => [key, frame[key]]))
+}
+
+function taskValidationReviewStart() {
+  return {
+    type: 'start', version: 1, context_role: 'task_validation_review', owner_id: 'user_123', actor_id: 'actor_123',
+    task_id: 'task_review_123', task_revision: 7, result_event_sequence: 19, result_sha256: '12'.repeat(32),
+    claim_generation: 3, lease_owner: 'review-worker', session_id: 'review_session_1234567890',
+    purpose: 'task_validation_review', model: 'review-model', tools: [],
+    system_prompt: 'Review the task result against the supplied validation evidence. Return only the requested report as text.',
+    prompt: 'Assess whether the task result satisfies the listed checks and cite evidence references.',
+  }
+}
+
+function taskValidationReviewAccountStart(runtimeSequence = 1) {
+  return {
+    ...taskValidationReviewStart(), type: 'task_validation_review_start', server_instance_id: account.server_instance_id,
+    runtime_id: account.runtime_id, runtime_generation: account.runtime_generation, runtime_sequence: runtimeSequence,
+  }
+}
+
 function coordinatorStart(messageID = 'm1234567', runtimeSequence = 1) {
   return {
     type: 'coordinator_start', version: 1, context_role: 'coordinator', conversation_id: 'conversation_123', message_id: messageID,
@@ -106,11 +132,35 @@ function coordinatorProcessAdmission(frame) {
   }
 }
 
+function taskValidationReviewProcessAdmission(frame) {
+  return {
+    type: 'task_validation_review_process_admit', server_instance_id: frame.server_instance_id, owner_id: frame.owner_id,
+    runtime_id: frame.runtime_id, runtime_generation: frame.runtime_generation, runtime_sequence: frame.runtime_sequence,
+    ...taskValidationReviewFence(frame),
+  }
+}
+
+function taskValidationReviewAccountResponse(startFrame, frame) {
+  return {
+    server_instance_id: account.server_instance_id, owner_id: startFrame.owner_id,
+    runtime_id: account.runtime_id, runtime_generation: account.runtime_generation,
+    runtime_sequence: startFrame.runtime_sequence,
+    ...taskValidationReviewFence(startFrame), ...frame,
+  }
+}
+
 function launchCoordinatorAccount(onFrame) {
   return launch((frame, proc) => {
     onFrame(frame, proc)
     if (frame.type === 'coordinator_process_ready') send(proc, coordinatorProcessAdmission(frame))
     if (frame.type === 'task_process_ready') send(proc, taskProcessAdmission(frame))
+  }, {}, 'bin-account.mjs')
+}
+
+function launchTaskValidationReviewAccount(onFrame) {
+  return launch((frame, proc) => {
+    onFrame(frame, proc)
+    if (frame.type === 'task_validation_review_process_ready') send(proc, taskValidationReviewProcessAdmission(frame))
   }, {}, 'bin-account.mjs')
 }
 
@@ -152,6 +202,19 @@ function replyCoordinatorWithText(proc, frame, text) {
   ]
   chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', ...coordinatorFence(frame), id: frame.id, index, chunk }))
   send(proc, { type: 'model_end', ...coordinatorFence(frame), id: frame.id, ok: true })
+}
+
+function replyTaskValidationReviewWithText(proc, startFrame, frame, text) {
+  const chunks = [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
+    { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  chunks.forEach((chunk, index) => send(proc, taskValidationReviewAccountResponse(startFrame,
+    { type: 'model_chunk', id: frame.id, index, chunk })))
+  send(proc, taskValidationReviewAccountResponse(startFrame, { type: 'model_end', id: frame.id, ok: true }))
 }
 
 function testJpeg(width = 3, height = 2) {
@@ -236,6 +299,213 @@ test('coordinator model ID has a stable cross-language test vector', () => {
   assert.equal(coordinatorModelCallID('conversation_123', 'm1234567', 'session_coord', 7),
     'mdl_c7855d4cc4fc2b54a9fed295b0f0fc27754995f60151893aa5ad949a14136ed1')
   assert.throws(() => coordinatorModelCallID('conversation_123', 'm1234567', 'session_coord', -1))
+})
+
+test('Task validation review model ID matches the server seed and field order', () => {
+  assert.equal(taskValidationReviewModelCallID('user_123', 'task_review_123', 7, 19, '12'.repeat(32), 3,
+    'review_session_1234567890', 7), 'review_e329114dfc3ea49fcead89a45650fc167e11a577003d391e7c4ba80de6803bc1')
+  assert.throws(() => taskValidationReviewModelCallID('user_123', 'task_review_123', 7, 19, 'A'.repeat(64), 3,
+    'review_session_1234567890', 7))
+})
+
+test('Task validation review start is a strict zero-tool root session', () => {
+  const valid = taskValidationReviewStart()
+  assert.equal(validStart(valid), true)
+  assert.equal(validStart({ ...valid, tools: [{ name: 'shell' }] }), false)
+  assert.equal(validStart({ ...valid, task_id: 'task_changed' }), true)
+  assert.equal(validStart({ ...valid, task_revision: -1 }), false)
+  assert.equal(validStart({ ...valid, result_sha256: 'AB'.repeat(32) }), false)
+  assert.equal(validStart({ ...valid, claim_generation: 0 }), false)
+  assert.equal(validStart({ ...valid, lease_owner: ' review-worker' }), false)
+  assert.equal(validStart({ ...valid, purpose: 'coordinator' }), false)
+  assert.equal(validStart({ ...valid, unexpected: true }), false)
+})
+
+test('accepts a fresh root Task validation review with only final text', async t => {
+  const startFrame = taskValidationReviewAccountStart()
+  const fence = taskValidationReviewFence(startFrame)
+  let through = -1
+  let modelCalls = 0
+  let terminal
+  const { child, frames } = launchTaskValidationReviewAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'task_validation_review_process_ready') {
+      assert.deepEqual(taskValidationReviewFence(frame), fence)
+    }
+    if (frame.type === 'task_validation_review_started') assert.deepEqual(taskValidationReviewFence(frame), fence)
+    if (frame.type === 'checkpoint') {
+      assert.deepEqual(taskValidationReviewFence(frame), fence)
+      assert.equal(frame.from_seq, through + 1)
+      through = frame.through_seq
+      send(proc, taskValidationReviewAccountResponse(startFrame,
+        { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: through, sha256: frame.sha256 }))
+    }
+    if (frame.type === 'model') {
+      modelCalls += 1
+      assert.deepEqual(taskValidationReviewFence(frame), fence)
+      assert.equal(frame.request.model, startFrame.model)
+      assert.equal(frame.id, taskValidationReviewModelCallID(fence.owner_id, fence.task_id, fence.task_revision,
+        fence.result_event_sequence, fence.result_sha256, fence.claim_generation, fence.session_id, frame.through_seq))
+      assert.deepEqual(frame.request.tools, [])
+      assert.ok(frame.request.messages.some(message => message.role === 'user' && message.content.some(block => block.text === startFrame.prompt)))
+      const system = frame.request.messages.filter(message => message.role === 'system')
+      assert.equal(system.length, 1)
+      assert.ok(system[0].content.some(block => block.text?.includes(startFrame.system_prompt)))
+      replyTaskValidationReviewWithText(proc, startFrame, frame, '{"recommendation":"passed"}')
+    }
+    if (frame.type === 'task_validation_review_settled') {
+      terminal = frame
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 1, `frames: ${frames.map(frame => frame.type + (frame.code ? `:${frame.code}:${frame.reason ?? ''}` : '')).join(', ')}`)
+  assert.equal(terminal?.state, 'completed')
+  assert.equal(terminal?.result, '{"recommendation":"passed"}')
+  assert.equal(terminal?.through_seq, through)
+  assert.deepEqual(taskValidationReviewFence(terminal), fence)
+  assert.equal(frames.some(frame => frame.type === 'agent_status'), false)
+})
+
+test('rejects Task validation review responses from a stale Account Runtime sequence', async t => {
+  const startFrame = taskValidationReviewAccountStart()
+  let protocolError
+  let checkpoint
+  let modelCalls = 0
+  let terminal
+  const { child, frames } = launchTaskValidationReviewAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') {
+      checkpoint = frame
+      const response = taskValidationReviewAccountResponse(startFrame,
+        { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+      response.runtime_sequence += 1
+      send(proc, response)
+    }
+    if (frame.type === 'model') {
+      modelCalls += 1
+      replyTaskValidationReviewWithText(proc, startFrame, frame, '{"recommendation":"passed"}')
+    }
+    if (frame.type === 'protocol_error') {
+      protocolError = frame.code
+      send(proc, taskValidationReviewAccountResponse(startFrame,
+        { type: 'checkpoint_ack', id: checkpoint.id, ok: true, through_seq: checkpoint.through_seq, sha256: checkpoint.sha256 }))
+    }
+    if (frame.type === 'task_validation_review_settled') {
+      terminal = frame
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(protocolError, 'invalid_task_validation_review_frame')
+  assert.equal(modelCalls, 1)
+  assert.equal(terminal?.state, 'completed')
+})
+
+test('cancels a root Task validation review through its exact lease fence', async t => {
+  const startFrame = taskValidationReviewAccountStart()
+  const fence = taskValidationReviewFence(startFrame)
+  const errors = []
+  let terminal
+  const { child, frames } = launchTaskValidationReviewAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true,
+      through_seq: frame.through_seq, sha256: frame.sha256 })
+    if (frame.type === 'model') send(proc, { type: 'task_validation_review_cancel', ...fence })
+    if (frame.type === 'task_validation_review_terminated') {
+      terminal = frame
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'protocol_error') {
+      errors.push(frame.code)
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.deepEqual(errors, [])
+  assert.equal(terminal?.state, 'cancelled')
+  assert.equal(terminal?.reason, 'cancelled')
+  assert.deepEqual(taskValidationReviewFence(terminal), fence)
+  assert.ok(frames.some(frame => frame.type === 'model_cancel' && frame.context_role === 'task_validation_review'))
+})
+
+test('rejects any tool activity from a Task validation review model', async () => {
+  const startFrame = taskValidationReviewStart()
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true,
+      through_seq: frame.through_seq, sha256: frame.sha256 })
+    if (frame.type === 'model') send(proc, { type: 'model_chunk', ...taskValidationReviewFence(frame), id: frame.id, index: 0,
+      chunk: { type: 'tool-call-delta', index: 0, id: 'review_tool_call', name: 'shell', argumentsDelta: '{}' } })
+  })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 1)
+  assert.ok(frames.some(frame => frame.type === 'model_cancel'))
+  assert.equal(frames.some(frame => frame.type === 'task_validation_review_settled'), false)
+  assert.ok(frames.some(frame => frame.type === 'failed'))
+})
+
+for (const [field, changed] of [['task_id', 'task_changed'], ['task_revision', 8], ['claim_generation', 4]]) {
+  test(`Task validation review model response rejects changed ${field}`, async () => {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const ipc = new WorkerIPC(input, output)
+    const startFrame = taskValidationReviewStart()
+    const identity = taskValidationReviewFence(startFrame)
+    input.write(`${JSON.stringify(startFrame)}\n`)
+    await ipc.start.promise
+    const id = taskValidationReviewModelCallID(identity.owner_id, identity.task_id, identity.task_revision,
+      identity.result_event_sequence, identity.result_sha256, identity.claim_generation, identity.session_id, 0)
+    const stream = ipc.streamModel(identity, id, 0, { messages: [], tools: [] })
+    const next = stream.next()
+    const rejected = assert.rejects(next, /request cancelled/)
+    const [requestBytes] = await once(output, 'data')
+    assert.equal(JSON.parse(requestBytes.toString()).id, id)
+    input.write(`${JSON.stringify({ type: 'model_chunk', ...identity, [field]: changed, id, index: 0,
+      chunk: { type: 'text-delta', text: 'wrong identity' } })}\n`)
+    await rejected
+    assert.equal(ipc.failed, true)
+    input.destroy()
+    output.destroy()
+  })
+}
+
+test('Task validation review model response rejects an extra frame field', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const startFrame = taskValidationReviewStart()
+  const identity = taskValidationReviewFence(startFrame)
+  input.write(`${JSON.stringify(startFrame)}\n`)
+  await ipc.start.promise
+  const id = taskValidationReviewModelCallID(identity.owner_id, identity.task_id, identity.task_revision,
+    identity.result_event_sequence, identity.result_sha256, identity.claim_generation, identity.session_id, 0)
+  const stream = ipc.streamModel(identity, id, 0, { messages: [], tools: [] })
+  const next = stream.next()
+  const rejected = assert.rejects(next, /request cancelled/)
+  await once(output, 'data')
+  input.write(`${JSON.stringify({ type: 'model_chunk', ...identity, id, index: 0, unexpected: true,
+    chunk: { type: 'text-delta', text: 'unexpected frame field' } })}\n`)
+  await rejected
+  assert.equal(ipc.failed, true)
+  input.destroy()
+  output.destroy()
 })
 
 test('coordinator checkpoint acknowledgements require the complete actor fence', async () => {
@@ -1303,6 +1573,141 @@ test('rejects an expired or mismatched step retry before IPC dispatch', async ()
   assert.equal(mismatched.modelCalls, 0)
 })
 
+test('runs a zero-tool child session without dispatching application tools', async () => {
+  const childIdentity = {
+    task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+    generation: start.generation, authorization_version: start.authorization_version,
+    session_id: 'child_review_readonly',
+  }
+  const throughBySession = new Map([[start.session_id, -1], [childIdentity.session_id, -1]])
+  let parentModels = 0
+  let childSettled = false
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool] })
+    if (frame.type === 'checkpoint') {
+      const through = throughBySession.get(frame.session_id) ?? -1
+      assert.equal(frame.from_seq, through + 1, `independent checkpoint sequence for ${frame.session_id}`)
+      throughBySession.set(frame.session_id, frame.through_seq)
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      parentModels += 1
+      assert.deepEqual(frame.request.tools, [delegateTool])
+      if (parentModels === 1) {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: 'call_readonly_review', name: delegateTool.name,
+            argumentsDelta: JSON.stringify({ title: 'Review result', objective: 'Check the supplied result evidence.', tool_names: [] }) },
+          { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+        return
+      }
+      assert.equal(childSettled, true, 'parent must wait for the read-only child to settle')
+      const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_readonly_review')
+      assert.equal(result?.content[0].text, 'The result is supported by the supplied evidence.')
+      replyWithText(proc, frame, 'Review complete.')
+      return
+    }
+    if (frame.type === 'model' && frame.session_id === childIdentity.session_id) {
+      assert.deepEqual(frame.request.tools, [], 'read-only reviewer receives no application tools')
+      assert.ok(frame.request.messages.some(message => message.role === 'user' &&
+        message.content.some(block => block.text.includes('Check the supplied result evidence.'))))
+      replyWithText(proc, frame, 'The result is supported by the supplied evidence.')
+      return
+    }
+    if (frame.type === 'child_create') {
+      assert.equal(frame.call_id, 'call_readonly_review')
+      assert.deepEqual(frame.arguments.tool_names, [])
+      send(proc, { type: 'child_session', call_id: frame.call_id, ...childIdentity,
+        parent_session_id: frame.session_id, objective: frame.arguments.objective, tools: [],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'tool_call') assert.fail('zero-tool child must not dispatch application tools')
+    if (frame.type === 'child_settle') {
+      assert.equal(frame.session_id, childIdentity.session_id)
+      assert.equal(frame.call_id, 'call_readonly_review')
+      assert.equal(frame.status, 'succeeded')
+      assert.equal(frame.summary, 'The result is supported by the supplied evidence.')
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      childSettled = true
+    }
+  })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(parentModels, 2)
+  assert.equal(frames.filter(frame => frame.type === 'child_create').length, 1)
+  assert.equal(frames.filter(frame => frame.type === 'child_settle').length, 1)
+  assert.equal(frames.filter(frame => frame.type === 'tool_call').length, 0)
+  assert.equal(frames.filter(frame => frame.type === 'settled').at(-1)?.state, 'completed_candidate')
+})
+
+test('rejects a tool call attempted by a zero-tool child session', async () => {
+  const childIdentity = {
+    task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+    generation: start.generation, authorization_version: start.authorization_version,
+    session_id: 'child_review_denied',
+  }
+  const throughBySession = new Map([[start.session_id, -1], [childIdentity.session_id, -1]])
+  let parentModels = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool] })
+    if (frame.type === 'checkpoint') {
+      const through = throughBySession.get(frame.session_id) ?? -1
+      assert.equal(frame.from_seq, through + 1)
+      throughBySession.set(frame.session_id, frame.through_seq)
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      parentModels += 1
+      if (parentModels === 1) {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: 'call_review_denied', name: delegateTool.name,
+            argumentsDelta: JSON.stringify({ title: 'Review result', objective: 'Check the supplied result evidence.', tool_names: [] }) },
+          { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      } else {
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_review_denied')
+        assert.ok(result?.content[0].text.includes('Child agent did not complete successfully.'))
+        replyWithText(proc, frame, 'Review unavailable.')
+        return
+      }
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+      return
+    }
+    if (frame.type === 'model' && frame.session_id === childIdentity.session_id) {
+      assert.deepEqual(frame.request.tools, [])
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id: 'call_forbidden_file_read', name: 'file_read', argumentsDelta: '{"path":"secret.txt"}' },
+        { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+      return
+    }
+    if (frame.type === 'child_create') {
+      send(proc, { type: 'child_session', call_id: frame.call_id, ...childIdentity,
+        parent_session_id: frame.session_id, objective: frame.arguments.objective, tools: [],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'tool_call') assert.fail('zero-tool child must not dispatch an application tool')
+    if (frame.type === 'child_settle') {
+      assert.equal(frame.status, 'failed')
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+  })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(parentModels, 2)
+  assert.equal(frames.filter(frame => frame.type === 'tool_call').length, 0)
+  assert.equal(frames.find(frame => frame.type === 'child_settle')?.status, 'failed')
+  assert.equal(frames.filter(frame => frame.type === 'settled').at(-1)?.state, 'completed_candidate')
+})
+
 test('runs dsh_delegate in an isolated child session and waits for settlement before resuming the parent', async () => {
   const fileRead = fileReadTool
   const delegate = delegateTool
@@ -1345,7 +1750,8 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
         } else {
           assert.equal(childSettled, true, 'parent must not resume before Go acknowledges child settlement')
           const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_delegate_1')
-          assert.equal(result?.content[0].text, 'Notes say hello.')
+          assert.equal(result?.content[0].text,
+            '{"summary":"Notes say hello.","action_refs":[{"call_id":"dsh_123","tool":"file_read"}]}')
           const chunks = [
             { type: 'block-start', index: 0, blockType: 'text' },
             { type: 'text-delta', index: 0, text: 'Task complete.' },
@@ -1411,7 +1817,8 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
       assert.equal(frame.summary, 'Notes say hello.')
       assert.ok(frame.through_seq >= 0)
       assert.equal(frame.sha256, pagesBySession.get(childIdentity.session_id).at(-1).sha256)
-      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true,
+        output: '{"summary":"Notes say hello.","action_refs":[{"call_id":"dsh_123","tool":"file_read"}]}' })
       childSettled = true
     }
   })
@@ -3505,6 +3912,48 @@ test('coordinator handles the next message while an independent Task keeps runni
     assert.equal(result?.result, `route ${coordinator.message_id}`)
     assert.equal(Object.hasOwn(result ?? {}, 'task_id'), false)
   }
+  assert.deepEqual(frames.filter(frame => frame.type === 'protocol_error'), [])
+})
+
+test('account runtime classifies independent conversation messages concurrently', async t => {
+  const starts = [
+    coordinatorStart('m1111111', 1),
+    coordinatorStart('m2222222', 2),
+    coordinatorStart('m3333333', 3),
+    coordinatorStart('m4444444', 4),
+  ].map((start, index) => ({
+    ...start,
+    agent_id: `agent_coord_${index}`,
+    session_id: `session_coord_${index}`,
+  }))
+  const models = new Map()
+  const settled = new Map()
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') starts.forEach(start => send(proc, start))
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model' && frame.context_role === 'coordinator') {
+      models.set(frame.message_id, frame)
+      if (models.size === starts.length) {
+        for (const [messageID, model] of models) replyCoordinatorWithText(proc, model, `route ${messageID}`)
+      }
+    }
+    if (frame.type === 'coordinator_settled') {
+      settled.set(frame.message_id, frame.result)
+      if (settled.size === starts.length) send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.deepEqual([...models.keys()].sort(), starts.map(start => start.message_id).sort())
+  assert.deepEqual([...settled.entries()].sort(), starts.map(start => [start.message_id, `route ${start.message_id}`]).sort())
   assert.deepEqual(frames.filter(frame => frame.type === 'protocol_error'), [])
 })
 

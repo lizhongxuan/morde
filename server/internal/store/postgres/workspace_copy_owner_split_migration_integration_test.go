@@ -24,6 +24,17 @@ func TestWorkspaceCopyOwnerSplitMigrationPreservesLegacyTransferredCopy(t *testi
 	if _, err := provider.DownTo(ctx, 161); err != nil {
 		t.Fatalf("roll back empty Workspace copy owner-split migration: %v", err)
 	}
+	// The migration fixture rewinds before this table's migration, but current
+	// Store mutation guards still query it while preparing legacy Workspace data.
+	if _, err := pool.Exec(ctx, `CREATE TABLE agent_workspace_history (
+workspace_id text PRIMARY KEY,
+owner_id text NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+CONSTRAINT agent_workspace_history_workspace_owner_fk FOREIGN KEY (workspace_id, owner_id)
+  REFERENCES workspaces(id, owner_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+)`); err != nil {
+		t.Fatalf("prepare current Agent Workspace guard for historical schema fixture: %v", err)
+	}
 
 	source := createTransferReadyWorkspace(t, ctx, store, sourceOwner.ID, "legacy share source")
 	legacyTarget := createTransferReadyWorkspace(t, ctx, store, sourceOwner.ID, "legacy shared copy")

@@ -39,7 +39,13 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
-	value := createTestWorkspace(t, ctx, store, owner.ID, "http-sync-e2e")
+	value, _, err := store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, owner.ID))
+	if err != nil {
+		t.Fatalf("create stable Agent Workspace: %v", err)
+	}
+	if err := store.MarkAgentWorkspaceDirectoryInitialized(ctx, owner.ID, value.ID); err != nil {
+		t.Fatalf("mark Agent Workspace directory initialized: %v", err)
+	}
 	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "blocks"))
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +336,13 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	if latest, err := store.GetWorkspace(ctx, value.ID); err != nil || latest.Revision != returnedRevision {
 		t.Fatalf("handoff final workspace revision = %d, %v", latest.Revision, err)
 	}
-	projectHost := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, value.ID)
+	projectWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "http-e2e-project-upload")
+	projectHost := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, projectWorkspace.ID)
+	var projectWorkspaceFolderCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_folders WHERE workspace_id=$1`, projectWorkspace.ID).Scan(&projectWorkspaceFolderCount); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("project Workspace %s has %d sync folders before project registration", projectWorkspace.ID, projectWorkspaceFolderCount)
 	projectFolders, err := app.NewWorkspaceSyncDeviceService(store, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +356,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	projectContent := []byte("synthetic project upload through the local Portal API\n")
 	writeWorkspaceSyncE2EFile(t, projectSource, "nested/readme.md", projectContent)
 	projectUpload, err := syncClient.Sync(ctx, client.SyncOptions{
-		WorkspaceID: value.ID, FolderID: projectFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abd",
+		WorkspaceID: projectWorkspace.ID, FolderID: projectFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abd",
 		Directory: projectSource, Direction: "upload", Policy: "compare_merge", BaseRevision: &zeroRevision, Scope: []string{},
 	})
 	if err != nil || projectUpload.Session.State != "completed" {
@@ -352,34 +364,34 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	}
 	projectDigest := sha256.Sum256(projectContent)
 	projectSHA256 := hex.EncodeToString(projectDigest[:])
-	projectManifest, err := store.GetWorkspaceManifestPage(ctx, value.ID, projectUpload.Session.TargetRevision, "project/demo", "", 100)
+	projectManifest, err := store.GetWorkspaceManifestPage(ctx, projectWorkspace.ID, projectUpload.Session.TargetRevision, "project/demo", "", 100)
 	if err != nil || len(projectManifest.Files) != 1 || projectManifest.Files[0].Path != "project/demo/nested/readme.md" ||
 		projectManifest.Files[0].SHA256 != projectSHA256 || projectManifest.Files[0].SizeBytes != int64(len(projectContent)) {
 		t.Fatalf("uploaded project manifest = %#v, %v", projectManifest.Files, err)
 	}
-	if err := blocks.VerifyBlock(value.ID, projectSHA256, int64(len(projectContent))); err != nil {
+	if err := blocks.VerifyBlock(projectWorkspace.ID, projectSHA256, int64(len(projectContent))); err != nil {
 		t.Fatalf("verify uploaded project bytes in local block store: %v", err)
 	}
 	if localContent, err := os.ReadFile(filepath.Join(projectSource, "nested/readme.md")); err != nil || !bytes.Equal(localContent, projectContent) {
 		t.Fatalf("project source changed during upload: %q, %v", localContent, err)
 	}
 	confirmWorkspaceProjectApplicationForTest(t, store, workspace.SyncSession{
-		ID: projectUpload.Session.ID, WorkspaceID: value.ID, OwnerID: owner.ID,
+		ID: projectUpload.Session.ID, WorkspaceID: projectWorkspace.ID, OwnerID: owner.ID,
 		SourceBindingID: "12345678-1234-4234-8234-123456789abd",
 	}, projectUpload.Session.TargetRevision, "applied")
 	cloudOnly := workspace.File{
 		Path: "project/demo/cloud-only.txt", Kind: workspace.FileKindRegular, SizeBytes: 0,
 		SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Mode: 0o644, Chunks: []workspace.Chunk{},
 	}
-	applySyntheticProjectMutationForTest(t, store, value.ID, cloudOnly.Path, &cloudOnly, nil)
+	applySyntheticProjectMutationForTest(t, store, projectWorkspace.ID, cloudOnly.Path, &cloudOnly, nil)
 	projectUpload, err = syncClient.Sync(ctx, client.SyncOptions{
-		WorkspaceID: value.ID, FolderID: projectFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abd",
+		WorkspaceID: projectWorkspace.ID, FolderID: projectFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abd",
 		Directory: projectSource, Direction: "upload", Policy: "compare_merge", BaseRevision: &zeroRevision, Scope: []string{},
 	})
 	if err != nil || projectUpload.Session.State != "completed" {
 		t.Fatalf("second one-way project upload through Portal API = %#v, %v", projectUpload.Session, err)
 	}
-	projectManifest, err = store.GetWorkspaceManifestPage(ctx, value.ID, projectUpload.Session.TargetRevision, "project/demo", "", 100)
+	projectManifest, err = store.GetWorkspaceManifestPage(ctx, projectWorkspace.ID, projectUpload.Session.TargetRevision, "project/demo", "", 100)
 	if err != nil || len(projectManifest.Files) != 2 {
 		t.Fatalf("second project manifest did not preserve independent cloud file: %#v, %v", projectManifest.Files, err)
 	}

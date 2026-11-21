@@ -173,16 +173,21 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 	}
 	runtime, err := c.runtimes.Acquire(ctx, claim.Message.OwnerID, claim.Message.ConversationID)
 	if err != nil {
-		if isOwnerExecutionDisabled(err) {
+		var startup interface{ RuntimeStartupStage() string }
+		if isOwnerExecutionDisabled(err) || errors.As(err, &startup) {
 			if fallback, ok := c.options.Models.(cloudDSHCoordinatorRouteFallback); ok {
-				// Plain replies need no account execution permission and have no tools.
+				// The fallback has no tools; task actions remain blocked below.
 				decision, fallbackErr := fallback.ClassifyConversationRoute(ctx, claim, value)
 				if fallbackErr != nil {
 					return app.ConversationRouteDecision{}, fallbackErr
 				}
 				if decision.Action != app.ConversationRouteReply && decision.Action != app.ConversationRouteClarify {
+					question := "当前账号的云端执行权限尚未启用，暂时不能启动任务或使用工具。请联系管理员启用后重试。"
+					if startup != nil && !isOwnerExecutionDisabled(err) {
+						question = "当前账号的云端执行服务暂时不可用，暂时不能启动任务或使用工具。请稍后重试。"
+					}
 					return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-						Question:    "当前账号的云端执行权限尚未启用，暂时不能启动任务或使用工具。请联系管理员启用后重试。",
+						Question:    question,
 						ModelOutput: decision.ModelOutput}, nil
 				}
 				return decision, nil

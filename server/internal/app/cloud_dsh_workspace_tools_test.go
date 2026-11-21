@@ -114,7 +114,7 @@ func (d cloudDSHLiveWorkspaceDirectory) WriteRegularFile(ctx context.Context, ow
 		return err
 	}
 	name := temporary.Name()
-	defer os.Remove(name)
+	defer func() { _ = os.Remove(name) }()
 	if _, err := temporary.Write(content); err != nil {
 		_ = temporary.Close()
 		return err
@@ -409,6 +409,55 @@ func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T)
 	unknownWorkspace := `{"expected_revision":0,"path":"notes/readme.txt","workspace_id":"w7654321"}`
 	if _, err := tools.execute(context.Background(), current, ModelToolCall{CallID: "cross-workspace", Name: cloudDSHWorkspaceReadToolName, Arguments: unknownWorkspace}, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("caller supplied workspace ID error = %v; want invalid argument", err)
+	}
+}
+
+func TestCloudDSHWorkspaceReadDoesNotPersistContentForExternalReview(t *testing.T) {
+	const content = "A private Workspace source passage."
+	file := syncServiceFile("docs/readme.md", []byte(content))
+	tools, _, blocks, current := newCloudDSHT08WorkspaceTools(t, []workspace.File{file}, nil, nil)
+	blocks.data[file.SHA256] = []byte(content)
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-workspace", 1, "session-root"
+	current.CurrentRevision = int64PointerForWorkspaceTools(0)
+	current.Authorization.Version = 1
+	fixture.store.details.Task = current
+	fixture.executor.workspaces = tools.workspaces
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := NewSealer(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "workspace-read-evidence", Name: cloudDSHWorkspaceReadToolName,
+		Arguments: `{"expected_revision":0,"path":"docs/readme.md"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	result, err := broker.executeWorkspaceTool(ctx, current, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded || len(store.toolCalls) < 2 {
+		t.Fatalf("Workspace tool result = %+v; tool progress = %d; err=%v", result, len(store.toolCalls), err)
+	}
+	progress := store.toolCalls[len(store.toolCalls)-1]
+	if progress.ToolName != cloudDSHWorkspaceReadToolName || progress.DetailState != "available" || len(progress.ContentEvidenceSHA256) != 0 {
+		t.Fatalf("Workspace read progress = %+v; file content must not be persisted for external review", progress)
+	}
+	plain, err := sealer.OpenWithAAD(progress.DetailCiphertext,
+		taskStepDetailAAD(current.OwnerID, current.ID, store.details.Steps[len(store.details.Steps)-1].ID, progress.TaskRevision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.ContentEvidence != nil || bytes.Contains(plain, []byte(content)) {
+		t.Fatalf("encrypted Workspace detail included file bytes for external review: %+v, err=%v", detail.ContentEvidence, err)
 	}
 }
 

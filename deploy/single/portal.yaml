@@ -58,13 +58,21 @@ storage:
   docker_host: ${CH_DOCKER_HOST}
   docker_data_dir: ${CH_DOCKER_DATA_DIR}
   min_free_bytes: ${CH_DOCKER_MIN_FREE_BYTES}
-# Enable only after installing the independent dsh Guardian and isolated Docker daemon.
 cloud_dsh:
-  enabled: false
+  enabled: true
+  max_concurrent_routes: 16
   max_concurrent_tasks: 4
-  max_concurrent_tasks_per_owner: 2
+  max_concurrent_tasks_per_owner: 4
+  docker_host: unix:///run/morde-dsh-docker/docker.sock
+  image: ${CH_CLOUD_DSH_IMAGE}
+  node_path: /usr/local/bin/node
+  script_path: /opt/morde-cloud-runtime/bin.mjs
+  supervisor_id: morde-portal
+  supervisor_key_file: /etc/morde/dsh-supervisor.key
+  guardian_socket: /run/morde/dsh-guardian.sock
+  guardian_public_key_file: /etc/morde/dsh-guardian/attestation.pub
   builtin_search:
-    enabled: false
+    enabled: true
     node_path: /usr/bin/node
     script_path: ${CH_BUILTIN_SEARCH_SCRIPT}
     searxng_url: http://127.0.0.1:8189
@@ -74,14 +82,13 @@ workspace_storage:
   max_workspace_bytes: ${CH_WORKSPACE_MAX_BYTES}
   max_owner_bytes: ${CH_WORKSPACE_OWNER_MAX_BYTES}
   min_free_bytes: ${CH_WORKSPACE_MIN_FREE_BYTES}
-# Enable Syncthing only after current-files, admission, relay, and revocation barriers are verified.
-# Project upload is independently gated and also remains closed until its real end-to-end acceptance.
-# The live directory source remains closed until legacy data is audited and cut over.
+# Cloud DSH, search, Workspace sync, project upload, and live Host Workspace features default on.
+# Portal startup fails closed when the required runtime, guardian, pinned images, or isolated storage are missing.
 workspace_sync_node:
-  enabled: false
-  project_upload_enabled: false
-  agent_workspace_live_directory_source_enabled: false
-  agent_workspace_host_mount_enabled: false
+  enabled: true
+  project_upload_enabled: true
+  agent_workspace_live_directory_source_enabled: true
+  agent_workspace_host_mount_enabled: true
   data_root: ${CH_WORKSPACE_SYNC_DATA_ROOT_DIR}
   image_digest: ${CH_WORKSPACE_SYNC_NODE_IMAGE_ID}
   relay_image_digest: ${CH_WORKSPACE_SYNC_RELAY_IMAGE_ID}

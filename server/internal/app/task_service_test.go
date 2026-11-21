@@ -1167,6 +1167,38 @@ func TestTaskServiceGetExpiresOnlyTheAuthorizedPendingRequestAndReloads(t *testi
 	}
 }
 
+func TestTaskValidationReviewSnapshotHidesRevokedWorkspaceEvidence(t *testing.T) {
+	const ownerID, actorID, taskID, conversationID, workspaceID = "u7654321", "u1234567", "q1234567", "c1234567", "w1234567"
+	const result = "workspace output"
+	revision, desiredRevision := int64(3), int64(3)
+	digest := sha256.Sum256([]byte(result))
+	step := task.Step{ID: "s1234567", TaskID: taskID, Sequence: 2, Kind: "tool", Status: task.StepSucceeded,
+		Title: "Read private file", Summary: "PRIVATE WORKSPACE SUMMARY", ToolName: "morde_workspace_read",
+		TaskRevision: &revision, DetailState: "available"}
+	artifact := task.Artifact{ID: "a1234567", TaskID: taskID, StepID: step.ID, Label: "private.txt", Path: "private.txt"}
+	evidence := &TaskValidationEvidenceRecord{TaskRevision: revision, EventSequence: 9, ResultSHA256: hex.EncodeToString(digest[:]),
+		Claims: []TaskValidationEvidenceClaimRecord{{ID: "c1", StartByte: 0, EndByte: int32(len(result)), EvidenceRefs: []TaskValidationEvidenceRefRecord{
+			{Kind: TaskValidationEvidenceAction, ID: step.ID, TaskRevision: revision, Sequence: step.Sequence},
+			{Kind: TaskValidationEvidenceSideEffect, ID: artifact.ID, TaskRevision: revision, Sequence: 4},
+		}}}}
+	details := TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID, InitiatorID: actorID, ConversationID: conversationID,
+		WorkspaceID: workspaceID, WorkspaceOwnerID: ownerID, Status: task.StatusCompleted, CurrentRevision: &revision,
+		DesiredRevision: &desiredRevision, Objective: "Read a file", Result: result}, Steps: []task.Step{step}, Artifacts: []task.Artifact{artifact},
+		ValidationEvidence: evidence}
+	store := &taskWorkspaceStoreStub{taskStoreStub: &taskStoreStub{details: details}, value: workspace.Workspace{ID: workspaceID,
+		OwnerID: ownerID, State: workspace.StateReady}}
+	authorizer := &taskAuthorizerStub{}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
+	claim := TaskValidationReviewClaim{OwnerID: ownerID, InitiatorID: actorID, ConversationID: conversationID, TaskID: taskID,
+		TaskRevision: revision, ResultEventSequence: 9, ResultSHA256: digest[:], ClaimGeneration: 1, LeaseOwner: "review-worker"}
+
+	snapshot, err := service.GetTaskValidationReviewSnapshot(context.Background(), claim)
+	if err != nil || snapshot.ValidationEvidence != nil || len(snapshot.Artifacts) != 0 || snapshot.Steps[0].DetailState != "restricted" ||
+		strings.Contains(snapshot.Steps[0].Summary, "PRIVATE") {
+		t.Fatalf("review snapshot exposed revoked Workspace data: %+v, %v", snapshot, err)
+	}
+}
+
 func TestTaskServiceRetryBatchItemRequiresControlScopeAndUsesStableIdempotency(t *testing.T) {
 	store := &taskStoreStub{details: TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}}}
 	authorizer := &taskAuthorizerStub{}

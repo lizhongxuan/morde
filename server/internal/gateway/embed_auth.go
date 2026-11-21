@@ -311,7 +311,7 @@ func embedRequestPermission(request *http.Request, claims embedClaims) (host.Per
 		return embedGrantPermission(claims, app.HostEmbedTargetWorkspace)
 	}
 	if requestPath == "/vnc" || strings.HasPrefix(requestPath, "/vnc/") {
-		if request.Method != http.MethodGet && request.Method != http.MethodHead || request.URL.RawQuery != "" {
+		if request.Method != http.MethodGet && request.Method != http.MethodHead || !validEmbedVNCRequest(request) {
 			return "", false
 		}
 		return embedBrowserPermission(claims, false)
@@ -373,7 +373,8 @@ func embedRequestPermission(request *http.Request, claims embedClaims) (host.Per
 	if strings.HasPrefix(requestPath, "/v1/file/") {
 		valid := request.Method == http.MethodPost && request.URL.RawQuery == ""
 		switch requestPath {
-		case "/v1/file/list", "/v1/file/read", "/v1/file/write", "/v1/file/upload":
+		case "/v1/file/list", "/v1/file/read", "/v1/file/write", "/v1/file/upload",
+			"/v1/file/mkdir", "/v1/file/move", "/v1/file/delete":
 		case "/v1/file/download":
 			valid = request.Method == http.MethodGet && validFileDownloadQuery(request)
 		default:
@@ -384,15 +385,43 @@ func embedRequestPermission(request *http.Request, claims embedClaims) (host.Per
 		}
 		return embedGrantPermission(claims, app.HostEmbedTargetFiles)
 	}
-	if strings.HasPrefix(requestPath, "/code-server/") || strings.HasPrefix(requestPath, "/cdp/devtools/") {
+	if strings.HasPrefix(requestPath, "/code-server/") {
+		upgradeAttempt := request.Header.Get("Upgrade") != "" || hasHeaderToken(request.Header.Get("Connection"), "upgrade")
+		if upgradeAttempt && (request.Method != http.MethodGet || !websocketRequest(request)) {
+			return "", false
+		}
+		switch request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		default:
+			return "", false
+		}
+		permission, ok := embedGrantPermission(claims, app.HostEmbedTargetVSCode)
+		return permission, ok
+	}
+	if strings.HasPrefix(requestPath, "/cdp/devtools/") {
 		if request.Method != http.MethodGet && request.Method != http.MethodHead ||
-			request.Method == http.MethodGet && request.Header.Get("Upgrade") != "" && !websocketRequest(request) {
+			(request.Header.Get("Upgrade") != "" || hasHeaderToken(request.Header.Get("Connection"), "upgrade")) && !websocketRequest(request) {
 			return "", false
 		}
 		permission, ok := embedGrantPermission(claims, app.HostEmbedTargetVSCode)
 		return permission, ok && request.Method == http.MethodGet
 	}
 	return "", false
+}
+
+func validEmbedVNCRequest(request *http.Request) bool {
+	if request.URL.RawQuery == "" {
+		return true
+	}
+	if request.URL.Path != "/vnc/index.html" {
+		return false
+	}
+	query, err := url.ParseQuery(request.URL.RawQuery)
+	return err == nil && len(query) == 4 &&
+		len(query["autoconnect"]) == 1 && query.Get("autoconnect") == "true" &&
+		len(query["reconnect"]) == 1 && query.Get("reconnect") == "true" &&
+		len(query["resize"]) == 1 && query.Get("resize") == "scale" &&
+		len(query["view_only"]) == 1 && (query.Get("view_only") == "true" || query.Get("view_only") == "false")
 }
 
 func embedWorkbenchQueryGrant(request *http.Request, claims embedClaims) (app.HostEmbedTargetGrant, bool) {

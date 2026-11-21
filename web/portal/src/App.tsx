@@ -23,6 +23,7 @@ import { PersonalData } from './routes/PersonalData';
 import { Projects } from './routes/Projects';
 import { Codex } from './routes/Codex';
 import { Reviews } from './routes/Reviews';
+import { BlindEvaluationWorkspace } from './routes/BlindEvaluationWorkspace';
 import { AdminAudit } from './routes/admin/AdminAudit';
 import { AdminHosts } from './routes/admin/AdminHosts';
 import { AdminLayout } from './routes/admin/AdminLayout';
@@ -36,6 +37,7 @@ import { AdminRecords } from './routes/admin/AdminRecords';
 import { AdminHostDetail } from './routes/admin/AdminHostDetail';
 import { AdminUserDetail } from './routes/admin/AdminUserDetail';
 import { AdminSettings } from './routes/admin/AdminSettings';
+import { AdminEvaluationBatches } from './routes/admin/AdminEvaluationBatches';
 import { RecoverablePageBoundary } from './app/PageErrorBoundary';
 import { RecoverableError } from './components/RecoverableError';
 
@@ -97,6 +99,8 @@ function UserRoutes() {
     <Route path="/settings/password" element={<StandaloneToastPage><ChangePassword loginPath="/login" cancelPath="/settings" /></StandaloneToastPage>} />
     <Route element={<RouteGuard />}>
       <Route path="host-entry/:id" element={<StandaloneToastPage><HostEntry /></StandaloneToastPage>} />
+      <Route path="evaluation-batches/:pack_id/review" element={<StandaloneToastPage><BlindEvaluationWorkspace /></StandaloneToastPage>} />
+      <Route path="evaluation-batches/:pack_id/arbitration" element={<StandaloneToastPage><BlindEvaluationWorkspace /></StandaloneToastPage>} />
       <Route element={<PortalLayout />}>
         <Route index element={<Navigate to="/assistant" replace />} />
         <Route path="assistant" element={<Assistant />} />
@@ -138,6 +142,7 @@ function AdminRoutes() {
           <Route path="models" element={<AdminModels />} />
           <Route path="usage" element={<AdminUsage />} />
           <Route path="quality" element={<AdminQuality />} />
+          <Route path="evaluations" element={<AdminEvaluationBatches />} />
           <Route path="controls" element={<AdminControls />} />
           <Route path="hosts" element={<AdminHosts />} />
           <Route path="hosts/:id" element={<AdminHostDetail />} />

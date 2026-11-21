@@ -254,6 +254,7 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID, co
 	session = &cloudDSHAccountRuntimeSession{manager: m, runtime: ready, process: process, frames: frames,
 		leaseExpiresAt: ready.LeaseExpiresAt, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask),
 		coordinators: make(map[string]*cloudDSHAccountCoordinator), coordinatorSlots: make(chan struct{}, max(1, ready.MaxConcurrentTasks)),
+		reviews: make(map[string]*cloudDSHTaskValidationReview), reviewSlots: make(chan struct{}, max(1, ready.MaxConcurrentTasks)),
 		stopped: make(map[cloudDSHTaskRuntimeIdentity]struct{}),
 		input:   &cloudDSHRuntimeInput{target: process.Input}}
 	go session.route()
@@ -552,11 +553,15 @@ type cloudDSHAccountRuntimeSession struct {
 	mu                  sync.Mutex
 	startMu             sync.Mutex
 	coordinatorStartMu  sync.Mutex
+	reviewStartMu       sync.Mutex
 	renewMu             sync.Mutex
 	tasks               map[app.AgentInstanceFence]*cloudDSHAccountTask
 	coordinators        map[string]*cloudDSHAccountCoordinator
+	reviews             map[string]*cloudDSHTaskValidationReview
 	coordinatorSlots    chan struct{}
 	coordinatorSequence int64
+	reviewSlots         chan struct{}
+	reviewSequence      int64
 	stopped             map[cloudDSHTaskRuntimeIdentity]struct{}
 	failed              error
 	stopping            bool
@@ -586,6 +591,11 @@ func (s *cloudDSHAccountRuntimeSession) hasActiveWorkLocked(exceptTask *cloudDSH
 			return true
 		}
 	}
+	for _, review := range s.reviews {
+		if review != nil {
+			return true
+		}
+	}
 	return false
 }
 
@@ -607,12 +617,19 @@ func (s *cloudDSHAccountRuntimeSession) fail(err error) {
 	for _, coordinator := range s.coordinators {
 		coordinators = append(coordinators, coordinator)
 	}
+	reviews := make([]*cloudDSHTaskValidationReview, 0, len(s.reviews))
+	for _, review := range s.reviews {
+		reviews = append(reviews, review)
+	}
 	s.mu.Unlock()
 	for _, task := range tasks {
 		task.fail(err)
 	}
 	for _, coordinator := range coordinators {
 		coordinator.fail(err)
+	}
+	for _, review := range reviews {
+		review.fail(err)
 	}
 	if markFailed {
 		_ = s.manager.markRuntimeFailed(context.Background(), s.runtime.Fence, execution.RuntimeFailureRuntime)
@@ -657,6 +674,12 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 	}
 	var role string
 	_ = json.Unmarshal(frame["context_role"], &role)
+	if role == cloudDSHTaskValidationReviewRole || kind == "task_validation_review_process_ready" ||
+		kind == "task_validation_review_started" || kind == "task_validation_review_settled" ||
+		kind == "task_validation_review_cancelled" || kind == "task_validation_review_failed" ||
+		kind == "task_validation_review_terminated" {
+		return s.routeTaskValidationReviewFrame(kind, frame)
+	}
 	if role == "coordinator" || kind == "coordinator_process_ready" || kind == "coordinator_started" ||
 		kind == "coordinator_settled" || kind == "coordinator_failed" || kind == "coordinator_terminated" {
 		return s.routeCoordinatorFrame(kind, frame)

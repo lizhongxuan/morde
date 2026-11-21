@@ -178,6 +178,31 @@ func TestCloudDSHCoordinatorUsesToolFreeReplyWhenOwnerExecutionIsDisabled(t *tes
 	}
 }
 
+func TestCloudDSHCoordinatorFallsBackWhenAccountRuntimeStartupFails(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	startupErr := cloudDSHStartupFailure("runtime_control_start", "account Agent Runtime start was not confirmed", errors.New("control unavailable"))
+	models := &coordinatorTestModels{directDecision: app.ConversationRouteDecision{
+		Action: app.ConversationRouteReply, Reply: "仍可回答", ModelOutput: `{"action":"reply"}`}}
+	manager := &coordinatorTestRuntimeManager{acquireErr: startupErr}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: manager}
+
+	decision, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || decision.Reply != "仍可回答" ||
+		models.directCalls != 1 || manager.acquireCalls != 1 || models.completeCalls != 0 {
+		t.Fatalf("runtime startup fallback = %+v, err=%v; direct calls=%d runtime calls=%d DSH model calls=%d",
+			decision, err, models.directCalls, manager.acquireCalls, models.completeCalls)
+	}
+	models.directDecision = app.ConversationRouteDecision{Action: app.ConversationRouteNew, ModelOutput: `{"action":"new"}`}
+	decision, err = coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteClarify || !strings.Contains(decision.Question, "执行服务暂时不可用") ||
+		models.directCalls != 2 || manager.acquireCalls != 2 || models.completeCalls != 0 {
+		t.Fatalf("runtime startup task guard = %+v, err=%v; direct calls=%d runtime calls=%d DSH model calls=%d",
+			decision, err, models.directCalls, manager.acquireCalls, models.completeCalls)
+	}
+}
+
 func TestCloudDSHCoordinatorDoesNotFallbackForOtherRuntimeConflicts(t *testing.T) {
 	claim, value := coordinatorTestClaimAndContext()
 	conflict := domain.NewError(domain.CodeConflict, "runtime lease is active in another worker")
@@ -187,7 +212,7 @@ func TestCloudDSHCoordinatorDoesNotFallbackForOtherRuntimeConflicts(t *testing.T
 		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
 	}, runtimes: manager}
 
-	if _, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value); err != conflict || models.directCalls != 0 {
+	if _, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value); !errors.Is(err, conflict) || models.directCalls != 0 {
 		t.Fatalf("non-disabled Runtime conflict was masked: err=%v direct calls=%d", err, models.directCalls)
 	}
 }

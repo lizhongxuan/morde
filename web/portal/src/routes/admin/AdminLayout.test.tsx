@@ -10,6 +10,7 @@ afterEach(cleanup);
 it('only shows the retained administration navigation', () => {
   render(<ToastProvider><MemoryRouter initialEntries={['/admin']}><AdminLayout /></MemoryRouter></ToastProvider>);
   expect(screen.getByRole('link', { name: '配置与预算' })).toHaveAttribute('href', '/admin/settings');
+  expect(screen.getByRole('link', { name: '盲测评测' })).toHaveAttribute('href', '/admin/evaluations');
   for (const name of ['邀请', '站点与提示', '活动']) {
     expect(screen.queryByRole('link', { name })).not.toBeInTheDocument();
   }

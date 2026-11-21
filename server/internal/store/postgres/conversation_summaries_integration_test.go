@@ -83,6 +83,17 @@ func (*blockingConversationSummaryModels) ResolveConversationSummaryModel(contex
 	return "p1234567", 100_000, nil
 }
 
+func (*blockingConversationSummaryModels) EstimateConversationSummaryTokenPressure(_ context.Context,
+	request worker.CloudDSHConversationSummaryEstimateRequest) ([]int, error) {
+	counts := make([]int, len(request.Sources))
+	total := 0
+	for index, source := range request.Sources {
+		total += len(source.Content)
+		counts[index] = total
+	}
+	return counts, nil
+}
+
 func (m *blockingConversationSummaryModels) CompactConversationSummary(ctx context.Context,
 	_ worker.CloudDSHConversationSummaryRequest) (worker.CloudDSHConversationSummaryResult, error) {
 	close(m.started)
@@ -132,6 +143,8 @@ func TestConversationMessageAcceptanceContinuesDuringSummaryModelCall(t *testing
 	}()
 	select {
 	case <-models.started:
+	case err := <-completed:
+		t.Fatalf("summary route ended before the summary model call: %v", err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("summary model call did not start")
 	}

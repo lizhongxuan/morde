@@ -412,6 +412,9 @@ func validateTaskArtifactWorkspaceProof(ctx context.Context, tx pgx.Tx, ownerID 
 }
 
 func recordTaskArtifactTx(ctx context.Context, tx pgx.Tx, artifact task.Artifact) (task.Artifact, error) {
+	if artifact.SourceCallID != "" && app.SafeTaskValidationCallID(artifact.SourceCallID) != artifact.SourceCallID {
+		return task.Artifact{}, domain.InvalidArgument("artifact.source_call_id", "artifact source call ID is invalid")
+	}
 	var current sqlcgen.TaskArtifact
 	current, err := loadTaskArtifactByPath(ctx, tx, artifact)
 	if err == nil {
@@ -463,6 +466,15 @@ FROM task_artifacts WHERE id=$1`, artifact.ID), &current); err != nil {
 		"artifact_id": artifact.ID, "step_id": artifact.StepID, "label": artifact.Label,
 		"media_type": artifact.MediaType, "path": artifact.Path, "workspace_id": artifact.WorkspaceID,
 		"revision": artifact.Revision, "size_bytes": artifact.SizeBytes, "sha256": artifact.SHA256,
+	}
+	var taskRevision int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(s.task_revision,t.current_revision)
+FROM task_steps s JOIN tasks t ON t.id=s.task_id WHERE s.task_id=$1 AND s.id=$2`, artifact.TaskID, artifact.StepID).Scan(&taskRevision); err != nil {
+		return task.Artifact{}, fmt.Errorf("read Task revision for artifact event: %w", err)
+	}
+	payloadFields["task_revision"] = taskRevision
+	if artifact.SourceCallID != "" {
+		payloadFields["source_call_id"] = artifact.SourceCallID
 	}
 	if artifact.BatchItemID != "" {
 		payloadFields["batch_item_id"] = artifact.BatchItemID

@@ -71,6 +71,15 @@ type ConversationRouteRequestCandidate struct {
 	Authorization        task.Authorization         `json:"-"`
 }
 
+// NormalizeConversationRouteStatusForClassification treats receipt ownership
+// as internal state: pending and processing are both still unresolved.
+func NormalizeConversationRouteStatusForClassification(status conversation.RoutingStatus) conversation.RoutingStatus {
+	if status == conversation.RoutingProcessing {
+		return conversation.RoutingPending
+	}
+	return status
+}
+
 // ConversationRouteAggregationCandidate is a same-scope message that a prior
 // route classifier explicitly joined to the currently waiting root. The final
 // root classification must list any candidate it wants included in its Task.
@@ -94,27 +103,30 @@ type conversationRouteModelRequestCandidate struct {
 }
 
 type ConversationRouteContext struct {
-	ActorID               string
-	ModelID               string
-	RouteAttempt          int64  `json:"-"`
-	SummaryVersion        int64  `json:"-"`
-	SummarySHA256         []byte `json:"-"`
-	SummarySourcesSHA256  []byte `json:"-"`
-	SummaryText           string `json:"-"`
-	PreviousUnresolved    bool
-	PreviousMissing       bool
-	Content               string
-	ExecutionScopeDigest  []byte `json:"-"`
-	ControlScopeDigest    []byte `json:"-"`
-	TimeZone              string
-	ServerReceivedAt      time.Time
-	ReferenceTaskID       string
-	ReferenceUnavailable  bool
-	History               []ConversationRouteHistory
-	Candidates            []ConversationRouteCandidate
-	RequestCandidates     []ConversationRouteRequestCandidate
-	AggregationCandidates []ConversationRouteAggregationCandidate
-	ResultReview          *ConversationTaskResultReview
+	ActorID                string
+	ModelID                string
+	RouteAttempt           int64  `json:"-"`
+	SummaryVersion         int64  `json:"-"`
+	SummarySHA256          []byte `json:"-"`
+	SummarySourcesSHA256   []byte `json:"-"`
+	SummaryText            string `json:"-"`
+	CandidateSetIncomplete bool
+	PreviousMessageID      string `json:"-"`
+	PreviousTaskID         string `json:"-"`
+	PreviousUnresolved     bool
+	PreviousMissing        bool
+	Content                string
+	ExecutionScopeDigest   []byte `json:"-"`
+	ControlScopeDigest     []byte `json:"-"`
+	TimeZone               string
+	ServerReceivedAt       time.Time
+	ReferenceTaskID        string
+	ReferenceUnavailable   bool
+	History                []ConversationRouteHistory
+	Candidates             []ConversationRouteCandidate
+	RequestCandidates      []ConversationRouteRequestCandidate
+	AggregationCandidates  []ConversationRouteAggregationCandidate
+	ResultReview           *ConversationTaskResultReview
 }
 
 type ConversationTaskResultReview struct {
@@ -153,7 +165,15 @@ const conversationRouteInstructions = `Classify the user's new message using the
 
 const conversationRouteAssociationInstructions = `A bare number such as "1" is a valid choice only when the latest unresolved assistant message explicitly presented that numbered option and it still identifies one target. A bare "好" confirms an action only when there is one clear pending action; it never selects between alternatives. Otherwise clarify and ask the smallest missing question. For a repeated request or a request that adds requirements to the same deliverable, join only an authorized same_execution_scope prior request, preserve every message, and do not create duplicate execution. Same topic alone is insufficient; keep different targets independent. Use update only when the user clearly changes an identified active Task.`
 
+const conversationRouteReversibleChoiceInstructions = `Do not ask for a preference when a safe, low-risk, reversible default is available. Route complete work and let the Task Agent choose a conservative default. Clarify only when missing information blocks safe progress or materially affects the user's intended outcome, authorization, cost, or an irreversible action.`
+
 const conversationRoutePendingStopInstructions = `A stop may target a not-yet-created Task only when one prior_requests entry has aggregation_waiting=true and same_control_scope=true. This explicit control scope matches the project/host/workspace/application/tool destination; the user does not need to reattach files. The server still validates the original message, authorization snapshot, current state, and lease before cancelling. If the target is outside that scope, clarify or use an active Task target.`
+
+const conversationRouteJSONModeExample = `For example, a direct reply is {"action":"reply","task_id":"","question":"","reply":"你好。"}.`
+
+const conversationRouteUnresolvedReplyInstructions = `Even if a previous message is unresolved or missing, use reply for a complete conversational request you can answer from the current message alone, such as a greeting or a self-contained calculation. When previous_missing is true, use new for complete independent work that needs execution, and clarify when the request depends on missing context. Never guess the missing message or claim to act on an existing Task.`
+
+const conversationRouteIncompleteCandidatesInstructions = `When candidate_set_incomplete is true, the supplied task or prior-request candidates are only a bounded subset. Continue with direct replies and clearly independent, self-contained new work. For update, status, stop, join, or dependencies, use only supplied candidate IDs; if the intended target or whether this repeats omitted work is unclear, ask the user instead of guessing. Never invent an omitted task or message ID.`
 
 const conversationRouteAcknowledgementInstructions = `Always include "acknowledge" as a JSON boolean. Set it to true only when you decide this user message needs work expected to take a while and you are accepting it for background execution; base the decision only on expected duration, never on the topic or operation type. Set false for quick work, direct replies, questions, status, stop, or clarification. It may be true only for new, update, or join actions. Only action "reply" may contain user-facing text in "reply"; for new, update, and join, both "reply" and "question" must be empty. Never put an acceptance or progress sentence in "reply"; "acknowledge" is the only acceptance signal.`
 
@@ -274,18 +294,19 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		referenceTime = value.ServerReceivedAt.In(timeZone).Format(time.RFC3339)
 	}
 	type routeInput struct {
-		Summary               map[string]any                          `json:"summary,omitempty"`
-		Message               string                                  `json:"message"`
-		ReferenceTime         string                                  `json:"reference_time,omitempty"`
-		TimeZone              string                                  `json:"time_zone,omitempty"`
-		TimeZoneProvided      bool                                    `json:"time_zone_provided"`
-		ReferenceTaskID       string                                  `json:"reference_task_id,omitempty"`
-		ReferenceUnavailable  bool                                    `json:"reference_unavailable,omitempty"`
-		PreviousUnresolved    bool                                    `json:"previous_unresolved,omitempty"`
-		PreviousMissing       bool                                    `json:"previous_missing,omitempty"`
-		History               []ConversationRouteHistory              `json:"history"`
-		Tasks                 []ConversationRouteCandidate            `json:"active_tasks"`
-		AggregationCandidates []ConversationRouteAggregationCandidate `json:"aggregation_candidates"`
+		Summary                map[string]any                          `json:"summary,omitempty"`
+		Message                string                                  `json:"message"`
+		ReferenceTime          string                                  `json:"reference_time,omitempty"`
+		TimeZone               string                                  `json:"time_zone,omitempty"`
+		TimeZoneProvided       bool                                    `json:"time_zone_provided"`
+		ReferenceTaskID        string                                  `json:"reference_task_id,omitempty"`
+		ReferenceUnavailable   bool                                    `json:"reference_unavailable,omitempty"`
+		CandidateSetIncomplete bool                                    `json:"candidate_set_incomplete,omitempty"`
+		PreviousUnresolved     bool                                    `json:"previous_unresolved,omitempty"`
+		PreviousMissing        bool                                    `json:"previous_missing,omitempty"`
+		History                []ConversationRouteHistory              `json:"history"`
+		Tasks                  []ConversationRouteCandidate            `json:"active_tasks"`
+		AggregationCandidates  []ConversationRouteAggregationCandidate `json:"aggregation_candidates"`
 	}
 	input := routeInput{Summary: func() map[string]any {
 		if value.SummaryVersion == 0 {
@@ -295,12 +316,14 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 			"sources_sha256": hex.EncodeToString(value.SummarySourcesSHA256), "text": value.SummaryText}
 	}(), Message: value.Content, ReferenceTime: referenceTime, TimeZone: value.TimeZone,
 		TimeZoneProvided: value.TimeZone != "", ReferenceTaskID: referenceID, ReferenceUnavailable: value.ReferenceUnavailable,
-		PreviousUnresolved: value.PreviousUnresolved, PreviousMissing: value.PreviousMissing, History: value.History, Tasks: value.Candidates,
+		CandidateSetIncomplete: value.CandidateSetIncomplete,
+		PreviousUnresolved:     value.PreviousUnresolved, PreviousMissing: value.PreviousMissing, History: value.History, Tasks: value.Candidates,
 		AggregationCandidates: value.AggregationCandidates}
 	priorRequests := make([]conversationRouteModelRequestCandidate, len(value.RequestCandidates))
 	for index, candidate := range value.RequestCandidates {
 		priorRequests[index] = conversationRouteModelRequestCandidate{MessageID: candidate.MessageID, Sequence: candidate.Sequence,
-			Content: candidate.Content, RoutingStatus: candidate.RoutingStatus, TaskID: candidate.TaskID, TaskStatus: candidate.TaskStatus,
+			Content: candidate.Content, RoutingStatus: NormalizeConversationRouteStatusForClassification(candidate.RoutingStatus),
+			TaskID: candidate.TaskID, TaskStatus: candidate.TaskStatus,
 			SameExecutionScope: candidate.SameExecutionScope, SameControlScope: candidate.SameControlScope,
 			AggregationWaiting: ValidConversationRoutePendingRootStop(candidate.MessageID, value.RequestCandidates),
 			Joinable:           conversationRouteJoinCandidateEligible(candidate)}
@@ -314,9 +337,17 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 	}
 	routeTemperature := 0.0
 	request := ModelRequest{Instructions: conversationRouteInstructions + "\n\n" + conversationRouteAcknowledgementInstructions + "\n\n" + conversationRouteAssociationInstructions +
+		"\n\n" + conversationRouteReversibleChoiceInstructions +
 		"\n\n" + conversationRoutePendingStopInstructions,
 		Input: []ModelInput{{Type: "message", Role: "user", Text: string(body)}}, MaxOutputTokens: 512,
-		Temperature: &routeTemperature, DisableThinking: true}
+		Temperature: &routeTemperature, DisableThinking: true, JSONMode: true}
+	request.Instructions += "\n\n" + conversationRouteJSONModeExample
+	if value.PreviousUnresolved {
+		request.Instructions += "\n\n" + conversationRouteUnresolvedReplyInstructions
+	}
+	if value.CandidateSetIncomplete {
+		request.Instructions += "\n\n" + conversationRouteIncompleteCandidatesInstructions
+	}
 	if modelRequestInputTokenReservation(request) > maxAgentInputBytes {
 		return ModelRequest{}, domain.NewError(domain.CodeResultTooLarge, "message exceeds model routing context limit")
 	}
@@ -372,11 +403,11 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 			return ConversationRouteDecision{Action: ConversationRouteClarify, Question: UnavailableRouteReferenceMessage, ModelOutput: decision.ModelOutput}
 		}
 		if value.PreviousMissing {
-			return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。", ModelOutput: decision.ModelOutput}
+			return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。", ModelOutput: decision.ModelOutput}
 		}
 	}
-	if value.PreviousMissing && decision.Action != ConversationRouteNew && decision.Action != ConversationRouteClarify {
-		return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。", ModelOutput: decision.ModelOutput}
+	if value.PreviousMissing && decision.Action != ConversationRouteNew && decision.Action != ConversationRouteReply && decision.Action != ConversationRouteClarify {
+		return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。", ModelOutput: decision.ModelOutput}
 	}
 	return decision
 }
@@ -544,6 +575,25 @@ func ValidConversationRouteJoinTarget(target string, candidates []ConversationRo
 	return false
 }
 
+func ValidConversationRouteExactDuplicateTarget(target, content string, candidates []ConversationRouteRequestCandidate) bool {
+	if !domain.ValidMessageID(target) {
+		return false
+	}
+	for _, candidate := range candidates {
+		if candidate.MessageID != target || !candidate.SameExecutionScope || strings.TrimSpace(candidate.Content) != strings.TrimSpace(content) {
+			continue
+		}
+		if candidate.AggregationClosed && candidate.TaskID == "" &&
+			candidate.RoutingStatus != conversation.RoutingPending && candidate.RoutingStatus != conversation.RoutingProcessing {
+			return false
+		}
+		// Exact duplicates can alias an in-flight root after its merge window closes.
+		candidate.AggregationClosed = false
+		return conversationRouteJoinCandidateEligible(candidate)
+	}
+	return false
+}
+
 // ValidConversationRouteAggregateIDs permits only explicit, authorized same-work
 // supplements loaded for the currently waiting root. It never infers candidates.
 func ValidConversationRouteAggregateIDs(ids []string, candidates []ConversationRouteAggregationCandidate) bool {
@@ -669,7 +719,7 @@ func parseConversationRouteDecision(text, content string, candidates []Conversat
 				TargetMessageID: answer.TargetMessageID, ModelOutput: text}
 		}
 	case ConversationRouteReply:
-		if !answer.Acknowledge && answer.TaskID == "" && answer.TargetMessageID == "" && !answer.ExplicitNew && answer.Question == "" &&
+		if !answer.Acknowledge && answer.TaskID == "" && answer.TargetMessageID == "" && !answer.ExplicitNew &&
 			len(answer.DependencyTaskIDs) == 0 && len(answer.AggregateMessageIDs) == 0 && ValidConversationRouteReply(answer.Reply) {
 			return ConversationRouteDecision{Action: ConversationRouteReply, Reply: strings.TrimSpace(answer.Reply), ModelOutput: text}
 		}

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ToastNoticeCenter, ToastProvider } from '../app/toast';
@@ -7,7 +7,7 @@ import { FloatingError, FloatingNotice } from './FloatingError';
 afterEach(cleanup);
 
 describe('FloatingError', () => {
-  it('keeps recoverable API errors in their page flow and keeps actions available', async () => {
+  it('moves API errors to one global notice without retry controls', async () => {
     const retry = vi.fn();
     const user = userEvent.setup();
     render(<ToastProvider><ToastNoticeCenter /><main data-testid="page"><p>页面内容</p><FloatingError className="error-card">
@@ -16,11 +16,12 @@ describe('FloatingError', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('接口暂不可用');
-    expect(alert.parentElement).toBe(screen.getByTestId('page'));
-    await user.click(screen.getByRole('button', { name: '重试' }));
-    expect(retry).toHaveBeenCalledOnce();
+    expect(alert.closest('.error-notice-overlay')).toBeInTheDocument();
+    expect(screen.getByTestId('page')).not.toContainElement(alert);
+    expect(within(alert).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '关闭错误提示' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
   });
 
   it('renders inline without an application provider', () => {
@@ -31,7 +32,7 @@ describe('FloatingError', () => {
   it('keeps errors inside hidden page sections without announcing them', () => {
     render(<ToastProvider><ToastNoticeCenter /><section hidden><FloatingError>隐藏页面错误</FloatingError></section></ToastProvider>);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    expect(document.querySelector('[hidden] [role="alert"]')).toHaveTextContent('隐藏页面错误');
+    expect(screen.queryByText('隐藏页面错误')).not.toBeInTheDocument();
   });
 });
 

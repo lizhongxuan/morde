@@ -62,9 +62,17 @@ export default function TopBar({
   }, []);
 
   const transitionFailure = control?.active_transition?.failure_reason;
+  const transitionPending = !!control && (control.control_state === 'taking_over' || control.control_state === 'returning' ||
+    !!control.pending_operation_ids?.length || !!control.active_transition && control.active_transition.phase !== 'completed');
+  const transitionAction = control?.active_transition?.action ?? (control?.control_state === 'taking_over'
+    ? 'take_over'
+    : control?.control_state === 'returning' ? 'release' : null);
+  const transitionLabel = transitionAction === 'take_over' ? '正在接管电脑，请稍候…'
+    : transitionAction === 'release' ? '正在交回 AI，请稍候…' : '控制权切换处理中，请稍候…';
   const controlLabel = controlError ? '控制状态暂时不可用'
     : controlLoading && !control ? '正在读取控制状态…'
       : transitionFailure ? control?.active_transition?.action === 'take_over' ? '接管未完成，可重试' : '交回未完成，可重试'
+        : transitionPending ? transitionLabel
         : control?.control_state === 'ai' ? embedded ? 'Morde 拥有控制权' : '当前控制者：AI · 桌面只读'
           : control?.control_state === 'user' ? control.control_lease_active
             ? control.control_lease_held_by_me ? embedded ? '你拥有控制权' : '你持有电脑操作权' : control.control_actor_user_id ? `当前操作账号：${control.control_actor_user_id}` : '其他用户持有电脑操作权'
@@ -74,6 +82,7 @@ export default function TopBar({
   const compactControlLabel = controlError ? '控制不可用'
     : controlLoading && !control ? '读取状态'
       : transitionFailure ? control?.active_transition?.action === 'take_over' ? '接管失败' : '交还失败'
+        : transitionPending ? transitionAction === 'take_over' ? '接管中' : transitionAction === 'release' ? '交还中' : '切换中'
         : control?.control_state === 'ai' ? 'AI 控制中 · 只读'
           : control?.control_state === 'user' ? control.control_lease_active
             ? control.control_lease_held_by_me ? '你正在控制' : '他人控制中'
@@ -81,7 +90,7 @@ export default function TopBar({
             : control?.control_state === 'taking_over' ? '接管中'
               : control?.control_state === 'returning' ? '交还中' : '状态未知';
   const embeddedActionLabel = embedded && controlActionLabel === '交回 AI' ? '交还控制权' : controlActionLabel;
-  const embeddedControlOwned = control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
+  const embeddedControlOwned = !transitionPending && control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
 
   return (
     <header className={`top-bar${embedded ? ` top-bar-embedded${embeddedControlOwned ? ' is-human' : ''}` : ''}`}>
@@ -99,7 +108,7 @@ export default function TopBar({
           <span className="control-state-full">{controlLabel}</span>
           <span className="control-state-compact">{compactControlLabel}</span>
         </span>
-        {control?.control_state === 'user' && <span className="control-lease">
+        {control?.control_state === 'user' && !transitionPending && <span className="control-lease">
           {control.control_lease_active
             ? `操作租约${control.control_lease_held_by_me ? '由你持有' : '有效'} · ${formatRemaining(control.control_lease_expires_at, now)}`
             : '当前没有有效操作租约'}
@@ -109,7 +118,7 @@ export default function TopBar({
         {!embedded && <button className="button button-secondary host-return-button" type="button" onClick={returnToPreviousPage}>返回云端电脑</button>}
         {controlError && <button className="button button-secondary" type="button" onClick={onRetryControl} disabled={controlLoading}>重试读取</button>}
           {embeddedActionLabel && (
-          <button className={`button${embeddedActionLabel.includes('接管') ? '' : ' button-secondary'}`} type="button" onClick={onControlAction} disabled={controlActionPending}>
+            <button className={`button${embeddedActionLabel.includes('接管') ? '' : ' button-secondary'}`} type="button" onClick={onControlAction} disabled={controlActionPending || (transitionPending && !transitionFailure)}>
             {embeddedActionLabel}
           </button>
         )}

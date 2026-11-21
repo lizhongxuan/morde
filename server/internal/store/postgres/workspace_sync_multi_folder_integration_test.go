@@ -273,6 +273,10 @@ func workspaceSyncPortalPrincipal(t *testing.T, store *Store, ownerID string) id
 
 func workspaceSyncHostForFolderTest(t *testing.T, ctx context.Context, store *Store, ownerID, workspaceID string) host.Host {
 	t.Helper()
+	value, err := store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		t.Fatalf("read Workspace before creating sync Host: %v", err)
+	}
 	hostValue := createTestHost(t, ctx, store, ownerID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceID})
 	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
 	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceID)
@@ -280,7 +284,7 @@ func workspaceSyncHostForFolderTest(t *testing.T, ctx context.Context, store *St
 		t.Fatal(err)
 	}
 	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceID, binding.BindingVersion,
-		workspace.BindingPreparing, workspace.BindingActive, 0, 0); err != nil {
+		workspace.BindingPreparing, workspace.BindingActive, value.Revision, value.Revision); err != nil {
 		t.Fatal(err)
 	}
 	return hostValue

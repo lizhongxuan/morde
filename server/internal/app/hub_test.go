@@ -409,7 +409,7 @@ func TestHubAcceptsTenThousandConnectionsAcrossAccounts(t *testing.T) {
 	service, _ := newHubFixture(t)
 	for index := range HubMaxConnections {
 		ownerID := fmt.Sprintf("u%07x", index/HubMaxConnectionsPerAccount)
-	if err := service.attach(newHubTestSession(ownerID, index%HubMaxConnectionsPerAccount)); err != nil {
+		if err := service.attach(newHubTestSession(ownerID, index%HubMaxConnectionsPerAccount)); err != nil {
 			t.Fatalf("attach connection %d: %v", index, err)
 		}
 	}

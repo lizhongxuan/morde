@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +31,10 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/execution"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/storage"
+	"morde/server/internal/storage/workspacefs"
 	"morde/server/internal/worker"
 )
 
@@ -50,8 +56,24 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enableTaskExecutionForTest(t, store, principal)
+	control, err := store.GetExecutionControl(ctx, owner.ID)
+	if err != nil || control.State != execution.StateEnabled {
+		t.Fatalf("new browser acceptance account execution state = %q, err=%v; want enabled by default", control.State, err)
+	}
 	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "workspace-blocks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blocks.Close() })
+	capacity, err := storage.NewWorkspaceCapacity(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceOps, err := app.NewWorkspaceService(store, blocks, nativeAcceptanceWorkspaceCurrentDeleter{}, capacity, audit, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +111,10 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 		model.routeBarrier = &browserAcceptanceRouteBarrier{expected: 4, ready: make(chan struct{})}
 	}
 	models, err := app.NewModelConnectionService(store, sealer, model, []string{"example.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	onboarding, err := app.NewOnboardingService(store, nativeAcceptanceHosts{}, models, "small")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +161,43 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv("MORDE_BROWSER_LONG_HISTORY") == "1" {
+		serviceInstanceID, err := store.ServiceInstanceID(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seededMessageIDs := make([]string, 0, 840)
+		for index := 0; index < 840; index++ {
+			prefix := fmt.Sprintf("PC long-history row=%04d ", index)
+			if index == 0 {
+				prefix += browserAcceptanceLongHistorySentinel + " "
+			}
+			content := prefix + strings.Repeat("q", 10*1024-len(prefix))
+			clientMessageID := fmt.Sprintf("browser-long-history-%04d", index)
+			message, replayed, err := tasks.AcceptConversationMessage(ctx, principal, mainConversation.ConversationID,
+				app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: clientMessageID,
+					IdempotencyKey: clientMessageID, Content: content, ModelID: checked.ID,
+					Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}})
+			if err != nil || replayed {
+				t.Fatalf("seed PC long-history message %d: replayed=%t err=%v", index, replayed, err)
+			}
+			seededMessageIDs = append(seededMessageIDs, message.ID)
+		}
+		if _, err := store.pool.Exec(ctx, `UPDATE conversation_messages AS message
+SET delivery_status='applied', created_at=clock_timestamp()-interval '1 day'+seed.position::double precision*interval '1 millisecond'
+FROM unnest($1::text[]) WITH ORDINALITY AS seed(message_id,position) WHERE message.id=seed.message_id`, seededMessageIDs); err != nil {
+			t.Fatalf("mark PC long-history messages as durable: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed' WHERE message_id=ANY($1::text[])`, seededMessageIDs); err != nil {
+			t.Fatalf("settle PC long-history message routes: %v", err)
+		}
+		var messageCount, sentinelCount, historyBytes int
+		if err := store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE content LIKE $2),sum(octet_length(content))
+FROM conversation_messages WHERE conversation_id=$1`, mainConversation.ConversationID, "%"+browserAcceptanceLongHistorySentinel+"%").
+			Scan(&messageCount, &sentinelCount, &historyBytes); err != nil || messageCount != 840 || sentinelCount != 1 || historyBytes <= 8*1024*1024 {
+			t.Fatalf("seeded PC long history: messages=%d sentinel=%d bytes=%d err=%v", messageCount, sentinelCount, historyBytes, err)
+		}
+	}
 	var projectConversations *app.ProjectConversationService
 	var projectAttachments *app.ProjectConversationAttachmentService
 	var projectAttachmentResume *browserProjectAttachmentResumeFixture
@@ -164,13 +227,22 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	}
 	var activity *browserAcceptanceActivity
 	var executor worker.TaskExecutor = browserAcceptanceExecutor{store: store}
+	var obsoletePredecessorErrorResponses atomic.Int32
 	var attachmentResume *browserAttachmentResumeFixture
 	var messageUploadResume *browserMessageUploadResumeFixture
+	var messageReceiptRetry *browserMessageReceiptRetryFixture
 	if os.Getenv("MORDE_BROWSER_ATTACHMENT_RESUME") == "1" {
 		attachmentResume = &browserAttachmentResumeFixture{}
 	}
 	if os.Getenv("MORDE_BROWSER_MESSAGE_UPLOAD_RESUME") == "1" {
 		messageUploadResume = newBrowserMessageUploadResumeFixture(mainConversation.ConversationID)
+	}
+	if os.Getenv("MORDE_BROWSER_MESSAGE_RECEIPT_RETRY") == "1" {
+		messageReceiptRetry = &browserMessageReceiptRetryFixture{
+			conversationID:           mainConversation.ConversationID,
+			requireExplicitRetry:     os.Getenv("MORDE_BROWSER_MESSAGE_EXPLICIT_RETRY") == "1",
+			clientOfflineBeforeRetry: os.Getenv("MORDE_BROWSER_MESSAGE_CLIENT_OFFLINE") == "1",
+		}
 	}
 	if os.Getenv("MORDE_BROWSER_ACTIVITY") == "1" {
 		activity, err = newBrowserAcceptanceActivity(store, sealer, mainConversation.ConversationID)
@@ -241,9 +313,11 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	portalRoot := filepath.Join("..", "..", "..", "..", "web", "portal", "dist")
 	apiDeps := api.Deps{Hosts: nativeAcceptanceHosts{}, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients, Tasks: tasks, Conversations: conversations,
+		WorkspaceOps: workspaceOps, Onboarding: onboarding,
 		PersonalData: personalData, PersonalSync: personalSync, PersonalDataQuotaUser: personalQuotaUser,
 		PersonalAttachments: personalAttachments,
-		ModelConnections:    models, ModelGateway: gateway, ExecutionControl: execution, MCPDisabled: true,
+		ModelConnections:    models, ModelGateway: gateway, ExecutionControl: execution,
+		HostSharing: nativeAcceptanceSharing{}, MCPDisabled: true,
 	}
 	if projects != nil {
 		apiDeps.Projects = projects
@@ -261,6 +335,36 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	// pass. This disposable fixture advertises it only to exercise the UI.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("LOCAL_HTTP %s %s authorization=%t\n", r.Method, r.URL.Path, r.Header.Get("Authorization") != "")
+		if os.Getenv("MORDE_BROWSER_OBSOLETE_PREDECESSOR_ERROR") == "1" && r.Method == http.MethodPost &&
+			strings.HasPrefix(r.URL.Path, "/api/conversations/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			body, readErr := io.ReadAll(r.Body)
+			var request struct {
+				ReferenceTaskID string `json:"reference_task_id"`
+			}
+			if readErr == nil && json.Unmarshal(body, &request) == nil && request.ReferenceTaskID != "" &&
+				obsoletePredecessorErrorResponses.CompareAndSwap(0, 1) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{
+					"code": "legacy_predecessor_error", "message": "前一条消息尚未确认，请先核对后重试。",
+				}})
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		if messageReceiptRetry != nil && r.Method == http.MethodGet && r.URL.Path == "/__morde_fixture/message-receipt-retry-status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(messageReceiptRetry.view())
+			return
+		}
+		if messageReceiptRetry != nil && r.Method == http.MethodPost && r.URL.Path == "/__morde_fixture/allow-message-receipt-retry" {
+			messageReceiptRetry.allowRetry()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if messageReceiptRetry != nil && messageReceiptRetry.proxy(w, r, router) {
+			return
+		}
 		if attachmentResume != nil && r.Method == http.MethodGet && r.URL.Path == "/__morde_fixture/attachment-status" {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(attachmentResume.view())
@@ -429,10 +533,14 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 			if _, err := os.Stat(stop); err == nil {
 				var messages, replies int
 				minimumMessages := 2
-				if activity != nil || attachmentResume != nil || projectAttachmentResume != nil || messageUploadResume != nil {
+				if activity != nil || attachmentResume != nil || projectAttachmentResume != nil || messageUploadResume != nil || messageReceiptRetry != nil {
 					minimumMessages = 1
 				}
 				minimumReplies := 1
+				if os.Getenv("MORDE_BROWSER_LONG_HISTORY") == "1" {
+					minimumMessages = 840
+					minimumReplies = 0
+				}
 				if activity != nil {
 					minimumReplies = 0
 					for _, scenario := range activity.required {
@@ -450,10 +558,30 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				if messageReceiptRetry != nil {
+					status := messageReceiptRetry.view()
+					retryFailed := status.RequireExplicitRetry && (!status.FirstAttemptRejected || !status.RetryAllowed || !status.ServerAccepted || status.PostAttempts != 2)
+					clientOfflineRetryFailed := status.ClientOfflineBeforeRetry &&
+						(status.FirstAttemptRejected || status.FirstResponseLost || !status.ServerAccepted || status.PostAttempts != 1)
+					lostReceipt := !status.RequireExplicitRetry && !status.ClientOfflineBeforeRetry &&
+						(!status.FirstResponseLost || !status.ServerAccepted || status.PostAttempts != 1)
+					if retryFailed || clientOfflineRetryFailed || lostReceipt || status.ClientMessageID == "" || status.ReconciliationChecks == 0 {
+						t.Fatalf("message receipt retry was not reconciled without a duplicate POST: %+v", status)
+					}
+					var receipts int
+					if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_message_routes
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4`,
+						instanceID, owner.ID, mainConversation.ConversationID, status.ClientMessageID).Scan(&receipts); err != nil || receipts != 1 {
+						t.Fatalf("accepted message receipts=%d err=%v", receipts, err)
+					}
+				}
 				if activity != nil {
 					if err := activity.assertVerified(); err != nil {
 						t.Fatal(err)
 					}
+				}
+				if os.Getenv("MORDE_BROWSER_OBSOLETE_PREDECESSOR_ERROR") == "1" && obsoletePredecessorErrorResponses.Load() != 1 {
+					t.Fatalf("obsolete predecessor response count=%d, want 1", obsoletePredecessorErrorResponses.Load())
 				}
 				if attachmentResume != nil {
 					status := attachmentResume.view()
@@ -467,9 +595,8 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3`, instanceID
 						t.Fatalf("recovered attachment state=%q err=%v", state, err)
 					}
 					var committedUploads int
-					// The synthetic 5 MiB JPEG produces one readable derivative beside its original.
 					if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM personal_attachment_uploads
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND state='committed'`, instanceID, owner.ID).Scan(&committedUploads); err != nil || committedUploads != 2 {
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND state='committed'`, instanceID, owner.ID).Scan(&committedUploads); err != nil || committedUploads != 1 {
 						t.Fatalf("attachment fixture created %d committed uploads, err=%v", committedUploads, err)
 					}
 				}
@@ -533,6 +660,7 @@ const browserAcceptanceStatusContent = "本机浏览器验收：进度如何"
 const browserAcceptanceIndependentContent = "本机浏览器验收：独立总结当前会话"
 const browserAcceptanceQuickReplyContent = "Morde browser acceptance: quick reply"
 const browserAcceptanceAcknowledgedContent = "Morde browser acceptance: long background task"
+const browserAcceptanceLongHistorySentinel = "ORCHID-PC-HISTORY-SENTINEL-8472"
 
 type browserAcceptanceModel struct {
 	nativeAcceptanceModel
@@ -567,6 +695,212 @@ func (barrier *browserAcceptanceRouteBarrier) wait(ctx context.Context) error {
 		return ctx.Err()
 	case <-timer.C:
 		return errors.New("cross-client route barrier timed out waiting for all four messages")
+	}
+}
+
+type browserMessageReceiptRetryFixture struct {
+	mu                       sync.Mutex
+	conversationID           string
+	requireExplicitRetry     bool
+	clientOfflineBeforeRetry bool
+	retryAllowed             bool
+	postAttempts             int
+	clientMessageID          string
+	firstResponseLost        bool
+	firstAttemptRejected     bool
+	serverAccepted           bool
+	reconciliationChecks     int
+}
+
+type browserMessageReceiptRetryStatus struct {
+	PostAttempts             int    `json:"post_attempts"`
+	ClientMessageID          string `json:"client_message_id"`
+	RequireExplicitRetry     bool   `json:"require_explicit_retry"`
+	ClientOfflineBeforeRetry bool   `json:"client_offline_before_retry"`
+	RetryAllowed             bool   `json:"retry_allowed"`
+	FirstResponseLost        bool   `json:"first_response_lost"`
+	FirstAttemptRejected     bool   `json:"first_attempt_rejected"`
+	ServerAccepted           bool   `json:"server_accepted"`
+	ReconciliationChecks     int    `json:"reconciliation_checks"`
+}
+
+func (f *browserMessageReceiptRetryFixture) view() browserMessageReceiptRetryStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return browserMessageReceiptRetryStatus{PostAttempts: f.postAttempts, ClientMessageID: f.clientMessageID,
+		RequireExplicitRetry: f.requireExplicitRetry, ClientOfflineBeforeRetry: f.clientOfflineBeforeRetry,
+		RetryAllowed:      f.retryAllowed,
+		FirstResponseLost: f.firstResponseLost, FirstAttemptRejected: f.firstAttemptRejected, ServerAccepted: f.serverAccepted,
+		ReconciliationChecks: f.reconciliationChecks}
+}
+
+func (f *browserMessageReceiptRetryFixture) allowRetry() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retryAllowed = true
+}
+
+func (f *browserMessageReceiptRetryFixture) proxy(w http.ResponseWriter, r *http.Request, router http.Handler) bool {
+	messagePath := "/api/conversations/" + f.conversationID + "/messages"
+	if r.Method == http.MethodGet && r.URL.Path == messagePath && r.URL.Query().Get("client_message_id") != "" {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, r)
+		f.mu.Lock()
+		if r.URL.Query().Get("client_message_id") != "" {
+			f.reconciliationChecks++
+		}
+		f.mu.Unlock()
+		copyBrowserFixtureResponse(w, recorder)
+		return true
+	}
+	if r.Method != http.MethodPost || r.URL.Path != messagePath {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return false
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var request struct {
+		ClientMessageID string `json:"client_message_id"`
+	}
+	if json.Unmarshal(body, &request) != nil || request.ClientMessageID == "" {
+		return false
+	}
+	f.mu.Lock()
+	f.postAttempts++
+	firstAttempt := f.postAttempts == 1
+	requireExplicitRetry := f.requireExplicitRetry
+	clientOfflineBeforeRetry := f.clientOfflineBeforeRetry
+	retryAllowed := f.retryAllowed
+	if firstAttempt {
+		f.clientMessageID = request.ClientMessageID
+	}
+	f.mu.Unlock()
+	if requireExplicitRetry && !retryAllowed {
+		if firstAttempt {
+			f.mu.Lock()
+			f.firstAttemptRejected = true
+			f.mu.Unlock()
+		}
+		http.Error(w, "synthetic local offline response before server acceptance", http.StatusServiceUnavailable)
+		return true
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, r)
+	if recorder.Code == http.StatusAccepted {
+		f.mu.Lock()
+		f.serverAccepted = true
+		loseResponse := firstAttempt && !requireExplicitRetry && !clientOfflineBeforeRetry
+		if loseResponse {
+			f.firstResponseLost = true
+		}
+		f.mu.Unlock()
+		if loseResponse {
+			http.Error(w, "synthetic local response interruption after acceptance", http.StatusServiceUnavailable)
+			return true
+		}
+	}
+	copyBrowserFixtureResponse(w, recorder)
+	return true
+}
+
+func copyBrowserFixtureResponse(w http.ResponseWriter, recorder *httptest.ResponseRecorder) {
+	for name, values := range recorder.Header() {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(recorder.Code)
+	_, _ = w.Write(recorder.Body.Bytes())
+}
+
+func TestBrowserMessageReceiptRetryFixtureGate(t *testing.T) {
+	fixture := &browserMessageReceiptRetryFixture{conversationID: "conversation-1"}
+	var serverRequests int
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverRequests++
+		w.WriteHeader(http.StatusAccepted)
+	})
+	request := func() *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/api/conversations/conversation-1/messages",
+			strings.NewReader(`{"client_message_id":"message-0001","content":"hello"}`))
+	}
+	first := httptest.NewRecorder()
+	if !fixture.proxy(first, request(), router) || first.Code != http.StatusServiceUnavailable || serverRequests != 1 {
+		t.Fatalf("first accepted response was not hidden: status=%d server_requests=%d", first.Code, serverRequests)
+	}
+	status := fixture.view()
+	if !status.FirstResponseLost || !status.ServerAccepted || status.PostAttempts != 1 || status.ClientMessageID != "message-0001" {
+		t.Fatalf("receipt retry fixture did not record accepted-but-unknown: %+v", status)
+	}
+	second := httptest.NewRecorder()
+	if !fixture.proxy(second, request(), router) || second.Code != http.StatusAccepted || serverRequests != 2 {
+		t.Fatalf("retry response was not forwarded: status=%d server_requests=%d", second.Code, serverRequests)
+	}
+	reconciliation := httptest.NewRequest(http.MethodGet,
+		"/api/conversations/conversation-1/messages?client_message_id=message-0001", nil)
+	if !fixture.proxy(httptest.NewRecorder(), reconciliation, router) || fixture.view().ReconciliationChecks != 1 {
+		t.Fatal("receipt reconciliation GET was not recorded")
+	}
+}
+
+func TestBrowserMessageReceiptRetryFixtureRequiresExplicitRetry(t *testing.T) {
+	fixture := &browserMessageReceiptRetryFixture{conversationID: "conversation-1", requireExplicitRetry: true}
+	var serverRequests int
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverRequests++
+		w.WriteHeader(http.StatusAccepted)
+	})
+	request := func() *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/api/conversations/conversation-1/messages",
+			strings.NewReader(`{"client_message_id":"message-0001","content":"hello"}`))
+	}
+	first := httptest.NewRecorder()
+	if !fixture.proxy(first, request(), router) || first.Code != http.StatusServiceUnavailable || serverRequests != 0 {
+		t.Fatalf("offline attempt reached the server: status=%d server_requests=%d", first.Code, serverRequests)
+	}
+	status := fixture.view()
+	if !status.RequireExplicitRetry || !status.FirstAttemptRejected || status.ServerAccepted || status.PostAttempts != 1 {
+		t.Fatalf("fixture did not record the unaccepted message: %+v", status)
+	}
+
+	fixture.allowRetry()
+	second := httptest.NewRecorder()
+	if !fixture.proxy(second, request(), router) || second.Code != http.StatusAccepted || serverRequests != 1 {
+		t.Fatalf("explicit retry was not accepted once: status=%d server_requests=%d", second.Code, serverRequests)
+	}
+	status = fixture.view()
+	if !status.RetryAllowed || !status.ServerAccepted || status.PostAttempts != 2 || status.ClientMessageID != "message-0001" {
+		t.Fatalf("explicit retry did not preserve the original idempotency key: %+v", status)
+	}
+}
+
+func TestBrowserMessageReceiptRetryFixtureAcceptsAfterClientOffline(t *testing.T) {
+	fixture := &browserMessageReceiptRetryFixture{
+		conversationID: "conversation-1", clientOfflineBeforeRetry: true,
+	}
+	var serverRequests int
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverRequests++
+		w.WriteHeader(http.StatusAccepted)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/conversation-1/messages",
+		strings.NewReader(`{"client_message_id":"message-0001","content":"hello"}`))
+	accepted := httptest.NewRecorder()
+	if !fixture.proxy(accepted, request, router) || accepted.Code != http.StatusAccepted || serverRequests != 1 {
+		t.Fatalf("first server-visible retry was not accepted once: status=%d server_requests=%d", accepted.Code, serverRequests)
+	}
+	status := fixture.view()
+	if !status.ClientOfflineBeforeRetry || status.FirstAttemptRejected || status.FirstResponseLost ||
+		!status.ServerAccepted || status.PostAttempts != 1 || status.ClientMessageID != "message-0001" {
+		t.Fatalf("client-offline retry outcome was not recorded: %+v", status)
+	}
+	reconciliation := httptest.NewRequest(http.MethodGet,
+		"/api/conversations/conversation-1/messages?client_message_id=message-0001", nil)
+	if !fixture.proxy(httptest.NewRecorder(), reconciliation, router) || fixture.view().ReconciliationChecks != 1 {
+		t.Fatal("receipt reconciliation GET was not recorded")
 	}
 }
 
@@ -1025,7 +1359,8 @@ func (browserAcceptanceTaskStopExecutor) StopTaskOperation(ctx context.Context, 
 
 func (e browserAcceptanceExecutor) ExecuteTask(ctx context.Context, current task.Task) error {
 	delay := 750 * time.Millisecond
-	if current.Objective == browserAcceptanceAcknowledgedContent {
+	switch current.Objective {
+	case browserAcceptanceAcknowledgedContent:
 		// Simulate DSH's persisted revision-start event for the PC acknowledgement fixture.
 		tx, err := e.store.pool.Begin(ctx)
 		if err != nil {
@@ -1039,7 +1374,7 @@ func (e browserAcceptanceExecutor) ExecuteTask(ctx context.Context, current task
 			return fmt.Errorf("commit acknowledgement fixture revision: %w", err)
 		}
 		delay = 2 * time.Minute
-	} else if current.Objective == browserAcceptanceDuplicateContent {
+	case browserAcceptanceDuplicateContent:
 		delay = 30 * time.Second
 	}
 	timer := time.NewTimer(delay)
@@ -1385,7 +1720,7 @@ func TestBrowserActivityOutcomeVerifyEndpoint(t *testing.T) {
 	for _, scenario := range []string{"failed", "approval"} {
 		t.Run(scenario, func(t *testing.T) {
 			activity := &browserAcceptanceActivity{controlToken: "fixture-token", runs: map[string]*browserActivityRun{
-				scenario: &browserActivityRun{name: scenario, stage: "progress"},
+				scenario: {name: scenario, stage: "progress"},
 			}}
 			request := httptest.NewRequest(http.MethodGet, "/__morde_fixture/verify/"+scenario, nil)
 			request.Header.Set("X-Morde-Fixture-Token", activity.controlToken)

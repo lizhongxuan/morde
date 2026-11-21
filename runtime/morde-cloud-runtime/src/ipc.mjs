@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
-import { coordinatorCompactionModelCallID, coordinatorModelCallID, validMessageDelivery } from './engine.mjs'
+import {
+  coordinatorCompactionModelCallID, coordinatorModelCallID, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
+  taskValidationReviewModelCallID, validMessageDelivery,
+} from './engine.mjs'
 
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024
 const MAX_MODEL_QUEUE_BYTES = 1024 * 1024
@@ -38,7 +41,9 @@ function exactKeys(value, expected) {
 function validModelEndFrame(frame, identity) {
   const fence = identity.context_role === 'coordinator'
     ? COORDINATOR_IDENTITY_FIELDS
-    : ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+    : identity.context_role === 'task_validation_review'
+      ? TASK_VALIDATION_REVIEW_IDENTITY_FIELDS
+      : ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
   if (typeof frame.ok !== 'boolean') return false
   if (frame.ok === true || !Object.hasOwn(frame, 'failure_code')) {
     return exactKeys(frame, ['type', ...fence, 'id', 'ok'])
@@ -49,6 +54,23 @@ function validModelEndFrame(frame, identity) {
 
 function matchesCoordinatorIdentity(frame, identity) {
   return identity?.context_role === 'coordinator' && COORDINATOR_IDENTITY_FIELDS.every(key => frame[key] === identity[key])
+}
+
+function matchesTaskValidationReviewIdentity(frame, identity) {
+  return identity?.context_role === 'task_validation_review' &&
+    TASK_VALIDATION_REVIEW_IDENTITY_FIELDS.every(key => frame[key] === identity[key])
+}
+
+function validTaskValidationReviewIdentity(identity) {
+  return isObject(identity) && exactKeys(identity, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS) &&
+    identity.context_role === 'task_validation_review' && identity.purpose === 'task_validation_review' &&
+    ['owner_id', 'actor_id', 'task_id', 'session_id'].every(key => typeof identity[key] === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(identity[key])) &&
+    Number.isSafeInteger(identity.task_revision) && identity.task_revision >= 0 &&
+    Number.isSafeInteger(identity.result_event_sequence) && identity.result_event_sequence > 0 &&
+    typeof identity.result_sha256 === 'string' && /^[a-f0-9]{64}$/.test(identity.result_sha256) &&
+    Number.isSafeInteger(identity.claim_generation) && identity.claim_generation > 0 &&
+    typeof identity.lease_owner === 'string' && identity.lease_owner.length > 0 && identity.lease_owner.trim() === identity.lease_owner &&
+    Buffer.byteLength(identity.lease_owner, 'utf8') <= 128
 }
 
 function jpegDimensions(bytes) {
@@ -230,6 +252,11 @@ export class WorkerIPC {
           (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS]) || !matchesCoordinatorIdentity(frame, this.startFrame))) {
         throw new Error('invalid coordinator cancellation fence')
       }
+      if (this.startFrame.context_role === 'task_validation_review' &&
+          (!exactKeys(frame, ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS]) ||
+            !matchesTaskValidationReviewIdentity(frame, this.startFrame))) {
+        throw new Error('invalid Task validation review cancellation fence')
+      }
       this.cancel()
       return
     }
@@ -270,6 +297,9 @@ export class WorkerIPC {
       if (pending.identity.context_role === 'coordinator' &&
           (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok', 'through_seq', 'sha256']) ||
             !matchesCoordinatorIdentity(frame, pending.identity))) throw new Error('invalid coordinator checkpoint acknowledgment')
+      if (pending.identity.context_role === 'task_validation_review' &&
+          (!exactKeys(frame, ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'id', 'ok', 'through_seq', 'sha256']) ||
+            !matchesTaskValidationReviewIdentity(frame, pending.identity))) throw new Error('invalid Task validation review checkpoint acknowledgment')
       this.pending.delete(frame.id)
       clearTimeout(pending.timer)
       if (frame.ok !== true || frame.through_seq !== pending.through || frame.sha256 !== pending.digest ||
@@ -286,6 +316,9 @@ export class WorkerIPC {
       if (pending.identity.context_role === 'coordinator' &&
           (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256']) ||
             !matchesCoordinatorIdentity(frame, pending.identity))) throw new Error('invalid coordinator checkpoint page')
+      if (pending.identity.context_role === 'task_validation_review' &&
+          (!exactKeys(frame, ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256']) ||
+            !matchesTaskValidationReviewIdentity(frame, pending.identity))) throw new Error('invalid Task validation review checkpoint page')
       this.pending.delete(frame.id)
       clearTimeout(pending.timer)
       if (frame.ok !== true || !Object.entries(pending.identity).every(([key, value]) => frame[key] === value)) {
@@ -338,11 +371,13 @@ export class WorkerIPC {
       if (!pending || pending.kind !== 'child_settle_ack') throw new Error('unknown child settlement response')
       this.childPending.delete(frame.call_id)
       clearTimeout(pending.timer)
-      if (frame.ok !== true || !Object.entries(pending.identity).every(([key, value]) => frame[key] === value)) {
+      const hasOutput = Object.hasOwn(frame, 'output')
+      if (frame.ok !== true || hasOutput && (typeof frame.output !== 'string' || Buffer.byteLength(frame.output) > MAX_TOOL_OUTPUT_BYTES) ||
+          !Object.entries(pending.identity).every(([key, value]) => frame[key] === value)) {
         pending.reject(new Error('child settlement was not confirmed'))
         throw new Error('invalid child settlement response')
       }
-      pending.resolve()
+      pending.resolve(hasOutput ? frame.output : undefined)
       return
     }
     if (frame.type === 'model_chunk' || frame.type === 'model_end') {
@@ -352,8 +387,13 @@ export class WorkerIPC {
             frame.type === 'model_chunk' && cancelledIdentity.context_role === 'coordinator' &&
             (!exactKeys(frame, frame.type === 'model_chunk'
               ? ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'index', 'chunk']
-              : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, cancelledIdentity))) {
-          throw new Error('invalid coordinator model response identity')
+              : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, cancelledIdentity)) ||
+            frame.type === 'model_chunk' && cancelledIdentity.context_role === 'task_validation_review' &&
+            (!exactKeys(frame, frame.type === 'model_chunk'
+              ? ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'id', 'index', 'chunk']
+              : ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'id', 'ok']) || !matchesTaskValidationReviewIdentity(frame, cancelledIdentity))) {
+          throw new Error(cancelledIdentity.context_role === 'task_validation_review'
+            ? 'invalid Task validation review model response identity' : 'invalid coordinator model response identity')
         }
         if (!Object.entries(cancelledIdentity).every(([key, value]) => frame[key] === value)) throw new Error('invalid model response identity')
         if (frame.type === 'model_end') this.cancelledModels.delete(frame.id)
@@ -365,8 +405,13 @@ export class WorkerIPC {
           frame.type === 'model_chunk' && model.identity.context_role === 'coordinator' &&
           (!exactKeys(frame, frame.type === 'model_chunk'
             ? ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'index', 'chunk']
-            : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, model.identity))) {
-        throw new Error('invalid coordinator model response identity')
+            : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, model.identity)) ||
+          frame.type === 'model_chunk' && model.identity.context_role === 'task_validation_review' &&
+          (!exactKeys(frame, frame.type === 'model_chunk'
+            ? ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'id', 'index', 'chunk']
+            : ['type', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'id', 'ok']) || !matchesTaskValidationReviewIdentity(frame, model.identity))) {
+        throw new Error(model.identity.context_role === 'task_validation_review'
+          ? 'invalid Task validation review model response identity' : 'invalid coordinator model response identity')
       }
       if (!Object.entries(model.identity).every(([key, value]) => frame[key] === value)) throw new Error('invalid model response identity')
       model.receive(frame)
@@ -534,7 +579,7 @@ export class WorkerIPC {
         type: 'child_settle', ...identity, call_id: callID, status,
         through_seq: through, sha256: digest, summary,
       })
-      await result.promise
+      return await result.promise
     } catch (error) {
       if (this.childPending.delete(callID)) clearTimeout(timer)
       throw error
@@ -546,7 +591,14 @@ export class WorkerIPC {
 
   async *streamModel(identity, id, through, request, signal) {
     if (this.models.size >= 17 || this.models.has(id) || this.cancelledModels.has(id)) throw new Error('too many active model requests')
-    if (identity.context_role === 'coordinator') {
+    if (identity.context_role === 'task_validation_review') {
+      if (!validTaskValidationReviewIdentity(identity) ||
+          id !== taskValidationReviewModelCallID(identity.owner_id, identity.task_id, identity.task_revision,
+            identity.result_event_sequence, identity.result_sha256, identity.claim_generation, identity.session_id, through) ||
+          !Array.isArray(request.tools) || request.tools.length !== 0) {
+        throw new Error('model call does not match the Task validation review fence')
+      }
+    } else if (identity.context_role === 'coordinator') {
       const expectedID = identity.purpose === 'compaction'
         ? coordinatorCompactionModelCallID(identity.conversation_id, identity.operation_id, identity.session_id, through)
         : coordinatorModelCallID(identity.conversation_id, identity.message_id, identity.session_id, through)

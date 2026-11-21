@@ -107,6 +107,25 @@ func TestConversationMessageReceiptIsAtomicAndScoped(t *testing.T) {
 	if err != nil || replayed || otherConversation.ID == acceptedID || otherConversation.ConversationID != third.ID {
 		t.Fatalf("client id crossed conversation scope: %+v, replayed=%t, err=%v", otherConversation, replayed, err)
 	}
+	if _, err := store.GetConversation(ctx, first.ID, other.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("another account read the conversation: %v", err)
+	}
+	if _, err := store.ListMessages(ctx, other.ID, first.ID, app.PageRequest{Limit: 10}); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("another account read conversation messages: %v", err)
+	}
+	ownerConversations, err := store.ListConversations(ctx, owner.ID, nil, app.PageRequest{Limit: 10})
+	if err != nil {
+		t.Fatalf("list owner conversations: %v", err)
+	}
+	otherConversations, err := store.ListConversations(ctx, other.ID, nil, app.PageRequest{Limit: 10})
+	if err != nil {
+		t.Fatalf("list other account conversations: %v", err)
+	}
+	if len(ownerConversations.Items) != 2 || len(otherConversations.Items) != 1 ||
+		ownerConversations.Items[0].OwnerID != owner.ID || ownerConversations.Items[1].OwnerID != owner.ID ||
+		otherConversations.Items[0].OwnerID != other.ID || otherConversations.Items[0].ID == first.ID {
+		t.Fatalf("conversation lists crossed account boundaries: owner=%+v other=%+v", ownerConversations.Items, otherConversations.Items)
+	}
 	var messages, routes, tasks int
 	if err := pool.QueryRow(ctx, `SELECT
 (SELECT count(*) FROM conversation_messages WHERE conversation_id=$1),

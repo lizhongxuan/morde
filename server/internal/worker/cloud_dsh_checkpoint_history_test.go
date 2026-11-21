@@ -301,6 +301,159 @@ func TestCloudDSHCheckpointHistoryReconcilesPinnedToolResult(t *testing.T) {
 	}
 }
 
+func TestCloudDSHCheckpointHistoryKeepsOnlyAnswerBoundEvidenceClaims(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		finalText  string
+		wantClaims bool
+		invalidEnd bool
+	}{
+		{name: "exact answer", finalText: "已完成", wantClaims: true},
+		{name: "answer changed", finalText: "已完成，另有结果", wantClaims: false},
+		{name: "invalid range", finalText: "已完成", invalidEnd: true, wantClaims: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			answer := "已完成"
+			endByte := int32(len(answer))
+			if test.invalidEnd {
+				endByte++
+			}
+			args, err := json.Marshal(map[string]any{"claims": []app.TaskResultClaim{{
+				ID: "claim-1", StartByte: 0, EndByte: endByte, EvidenceRefs: []app.TaskValidationEvidenceRef{
+					{Kind: app.TaskValidationEvidenceSource, ID: "current"},
+					{Kind: app.TaskValidationEvidenceAction, CallID: "call_action_1"},
+				},
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			history := newCloudDSHCheckpointHistory("session_1")
+			if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+				checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+				checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+				checkpointAssistantTextAndTool(2, answer, "call_evidence_1", cloudDSHResultEvidenceToolName, string(args)),
+				checkpointNamedToolCall(3, "call_evidence_1", cloudDSHResultEvidenceToolName, string(args)),
+			), 0, 3); err != nil {
+				t.Fatal(err)
+			}
+			ack := "Evidence map received as an untrusted claim."
+			if err := history.noteToolResult("call_evidence_1", cloudDSHResultEvidenceToolName, args,
+				app.AgentToolSucceeded, ack, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := history.append(cloudDSHCheckpointPayload("session_1", 4,
+				checkpointNamedToolResult(4, "call_evidence_1", ack, 3),
+				checkpointAssistantText(5, test.finalText),
+				checkpointTurnEnd(6, "step/end", map[string]any{"turn": 1, "step": 1}),
+				checkpointTurnEnd(7, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
+			), 4, 7); err != nil {
+				t.Fatal(err)
+			}
+			completion, err := history.completion(cloudDSHFence("session_1"), 7, make([]byte, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(completion.ValidationClaims) > 0; got != test.wantClaims {
+				t.Fatalf("completion ValidationClaims present = %v, want %v", got, test.wantClaims)
+			}
+		})
+	}
+}
+
+func TestCloudDSHCheckpointHistoryDoesNotReuseEvidenceAcrossTurns(t *testing.T) {
+	answer := "已完成"
+	args, err := json.Marshal(map[string]any{"claims": []app.TaskResultClaim{{
+		ID: "claim-1", StartByte: 0, EndByte: int32(len(answer)), EvidenceRefs: []app.TaskValidationEvidenceRef{
+			{Kind: app.TaskValidationEvidenceSource, ID: "current"},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+		checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+		checkpointAssistantTextAndTool(2, answer, "call_evidence_1", cloudDSHResultEvidenceToolName, string(args)),
+		checkpointNamedToolCall(3, "call_evidence_1", cloudDSHResultEvidenceToolName, string(args)),
+	), 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	ack := "Evidence map received as an untrusted claim."
+	if err := history.noteToolResult("call_evidence_1", cloudDSHResultEvidenceToolName, args, app.AgentToolSucceeded, ack, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 4,
+		checkpointNamedToolResult(4, "call_evidence_1", ack, 3), checkpointAssistantText(5, answer),
+		checkpointTurnEnd(6, "step/end", map[string]any{"turn": 1, "step": 1}),
+		checkpointTurnEnd(7, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
+	), 4, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 8,
+		checkpointTurnStart(8, "turn/start", map[string]any{"turn": 2}),
+		checkpointTurnStart(9, "step/start", map[string]any{"turn": 2, "step": 1}),
+		cloudDSHCheckpointEvent{Sequence: 10, Type: "assistant/message", Data: map[string]any{"turn": 2, "step": 1,
+			"message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": answer}}}}},
+		checkpointTurnEnd(11, "step/end", map[string]any{"turn": 2, "step": 1}),
+		checkpointTurnEnd(12, "turn/end", map[string]any{"turn": 2, "reason": map[string]any{"kind": "completed"}}),
+	), 8, 12); err != nil {
+		t.Fatal(err)
+	}
+	completion, err := history.completion(cloudDSHFence("session_1"), 12, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completion.ValidationClaims) != 0 {
+		t.Fatalf("stale prior-turn claims survived: %#v", completion.ValidationClaims)
+	}
+}
+
+func TestCloudDSHPerformanceComparisonRequiresMatchingReconciledMeasurements(t *testing.T) {
+	comparison := &app.TaskResultPerformanceComparison{
+		Metric: "latency", Unit: "ms", Before: 120, After: 90, Environment: "same host",
+		BaselineCallID: "call_baseline_1", AfterCallID: "call_after_1",
+	}
+	measurement := func(value string) *cloudDSHToolCall {
+		return &cloudDSHToolCall{callSeen: true, resultSeen: true, reconciled: true, status: app.AgentToolSucceeded,
+			output: value}
+	}
+	baseOutput := `{"type":"morde.performance_measurement.v1","metric":"latency","unit":"ms","value":120,"environment":"same host"}`
+	afterOutput := `{"type":"morde.performance_measurement.v1","metric":"latency","unit":"ms","value":90,"environment":"same host"}`
+	for _, test := range []struct {
+		name      string
+		baseline  *cloudDSHToolCall
+		after     *cloudDSHToolCall
+		wantMatch bool
+	}{
+		{name: "matching outputs", baseline: measurement(baseOutput), after: measurement(afterOutput), wantMatch: true},
+		{name: "claimed value differs", baseline: measurement(baseOutput), after: measurement(strings.Replace(afterOutput, `"value":90`, `"value":91`, 1))},
+		{name: "different metric", baseline: measurement(baseOutput), after: measurement(strings.Replace(afterOutput, `"metric":"latency"`, `"metric":"throughput"`, 1))},
+		{name: "not reconciled", baseline: measurement(baseOutput), after: func() *cloudDSHToolCall {
+			call := measurement(afterOutput)
+			call.reconciled = false
+			return call
+		}()},
+		{name: "failed tool", baseline: measurement(baseOutput), after: func() *cloudDSHToolCall {
+			call := measurement(afterOutput)
+			call.status = app.AgentToolFailed
+			return call
+		}()},
+		{name: "missing value", baseline: measurement(`{"type":"morde.performance_measurement.v1","metric":"latency","unit":"ms","environment":"same host"}`), after: measurement(afterOutput)},
+		{name: "duplicate key", baseline: measurement(`{"type":"morde.performance_measurement.v1","metric":"latency","unit":"ms","value":120,"value":120,"environment":"same host"}`), after: measurement(afterOutput)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claims := []app.TaskResultClaim{{PerformanceComparison: comparison}}
+			got := cloudDSHPerformanceComparisonsMatch(claims, map[string]*cloudDSHToolCall{
+				"call_baseline_1": test.baseline, "call_after_1": test.after,
+			})
+			if got != test.wantMatch {
+				t.Fatalf("comparison matched = %v, want %v", got, test.wantMatch)
+			}
+		})
+	}
+}
+
 func TestCloudDSHCheckpointHistoryRequiresRecoveredResultToBeDurable(t *testing.T) {
 	history := newCloudDSHCheckpointHistory("session_1")
 	history.beginRestore()
@@ -510,13 +663,38 @@ func checkpointAssistantText(seq int64, text string) cloudDSHCheckpointEvent {
 	}}
 }
 
+func checkpointAssistantTextAndTool(seq int64, text, callID, name, arguments string) cloudDSHCheckpointEvent {
+	return cloudDSHCheckpointEvent{Sequence: seq, Type: "assistant/message", Data: map[string]any{
+		"turn": 1, "step": 1,
+		"message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": text},
+			map[string]any{"type": "tool-call", "id": callID, "name": name, "arguments": arguments},
+		}},
+	}}
+}
+
 func checkpointToolCall(seq int64, callID string) cloudDSHCheckpointEvent {
 	return cloudDSHCheckpointEvent{Sequence: seq, Type: "tool/call", Data: map[string]any{
 		"turn": 1, "step": 1, "callId": callID, "name": "file_write", "arguments": checkpointToolArguments,
 	}}
 }
 
+func checkpointNamedToolCall(seq int64, callID, name, arguments string) cloudDSHCheckpointEvent {
+	return cloudDSHCheckpointEvent{Sequence: seq, Type: "tool/call", Data: map[string]any{
+		"turn": 1, "step": 1, "callId": callID, "name": name, "arguments": arguments,
+	}}
+}
+
 func checkpointToolResult(seq int64, callID, output string, sourceSeq int64) cloudDSHCheckpointEvent {
+	return cloudDSHCheckpointEvent{Sequence: seq, Type: "tool/result", Data: map[string]any{
+		"turn": 1, "step": 1,
+		"message": map[string]any{"toolCallId": callID, "isError": false,
+			"source":  map[string]any{"kind": "tool", "callId": callID},
+			"content": []any{map[string]any{"type": "text", "text": output}}},
+	}, SurfaceOp: "append", SourceEventSeqs: []int64{sourceSeq}}
+}
+
+func checkpointNamedToolResult(seq int64, callID, output string, sourceSeq int64) cloudDSHCheckpointEvent {
 	return cloudDSHCheckpointEvent{Sequence: seq, Type: "tool/result", Data: map[string]any{
 		"turn": 1, "step": 1,
 		"message": map[string]any{"toolCallId": callID, "isError": false,

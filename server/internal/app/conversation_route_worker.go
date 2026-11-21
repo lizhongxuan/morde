@@ -66,3 +66,9 @@ type ConversationRouteAggregationResolution interface {
 type ConversationRoutePredecessorRecovery interface {
 	RequeueConversationRouteAfterPredecessor(context.Context, ConversationRouteClaim, ConversationRouteSnapshot) (bool, error)
 }
+
+// ConversationRouteContextRecovery releases a route for a fresh classification
+// after the model gateway rejects a stale authorization snapshot.
+type ConversationRouteContextRecovery interface {
+	RequeueConversationRouteAfterContextChange(context.Context, ConversationRouteClaim) (bool, error)
+}

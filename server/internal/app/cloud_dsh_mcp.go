@@ -1022,6 +1022,7 @@ func validCloudDSHMCPJSON(raw []byte) bool {
 }
 
 func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
+	ctx = withTaskToolContentEvidence(ctx, name, result)
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh MCP tool completed and its result was saved."
 	if result.Status == AgentToolFailed {
 		step.Status, step.Summary = task.StepFailed, "The MCP connector reported a definitive tool error."

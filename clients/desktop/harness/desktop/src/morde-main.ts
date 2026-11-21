@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync 
 import { access, lstat, realpath } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, SyncRunError, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
@@ -17,6 +17,55 @@ const userData = mordeUserDataDirectory(app.getPath("appData"), process.env.MORD
 mkdirSync(userData, { recursive: true, mode: 0o700 });
 app.setPath("userData", userData);
 const systemFetch: typeof fetch = (input, init) => net.fetch(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, init);
+const hostEmbedFetch: typeof fetch = (input, init) => {
+  const options = init;
+  const body = options?.body;
+  if (!options || !(body instanceof URLSearchParams)) return Promise.reject(new TypeError("Invalid Host embed request body"));
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const requestSession = session.fromPartition(`morde-host-embed-${randomUUID()}`);
+  const headers: Record<string, string> = {};
+  new Headers(options.headers).forEach((value, name) => { headers[name] = value; });
+  const request = net.request({
+    url, method: options.method ?? "GET", headers, redirect: "manual", session: requestSession, credentials: "omit",
+  });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let exchangeHeaders: Record<string, string[]> | undefined;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      requestSession.webRequest.onHeadersReceived(null);
+      void requestSession.clearStorageData().catch(() => undefined);
+      callback();
+    };
+    const onAbort = () => finish(() => { request.abort(); reject(new Error("Host embed exchange timed out")); });
+    const headersFrom = (source: Record<string, string | string[] | undefined>) => {
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(source)) {
+        for (const item of Array.isArray(value) ? value : value === undefined ? [] : [value]) headers.append(name, item);
+      }
+      return headers;
+    };
+    // The redirect event omits Set-Cookie; capture it before Chromium filters the response headers.
+    requestSession.webRequest.onHeadersReceived({ urls: [url] }, (details, callback) => {
+      if (details.url === url) exchangeHeaders = details.responseHeaders;
+      callback({});
+    });
+    request.on("redirect", (statusCode, _method, _redirectUrl, headers) => {
+      finish(() => resolve(new Response(null, { status: statusCode, headers: headersFrom(exchangeHeaders ?? headers) })));
+    });
+    request.on("response", (response) => {
+      response.on("data", () => undefined);
+      response.on("error", (error) => finish(() => reject(error)));
+      finish(() => resolve(new Response(null, { status: response.statusCode ?? 500, headers: headersFrom(exchangeHeaders ?? response.headers) })));
+    });
+    request.on("error", (error) => finish(() => reject(error)));
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    else request.end(body.toString());
+  });
+};
 const zh = (app.getLocale() || "").toLowerCase().startsWith("zh");
 let mainWindow: BrowserWindow | null = null;
 let codexWindow: BrowserWindow | null = null;
@@ -145,7 +194,7 @@ let localPortalServer: LocalPortalServer | null = null;
 let localPortalServerClose: Promise<void> | null = null;
 let webAttached = false;
 let webOpenTask: { window: BrowserWindow; promise: Promise<void> } | null = null;
-let view: "web" | "offline" = "web";
+let view: "connecting" | "web" | "offline" = "connecting";
 let webRefreshTimer: NodeJS.Timeout | null = null;
 let credentialExpiryTimer: NodeJS.Timeout | null = null;
 let authorizationCheckTimer: NodeJS.Timeout | null = null;
@@ -2125,6 +2174,9 @@ function trustedPortalBridgeEvent(event: { sender: WebContents; senderFrame: { u
 }
 
 const documentLoadOptions = { extraHeaders: "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
+async function loadAssistantPage(contents: WebContents, url: string): Promise<void> {
+  await withTimeout(contents.loadURL(url, documentLoadOptions), 20_000, () => contents.stop());
+}
 function installDocumentErrorRecovery(partition: Session, origin?: string): (contents: WebContents, fallbackURL: string, fallbackLabel: string) => (value: string) => boolean {
   type RecoveryPage = { contents: WebContents; fallbackURL: string; fallbackLabel: string; recoveryPageURL: string | null; blockedDocumentURL: string | null };
   const pages = new Map<number, RecoveryPage>();
@@ -2295,7 +2347,7 @@ async function openNativeWorkbenchEmbed(input: unknown): Promise<{ hostID: strin
     throw new Error("Host authorization targets changed; refresh and reconnect");
   }
   const exchanged = await exchangeHostEmbedTicket(ticket.exchangeURL, host, auth.origin, ticket.ticket, ticket.embedNonce,
-    initialTarget as HostEmbedTarget, ticket.targets, systemFetch);
+    initialTarget as HostEmbedTarget, ticket.targets, hostEmbedFetch);
   if (credentials !== auth || !webView || !mainWindow || mainWindow.isDestroyed()) throw new Error("Morde authorization changed; reconnect the computer");
   const partition = session.fromPartition(`morde-workbench-${profileID(auth)}`);
   let content: WebContentsView | undefined;
@@ -2377,7 +2429,19 @@ function sendNativeWorkbenchCommand(nonce: unknown, value: unknown): { sent: boo
   if (typeof nonce !== "string" || !embed || nonce !== embed.nonce || credentials !== embed.auth ||
     !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Host Workbench command");
   const message = value as Record<string, unknown>;
-  if (embed.view.webContents.isDestroyed() || !trustedNativeWorkbenchPage(embed.view.webContents.getURL(), embed)) return { sent: false };
+  if (embed.view.webContents.isDestroyed()) return { sent: false };
+  if (!trustedNativeWorkbenchPage(embed.view.webContents.getURL(), embed)) {
+    if (message.type === "init" && message.conversation_id === embed.conversationID && typeof message.visible === "boolean") {
+      embed.initialized = true;
+      embed.visible = message.visible;
+      return { sent: true };
+    }
+    if (message.type === "visibility" && embed.initialized && typeof message.visible === "boolean") {
+      embed.visible = message.visible;
+      return { sent: true };
+    }
+    return { sent: false };
+  }
   let forwarded: Record<string, unknown>;
   if (message.type === "init" && message.conversation_id === embed.conversationID && typeof message.visible === "boolean") {
     embed.initialized = true;
@@ -2428,13 +2492,20 @@ function notifyNativeWorkbenchState(event: { sender: WebContents; senderFrame: {
   const validSequence = (sequence: unknown, latestCommand: number, lastState: number) => sequence === null
     ? lastState === 0
     : Number.isSafeInteger(sequence) && (sequence as number) >= Math.max(1, lastState) && (sequence as number) <= latestCommand;
-  if (message.nonce !== embed.nonce || message.type !== "state" || message.conversation_id !== embed.conversationID || message.host_id !== embed.hostID ||
-    typeof message.workbench_ready !== "boolean" || !["connecting", "connected", "disconnected", "failed"].includes(String(message.remote_desktop)) ||
-    !["ai", "taking_over", "user", "returning", "unknown"].includes(String(message.control_state)) || typeof message.control_lease_active !== "boolean" ||
-    typeof message.control_lease_held_by_me !== "boolean" || !activeTargetAllowed ||
-    !(message.control_version === null || Number.isSafeInteger(message.control_version) && (message.control_version as number) >= 0) ||
-    typeof message.control_locked !== "boolean" || !validSequence(message.selection_seq, embed.selectionCommandSeq, embed.selectionStateSeq) ||
-    !validSequence(message.lock_seq, embed.lockCommandSeq, embed.lockStateSeq)) throw new Error("Invalid Host Workbench state");
+  const invalidFields = [
+    ["nonce", message.nonce === embed.nonce], ["type", message.type === "state"],
+    ["conversation_id", message.conversation_id === embed.conversationID], ["host_id", message.host_id === embed.hostID],
+    ["workbench_ready", typeof message.workbench_ready === "boolean"],
+    ["remote_desktop", ["connecting", "connected", "disconnected", "failed"].includes(String(message.remote_desktop))],
+    ["control_state", ["ai", "taking_over", "user", "returning", "unknown"].includes(String(message.control_state))],
+    ["control_lease_active", typeof message.control_lease_active === "boolean"],
+    ["control_lease_held_by_me", typeof message.control_lease_held_by_me === "boolean"], ["active_target", activeTargetAllowed],
+    ["control_version", message.control_version === null || Number.isSafeInteger(message.control_version) && (message.control_version as number) >= 0],
+    ["control_locked", typeof message.control_locked === "boolean"],
+    ["selection_seq", validSequence(message.selection_seq, embed.selectionCommandSeq, embed.selectionStateSeq)],
+    ["lock_seq", validSequence(message.lock_seq, embed.lockCommandSeq, embed.lockStateSeq)],
+  ].filter(([, valid]) => !valid).map(([field]) => field);
+  if (invalidFields.length) throw new Error(`Invalid Host Workbench state: ${invalidFields.join(",")}`);
   if (typeof message.selection_seq === "number") embed.selectionStateSeq = message.selection_seq;
   if (typeof message.lock_seq === "number") embed.lockStateSeq = message.lock_seq;
   embed.parent.send("morde:portal-workbench-message", {
@@ -2548,6 +2619,14 @@ function showView(next: "web" | "offline"): void {
   }
   notifyState();
 }
+function showConnecting(): void {
+  view = "connecting";
+  if (mainWindow && webAttached && webView) {
+    mainWindow.contentView.removeChildView(webView);
+    webAttached = false;
+  }
+  notifyState();
+}
 function showOffline(): void {
   showView("offline");
   mainWindow?.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
@@ -2614,7 +2693,9 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
         : "/assistant";
       void refreshWebSession(auth).then(() => {
         const refreshedOrigin = portalOriginFor(auth);
-        if (refreshedOrigin && credentials === auth && mainWindow === owner && webPartition === partition && !content.webContents.isDestroyed()) return content.webContents.loadURL(`${refreshedOrigin}${route}`, documentLoadOptions).catch(() => undefined);
+        if (refreshedOrigin && credentials === auth && mainWindow === owner && webPartition === partition && !content.webContents.isDestroyed()) {
+          return loadAssistantPage(content.webContents, `${refreshedOrigin}${route}`);
+        }
       }).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
     };
     content.webContents.setWindowOpenHandler((details) => {
@@ -2663,11 +2744,14 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
       const embed = nativeWorkbenchEmbed;
       if (embed?.parent === content.webContents && target?.pathname !== "/assistant") void closeNativeWorkbenchEmbed(embed.nonce).catch(() => undefined);
       if (target?.pathname === "/login") restoreFromLogin(target);
-      if (target?.pathname.startsWith("/admin")) { void shell.openExternal(new URL(`${target.pathname}${target.search}${target.hash}`, auth.origin).href); void content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined); }
+      if (target?.pathname.startsWith("/admin")) {
+        void shell.openExternal(new URL(`${target.pathname}${target.search}${target.hash}`, auth.origin).href);
+        void loadAssistantPage(content.webContents, assistantURL).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
+      }
     });
-    await content.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined);
-  } else if (webView.webContents.getURL() !== assistantURL) {
-    await webView.webContents.loadURL(assistantURL, documentLoadOptions).catch(() => undefined);
+    await loadAssistantPage(content.webContents, assistantURL);
+  } else if (webView.webContents.getURL() !== assistantURL || view !== "web") {
+    await loadAssistantPage(webView.webContents, assistantURL);
   }
   if (credentials !== auth || mainWindow !== owner || owner.isDestroyed() || webPartition !== partition) return;
   showView("web");
@@ -2723,7 +2807,9 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     scheduleAuthorizationCheck();
     void codex.start().catch(() => notifyState());
     void refreshLiveSyncCapability(result.credentials);
-    await openAssistant(result.webSession);
+    showConnecting();
+    try { await openAssistant(result.webSession); }
+    catch { showOffline(); }
     void restoreWorkspaceNode(result.credentials);
     return publicState();
   } catch (error) {
@@ -3518,8 +3604,9 @@ function showWindow(): void {
   const created = !mainWindow;
   if (created) mainWindow = makeWindow();
   if (credentials) {
-    if (webView) showView("web");
+    if (webView && view === "web") showView("web");
     else {
+      showConnecting();
       const owner = mainWindow;
       void openAssistant().catch(() => {
         if (!owner || mainWindow !== owner || owner.isDestroyed()) return;

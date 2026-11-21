@@ -16,7 +16,7 @@ class Element {
 async function mount(api) {
   const elements = new Map();
   const document = { getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); } };
-  ['login', 'offline-page', 'offline-message', 'login-form', 'origin', 'name', 'password', 'submit', 'message', 'register', 'download', 'retry-assistant', 'sign-out'].forEach((id) => document.getElementById(id));
+  ['login', 'connecting-page', 'offline-page', 'offline-message', 'login-form', 'origin', 'name', 'password', 'submit', 'message', 'register', 'download', 'retry-assistant', 'sign-out'].forEach((id) => document.getElementById(id));
   const source = await readFile(new URL('../resources/morde.js', import.meta.url), 'utf8');
   vm.runInNewContext(source, { window: { morde: api }, document }, { filename: 'morde.js' });
   await new Promise((resolve) => setImmediate(resolve));
@@ -82,10 +82,29 @@ test('offline fallback retries the PC page instead of opening a standalone sync 
   assert.deepEqual(calls[1], ['register', 'https://portal.example']);
 });
 
+test('authenticated startup shows a connecting state until the Portal view is ready', async () => {
+  let updateState;
+  const api = {
+    state: async () => ({ authenticated: true, origin: 'https://portal.example', storageReady: true, view: 'connecting' }),
+    onState: (listener) => { updateState = listener; },
+    onSync() {},
+  };
+  const elements = await mount(api);
+  assert.equal(elements.get('login').hidden, true);
+  assert.equal(elements.get('connecting-page').hidden, false);
+  assert.equal(elements.get('offline-page').hidden, true);
+  updateState({ authenticated: true, view: 'web' });
+  assert.equal(elements.get('connecting-page').hidden, true);
+  updateState({ authenticated: true, view: 'offline' });
+  assert.equal(elements.get('connecting-page').hidden, true);
+  assert.equal(elements.get('offline-page').hidden, false);
+});
+
 test('desktop fallback contains no separate sync page or fixed notification overlay', async () => {
   const html = await readFile(new URL('../resources/morde.html', import.meta.url), 'utf8');
   const css = await readFile(new URL('../resources/morde.css', import.meta.url), 'utf8');
   assert.match(html, /id="offline-page"/);
+  assert.match(html, /id="connecting-page"/);
   assert.match(html, /本机项目/);
   assert.doesNotMatch(html, /sync-page|project-upload|workspace-sync|local-sync/);
   assert.doesNotMatch(css, /position\s*:\s*fixed/);

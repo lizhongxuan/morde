@@ -247,7 +247,7 @@ func TestRuntimeToolRiskTiers(t *testing.T) {
 	}
 }
 
-func TestRuntimeToolExecutorPrepareRequiresSensitiveApprovalWithoutPersistingArguments(t *testing.T) {
+func TestRuntimeToolExecutorPrepareShowsBoundedSensitiveActionPreviewWithoutDispatch(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
 		capability: "shell.exec", action: "run",
 		result: `{"exit_code":0,"stdout":"ok","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
@@ -260,10 +260,18 @@ func TestRuntimeToolExecutorPrepareRequiresSensitiveApprovalWithoutPersistingArg
 	if preparation.Token != "" || preparation.Approval.Object == "" || preparation.Approval.Content == "" || preparation.Approval.Impact == "" {
 		t.Fatalf("sensitive preparation = %#v; want a non-executable approval request", preparation)
 	}
-	if strings.Contains(preparation.Approval.Object+preparation.Approval.Content+preparation.Approval.Impact, "private-value") ||
-		fixture.handlers["shell.exec"].calls.Load() != 0 || len(fixture.store.operations) != 0 {
-		t.Fatalf("approval exposed arguments or executed work: approval=%#v calls=%d operations=%d", preparation.Approval,
+	if !strings.Contains(preparation.Approval.Content, `"command":"echo private-value"`) ||
+		strings.Contains(preparation.Approval.Content, `"workspace_id"`) || fixture.handlers["shell.exec"].calls.Load() != 0 || len(fixture.store.operations) != 0 {
+		t.Fatalf("approval did not show the bounded exact-action preview or executed work: approval=%#v calls=%d operations=%d", preparation.Approval,
 			fixture.handlers["shell.exec"].calls.Load(), len(fixture.store.operations))
+	}
+}
+
+func TestRuntimeToolApprovalPreviewRedactsCredentialFieldsAndWorkspaceID(t *testing.T) {
+	preview := runtimeToolApprovalArgumentPreview(json.RawMessage(`{"workspace_id":"w1234567","command":"npm test","api_key":"secret-value"}`))
+	if strings.Contains(preview, "w1234567") || strings.Contains(preview, "secret-value") ||
+		!strings.Contains(preview, "npm test") || !strings.Contains(preview, "[redacted]") {
+		t.Fatalf("runtime approval argument preview = %q; want action text without internal Workspace ID or credential value", preview)
 	}
 }
 
@@ -1583,7 +1591,7 @@ func TestRuntimeToolExecutorVerifyRequiresRuntimeFileMatchAndPersistsIdempotentO
 	}
 	artifact := result.Artifacts[0]
 	if artifact.Path != "notes/hello.txt" || artifact.Label != "hello.txt" || !strings.HasPrefix(artifact.MediaType, "text/plain") ||
-		artifact.WorkspaceID != "w1234567" || artifact.Revision != 1 || artifact.SizeBytes != 5 ||
+		artifact.SourceCallID != "" || artifact.WorkspaceID != "w1234567" || artifact.Revision != 1 || artifact.SizeBytes != 5 ||
 		artifact.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("artifact = %#v; want basename label, Workspace path, and extension-derived MIME", artifact)
 	}
@@ -1609,6 +1617,27 @@ func TestRuntimeToolExecutorVerifyRequiresRuntimeFileMatchAndPersistsIdempotentO
 	conflict, err := fixture.executor.Verify(context.Background(), request)
 	if err != nil || conflict.Status != AgentVerifyUnknown || fixture.handlers[runtimeFileVerifyCapability].calls.Load() != 1 {
 		t.Fatalf("same-step changed evidence Verify() = %#v, %v; runtime calls = %d; want fail-closed idempotency conflict", conflict, err, fixture.handlers[runtimeFileVerifyCapability].calls.Load())
+	}
+}
+
+func TestMapFileVerificationOperationCarriesOnlySafeSourceCallID(t *testing.T) {
+	base := AgentFileEvidence{Path: "notes/hello.txt", Size: 5,
+		SHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", WorkspaceID: "w1234567"}
+	op := task.Operation{Status: task.OperationSucceeded,
+		Result: `{"files":[{"path":"notes/hello.txt","size":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","matches":true}]}`}
+	base.CallID = "write-1"
+	verified := mapFileVerificationOperation(op, []AgentFileEvidence{base})
+	if verified.Status != AgentVerified || len(verified.Artifacts) != 1 || verified.Artifacts[0].SourceCallID != "write-1" {
+		t.Fatalf("safe write source mapping = %+v; want source call ID on verified artifact", verified)
+	}
+	base.CallID = "write:1"
+	verified = mapFileVerificationOperation(op, []AgentFileEvidence{base})
+	if verified.Status != AgentVerified || len(verified.Artifacts) != 1 || verified.Artifacts[0].SourceCallID != "" {
+		t.Fatalf("unsafe write source mapping = %+v; want valid artifact with omitted source ID", verified)
+	}
+	group := runtimeFileEvidenceGroup{workspaceID: "w1234567", files: []AgentFileEvidence{base}}
+	if got := fileEvidenceArtifacts(group); len(got) != 1 || got[0].SourceCallID != "" {
+		t.Fatalf("unsafe write source on publish artifacts = %+v; want omitted source ID", got)
 	}
 }
 

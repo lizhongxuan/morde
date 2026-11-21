@@ -54,7 +54,7 @@ function mockFetch(calls) {
   };
 }
 
-function harness({ checkpoint } = {}) {
+function harness({ checkpoint, portalLoadError } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'morde-p11-portal-'));
   const intervals = new Set();
   const originalSetInterval = globalThis.setInterval;
@@ -84,7 +84,7 @@ function harness({ checkpoint } = {}) {
     mainFrame = {};
     on(name, fn) { this.events.set(name, fn); }
     setWindowOpenHandler(fn) { this.open = fn; }
-    async loadURL(url) { this.url = url; if (this.isPortal) portalLoaded(); }
+    async loadURL(url) { this.url = url; if (this.isPortal) { portalLoaded(); if (portalLoadError) throw portalLoadError; } }
     getURL() { return this.url; }
     isDestroyed() { return this.closed; }
     focus() { this.focused = true; }
@@ -151,7 +151,29 @@ function harness({ checkpoint } = {}) {
       getLocale: () => 'en', getVersion: () => '0.1.0', requestSingleInstanceLock: () => true,
       isPackaged: false, whenReady: () => Promise.resolve(), on: (name, fn) => appEvents.set(name, fn), quit() {},
     },
-    BrowserWindow: FakeWindow, WebContentsView: FakeView, net: { fetch: (...args) => globalThis.fetch(...args) }, session: fakeSession,
+    BrowserWindow: FakeWindow, WebContentsView: FakeView, net: {
+      fetch: (...args) => globalThis.fetch(...args),
+      request(options) {
+        const listeners = new Map();
+        return {
+          on(name, listener) { listeners.set(name, listener); return this; },
+          abort() {},
+          end(body) {
+            void globalThis.fetch(options.url, { method: options.method, headers: options.headers, body }).then((response) => {
+              const responseHeaders = Object.fromEntries([...response.headers].map(([name, value]) => [name, [value]]));
+              const setCookies = response.headers.getSetCookie?.();
+              if (setCookies?.length) responseHeaders['set-cookie'] = setCookies;
+              options.session.webRequest.headersReceived?.({ url: options.url, responseHeaders }, () => {});
+              if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+                listeners.get('redirect')?.(response.status, options.method, response.headers.get('location'), responseHeaders);
+              } else {
+                listeners.get('response')?.({ statusCode: response.status, headers: responseHeaders });
+              }
+            }).catch((error) => listeners.get('error')?.(error));
+          },
+        };
+      },
+    }, session: fakeSession,
     ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) }, dialog,
     Menu: { buildFromTemplate: (template) => ({ template, popup: (options) => menus.push({ template, options }) }), setApplicationMenu() {} },
     safeStorage: {
@@ -216,6 +238,22 @@ test('Portal text fields expose native editing commands in the context menu', as
     const menuCount = h.menus.length;
     listener({}, { ...params, isEditable: false });
     assert.equal(h.menus.length, menuCount);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('assistant page load failure leaves the authenticated client on its offline screen', async () => {
+  const originalFetch = globalThis.fetch;
+  mockFetch([]);
+  const h = harness({ portalLoadError: new Error('synthetic navigation failure') });
+  try {
+    await h.ready();
+    const state = await h.invoke('morde:state', h.windows[0].webContents);
+    assert.equal(state.authenticated, true);
+    assert.equal(state.view, 'offline');
+    assert.equal(h.windows[0].contentView.attached.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     h.cleanup();
@@ -612,11 +650,18 @@ test('native Workbench exchange keeps the ticket and strict cookie in an isolate
     await assert.rejects(h.invoke('morde:portal-workbench-bounds', portal, ['wrong-nonce', { x: 0, y: 0, width: 100, height: 100 }]), /Invalid Host Workbench bounds request/);
     assert.deepEqual(await h.invoke('morde:portal-workbench-bounds', portal, [nonce, { x: 12, y: 20, width: 700, height: 500 }]), { updated: true });
     assert.deepEqual(workbench.bounds, { x: 12, y: 20, width: 700, height: 500 });
+    workbench.webContents.url = 'about:blank';
     assert.deepEqual(await h.invoke('morde:portal-workbench-command', portal, [nonce,
       { type: 'init', conversation_id: 'c1234567', visible: true }]), { sent: true });
+    assert.equal(workbench.webContents.messages.some(([channel, message]) => channel === 'morde:host-workbench-message' && message.type === 'init'), false,
+      'an init command is buffered until the trusted Workbench page is ready');
+    assert.deepEqual(await h.invoke('morde:portal-workbench-command', portal, [nonce,
+      { type: 'visibility', conversation_id: 'c1234567', visible: false }]), { sent: true });
+    workbench.webContents.url = exchangeTarget;
     const ready = await h.invoke('morde:host-workbench-ready', workbench.webContents, [nonce]);
     assert.deepEqual(ready, { ready: true });
-    assert.equal(workbench.webContents.messages.some(([channel, message]) => channel === 'morde:host-workbench-message' && message.type === 'init'), true);
+    assert.equal(workbench.webContents.messages.some(([channel, message]) => channel === 'morde:host-workbench-message' && message.type === 'init' &&
+      message.conversation_id === 'c1234567' && message.visible === false), true, 'the trusted page receives the buffered init state');
     assert.equal(portal.messages.some(([channel, message]) => channel === 'morde:portal-workbench-message' && message.type === 'ready'), true);
     const selectCommand = { type: 'select_target', target: 'terminal', seq: 1 };
     const lockCommand = { type: 'control_lock', locked: true, seq: 1 };
@@ -640,7 +685,7 @@ test('native Workbench exchange keeps the ticket and strict cookie in an isolate
     assert.deepEqual(forwarded, { type: 'state', nonce, conversation_id: 'c1234567', host_id: 'h1234567', workbench_ready: false,
       remote_desktop: 'connecting', control_state: 'taking_over', control_lease_active: false, control_lease_held_by_me: false,
       active_target: 'files', control_version: 2, control_locked: true, selection_seq: 3, lock_seq: 2 });
-    assert.throws(() => h.invoke('morde:host-workbench-state', workbench.webContents, [{ ...state, active_target: 'vscode' }]), /Invalid Host Workbench state/);
+    assert.throws(() => h.invoke('morde:host-workbench-state', workbench.webContents, [{ ...state, active_target: 'vscode' }]), /Invalid Host Workbench state: active_target/);
     assert.throws(() => h.invoke('morde:host-workbench-state', workbench.webContents, [{ ...state, control_version: -1 }]), /Invalid Host Workbench state/);
     assert.throws(() => h.invoke('morde:host-workbench-state', workbench.webContents, [{ ...state, selection_seq: 2 }]), /Invalid Host Workbench state/);
     assert.equal(portal.messages.filter(([channel, message]) => channel === 'morde:portal-workbench-message' && message.type === 'state').length, 1,

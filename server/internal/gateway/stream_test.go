@@ -450,6 +450,50 @@ func TestRevokingPortalCredentialClosesExistingEmbeddedDesktopWebSocket(t *testi
 	}
 }
 
+func TestEmbeddedVSCodeWebSocketPassesGatewayWithVSCodeGrant(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(websocketEcho))
+	defer upstream.Close()
+	handler, g, runtime, _, _ := newTestDeps(t, app.Upstream{BaseURL: upstream.URL, APIKey: "aio-secret"})
+	runtime.ref.ControlState = host.ControlUser
+	g.deps.ServiceInstanceID = testServiceInstanceID
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	connection, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = connection.Close() }()
+	if err := connection.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	claims := embedClaims{HostID: testHostID, ActorID: testUserID, PortalTokenID: "t1234567", ConversationID: "c1234567",
+		ServiceInstanceID: testServiceInstanceID, PortalOrigin: "https://portal.example.test", InitialTarget: app.HostEmbedTargetVSCode,
+		TargetGrants: []app.HostEmbedTargetGrant{{Target: app.HostEmbedTargetVSCode, PermissionCeiling: host.PermissionDesktopControl}},
+		EmbedNonce:   "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", RuntimeGeneration: 1, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	cookie := g.signEmbedClaims(claims)
+	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	_, err = fmt.Fprintf(connection,
+		"GET /code-server/?folder=workspace HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\nOrigin: https://%s\r\nCookie: %s=%s\r\n\r\n",
+		hostAuthority(), key, hostAuthority(), embedCookieName, cookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(connection)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
+		t.Fatalf("embedded VS Code websocket handshake = %q, %v", status, err)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+}
+
 func TestRevokingPortalCredentialClosesExistingEmbeddedTerminalWebSocket(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(websocketEcho))
 	defer upstream.Close()

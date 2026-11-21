@@ -10,6 +10,7 @@ import (
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 type sharedHostAuditStub struct{}
@@ -28,7 +29,15 @@ func TestProjectTaskSharedHostUsesActorCredentialAndRevocableGrant(t *testing.T)
 	ctx := context.Background()
 	f := newProjectAttachmentFixture(t)
 	hostOwner := createPreRetirementTestUser(t, f.store, 2, 2000, 4096)
-	computer := createRunningControlHost(t, ctx, f.store, hostOwner.ID, "ai", 0)
+	hostWorkspace, _, err := f.store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, hostOwner.ID))
+	if err != nil {
+		t.Fatalf("create Host owner's stable Agent Workspace: %v", err)
+	}
+	computer, binding := createRunningControlHostForWorkspace(t, ctx, f.store, hostOwner.ID, hostWorkspace, "ai", 0)
+	if _, err := f.store.TransitionWorkspaceBinding(ctx, computer.ID, hostWorkspace.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, hostWorkspace.Revision, hostWorkspace.Revision); err != nil {
+		t.Fatalf("activate Host owner's stable Agent Workspace binding: %v", err)
+	}
 	grant := host.Member{HostID: computer.ID, OwnerID: hostOwner.ID, UserID: f.member.UserID,
 		Permissions: []host.Permission{host.PermissionDesktopControl}}
 	if _, err := f.store.UpsertHostMember(ctx, grant); err != nil {

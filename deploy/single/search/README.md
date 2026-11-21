@@ -24,4 +24,4 @@ ssh -F "$HOME/.lima/morde-f01-u2604/ssh.config" -o ControlPath=none \
 
 该进程必须保持运行；重连后检查端口，并在虚拟机内请求 `http://127.0.0.1:8189/`。若端口已被其他进程占用，应先核对用途，不终止未知进程。确认转发和依赖后，虚拟机 Portal 配置使用 `/usr/bin/node`、`/opt/morde-search/node_modules/mcp-searxng/dist/cli.js` 和 `http://127.0.0.1:8189`，再由服务管理器完成更新。上述步骤仅为本机集成说明，未修改虚拟机已有进程或数据。
 
-配置就绪后，`scripts/start-macos.sh` 会启动或复用本机搜索容器，并在已有的本地 Lima 启动环境下检查 DSH、Guardian 和 Portal 搜索配置，自动建立或复用回环转发；缺少依赖或检查失败时会提示原因。它不会替虚拟机安装 Node 或修改 Portal 配置，首次集成需要先完成上述准备。`--demo` 使用模拟数据，不启动搜索。生产示例配置默认仍保持关闭。
+Portal 配置模板默认启用内置搜索；启用前必须完成 SearXNG、Node、固定脚本路径和 Portal 回环连通检查。配置就绪后，`scripts/start-macos.sh` 会启动或复用本机搜索容器，并在已有的本地 Lima 启动环境下检查 DSH、Guardian 和 Portal 搜索配置，自动建立或复用回环转发；缺少依赖或检查失败时会提示原因。它不会替虚拟机安装 Node 或修改 Portal 配置，首次集成需要先完成上述准备。`--demo` 使用模拟数据，不启动搜索。

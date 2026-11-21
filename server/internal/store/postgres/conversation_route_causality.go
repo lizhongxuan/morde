@@ -41,25 +41,12 @@ WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.c
 		if !arrived {
 			return nil
 		}
-		var state string
-		attempt := claim.RouteAttempt
-		if claim.Input.ResultReviewID != "" {
-			attempt = 0
+		safe, err := releaseConversationRouteModelCallForReclassification(ctx, tx, claim)
+		if err != nil {
+			return err
 		}
-		err := tx.QueryRow(ctx, `SELECT state FROM conversation_route_model_calls
-WHERE message_id=$1 AND actor_id=$2 AND (state IN ('reserved','dispatched') OR (state='unknown' AND attempt=$3))
-ORDER BY (state IN ('reserved','dispatched')) DESC,updated_at DESC LIMIT 1 FOR UPDATE`,
-			claim.Message.ID, claim.Message.ActorID, attempt).Scan(&state)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("lock predecessor route model call: %w", err)
-		}
-		if state == "dispatched" || state == "unknown" {
+		if !safe {
 			return nil
-		}
-		if state == "reserved" {
-			if err := releaseRouteReservationInTx(ctx, tx, claim.Message.ActorID, claim.Message.ID); err != nil {
-				return err
-			}
 		}
 		result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='pending',route_attempt=route_attempt+1,
 lease_owner='',lease_expires_at=NULL,available_after=clock_timestamp(),failure_reason='',updated_at=clock_timestamp()
@@ -85,4 +72,56 @@ WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_i
 		return nil
 	})
 	return requeued, err
+}
+
+// RequeueConversationRouteAfterContextChange retries only before a model call
+// was dispatched, so a fresh authorization snapshot cannot duplicate a charge.
+func (s *Store) RequeueConversationRouteAfterContextChange(ctx context.Context, claim app.ConversationRouteClaim) (bool, error) {
+	if ctx == nil {
+		return false, domain.InvalidArgument("route_context", "conversation route context is required")
+	}
+	var requeued bool
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockModelLedgerOwner(ctx, tx, claim.Message.ActorID); err != nil {
+			return err
+		}
+		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
+			return err
+		}
+		safe, err := releaseConversationRouteModelCallForReclassification(ctx, tx, claim)
+		if err != nil || !safe {
+			return err
+		}
+		if err := requeueConversationRouteForReclassification(ctx, tx, claim); err != nil {
+			return err
+		}
+		requeued = true
+		return nil
+	})
+	return requeued, err
+}
+
+func releaseConversationRouteModelCallForReclassification(ctx context.Context, tx pgx.Tx,
+	claim app.ConversationRouteClaim) (bool, error) {
+	attempt := claim.RouteAttempt
+	if claim.Input.ResultReviewID != "" {
+		attempt = 0
+	}
+	var state string
+	err := tx.QueryRow(ctx, `SELECT state FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND (state IN ('reserved','dispatched') OR (state='unknown' AND attempt=$3))
+ORDER BY (state IN ('reserved','dispatched')) DESC,updated_at DESC LIMIT 1 FOR UPDATE`,
+		claim.Message.ID, claim.Message.ActorID, attempt).Scan(&state)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("lock route model call for reclassification: %w", err)
+	}
+	if state == "dispatched" || state == "unknown" {
+		return false, nil
+	}
+	if state == "reserved" {
+		if err := releaseRouteReservationInTx(ctx, tx, claim.Message.ActorID, claim.Message.ID); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }

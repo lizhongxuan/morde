@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AioError } from "./aio";
-import { listFiles, MAX_UPLOAD_BYTES, readFile, uploadFile } from "./fileApi";
+import { createDirectory, deleteFile, listFiles, MAX_UPLOAD_BYTES, moveFile, readFile, uploadFile } from "./fileApi";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -149,6 +149,37 @@ describe("listFiles", () => {
     await expect(listFiles("/workspace", false)).resolves.toEqual(files);
     expect(fetchMock).toHaveBeenCalledWith("/v1/file/list", expect.objectContaining({
       body: JSON.stringify({ path: "/workspace", recursive: false, show_hidden: false, include_size: true }),
+    }));
+  });
+});
+
+describe("file mutations", () => {
+  it("uses the AIO mkdir, move, and recursive delete APIs", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ success: true, message: "ok", data: {} }))));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createDirectory("/workspace/new-folder");
+    await moveFile("/workspace/old.txt", "/workspace/new.txt");
+    await deleteFile("/workspace/new.txt");
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, (init as RequestInit).body])).toEqual([
+      ["/v1/file/mkdir", JSON.stringify({ path: "/workspace/new-folder" })],
+      ["/v1/file/move", JSON.stringify({ source: "/workspace/old.txt", destination: "/workspace/new.txt" })],
+      ["/v1/file/delete", JSON.stringify({ path: "/workspace/new.txt", recursive: true })],
+    ]);
+  });
+
+  it("surfaces a rename conflict returned by AIO without requesting overwrite", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      success: false,
+      message: "目标路径已存在",
+      data: { error_type: "already_exists" },
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(moveFile("/workspace/old.txt", "/workspace/new.txt")).rejects.toThrow("目标路径已存在");
+    expect(fetchMock).toHaveBeenCalledWith("/v1/file/move", expect.objectContaining({
+      body: JSON.stringify({ source: "/workspace/old.txt", destination: "/workspace/new.txt" }),
     }));
   });
 });

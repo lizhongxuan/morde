@@ -82,6 +82,7 @@ type Deps struct {
 	MCPConnectors                MCPConnectorManager
 	ModelGateway                 ModelGateway
 	ModelUsageAdmin              ModelUsageAdmin
+	BlindEvaluations             BlindEvaluationManager
 	Hub                          app.HubConnectionService
 	Devices                      deviceService
 	PersonalData                 personalDataService
@@ -259,6 +260,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerModelGateway(group)
 	h.registerAdmin(group)
 	h.registerAdminQualityActivity(group)
+	h.registerBlindEvaluationRoutes(group)
 	h.registerAdminControls(group)
 	h.registerAdminOperations(group)
 	h.registerAdminRecords(group)

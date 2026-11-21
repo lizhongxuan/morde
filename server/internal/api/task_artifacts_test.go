@@ -65,6 +65,23 @@ func TestGetTaskArtifactContentStreamsVerifiedAttachment(t *testing.T) {
 	}
 }
 
+func TestGetTaskArtifactContentHidesAnotherUsersArtifact(t *testing.T) {
+	other := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t7654321"}
+	service := &taskArtifactContentStub{
+		content: app.TaskArtifactContent{Filename: "private.txt", MediaType: "text/plain", SizeBytes: 13,
+			SHA256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+			Body:   readSeekCloser{bytes.NewReader([]byte("private data"))}},
+		err: domain.NewError(domain.CodeNotFound, "task artifact not found"),
+	}
+	response := httptest.NewRecorder()
+	taskArtifactAPIRouter(service, other).ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/api/tasks/q1234567/artifacts/a1234567/content", nil))
+	if response.Code != http.StatusNotFound || service.calls != 1 || service.principal.UserID != other.UserID ||
+		strings.Contains(response.Body.String(), "private data") {
+		t.Fatalf("cross-account artifact response=%d body=%q principal=%+v calls=%d", response.Code, response.Body.String(), service.principal, service.calls)
+	}
+}
+
 type readSeekCloser struct{ *bytes.Reader }
 
 func (readSeekCloser) Close() error { return nil }

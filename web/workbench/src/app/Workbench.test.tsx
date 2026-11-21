@@ -162,6 +162,7 @@ describe('Workbench MVP navigation', () => {
 
     await waitFor(() => expect(ready).toHaveBeenCalledWith(nonce));
     expect(container.querySelector('main')).toHaveClass('is-embedded');
+    expect(sendState).not.toHaveBeenCalled();
     await waitFor(() => expect(gatewayApi.control).toHaveBeenCalledOnce());
     act(() => receive?.({ channel: 'morde.workbench.embed', version: 1, type: 'init', nonce,
       conversation_id: 'c1234567', visible: true }));
@@ -232,6 +233,9 @@ describe('Workbench MVP navigation', () => {
     send({ type: 'select_target', target: 'vscode', seq: 5 });
     expect(await screen.findByTitle('VSCode')).toBeVisible();
     await waitFor(() => expect(latestState()).toMatchObject({ active_target: 'vscode', selection_seq: 5 }));
+    send({ type: 'select_target', target: 'terminal', seq: 6 });
+    expect(await screen.findByTitle('主机终端')).toBeVisible();
+    expect(terminal).toHaveBeenCalledOnce();
     send({ type: 'control_lock', locked: true, seq: 3 });
     await waitFor(() => expect(latestState()).toMatchObject({ control_locked: true, lock_seq: 3 }));
     expect(screen.queryByTitle('VSCode')).not.toBeInTheDocument();
@@ -554,6 +558,35 @@ describe('Workbench control conflicts', () => {
     expect(terminal).not.toHaveBeenCalled();
   });
 
+  it('waits for a control transition to finish before starting the terminal', async () => {
+    vi.useFakeTimers();
+    const transitioning: GatewayControl = {
+      ...userControl,
+      active_transition: {
+        request_id: 'req1234567', action: 'take_over', phase: 'drained', failure_reason: '',
+        expected_control_version: 0, blocked_control_version: 0, target_control_version: 1,
+        created_at: '2026-11-21T00:00:00.000Z', updated_at: '2026-11-21T00:00:01.000Z',
+      },
+      pending_operation_ids: ['op1234567'],
+    };
+    vi.spyOn(gatewayApi, 'control').mockResolvedValueOnce(transitioning).mockResolvedValue(userControl);
+    const ensureTerminal = vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({
+      state: 'ready', url: '/terminal?session_id=registered',
+    });
+    render(<Workbench />);
+
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: '终端' }));
+    expect(screen.getByText('请先接管电脑后使用终端。')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
+    expect(within(screen.getByLabelText('电脑控制权')).getByRole('button', { name: '接管中…' })).toBeDisabled();
+    expect(ensureTerminal).not.toHaveBeenCalled();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(ensureTerminal).toHaveBeenCalledOnce();
+    expect(screen.getByTitle('主机终端')).toHaveAttribute('src', '/terminal?session_id=registered');
+  });
+
   it('renews the current user lease while the Workbench stays open', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-11-02T00:00:00.000Z'));
@@ -580,6 +613,7 @@ describe('Workbench terminal sessions', () => {
 
   it('reuses the registered session and confirms before replacing it', async () => {
     vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true } as Response);
     const ensure = vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({
       state: 'ready', url: '/terminal?session_id=registered',
     });
@@ -594,6 +628,12 @@ describe('Workbench terminal sessions', () => {
     expect(frame.getAttribute('src')).toBe('/terminal?session_id=registered');
     expect(ensure).toHaveBeenCalledTimes(1);
 
+    fireEvent.click(screen.getByRole('button', { name: '浏览器' }));
+    expect(frame).toHaveAttribute('hidden');
+    fireEvent.click(screen.getByRole('button', { name: '终端' }));
+    expect(screen.getByTitle('主机终端')).toBe(frame);
+    expect(ensure).toHaveBeenCalledOnce();
+
     fireEvent.click(screen.getByRole('button', { name: '新建终端' }));
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('原终端中的命令'));
     expect(createNew).not.toHaveBeenCalled();
@@ -602,6 +642,158 @@ describe('Workbench terminal sessions', () => {
     fireEvent.click(screen.getByRole('button', { name: '新建终端' }));
     await waitFor(() => expect(screen.getByTitle('主机终端').getAttribute('src')).toBe('/terminal?session_id=replacement'));
     expect(createNew).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks terminal and VS Code ready after their embedded UI roots render', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({
+      state: 'ready', url: '/terminal?session_id=registered',
+    });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true } as Response);
+    render(<Workbench />);
+
+    fireEvent.click(screen.getByRole('button', { name: '终端' }));
+    const terminalFrame = await screen.findByTitle('主机终端');
+    Object.defineProperty(terminalFrame, 'contentDocument', {
+      configurable: true,
+      value: { querySelector: (selector: string) => selector === '[aria-label="Terminal input"]' ? {} : null },
+    });
+    fireEvent.load(terminalFrame);
+    await waitFor(() => expect(screen.queryByText('正在连接终端…')).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'VS Code' }));
+    const vscodeFrame = await screen.findByTitle('VSCode');
+    Object.defineProperty(vscodeFrame, 'contentDocument', {
+      configurable: true,
+      value: { querySelector: (selector: string) => selector === '.monaco-workbench' ? {} : null },
+    });
+    fireEvent.load(vscodeFrame);
+    await waitFor(() => expect(screen.queryByText('正在连接 VS Code…')).not.toBeInTheDocument());
+  });
+
+  it('ignores a terminal load result after switching to a replacement session', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({
+      state: 'ready', url: '/terminal?session_id=registered',
+    });
+    vi.spyOn(gatewayApi, 'newTerminalSession').mockResolvedValue({
+      state: 'ready', url: '/terminal?session_id=replacement',
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    let resolveFirstRequest!: (response: Response) => void;
+    const firstRequest = new Promise<Response>((resolve) => { resolveFirstRequest = resolve; });
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce({ ok: false, status: 502 } as Response)
+      .mockReturnValueOnce(firstRequest)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response);
+    render(<Workbench />);
+
+    fireEvent.click(screen.getByRole('button', { name: '终端' }));
+    const firstFrame = await screen.findByTitle('主机终端');
+    fireEvent.load(firstFrame);
+    expect(await screen.findByText('终端页面请求失败（HTTP 502）')).toBeVisible();
+    fireEvent.load(firstFrame);
+
+    fireEvent.click(screen.getByRole('button', { name: '新建终端' }));
+    await waitFor(() => expect(screen.getByTitle('主机终端')).toHaveAttribute('src', '/terminal?session_id=replacement'));
+    const replacementFrame = screen.getByTitle('主机终端');
+    expect(replacementFrame).not.toBe(firstFrame);
+    expect(replacementFrame).toHaveAttribute('src', '/terminal?session_id=replacement');
+    fireEvent.load(replacementFrame);
+    expect(await screen.findByText('终端页面请求失败（HTTP 503）')).toBeVisible();
+
+    Object.defineProperty(firstFrame, 'contentDocument', {
+      configurable: true,
+      value: { querySelector: (selector: string) => selector === '[aria-label="Terminal input"]' ? {} : null },
+    });
+    await act(async () => { resolveFirstRequest({ ok: true } as Response); });
+    expect(screen.getByText('终端页面请求失败（HTTP 503）')).toBeVisible();
+  });
+
+  it('ignores an old VS Code response after retrying the iframe', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    let resolveFirstRequest!: (response: Response) => void;
+    const firstRequest = new Promise<Response>((resolve) => { resolveFirstRequest = resolve; });
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce({ ok: false, status: 502 } as Response)
+      .mockReturnValueOnce(firstRequest)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response);
+    render(<Workbench />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'VS Code' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'VS Code' }));
+    const firstFrame = await screen.findByTitle('VSCode');
+    fireEvent.load(firstFrame);
+    expect(await screen.findByText('VS Code 页面请求失败（HTTP 502）')).toBeVisible();
+    fireEvent.load(firstFrame);
+
+    fireEvent.click(screen.getByRole('button', { name: '重试 VS Code' }));
+    const retryFrame = screen.getByTitle('VSCode');
+    expect(retryFrame).not.toBe(firstFrame);
+    fireEvent.load(retryFrame);
+    expect(await screen.findByText('VS Code 页面请求失败（HTTP 503）')).toBeVisible();
+
+    Object.defineProperty(firstFrame, 'contentDocument', {
+      configurable: true,
+      value: { querySelector: (selector: string) => selector === '.monaco-workbench' ? {} : null },
+    });
+    await act(async () => { resolveFirstRequest({ ok: true } as Response); });
+    expect(screen.getByText('VS Code 页面请求失败（HTTP 503）')).toBeVisible();
+  });
+
+  it('does not treat an empty HTTP 200 VS Code frame as ready', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true } as Response);
+    render(<Workbench />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole('button', { name: 'VS Code' }));
+    const frame = screen.getByTitle('VSCode');
+    Object.defineProperty(frame, 'contentDocument', {
+      configurable: true,
+      value: { querySelector: () => null },
+    });
+    fireEvent.load(frame);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+
+    expect(screen.getByText('VS Code 页面已响应，但 10 秒内界面未就绪')).toBeVisible();
+  });
+
+  it('shows when the VS Code route cannot be reached', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'));
+    render(<Workbench />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'VS Code' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'VS Code' }));
+    const frame = await screen.findByTitle('VSCode');
+    fireEvent.load(frame);
+
+    expect(await screen.findByText('VS Code 无法连接云端电脑服务')).toBeVisible();
+  });
+
+  it('shows terminal connection failures and retries the same session', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({
+      state: 'ready', url: '/terminal?session_id=registered',
+    });
+    const createNew = vi.spyOn(gatewayApi, 'newTerminalSession');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 503 } as Response);
+    render(<Workbench />);
+
+    fireEvent.click(screen.getByRole('button', { name: '终端' }));
+    const frame = await screen.findByTitle('主机终端');
+    fireEvent.load(frame);
+    expect(await screen.findByText('终端页面请求失败（HTTP 503）')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '重新连接终端' }));
+    const retryFrame = screen.getByTitle('主机终端');
+    expect(retryFrame).not.toBe(frame);
+    expect(retryFrame).toHaveAttribute('src', '/terminal?session_id=registered');
+    expect(createNew).not.toHaveBeenCalled();
+    fireEvent.load(retryFrame);
+    expect(await screen.findByText('终端页面请求失败（HTTP 503）')).toBeVisible();
   });
 
   it('does not create another PTY automatically when the prior result is unknown', async () => {
@@ -650,5 +842,25 @@ describe('Workbench terminal sessions', () => {
     });
     expect(screen.getByTitle('主机终端').getAttribute('src')).toBe('/terminal?session_id=created');
     expect(ensure).toHaveBeenCalledTimes(2);
+  });
+
+  it('opens VS Code in the Host workspace and offers retry after a failed load', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 404 } as Response);
+    render(<Workbench />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'VS Code' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'VS Code' }));
+    const frame = await screen.findByTitle('VSCode');
+    expect(frame).toHaveAttribute('src', '/code-server/?folder=%2Fhome%2Fgem%2Fworkspace');
+    fireEvent.load(frame);
+    expect(await screen.findByText('VS Code 页面请求失败（HTTP 404）')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试 VS Code' }));
+    const retryFrame = screen.getByTitle('VSCode');
+    expect(retryFrame).not.toBe(frame);
+    expect(retryFrame).toHaveAttribute('src', '/code-server/?folder=%2Fhome%2Fgem%2Fworkspace');
+    fireEvent.load(retryFrame);
+    expect(await screen.findByText('VS Code 页面请求失败（HTTP 404）')).toBeVisible();
   });
 });

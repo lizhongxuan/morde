@@ -486,6 +486,36 @@ export const handlers = [
   http.post("/v1/file/list", async ({ request }) => { const body = await request.json().catch(() => ({})) as { path?: string; show_hidden?: boolean }; const path = body.path ?? "/home/gem/workspace"; return directories.has(path) ? aio({ path, files: entries(path, body.show_hidden === true) }) : aio({ error_type: "not_found", errno_name: "ENOENT" }, false, "目录不存在"); }),
   http.post("/v1/file/read", async ({ request }) => { const body = await request.json().catch(() => ({})) as { file?: string }; const file = body.file ?? ""; const content = files.get(file); if (!content) return aio({ path: file, error_type: "not_found", errno_name: "ENOENT" }, false, "文件不存在"); let text: string; try { text = new TextDecoder("utf-8", { fatal: true }).decode(await content.arrayBuffer()); } catch { return aio({ file, error_type: "decode_error" }, false, "文件不是有效的 UTF-8 文本，无法预览"); } return aio({ file, content: text, line_count: text.split("\n").length }); }),
   http.post("/v1/file/write", async ({ request }) => { const body = await request.json().catch(() => ({})) as { file?: string; content?: string }; if (!body.file) return aio({ error_type: "invalid_path" }, false, "缺少文件路径"); if (!directories.has(parentPath(body.file))) return aio({ error_type: "not_found", errno_name: "ENOENT" }, false, "父目录不存在"); const content = new Blob([body.content ?? ""]); files.set(body.file, content); return aio({ file: body.file, bytes_written: content.size }); }),
+  http.post("/v1/file/mkdir", async ({ request }) => {
+    const body = await request.json().catch(() => ({})) as { path?: string };
+    const path = body.path ?? "";
+    if (!path || exists(path)) return aio({ error_type: "already_exists" }, false, "目标路径已存在或无效");
+    if (!directories.has(parentPath(path))) return aio({ error_type: "not_found", errno_name: "ENOENT" }, false, "父目录不存在");
+    directories.add(path);
+    return aio({ path });
+  }),
+  http.post("/v1/file/move", async ({ request }) => {
+    const body = await request.json().catch(() => ({})) as { source?: string; destination?: string };
+    const source = body.source ?? "";
+    const destination = body.destination ?? "";
+    if (!source || !destination || !exists(source) || exists(destination) || !directories.has(parentPath(destination)) || destination.startsWith(`${source}/`)) {
+      return aio({ error_type: "already_exists" }, false, "源路径或目标路径无效");
+    }
+    for (const [file, content] of [...files]) if (file === source || file.startsWith(`${source}/`)) { files.set(`${destination}${file.slice(source.length)}`, content); files.delete(file); }
+    for (const directory of [...directories]) if (directory === source || directory.startsWith(`${source}/`)) { directories.add(`${destination}${directory.slice(source.length)}`); directories.delete(directory); }
+    return aio({ source, destination });
+  }),
+  http.post("/v1/file/delete", async ({ request }) => {
+    const body = await request.json().catch(() => ({})) as { path?: string; recursive?: boolean };
+    const path = body.path ?? "";
+    if (!path || !exists(path)) return aio({ error_type: "not_found", errno_name: "ENOENT" }, false, "路径不存在");
+    if (directories.has(path) && body.recursive !== true && [...directories, ...files.keys()].some((entry) => entry.startsWith(`${path}/`))) {
+      return aio({ error_type: "invalid_path" }, false, "目录非空，需要递归删除");
+    }
+    for (const directory of [...directories]) if (directory === path || directory.startsWith(`${path}/`)) directories.delete(directory);
+    for (const file of [...files.keys()]) if (file === path || file.startsWith(`${path}/`)) files.delete(file);
+    return aio({ path });
+  }),
   http.post("/v1/file/upload", async ({ request }) => { const form = await request.formData(); const file = form.get("file"); const path = String(form.get("path") ?? ""); if (!(file instanceof File)) return aio({ error_type: "invalid_path" }, false, "未选择文件"); const destination = path || `/home/gem/workspace/${file.name}`; if (!directories.has(parentPath(destination))) return aio({ error_type: "not_found", errno_name: "ENOENT" }, false, "父目录不存在"); if (directories.has(destination)) return aio({ error_type: "is_directory" }, false, "目标路径是目录，无法覆盖"); files.set(destination, file); return aio({ path: destination, bytes_written: file.size }); }),
   http.get("/v1/file/download", ({ request }) => { const path = new URL(request.url).searchParams.get("path") ?? ""; const content = files.get(path); return content === undefined ? new HttpResponse("not found", { status: 404 }) : new HttpResponse(content, { headers: { "Content-Type": "application/octet-stream", "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(path.split("/").at(-1) ?? "download")}` } }); }),
 ];

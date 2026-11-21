@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -21,7 +22,8 @@ import (
 func (s *Store) ReserveModelCall(ctx context.Context, request app.ModelCallReservation) error {
 	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || !domain.ValidModelConnectionID(request.ModelID) || len(request.RequestDigest) != 32 ||
 		request.ReservedTokens <= 0 || request.ProviderModel == "" || len(request.ProviderModel) > 256 ||
-		len(request.CallID) < 8 || len(request.CallID) > 128 || (request.Source == app.ModelCallCompaction) != (request.Summary != nil) {
+		len(request.CallID) < 8 || len(request.CallID) > 128 || (request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
+		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) {
 		return domain.InvalidArgument("model_call", "invalid model reservation")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error { return reserveModelCallInTx(ctx, tx, request, nil) })
@@ -77,6 +79,7 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		return err
 	}
 	var taskProjectID string
+	var err error
 	if request.Source == app.ModelCallTask {
 		if request.Task == nil {
 			return domain.NewError(domain.CodeUnauthenticated, "task model authorization is unavailable")
@@ -85,20 +88,26 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&taskProjectID); err != nil {
 			return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 		}
+	} else if request.Source == app.ModelCallReview {
+		taskProjectID, err = checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
+		if err != nil {
+			return err
+		}
 	}
-	if request.Source == app.ModelCallTask && request.ProjectID != taskProjectID {
-		return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
+	if (request.Source == app.ModelCallTask || request.Source == app.ModelCallReview) && request.ProjectID != taskProjectID {
+		return domain.NewError(domain.CodeUnauthenticated, "Task model project scope is unavailable")
 	}
 	projectID := request.ProjectID
 	if projectID != "" && (!project.ValidID(projectID) || (!request.PersonalModel && (projectReservation == nil || projectReservation.ProjectID != projectID)) ||
-		(request.PersonalModel && (projectReservation != nil || (request.Source != app.ModelCallTask && request.Source != app.ModelCallRoute && request.Source != app.ModelCallCompaction)))) {
+		(request.PersonalModel && (projectReservation != nil || (request.Source != app.ModelCallTask && request.Source != app.ModelCallReview &&
+			request.Source != app.ModelCallRoute && request.Source != app.ModelCallCompaction)))) {
 		return domain.NewError(domain.CodeInvalidState, "project model budget reservation is required")
 	}
 	if projectID == "" && projectReservation != nil {
 		return domain.NewError(domain.CodeUnauthenticated, "project model Task attribution is unavailable")
 	}
 	var priorDigest []byte
-	err := tx.QueryRow(ctx, `SELECT request_digest FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3`,
+	err = tx.QueryRow(ctx, `SELECT request_digest FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3`,
 		request.OwnerID, string(request.Source), request.CallID).Scan(&priorDigest)
 	if err == nil {
 		if !bytes.Equal(priorDigest, request.RequestDigest) {
@@ -136,7 +145,7 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			return domain.NewError(domain.CodeInvalidState, "task model usage is unavailable")
 		}
 		var pending int64
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND state='dispatched'`, request.Task.TaskID).Scan(&pending); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='dispatched'`, request.Task.TaskID).Scan(&pending); err != nil {
 			return fmt.Errorf("read task model reservations: %w", err)
 		}
 		if taskUsed > taskLimit || pending > taskLimit-taskUsed || request.ReservedTokens > taskLimit-taskUsed-pending {
@@ -145,16 +154,27 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			return budgetErr
 		}
 		taskID = request.Task.TaskID
+	} else if request.Review != nil {
+		taskID = request.Review.Claim.TaskID
 	}
 	if projectReservation != nil {
 		if err := reserveProjectBudgetLedgerInTx(ctx, tx, *projectReservation); err != nil {
 			return err
 		}
 	}
+	var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration any
+	var reviewResultSHA256 any
+	if request.Review != nil {
+		claim := request.Review.Claim
+		reviewTaskRevision, reviewResultSequence, reviewResultSHA256, reviewClaimGeneration = claim.TaskRevision, claim.ResultEventSequence,
+			claim.ResultSHA256, claim.ClaimGeneration
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO model_call_ledger
-	 (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,created_at,personal_model)
-	 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched',clock_timestamp(),$9)`, request.OwnerID, string(request.Source), request.CallID,
-		request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens, request.PersonalModel); err != nil {
+		 (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,created_at,personal_model,
+		  review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched',clock_timestamp(),$9,$10,$11,$12,$13)`, request.OwnerID, string(request.Source), request.CallID,
+		request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens, request.PersonalModel,
+		reviewTaskRevision, reviewResultSequence, reviewResultSHA256, reviewClaimGeneration); err != nil {
 		return fmt.Errorf("reserve model call: %w", err)
 	}
 	if request.Source == app.ModelCallCompaction {
@@ -180,8 +200,101 @@ func (s *Store) ModelTaskProjectID(ctx context.Context, fence app.ModelTaskFence
 	return projectID, nil
 }
 
+// ModelTaskProjectIDForReview resolves a review's project from its still-live,
+// revision-bound Task claim rather than from caller-supplied scope.
+func (s *Store) ModelTaskProjectIDForReview(ctx context.Context, fence app.TaskValidationReviewModelFence) (string, error) {
+	if ctx == nil || !validTaskValidationReviewModelFence(fence) {
+		return "", domain.NewError(domain.CodeUnauthenticated, "Task validation review project scope is unavailable")
+	}
+	var projectID string
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		projectID, err = checkTaskValidationReviewModelFence(ctx, tx, fence)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	if projectID != "" && !project.ValidID(projectID) {
+		return "", domain.NewError(domain.CodeInternal, "Task validation review project scope is invalid")
+	}
+	return projectID, nil
+}
+
+func validTaskValidationReviewModelFence(fence app.TaskValidationReviewModelFence) bool {
+	return app.ValidTaskValidationReviewModelFence(fence) && !fence.Claim.LeaseExpiresAt.IsZero() &&
+		fence.Claim.InitiatorID == fence.InitiatorID
+}
+
+func validReviewModelCallReservation(request app.ModelCallReservation) bool {
+	if request.Source != app.ModelCallReview || request.Review == nil || request.Task != nil || request.Summary != nil ||
+		!validTaskValidationReviewModelFence(*request.Review) || request.OwnerID != request.Review.InitiatorID {
+		return false
+	}
+	expected, err := app.DSHTaskValidationReviewModelCallID(*request.Review)
+	return err == nil && expected == request.CallID
+}
+
+func modelCallReviewAttributionMatches(taskID string, taskRevision, resultSequence int64, resultSHA256 string,
+	claimGeneration int64, fence *app.TaskValidationReviewModelFence) bool {
+	if fence == nil {
+		return false
+	}
+	claim := fence.Claim
+	return taskID == claim.TaskID && taskRevision == claim.TaskRevision && resultSequence == claim.ResultEventSequence &&
+		resultSHA256 == fmt.Sprintf("%x", claim.ResultSHA256) && claimGeneration == claim.ClaimGeneration
+}
+
+// checkTaskValidationReviewModelFence locks the completed Task and review lease
+// and verifies the exact revision-bound result claim before accounting a call.
+func checkTaskValidationReviewModelFence(ctx context.Context, tx pgx.Tx, fence app.TaskValidationReviewModelFence) (string, error) {
+	if ctx == nil || tx == nil || !validTaskValidationReviewModelFence(fence) {
+		return "", domain.NewError(domain.CodeUnauthenticated, "Task validation review model fence is invalid")
+	}
+	claim := fence.Claim
+	var taskOwnerID, initiatorID, conversationID, reviewOwnerID, projectID, taskStatus string
+	var taskRevision, desiredRevision, reviewRevision, reviewSequence, reviewGeneration, eventRevision int64
+	var taskHasResult bool
+	var taskResultDigest, reviewDigest, eventDigest []byte
+	var reviewState, leaseOwner, eventType string
+	var leaseExpiresAt time.Time
+	err := tx.QueryRow(ctx, `SELECT task.owner_id,task.initiator_id,task.conversation_id,COALESCE(task.project_id,''),task.status,
+COALESCE(task.current_revision,-1),COALESCE(task.desired_revision,-1),task.result<>'',
+sha256(convert_to(task.result,'UTF8')),review.owner_id,review.task_revision,review.result_event_sequence,review.result_sha256,
+review.state,review.lease_owner,review.claim_generation,review.lease_expires_at,
+event.event_type,event.task_revision,COALESCE(event.result_content_sha256,''::bytea)
+FROM tasks task
+JOIN task_validation_reviews review ON review.task_id=task.id AND review.task_revision=$3
+JOIN task_events event ON event.task_id=task.id AND event.sequence=$4
+	WHERE task.id=$1 AND review.state='processing' AND review.lease_owner=$5 AND review.claim_generation=$6
+	AND review.owner_id=$2 AND review.result_event_sequence=$4 AND review.result_sha256=$7
+	AND review.lease_expires_at=$8 AND review.lease_expires_at>clock_timestamp()
+	FOR SHARE OF task,review`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.ResultEventSequence,
+		claim.LeaseOwner, claim.ClaimGeneration, claim.ResultSHA256, claim.LeaseExpiresAt).
+		Scan(&taskOwnerID, &initiatorID, &conversationID, &projectID, &taskStatus, &taskRevision, &desiredRevision, &taskHasResult,
+			&taskResultDigest, &reviewOwnerID, &reviewRevision, &reviewSequence, &reviewDigest, &reviewState, &leaseOwner,
+			&reviewGeneration, &leaseExpiresAt, &eventType, &eventRevision, &eventDigest)
+	if err != nil {
+		return "", domain.NewError(domain.CodeConflict, "Task validation review model fence is no longer current")
+	}
+	if taskOwnerID != claim.OwnerID || reviewOwnerID != claim.OwnerID || initiatorID != fence.InitiatorID ||
+		claim.InitiatorID != initiatorID || conversationID != claim.ConversationID || taskStatus != "completed" ||
+		taskRevision != claim.TaskRevision || desiredRevision != claim.TaskRevision || !taskHasResult ||
+		!bytes.Equal(taskResultDigest, claim.ResultSHA256) ||
+		reviewRevision != claim.TaskRevision || reviewSequence != claim.ResultEventSequence || !bytes.Equal(reviewDigest, claim.ResultSHA256) ||
+		reviewState != "processing" || leaseOwner != claim.LeaseOwner || reviewGeneration != claim.ClaimGeneration ||
+		!leaseExpiresAt.Equal(claim.LeaseExpiresAt) || eventType != "task.result" || eventRevision != claim.TaskRevision ||
+		!bytes.Equal(eventDigest, claim.ResultSHA256) {
+		return "", domain.NewError(domain.CodeConflict, "Task validation review model fence is no longer current")
+	}
+	return projectID, nil
+}
+
 func projectTaskID(request app.ModelCallReservation) any {
 	if request.Task == nil {
+		if request.Review != nil {
+			return request.Review.Claim.TaskID
+		}
 		return nil
 	}
 	return request.Task.TaskID
@@ -201,7 +314,8 @@ func (s *Store) BeginModelCallDispatchWithTextStreaming(ctx context.Context, req
 
 func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCallReservation, requestStreaming bool) (bool, error) {
 	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || len(request.CallID) < 8 || len(request.CallID) > 128 ||
-		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) {
+		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
+		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) {
 		return false, domain.InvalidArgument("model_call", "invalid model dispatch")
 	}
 	var streaming bool
@@ -233,6 +347,12 @@ func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCal
 				request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&projectID); err != nil || projectID != request.ProjectID {
 				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 			}
+		} else if request.Source == app.ModelCallReview {
+			var err error
+			projectID, err = checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
+			if err != nil || projectID != request.ProjectID {
+				return domain.NewError(domain.CodeUnauthenticated, "Task validation review project scope is unavailable")
+			}
 		}
 		if projectID != "" {
 			if _, _, err := lockProjectForActorInTx(ctx, tx, request.OwnerID, projectID, project.RoleMember, false); err != nil {
@@ -249,12 +369,22 @@ AND source=$2 AND call_id=$3 AND actor_id=$4 AND task_id IS NOT DISTINCT FROM $5
 		}
 		var state, modelID string
 		var priorDigest []byte
-		if err := tx.QueryRow(ctx, `SELECT state,model_id,request_digest FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`,
-			request.OwnerID, string(request.Source), request.CallID).Scan(&state, &modelID, &priorDigest); err != nil {
+		var storedTaskID string
+		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration int64
+		var reviewResultSHA256 string
+		if err := tx.QueryRow(ctx, `SELECT state,model_id,request_digest,COALESCE(task_id,''),COALESCE(review_task_revision,-1),
+COALESCE(review_result_event_sequence,-1),COALESCE(encode(review_result_sha256,'hex'),''),COALESCE(review_claim_generation,-1)
+FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`,
+			request.OwnerID, string(request.Source), request.CallID).Scan(&state, &modelID, &priorDigest, &storedTaskID,
+			&reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration); err != nil {
 			return storeError("find model dispatch", "model call", err)
 		}
 		if state != "dispatched" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeInvalidState, "model call is no longer awaiting dispatch")
+		}
+		if request.Source == app.ModelCallReview && !modelCallReviewAttributionMatches(storedTaskID, reviewTaskRevision,
+			reviewResultSequence, reviewResultSHA256, reviewClaimGeneration, request.Review) {
+			return domain.NewError(domain.CodeInvalidState, "Task validation review model call attribution changed")
 		}
 		if requestStreaming {
 			err := tx.QueryRow(ctx, `SELECT state='verified' FROM model_text_streaming_capabilities
@@ -299,9 +429,10 @@ func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.Mod
 		len(request.RequestDigest) != 32 || request.ReservedTokens <= 0 || len(request.CallID) < 8 || len(request.CallID) > 128 ||
 		(request.ProjectID != "" && !project.ValidID(request.ProjectID)) ||
 		(request.Source != app.ModelCallClient && request.Source != app.ModelCallChat && request.Source != app.ModelCallTask &&
-			request.Source != app.ModelCallProbe && request.Source != app.ModelCallCompaction) ||
+			request.Source != app.ModelCallProbe && request.Source != app.ModelCallCompaction && request.Source != app.ModelCallReview) ||
 		(request.Source == app.ModelCallTask) != (request.Task != nil) ||
 		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
+		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) ||
 		(request.Task != nil && request.Task.InitiatorID != request.OwnerID) ||
 		(request.ProjectID != "" && request.Source == app.ModelCallProbe) {
 		return domain.InvalidArgument("model_call", "invalid model reservation release")
@@ -325,6 +456,8 @@ func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.Mod
 		expectedTaskID := ""
 		if request.Task != nil {
 			expectedTaskID = request.Task.TaskID
+		} else if request.Review != nil {
+			expectedTaskID = request.Review.Claim.TaskID
 		}
 		if request.ProjectID != "" && !personal {
 			if err := lockProjectByIDInTx(ctx, tx, request.ProjectID); err != nil {
@@ -347,14 +480,23 @@ FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3 FOR 
 		var state, modelID, providerModel, taskID string
 		var priorDigest []byte
 		var reservedTokens int64
-		if err := tx.QueryRow(ctx, `SELECT state,model_id,provider_model,request_digest,COALESCE(task_id,''),reserved_tokens FROM model_call_ledger
+		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration int64
+		var reviewResultSHA256 string
+		if err := tx.QueryRow(ctx, `SELECT state,model_id,provider_model,request_digest,COALESCE(task_id,''),reserved_tokens,
+COALESCE(review_task_revision,-1),COALESCE(review_result_event_sequence,-1),COALESCE(encode(review_result_sha256,'hex'),''),
+COALESCE(review_claim_generation,-1) FROM model_call_ledger
 WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, request.OwnerID, string(request.Source), request.CallID).
-			Scan(&state, &modelID, &providerModel, &priorDigest, &taskID, &reservedTokens); err != nil {
+			Scan(&state, &modelID, &providerModel, &priorDigest, &taskID, &reservedTokens, &reviewTaskRevision,
+				&reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration); err != nil {
 			return storeError("find model reservation release", "model call", err)
 		}
 		if state != "dispatched" || modelID != request.ModelID || providerModel != request.ProviderModel ||
 			taskID != expectedTaskID || reservedTokens != request.ReservedTokens || !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeConflict, "model reservation is no longer undispatched")
+		}
+		if request.Source == app.ModelCallReview && !modelCallReviewAttributionMatches(taskID, reviewTaskRevision,
+			reviewResultSequence, reviewResultSHA256, reviewClaimGeneration, request.Review) {
+			return domain.NewError(domain.CodeConflict, "Task validation review reservation attribution changed")
 		}
 		if request.ProjectID != "" && !personal {
 			result, err := tx.Exec(ctx, `DELETE FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3 AND status='reserved'`,
@@ -470,6 +612,18 @@ func checkModelCaller(ctx context.Context, tx pgx.Tx, request app.ModelCallReser
 	case app.ModelCallCompaction:
 		if err := checkConversationSummaryModelFence(ctx, tx, request); err != nil {
 			return err
+		}
+	case app.ModelCallReview:
+		if request.Task != nil || request.Summary != nil || !validReviewModelCallReservation(request) ||
+			request.OwnerID != request.Review.InitiatorID {
+			return domain.NewError(domain.CodeUnauthenticated, "Task validation review model authorization is unavailable")
+		}
+		projectID, err := checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
+		if err != nil {
+			return err
+		}
+		if projectID != request.ProjectID {
+			return domain.NewError(domain.CodeUnauthenticated, "Task validation review project scope is unavailable")
 		}
 	default:
 		return domain.InvalidArgument("model_call", "invalid model call source")
@@ -812,18 +966,33 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 	taskCall := settlement.TaskCall
 	taskCallValid := taskCall != nil && taskCall.Source == app.ModelCallTask && taskCall.Task != nil &&
 		taskCall.OwnerID == settlement.OwnerID && taskCall.CallID == settlement.CallID && len(taskCall.RequestDigest) == 32
+	reviewCall := settlement.ReviewCall
+	reviewCallValid := reviewCall != nil && validReviewModelCallReservation(*reviewCall) && reviewCall.OwnerID == settlement.OwnerID &&
+		reviewCall.CallID == settlement.CallID && len(reviewCall.RequestDigest) == 32
 	if settlement.Source == app.ModelCallRoute || !domain.ValidUserID(settlement.OwnerID) || settlement.CallID == "" ||
 		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
-		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.ResponseInvalid) ||
-		settlement.TaskCall != nil && !taskCallValid ||
-		settlement.Source == app.ModelCallTask && ((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
+		(settlement.Source == app.ModelCallReview && !settlement.Unknown && !settlement.ResponseInvalid && settlement.ReviewCall == nil) ||
+		settlement.ReviewCall != nil && !reviewCallValid ||
+		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && settlement.Source != app.ModelCallReview &&
+			(len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.ResponseInvalid) ||
+		settlement.Source == app.ModelCallReview && ((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
+			len(settlement.ResponseCiphertext) > app.MaxTaskValidationReviewModelResponseCiphertext ||
 			len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
-			len(settlement.ResponseCiphertext) != 0 && (!taskCallValid || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext) ||
-			settlement.TaskCall != nil && len(settlement.ResponseCiphertext) == 0) ||
-		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
-		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || settlement.TaskCall != nil) ||
+			len(settlement.ResponseTextDigest) != 0 && len(settlement.ResponseTextDigest) != 32 ||
+			settlement.Unknown && len(settlement.ResponseCiphertext) != 0 || settlement.ResponseInvalid && len(settlement.ResponseCiphertext) != 0 ||
+			(settlement.Unknown || settlement.ResponseInvalid) && len(settlement.ResponseTextDigest) != 0 ||
+			!settlement.Unknown && !settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseTextDigest) != 32)) ||
+		settlement.TaskCall != nil && !taskCallValid ||
+		settlement.TaskCall != nil && settlement.ReviewCall != nil ||
+		settlement.Source == app.ModelCallTask && (len(settlement.ResponseTextDigest) != 0 ||
+			((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
+				len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
+				len(settlement.ResponseCiphertext) != 0 && (!taskCallValid || len(settlement.ResponseCiphertext) > app.MaxTaskModelResponseCiphertext) ||
+				settlement.TaskCall != nil && len(settlement.ResponseCiphertext) == 0)) ||
+		settlement.Unknown && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.TaskCall != nil) ||
+		settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.TaskCall != nil) ||
 		!settlement.Unknown && !settlement.ResponseInvalid && settlement.Source == app.ModelCallCompaction &&
-			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32) ||
+			(len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseCiphertext) > app.MaxConversationSummaryCiphertext || len(settlement.ResponseDigest) != 32 || len(settlement.ResponseTextDigest) != 0) ||
 		(!settlement.Unknown && (!settlement.Usage.Known || settlement.Usage.InputTokens < 0 || settlement.Usage.OutputTokens < 0 ||
 			settlement.Usage.InputTokens > math.MaxInt64-settlement.Usage.OutputTokens)) {
 		return domain.InvalidArgument("model_call", "invalid model settlement")
@@ -845,15 +1014,30 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		var state string
 		var taskID *string
 		var input, output *int64
-		err = tx.QueryRow(ctx, `SELECT state,task_id,input_tokens,output_tokens FROM model_call_ledger
+		var accountRequestDigest []byte
+		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration *int64
+		var reviewResultSHA256 []byte
+		err = tx.QueryRow(ctx, `SELECT state,task_id,input_tokens,output_tokens,request_digest,review_task_revision,
+review_result_event_sequence,review_result_sha256,review_claim_generation FROM model_call_ledger
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, settlement.OwnerID, string(settlement.Source), settlement.CallID).
-			Scan(&state, &taskID, &input, &output)
+			Scan(&state, &taskID, &input, &output, &accountRequestDigest, &reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration)
 		if err != nil {
 			return storeError("find model settlement", "model call", err)
 		}
+		if settlement.Source == app.ModelCallReview {
+			if taskID == nil || reviewTaskRevision == nil || reviewResultSequence == nil || reviewClaimGeneration == nil {
+				return domain.NewError(domain.CodeInvalidState, "Task validation review model call attribution changed")
+			}
+			if reviewCall != nil && (*taskID != reviewCall.Review.Claim.TaskID ||
+				!bytes.Equal(accountRequestDigest, reviewCall.RequestDigest) ||
+				*reviewTaskRevision != reviewCall.Review.Claim.TaskRevision || *reviewResultSequence != reviewCall.Review.Claim.ResultEventSequence ||
+				!bytes.Equal(reviewResultSHA256, reviewCall.Review.Claim.ResultSHA256) || *reviewClaimGeneration != reviewCall.Review.Claim.ClaimGeneration) {
+				return domain.NewError(domain.CodeInvalidState, "Task validation review model call attribution changed")
+			}
+		}
 		if state != "dispatched" {
 			if state == "unknown" && !settlement.Unknown {
-				if settlement.TaskCall != nil {
+				if settlement.TaskCall != nil || settlement.ReviewCall != nil {
 					return domain.NewError(domain.CodeInvalidState, "unknown Task model calls cannot deliver a saved response")
 				}
 				if settlement.Source == app.ModelCallCompaction {
@@ -865,16 +1049,16 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 				if err != nil {
 					return fmt.Errorf("settle late model usage: %w", err)
 				}
-				if taskID != nil {
+				if taskID != nil && settlement.Source == app.ModelCallTask {
 					var unknown bool
-					if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND state='unknown')`, *taskID).Scan(&unknown); err != nil {
+					if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='unknown')`, *taskID).Scan(&unknown); err != nil {
 						return fmt.Errorf("check unknown task model usage: %w", err)
 					}
 					if unknown {
 						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=clock_timestamp() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
 					} else {
 						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=COALESCE((SELECT SUM(input_tokens::numeric+output_tokens::numeric)
- FROM model_call_ledger WHERE task_id=$1 AND state='settled'),0),updated_at=clock_timestamp() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
+ FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='settled'),0),updated_at=clock_timestamp() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
 					}
 					if err != nil {
 						return fmt.Errorf("rebuild late task model usage: %w", err)
@@ -886,6 +1070,9 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 				input != nil && output != nil && *input == settlement.Usage.InputTokens && *output == settlement.Usage.OutputTokens) {
 				if state == "settled" && settlement.Source == app.ModelCallTask {
 					return verifySettledTaskModelResponseInTx(ctx, tx, settlement)
+				}
+				if state == "settled" && settlement.Source == app.ModelCallReview && settlement.ReviewCall != nil && !settlement.ResponseInvalid {
+					return verifySettledTaskValidationReviewModelResponseInTx(ctx, tx, settlement)
 				}
 				return nil
 			}
@@ -915,7 +1102,12 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 				responseRejected = err
 			}
 		}
-		if taskID != nil {
+		if settlement.Source == app.ModelCallReview && !settlement.Unknown && !settlement.ResponseInvalid {
+			if _, err := recordTaskValidationReviewModelResponseInTx(ctx, tx, settlement); err != nil {
+				return err
+			}
+		}
+		if taskID != nil && settlement.Source == app.ModelCallTask {
 			if settlement.Unknown {
 				_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=now() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
 			} else {

@@ -86,7 +86,7 @@ func (w *ConversationRouteWorker) Run(ctx context.Context) error {
 }
 
 // RunOnce processes at most one leased message. Model failures and stale
-// context conflicts are durable; an absent predecessor is deferred without guessing.
+// context conflicts are durable; routing cannot rely on an absent predecessor.
 func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if ctx == nil {
 		return false, errors.New("conversation routing context is required")
@@ -129,11 +129,11 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			Action: app.ConversationRouteClarify, Question: "消息顺序存在循环，请重新发送。",
 		})
 	}
-	if snapshot.PreviousSequence > claim.Message.Sequence && snapshot.Context.PreviousUnresolved && snapshot.PreviousRoutingState != "waiting_adjustment" {
-		return true, w.options.Actions.DeferConversationRoute(routeCtx, claim, 2*time.Second)
-	}
 	modelID, err := w.options.Models.ResolveConversationRouteModel(routeCtx, claim)
 	if err != nil || !domain.ValidModelConnectionID(modelID) {
+		if routeCtx.Err() != nil && ctx.Err() == nil {
+			return true, w.options.Actions.DeferConversationRoute(ctx, claim, 2*time.Second)
+		}
 		if err == nil {
 			err = errors.New("resolved conversation model identity is invalid")
 		}
@@ -175,18 +175,28 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
 	}
 	classifyContext.ModelID = modelID
+	copyConversationRouteCandidates(&classifyContext)
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
 		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 || classifyContext.ResultReview != nil {
-		if _, err := app.ConversationRouteModelRequest(classifyContext); domain.CodeOf(err) == domain.CodeResultTooLarge && classifyContext.SummaryVersion > 0 {
-			classifyContext = snapshot.Context
-			classifyContext.ModelID = modelID
-			classifyContext.SummaryVersion = 0
-			classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
-			classifyContext.SummaryText = ""
-		}
-		if _, err := app.ConversationRouteModelRequest(classifyContext); domain.CodeOf(err) == domain.CodeResultTooLarge {
-			return true, w.failRoute(ctx, claim, "message_too_long", err)
+		for {
+			_, requestErr := app.ConversationRouteModelRequest(classifyContext)
+			if domain.CodeOf(requestErr) != domain.CodeResultTooLarge {
+				break
+			}
+			if classifyContext.SummaryVersion > 0 {
+				classifyContext = snapshot.Context
+				classifyContext.ModelID = modelID
+				copyConversationRouteCandidates(&classifyContext)
+				classifyContext.SummaryVersion = 0
+				classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
+				classifyContext.SummaryText = ""
+				continue
+			}
+			if trimConversationRouteCandidates(&classifyContext) {
+				continue
+			}
+			return true, w.failRoute(ctx, claim, "message_too_long", requestErr)
 		}
 		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, classifyContext)
 		if err != nil {
@@ -207,8 +217,16 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			if !snapshot.PreviousMissing && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
-				// Surface stale context to the existing retry action instead of leaving the accepted message pending forever.
+			if !snapshot.PreviousMissing && claim.Input.ResultReviewID == "" && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
+				if recovery, ok := w.options.Actions.(app.ConversationRouteContextRecovery); ok {
+					requeued, recoveryErr := recovery.RequeueConversationRouteAfterContextChange(ctx, claim)
+					if recoveryErr != nil {
+						return true, errors.Join(err, recoveryErr)
+					}
+					if requeued {
+						return true, nil
+					}
+				}
 				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 			}
 			return true, w.failRoute(ctx, claim, "model_unavailable", err)
@@ -217,15 +235,12 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if decision.InvalidOutput {
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid"))
 	}
-	decision = safeConversationRouteDecision(snapshot.Context, decision)
+	decision = safeConversationRouteDecision(classifyContext, decision)
 	if decision.InvalidOutput {
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid for the current context"))
 	}
 	if snapshot.Context.ResultReview != nil && decision.Action != app.ConversationRouteReply {
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("task result review did not produce a reply"))
-	}
-	if snapshot.PreviousMissing && decision.Action != app.ConversationRouteNew {
-		decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 	}
 	if decision.Action == app.ConversationRouteNew {
 		if aggregation, ok := w.options.Actions.(app.ConversationRouteAggregation); ok {
@@ -299,13 +314,46 @@ func (w *ConversationRouteWorker) observeRouteDecision(claim app.ConversationRou
 	w.metrics.aggregationStates.WithLabelValues(state).Inc()
 }
 
+func copyConversationRouteCandidates(value *app.ConversationRouteContext) {
+	value.Candidates = append(value.Candidates[:0:0], value.Candidates...)
+	value.RequestCandidates = append(value.RequestCandidates[:0:0], value.RequestCandidates...)
+	value.AggregationCandidates = append(value.AggregationCandidates[:0:0], value.AggregationCandidates...)
+}
+
+func trimConversationRouteCandidates(value *app.ConversationRouteContext) bool {
+	for index := len(value.RequestCandidates) - 1; index >= 0; index-- {
+		if value.RequestCandidates[index].MessageID == value.PreviousMessageID {
+			continue
+		}
+		value.RequestCandidates = append(value.RequestCandidates[:index], value.RequestCandidates[index+1:]...)
+		value.CandidateSetIncomplete = true
+		return true
+	}
+	for index := len(value.Candidates) - 1; index >= 0; index-- {
+		taskID := value.Candidates[index].TaskID
+		if taskID == value.ReferenceTaskID || taskID == value.PreviousTaskID {
+			continue
+		}
+		value.Candidates = append(value.Candidates[:index], value.Candidates[index+1:]...)
+		value.CandidateSetIncomplete = true
+		return true
+	}
+	if len(value.AggregationCandidates) > 0 {
+		value.AggregationCandidates = value.AggregationCandidates[:len(value.AggregationCandidates)-1]
+		value.CandidateSetIncomplete = true
+		return true
+	}
+	return false
+}
+
 func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.ConversationRouteClaim, reason string, cause error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	w.options.Logger.Warn("conversation route failed",
 		zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
-		zap.String("failure_reason", reason), zap.String("failure_category", cloudDSHModelErrorCategory(cause)))
+		zap.String("failure_reason", reason), zap.String("failure_code", string(domain.CodeOf(cause))),
+		zap.String("failure_category", cloudDSHModelErrorCategory(cause)))
 	if err := w.options.Actions.FailConversationRoute(ctx, claim, reason); err != nil {
 		return errors.Join(cause, err)
 	}
@@ -326,13 +374,19 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 				ModelOutput: decision.ModelOutput}
 		}
 		if value.PreviousMissing {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。",
+			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。",
 				ModelOutput: decision.ModelOutput}
 		}
 	}
-	if value.PreviousMissing && (decision.Action != app.ConversationRouteNew || strings.TrimSpace(value.Content) == "") {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。",
+	if value.PreviousMissing && decision.Action != app.ConversationRouteClarify &&
+		((decision.Action != app.ConversationRouteNew && decision.Action != app.ConversationRouteReply) || strings.TrimSpace(value.Content) == "") {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。",
 			ModelOutput: decision.ModelOutput}
+	}
+	if value.CandidateSetIncomplete && app.ConversationRouteHasExplicitControlIntent(value.Content) &&
+		(decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question: "当前未能确认你要操作的任务。请指出任务，或重新描述一项独立工作。", ModelOutput: decision.ModelOutput}
 	}
 	switch decision.Action {
 	case app.ConversationRouteNew:

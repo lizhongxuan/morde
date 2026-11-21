@@ -8003,6 +8003,174 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
+  /api/admin/evaluation-batches:
+    post:
+      tags: [Admin]
+      operationId: createBlindEvaluationBatch
+      summary: Freeze synthetic candidate runs into an anonymous review batch
+      description: Stores the anonymous pack separately from candidate mappings and run manifests. Only an administrator may create a batch; participant identities are checked by the service and database.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBlindEvaluationRequest' }
+      responses:
+        '201':
+          description: Anonymous review pack; contains no candidate model or provider identity
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindPack' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/evaluation-batches/{pack_id}:
+    get:
+      tags: [Admin]
+      operationId: getBlindEvaluationPanel
+      summary: Read review batch readiness without revealing candidate mapping
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Readiness and record counts
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindEvaluationPanel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/evaluation-batches/{pack_id}/mapping:
+    get:
+      tags: [Admin]
+      operationId: getBlindEvaluationMapping
+      summary: Read the private candidate-to-run mapping
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Private candidate mapping
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindMapping' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/evaluation-batches/{pack_id}/manifests:
+    get:
+      tags: [Admin]
+      operationId: getBlindEvaluationRunManifests
+      summary: Read private candidate run manifests for the batch owner
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Private run manifests
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/EvaluationRunManifest' } }
+                additionalProperties: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/evaluation-batches/{pack_id}/review:
+    get:
+      tags: [Portal]
+      operationId: getAssignedBlindReview
+      summary: Read an assigned anonymous review pack and the current reviewer’s submissions
+      security:
+        - portalSession: []
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Assigned anonymous pack and this reviewer’s saved submissions only
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindReviewerBundle' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/evaluation-batches/{pack_id}/reviews:
+    post:
+      tags: [Portal]
+      operationId: submitBlindReview
+      summary: Submit an assigned reviewer’s evidence-linked scores
+      description: Reviewer identity comes from the authenticated user session. The request cannot supply reviewer identity or timestamps.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmitBlindReviewRequest' }
+      responses:
+        '200':
+          description: Idempotent reviewer receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindReviewReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/evaluation-batches/{pack_id}/arbitration:
+    get:
+      tags: [Portal]
+      operationId: getAssignedBlindArbitration
+      summary: Read an assigned arbitrator’s anonymous pack and anonymized reviews
+      security:
+        - portalSession: []
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Assigned pack and peer review content without reviewer IDs or timestamps
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindArbitrationBundle' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/evaluation-batches/{pack_id}/arbitrations:
+    post:
+      tags: [Portal]
+      operationId: submitBlindArbitration
+      summary: Resolve a disagreement between independent blind reviews
+      description: Arbitrator identity comes from the authenticated user session; unresolved batches remain not ready.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: pack_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmitBlindArbitrationRequest' }
+      responses:
+        '200':
+          description: Idempotent arbitration receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlindArbitrationReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/admin/activity:
     get:
       tags: [Admin]
@@ -12449,6 +12617,56 @@ components:
         source_event_sequence: { type: integer, format: int64, minimum: 1 }
         trigger_message_id: { oneOf: [{ $ref: '#/components/schemas/MessageId' }, { type: 'null' }] }
         reply_message_id: { oneOf: [{ $ref: '#/components/schemas/MessageId' }, { type: 'null' }] }
+    TaskValidationSummary:
+      type: object
+      additionalProperties: false
+      required: [state]
+      description: Independent review state, orthogonal to Task.status. The server emits pending until a trusted, revision-bound validation record exists; ResultReview is not a validation verdict.
+      properties:
+        state: { type: string, enum: [pending, PASS, 'PASS+NOTES', FAIL] }
+    TaskValidationEvidenceRef:
+      type: object
+      additionalProperties: false
+      required: [kind, id, task_revision, sequence]
+      properties:
+        kind: { type: string, enum: [source, baseline, action, result, side_effect, before_after] }
+        id: { type: string, pattern: '^[msa][a-z0-9]{7}$' }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        sequence: { type: integer, format: int64, minimum: 1, description: Conversation message sequence for source messages; Task Step sequence for other evidence. }
+        call_id: { type: string, maxLength: 128, pattern: '^[A-Za-z0-9_-]{1,128}$', description: Source tool call for action, baseline, or before_after evidence, or its unambiguous verified write when side_effect evidence is resolved. }
+    TaskValidationPerformanceComparison:
+      type: object
+      additionalProperties: false
+      required: [metric, unit, before, after, delta, environment, baseline_ref, after_ref]
+      description: Untrusted performance measurements with server-computed delta and same-revision Task Step references; this structure does not establish a validation verdict.
+      properties:
+        metric: { type: string, minLength: 1, maxLength: 128 }
+        unit: { type: string, minLength: 1, maxLength: 32 }
+        before: { type: number, format: double }
+        after: { type: number, format: double }
+        delta: { type: number, format: double, description: Server-computed as after minus before. }
+        environment: { type: string, minLength: 1, maxLength: 512 }
+        baseline_ref: { $ref: '#/components/schemas/TaskValidationEvidenceRef' }
+        after_ref: { $ref: '#/components/schemas/TaskValidationEvidenceRef' }
+    TaskValidationEvidenceClaim:
+      type: object
+      additionalProperties: false
+      required: [claim_id, start_byte, end_byte, evidence_refs]
+      properties:
+        claim_id: { type: string, minLength: 2, maxLength: 3, pattern: '^c([1-9]|[1-5][0-9]|6[0-4])$' }
+        start_byte: { type: integer, minimum: 0 }
+        end_byte: { type: integer, minimum: 1, description: Exclusive UTF-8 byte offset into the SHA-256-bound Task result. }
+        evidence_refs: { type: array, minItems: 1, maxItems: 64, items: { $ref: '#/components/schemas/TaskValidationEvidenceRef' } }
+        performance_comparison: { $ref: '#/components/schemas/TaskValidationPerformanceComparison' }
+    TaskValidationEvidenceDetail:
+      type: object
+      additionalProperties: false
+      required: [task_revision, event_sequence, result_sha256, claims]
+      properties:
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        event_sequence: { type: integer, format: int64, minimum: 1 }
+        result_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        claims: { type: array, minItems: 1, maxItems: 64, items: { $ref: '#/components/schemas/TaskValidationEvidenceClaim' } }
     TaskSummary:
       type: object
       required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, queue_priority, current_step, step_count, completed_step_count, budget, usage, dependencies, child_jobs, result_review, created_at, updated_at]
@@ -12477,6 +12695,7 @@ components:
         dependencies: { type: array, items: { $ref: '#/components/schemas/TaskDependency' } }
         child_jobs: { type: array, items: { $ref: '#/components/schemas/TaskChildJob' } }
         result_review: { oneOf: [{ $ref: '#/components/schemas/TaskResultReview' }, { type: 'null' }] }
+        validation: { $ref: '#/components/schemas/TaskValidationSummary', description: Newer servers always include this summary. Clients must treat it as optional when reading snapshots from older server versions. }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     TaskStep:
@@ -12808,6 +13027,7 @@ components:
           properties:
             event_sequence: { type: integer, format: int64, minimum: 0, description: Event cursor from the same database snapshot as this Task; resume task events after this sequence. }
             result: { type: [string, 'null'] }
+            validation_detail: { $ref: '#/components/schemas/TaskValidationEvidenceDetail', description: Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. }
             current_revision_started: { type: boolean, description: True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. }
             result_message_pending: { type: boolean, description: A completed result is being held for a conversation reply; do not display it as a separate final message until published. }
             result_message_published: { type: boolean, description: The final result is published as a conversation message with sources; use that message rather than displaying a separate Task result. }
@@ -13160,6 +13380,252 @@ components:
         summary: { $ref: '#/components/schemas/AdminUsageSummary' }
         by_day: { type: array, items: { $ref: '#/components/schemas/AdminUsageDay' } }
         by_model: { type: array, items: { $ref: '#/components/schemas/AdminUsageModel' } }
+      additionalProperties: false
+    EvaluationScore:
+      type: string
+      enum: ['0', '1', N/A]
+    EvaluationRubricCriterion:
+      type: object
+      required: [id, name, hard_gate]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 64 }
+        name: { type: string, minLength: 1, maxLength: 256 }
+        hard_gate: { type: boolean }
+      additionalProperties: false
+    EvaluationCaseExpectation:
+      type: object
+      required: [criterion_id, expected]
+      properties:
+        criterion_id: { type: string, minLength: 1, maxLength: 64 }
+        expected: { $ref: '#/components/schemas/EvaluationScore' }
+        not_applicable_reason: { type: string, maxLength: 4096 }
+      additionalProperties: false
+    EvaluationCase:
+      type: object
+      required: [id, priority, tags, input, expected_behavior, expectations]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 64 }
+        priority: { type: string, enum: [P0, P1, P2] }
+        tags: { type: array, items: { type: string } }
+        input: { type: string }
+        expected_behavior: { type: string }
+        expectations: { type: array, items: { $ref: '#/components/schemas/EvaluationCaseExpectation' } }
+      additionalProperties: false
+    EvaluationSuite:
+      type: object
+      required: [version, data_class, rubric, cases]
+      properties:
+        version: { type: string }
+        data_class: { type: string, enum: [synthetic] }
+        rubric: { type: array, items: { $ref: '#/components/schemas/EvaluationRubricCriterion' } }
+        cases: { type: array, items: { $ref: '#/components/schemas/EvaluationCase' } }
+      additionalProperties: false
+    EvaluationRunManifest:
+      type: object
+      required: [run_id, suite_version, provider, model, prompt_version, skill_version, dsh_version, build_sha, tool_permissions, parameters, started_at]
+      properties:
+        run_id: { type: string, minLength: 1, maxLength: 256 }
+        suite_version: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        prompt_version: { type: string }
+        skill_version: { type: string }
+        dsh_version: { type: string }
+        build_sha: { type: string }
+        tool_permissions: { type: array, items: { type: string } }
+        parameters: { type: object, additionalProperties: { type: string } }
+        started_at: { type: string, format: date-time }
+      additionalProperties: false
+    EvaluationEvidence:
+      type: object
+      required: [id, kind, sha256]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 256 }
+        kind: { type: string, minLength: 1, maxLength: 64 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        excerpt: { type: string }
+      additionalProperties: false
+    EvaluationEvidenceReference:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, minLength: 1, maxLength: 64 }
+        id: { type: string, maxLength: 256 }
+        start_byte: { type: integer, minimum: 0 }
+        end_byte: { type: integer, minimum: 0 }
+      additionalProperties: false
+    EvaluationJudgment:
+      type: object
+      required: [criterion_id, score, rationale, evidence]
+      properties:
+        criterion_id: { type: string, minLength: 1, maxLength: 64 }
+        score: { $ref: '#/components/schemas/EvaluationScore' }
+        rationale: { type: string, maxLength: 4096 }
+        evidence: { type: array, minItems: 1, items: { $ref: '#/components/schemas/EvaluationEvidenceReference' } }
+      additionalProperties: false
+    EvaluationCaseResult:
+      type: object
+      required: [case_id, output, evidence, judgments]
+      properties:
+        case_id: { type: string, minLength: 1, maxLength: 64 }
+        output: { type: string }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvaluationEvidence' } }
+        judgments: { type: array, items: { $ref: '#/components/schemas/EvaluationJudgment' } }
+      additionalProperties: false
+    EvaluationRun:
+      type: object
+      required: [manifest, cases]
+      properties:
+        manifest: { $ref: '#/components/schemas/EvaluationRunManifest' }
+        cases: { type: array, items: { $ref: '#/components/schemas/EvaluationCaseResult' } }
+      additionalProperties: false
+    CreateBlindEvaluationRequest:
+      type: object
+      required: [suite, runs, implementers, reviewers, arbitrators]
+      properties:
+        suite: { $ref: '#/components/schemas/EvaluationSuite' }
+        runs: { type: array, minItems: 2, items: { $ref: '#/components/schemas/EvaluationRun' } }
+        implementers: { type: array, minItems: 1, items: { type: string, pattern: '^u[a-z0-9]{7,15}$' } }
+        reviewers: { type: array, minItems: 2, items: { type: string, pattern: '^u[a-z0-9]{7,15}$' } }
+        arbitrators: { type: array, minItems: 1, items: { type: string, pattern: '^u[a-z0-9]{7,15}$' } }
+      additionalProperties: false
+    BlindApplicability:
+      type: object
+      required: [criterion_id, applicable]
+      properties:
+        criterion_id: { type: string }
+        applicable: { type: boolean }
+        not_applicable_reason: { type: string }
+      additionalProperties: false
+    BlindCandidate:
+      type: object
+      required: [label, output, evidence]
+      properties:
+        label: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        output: { type: string }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvaluationEvidence' } }
+      additionalProperties: false
+    BlindCase:
+      type: object
+      required: [case_id, priority, tags, input, expected_behavior, applicability, candidates]
+      properties:
+        case_id: { type: string }
+        priority: { type: string, enum: [P0, P1, P2] }
+        tags: { type: array, items: { type: string } }
+        input: { type: string }
+        expected_behavior: { type: string }
+        applicability: { type: array, items: { $ref: '#/components/schemas/BlindApplicability' } }
+        candidates: { type: array, minItems: 2, items: { $ref: '#/components/schemas/BlindCandidate' } }
+      additionalProperties: false
+    BlindPack:
+      type: object
+      required: [id, suite_version, rubric, cases]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        suite_version: { type: string }
+        rubric: { type: array, items: { $ref: '#/components/schemas/EvaluationRubricCriterion' } }
+        cases: { type: array, items: { $ref: '#/components/schemas/BlindCase' } }
+      additionalProperties: false
+    BlindCaseReview:
+      type: object
+      required: [case_id, judgments]
+      properties:
+        case_id: { type: string }
+        judgments: { type: array, items: { $ref: '#/components/schemas/EvaluationJudgment' } }
+      additionalProperties: false
+    SubmitBlindReviewRequest:
+      type: object
+      required: [candidate, cases]
+      properties:
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        cases: { type: array, items: { $ref: '#/components/schemas/BlindCaseReview' } }
+      additionalProperties: false
+    BlindReviewResponse:
+      type: object
+      required: [candidate, submitted_at, cases]
+      properties:
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        submitted_at: { type: string, format: date-time }
+        cases: { type: array, items: { $ref: '#/components/schemas/BlindCaseReview' } }
+      additionalProperties: false
+    BlindReviewerBundle:
+      type: object
+      required: [pack, reviews]
+      properties:
+        pack: { $ref: '#/components/schemas/BlindPack' }
+        reviews: { type: array, items: { $ref: '#/components/schemas/BlindReviewResponse' } }
+      additionalProperties: false
+    SubmitBlindArbitrationRequest:
+      type: object
+      required: [candidate, reason, cases]
+      properties:
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        reason: { type: string, minLength: 1, maxLength: 4096 }
+        cases: { type: array, items: { $ref: '#/components/schemas/BlindCaseReview' } }
+      additionalProperties: false
+    BlindArbitrationReview:
+      type: object
+      required: [reviewer, candidate, cases]
+      properties:
+        reviewer: { type: string, pattern: '^审阅者[1-9][0-9]*$' }
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        cases: { type: array, items: { $ref: '#/components/schemas/BlindCaseReview' } }
+      additionalProperties: false
+    BlindArbitrationBundle:
+      type: object
+      required: [pack, expected_reviews_per_candidate, reviews, arbitrations]
+      properties:
+        pack: { $ref: '#/components/schemas/BlindPack' }
+        expected_reviews_per_candidate: { type: integer, minimum: 2 }
+        reviews: { type: array, items: { $ref: '#/components/schemas/BlindArbitrationReview' } }
+        arbitrations: { type: array, items: { $ref: '#/components/schemas/BlindArbitrationResult' } }
+      additionalProperties: false
+    BlindArbitrationResult:
+      type: object
+      required: [candidate, reason, cases]
+      properties:
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        reason: { type: string }
+        cases: { type: array, items: { $ref: '#/components/schemas/BlindCaseReview' } }
+      additionalProperties: false
+    BlindReviewReceipt:
+      type: object
+      required: [candidate, submitted_at]
+      properties:
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        submitted_at: { type: string, format: date-time }
+      additionalProperties: false
+    BlindArbitrationReceipt:
+      type: object
+      required: [candidate, resolved_at]
+      properties:
+        candidate: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        resolved_at: { type: string, format: date-time }
+      additionalProperties: false
+    BlindAssignment:
+      type: object
+      required: [label, run_id, positions]
+      properties:
+        label: { type: string, pattern: '^blind-[0-9a-f]{16}$' }
+        run_id: { type: string }
+        positions: { type: array, items: { type: integer, minimum: 0 } }
+      additionalProperties: false
+    BlindMapping:
+      type: object
+      required: [pack_id, assignments]
+      properties:
+        pack_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        assignments: { type: array, items: { $ref: '#/components/schemas/BlindAssignment' } }
+      additionalProperties: false
+    BlindEvaluationPanel:
+      type: object
+      required: [pack_id, ready, review_count, arbitration_count]
+      properties:
+        pack_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        ready: { type: boolean }
+        pending_reason: { type: string }
+        review_count: { type: integer, minimum: 0 }
+        arbitration_count: { type: integer, minimum: 0 }
       additionalProperties: false
     AdminQuality:
       type: object

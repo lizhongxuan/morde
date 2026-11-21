@@ -64,6 +64,24 @@ func TestConversationRouteAcknowledgementIsExplicitAndLimitedToBackgroundWork(t 
 	}
 }
 
+func TestConversationRouteModelRequestNormalizesUnresolvedCandidateState(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "帮我查一个新问题", RequestCandidates: []ConversationRouteRequestCandidate{{
+		MessageID: "m1234567", Sequence: 1, Content: "前一条独立请求", RoutingStatus: conversation.RoutingProcessing,
+	}}}
+	processing, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.RequestCandidates[0].RoutingStatus = conversation.RoutingPending
+	pending, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processing.Input[0].Text != pending.Input[0].Text {
+		t.Fatal("pending and processing receipts produced different classification contexts")
+	}
+}
+
 func TestConversationRouteModelRequestUsesUTCWhenTimeZoneMissing(t *testing.T) {
 	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "现在几点？",
 		ServerReceivedAt: time.Date(2026, 11, 12, 3, 4, 5, 0, time.UTC)})
@@ -85,6 +103,34 @@ func TestConversationRouteModelRequestUsesUTCWhenTimeZoneMissing(t *testing.T) {
 	}
 }
 
+func TestConversationRouteModelRequestMarksIncompleteCandidates(t *testing.T) {
+	request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "处理这个独立问题",
+		CandidateSetIncomplete: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input["candidate_set_incomplete"] != true || !strings.Contains(request.Instructions, "candidate_set_incomplete is true") ||
+		!strings.Contains(request.Instructions, "Never invent an omitted task or message ID") {
+		t.Fatalf("incomplete candidate boundary missing from model request: input=%+v instructions=%s", input, request.Instructions)
+	}
+	legacy, err := legacyConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "处理这个独立问题",
+		CandidateSetIncomplete: true}, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyInput map[string]any
+	if err := json.Unmarshal([]byte(legacy.Input[0].Text), &legacyInput); err != nil {
+		t.Fatal(err)
+	}
+	if legacyInput["candidate_set_incomplete"] != true || !strings.Contains(legacy.Instructions, "candidate_set_incomplete is true") {
+		t.Fatalf("legacy model request lost incomplete candidate boundary: input=%+v instructions=%s", legacyInput, legacy.Instructions)
+	}
+}
+
 func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 	candidates := []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 4}}
 	for _, test := range []struct {
@@ -98,6 +144,7 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 		{"status", `{"action":"status","task_id":"q1234567","question":""}`, ConversationRouteStatus, "q1234567"},
 		{"stop", `{"action":"stop","task_id":"q1234567","question":""}`, ConversationRouteStop, "q1234567"},
 		{"direct reply", `{"action":"reply","task_id":"","question":"","reply":"你好，答案是 42。"}`, ConversationRouteReply, ""},
+		{"reply with unused question", `{"action":"reply","task_id":"","question":"为什么？","reply":"你好，答案是 42。"}`, ConversationRouteReply, ""},
 		{"ambiguous", `{"action":"clarify","task_id":"","question":"你指的是哪个任务？"}`, ConversationRouteClarify, ""},
 		{"unknown task", `{"action":"stop","task_id":"q7654321","question":""}`, ConversationRouteClarify, ""},
 		{"extra fields", `{"action":"update","task_id":"q1234567","question":"","admin":true}`, ConversationRouteClarify, ""},
@@ -115,7 +162,7 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 			if test.action == ConversationRouteClarify && decision.Question == "" {
 				t.Fatal("clarification must have a visible question")
 			}
-			if test.action == ConversationRouteReply && (decision.Reply != "你好，答案是 42。" || decision.ModelOutput != test.output) {
+			if test.action == ConversationRouteReply && (decision.Reply != "你好，答案是 42。" || decision.Question != "" || decision.ModelOutput != test.output) {
 				t.Fatalf("direct reply or original model output was not preserved: %+v", decision)
 			}
 		})
@@ -362,7 +409,6 @@ func TestConversationRouteDecisionFencesDependenciesToActiveTasks(t *testing.T) 
 func TestConversationRouteDirectReplyRequiresValidTargetlessText(t *testing.T) {
 	for _, output := range []string{
 		`{"action":"reply","task_id":"q1234567","question":"","reply":"answer"}`,
-		`{"action":"reply","task_id":"","question":"which?","reply":"answer"}`,
 		`{"action":"reply","task_id":"","question":"","reply":""}`,
 		`{"action":"reply","task_id":"","question":"","reply":"   "}`,
 		`{"action":"reply","task_id":"","question":"","reply":"\u0000"}`,
@@ -395,8 +441,25 @@ func TestConversationRouteDirectReplyCannotHideUnknownTaskControl(t *testing.T) 
 	value.PreviousMissing = true
 	value.PreviousUnresolved = true
 	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"The answer is 42."}`, value)
-	if decision.Action != ConversationRouteClarify || decision.Question != "前一条消息尚未确认，请先处理或重试。" || decision.ModelOutput == "" {
+	if decision.Action != ConversationRouteClarify || decision.Question != "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。" || decision.ModelOutput == "" {
 		t.Fatalf("reply used unavailable predecessor context or lost source output: %+v", decision)
+	}
+}
+
+func TestConversationRouteAcceptsIndependentReplyWithoutPredecessor(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "2+2 等于多少？", PreviousMissing: true, PreviousUnresolved: true}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil || !strings.Contains(request.Instructions, conversationRouteUnresolvedReplyInstructions) {
+		t.Fatalf("independence instructions unavailable: %v", err)
+	}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"答案是 4。"}`, value)
+	if decision.Action != ConversationRouteReply || decision.Reply != "答案是 4。" || decision.TaskID != "" {
+		t.Fatalf("independent conversation answer was blocked: %+v", decision)
+	}
+	value.Content = "把上面的内容缩短"
+	decision = ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"请提供需要缩短的原文。"}`, value)
+	if decision.Action != ConversationRouteClarify || decision.Question != "请提供需要缩短的原文。" {
+		t.Fatalf("specific clarification was lost: %+v", decision)
 	}
 }
 
@@ -409,7 +472,9 @@ func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || len(request.Input) != 1 || len(request.Tools) != 0 ||
-		!request.DisableThinking || request.Temperature == nil || *request.Temperature != 0 ||
+		!request.DisableThinking || !request.JSONMode || request.Temperature == nil || *request.Temperature != 0 ||
+		!strings.Contains(request.Instructions, conversationRouteJSONModeExample) ||
+		!strings.Contains(request.Instructions, conversationRouteReversibleChoiceInstructions) ||
 		!strings.Contains(request.Instructions, `"acknowledge" is the only acceptance signal`) ||
 		!strings.Contains(request.Input[0].Text, "只看收入和净利润") || !strings.Contains(request.Input[0].Text, "q1234567") ||
 		strings.Contains(request.Input[0].Text, "u1234567") {
@@ -496,7 +561,7 @@ func TestUnavailableRouteReferenceIsHiddenAndControlsAreRejected(t *testing.T) {
 	value.PreviousMissing = true
 	value.PreviousUnresolved = true
 	value.Content = "停止任务"
-	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteClarify || decision.Question != "前一条消息尚未确认，请先处理或重试。" {
+	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteClarify || decision.Question != "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。" {
 		t.Fatalf("missing predecessor control intent became new work: %+v", decision)
 	}
 	value.Content = "另外写一首春天的短诗"

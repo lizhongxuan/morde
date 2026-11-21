@@ -390,11 +390,14 @@ func runtimeToolRisk(name string, arguments json.RawMessage) runtimeToolRiskTier
 }
 
 func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMessage) AgentApprovalRequest {
+	preview := runtimeToolApprovalArgumentPreview(arguments)
 	switch mapping.name {
 	case runtimeToolShellExec:
-		return AgentApprovalRequest{Object: "Host Workspace command", Content: "Run a command in the Host Workspace?", Impact: "The command can change files or send data from the authorized Workspace."}
+		return AgentApprovalRequest{Object: "Host Workspace shell command", Content: "Command preview: " + preview,
+			Impact: "The command can change files or send data from the authorized Workspace. Approval is limited to these exact arguments and the current Host control version."}
 	case runtimeToolBrowserType:
-		return AgentApprovalRequest{Object: "Browser input", Content: "Type text into the selected browser field?", Impact: "The website may receive and store the text."}
+		return AgentApprovalRequest{Object: "Selected browser field", Content: "Input preview: " + preview,
+			Impact: "The website may receive and store the shown text. Approval is limited to these exact arguments and the current Host control version."}
 	case runtimeToolDesktopClick:
 		var click struct {
 			WindowID string `json:"window_id"`
@@ -412,12 +415,31 @@ func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMe
 		}
 		return AgentApprovalRequest{Object: "Host desktop input", Content: "Click a point on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
 	case runtimeToolDesktopType:
-		return AgentApprovalRequest{Object: "Host desktop input", Content: "Type text into the current Host desktop window?", Impact: "The text may change app data or be submitted externally."}
+		return AgentApprovalRequest{Object: "Current Host desktop window", Content: "Input preview: " + preview,
+			Impact: "The shown text may change app data or be submitted externally. Approval is limited to these exact arguments and the current Host control version."}
 	case runtimeToolDesktopPressKey:
-		return AgentApprovalRequest{Object: "Host desktop input", Content: "Press a potentially submitting or destructive key on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
+		return AgentApprovalRequest{Object: "Current Host desktop window", Content: "Key action preview: " + preview,
+			Impact: "This key may submit or destroy data in the current window. Approval is limited to these exact arguments and the current Host control version."}
 	default:
-		return AgentApprovalRequest{Object: "Host tool action", Content: "Run this sensitive Host action?", Impact: "The action may have effects that cannot be assessed from the available tool context."}
+		return AgentApprovalRequest{Object: "Host tool action: " + mapping.name, Content: "Argument preview: " + preview,
+			Impact: "The action may have effects that cannot be assessed from the available tool context. Approval is limited to these exact arguments and the current Host control version."}
 	}
+}
+
+func runtimeToolApprovalArgumentPreview(arguments json.RawMessage) string {
+	decoder := json.NewDecoder(bytes.NewReader(arguments))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return "unavailable"
+	}
+	delete(value, "workspace_id")
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "unavailable"
+	}
+	// shortcut: credential-shaped fields are redacted, not secrets embedded in arbitrary command text; add tool-specific masking if credentials become inline arguments.
+	return cloudDSHMCPApprovalArgumentPreview(encoded)
 }
 
 func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequest, preparation AgentToolPreparation) (AgentToolResult, error) {
@@ -1585,7 +1607,7 @@ func mapFileVerificationOperation(operation task.Operation, expected []AgentFile
 		}
 		artifacts = append(artifacts, AgentVerifiedArtifact{
 			Label: path.Base(actual.Path), Path: actual.Path, MediaType: mediaType,
-			WorkspaceID: candidate.WorkspaceID, SizeBytes: actual.Size, SHA256: actual.SHA256,
+			SourceCallID: SafeTaskValidationCallID(candidate.CallID), WorkspaceID: candidate.WorkspaceID, SizeBytes: actual.Size, SHA256: actual.SHA256,
 		})
 	}
 	return AgentVerificationResult{
@@ -1817,7 +1839,7 @@ func fileEvidenceArtifacts(group runtimeFileEvidenceGroup) []AgentVerifiedArtifa
 		}
 		artifacts = append(artifacts, AgentVerifiedArtifact{
 			Label: path.Base(file.Path), Path: file.Path, MediaType: mediaType,
-			WorkspaceID: group.workspaceID, SizeBytes: file.Size, SHA256: file.SHA256,
+			SourceCallID: SafeTaskValidationCallID(file.CallID), WorkspaceID: group.workspaceID, SizeBytes: file.Size, SHA256: file.SHA256,
 		})
 	}
 	return artifacts
@@ -1924,6 +1946,8 @@ func (e *RuntimeToolExecutor) workspaceOutputDeltaArtifacts(ctx context.Context,
 		if !exists || actual.Path != expected.Path || actual.SizeBytes != expected.SizeBytes || actual.SHA256 != expected.SHA256 {
 			return nil, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output does not match durable file evidence")
 		}
+		actual.SourceCallID = SafeTaskValidationCallID(expected.SourceCallID)
+		changed[key] = actual
 	}
 	result := make([]AgentVerifiedArtifact, 0, len(changed))
 	for _, artifact := range changed {
@@ -2011,7 +2035,7 @@ func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifactsAuthorized(ct
 			}
 			artifacts = append(artifacts, AgentVerifiedArtifact{
 				Label: path.Base(file.Path), Path: file.Path, MediaType: mediaType,
-				WorkspaceID: group.workspaceID, SizeBytes: file.Size, SHA256: file.SHA256,
+				SourceCallID: SafeTaskValidationCallID(file.CallID), WorkspaceID: group.workspaceID, SizeBytes: file.Size, SHA256: file.SHA256,
 			})
 		}
 		result = &AgentVerificationResult{Status: AgentVerified, Artifacts: artifacts}

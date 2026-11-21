@@ -364,6 +364,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model usage admin: %w", err)
 	}
+	blindEvaluations, err := app.NewBlindEvaluationService(store)
+	if err != nil {
+		return fmt.Errorf("initialize blind evaluations: %w", err)
+	}
 	adminConsole, err := app.NewAdminConsoleService(store)
 	if err != nil {
 		return fmt.Errorf("initialize admin console: %w", err)
@@ -718,6 +722,7 @@ func serve(ctx context.Context, configPath string) error {
 	var executionControlService api.ExecutionControlService
 	var taskWorker *worker.TaskWorker
 	var routeWorker *worker.ConversationRouteWorker
+	var taskValidationReviewWorker *worker.TaskValidationReviewWorker
 	var taskAgentStopReconciler worker.TaskAgentStopReconciler
 	if cfg.CloudDSH.Enabled {
 		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
@@ -747,10 +752,18 @@ func serve(ctx context.Context, configPath string) error {
 			Queue: store, Actions: store, Models: coordinator, WorkerID: workerSuffix + "-route",
 			SummaryStore: store, SummaryInputs: store, SummarySealer: sealer,
 			LeaseDuration: 2 * time.Minute, PollInterval: 500 * time.Millisecond,
-			MaxConcurrent: min(cfg.CloudDSH.MaxConcurrentTasks, 16), Logger: logger, Metrics: registry,
+			MaxConcurrent: cfg.CloudDSH.MaxConcurrentRoutes, Logger: logger, Metrics: registry,
 		})
 		if err != nil {
 			return fmt.Errorf("initialize conversation routing worker: %w", err)
+		}
+		taskValidationReviewWorker, err = worker.NewTaskValidationReviewWorker(worker.TaskValidationReviewWorkerOptions{
+			Queue: store, Snapshots: tasks, AccountRuntime: cloudDSHWorkers.accountRuntimes, Models: modelGateway,
+			WorkerID: workerSuffix + "-review", LeaseDuration: 5 * time.Minute, PollInterval: 500 * time.Millisecond,
+			MaxConcurrent: cfg.CloudDSH.MaxConcurrentRoutes, Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Task validation review worker: %w", err)
 		}
 	}
 	mcpRuntimeTools, err := app.NewMCPRuntimeToolExecutor(store, mcpHosts, credentials, store, runtimeControl)
@@ -810,7 +823,8 @@ func serve(ctx context.Context, configPath string) error {
 		RuntimeOperationLedger: store,
 		Projects:               projects, ProjectContent: projects,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
-		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
+		BlindEvaluations: blindEvaluations,
+		Hub:              hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
 		Goals: goalService, Schedules: executionAdapters.schedules,
 		PersonalDataQuota: personalDataQuotaService, PersonalDataQuotaUser: personalDataQuotaUserService,
 		PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
@@ -891,7 +905,9 @@ func serve(ctx context.Context, configPath string) error {
 	fileFetchCleanupCtx, stopFileFetchCleanup := context.WithCancel(ctx)
 	defer stopFileFetchCleanup()
 	go runTaskFileFetchCleanup(fileFetchCleanupCtx, tasks, logger)
-	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker,
+		taskValidationReviewWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime,
+		gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
 func runTaskFileFetchCleanup(ctx context.Context, tasks *app.TaskService, logger *zap.Logger) {
@@ -1514,7 +1530,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, taskValidationReviewWorker *worker.TaskValidationReviewWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -1566,6 +1582,14 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		routeWorkerDone = make(chan error, 1)
 		go func() { routeWorkerDone <- routeWorker.Run(routeWorkerCtx) }()
 	}
+	var taskValidationReviewWorkerDone chan error
+	var cancelTaskValidationReviewWorker context.CancelFunc
+	if taskValidationReviewWorker != nil {
+		reviewWorkerCtx, cancel := context.WithCancel(context.Background())
+		cancelTaskValidationReviewWorker = cancel
+		taskValidationReviewWorkerDone = make(chan error, 1)
+		go func() { taskValidationReviewWorkerDone <- taskValidationReviewWorker.Run(reviewWorkerCtx) }()
+	}
 	serverErrors := make(chan error, len(servers))
 	var serverWG sync.WaitGroup
 	for index, server := range servers {
@@ -1583,6 +1607,7 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	var runErr error
 	taskWorkerExited := false
 	routeWorkerExited := false
+	taskValidationReviewWorkerExited := false
 	resultWorkerExited := false
 	select {
 	case <-ctx.Done():
@@ -1600,6 +1625,13 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			runErr = errors.New("conversation routing worker stopped unexpectedly")
 		} else {
 			runErr = fmt.Errorf("conversation routing worker stopped unexpectedly: %w", err)
+		}
+	case err := <-taskValidationReviewWorkerDone:
+		taskValidationReviewWorkerExited = true
+		if err == nil {
+			runErr = errors.New("Task validation review worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("Task validation review worker stopped unexpectedly: %w", err)
 		}
 	case err := <-resultWorkerDone:
 		resultWorkerExited = true
@@ -1646,6 +1678,21 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			case <-shutdownCtx.Done():
 				if runErr == nil {
 					runErr = errors.New("conversation routing worker did not stop before shutdown timeout")
+				}
+			}
+		}
+	}
+	if cancelTaskValidationReviewWorker != nil {
+		cancelTaskValidationReviewWorker()
+		if !taskValidationReviewWorkerExited {
+			select {
+			case err := <-taskValidationReviewWorkerDone:
+				if err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+					runErr = fmt.Errorf("stop Task validation review worker: %w", err)
+				}
+			case <-shutdownCtx.Done():
+				if runErr == nil {
+					runErr = errors.New("Task validation review worker did not stop before shutdown timeout")
 				}
 			}
 		}

@@ -97,6 +97,7 @@ type TaskK2Projection struct {
 	Dependencies []Dependency
 	ChildJobs    []ChildJob
 	ResultReview *ResultReview
+	Validation   TaskValidationSummary
 }
 
 type TaskDetails struct {
@@ -104,6 +105,8 @@ type TaskDetails struct {
 	Dependencies           []Dependency
 	ChildJobs              []ChildJob
 	ResultReview           *ResultReview
+	Validation             TaskValidationSummary
+	ValidationEvidence     *TaskValidationEvidenceRecord
 	AssistantMessage       *AssistantMessageSnapshot
 	CurrentRevisionStarted *bool
 	ResultMessagePending   bool
@@ -156,33 +159,53 @@ type TaskAgentActivityRecorder interface {
 }
 
 type TaskStepDetailRecord struct {
-	TaskID        string
-	OwnerID       string
-	StepID        string
-	TaskRevision  int64
-	EventSequence int64
-	Ciphertext    []byte
-	SHA256        []byte
-	SizeBytes     int32
-	Truncated     bool
+	TaskID                string
+	OwnerID               string
+	StepID                string
+	TaskRevision          int64
+	EventSequence         int64
+	Ciphertext            []byte
+	SHA256                []byte
+	ContentEvidenceSHA256 []byte
+	SizeBytes             int32
+	Truncated             bool
+}
+
+type TaskStepShellExecutionEvidence struct {
+	ExitCode        int  `json:"exit_code"`
+	TimedOut        bool `json:"timed_out"`
+	StdoutBytes     int  `json:"stdout_bytes"`
+	StderrBytes     int  `json:"stderr_bytes"`
+	StdoutTruncated bool `json:"stdout_truncated"`
+	StderrTruncated bool `json:"stderr_truncated"`
+}
+
+type TaskStepContentEvidence struct {
+	SHA256    string `json:"sha256"`
+	Preview   string `json:"preview"`
+	Truncated bool   `json:"truncated"`
 }
 
 type TaskStepDetailDocument struct {
-	Object string `json:"object"`
-	Input  string `json:"input"`
-	Result string `json:"result"`
+	Object          string                          `json:"object"`
+	Input           string                          `json:"input"`
+	Result          string                          `json:"result"`
+	ShellExecution  *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
+	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
 }
 
 type TaskStepDetail struct {
-	TaskID        string  `json:"task_id"`
-	StepID        string  `json:"step_id"`
-	EventSequence int64   `json:"event_sequence"`
-	ToolName      string  `json:"tool_name"`
-	DetailState   string  `json:"detail_state"`
-	Object        *string `json:"object"`
-	Input         *string `json:"input"`
-	Result        *string `json:"result"`
-	Truncated     bool    `json:"truncated"`
+	TaskID          string                          `json:"task_id"`
+	StepID          string                          `json:"step_id"`
+	EventSequence   int64                           `json:"event_sequence"`
+	ToolName        string                          `json:"tool_name"`
+	DetailState     string                          `json:"detail_state"`
+	Object          *string                         `json:"object"`
+	Input           *string                         `json:"input"`
+	Result          *string                         `json:"result"`
+	Truncated       bool                            `json:"truncated"`
+	ShellExecution  *TaskStepShellExecutionEvidence `json:"-"`
+	ContentEvidence *TaskStepContentEvidence        `json:"-"`
 }
 
 type TaskStepDetailReader interface {
@@ -224,22 +247,23 @@ type TaskStepRetryIntentConsumer interface {
 }
 
 type TaskToolCallProgress struct {
-	AgentSessionID       string
-	AgentInstanceID      string
-	AgentGeneration      int64
-	AuthorizationVersion int64
-	TaskRevision         int64
-	CallKey              string
-	ToolName             string
-	RequestDigest        []byte
-	Phase                string
-	DetailState          string
-	FailureReason        string
-	Retryable            bool
-	DetailCiphertext     []byte
-	DetailSHA256         []byte
-	DetailSizeBytes      int32
-	Truncated            bool
+	AgentSessionID        string
+	AgentInstanceID       string
+	AgentGeneration       int64
+	AuthorizationVersion  int64
+	TaskRevision          int64
+	CallKey               string
+	ToolName              string
+	RequestDigest         []byte
+	Phase                 string
+	DetailState           string
+	FailureReason         string
+	Retryable             bool
+	DetailCiphertext      []byte
+	DetailSHA256          []byte
+	ContentEvidenceSHA256 []byte
+	DetailSizeBytes       int32
+	Truncated             bool
 }
 
 type AssistantMessageStatus string
@@ -327,6 +351,7 @@ type TaskProgress struct {
 	ClarificationRequest     *task.ClarificationRequest
 	AssistantMessage         *conversation.Message
 	PublishResultMessage     bool
+	ValidationClaims         []TaskResultClaim
 	CloudDSHSkillRead        *CloudDSHSkillReadCommit
 	CloudDSHPersonalMutation *CloudDSHPersonalMutationCommit
 	CloudDSHTaskPlan         *CloudDSHTaskPlanCommit

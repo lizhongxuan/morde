@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"math"
 	"reflect"
@@ -288,6 +289,35 @@ func TestProjectBudgetReserveUsesServerRateSnapshotAndStableRequestDigest(t *tes
 	}
 }
 
+func TestProjectBudgetReviewReservationChargesInitiatorAndAttributesReviewedTask(t *testing.T) {
+	service, store, _, rates := projectBudgetServiceFixture(t, project.RoleMember)
+	initiator := projectBudgetPrincipal(projectBudgetTestMember)
+	resultHash := make([]byte, 32)
+	claim := TaskValidationReviewClaim{
+		OwnerID: projectBudgetTestOwner, InitiatorID: initiator.UserID, ConversationID: "c1234567",
+		TaskID: "q1234567", TaskRevision: 9, ResultEventSequence: 20, ResultSHA256: resultHash,
+		ClaimGeneration: 2, LeaseOwner: "review-worker-1", LeaseExpiresAt: time.Now().Add(time.Minute),
+	}
+	fence := TaskValidationReviewModelFence{Claim: claim, InitiatorID: initiator.UserID, SessionID: "review-session-1", ThroughSequence: 7}
+	callID, err := DSHTaskValidationReviewModelCallID(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDigest := sha256.Sum256([]byte("review request"))
+	call := ModelCallReservation{Source: ModelCallReview, ProjectID: projectBudgetTestID, OwnerID: initiator.UserID,
+		ModelID: "p1234567", ProviderModel: "gpt-4o", CallID: callID, RequestDigest: requestDigest[:],
+		ReservedTokens: 10, Review: &fence}
+	usage := project.Usage{InputTokens: 7, OutputTokens: 3}
+	reservation, replay, err := service.reserveTaskValidationReviewModelCall(context.Background(), projectBudgetTestID, call, usage)
+	if err != nil || replay || reservation.Source != ModelCallReview || reservation.ActorID != initiator.UserID ||
+		reservation.TaskID != claim.TaskID || reservation.AccountCall.OwnerID != initiator.UserID ||
+		reservation.AccountCall.Review == nil || !sameTaskValidationReviewModelFence(reservation.AccountCall.Review, &fence) ||
+		store.reservation.Source != ModelCallReview || store.reservation.TaskID != claim.TaskID || store.reservation.ActorID != initiator.UserID ||
+		rates.model != call.ModelID || rates.calls != 1 {
+		t.Fatalf("review project reservation = %#v replay=%v err=%v; stored=%#v rate=%#v", reservation, replay, err, store.reservation, rates)
+	}
+}
+
 func TestProjectBudgetReserveFailsClosedForUnknownRateOrQuota(t *testing.T) {
 	service, store, access, rates := projectBudgetServiceFixture(t, project.RoleMember)
 	principal := projectBudgetPrincipal(projectBudgetTestMember)
@@ -403,6 +433,12 @@ func TestProjectBudgetSettlementKeepsUnknownUsageHeld(t *testing.T) {
 	known.Usage.InputTokens = -1
 	if err := service.SettleModelCall(context.Background(), known); domain.CodeOf(err) != domain.CodeInvalidArgument || store.settleCalls != 2 {
 		t.Fatalf("invalid settlement error=%v, store calls=%d", err, store.settleCalls)
+	}
+	compaction := SettleProjectModelCallCommand{ProjectID: projectBudgetTestID, Source: ModelCallCompaction, CallID: "summary-call-0001",
+		Summary: &ConversationSummaryModelFence{}, Usage: project.Usage{InputTokens: 1}, ResponseCiphertext: []byte{1},
+		ResponseDigest: make([]byte, 32), ResponseTextDigest: make([]byte, 32)}
+	if err := service.SettleModelCall(context.Background(), compaction); domain.CodeOf(err) != domain.CodeInvalidArgument || store.settleCalls != 2 {
+		t.Fatalf("compaction accepted a review-only response digest: err=%v calls=%d", err, store.settleCalls)
 	}
 }
 

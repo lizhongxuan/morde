@@ -569,7 +569,7 @@ func TestCoordinatorGatewayPreservesTextOnlyClassificationAndSettledOutput(t *te
 		t.Fatal(err)
 	}
 	if response.Text != output || client.calls != 1 || store.begins != 1 || store.unknown || store.decision == nil ||
-		store.decision.Action != ConversationRouteReply || len(client.request.Tools) != 0 ||
+		store.decision.Action != ConversationRouteReply || len(client.request.Tools) != 0 || !client.request.JSONMode ||
 		strings.Count(client.request.Instructions, strings.TrimSpace(mordeSoulFile)) != 1 ||
 		strings.Count(client.request.Instructions, conversationRouteInstructions) != 1 ||
 		strings.Contains(client.request.Instructions, value.History[0].Content) || len(client.request.Input) != 1 ||

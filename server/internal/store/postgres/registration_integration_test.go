@@ -7,8 +7,41 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/execution"
 	"morde/server/internal/domain/identity"
 )
+
+func TestNewAccountExecutionDefaultsEnabledWithoutChangingExistingControls(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	users, err := app.NewUserService(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing, err := users.Register(ctx, "existing-member", "existing-password-123", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.GetExecutionControl(ctx, existing.ID)
+	if err != nil || initial.State != execution.StateEnabled {
+		t.Fatalf("new account execution control = %#v, err=%v; want enabled", initial, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='disabled',epoch=epoch+1 WHERE owner_id=$1`, existing.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := users.Register(ctx, "new-member", "new-password-123", "192.0.2.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldControl, err := store.GetExecutionControl(ctx, existing.ID)
+	if err != nil || oldControl.State != execution.StateDisabled {
+		t.Fatalf("existing account execution control = %#v, err=%v; want disabled", oldControl, err)
+	}
+	newControl, err := store.GetExecutionControl(ctx, created.ID)
+	if err != nil || newControl.State != execution.StateEnabled {
+		t.Fatalf("new account execution control = %#v, err=%v; want enabled", newControl, err)
+	}
+}
 
 func TestRegisteredUserWaitsForApprovalBeforeLogin(t *testing.T) {
 	store, pool := newTemporaryStore(t)

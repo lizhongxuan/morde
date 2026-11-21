@@ -12,17 +12,17 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-func loadTaskK2Projection(ctx context.Context, tx pgx.Tx, taskID string, revision int64) ([]app.Dependency, []app.ChildJob, *app.ResultReview, error) {
+func loadTaskK2Projection(ctx context.Context, tx pgx.Tx, taskID string, revision int64) ([]app.Dependency, []app.ChildJob, *app.ResultReview, app.TaskValidationSummary, error) {
 	currentRevision := revision
 	projections, err := loadTaskK2Projections(ctx, tx, []task.Task{{ID: taskID, CurrentRevision: &currentRevision}})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, app.TaskValidationSummary{}, err
 	}
 	projection, ok := projections[taskID]
 	if !ok {
-		return nil, nil, nil, domain.NewError(domain.CodeInvalidState, "Task K2 projection is missing")
+		return nil, nil, nil, app.TaskValidationSummary{}, domain.NewError(domain.CodeInvalidState, "Task K2 projection is missing")
 	}
-	return projection.Dependencies, projection.ChildJobs, projection.ResultReview, nil
+	return projection.Dependencies, projection.ChildJobs, projection.ResultReview, projection.Validation, nil
 }
 
 // loadTaskK2Projections hydrates every summary from the caller's existing
@@ -51,6 +51,7 @@ func loadTaskK2Projections(ctx context.Context, tx pgx.Tx, items []task.Task) (m
 		projections[item.ID] = app.TaskK2Projection{
 			Dependencies: make([]app.Dependency, 0),
 			ChildJobs:    make([]app.ChildJob, 0),
+			Validation:   app.TaskValidationSummary{State: app.TaskValidationPending},
 		}
 	}
 
@@ -169,6 +170,44 @@ ORDER BY source.task_id`, ids, revisions)
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return nil, fmt.Errorf("iterate Task result reviews: %w", err)
+	}
+	rows.Close()
+
+	rows, err = tx.Query(ctx, `SELECT review.task_id,review.validation_state
+FROM unnest($1::text[],$2::bigint[]) AS requested(task_id,task_revision)
+JOIN task_validation_reviews review ON review.task_id=requested.task_id AND review.task_revision=requested.task_revision
+JOIN tasks task ON task.id=review.task_id AND task.status='completed'
+  AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
+  AND task.result<>'' AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
+JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
+  AND event.task_revision=review.task_revision AND event.event_type='task.result'
+  AND event.result_content_sha256=review.result_sha256
+WHERE review.state='reviewed'`, ids, revisions)
+	if err != nil {
+		return nil, fmt.Errorf("read Task validation verdicts: %w", err)
+	}
+	for rows.Next() {
+		var taskID string
+		var state app.TaskValidationState
+		if err := rows.Scan(&taskID, &state); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan Task validation verdict: %w", err)
+		}
+		if !app.ValidTaskValidationState(state) {
+			rows.Close()
+			return nil, fmt.Errorf("Task validation verdict has unknown state %q", state)
+		}
+		projection, exists := projections[taskID]
+		if !exists {
+			rows.Close()
+			return nil, domain.NewError(domain.CodeInvalidState, "Task validation projection escaped its page")
+		}
+		projection.Validation.State = state
+		projections[taskID] = projection
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate Task validation verdicts: %w", err)
 	}
 	rows.Close()
 

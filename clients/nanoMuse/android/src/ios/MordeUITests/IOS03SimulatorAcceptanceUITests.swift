@@ -206,6 +206,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         } else {
             portalOrigin = "http://127.0.0.1:24131"
         }
+        let offlineRetryAcceptance = ProcessInfo.processInfo.environment["MORDE_C10_OFFLINE_RETRY"] == "1"
         let serverArguments = ["-morde.server", portalOrigin]
         let portalBaseURL = URL(string: portalOrigin)!
         let sessionConfiguration = URLSessionConfiguration.ephemeral
@@ -256,7 +257,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         }
 
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        app.launchArguments = serverArguments
+        app.launchArguments = offlineRetryAcceptance
+            ? serverArguments + ["-morde.portalMessageTransportFailureFixture",
+                                 "-morde.portalMessageTransportFailureOrigin", portalOrigin]
+            : serverArguments
         app.launch()
 
         let usernameField = app.textFields["morde.auth.username"]
@@ -288,6 +292,14 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(chatComposer.waitForExistence(timeout: 30),
                       "Real Portal login should open the authenticated chat composer.")
 
+        if let expectedExistingMessage = ProcessInfo.processInfo.environment["MORDE_C10_EXPECTED_EXISTING_MESSAGE"] {
+            let existingMessage = app.staticTexts.matching(NSPredicate(format: "label == %@", expectedExistingMessage))
+            XCTAssertTrue(existingMessage.firstMatch.waitForExistence(timeout: 30),
+                          "The iOS client should load a message already sent from the same account's PC client.")
+            XCTAssertEqual(existingMessage.count, 1,
+                           "A message sent from the same account's PC client should appear once on iOS.")
+        }
+
         let marker = "C10-Portal-\(UUID().uuidString)"
         let messageText = ProcessInfo.processInfo.environment["MORDE_C10_MESSAGE_TEXT"]
             ?? "\(marker) Create a new task to reply with a short acknowledgment."
@@ -315,9 +327,48 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             return
         }
         let clientMessageID = String(sentMessage.identifier.dropFirst(contentIdentifierPrefix.count))
-        let sentStatus = app.staticTexts["morde.chat.message.status.\(clientMessageID)"]
-        XCTAssertTrue(sentStatus.waitForExistence(timeout: 120),
-                      "The Portal should confirm the original client message before the app is restarted.")
+
+        if offlineRetryAcceptance {
+            XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 15))
+            XCTAssertFalse(app.staticTexts["已发送"].exists)
+            var retryStatus = try await portalJSON("/__morde_fixture/message-receipt-retry-status")
+            XCTAssertEqual(retryStatus["client_offline_before_retry"] as? Bool, true)
+            XCTAssertEqual(retryStatus["client_message_id"] as? String, "")
+            XCTAssertEqual(retryStatus["post_attempts"] as? Int, 0)
+            XCTAssertEqual(retryStatus["server_accepted"] as? Bool, false)
+
+            app.terminate()
+            app.launchArguments = serverArguments
+            app.launch()
+            XCTAssertTrue(app.textFields["morde.chat.composer"].waitForExistence(timeout: 40))
+            XCTAssertTrue(app.staticTexts["morde.chat.message.content.\(clientMessageID)"].waitForExistence(timeout: 40))
+            XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 10))
+            retryStatus = try await portalJSON("/__morde_fixture/message-receipt-retry-status")
+            XCTAssertEqual(retryStatus["post_attempts"] as? Int, 0,
+                           "Restart and connectivity restoration must not resubmit the uncertain message.")
+            XCTAssertFalse(app.staticTexts["已发送"].exists)
+
+            let retry = app.buttons.matching(NSPredicate(
+                format: "identifier BEGINSWITH %@", "morde.chat.message.retry.")).firstMatch
+            XCTAssertTrue(retry.waitForExistence(timeout: 10))
+            retry.tap()
+            let sentStatus = app.staticTexts["morde.chat.message.status.\(clientMessageID)"]
+            let accepted = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "已发送"),
+                                                       object: sentStatus)
+            XCTAssertEqual(XCTWaiter.wait(for: [accepted], timeout: 40), .completed)
+            XCTAssertEqual(app.staticTexts.matching(identifier:
+                "morde.chat.message.content.\(clientMessageID)").count, 1,
+                "The original user message should render once; its text may also appear in the result evidence.")
+            retryStatus = try await portalJSON("/__morde_fixture/message-receipt-retry-status")
+            XCTAssertEqual(retryStatus["post_attempts"] as? Int, 1,
+                           "Only the explicit retry should reach the Portal after the offline send.")
+            XCTAssertEqual(retryStatus["client_message_id"] as? String, clientMessageID)
+            XCTAssertEqual(retryStatus["first_attempt_rejected"] as? Bool, false)
+            XCTAssertEqual(retryStatus["first_response_lost"] as? Bool, false)
+            XCTAssertEqual(retryStatus["server_accepted"] as? Bool, true)
+            XCTAssertGreaterThan(retryStatus["reconciliation_checks"] as? Int ?? 0, 0)
+            return
+        }
 
         app.terminate()
         XCTAssertEqual(app.state, .notRunning, "The app should stay closed while the Portal finishes processing the message.")
@@ -509,11 +560,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The second installation cloud reply should remain readable after relaunch.")
         XCTAssertEqual(restoredReplyQuery.count, 1,
                        "The cloud reply should appear exactly once in the relaunched iOS conversation.")
-        let restoredReplyContent = app.staticTexts["morde.chat.message.content.\(peerReplyID)"]
-        XCTAssertTrue(restoredReplyContent.waitForExistence(timeout: 30),
-                      "The final Agent reply should remain readable after relaunch.")
-        XCTAssertTrue(restoredReplyContent.label.contains(peerReplyText),
-                      "The restored Agent reply should contain its Portal reply text.")
+        XCTAssertTrue(restoredReplyQuery.firstMatch.label.contains(peerReplyText),
+                      "The restored task result card should contain the final Agent reply text.")
     }
 
     @MainActor
@@ -1776,11 +1824,20 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Task A coordinator"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["Task B research"].waitForExistence(timeout: 15),
                       "Each Task in the same conversation should keep its own status row.")
+        XCTAssertEqual(app.staticTexts["morde.chat.task.validation.q0000201"].label, "待复核",
+                       "An omitted validation object defaults conservatively to pending.")
+        XCTAssertEqual(app.staticTexts["morde.chat.task.validation.q0000202"].label, "通过",
+                       "The chat card shows the overall validation state only.")
+        XCTAssertFalse(app.staticTexts["morde.task.validation.explanation"].exists,
+                       "Validation explanations stay in Task details.")
 
-        XCTAssertTrue(app.staticTexts["q0000202 · 所需修订 1"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["等待依赖任务"].exists)
-        XCTAssertTrue(app.staticTexts["Read source material"].exists)
-        XCTAssertTrue(app.staticTexts["等待整理结果"].exists)
+        XCTAssertFalse(app.staticTexts["Synthetic hidden task step"].exists,
+                       "Task steps should remain in Task details instead of expanding inside the main conversation.")
+        XCTAssertFalse(app.staticTexts["q0000202 · 所需修订 1"].exists,
+                       "Dependency details should stay in Task details.")
+        XCTAssertFalse(app.staticTexts["等待依赖任务"].exists)
+        XCTAssertFalse(app.staticTexts["Read source material"].exists)
+        XCTAssertFalse(app.staticTexts["等待整理结果"].exists)
         let source = app.descendants(matching: .any)["morde.chat.message.source.q0000202.r1.e7"]
         XCTAssertTrue(source.waitForExistence(timeout: 15))
         XCTAssertTrue(source.label.contains("Raw child task result from local research."))
@@ -1794,6 +1851,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["q0000202 · 所需修订 1"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.childJobs"].exists)
         XCTAssertTrue(app.staticTexts["Read source material"].exists)
+        XCTAssertTrue(app.staticTexts["Synthetic hidden task step"].exists,
+                      "Task details should continue to show the complete step list.")
+        XCTAssertEqual(app.staticTexts["morde.task.validation.state"].label, "待复核")
+        XCTAssertEqual(app.staticTexts["morde.task.validation.explanation"].label,
+                       "独立复核尚未完成，不代表验证通过。")
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.resultReview"].exists)
         XCTAssertTrue(app.staticTexts["来源 q0000202 · 修订 1 · 事件 7"].exists)
         attachScreen(app, named: "C20 task detail with K2 relationships")
@@ -1904,6 +1966,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(completedStatus.waitForExistence(timeout: 15))
         XCTAssertTrue(completedStatus.label.contains("已完成"))
         XCTAssertTrue(completedStatus.label.contains("Local completed result"))
+        XCTAssertEqual(app.staticTexts["morde.task.validation.state"].label, "通过",
+                       "The PASS fixture exercises local UI rendering only.")
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.step.s0000005"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.activity.emptyHistory"].waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["Private budget field"].exists)
@@ -1920,6 +1984,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(failedStatus.waitForExistence(timeout: 15))
         XCTAssertTrue(failedStatus.label.contains("失败"))
         XCTAssertTrue(failedStatus.label.contains("Review failed output"))
+        XCTAssertEqual(app.staticTexts["morde.task.validation.state"].label, "失败",
+                       "The FAIL fixture exercises local UI rendering only.")
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.step.s0000007"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.activity.emptyHistory"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons["morde.task.action.retry:b0000001"].waitForExistence(timeout: 10),
@@ -1938,9 +2004,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(cancelledStatus.waitForExistence(timeout: 15))
         XCTAssertTrue(cancelledStatus.label.contains("已取消"))
         XCTAssertTrue(cancelledStatus.label.contains("Local cancelled result"))
-        let cancelledStep = app.descendants(matching: .any)["morde.task.step.s0000009"]
-        XCTAssertTrue(cancelledStep.exists)
-        XCTAssertTrue((cancelledStep.value as? String ?? "").contains("已取消"),
+        let cancelledStepSummary = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "The local task was cancelled.")).firstMatch
+        XCTAssertTrue(cancelledStepSummary.waitForExistence(timeout: 10))
+        XCTAssertTrue(cancelledStepSummary.label.contains("已取消"),
                       "A cancelled task step must not be presented as an unknown status.")
         XCTAssertTrue(app.descendants(matching: .any)["morde.task.activity.emptyHistory"].waitForExistence(timeout: 10))
         XCTAssertFalse(app.buttons["morde.task.action.pause"].exists)
@@ -2176,6 +2243,24 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The event stream already reconnects automatically after a transient failure.")
         XCTAssertFalse(app.buttons["Retry loading"].exists)
         attachScreen(app, named: "MDA-04 task detail timeline recovered without retry button")
+    }
+
+    func testMordeTaskDetailReconnectsAfter204WhenSnapshotIsStillActive() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskPagesTimelineNoContentRecoveryFixture",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+
+        let task = app.buttons["morde.tasks.row.q0000101"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        XCTAssertTrue(app.staticTexts["Event before empty response"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Recovered after 204"].waitForExistence(timeout: 20),
+                      "The task snapshot remains active after 204, so the event stream should reconnect with its cursor.")
+        attachScreen(app, named: "MDA-04 task event stream recovered after 204")
     }
 
     func testMordeTaskDetailUnconfirmedHistoryHasNoRetryButton() {
@@ -4318,8 +4403,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     func testMordeChatComposerRecoversPlainTextAfterOfflineRestart() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         let fixtures = ["-morde.localMessageSendWithoutAutoRoutingFixture", "-morde.localChatOfflineRecoveryFixture"]
+        let accountID = "u\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(7))"
+        let accountFixture = ["-morde.localFixtureAccountID", accountID]
         let messageText = "Keep plain text while offline and send after restart"
-        launchLocalChat(app, additionalArguments: fixtures + ["-morde.localChatSendOfflineFixture"],
+        launchLocalChat(app, additionalArguments: accountFixture + fixtures + ["-morde.localChatSendOfflineFixture"],
                         resetExistingAccount: true)
 
         let composer = app.textFields["morde.chat.composer"]
@@ -4339,13 +4426,22 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["已发送"].exists)
 
         app.terminate()
-        launchLocalChat(app, additionalArguments: fixtures)
+        launchLocalChat(app, additionalArguments: accountFixture + fixtures)
 
         let recoveredMessages = app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
         let recovered = recoveredMessages.firstMatch
         XCTAssertTrue(recovered.waitForExistence(timeout: 40),
-                      "After connectivity returns, the persisted outbox message should be sent.")
-        XCTAssertEqual(recoveredMessages.count, 1, "Offline recovery must not duplicate the message.")
+                      "After connectivity returns, the persisted outbox message should remain visible.")
+        XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 10),
+                      "An unknown send must wait for an explicit retry after restart.")
+        XCTAssertFalse(app.staticTexts["已发送"].exists,
+                       "Restoring connectivity must not automatically resubmit an unknown message.")
+        let retry = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.retry.")).firstMatch
+        XCTAssertTrue(retry.waitForExistence(timeout: 10), "The saved message must expose a retry action.")
+        retry.tap()
+        XCTAssertTrue(app.staticTexts["已发送"].waitForExistence(timeout: 30),
+                      "An explicit retry should reconcile and send the saved message.")
+        XCTAssertEqual(recoveredMessages.count, 1, "Explicit retry must keep one local message with its original ID.")
         XCTAssertTrue(app.staticTexts["已发送"].waitForExistence(timeout: 20))
         XCTAssertFalse(app.staticTexts["发送结果待确认"].exists)
     }

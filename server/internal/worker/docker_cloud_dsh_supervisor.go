@@ -23,7 +23,8 @@ import (
 )
 
 const (
-	dockerDSHUser         = "65532:65532"
+	// Workspace bind mounts use GID 1000; keep the runtime unprivileged and the mount read-only.
+	dockerDSHUser         = "65532:1000"
 	dockerDSHWorkspaceDir = "/workspace"
 	dockerDSHMemory       = int64(512 << 20)
 	dockerDSHNanoCPUs     = int64(1_000_000_000)

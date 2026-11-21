@@ -323,9 +323,13 @@ func clearDeadlines(c *gin.Context) error {
 }
 
 func upstreamPrefix(path string) string {
-	first, _, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
+	requestPath := strings.TrimPrefix(path, "/")
+	if requestPath == "v1/shell/ws" {
+		return "/v1/shell/ws"
+	}
+	first, _, _ := strings.Cut(requestPath, "/")
 	switch first {
-	case "v1", "vnc":
+	case "v1", "vnc", "terminal", "code-server":
 		return "/" + first
 	default:
 		return "/other"

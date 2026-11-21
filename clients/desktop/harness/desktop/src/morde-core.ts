@@ -42,6 +42,7 @@ export type CodexQueuedCommand = {
 };
 
 const IDS = { host: /^h[a-z0-9]{7}$/, workspace: /^w[a-z0-9]{7}$/ };
+const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SYNC_DEVICE_ID = /^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){7}$/;
 const SYNC_FOLDER_ID = /^morde-[a-f0-9]{32}$/;
 const SYNC_DEVICE_STATES = new Set(["pending_node", "active", "revoking", "revoked"]);
@@ -83,6 +84,13 @@ export function checkedId(kind: keyof typeof IDS, value: unknown): string {
   return value;
 }
 
+function requestFailure(response: Response, method: string, path: string, unauthorized: string): Error {
+  if (response.status === 401) return new Error(unauthorized);
+  const requestID = response.headers.get("x-request-id");
+  const reference = requestID && REQUEST_ID.test(requestID) ? `; request ID ${requestID}` : "";
+  return new Error(`Morde returned HTTP ${response.status} (${method} ${path})${reference}`);
+}
+
 export function portalOrigin(input: unknown): string {
   if (typeof input !== "string") throw new Error("Enter a Morde service address");
   const url = new URL(input.trim());
@@ -99,6 +107,20 @@ export function mordeUserDataDirectory(appDataDirectory: string, testDirectory?:
   if (!override) return join(appDataDirectory, "Morde Client");
   if (!isAbsolute(override)) throw new Error("MORDE_TEST_USER_DATA must be an absolute path");
   return resolve(override);
+}
+
+export async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([operation, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        try { onTimeout(); } catch { /* Timeout remains the primary failure if cleanup is unavailable. */ }
+        reject(new Error("Operation timed out"));
+      }, timeoutMs);
+    })]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export function desktopDownloadsURL(origin: unknown): string {
@@ -342,7 +364,7 @@ export class MordeAPI {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: "error", signal: AbortSignal.timeout(20_000),
     });
-    if (!response.ok) throw new Error(response.status === 401 ? "Authorization expired or revoked" : `Morde returned HTTP ${response.status} (${method} ${path})`);
+    if (!response.ok) throw requestFailure(response, method, path, "Authorization expired or revoked");
     return response.status === 204 ? null : response.json();
   }
 
@@ -536,7 +558,7 @@ export class MordeAPI {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
     });
-    if (!response.ok) throw new Error(response.status === 401 ? "Portal authorization expired or revoked" : `Morde returned HTTP ${response.status} (${method} ${path})`);
+    if (!response.ok) throw requestFailure(response, method, path, "Portal authorization expired or revoked");
     return response.status === 204 ? null : response.json();
   }
 

@@ -159,6 +159,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .notice-center-panel .toast-success { color: #05603a; border-color: #a6f4c5; background: #f2fbf6; }
 .notice-center-panel .toast-error { color: #8b211a; border-color: #f1c9c5; background: #fff8f7; }
 .notice-center-panel .toast-notice .icon-button { flex: 0 0 auto; }
+.error-notice-overlay { position: fixed; top: 72px; right: clamp(12px, 3vw, 32px); z-index: 1000; width: min(420px, calc(100vw - 24px)); pointer-events: none; }
+.error-notice-overlay .toast-notice { min-width: 0; padding: 10px 12px; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; border: 1px solid #f1c9c5; border-radius: 9px; color: #8b211a; background: #fff8f7; box-shadow: var(--shadow); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; pointer-events: auto; }
+.error-notice-overlay .icon-button { flex: 0 0 auto; color: inherit; }
 .notice-center-overlay { position: fixed; top: 16px; right: clamp(12px, 3vw, 32px); z-index: 1000; pointer-events: none; }
 .notice-center-overlay details { pointer-events: auto; }
 .notice-center-overlay .notice-center-panel { position: fixed; top: 52px; right: clamp(12px, 3vw, 32px); z-index: 1000; width: min(420px, calc(100vw - 24px)); max-width: calc(100vw - 24px); margin: 0; }
@@ -1290,6 +1293,11 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-panel-detail .task-activity-k2 h3 { margin: 0 0 5px; color: #60728b; font-size: 13px; }
 .assistant-page .task-current-progress p { margin: 0; color: #29384f; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
 .assistant-page .task-current-progress p + p { margin-top: 5px; }
+.assistant-page .task-activity-evidence > p,
+.assistant-page .task-activity-evidence-performance { margin: 0; color: #75839a; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.assistant-page .task-activity-evidence ol { margin: 8px 0 0; padding-left: 22px; display: grid; gap: 10px; }
+.assistant-page .task-activity-evidence blockquote { margin: 4px 0; padding: 8px 10px; border-left: 2px solid #8eb5ff; border-radius: 4px; background: #f3f8ff; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+.assistant-page .task-activity-evidence details > summary { color: #536780; font-size: 12px; cursor: pointer; }
 .assistant-page .task-queue-priority h3 { margin: 0 0 5px; color: #60728b; font-size: 13px; }
 .assistant-page .task-queue-priority p { margin: 0 0 7px; color: #75839a; font-size: 12px; }
 .assistant-page .task-queue-priority small { display: block; margin-top: 6px; color: #8794a8; font-size: 11px; line-height: 1.45; }

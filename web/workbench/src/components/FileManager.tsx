@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { downloadFile, listFiles, MAX_UPLOAD_BYTES, readFile, uploadFile, writeFile, type AioFile } from '../app/fileApi';
-import { isTransientNetworkError, runShell } from '../app/aio';
+import { createDirectory as createDirectoryRequest, deleteFile, downloadFile, listFiles, MAX_UPLOAD_BYTES, moveFile, readFile, uploadFile, writeFile, type AioFile } from '../app/fileApi';
+import { isTransientNetworkError } from '../app/aio';
 import { useWorkbenchNotice } from '../app/notice';
-import { shellQuote } from '../util/shellQuote';
 import FloatingError from './FloatingError';
 
 const INITIAL_PATH = '/home/gem/workspace';
@@ -192,7 +191,7 @@ export default function FileManager() {
     }
     setError('');
     try {
-      await runShell(`mkdir -- ${shellQuote(joinPath(path, directoryName))}`, path);
+      await createDirectoryRequest(joinPath(path, directoryName));
       setMessage('目录已创建');
       setDirectoryName('');
       await refreshCurrentDirectory(path, showHidden);
@@ -218,7 +217,7 @@ export default function FileManager() {
     }
     setError('');
     try {
-      await runShell(`mv -n -- ${shellQuote(selected.path)} ${shellQuote(nextPath)} && test ! -e ${shellQuote(selected.path)}`, path);
+      await moveFile(selected.path, nextPath);
       setMessage('名称已更新');
       setSelected(null);
       setContent('');
@@ -235,7 +234,7 @@ export default function FileManager() {
     if (!window.confirm(`确定删除“${selected.name}”吗？此操作不可撤销。`)) return;
     setError('');
     try {
-      await runShell(`rm -r -- ${shellQuote(selected.path)}`, path);
+      await deleteFile(selected.path);
       setMessage('已删除');
       setSelected(null);
       setContent('');

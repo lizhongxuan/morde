@@ -379,6 +379,7 @@ type Artifact struct {
 	ID           string
 	TaskID       string
 	StepID       string
+	SourceCallID string `json:"-"`
 	BatchItemID  string
 	BatchAttempt int32
 	WorkspaceID  string

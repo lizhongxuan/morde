@@ -1,9 +1,11 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"morde/server/internal/app"
@@ -51,15 +53,21 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256([]byte("morde_workspace_file_read:{\"path\":\"src/main.go\"}"))
+	digest := sha256.Sum256([]byte("morde_web_read:{\"url\":\"https://example.com\"}"))
+	contentDigest := sha256.Sum256([]byte("Public source passage."))
 	makeProgress := func(status task.StepStatus, summary string, toolDigest []byte, agentSessionID string, id string, stepSequence int64) app.TaskProgress {
 		phase := string(status)
 		if status == task.StepRunning {
 			phase = "prepare"
 		}
 		step := task.Step{ID: id, TaskID: current.Task.ID, Sequence: stepSequence, Kind: "tool", Status: status,
-			Title: "Read src/main.go", Summary: summary, Phase: phase}
-		document := app.TaskStepDetailDocument{Object: "src/main.go", Input: "Read the requested file.", Result: summary}
+			Title: "Read public source", Summary: summary, Phase: phase}
+		document := app.TaskStepDetailDocument{Object: "https://example.com", Input: "Read the requested public source.", Result: summary}
+		var contentEvidenceSHA256 []byte
+		if status == task.StepSucceeded {
+			document.ContentEvidence = &app.TaskStepContentEvidence{SHA256: fmt.Sprintf("%x", contentDigest[:]), Preview: "Public source passage."}
+			contentEvidenceSHA256 = contentDigest[:]
+		}
 		plain, err := json.Marshal(document)
 		if err != nil {
 			t.Fatal(err)
@@ -94,9 +102,10 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 			ToolCall: &app.TaskToolCallProgress{
 				AgentSessionID: agentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
 				AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
-				TaskRevision: *current.Task.CurrentRevision, CallKey: "call-activity-1", ToolName: "morde_workspace_file_read",
+				TaskRevision: *current.Task.CurrentRevision, CallKey: "call-activity-1", ToolName: "morde_web_read",
 				RequestDigest: append([]byte(nil), toolDigest...), Phase: phase, DetailState: "available",
 				DetailCiphertext: ciphertext, DetailSHA256: plainDigest[:], DetailSizeBytes: int32(len(plain)),
+				ContentEvidenceSHA256: contentEvidenceSHA256,
 			},
 		}
 	}
@@ -129,11 +138,12 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 	}
 	if persisted == nil || persisted.Status != task.StepSucceeded || persisted.AgentSessionID != lease.Fence.AgentSessionID ||
 		persisted.TaskRevision == nil || *persisted.TaskRevision != *current.Task.CurrentRevision || persisted.ToolCallKey != "call-activity-1" ||
-		persisted.ToolName != "morde_workspace_file_read" || persisted.DetailState != "available" || persisted.Phase != string(task.StepSucceeded) {
+		persisted.ToolName != "morde_web_read" || persisted.DetailState != "available" || persisted.Phase != string(task.StepSucceeded) {
 		t.Fatalf("persisted task activity step = %#v", persisted)
 	}
 	stored, err := f.store.GetTaskStepDetail(ctx, current.Task.OwnerID, current.Task.ID, stepID)
-	if err != nil || stored.EventSequence != second.Sequence || stored.TaskRevision != *current.Task.CurrentRevision || stored.Truncated {
+	if err != nil || stored.EventSequence != second.Sequence || stored.TaskRevision != *current.Task.CurrentRevision || stored.Truncated ||
+		!bytes.Equal(stored.ContentEvidenceSHA256, contentDigest[:]) {
 		t.Fatalf("read persisted step detail = %+v, err=%v", stored, err)
 	}
 	plain, err := sealer.OpenWithAAD(stored.Ciphertext, aadForTaskStepDetail(current.Task.OwnerID, current.Task.ID, stepID, stored.TaskRevision))
@@ -141,7 +151,8 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 		t.Fatalf("open persisted step detail: %v", err)
 	}
 	var document app.TaskStepDetailDocument
-	if err := json.Unmarshal(plain, &document); err != nil || document.Object != "src/main.go" || document.Result != "Read completed." {
+	if err := json.Unmarshal(plain, &document); err != nil || document.Object != "https://example.com" || document.Result != "Read completed." ||
+		document.ContentEvidence == nil || document.ContentEvidence.SHA256 != fmt.Sprintf("%x", contentDigest[:]) {
 		t.Fatalf("persisted step detail document = %+v, err=%v", document, err)
 	}
 
@@ -153,7 +164,7 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 	conflict := makeProgress(task.StepRunning, "Changed input.", conflictingDigest[:], lease.Fence.AgentSessionID, conflictStepID, sequence+1)
 	conflict.Event.Payload, err = json.Marshal(map[string]any{
 		"step_id": conflict.Steps[0].ID, "sequence": conflict.Steps[0].Sequence, "kind": "tool",
-		"status": "running", "title": "Read src/main.go", "summary": "Changed input.",
+		"status": "running", "title": "Read public source", "summary": "Changed input.",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +192,7 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 	}
 	childCallCount := 0
 	for _, persistedStep := range details.Steps {
-		if persistedStep.ToolCallKey == "call-activity-1" && persistedStep.ToolName == "morde_workspace_file_read" {
+		if persistedStep.ToolCallKey == "call-activity-1" && persistedStep.ToolName == "morde_web_read" {
 			childCallCount++
 		}
 	}

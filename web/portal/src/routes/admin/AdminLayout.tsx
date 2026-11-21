@@ -12,6 +12,7 @@ const links: { to: string; label: string; icon: MordeIconName; end?: boolean }[]
   { to: '/admin/models', label: '平台模型', icon: 'spark' },
   { to: '/admin/usage', label: '用量与统计', icon: 'chart' },
   { to: '/admin/quality', label: '质量与风险', icon: 'shield' },
+  { to: '/admin/evaluations', label: '盲测评测', icon: 'chart' },
   { to: '/admin/controls', label: '规则与通知', icon: 'bell' },
   { to: '/admin/hosts', label: '云端电脑', icon: 'monitor' },
   { to: '/admin/audit', label: '审计', icon: 'file' },
@@ -20,7 +21,7 @@ const links: { to: string; label: string; icon: MordeIconName; end?: boolean }[]
 const titles: Record<string, string> = {
   '/admin': '总览', '/admin/': '总览', '/admin/users': '用户', '/admin/hosts': '云端电脑',
   '/admin/settings': '配置与预算',
-  '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/quality': '质量与风险', '/admin/controls': '规则与通知', '/admin/audit': '审计',
+  '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/quality': '质量与风险', '/admin/evaluations': '盲测评测', '/admin/controls': '规则与通知', '/admin/audit': '审计',
 };
 
 export function AdminLayout() {

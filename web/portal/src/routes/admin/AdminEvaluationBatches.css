@@ -1,0 +1,33 @@
+.admin-blind-evaluations { display: grid; gap: 22px; }
+.admin-blind-heading { display: flex; align-items: flex-start; justify-content: space-between; }
+.admin-blind-heading h2 { margin-bottom: 6px; }
+.admin-blind-heading p, .admin-blind-privacy { margin-bottom: 0; color: var(--muted); }
+.blind-suite-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 14px 0; padding: 12px 14px; border: 1px solid var(--brand-tint, #cfe3ff); border-radius: 12px; color: var(--ink); background: var(--brand-soft, #eff6ff); }
+.blind-suite-summary strong { color: var(--brand-deep, #245da8); }
+.admin-blind-privacy { margin: 0 0 16px; padding: 10px 12px; border-left: 3px solid var(--brand, #60a5fa); background: var(--brand-soft, #eff6ff); }
+.blind-roster-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.blind-roster-card { min-width: 0; max-height: 280px; padding: 12px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
+.blind-roster-card legend { padding: 0 4px; font-weight: 700; }
+.blind-roster-card legend span { display: block; color: var(--muted); font-size: .8rem; font-weight: 500; }
+.blind-user-list { display: grid; gap: 7px; }
+.blind-user-list label { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 2px 8px; min-width: 0; padding: 8px; border-radius: 8px; background: var(--surface, #fff); }
+.blind-user-list input { grid-row: span 2; accent-color: var(--brand); }
+.blind-user-list span, .blind-user-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.blind-user-list small { color: var(--muted); }
+.blind-runs-field { display: grid; gap: 8px; margin-top: 18px; font-weight: 650; }
+.blind-runs-field textarea { width: 100%; min-height: 180px; padding: 12px; resize: vertical; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--surface); font: 500 .82rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.blind-batch-actions, .blind-review-links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.blind-created-notice { margin: 14px 0 0; color: var(--success); }
+.blind-pack-lookup { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.blind-pack-lookup input { width: min(440px, 100%); min-width: 180px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; }
+.blind-batch-result { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.blind-batch-result article { min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.blind-batch-result article > span { display: block; color: var(--muted); font-size: .85rem; }
+.blind-batch-result article strong { display: block; margin-top: 4px; font-size: 1.15rem; }
+.blind-batch-result article p { margin: 8px 0 0; color: var(--muted); }
+.blind-admin-data { margin-top: 16px; }
+.blind-admin-data summary { padding: 10px 0; color: var(--brand-deep, #245da8); cursor: pointer; font-weight: 650; }
+.blind-admin-limit { margin: 0; }
+@media (max-width: 900px) {
+  .blind-roster-grid, .blind-batch-result { grid-template-columns: 1fr; }
+}

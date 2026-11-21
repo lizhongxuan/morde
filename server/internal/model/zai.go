@@ -227,6 +227,7 @@ func encodeZAIMessage(item app.ModelInput) (zaiMessage, bool, error) {
 }
 
 type zaiResponse struct {
+	Model   string `json:"model"`
 	Choices []struct {
 		Index   int `json:"index"`
 		Message struct {
@@ -250,11 +251,11 @@ type zaiResponse struct {
 func parseZAIResponse(body []byte) (app.ModelResponse, error) {
 	var wire zaiResponse
 	if !utf8.Valid(body) || json.Unmarshal(body, &wire) != nil || len(wire.Choices) != 1 || wire.Choices[0].Index != 0 ||
-		wire.Choices[0].Message.Role != "assistant" {
+		wire.Choices[0].Message.Role != "assistant" || !app.ValidProviderReportedModel(wire.Model) {
 		return app.ModelResponse{}, errors.New("model provider returned an invalid response")
 	}
 	choice := wire.Choices[0]
-	result := app.ModelResponse{Text: choice.Message.Content, Reasoning: choice.Message.Reasoning}
+	result := app.ModelResponse{Text: choice.Message.Content, Reasoning: choice.Message.Reasoning, ProviderReportedModel: wire.Model}
 	for _, call := range choice.Message.ToolCalls {
 		arguments, err := zaiArgumentString(call.Function.Arguments)
 		if err != nil || call.Type != "function" {
@@ -359,6 +360,7 @@ func readZAIStream(body io.Reader, onTextDelta func(string) error) (app.ModelRes
 	var result app.ModelResponse
 	var text, reasoning strings.Builder
 	var usage *zaiUsage
+	providerReportedModel := ""
 	reason, done := "", false
 	calls := make(map[int]*zaiPartialCall)
 	dispatch := func() error {
@@ -374,12 +376,20 @@ func readZAIStream(body io.Reader, onTextDelta func(string) error) (app.ModelRes
 			return nil
 		}
 		var chunk struct {
+			Model   string            `json:"model"`
 			Choices []zaiStreamChoice `json:"choices"`
 			Usage   *zaiUsage         `json:"usage"`
 		}
 		if !utf8.Valid(data) || json.Unmarshal(data, &chunk) != nil || len(chunk.Choices) > 1 ||
 			(len(chunk.Choices) == 0 && chunk.Usage == nil) {
 			return errors.New("model provider returned an invalid stream event")
+		}
+		if !app.ValidProviderReportedModel(chunk.Model) ||
+			(chunk.Model != "" && providerReportedModel != "" && chunk.Model != providerReportedModel) {
+			return errors.New("model provider stream identity is invalid")
+		}
+		if chunk.Model != "" {
+			providerReportedModel = chunk.Model
 		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage
@@ -473,7 +483,7 @@ func readZAIStream(body io.Reader, onTextDelta func(string) error) (app.ModelRes
 	if !done || reason == "" {
 		return app.ModelResponse{}, errors.New("model provider stream ended before a final response")
 	}
-	result.Text, result.Reasoning = text.String(), reasoning.String()
+	result.Text, result.Reasoning, result.ProviderReportedModel = text.String(), reasoning.String(), providerReportedModel
 	indices := make([]int, 0, len(calls))
 	for index := range calls {
 		indices = append(indices, index)

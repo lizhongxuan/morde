@@ -260,15 +260,11 @@ func TestWorkspaceSyncCommittedBeforeTaskPublishKeepsTaskPublishFenced(t *testin
 	ctx := context.Background()
 	workspaceValue, command := newSyncTaskWorkspacePublishTask(t, ctx, store, "sync-before-task-publish")
 
-	deviceFile := syncTestFile("reports/device.txt", []byte("device revision"))
-	session := newTestSyncSession(t, workspaceValue, command.OwnerID, []workspace.File{deviceFile}, []workspace.File{deviceFile}, nil)
-	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
-		syncTestIdempotency(command.OwnerID, "workspace.sync.create", "sync-before-task-publish:create", session.ID)); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
-		syncTestIdempotency(command.OwnerID, "workspace.sync.commit", "sync-before-task-publish:commit", session.ID)); err != nil {
-		t.Fatalf("commit Workspace sync before Task publish: %v", err)
+	committed := commitWorkspaceProjectUploadForTest(t, ctx, store, command.HostID, workspaceValue.ID,
+		"task-publish", "sync-before-task-publish-folder", "12345678-1234-4234-8234-123456789abc",
+		syncTestFile("reports/device.txt", nil))
+	if committed.TargetRevision != 1 {
+		t.Fatalf("project upload before Task publish = revision %d, want 1", committed.TargetRevision)
 	}
 
 	service, _ := taskWorkspacePublishTestService(t, store)
@@ -293,7 +289,8 @@ func TestWorkspaceSyncCommittedBeforeTaskPublishKeepsTaskPublishFenced(t *testin
 		t.Fatalf("Task publish conflict receipt = %#v, err=%v", receipt, err)
 	}
 	page, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, 1, "", "", 10)
-	if err != nil || len(page.Files) != 1 || page.Files[0].Path != deviceFile.Path || page.Files[0].SHA256 != deviceFile.SHA256 {
+	wantDeviceFile := syncTestFile("project/task-publish/reports/device.txt", nil)
+	if err != nil || len(page.Files) != 1 || page.Files[0].Path != wantDeviceFile.Path || page.Files[0].SHA256 != wantDeviceFile.SHA256 {
 		t.Fatalf("Workspace revision after fenced Task publish = %#v, err=%v", page, err)
 	}
 }
@@ -1136,23 +1133,15 @@ func TestHostWorkspaceSyncRejectsBaseAheadOfAppliedRevision(t *testing.T) {
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "host-sync-base-ahead")
-	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
-	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
-	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, 1,
-		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
+	hostValue := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, value.ID)
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
 	if err != nil {
-		t.Fatalf("activate Host binding at revision zero: %v", err)
+		t.Fatalf("read active Host binding at revision zero: %v", err)
 	}
 
 	file := syncTestFile("already-saved.txt", []byte("revision one"))
-	upload := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
-	if _, _, err := createTestWorkspaceSyncSession(ctx, store, upload, syncTestBlocks(upload.UploadFiles),
-		syncTestIdempotency(owner.ID, "workspace.sync.create", "host-base-ahead:owner-create", upload.ID)); err != nil {
-		t.Fatalf("create Workspace revision: %v", err)
-	}
-	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, upload.ID,
-		syncTestIdempotency(owner.ID, "workspace.sync.commit", "host-base-ahead:owner-commit", upload.ID)); err != nil {
-		t.Fatalf("commit Workspace revision: %v", err)
+	if revision := applySyntheticProjectMutationForTest(t, store, value.ID, file.Path, &file, nil); revision != 1 {
+		t.Fatalf("advance Workspace before Host sync = revision %d, want 1", revision)
 	}
 	value, err = store.GetWorkspace(ctx, value.ID)
 	if err != nil || value.Revision != 1 {
@@ -2138,6 +2127,57 @@ func syncTestBlocks(files []workspace.File) []workspace.TransferBlock {
 
 func createTestWorkspaceSyncSession(ctx context.Context, store *Store, session workspace.SyncSession, transfers []workspace.TransferBlock, idempotency app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
 	return createTestWorkspaceSyncSessionWithQuota(ctx, store, session, transfers, syncTestOwnerQuotaBytes, idempotency)
+}
+
+func commitWorkspaceProjectUploadForTest(t *testing.T, ctx context.Context, store *Store, hostID, workspaceID,
+	projectName, folderKey, sourceBindingID string, file workspace.File) workspace.SyncSession {
+	t.Helper()
+	value, err := store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	portal := workspaceSyncPortalPrincipal(t, store, value.OwnerID)
+	folders, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folders.CreateFolder(ctx, portal, hostID, projectName, folderKey)
+	if err != nil {
+		t.Fatalf("register project sync folder: %v", err)
+	}
+	installationID := createTestClientInstallation(t, store.pool, value.OwnerID, nil)
+	token := clientTestToken(t, value.OwnerID, installationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	device := identity.Principal{UserID: value.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: token.ID, ClientInstallationID: installationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync}}
+	blocks, err := workspacefs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close project upload block store: %v", err)
+		}
+	}()
+	service, err := app.NewWorkspaceSyncServiceWithOptions(store, blocks, workspace.MaxSyncManifestBytes, syncTestOwnerQuotaBytes,
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSyncSession(ctx, device, workspaceID, workspace.CreateSyncSession{
+		FolderID: folder.FolderID, SourceBindingID: sourceBindingID, Direction: workspace.SyncUpload,
+		Policy: workspace.SyncCompareMerge, Files: []workspace.File{file},
+	}, folderKey+"-upload")
+	if err != nil {
+		t.Fatalf("create project upload session: %v", err)
+	}
+	committed, err := service.CommitSyncSession(ctx, device, workspaceID, session.ID, folderKey+"-commit")
+	if err != nil || committed.State != workspace.SyncCompleted {
+		t.Fatalf("commit project upload: session=%#v err=%v", committed, err)
+	}
+	return committed
 }
 
 func createTestWorkspaceSyncSessionWithQuota(ctx context.Context, store *Store, session workspace.SyncSession, transfers []workspace.TransferBlock, maxOwnerBytes int64, idempotency app.IdempotencyRecord) (workspace.SyncSession, bool, error) {

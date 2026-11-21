@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,12 +26,13 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 	storepostgres "morde/server/internal/store/postgres"
 )
 
 type f02MCPCommitObserver struct {
-	app.WorkspaceSyncStore
+	*storepostgres.Store
 	entered chan struct{}
 	once    sync.Once
 }
@@ -94,23 +96,30 @@ func (capture *f01MCPCheckpointCapture) inspectMordeMemoryContext() (bool, []str
 
 func (s *f02MCPCommitObserver) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string, key app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
 	s.once.Do(func() { close(s.entered) })
-	return s.WorkspaceSyncStore.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, key)
+	return s.Store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, key)
+}
+
+func (s *f02MCPCommitObserver) CommitWorkspaceSyncSessionDirect(ctx context.Context, workspaceID, sessionID string,
+	key app.IdempotencyRecord, apply app.WorkspaceSyncDirectCommitCallback) (workspace.SyncSession, bool, error) {
+	s.once.Do(func() { close(s.entered) })
+	return s.Store.CommitWorkspaceSyncSessionDirect(ctx, workspaceID, sessionID, key, apply)
 }
 
 type f02MCPWorkspaceFixture struct {
-	store       *storepostgres.Store
-	principal   identity.Principal
-	workspaceID string
-	sessionID   string
-	connectorID string
-	claimed     task.Task
-	tasks       *app.TaskService
-	sync        *app.WorkspaceSyncService
-	broker      *app.CloudDSHToolBroker
-	provider    *f01LocalMCPProvider
-	commit      *f02MCPCommitObserver
-	call        app.ModelToolCall
-	agent       f01MCPTestAgent
+	store         *storepostgres.Store
+	principal     identity.Principal
+	syncPrincipal identity.Principal
+	workspaceID   string
+	sessionID     string
+	connectorID   string
+	claimed       task.Task
+	tasks         *app.TaskService
+	sync          *app.WorkspaceSyncService
+	broker        *app.CloudDSHToolBroker
+	provider      *f01LocalMCPProvider
+	commit        *f02MCPCommitObserver
+	call          app.ModelToolCall
+	agent         f01MCPTestAgent
 }
 
 type f01MCPTestAgent struct {
@@ -266,11 +275,64 @@ func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspac
 			t.Errorf("close Workspace block store: %v", err)
 		}
 	})
-	commit := &f02MCPCommitObserver{WorkspaceSyncStore: store, entered: make(chan struct{})}
-	syncService, err := app.NewWorkspaceSyncService(commit, blocks, 0, 1<<40)
+	currentRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	current, err := workspacecurrent.Open(filepath.Join(currentRoot, "workspace-current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := current.Close(); err != nil {
+			t.Errorf("close current Workspace fixture: %v", err)
+		}
+	})
+	if err := current.Materialize(ctx, owner.ID, value.ID, 0, nil, nil,
+		[]workspace.Directory{{Path: ".", MetadataKnown: true}}, blocks); err != nil {
+		t.Fatalf("materialize empty Agent Workspace fixture: %v", err)
+	}
+	commit := &f02MCPCommitObserver{Store: store, entered: make(chan struct{})}
+	syncService, err := app.NewWorkspaceSyncServiceWithOptions(commit, blocks, 0, 1<<40,
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: true, LiveDirectorySourceEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syncService.SetWorkspaceCurrentDirectory(current); err != nil {
+		t.Fatal(err)
+	}
+	folders, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folders.CreateFolder(ctx, principal, host.ID, "mcp", "f02-mcp-workspace-folder")
+	if err != nil {
+		t.Fatalf("register MCP project upload folder: %v", err)
+	}
+	installationID, err := domain.NewClientInstallationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO client_installations
+  (id,owner_id,display_name,platform,expires_at)
+  VALUES ($1,$2,'test desktop','desktop',now()+interval '30 days')`, installationID, owner.ID); err != nil {
+		t.Fatalf("create MCP project upload installation: %v", err)
+	}
+	tokenID, err := domain.NewTokenID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secretHash, err := identity.NewCredential(identity.KindDevice, tokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateToken(ctx, identity.Token{ID: tokenID, OwnerID: owner.ID, ClientInstallationID: installationID,
+		Kind: identity.KindDevice, Name: "MCP project upload fixture", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+		SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("create MCP project upload device token: %v", err)
+	}
+	syncPrincipal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: tokenID,
+		ClientInstallationID: installationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync}}
 	runtimeControl, err := app.NewRuntimeControl(store, f01SandboxRouter{}, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -288,21 +350,22 @@ func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspac
 	digest := sha256.Sum256(content)
 	fileHash := hex.EncodeToString(digest[:])
 	file := workspace.File{
-		Path: "external.txt", SizeBytes: int64(len(content)), SHA256: fileHash, Mode: 0o644,
+		Path: "external.txt", Kind: workspace.FileKindRegular, SizeBytes: int64(len(content)), SHA256: fileHash, Mode: 0o644,
 		Chunks: []workspace.Chunk{{SHA256: fileHash, SizeBytes: int64(len(content))}},
 	}
-	session, err := syncService.CreateSyncSession(ctx, principal, value.ID, workspace.CreateSyncSession{
-		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{file},
+	session, err := syncService.CreateSyncSession(ctx, syncPrincipal, value.ID, workspace.CreateSyncSession{
+		FolderID: folder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, Files: []workspace.File{file},
 	}, "f02-mcp-workspace-upload")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if written, err := syncService.PutSyncBlock(ctx, principal, value.ID, session.ID, fileHash, bytes.NewReader(content)); err != nil || written != int64(len(content)) {
+	if written, err := syncService.PutSyncBlock(ctx, syncPrincipal, value.ID, session.ID, fileHash, bytes.NewReader(content)); err != nil || written != int64(len(content)) {
 		t.Fatalf("upload synthetic block: written=%d err=%v", written, err)
 	}
 	discoverF01MCPTool(t, ctx, broker, claimed, connector.ID)
 	return f02MCPWorkspaceFixture{
-		store: store, principal: principal, workspaceID: value.ID, sessionID: session.ID, connectorID: connector.ID,
+		store: store, principal: principal, syncPrincipal: syncPrincipal, workspaceID: value.ID, sessionID: session.ID, connectorID: connector.ID,
 		claimed: claimed, tasks: tasks, sync: syncService, broker: broker, provider: provider, commit: commit, agent: agent,
 		call: f01SelectedMCPCall(t, "f02-mcp-workspace-call", connector.ID, "synthetic"),
 	}
@@ -332,6 +395,9 @@ func approveF02MCPCall(t *testing.T, ctx context.Context, fixture *f02MCPWorkspa
 }
 
 func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live Workspace file access requires Linux openat2")
+	}
 	t.Run("unchanged_workspace_allows_call", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -348,7 +414,7 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 		defer cancel()
 		f := newF02MCPWorkspaceFixture(t, ctx)
 		approveF02MCPCall(t, ctx, &f)
-		committed, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
+		committed, err := f.sync.CommitSyncSession(ctx, f.syncPrincipal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
 		if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
 			t.Fatalf("commit external Workspace change = %#v err=%v", committed, err)
 		}
@@ -416,7 +482,7 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 		goroutines.Add(1)
 		go func() {
 			defer goroutines.Done()
-			session, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
+			session, err := f.sync.CommitSyncSession(ctx, f.syncPrincipal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
 			commitDone <- commitResult{session, err}
 		}()
 		var earlyResult commitResult
@@ -466,7 +532,7 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 		if domain.CodeOf(earlyResult.err) != domain.CodeWorkspaceBusy {
 			t.Fatalf("Workspace commit during MCP call = %#v err=%v; want workspace_busy", earlyResult.session, earlyResult.err)
 		}
-		committed, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
+		committed, err := f.sync.CommitSyncSession(ctx, f.syncPrincipal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
 		if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
 			t.Fatalf("Workspace retry after MCP settled = %#v err=%v", committed, err)
 		}
@@ -474,6 +540,9 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 }
 
 func TestCloudTaskMCPGrantRevocationBeforeAndAfterDispatch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live Workspace file access requires Linux openat2")
+	}
 	for _, inFlight := range []bool{false, true} {
 		name := "before_dispatch"
 		if inFlight {

@@ -93,7 +93,7 @@ func (t *cloudDSHWorkspaceTools) readLive(ctx context.Context, current task.Task
 		}
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeWorkspaceUnavailable, "live Workspace file could not be opened")), nil
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if info.Size() < 0 || info.Size() > cloudDSHWorkspaceReadMaxBytes {
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeRequestTooLarge, "Workspace file exceeds the read limit")), nil
 	}
@@ -333,4 +333,4 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 	return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
 }
 
-var errWorkspaceSearchLimit = errors.New("Workspace search result limit reached")
+var errWorkspaceSearchLimit = errors.New("workspace search result limit reached")

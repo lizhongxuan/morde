@@ -1,21 +1,21 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runShell } from "../app/aio";
-import { listFiles, MAX_UPLOAD_BYTES, readFile, uploadFile, writeFile } from "../app/fileApi";
+import { createDirectory, deleteFile, listFiles, MAX_UPLOAD_BYTES, moveFile, readFile, uploadFile, writeFile } from "../app/fileApi";
 import { WorkbenchNoticeProvider } from "../app/notice";
 import FileManager from "./FileManager";
 
 vi.mock("../app/fileApi", () => ({
   downloadFile: vi.fn(),
+  createDirectory: vi.fn(),
+  deleteFile: vi.fn(),
   listFiles: vi.fn(),
   MAX_UPLOAD_BYTES: 100 * 1024 * 1024,
+  moveFile: vi.fn(),
   readFile: vi.fn(),
   uploadFile: vi.fn(),
   writeFile: vi.fn(),
 }));
-vi.mock("../app/aio", async (importOriginal) => ({ ...await importOriginal(), runShell: vi.fn() }));
-
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -121,7 +121,8 @@ describe("FileManager upload", () => {
     fireEvent.submit(screen.getByLabelText("重命名所选项").closest("form")!);
     fireEvent.submit(screen.getByLabelText("新建目录").closest("form")!);
     expect(writeFile).not.toHaveBeenCalled();
-    expect(runShell).not.toHaveBeenCalled();
+    expect(createDirectory).not.toHaveBeenCalled();
+    expect(moveFile).not.toHaveBeenCalled();
 
     await act(async () => finishUpload());
     expect(await screen.findByText("README.md 上传完成")).toBeInTheDocument();
@@ -220,6 +221,81 @@ describe("FileManager upload", () => {
     await waitFor(() => expect(listFiles).toHaveBeenCalledTimes(3));
     expect(uploadFile).toHaveBeenCalledTimes(1);
     expect(window.confirm).toHaveBeenCalledExactlyOnceWith("“same.txt”已存在，确定覆盖吗？");
+  });
+});
+
+describe("FileManager mutations", () => {
+  it("creates a directory through AIO and refreshes the current listing", async () => {
+    vi.mocked(listFiles).mockResolvedValueOnce([]).mockResolvedValueOnce([{
+      name: "new-folder",
+      path: "/home/gem/workspace/new-folder",
+      is_directory: true,
+    }]);
+    render(<FileManager />);
+    await waitFor(() => expect(listFiles).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByLabelText("新建目录"), { target: { value: "new-folder" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+
+    expect(await screen.findByText("目录已创建")).toBeInTheDocument();
+    expect(createDirectory).toHaveBeenCalledExactlyOnceWith("/home/gem/workspace/new-folder");
+    expect(await screen.findByRole("button", { name: "new-folder" })).toBeInTheDocument();
+    expect(listFiles).toHaveBeenCalledTimes(2);
+  });
+
+  it("renames through AIO without overwriting and refreshes the listing", async () => {
+    const original = { name: "old.txt", path: "/home/gem/workspace/old.txt", is_directory: false };
+    const renamed = { name: "new.txt", path: "/home/gem/workspace/new.txt", is_directory: false };
+    vi.mocked(listFiles).mockResolvedValueOnce([original]).mockResolvedValueOnce([renamed]);
+    vi.mocked(readFile).mockResolvedValue("contents");
+    render(<FileManager />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "old.txt" }));
+    await waitFor(() => expect(screen.getByLabelText("文件内容")).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("重命名所选项"), { target: { value: "new.txt" } });
+    fireEvent.click(screen.getByRole("button", { name: "重命名" }));
+
+    expect(await screen.findByText("名称已更新")).toBeInTheDocument();
+    expect(moveFile).toHaveBeenCalledExactlyOnceWith(original.path, renamed.path);
+    expect(await screen.findByRole("button", { name: "new.txt" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("文件内容")).not.toBeInTheDocument();
+  });
+
+  it("keeps the editor contents and selection when AIO refuses a rename", async () => {
+    const original = { name: "old.txt", path: "/home/gem/workspace/old.txt", is_directory: false };
+    vi.mocked(listFiles).mockResolvedValue([original]);
+    vi.mocked(readFile).mockResolvedValue("contents");
+    vi.mocked(moveFile).mockRejectedValue(new Error("目标路径已存在"));
+    render(<FileManager />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "old.txt" }));
+    const editor = await screen.findByLabelText("文件内容");
+    await waitFor(() => expect(editor).toBeEnabled());
+    fireEvent.change(editor, { target: { value: "unsaved edits" } });
+    fireEvent.change(screen.getByLabelText("重命名所选项"), { target: { value: "new.txt" } });
+    fireEvent.click(screen.getByRole("button", { name: "重命名" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("目标路径已存在");
+    expect(screen.getByLabelText("文件内容")).toHaveValue("unsaved edits");
+    expect(screen.getByLabelText("重命名所选项")).toHaveValue("new.txt");
+    expect(screen.getByRole("button", { name: "old.txt" })).toBeInTheDocument();
+  });
+
+  it("confirms deletion before calling AIO and refreshes the listing", async () => {
+    const original = { name: "old.txt", path: "/home/gem/workspace/old.txt", is_directory: false };
+    vi.mocked(listFiles).mockResolvedValueOnce([original]).mockResolvedValueOnce([]);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.mocked(readFile).mockResolvedValue("contents");
+    render(<FileManager />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "old.txt" }));
+    await waitFor(() => expect(screen.getByLabelText("文件内容")).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+
+    expect(window.confirm).toHaveBeenCalledExactlyOnceWith("确定删除“old.txt”吗？此操作不可撤销。");
+    expect(deleteFile).toHaveBeenCalledExactlyOnceWith(original.path);
+    expect(await screen.findByText("此目录为空")).toBeInTheDocument();
+    expect(screen.queryByLabelText("文件内容")).not.toBeInTheDocument();
   });
 });
 
@@ -429,7 +505,7 @@ describe("FileManager directory requests", () => {
 
   it("does not refresh the old directory after a mutation finishes following navigation", async () => {
     let finishCreate!: () => void;
-    vi.mocked(runShell).mockReturnValue(new Promise<void>((resolve) => { finishCreate = resolve; }));
+    vi.mocked(createDirectory).mockReturnValue(new Promise<void>((resolve) => { finishCreate = resolve; }));
     vi.mocked(listFiles)
       .mockResolvedValueOnce([{
         name: "folder",
@@ -442,7 +518,7 @@ describe("FileManager directory requests", () => {
     await screen.findByRole("button", { name: "folder" });
     fireEvent.change(screen.getByLabelText("新建目录"), { target: { value: "new-folder" } });
     fireEvent.click(screen.getByRole("button", { name: "创建" }));
-    await waitFor(() => expect(runShell).toHaveBeenCalled());
+    await waitFor(() => expect(createDirectory).toHaveBeenCalled());
 
     fireEvent.change(screen.getByLabelText("当前路径"), {
       target: { value: "/home/gem/workspace/folder" },

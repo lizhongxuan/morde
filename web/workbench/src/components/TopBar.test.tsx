@@ -166,6 +166,42 @@ describe('TopBar countdown', () => {
     expect(screen.queryByText('当前控制者：用户身份未提供')).not.toBeInTheDocument();
   });
 
+  it('does not report user control while a drained handoff still has pending operations', () => {
+    const { container } = render(<TopBar
+      host={null}
+      renewing={false}
+      onRenew={vi.fn()}
+      {...controlProps}
+      control={{
+        host_id: 'h1234567',
+        control_state: 'user',
+        control_version: 1,
+        control_actor_user_id: '',
+        control_lease_expires_at: '2026-10-19T00:05:00.000Z',
+        control_lease_active: true,
+        control_lease_held_by_me: true,
+        active_transition: {
+          request_id: 'handoff-2',
+          action: 'take_over',
+          phase: 'drained',
+          failure_reason: '',
+          expected_control_version: 0,
+          blocked_control_version: 0,
+          target_control_version: 1,
+          created_at: '',
+          updated_at: '',
+        },
+        pending_operation_ids: ['operation-1'],
+      }}
+      controlActionLabel="接管中…"
+    />);
+
+    expect(container.querySelector('.control-state-full')).toHaveTextContent('正在接管电脑，请稍候…');
+    expect(container.querySelector('.control-state-compact')).toHaveTextContent('接管中');
+    expect(container.querySelector('.control-lease')).toBeNull();
+    expect(screen.getByRole('button', { name: '接管中…' })).toBeDisabled();
+  });
+
   it('shows the other operator and lease countdown when the server returns them', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-19T00:00:00.000Z'));

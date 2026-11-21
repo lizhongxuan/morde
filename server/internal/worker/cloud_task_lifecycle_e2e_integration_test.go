@@ -1878,12 +1878,14 @@ func createF01Workspace(t *testing.T, ctx context.Context, store *storepostgres.
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash := sha256.Sum256([]byte("f01-workspace:" + id))
-	value, replayed, err := store.CreateWorkspace(ctx, workspace.Workspace{
-		ID: id, OwnerID: ownerID, Name: "F01 cloud task integration", State: workspace.StateReady, QuotaBytes: 1 << 30,
-	}, app.IdempotencyRecord{OwnerID: ownerID, Operation: "workspace.create", Key: "f01:" + id, RequestHash: hash[:], ResourceID: id})
-	if err != nil || replayed {
-		t.Fatalf("create Workspace fixture = %#v, replayed=%t, err=%v", value, replayed, err)
+	value, _, err := store.CreateAgentWorkspace(ctx, workspace.Workspace{
+		ID: id, OwnerID: ownerID, Name: "Agent Workspace", State: workspace.StateReady, QuotaBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("create stable Agent Workspace fixture = %#v, err=%v", value, err)
+	}
+	if err := store.MarkAgentWorkspaceDirectoryInitialized(ctx, ownerID, value.ID); err != nil {
+		t.Fatalf("mark stable Agent Workspace fixture initialized: %v", err)
 	}
 	return value
 }

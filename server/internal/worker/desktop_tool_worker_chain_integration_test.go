@@ -92,8 +92,8 @@ func TestDSHDesktopToolCompletesThroughWorkerAndRecordsOperationAndStep(t *testi
 		t.Fatal("TaskWorker did not stop after the synthetic Task completed")
 	}
 
-	if len(models.calls) != 2 || !validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, []app.AgentToolDefinition{tool}) ||
-		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, []app.AgentToolDefinition{tool}) {
+	if len(models.calls) != 2 || !validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})) ||
+		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})) {
 		t.Fatalf("DSH model rounds=%d; want tool call then result-consuming reply", len(models.calls))
 	}
 	if len(broker.calls) != 1 || broker.calls[0].TaskID != value.ID || broker.calls[0].OwnerID != value.OwnerID ||

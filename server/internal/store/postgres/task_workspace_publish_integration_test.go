@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -15,7 +18,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 
+	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
@@ -382,6 +389,121 @@ func TestTaskWorkspacePublishedArtifactPersistsAcrossPostgresConnectionRestartFo
 	if _, err := reopenedService.GetManifest(ctx, otherPrincipal, workspaceValue.ID, receipt.PublishedRevision, "", "", 10); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("other owner's Workspace manifest lookup = %v; want not found", err)
 	}
+	tasks, err := app.NewTaskService(reopenedStore, k4FixtureAuthorization{}, k4FixtureModelCatalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.SetTaskArtifactReader(reopenedService); err != nil {
+		t.Fatal(err)
+	}
+	conversations, err := app.NewConversationService(reopenedStore, k4FixtureAuthorization{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit, err := app.NewAuditService(reopenedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(reopenedStore, reopenedStore, reopenedStore, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
+	}, credentialDefaultHostNoop{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, err := app.NewUserService(reopenedStore, reopenedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password := "local-account-isolation-password"
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []string{claimed.OwnerID, otherOwner.ID} {
+		if _, err := reopenedPool.Exec(ctx, `UPDATE users SET password_hash=$2 WHERE id=$1`, userID, string(passwordHash)); err != nil {
+			t.Fatalf("prepare login password for %s: %v", userID, err)
+		}
+	}
+	router, err := api.New(api.Deps{
+		Hosts: k4FixtureHostService{}, TLSAuthorizer: k4FixtureHostService{}, Verifier: credentials,
+		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, Tasks: tasks, Conversations: conversations, TaskArtifactContent: tasks,
+	}, api.Options{Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 1 << 20,
+		MCPMaxBodyBytes: 1 << 20, SessionTTL: time.Hour, HostScheme: "http", PortalDomain: "morde.test",
+		HostSuffix: "hosts.invalid", PreviewPortMin: 1024})
+	if err != nil {
+		t.Fatalf("create cross-account API: %v", err)
+	}
+	loginAs := func(userID string) string {
+		user, err := reopenedStore.GetUserByID(ctx, userID)
+		if err != nil {
+			t.Fatalf("load login user %s: %v", userID, err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+			strings.NewReader(fmt.Sprintf(`{"name":%q,"password":%q}`, user.Name, password)))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("login account %s: status=%d body=%s", userID, response.Code, response.Body.String())
+		}
+		for _, cookie := range response.Result().Cookies() {
+			if cookie.Name == "ch_portal" && cookie.Value != "" {
+				return cookie.Value
+			}
+		}
+		t.Fatalf("login account %s did not issue a session cookie", userID)
+		return ""
+	}
+	ownerCookie := loginAs(claimed.OwnerID)
+	otherCookie := loginAs(otherOwner.ID)
+	requestAs := func(cookie, path string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.AddCookie(&http.Cookie{Name: "ch_portal", Value: cookie})
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	ownerTask := requestAs(ownerCookie, "/api/tasks/"+claimed.ID)
+	if ownerTask.Code != http.StatusOK {
+		t.Fatalf("owner Task HTTP read=%d body=%s", ownerTask.Code, ownerTask.Body.String())
+	}
+	ownerConversation := requestAs(ownerCookie, "/api/conversations/"+claimed.ConversationID)
+	if ownerConversation.Code != http.StatusOK {
+		t.Fatalf("owner Conversation HTTP read=%d body=%s", ownerConversation.Code, ownerConversation.Body.String())
+	}
+	ownerMessages := requestAs(ownerCookie, "/api/conversations/"+claimed.ConversationID+"/messages")
+	if ownerMessages.Code != http.StatusOK {
+		t.Fatalf("owner Conversation messages HTTP read=%d body=%s", ownerMessages.Code, ownerMessages.Body.String())
+	}
+	otherTask := requestAs(otherCookie, "/api/tasks/"+claimed.ID)
+	if otherTask.Code != http.StatusNotFound {
+		t.Fatalf("cross-account Task HTTP read=%d body=%s", otherTask.Code, otherTask.Body.String())
+	}
+	otherConversation := requestAs(otherCookie, "/api/conversations/"+claimed.ConversationID)
+	if otherConversation.Code != http.StatusNotFound {
+		t.Fatalf("cross-account Conversation HTTP read=%d body=%s", otherConversation.Code, otherConversation.Body.String())
+	}
+	otherMessages := requestAs(otherCookie, "/api/conversations/"+claimed.ConversationID+"/messages")
+	if otherMessages.Code != http.StatusNotFound {
+		t.Fatalf("cross-account Conversation messages HTTP read=%d body=%s", otherMessages.Code, otherMessages.Body.String())
+	}
+	otherEvents := requestAs(otherCookie, "/api/tasks/"+claimed.ID+"/events")
+	if otherEvents.Code != http.StatusNotFound {
+		t.Fatalf("cross-account Task events HTTP read=%d body=%s", otherEvents.Code, otherEvents.Body.String())
+	}
+	ownerDownload := requestAs(ownerCookie, "/api/tasks/"+claimed.ID+"/artifacts/"+artifact.ID+"/content")
+	if ownerDownload.Code != http.StatusOK || !bytes.Equal(ownerDownload.Body.Bytes(), wantContent) {
+		t.Fatalf("owner artifact HTTP download=%d body=%q", ownerDownload.Code, ownerDownload.Body.String())
+	}
+	otherDownload := requestAs(otherCookie, "/api/tasks/"+claimed.ID+"/artifacts/"+artifact.ID+"/content")
+	if otherDownload.Code != http.StatusNotFound || strings.Contains(otherDownload.Body.String(), string(wantContent)) {
+		t.Fatalf("cross-account artifact HTTP download=%d body=%q", otherDownload.Code, otherDownload.Body.String())
+	}
+	for _, response := range []*httptest.ResponseRecorder{otherTask, otherConversation, otherMessages, otherEvents, otherDownload} {
+		if strings.Contains(response.Body.String(), "write a report") || strings.Contains(response.Body.String(), string(wantContent)) {
+			t.Fatalf("cross-account response leaked private content: %s", response.Body.String())
+		}
+	}
 	if _, err := reopenedService.VerifyCommittedArtifact(ctx, proof); err != nil {
 		t.Fatalf("verify published artifact after PostgreSQL reconnect: %v", err)
 	}
@@ -443,13 +565,15 @@ VALUES ($1,$2,$3,$4,1,0,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,'prepared')`,
 func TestTaskWorkspacePublishBlocksSyncUntilPublishSettles(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-sync-barrier")
+	hostValue, workspaceValue, binding, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-sync-barrier")
 	service, _ := taskWorkspacePublishTestService(t, store)
 	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
 		t.Fatal(err)
 	}
 	external := syncTestFile("reports/result.txt", []byte("same content"))
 	session := newTestSyncSession(t, workspaceValue, command.OwnerID, []workspace.File{external}, []workspace.File{external}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+	session.Direction = workspace.SyncBidirectional
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
 		syncTestIdempotency(command.OwnerID, "workspace.sync.create", "task-publish-sync-barrier:create", session.ID)); err != nil {
 		t.Fatal(err)

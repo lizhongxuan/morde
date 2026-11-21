@@ -458,7 +458,11 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertNil(second.previousClientMessageID)
         XCTAssertEqual(firstFollowup.previousClientMessageID, first.id)
         XCTAssertEqual(MordeOutboxScheduling.readyIDs(recovered, scope: renewedScope, inFlight: []),
-                       [first.id, second.id])
+                       [second.id])
+        var explicitlyRetried = try XCTUnwrap(recovered.first)
+        explicitlyRetried.state = .sending
+        XCTAssertEqual(MordeOutboxScheduling.readyIDs([explicitlyRetried, recovered[1], recovered[2]],
+            scope: renewedScope, inFlight: []), [first.id, second.id])
         XCTAssertEqual(MordeConversationMessagePayload.direct(recovered[0])["client_message_id"] as? String, first.id)
         XCTAssertEqual(MordeConversationMessagePayload.direct(recovered[2])["previous_client_message_id"] as? String, first.id)
     }

@@ -146,6 +146,7 @@ type AgentFileEvidence struct {
 	Path         string `json:"path"`
 	Size         int64  `json:"size"`
 	SHA256       string `json:"sha256"`
+	CallID       string `json:"-"`
 	WorkspaceID  string `json:"-"`
 	OperationKey string `json:"-"`
 	RequestHash  []byte `json:"-"`
@@ -186,13 +187,14 @@ func validAgentObservationFingerprint(value string) bool {
 // AgentVerifiedArtifact is metadata independently observed by ToolExecutor.Verify.
 // It must never be populated from the model's completion claim.
 type AgentVerifiedArtifact struct {
-	Label       string
-	Path        string
-	MediaType   string
-	WorkspaceID string
-	Revision    int64
-	SizeBytes   int64
-	SHA256      string
+	Label        string
+	Path         string
+	MediaType    string
+	SourceCallID string `json:"-"`
+	WorkspaceID  string
+	Revision     int64
+	SizeBytes    int64
+	SHA256       string
 }
 
 const maxAgentVerifiedArtifacts = 64
@@ -225,6 +227,7 @@ func validateAgentVerificationArtifacts(result AgentVerificationResult) error {
 	seen := make(map[string]struct{}, len(result.Artifacts))
 	for _, artifact := range result.Artifacts {
 		if !validBoundedText(artifact.Label, 256) || len(artifact.Path) > 4096 || len(artifact.MediaType) > 256 ||
+			(artifact.SourceCallID != "" && SafeTaskValidationCallID(artifact.SourceCallID) != artifact.SourceCallID) ||
 			!domain.ValidWorkspaceID(artifact.WorkspaceID) || artifact.Revision < 0 || artifact.SizeBytes < 0 || !validAgentObservationFingerprint(artifact.SHA256) ||
 			strings.ContainsRune(artifact.Path, '\x00') || strings.Contains(artifact.Path, "\\") || path.IsAbs(artifact.Path) ||
 			artifact.Path == "." || artifact.Path == ".." || strings.HasPrefix(path.Clean(artifact.Path), "../") || path.Clean(artifact.Path) != artifact.Path {
@@ -316,7 +319,8 @@ func agentFileWriteEvidence(inputs []ModelInput) ([]AgentFileEvidence, error) {
 		}
 		latest[evidenceKey] = AgentFileEvidence{
 			Path: args.Path, Size: int64(len(content)), SHA256: fmt.Sprintf("%x", digest[:]),
-			WorkspaceID: args.WorkspaceID, OperationKey: operationKey, RequestHash: append([]byte(nil), requestHash[:]...), Result: outputItem.Output,
+			CallID: SafeTaskValidationCallID(outputItem.CallID), WorkspaceID: args.WorkspaceID,
+			OperationKey: operationKey, RequestHash: append([]byte(nil), requestHash[:]...), Result: outputItem.Output,
 		}
 	}
 

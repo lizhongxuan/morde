@@ -367,21 +367,22 @@ WHERE r.service_instance_id=$1::uuid AND r.actor_id=$2 AND r.conversation_id=$3 
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("read previous conversation route: %w", err)
 		} else {
 			value.Context.PreviousUnresolved = state != "routed"
+			value.Context.PreviousMessageID, value.Context.PreviousTaskID = previousMessageID, previousTaskID
 			value.PreviousRoutingState, value.PreviousTaskID = state, previousTaskID
 			value.PreviousMessageID, value.PreviousSequence = previousMessageID, previousSequence
 		}
-		err = tx.QueryRow(ctx, `WITH RECURSIVE chain(client_id,previous_id,seen,cycle,depth) AS (
- SELECT r.client_message_id,r.previous_client_message_id,ARRAY[r.client_message_id],r.client_message_id=$5,1
+		err = tx.QueryRow(ctx, `WITH RECURSIVE chain(client_id,previous_id) AS (
+	 SELECT r.client_message_id,r.previous_client_message_id
  FROM conversation_message_routes r WHERE r.service_instance_id=$1::uuid AND r.actor_id=$2 AND r.conversation_id=$3
   AND r.client_message_id=$4 AND r.owner_id=$6
- UNION ALL
- SELECT r.client_message_id,r.previous_client_message_id,c.seen||r.client_message_id,
-  r.client_message_id=ANY(c.seen) OR r.client_message_id=$5,c.depth+1
+	 UNION
+	 SELECT r.client_message_id,r.previous_client_message_id
  FROM chain c JOIN conversation_message_routes r ON r.service_instance_id=$1::uuid AND r.actor_id=$2
   AND r.conversation_id=$3 AND r.owner_id=$6 AND r.client_message_id=c.previous_id
- WHERE NOT c.cycle AND c.depth<128
 )
-SELECT COALESCE(bool_or(cycle OR (depth=128 AND previous_id IS NOT NULL)),false) FROM chain`,
+SELECT COALESCE(bool_or(c.client_id=$5),false) OR COALESCE(bool_and(c.previous_id IS NOT NULL AND EXISTS (
+	SELECT 1 FROM chain ancestor WHERE ancestor.client_id=c.previous_id
+)),false) FROM chain c`,
 			claim.ServiceInstanceID, claim.Message.ActorID, claim.Message.ConversationID,
 			claim.Input.PreviousClientMessageID, claim.Message.ClientMessageID, claim.Message.OwnerID).Scan(&value.PreviousCycle)
 		if err != nil {
@@ -583,16 +584,21 @@ WHERE owner_id=$1 AND conversation_id=$2 AND initiator_id=$3
  AND (created_at<=$4 OR EXISTS (SELECT 1 FROM conversation_messages origin
    WHERE origin.task_id=tasks.id AND origin.owner_id=tasks.owner_id AND origin.conversation_id=tasks.conversation_id
      AND origin.actor_id=tasks.initiator_id AND origin.role='user' AND (origin.sequence<$5 OR origin.id=$6)))
-ORDER BY id LIMIT 65`
+ORDER BY CASE WHEN id=$9 AND $9<>'' THEN 0 WHEN id=$10 AND $10<>'' THEN 1 ELSE 2 END,created_at DESC,id LIMIT 65`
 	if lockTasks {
 		query += ` FOR UPDATE`
 	}
 	rows, err = tx.Query(ctx, query, claim.Message.OwnerID, claim.Message.ConversationID, claim.Message.ActorID,
-		claim.Message.CreatedAt, claim.Message.Sequence, value.PreviousMessageID, descendants, claim.Input.VariantGroupID)
+		claim.Message.CreatedAt, claim.Message.Sequence, value.PreviousMessageID, descendants, claim.Input.VariantGroupID,
+		claim.Input.ReferenceTaskID, value.PreviousTaskID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read route task candidates: %w", err)
 	}
 	for rows.Next() {
+		if len(value.Context.Candidates) == 64 {
+			value.Context.CandidateSetIncomplete = true
+			break
+		}
 		var item app.ConversationRouteCandidate
 		var status string
 		if err := rows.Scan(&item.TaskID, &item.InitiatorID, &item.Objective, &status, &item.Revision); err != nil {
@@ -606,9 +612,6 @@ ORDER BY id LIMIT 65`
 	rows.Close()
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read route task candidates: %w", err)
-	}
-	if len(value.Context.Candidates) > 64 {
-		return app.ConversationRouteSnapshot{}, domain.NewError(domain.CodeInvalidState, "too many active tasks to route safely")
 	}
 	if claim.AggregationState == "waiting" && claim.Message.TaskID == "" {
 		progress, err := conversationRouteAggregationProgress(ctx, tx, claim.Message.ID)
@@ -645,7 +648,8 @@ WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.c
    OR t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
    OR (r.state='routed' AND m.created_at >= $8::timestamptz-interval '30 minutes'))
  AND $9=''
-ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_adjustment','failed')
+ORDER BY CASE WHEN r.client_message_id=$7 THEN 0 ELSE 1 END,
+ CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_adjustment','failed')
  OR t.status IN ('queued','running','waiting_user','pausing','paused','cancelling') THEN 0 ELSE 1 END,
 		m.sequence DESC LIMIT 101`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
 		claim.Message.ConversationID, claim.Message.ID, claim.Message.Sequence, claim.Input.PreviousClientMessageID,
@@ -654,6 +658,10 @@ ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_ad
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read prior conversation route candidates: %w", err)
 	}
 	for requestRows.Next() {
+		if len(value.Context.RequestCandidates) == 100 {
+			value.Context.CandidateSetIncomplete = true
+			break
+		}
 		var candidate app.ConversationRouteRequestCandidate
 		var routeStatus, taskStatus string
 		var directReply, aggregationWaiting, aggregationClosed bool
@@ -662,10 +670,6 @@ ORDER BY CASE WHEN r.state IN ('pending','processing','waiting_user','waiting_ad
 			&candidate.TaskID, &taskStatus, &aggregationWaiting, &aggregationClosed, &directReply, &metadata, &authorization); err != nil {
 			requestRows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("scan prior conversation route candidate: %w", err)
-		}
-		if len(value.Context.RequestCandidates) == 100 {
-			requestRows.Close()
-			return app.ConversationRouteSnapshot{}, domain.NewError(domain.CodeInvalidState, "too many prior requests to route safely")
 		}
 		if len(candidate.Content) > 4096 {
 			requestRows.Close()
@@ -870,7 +874,7 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		}
 		modelID := snapshot.Context.ModelID
 		snapshot.Context.ModelID = ""
-		if !reflect.DeepEqual(snapshot, current) {
+		if !conversationRouteSnapshotsMatch(snapshot, current) {
 			if current.Context.ResultReview != nil {
 				return domain.NewError(domain.CodeConflict, "task result review context changed")
 			}
@@ -889,18 +893,16 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 			if current.Context.ReferenceUnavailable {
 				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
 			} else if current.PreviousMissing {
-				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
+				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。"}
 			}
 		}
-		if current.PreviousMissing && decision.Action == app.ConversationRouteReply {
-			decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-				Question: "前一条消息尚未确认，请先处理或重试。", ModelOutput: decision.ModelOutput}
-		}
-		if current.PreviousMissing && decision.Action == app.ConversationRouteNew {
+		if current.PreviousMissing && (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) {
 			var independent bool
 			err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
 WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='settled' AND model_id=$3
- AND decision->>'Action'='new' AND COALESCE(decision->>'TaskID','')='')`, claim.Message.ID, claim.Message.ActorID, modelID).Scan(&independent)
+ AND attempt=$4 AND decision->>'Action'=$5 AND COALESCE(decision->>'TaskID','')=''
+ AND COALESCE(decision->>'Reply','')=$6)`, claim.Message.ID, claim.Message.ActorID, modelID,
+				claim.RouteAttempt, string(decision.Action), decision.Reply).Scan(&independent)
 			if err != nil || !independent || strings.TrimSpace(claim.Message.Content) == "" {
 				return domain.NewError(domain.CodeConflict, "independent conversation request was not verified")
 			}
@@ -992,7 +994,7 @@ FROM tasks WHERE id=$1`, candidate.TaskID).Scan(&waitingReason, &ownStop); err !
 				return finishConversationRoute(ctx, tx, claim, "waiting_user", "该任务正在停止或等待其他问题处理，请处理后重新发送修改。", "", false)
 			}
 			if current.Context.PreviousUnresolved && (current.PreviousRoutingState != "waiting_adjustment" || current.PreviousTaskID != candidate.TaskID) {
-				return finishConversationRoute(ctx, tx, claim, "waiting_user", "前一条消息尚未确认，请说明这次要修改哪个任务。", "", false)
+				return finishConversationRoute(ctx, tx, claim, "waiting_user", "我无法确认这次修改对应的任务。请指定目标任务。", "", false)
 			}
 			var lastRevisionSequence, lastExpectedRevision int64
 			var lastRevisionMessage string
@@ -1109,7 +1111,7 @@ RETURNING m.id,m.owner_id,r.client_message_id`, claim.Message.ID, claim.Message.
 }
 
 func requeueConversationRouteForReclassification(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
-	const maxAutomaticConflicts = 3
+	const maxAutomaticConflicts = 16 // Matches the maximum route-worker concurrency so one independent batch can settle.
 	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET
 state=CASE WHEN auto_retry_count+1 >= $9 THEN 'failed' ELSE 'pending' END,
 failure_reason=CASE WHEN auto_retry_count+1 >= $9 THEN 'routing_context_unavailable' ELSE '' END,
@@ -1189,9 +1191,9 @@ func exactConversationRouteDuplicate(candidates []app.ConversationRouteRequestCa
 	var target string
 	var targetSequence int64
 	for _, candidate := range candidates {
-		if candidate.SameExecutionScope && strings.TrimSpace(candidate.Content) == content &&
+		if strings.TrimSpace(candidate.Content) == content &&
 			(target == "" || candidate.Sequence < targetSequence) &&
-			app.ValidConversationRouteJoinTarget(candidate.MessageID, candidates) {
+			app.ValidConversationRouteExactDuplicateTarget(candidate.MessageID, content, candidates) {
 			target, targetSequence = candidate.MessageID, candidate.Sequence
 		}
 	}
@@ -1556,7 +1558,11 @@ func linkDuplicateConversationRouteInTx(ctx context.Context, tx pgx.Tx, claim ap
 			break
 		}
 	}
-	if candidate == nil || !app.ValidConversationRouteJoinTarget(targetMessageID, snapshot.Context.RequestCandidates) {
+	validTarget := candidate != nil && app.ValidConversationRouteJoinTarget(targetMessageID, snapshot.Context.RequestCandidates)
+	if candidate != nil && sameConversationRouteContent(candidate.Content, claim.Message.Content) {
+		validTarget = app.ValidConversationRouteExactDuplicateTarget(targetMessageID, claim.Message.Content, snapshot.Context.RequestCandidates)
+	}
+	if candidate == nil || !validTarget {
 		return domain.NewError(domain.CodeConflict, "conversation join target is no longer authorized")
 	}
 	var rootSequence int64
@@ -1594,7 +1600,7 @@ FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Messag
 	}
 	if rootAggregationState == "open" || rootAggregationState == "waiting" {
 		var rootAuthorizationValue task.Authorization
-		if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil || !rootAggregationEligible ||
+		if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil || (!rootAggregationEligible && !sameConversationRouteContent(rootContent, claim.Message.Content)) ||
 			len(rootInput.ClientAttachmentIDs) != 0 || !reflect.DeepEqual(rootAuthorizationValue, claim.Authorization) {
 			return requeueConversationRouteForReclassification(ctx, tx, claim)
 		}
@@ -1653,7 +1659,7 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='normal' AND attempt=$3 AND state=
 			return domain.NewError(domain.CodeConflict, "conversation join Task revision is no longer available")
 		}
 		if snapshot.Context.PreviousUnresolved && (snapshot.PreviousRoutingState != "waiting_adjustment" || snapshot.PreviousTaskID != rootTaskID) {
-			return finishConversationRoute(ctx, tx, claim, "waiting_user", "前一条消息尚未确认，请说明这次要修改哪个任务。", "", false)
+			return finishConversationRoute(ctx, tx, claim, "waiting_user", "我无法确认这次修改对应的任务。请指定目标任务。", "", false)
 		}
 		// A validated `join` decision is a fresh, same-scope statement that this
 		// message adds to the target Task. Multiple messages can be classified in

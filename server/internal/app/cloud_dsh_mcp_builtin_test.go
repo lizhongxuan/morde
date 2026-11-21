@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,62 @@ import (
 	"morde/server/internal/domain/task"
 	"morde/server/internal/mcpconnector"
 )
+
+func TestBuiltinSearchStepStoresEncryptedContentEvidenceForReview(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	current := store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-review", 1, "session-review"
+	revision := int64(3)
+	current.CurrentRevision, current.Authorization.Version = &revision, 1
+	store.details.Task = current
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := NewSealer(bytes.Repeat([]byte{12}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "review-search-call", Name: cloudDSHWebSearchToolName, Arguments: `{"query":"public source"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := broker.toolActivityContext(context.Background(), current, call)
+	output, err := json.Marshal(cloudDSHMCPOutput{Text: []string{"Source title: Morde public documentation. Supporting passage."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := newAgentStep(current.ID, 1, "tool", task.StepRunning, "Search public source", "Searching.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broker.commitMCPResult(ctx, current, step, current.Usage, call.Name,
+		AgentToolResult{Status: AgentToolSucceeded, Output: string(output)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.toolCalls) != 1 || len(store.toolCalls[0].DetailCiphertext) == 0 {
+		t.Fatalf("search step detail was not persisted for review: %+v", store.toolCalls)
+	}
+	if len(store.details.Steps) != 1 {
+		t.Fatalf("search step was not committed: %+v", store.details.Steps)
+	}
+	plain, err := sealer.OpenWithAAD(store.toolCalls[0].DetailCiphertext,
+		taskStepDetailAAD(current.OwnerID, current.ID, store.details.Steps[0].ID, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.ContentEvidence == nil ||
+		!strings.Contains(detail.ContentEvidence.Preview, "Supporting passage") ||
+		bytes.Contains(plain, output) {
+		t.Fatalf("review content evidence was not captured safely: %+v, err=%v", detail.ContentEvidence, err)
+	}
+}
 
 type cloudDSHBuiltinSearchAuthorizer struct {
 	authorization task.Authorization

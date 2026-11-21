@@ -345,6 +345,9 @@ func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error)
 		Stream:          request.OnTextDelta != nil,
 		ToolChoice:      choice,
 	}
+	if request.JSONMode && isDeepSeek(request.Endpoint) {
+		payload.Text = &responseText{Format: responseTextFormat{Type: "json_object"}}
+	}
 	// These first-party APIs document the Responses reasoning toggle; generic
 	// OpenAI-compatible endpoints may reject it.
 	if request.ReasoningEffort != "" {
@@ -442,7 +445,10 @@ func parseResponse(result responseBodyJSON) (app.ModelResponse, error) {
 	if result.Status == "failed" {
 		return app.ModelResponse{}, errors.New("model provider returned a failed response")
 	}
-	response := app.ModelResponse{Usage: app.ModelUsage{Known: false}, StopReason: "stop"}
+	if !app.ValidProviderReportedModel(result.Model) {
+		return app.ModelResponse{}, errors.New("model provider returned an invalid model identity")
+	}
+	response := app.ModelResponse{Usage: app.ModelUsage{Known: false}, StopReason: "stop", ProviderReportedModel: result.Model}
 	if result.Usage != nil && result.Usage.InputTokens != nil && result.Usage.OutputTokens != nil && *result.Usage.InputTokens >= 0 && *result.Usage.OutputTokens >= 0 {
 		response.Usage = app.ModelUsage{InputTokens: *result.Usage.InputTokens, OutputTokens: *result.Usage.OutputTokens, Known: true}
 	}
@@ -940,6 +946,15 @@ type responseRequest struct {
 	Temperature     *float64           `json:"temperature,omitempty"`
 	Stream          bool               `json:"stream,omitempty"`
 	Reasoning       *responseReasoning `json:"reasoning,omitempty"`
+	Text            *responseText      `json:"text,omitempty"`
+}
+
+type responseText struct {
+	Format responseTextFormat `json:"format"`
+}
+
+type responseTextFormat struct {
+	Type string `json:"type"`
 }
 
 type responseReasoning struct {
@@ -999,6 +1014,7 @@ type toolChoice struct {
 
 type responseBodyJSON struct {
 	Status            string               `json:"status"`
+	Model             string               `json:"model"`
 	Output            []responseOutputItem `json:"output"`
 	Usage             *responseUsage       `json:"usage"`
 	IncompleteDetails *incompleteDetails   `json:"incomplete_details"`

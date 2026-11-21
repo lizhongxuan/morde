@@ -74,6 +74,7 @@ type CloudDSHTaskCompletion struct {
 	CheckpointDigest          []byte
 	Result                    string
 	Inputs                    []ModelInput
+	ValidationClaims          []TaskResultClaim
 	StreamMessageID           string
 	StreamTurnID              string
 }
@@ -360,6 +361,9 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		completion.StreamMessageID != "" && (!domain.ValidMessageID(completion.StreamMessageID) || !domain.ValidStepID(completion.StreamTurnID)) {
 		return domain.InvalidArgument("dsh_completion", "cloud dsh completion evidence is invalid")
 	}
+	if len(completion.ValidationClaims) > 0 && ValidateTaskResultClaims(completion.Result, completion.ValidationClaims) != nil {
+		completion.ValidationClaims = nil
+	}
 	inputBytes := len(completion.Result)
 	for _, input := range completion.Inputs {
 		inputBytes += len(input.Arguments) + len(input.Output) + len(input.CallID) + len(input.Name) + len(input.Type)
@@ -412,7 +416,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if err != nil {
 			return err
 		}
-		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
+		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
 			map[string]any{"source": "cloud_dsh"}, "", artifacts)
 	}
 
@@ -431,7 +435,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 				return err
 			}
 			useCloudDSHStreamResultStep(&step, details, completion)
-			return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
+			return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
 				map[string]any{"source": "cloud_dsh"}, "", nil)
 		}
 	}
@@ -483,7 +487,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	}
 	step.Status = task.StepSucceeded
 	step.Summary = safeStepSummary(verification.Summary, "Host and committed Workspace verified the task output.")
-	return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
+	return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
 		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts)
 }
 
@@ -548,7 +552,7 @@ func prepareCloudDSHVerifiedArtifacts(details TaskDetails, step task.Step, verif
 			return nil, err
 		}
 		prepared = append(prepared, task.Artifact{
-			ID: artifactID, TaskID: current.ID, StepID: step.ID, Label: verified.Label, Path: verified.Path,
+			ID: artifactID, TaskID: current.ID, StepID: step.ID, SourceCallID: verified.SourceCallID, Label: verified.Label, Path: verified.Path,
 			WorkspaceID: verified.WorkspaceID, Revision: verified.Revision, SizeBytes: verified.SizeBytes, SHA256: verified.SHA256,
 			MediaType: verified.MediaType,
 		})
@@ -557,7 +561,7 @@ func prepareCloudDSHVerifiedArtifacts(details TaskDetails, step task.Step, verif
 }
 
 func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, current task.Task, step task.Step,
-	usage task.Usage, result string, detail any, observationFingerprint string, artifacts []task.Artifact) error {
+	usage task.Usage, result string, validationClaims []TaskResultClaim, detail any, observationFingerprint string, artifacts []task.Artifact) error {
 	if len(result) > agentUserVisibleResultBytes || !validUTF8(result) {
 		step.Status = task.StepFailed
 		step.Summary = "The cloud task returned invalid text output."
@@ -578,13 +582,19 @@ func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, curr
 	if err != nil {
 		return err
 	}
-	_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
+	progress := TaskProgress{
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		Status: task.StatusCompleted, CurrentStep: step.ID, Result: result, Usage: usage,
 		PublishResultMessage:   strings.TrimSpace(result) != "",
 		ObservationFingerprint: observationFingerprint, Steps: []task.Step{step}, Artifacts: artifacts,
-		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
-	})
+		ValidationClaims: validationClaims,
+		Event:            task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
+	}
+	_, err = b.store.CommitTaskProgress(ctx, progress)
+	if isOptionalTaskValidationEvidenceError(err) {
+		progress.ValidationClaims = nil
+		_, err = b.store.CommitTaskProgress(ctx, progress)
+	}
 	if err != nil {
 		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
 			_, pauseErr := b.pauseForWorkspaceInputChange(ctx, current, step, usage, "task.complete")
@@ -1227,6 +1237,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The Host action completed but its result could not be committed safely.")
 	}
 	step.Status, step.Summary = stepStatus, summary
+	ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, result)
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
 		"tool": call.Name, "operation_key": request.OperationKey, "operation_status": operationStatus,
 	}); err != nil {
@@ -1552,6 +1563,11 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 	if pendingApproval != nil && pendingApproval.CallID == call.CallID {
 		if pendingApproval.TaskID != current.ID || pendingApproval.Kind != "approval" || pendingApproval.ToolName != call.Name ||
 			!bytes.Equal(pendingApproval.RequestHash, hash[:]) {
+			_, lookupErr := b.store.GetOperation(ctx, current.OwnerID, current.ID, operationKey)
+			if domain.CodeOf(lookupErr) == domain.CodeNotFound && checkpointOutput == nil {
+				result, err := b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)
+				return result, true, err
+			}
 			return pause("The saved approval does not match this exact checkpointed tool call.")
 		}
 		if pendingApproval.Status == task.PendingRequestRejected || pendingApproval.Status == task.PendingRequestExpired {
@@ -1717,6 +1733,7 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 }
 
 func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
+	ctx = withTaskToolShellExecutionEvidence(ctx, name, result)
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh tool completed and its result was saved."
 	if result.Status == AgentToolFailed {
 		step.Status, step.Summary = task.StepFailed, "The Host runtime reported a definitive tool failure."
@@ -1882,6 +1899,11 @@ func (b *CloudDSHToolBroker) markUnknown(ctx context.Context, current task.Task,
 		LeaseVersion: current.Lease.Version, Status: task.OperationUnknown,
 	})
 	return err
+}
+
+func isOptionalTaskValidationEvidenceError(err error) bool {
+	var domainErr *domain.Error
+	return errors.As(err, &domainErr) && domainErr.Code == domain.CodeInvalidArgument && domainErr.Details["field"] == "validation_evidence"
 }
 
 func (b *CloudDSHToolBroker) prepareTaskToolStep(ctx context.Context, current task.Task, step task.Step) (task.Step, *TaskToolCallProgress, error) {

@@ -45,6 +45,18 @@ export async function writeFile(file: string, content: string): Promise<void> {
   await aioRequest('/v1/file/write', jsonRequest({ file, content }));
 }
 
+export async function createDirectory(path: string): Promise<void> {
+  await aioRequest('/v1/file/mkdir', jsonRequest({ path }));
+}
+
+export async function moveFile(source: string, destination: string): Promise<void> {
+  await aioRequest('/v1/file/move', jsonRequest({ source, destination }));
+}
+
+export async function deleteFile(path: string): Promise<void> {
+  await aioRequest('/v1/file/delete', jsonRequest({ path, recursive: true }));
+}
+
 export function uploadFile(
   file: File,
   path: string,

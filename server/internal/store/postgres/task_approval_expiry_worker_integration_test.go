@@ -299,9 +299,12 @@ func TestPostgresApprovalThatExpiresWhileResponseWriteWaitsIsRejected(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	blockerOpen := true
 	defer func() {
-		if err := blocker.Rollback(ctx); err != nil {
-			t.Errorf("rollback blocker transaction: %v", err)
+		if blockerOpen {
+			if err := blocker.Rollback(ctx); err != nil {
+				t.Errorf("rollback blocker transaction: %v", err)
+			}
 		}
 	}()
 	if _, err := blocker.Exec(ctx, `LOCK TABLE task_pending_requests IN SHARE MODE`); err != nil {
@@ -333,6 +336,7 @@ WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='
 	if err := blocker.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	blockerOpen = false
 	if err := <-response; domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("response after deadline = %v, want conflict", err)
 	}

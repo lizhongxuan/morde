@@ -13,10 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacecurrent"
+
+	"golang.org/x/sys/unix"
 )
 
 type agentWorkspaceFileProviderStub struct {
@@ -140,7 +141,11 @@ func TestAgentWorkspaceFilesAndHostUseTheSameDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open Host-written file through Agent Workspace service: %v", err)
 	}
-	defer file.Close()
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close Host-written file: %v", err)
+		}
+	})
 	got, err := io.ReadAll(file)
 	if err != nil || string(got) != string(hostContent) || info.Size() != int64(len(hostContent)) {
 		t.Fatalf("Agent view of Host file = %q info=%#v, %v", got, info, err)

@@ -155,6 +155,13 @@ type WorkspaceSyncNode struct {
 	ProtectedStorageRoots                    []string `yaml:"protected_storage_roots"`
 }
 
+func (c *WorkspaceSyncNode) setDefaults() {
+	*c = WorkspaceSyncNode{
+		Enabled: true, ProjectUploadEnabled: true,
+		AgentWorkspaceHostMountEnabled: true, AgentWorkspaceLiveDirectorySourceEnabled: true,
+	}
+}
+
 type SiteStorage struct {
 	RootDir         string `yaml:"root_dir"`
 	MaxReleaseBytes int64  `yaml:"max_release_bytes"`
@@ -186,6 +193,7 @@ func (r ProjectModelRate) Snapshot() project.RateSnapshot {
 
 type CloudDSH struct {
 	Enabled               bool          `yaml:"enabled"`
+	MaxConcurrentRoutes   int           `yaml:"max_concurrent_routes"`
 	MaxConcurrentTasks    int           `yaml:"max_concurrent_tasks"`
 	MaxConcurrentPerOwner int           `yaml:"max_concurrent_tasks_per_owner"`
 	DockerHost            string        `yaml:"docker_host"`
@@ -197,6 +205,13 @@ type CloudDSH struct {
 	GuardianSocket        string        `yaml:"guardian_socket"`
 	GuardianPublicKeyFile string        `yaml:"guardian_public_key_file"`
 	BuiltinSearch         BuiltinSearch `yaml:"builtin_search"`
+}
+
+func (c *CloudDSH) setDefaults() {
+	*c = CloudDSH{
+		Enabled: true, MaxConcurrentRoutes: 16, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 4,
+		BuiltinSearch: BuiltinSearch{Enabled: true, MaxConcurrent: 4},
+	}
 }
 
 type BuiltinSearch struct {
@@ -247,7 +262,9 @@ func parseConfig(data string) (Config, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
 	decoder.KnownFields(true)
 	var cfg Config
+	cfg.CloudDSH.setDefaults()
 	cfg.MCP.setDefaults()
+	cfg.WorkspaceSyncNode.setDefaults()
 	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
@@ -453,7 +470,8 @@ func (c Config) validate() error {
 		}
 	}
 	if c.CloudDSH.Enabled {
-		if c.CloudDSH.MaxConcurrentTasks < 1 || c.CloudDSH.MaxConcurrentTasks > 64 ||
+		if c.CloudDSH.MaxConcurrentRoutes < 1 || c.CloudDSH.MaxConcurrentRoutes > 16 ||
+			c.CloudDSH.MaxConcurrentTasks < 1 || c.CloudDSH.MaxConcurrentTasks > 64 ||
 			c.CloudDSH.MaxConcurrentPerOwner < 1 || c.CloudDSH.MaxConcurrentPerOwner > c.CloudDSH.MaxConcurrentTasks ||
 			c.CloudDSH.MaxConcurrentPerOwner > maxCloudDSHConcurrentPerOwner {
 			return fmt.Errorf("config.cloud_dsh concurrency limits must be positive and per-owner may not exceed the global limit")
