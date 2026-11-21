@@ -92660,6 +92660,20 @@
         }
       }
     },
+    "More tasks" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Weitere Aufgaben" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "More tasks" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Más tareas" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Plus de tâches" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "さらにタスク" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "더 많은 작업" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ещё задачи" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更多任务" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "更多任務" } }
+      }
+    },
     "More options" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -101524,6 +101538,20 @@
             "value" : "無結果"
           }
         }
+      }
+    },
+    "No tool was called" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Kein Werkzeug wurde aufgerufen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No tool was called" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No se ha llamado a ninguna herramienta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucun outil n’a été appelé" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ツールは呼び出されていません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "호출된 도구가 없습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Инструмент не вызывался" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "未调用工具" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "未呼叫工具" } }
       }
     },
     "No routines yet. Ask the agent for something \"every morning\" and it will appear here." : {
@@ -192452,6 +192480,20 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "歸屬尚未確認" } }
       }
     },
+    "Agent work process" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Arbeitsprozess des Agenten" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Agent work process" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Proceso de trabajo del agente" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Processus de travail de l’agent" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Agentの作業プロセス" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Agent 작업 과정" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Рабочий процесс агента" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Agent 工作过程" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "Agent 工作流程" } }
+      }
+    },
     "Details are truncated" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -192674,6 +192716,34 @@
         "ru" : { "stringUnit" : { "state" : "translated", "value" : "ПРОЙДЕНО + ПРИМЕЧАНИЯ" } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "通过（有备注）" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "通過（附註）" } }
+      }
+    },
+    "Task executing" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wird ausgeführt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Executing" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "En ejecución" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En cours d’exécution" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "実行中" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "실행 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Выполняется" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行中" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "執行中" } }
+      }
+    },
+    "Task stopped" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Gestoppt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Stopped" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Detenido" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Arrêté" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "停止" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "중지" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Остановлено" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "停止" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "停止" } }
       }
     },
     "Task validation" : {

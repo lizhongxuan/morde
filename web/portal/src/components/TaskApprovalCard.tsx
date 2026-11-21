@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { formatDate } from '../app/format';
 import type { components } from '../api/schema';
 
 type ApprovalView = Pick<components['schemas']['TaskPendingRequest'],
-  'id' | 'version' | 'status' | 'kind' | 'title' | 'object' | 'content' | 'impact' | 'disclosures' | 'expires_at'> &
+  'id' | 'version' | 'status' | 'kind' | 'title' | 'object' | 'content' | 'impact' | 'disclosures' |
+  'expires_at' | 'media_preview_operation_id'> &
   Partial<Pick<components['schemas']['TaskApprovalSnapshot'], 'decision' | 'responded_at'>>;
 
 export type TaskApprovalDecision = 'approve' | 'reject';
@@ -30,13 +31,24 @@ function alternativesDisclosure(value: components['schemas']['TaskApprovalAltern
   return value.options.length ? value.options.join('；') : '服务端标记为已知，但未提供方案';
 }
 
-export function TaskApprovalCard({ approval, submitting = false, compact = false, onDecision }: {
+export function TaskApprovalCard({ approval, submitting = false, compact = false, reviewInbox = false, onDecision }: {
   approval: ApprovalView;
   submitting?: boolean;
   compact?: boolean;
+  reviewInbox?: boolean;
   onDecision: (decision: TaskApprovalDecision) => void;
 }) {
   const [now, setNow] = useState(Date.now);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsRef = useRef<HTMLDialogElement>(null);
+  const closeDetails = () => {
+    const dialog = detailsRef.current;
+    if (dialog && typeof dialog.close === 'function' && dialog.open) dialog.close();
+    else {
+      dialog?.removeAttribute('open');
+      setDetailsOpen(false);
+    }
+  };
   useEffect(() => {
     if (!approval.expires_at) return;
     const expiresAt = Date.parse(approval.expires_at);
@@ -47,11 +59,69 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
   const expiresAt = approval.expires_at === null ? null : Date.parse(approval.expires_at);
   const invalidExpiry = expiresAt !== null && !Number.isFinite(expiresAt);
   const locallyExpired = expiresAt !== null && Number.isFinite(expiresAt) && expiresAt <= now;
-  const actionable = approval.status === 'pending' && !invalidExpiry && !locallyExpired;
+  const actionable = approval.status === 'pending' && !invalidExpiry && !locallyExpired && !approval.media_preview_operation_id;
   const status = locallyExpired && approval.status === 'pending' ? '到期，正在核对状态'
     : ({ pending: '待审核', approved: '已允许', rejected: '已拒绝', cancelled: '已取消', expired: '已过期' } as const)[approval.status];
+  const reviewStatus = approval.media_preview_operation_id ? '请在任务中预览后处理'
+    : invalidExpiry && approval.status === 'pending' ? '到期信息无效，正在核对状态' : status;
   const label = approval.status === 'pending' && !locallyExpired ? '需要批准的操作'
     : approval.status === 'expired' || locallyExpired ? '审批已到期' : '已处理的审批';
+
+  useEffect(() => {
+    const dialog = detailsRef.current;
+    if (!dialog) return;
+    if (detailsOpen && !dialog.open) {
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.setAttribute('open', '');
+    } else if (!detailsOpen && dialog.open) {
+      if (typeof dialog.close === 'function') dialog.close();
+      else dialog.removeAttribute('open');
+    }
+  }, [detailsOpen]);
+
+  if (reviewInbox) {
+    return <article className="chat-approval task-approval-card task-approval-review-card" role="group"
+      aria-label={approval.title} data-approval-id={approval.id} aria-busy={submitting || undefined}>
+      <button type="button" className="task-approval-review-main" aria-haspopup="dialog"
+        aria-label={`查看操作详情：${approval.title}`} onClick={() => setDetailsOpen(true)}>
+        <span className="task-approval-review-copy">
+          <span className="task-approval-review-kind"><span aria-hidden="true" />操作确认</span>
+          <span className="task-approval-review-title">{approval.title}</span>
+          <span className="task-approval-review-object">
+            {approval.object}{approval.content ? ` · ${approval.content}` : ''}
+          </span>
+        </span>
+      </button>
+      <div className="task-approval-review-actions">
+        {actionable ? <>
+          <button type="button" className="button button-secondary" disabled={submitting}
+            aria-label={`拒绝：${approval.title}`} onClick={() => onDecision('reject')}>拒绝</button>
+          <button type="button" className="button button-primary" disabled={submitting}
+            aria-label={`允许：${approval.title}`} onClick={() => onDecision('approve')}>允许</button>
+        </> : <span className="task-approval-review-status" role="status">{reviewStatus}</span>}
+      </div>
+      <dialog ref={detailsRef} className="task-approval-review-dialog" aria-labelledby={`approval-title-${approval.id}`}
+        onClose={() => setDetailsOpen(false)}
+        onClick={(event) => { if (event.target === detailsRef.current) closeDetails(); }}>
+        <header className="task-approval-review-dialog-heading">
+          <div><p>操作详情</p><h2 id={`approval-title-${approval.id}`}>{approval.title}</h2></div>
+          <button type="button" className="task-approval-review-dialog-close" aria-label="关闭"
+            onClick={closeDetails}>×</button>
+        </header>
+        <dl className="task-approval-review-details">
+          <dt>操作对象</dt><dd>{approval.object}</dd>
+          <dt>操作内容</dt><dd>{approval.content}</dd>
+          <dt>可能影响</dt><dd>{approval.impact}</dd>
+          <dt>风险</dt><dd>{textDisclosure(approval.disclosures?.risk)}</dd>
+          <dt>本次费用</dt><dd>{costDisclosure(approval.disclosures?.this_cost)}</dd>
+          <dt>累计费用</dt><dd>{costDisclosure(approval.disclosures?.cumulative_cost)}</dd>
+          <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
+          <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd>
+          {approval.expires_at && <><dt>审批到期</dt><dd>{formatDate(approval.expires_at)}</dd></>}
+        </dl>
+      </dialog>
+    </article>;
+  }
 
   return <article className="chat-approval task-approval-card" role="region" aria-label={label} data-approval-id={approval.id}>
     <header className="task-approval-card-heading"><h3>{approval.title}</h3><span>{status}</span></header>

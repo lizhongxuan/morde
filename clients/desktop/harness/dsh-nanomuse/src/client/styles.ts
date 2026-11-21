@@ -493,30 +493,48 @@ html[data-nm-platform='darwin']:not([data-nm-fullscreen]) .nm-doc-bar { padding-
 .nm-doc-note { color: var(--dsw-alias-label-tertiary); }
 .nm-doc-source { flex: 1; min-height: 0; width: 100%; box-sizing: border-box; border: 0; outline: none; resize: none; padding: 28px 48px 120px; background: transparent; color: var(--dsw-alias-label-primary); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; line-height: 1.6; max-width: 860px; margin: 0 auto; display: block; }
 @media print { html[data-nm-print] body * { visibility: hidden; } html[data-nm-print] .nm-doc, html[data-nm-print] .nm-doc * { visibility: visible; } html[data-nm-print] .nm-doc { position: absolute; inset: 0; height: auto; overflow: visible; } html[data-nm-print] .nm-doc-bar { display: none; } html[data-nm-print] .nm-doc-scroll { overflow: visible; } }
-/* a task's detail (from the Activity tab) */
-.nm-task-backdrop { position: fixed; inset: 0; z-index: 86; background: rgba(0,0,0,0.32); display: flex; align-items: center; justify-content: center; animation: nm-fade-in 120ms ease-out; }
-.nm-task { width: min(920px, calc(100vw - 48px)); height: min(640px, calc(100vh - 48px)); display: flex; flex-direction: column; border-radius: 18px; background: var(--nm-base); color: var(--dsw-alias-label-primary); box-shadow: 0 24px 80px rgba(0,0,0,0.35), 0 0 0 1px var(--nm-divider); overflow: hidden; animation: nm-rise 160ms ease-out; }
-.nm-task-head { flex: none; display: flex; align-items: center; gap: 10px; padding: 14px 14px 12px 18px; border-bottom: 1px solid var(--nm-divider); }
-.nm-task-pill { flex: none; font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); }
-.nm-task-pill.nm-live { background: color-mix(in srgb, var(--nm-blue) 22%, transparent); color: var(--nm-blue); }
-.nm-task-pill.nm-ok { background: color-mix(in srgb, #2f9e5f 20%, transparent); color: #2f9e5f; }
-.nm-task-pill.nm-err { background: color-mix(in srgb, #d2453d 20%, transparent); color: #d2453d; }
-.nm-task-title { flex: 1; min-width: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nm-task-body { flex: 1; min-height: 0; display: flex; }
-.nm-task-steps { flex: none; width: 300px; overflow-y: auto; padding: 10px 8px; border-right: 1px solid var(--nm-divider); display: flex; flex-direction: column; gap: 1px; }
-.nm-task-step { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
-.nm-task-step:hover, .nm-task-step.nm-active { background: var(--nm-hover); }
-.nm-task-step-icon { width: 24px; height: 24px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); flex: none; }
-.nm-task-step-icon.nm-ok { color: #2f9e5f; }
-.nm-task-step-icon.nm-err { color: #d2453d; }
-.nm-task-step-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.nm-task-step-title { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nm-task-step-time { font-size: 11.5px; color: var(--dsw-alias-label-dimmed); }
-.nm-task-detail { flex: 1; min-width: 0; overflow-y: auto; padding: 18px 22px 28px; display: flex; flex-direction: column; gap: 14px; }
-.nm-task-detail h3 { font-size: 12px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--dsw-alias-label-tertiary); margin: 0 0 6px; }
-.nm-task-detail pre { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--dsw-alias-bg-layer-2); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
+/* Task dynamics stays in the right-hand drawer; the chat remains visible behind it. */
+.nm-pf.nm-pf-activity { width: min(500px, 48vw); }
+.nm-pf-activity .nm-pf-body { padding: 8px 20px 20px; }
+.nm-pf-task-list { gap: 7px; }
+.nm-pf-task { padding: 13px 14px; margin: 0 0 8px; border: 1px solid var(--dsw-alias-bg-layer-3); border-radius: 18px; background: var(--nm-card); transition: border-color 120ms, background 120ms; }
+.nm-pf-task:hover, .nm-pf-task.nm-running { border-color: color-mix(in srgb, var(--nm-blue) 34%, var(--nm-divider)); }
+.nm-pf-task .nm-pf-row-icon { width: 44px; height: 44px; border-radius: 50%; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-tertiary); }
+.nm-pf-task .nm-pf-row-icon.nm-live { background: color-mix(in srgb, var(--nm-blue) 12%, var(--nm-base)); color: var(--nm-blue); }
+.nm-pf-task .nm-pf-row-main { gap: 4px; }
+.nm-pf-task .nm-pf-row-title { font-size: 15px; font-weight: 600; white-space: normal; line-height: 1.35; }
+.nm-pf-task .nm-pf-row-sub { font-size: 13px; white-space: normal; line-height: 1.4; }
+.nm-pf-task .nm-pf-row-time { font-size: 11.5px; margin-top: 3px; }
+.nm-pf-stopped-mark { width: 8px; height: 8px; border-radius: 2px; background: var(--dsw-alias-label-tertiary); }
+.nm-pf-more { width: 100%; min-height: 42px; margin-top: 2px; border: 1px solid var(--nm-divider); border-radius: 14px; background: transparent; color: var(--nm-blue); font: inherit; font-weight: 600; cursor: pointer; }
+.nm-pf-more:hover { background: var(--nm-hover); }
+.nm-task-backdrop { position: fixed; inset: 0; z-index: 86; display: flex; justify-content: flex-end; pointer-events: none; }
+.nm-task { pointer-events: auto; width: min(500px, 48vw); height: 100vh; height: 100dvh; display: flex; flex-direction: column; background: var(--nm-base); color: var(--dsw-alias-label-primary); box-shadow: -14px 0 38px rgba(24,45,77,0.12), 0 0 0 1px var(--nm-divider); overflow: hidden; animation: nm-slide-in 160ms ease-out; }
+.nm-task-head { flex: none; display: flex; align-items: center; padding: 15px 20px; min-height: 64px; border-bottom: 1px solid var(--nm-divider); }
+.nm-task-back { display: inline-flex; align-items: center; gap: 5px; border: 1px solid color-mix(in srgb, var(--nm-blue) 28%, var(--nm-divider)); border-radius: 999px; padding: 7px 12px; background: transparent; color: var(--nm-blue); font: inherit; font-weight: 600; cursor: pointer; }
+.nm-task-back:hover { background: var(--nm-hover); }
+.nm-task-back svg { transform: rotate(180deg); }
+.nm-task-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 20px 28px; }
+.nm-task-summary { display: flex; align-items: flex-start; gap: 14px; margin: 2px 0 26px; }
+.nm-task-title { flex: 1; min-width: 0; margin: 0; font-size: 19px; font-weight: 650; line-height: 1.4; }
+.nm-task-pill { flex: none; display: inline-flex; align-items: center; gap: 5px; margin-top: 1px; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); }
+.nm-task-pill.nm-live { background: color-mix(in srgb, var(--nm-blue) 14%, var(--nm-base)); color: var(--nm-blue); }
+.nm-task-process-title { padding: 0 0 10px; margin-bottom: 8px; border-bottom: 1px solid var(--nm-divider); color: var(--dsw-alias-label-secondary); font-size: 14px; font-weight: 600; }
+.nm-task-work-list { display: flex; flex-direction: column; gap: 2px; }
+.nm-task-work { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 4px; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.nm-task-work:hover, .nm-task-work:focus-visible { background: var(--nm-hover); outline: none; }
+.nm-task-step-icon { width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: color-mix(in srgb, #2f9e5f 14%, var(--nm-base)); color: #2f9e5f; flex: none; }
+.nm-task-step-icon.nm-err { background: color-mix(in srgb, #d2453d 12%, var(--nm-base)); color: #d2453d; }
+.nm-task-work-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.nm-task-work-title { font-size: 14px; font-weight: 600; line-height: 1.4; }
+.nm-task-work-sub { font-size: 12.5px; color: var(--dsw-alias-label-tertiary); line-height: 1.4; }
+.nm-task-step-time { flex: none; font-size: 11.5px; color: var(--dsw-alias-label-dimmed); }
+.nm-task-detail { display: flex; flex-direction: column; gap: 14px; }
+.nm-task-block { display: flex; flex-direction: column; gap: 6px; }
+.nm-task-label { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-tertiary); }
+.nm-task-pre { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--dsw-alias-bg-layer-2); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .nm-task-muted { font-size: 13.5px; color: var(--dsw-alias-label-tertiary); }
-.nm-task-empty { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 13.5px; color: var(--dsw-alias-label-tertiary); }
+.nm-task-empty { min-height: 120px; display: flex; align-items: center; justify-content: center; font-size: 13.5px; color: var(--dsw-alias-label-tertiary); }
 /* the profile drawer's Identity tab */
 .nm-pf-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 14px; background: var(--nm-card); margin: 4px 0 10px; }
 .nm-pf-card-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -541,12 +559,6 @@ html[data-nm-platform='darwin']:not([data-nm-fullscreen]) .nm-doc-bar { padding-
 .nm-pf-doc-foot { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; font-size: 11px; color: var(--dsw-alias-label-dimmed); }
 .nm-seg-btn.nm-seg-text { min-width: 0; padding: 0 12px; font-size: 12.5px; }
 .nm-task-loading { padding: 24px; font-size: 13.5px; color: var(--dsw-alias-label-tertiary); }
-.nm-task-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dsw-alias-label-dimmed); }
-.nm-task-step-text { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nm-task-detail-title { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
-.nm-task-block { display: flex; flex-direction: column; gap: 6px; }
-.nm-task-label { font-size: 12px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--dsw-alias-label-tertiary); }
-.nm-task-pre { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--dsw-alias-bg-layer-2); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
 /* The approval card: a dark rounded card with a shield, Allow in blue. */
 /* The approval card, Muse-shaped: shield + headline, Allow (blue) first, then Reject. */
 html[data-nanomuse] [data-approval-key] > div { background: var(--nm-card) !important; border: 1px solid var(--nm-divider) !important; border-radius: 18px !important; box-shadow: 0 10px 30px rgba(0,0,0,0.18) !important; padding: 14px 16px !important; outline: none !important; }

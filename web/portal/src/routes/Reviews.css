@@ -1,38 +1,349 @@
-.morde-shell:not(.morde-admin-shell) .reviews-page { width: min(100%, 1120px); margin: 0 auto; }
-.morde-shell:not(.morde-admin-shell) .reviews-heading { align-items: flex-end; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
-.morde-shell:not(.morde-admin-shell) .reviews-heading h1 { margin: 0; font-size: 28px; letter-spacing: -.025em; }
-.morde-shell:not(.morde-admin-shell) .reviews-heading p { max-width: 680px; margin: 7px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
-.morde-shell:not(.morde-admin-shell) .reviews-pending-count { padding: 7px 11px; border-color: var(--line); background: var(--pc-blue-bg, #edf5fb); color: var(--pc-blue-text, #315f7b); font-size: 12px; }
-.morde-shell:not(.morde-admin-shell) .reviews-section { margin: 0 0 22px; }
-.morde-shell:not(.morde-admin-shell) .reviews-section h2 { margin: 0 0 14px; color: var(--ink); font-size: 15px; font-weight: 700; }
-.morde-shell:not(.morde-admin-shell) .reviews-list { gap: 10px; }
-.morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card { width: 100%; max-width: none; margin: 0; padding: 20px; border-color: var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-jelly, 0 6px 20px rgb(35 79 145 / 7%)); }
-.morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card .task-approval-card-heading h3 { font-size: 17px; }
-.morde-shell:not(.morde-admin-shell) .reviews-history { margin: 0 0 20px; }
-.morde-shell:not(.morde-admin-shell) .reviews-history > summary { width: fit-content; padding: 6px 0; color: var(--muted-strong, var(--muted)); font-size: 13px; font-weight: 650; cursor: pointer; }
-.morde-shell:not(.morde-admin-shell) .reviews-history .reviews-section { margin-top: 12px; }
-.morde-shell:not(.morde-admin-shell) .reviews-empty { margin: 0; padding: 24px 14px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); background: var(--surface); font-size: 13px; text-align: center; }
-.morde-shell:not(.morde-admin-shell) .reviews-loading { margin: 0; padding: 14px 0; color: var(--muted); font-size: 13px; }
-.morde-shell:not(.morde-admin-shell) .reviews-error { min-width: 0; margin: 0 0 16px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; border: 1px solid #f1c9c5; border-radius: 12px; color: var(--pc-red-text, #8b211a); background: var(--pc-red-bg, #fff8f7); }
-.morde-shell:not(.morde-admin-shell) .reviews-error-mark { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 50%; color: var(--danger); background: #fee4e2; font-size: 16px; font-weight: 750; }
-.morde-shell:not(.morde-admin-shell) .reviews-error-copy { min-width: 0; flex: 1; }
-.morde-shell:not(.morde-admin-shell) .reviews-error-title { display: block; font-size: 13px; font-weight: 700; }
-.morde-shell:not(.morde-admin-shell) .reviews-error-copy p { margin: 3px 0 0; color: inherit; font-size: 12px; line-height: 1.55; opacity: .88; overflow-wrap: anywhere; }
+.morde-shell:not(.morde-admin-shell) .reviews-page {
+  width: min(100%, 1120px);
+  min-height: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-heading {
+  margin: 0 0 12px;
+  padding: 0 0 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-heading h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: -.025em;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-heading p {
+  max-width: 680px;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-list {
+  min-width: 0;
+  flex: 1 0 auto;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  margin: 0;
+  padding-bottom: 14px;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-review-card {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--surface);
+  box-shadow: var(--shadow-jelly, 0 6px 20px rgb(35 79 145 / 7%));
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-main {
+  min-width: 0;
+  min-height: 58px;
+  flex: 1 1 auto;
+  padding: 3px 0;
+  display: block;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-main:focus-visible {
+  outline: 2px solid var(--brand, #4c94ef);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-copy {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 2px 10px;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--brand-ink, #2469d8);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-kind > span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--brand, #4c94ef);
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-title {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-object {
+  min-width: 0;
+  grid-column: 1 / -1;
+  overflow: hidden;
+  color: var(--muted-strong, var(--muted));
+  font-size: 13px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-actions .button {
+  min-height: 38px;
+  padding: 7px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-status {
+  padding: 6px 10px;
+  border-radius: 999px;
+  color: var(--muted-strong, var(--muted));
+  background: var(--side, #f2f6fc);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-dialog {
+  width: min(640px, calc(100vw - 28px));
+  max-width: none;
+  max-height: min(84dvh, 780px);
+  padding: 22px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: 0 24px 80px rgb(22 42 76 / 24%);
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-dialog::backdrop {
+  background: rgb(24 41 68 / 38%);
+  backdrop-filter: blur(3px);
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-dialog-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-dialog-heading p {
+  margin: 0 0 5px;
+  color: var(--brand-ink, #2469d8);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-dialog-heading h2 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-dialog-close {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted-strong, var(--muted));
+  background: var(--surface);
+  font-size: 23px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-details {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(90px, max-content) minmax(0, 1fr);
+  gap: 11px 16px;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-details dt {
+  color: var(--muted);
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-empty {
+  margin: 0;
+  padding: 24px 14px;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 13px;
+  text-align: center;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-loading {
+  margin: 0;
+  padding: 14px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-error {
+  min-width: 0;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #f1c9c5;
+  border-radius: 12px;
+  color: var(--pc-red-text, #8b211a);
+  background: var(--pc-red-bg, #fff8f7);
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-error-mark {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--danger);
+  background: #fee4e2;
+  font-size: 15px;
+  font-weight: 750;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-error-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-error-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-error-copy p {
+  margin: 3px 0 0;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: .88;
+  overflow-wrap: anywhere;
+}
+
 .morde-shell:not(.morde-admin-shell) .reviews-error > .button { flex: 0 0 auto; }
-.morde-shell:not(.morde-admin-shell) .reviews-load-more { padding: 4px 0 18px; }
+
+.morde-shell:not(.morde-admin-shell) .reviews-pagination {
+  position: sticky;
+  z-index: 2;
+  bottom: 0;
+  margin: auto -24px -24px;
+  padding: 13px 24px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-pagination-range {
+  color: var(--muted-strong, var(--muted));
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-pagination-controls,
+.morde-shell:not(.morde-admin-shell) .reviews-pagination-number {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-pagination-controls .button {
+  min-width: 38px;
+  min-height: 38px;
+  padding: 7px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-pagination-number > span {
+  color: var(--muted);
+}
 
 @media (prefers-color-scheme: dark) {
-  .morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card { box-shadow: none; }
+  .morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-review-card { box-shadow: none; }
   .morde-shell:not(.morde-admin-shell) .reviews-error { border-color: #69413d; }
   .morde-shell:not(.morde-admin-shell) .reviews-error-mark { color: var(--pc-red-text); background: var(--pc-red-bg); }
 }
 
 @media (max-width: 680px) {
-  .morde-shell:not(.morde-admin-shell) .reviews-heading { align-items: flex-start; }
-  .morde-shell:not(.morde-admin-shell) .reviews-heading { flex-direction: column; }
-  .morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card { padding: 16px; }
+  .morde-shell:not(.morde-admin-shell) .reviews-heading h1 { font-size: 24px; }
+  .morde-shell:not(.morde-admin-shell) .reviews-heading p { font-size: 13px; }
+  .morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-review-card {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+  }
+  .morde-shell:not(.morde-admin-shell) .task-approval-review-actions { justify-content: flex-end; }
   .morde-shell:not(.morde-admin-shell) .reviews-error { align-items: flex-start; flex-wrap: wrap; }
-  .morde-shell:not(.morde-admin-shell) .reviews-error-copy { flex-basis: calc(100% - 44px); }
-  .morde-shell:not(.morde-admin-shell) .reviews-error > .button { margin-left: 42px; }
-  .chat-approval-row { margin-left: 0; }
+  .morde-shell:not(.morde-admin-shell) .reviews-error-copy { flex-basis: calc(100% - 40px); }
+  .morde-shell:not(.morde-admin-shell) .reviews-error > .button { margin-left: 40px; }
+  .morde-shell:not(.morde-admin-shell) .reviews-pagination {
+    margin-inline: -10px;
+    margin-bottom: -12px;
+    padding: 10px 10px 14px;
+    flex-wrap: wrap;
+  }
+  .morde-shell:not(.morde-admin-shell) .reviews-pagination-controls,
+  .morde-shell:not(.morde-admin-shell) .reviews-pagination-number { gap: 4px; }
+  .morde-shell:not(.morde-admin-shell) .reviews-pagination-controls .button { min-width: 34px; padding-inline: 9px; }
 }

@@ -14,7 +14,7 @@ import { createElement as h, Fragment, useEffect, useRef, useState, type FormEve
 import { call, type Translate, failureText } from './api.ts'
 import { Avatar } from './Avatar.tsx'
 import { profileBus, settingsBus, useProfileOpen } from './bus.ts'
-import { IconAlarm, IconBell, IconCheck, IconChevronDown, IconChevronRight, IconClock, IconClose, IconList, IconPencil, IconShare, IconShield, IconSparkle, IconSpinner, IconSquare } from './icons.tsx'
+import { IconAlarm, IconBell, IconCheck, IconChevronDown, IconChevronRight, IconClock, IconClose, IconList, IconPencil, IconShare, IconShield, IconSparkle, IconSpinner } from './icons.tsx'
 import { AvatarShareSheet } from './AvatarShare.tsx'
 import { studioBus } from './AvatarStudio.tsx'
 import { prefillComposer } from './composer.ts'
@@ -51,7 +51,7 @@ export function makeProfileDrawer(t: Translate, stop: (sessionId: string) => Pro
   }
 }
 
-function Drawer({ t, stop, openSchedules, useSessions, useSessionStatus }: ProfileDrawerProps): ReactNode {
+function Drawer({ t, openSchedules, useSessions, useSessionStatus }: ProfileDrawerProps): ReactNode {
   const live = useLive()
   const rooms = useRooms()
   const mordeProfile = rooms.mordeProfile?.body ?? { name: 'nanoMuse', avatar: 'dragon' as const, description: '', style: '' }
@@ -87,9 +87,10 @@ function Drawer({ t, stop, openSchedules, useSessions, useSessionStatus }: Profi
   const name = profile.name || t('brand')
   // the status line under the name follows what the agent is doing right now
   const running = rooms.activity.find((r) => r.status === 'running' || r.status === 'waiting')
+  const activityRunning = tab === 'activity' ? rooms.activity.find((r) => r.status === 'running') : running
   // "online" as on the phone: the agent answers here; the account's state is a matter for Settings
   let status: ReactNode
-  if (running) status = h('span', { className: 'nm-pf-status nm-live' }, h(IconSpinner, { size: 13 }), statusWords(t, running))
+  if (activityRunning) status = h('span', { className: 'nm-pf-status nm-live' }, h(IconSpinner, { size: 13 }), activityRunning.current ? statusWords(t, activityRunning) : t('statusWorking'))
   else if (live.cloud.signedIn && !live.hub.connected) status = h('span', { className: 'nm-pf-status' }, h('span', { className: 'nm-status-dot nm-wait' }), t('pfOffline'))
   else status = h('span', { className: 'nm-pf-status' }, h('span', { className: 'nm-status-dot nm-on' }), t('pfOnline'))
   // the phone's "Change avatar": the words land in the chat and the avatar flow takes them from there
@@ -113,12 +114,12 @@ function Drawer({ t, stop, openSchedules, useSessions, useSessionStatus }: Profi
   let body: ReactNode
   if (editing === 'name') body = h(NameEditor, { t, profile, onDone: () => setEditing('none') })
   else if (editing === 'look') body = h(LookEditor, { t, profile, onDone: () => setEditing('none') })
-  else if (tab === 'activity') body = h(Activity, { t, name, stop, useSessions, open: (id) => setDetail(id) })
+  else if (tab === 'activity') body = h(Activity, { t, name, useSessions, open: (id) => setDetail(id) })
   else if (tab === 'approvals') body = h(Approvals, { t, name, approvals: prefs.approvals, grants: live.grants, goneSchedules: live.goneSchedules, chatTasks: live.chatTasks })
   else if (tab === 'reminders') body = h(Reminders, { t, name, openSchedules: () => { profileBus.close(); openSchedules() } })
   else body = h(Identity, { t, name, profile, onEditName: () => setEditing('name') })
 
-  return h('aside', { ref: panel, tabIndex: -1, className: 'nm-pf', role: 'complementary', 'aria-label': name },
+  return h('aside', { ref: panel, tabIndex: -1, className: `nm-pf${tab === 'activity' && editing === 'none' ? ' nm-pf-activity' : ''}`, role: 'complementary', 'aria-label': name },
     h('div', { className: 'nm-pf-top', 'data-window-drag': true },
       h('button', { type: 'button', className: 'nm-icon-btn', 'aria-label': t('close'), onClick: () => profileBus.close() }, h(IconClose, { size: 16 })),
       h('span', { className: 'nm-pf-top-space' }),
@@ -127,7 +128,7 @@ function Drawer({ t, stop, openSchedules, useSessions, useSessionStatus }: Profi
       h('div', { className: 'nm-pf-face' },
         // the face itself opens the same menu as the pen (as on the phone): the look, the name, the studio
         h('button', { type: 'button', className: 'nm-pf-face-btn', 'aria-label': t('pfChangeLook'), 'aria-haspopup': 'menu', 'aria-expanded': menu, onClick: () => setMenu((m) => !m) },
-          h(Avatar, { size: 86, profile, mood: running ? 'working' : 'idle' })),
+          h(Avatar, { size: 86, profile, mood: activityRunning ? 'working' : 'idle' })),
         h('button', { type: 'button', className: 'nm-pf-pen', 'aria-label': t('pfEditName'), 'aria-haspopup': 'menu', 'aria-expanded': menu, onClick: () => setMenu((m) => !m) }, h(IconPencil, { size: 13 })),
         menu
           ? h('div', { className: 'nm-menu nm-pf-menu', role: 'menu' },
@@ -208,8 +209,7 @@ export function requestBrief(text: string, max = 36): string {
   return `${(at > max / 2 ? cut.slice(0, at) : cut).trimEnd()}…`
 }
 
-function Activity({ t, name, stop, useSessions, open }: { t: Translate; name: string; stop(id: string): Promise<void>; useSessions: ProfileDrawerProps['useSessions']; open(id: string): void }): ReactNode {
-  const live = useLive()
+function Activity({ t, name, useSessions, open }: { t: Translate; name: string; useSessions: ProfileDrawerProps['useSessions']; open(id: string): void }): ReactNode {
   const rooms = useRooms()
   const titles = typeof useSessions === 'function'
     ? useSessions((s) => new Map(s.ids
@@ -217,38 +217,57 @@ function Activity({ t, name, stop, useSessions, open }: { t: Translate; name: st
       .filter((pair): pair is [string, NonNullable<ChatListState['byId'][string]>] => pair[1] !== undefined && pair[1].origin !== 'subagent')
       .map(([id, c]) => [id, c.displayTitle] as const)))
     : new Map<string, string>()
-  const [stopping, setStopping] = useState<string | null>(null)
-  interface Row { id: string; at: number; title: string; sub: string; state: 'live' | 'done' | 'error' | 'avatar' | 'notice' }
+  const [visibleCount, setVisibleCount] = useState(5)
+  interface Row { id: string; at: number; title: string; sub: string; state: 'running' | 'stopped' }
   const rows: Row[] = rooms.activity
     .filter((r) => titles.size === 0 || titles.has(r.sessionId))
     .map((r) => ({
       id: r.sessionId,
       at: r.updatedAt,
-      title: titles.get(r.sessionId) || r.request || t('chUntitled'),
-      sub: r.status === 'running' || r.status === 'waiting' ? statusWords(t, r) : r.words || r.request,
-      state: r.status === 'running' || r.status === 'waiting' ? 'live' : r.status === 'error' ? 'error' : r.steps.some((s) => /draw_new_look|studio/.test(s.name)) ? 'avatar' : 'done',
+      title: requestBrief(titles.get(r.sessionId) || r.request) || t('chUntitled'),
+      sub: activitySummary(t, r),
+      state: r.status === 'running' ? 'running' : 'stopped',
     }))
-  for (const notice of live.notices) rows.push({ id: '', at: notice.at, title: notice.title, sub: notice.from, state: 'notice' })
-  rows.sort((a, b) => b.at - a.at)
+  rows.sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running') || b.at - a.at)
   if (rows.length === 0) return h('p', { className: 'nm-pf-empty' }, t('pfNoActivity', { name }))
   const groups = new Map<string, Row[]>()
-  for (const row of rows.slice(0, 60)) {
+  for (const row of rows.slice(0, visibleCount)) {
     const label = dayLabel(t, row.at, rooms.lang)
     const list = groups.get(label) ?? []
     list.push(row)
     groups.set(label, list)
   }
-  const icon = (row: Row) => row.state === 'live' ? h(IconSpinner, { size: 18 }) : row.state === 'avatar' ? h(IconSparkle, { size: 18 }) : h(IconCheck, { size: 18 })
-  return h('div', { className: 'nm-pf-rows' }, [...groups].map(([label, items]) => h('div', { key: label },
+  const groupNodes = [...groups].map(([label, items]) => h('section', { key: label },
     h('div', { className: 'nm-pf-day' }, label),
-    items.map((r, i) => h('div', { key: `${r.id}-${r.at}-${i}`, className: `nm-pf-row nm-pf-task${r.id ? ' nm-clickable' : ''}`, role: r.id ? 'button' : undefined, tabIndex: r.id ? 0 : undefined, onClick: () => { if (r.id) open(r.id) }, onKeyDown: (e: KeyboardEvent) => { if (r.id && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); open(r.id) } } },
-      h('span', { className: `nm-pf-row-icon${r.state === 'live' ? ' nm-live' : r.state === 'error' ? ' nm-err' : ''}` }, icon(r)),
-      h('div', { className: 'nm-pf-row-main' },
-        h('div', { className: 'nm-pf-row-title' }, r.title),
-        r.sub ? h('div', { className: 'nm-pf-row-sub' }, r.sub) : null),
-      r.state === 'live' && r.id
-        ? h('button', { type: 'button', className: 'nm-pf-stop', title: t('capsuleStop'), 'aria-label': t('capsuleStop'), disabled: stopping === r.id, onClick: (e: MouseEvent) => { e.stopPropagation(); setStopping(r.id); void stop(r.id).finally(() => setStopping(null)) } }, h(IconSquare, { size: 14 }))
-        : h('span', { className: 'nm-pf-row-time' }, clockLabel(r.at, rooms.lang)))))))
+    items.map((row, i) => h('div', {
+      key: `${row.id}-${row.at}-${i}`,
+      className: `nm-pf-row nm-pf-task nm-clickable${row.state === 'running' ? ' nm-running' : ''}`,
+      role: 'button',
+      tabIndex: 0,
+      'aria-label': `${row.title}, ${row.state === 'running' ? t('taskRunning') : t('taskStopped')}`,
+      onClick: () => open(row.id),
+      onKeyDown: (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(row.id) } },
+    },
+    h('span', { className: `nm-pf-row-icon nm-pf-task-state${row.state === 'running' ? ' nm-live' : ''}`, 'aria-hidden': true },
+      row.state === 'running' ? h(IconSpinner, { size: 18 }) : h('span', { className: 'nm-pf-stopped-mark' })),
+    h('div', { className: 'nm-pf-row-main' },
+      h('div', { className: 'nm-pf-row-title' }, row.title),
+      row.sub ? h('div', { className: 'nm-pf-row-sub' }, row.sub) : null,
+      h('span', { className: 'nm-pf-row-time' }, clockLabel(row.at, rooms.lang)))))))
+  return h('div', { className: 'nm-pf-rows nm-pf-task-list' },
+    groupNodes,
+    rows.length > visibleCount
+      ? h('button', { type: 'button', className: 'nm-pf-more', onClick: () => setVisibleCount((count) => count + 5) }, t('taskMore'))
+      : null)
+}
+
+function activitySummary(t: Translate, record: ActivityRecord): string {
+  const latestTool = [...record.steps].reverse().find((step) => step.kind === 'tool')
+  const activeTitle = record.status === 'running' ? record.current?.title.trim() : ''
+  const step = activeTitle ? null : latestTool
+  const summary = activeTitle || step?.title || (step ? toolWords(step.name, step.name) : '')
+  if (summary) return firstWords(summary, 72)
+  return record.steps.some((item) => item.kind === 'answer') ? t('taskAnalysisNoTool') : t('taskNoSteps')
 }
 
 function Approvals({ t, name, approvals, grants, goneSchedules, chatTasks }: { t: Translate; name: string; approvals: { at: number; toolName: string; reason: string; outcome: 'allowed' | 'rejected' }[]; grants: Grant[]; goneSchedules: string[]; chatTasks: Record<string, string[]> }): ReactNode {

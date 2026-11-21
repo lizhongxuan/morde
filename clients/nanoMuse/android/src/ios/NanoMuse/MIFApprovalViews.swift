@@ -21,6 +21,10 @@ struct MIFApprovalInboxRoom: View {
     @State private var actionMessage: String?
     @State private var submissionLedger = MIFApprovalSubmissionLedger()
     @State private var expiryRevision = 0
+    @State private var pageIndex = 1
+    @State private var selectedApproval: MIFApprovalEntry?
+
+    private let approvalsPerPage = 5
 
     init(onConfirmedCount: ((MIFApprovalCountSnapshot) -> Void)? = nil, chrome: NanoMuseRoomChrome? = nil,
          onMenu: (() -> Void)? = nil, onOpenEventChain: ((String) -> Void)? = nil) {
@@ -37,8 +41,14 @@ struct MIFApprovalInboxRoom: View {
                                      failedTaskIDs: failedTaskIDs, pageReadFailed: pageReadFailed)
     }
 
-    private var approvalSeparatorColor: Color {
-        NanoMuseTones.hairline
+    private var pageCount: Int { max(1, (summary.approvals.count + approvalsPerPage - 1) / approvalsPerPage) }
+    private var currentPage: Int { min(pageIndex, pageCount) }
+    private var visibleApprovals: [MIFApprovalEntry] {
+        Array(summary.approvals.dropFirst((currentPage - 1) * approvalsPerPage).prefix(approvalsPerPage))
+    }
+    private var pageNumbers: [Int] {
+        Array(Set([1, currentPage - 1, currentPage, currentPage + 1, pageCount]
+            .filter { $0 >= 1 && $0 <= pageCount })).sorted()
     }
 
     private var approvalNeutralActionFill: Color {
@@ -54,16 +64,7 @@ struct MIFApprovalInboxRoom: View {
             if let onMenu {
                 approvalDesignHeader(onMenu: onMenu)
             } else if let chrome {
-                NanoMuseRoomHeader(chrome: chrome) {
-                    // nanoMuse: shared room headers need the confirmed count for the approval inbox.
-                    if let confirmedHeaderCountText {
-                        Text(confirmedHeaderCountText)
-                            .font(.system(size: 13.5, weight: .medium))
-                            .foregroundStyle(NanoMuseTones.secondaryText)
-                            .lineLimit(1)
-                            .accessibilityIdentifier("mif.approval.count")
-                    }
-                }
+                NanoMuseRoomHeader(chrome: chrome) { EmptyView() }
             } else {
                 NanoMuseTopBar(title: AppLocalized("Approvals"), onBack: { dismiss() })
             }
@@ -95,28 +96,30 @@ struct MIFApprovalInboxRoom: View {
                                     .accessibilityIdentifier("mif.approval.unconfirmed")
                             }
                         } else {
-                            VStack(spacing: 0) {
-                                ForEach(summary.approvals) { approval in
-                                    if summary.eventChainApprovalID != approval.id {
-                                        Rectangle()
-                                            .fill(approvalSeparatorColor)
-                                            .frame(height: 1)
-                                    }
-                                    approvalCard(approval)
-                                }
+                            LazyVStack(spacing: 10) {
+                                ForEach(visibleApprovals) { approval in approvalCard(approval) }
                             }
+                            .accessibilityIdentifier("mif.approval.cards")
                         }
                     }
                 }
                 .padding(.horizontal, 22)
                 .padding(.top, 2)
-                .padding(.bottom, onMenu == nil && chrome != nil ? NanoMuseBottomBar.height : 0)
             }
             .accessibilityIdentifier("mif.approval.list")
             .refreshable { await reload(scopeKey: store.scopeKey) }
+            if hasLoaded, loadedScopeKey == store.scopeKey, !summary.approvals.isEmpty {
+                paginationBar
+                    .padding(.horizontal, 22)
+                    .padding(.bottom, onMenu == nil && chrome != nil ? NanoMuseBottomBar.height : 0)
+            }
         }
         .background(approvalCanvasColor.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .sheet(item: $selectedApproval) { approval in approvalDetailsSheet(approval) }
+        .onChange(of: summary.approvals.count) { count in
+            pageIndex = min(pageIndex, max(1, (count + approvalsPerPage - 1) / approvalsPerPage))
+        }
         .onChange(of: confirmedCount) { snapshot in
             guard store.isSignedIn, let scopeKey = store.scopeKey,
                   hasLoaded, loadedScopeKey == scopeKey else { return }
@@ -132,12 +135,6 @@ struct MIFApprovalInboxRoom: View {
                 await reload(scopeKey: scopeKey, preservingSnapshot: true)
             }
         }
-    }
-
-    private var confirmedHeaderCountText: String? {
-        guard store.isSignedIn, let scopeKey = store.scopeKey,
-              hasLoaded, loadedScopeKey == scopeKey, let count = confirmedCount.count else { return nil }
-        return String(format: AppLocalized("%d approvals pending"), count)
     }
 
     private var confirmedCount: MIFApprovalCountSnapshot { summary.confirmedCount }
@@ -168,14 +165,6 @@ struct MIFApprovalInboxRoom: View {
                 .tracking(-0.17)
                 .foregroundStyle(NanoMuseTones.ink)
                 .lineLimit(1)
-            if let confirmedHeaderCountText {
-                Text(confirmedHeaderCountText)
-                    .font(.system(size: 13.5, weight: .medium))
-                    .foregroundStyle(NanoMuseTones.secondaryText)
-                    .lineLimit(1)
-                    .padding(.leading, 10)
-                    .accessibilityIdentifier("mif.approval.count")
-            }
             Spacer(minLength: 8)
         }
         .padding(.horizontal, 22)
@@ -209,37 +198,41 @@ struct MIFApprovalInboxRoom: View {
         let task = approval.task
         let pending = approval.pending
         let decisionWasAccepted = submissionLedger.contains(approval.id, scopeKey: store.scopeKey)
-        let taskStateConfirmsDecision = details[task.id].map {
-            !taskStillHasPendingRequest($0, matching: approval)
-        } ?? false
-        var factLines: [String] = []
-        if let object = pending.object, !object.isEmpty { factLines.append(object) }
-        if !pending.content.isEmpty { factLines.append(pending.content) }
-        if !pending.impact.isEmpty { factLines.append(pending.impact) }
-        factLines.append(contentsOf: MordeTaskApprovalDisclosurePresentation.lines(pending.disclosures))
-        if let expiresAt = pending.expirationDate {
-            factLines.append(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
-        }
+        let summaryLine = [pending.object, pending.content.isEmpty ? nil : pending.content]
+            .compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · ")
 
         return VStack(alignment: .leading, spacing: 0) {
-            Text(pending.title)
-                .font(.system(size: 17.5, weight: .bold))
-                .tracking(-0.175)
-                .lineSpacing(2.5)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text(factLines.joined(separator: "\n"))
-            .font(.system(size: 14.5))
-            .lineSpacing(6)
-            .foregroundStyle(NanoMuseTones.secondaryText)
-            .padding(.top, 7)
-            .fixedSize(horizontal: false, vertical: true)
+            Button { selectedApproval = approval } label: {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .firstTextBaseline, spacing: 9) {
+                        Circle().fill(NanoMuseTones.action).frame(width: 8, height: 8)
+                            .accessibilityHidden(true)
+                        Text(pending.title)
+                            .font(.system(size: 16, weight: .bold))
+                            .tracking(-0.16)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .foregroundStyle(NanoMuseTones.ink)
+                    }
+                    Text(summaryLine.isEmpty ? pending.impact : summaryLine)
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(NanoMuseTones.secondaryText)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(AppLocalized("Details") + ": " + pending.title)
+            .accessibilityIdentifier("mif.approval.details.\(approval.id)")
 
             if let message = store.actionErrors[task.id] {
                 Text(message)
                     .font(.footnote)
                     .foregroundStyle(NanoMuseTones.dangerInk)
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 6)
             }
 
             TimelineView(.periodic(from: .now, by: 1)) { timeline in
@@ -275,23 +268,17 @@ struct MIFApprovalInboxRoom: View {
                             .foregroundStyle(NanoMuseTones.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
-                        GeometryReader { geometry in
-                            let availableWidth = max(0, geometry.size.width - 8)
-                            HStack(spacing: 8) {
-                                approvalActionButton(AppLocalized("Reject"), isPrimary: false, isReject: true,
-                                                     id: "mif.approval.reject.\(approval.id)", title: pending.title) {
-                                    Task { await respond(to: approval, decision: "reject") }
-                                }
-                                .frame(width: availableWidth / 2.25)
-                                approvalActionButton(AppLocalized("Approve"), isPrimary: true, isReject: false,
-                                                     id: "mif.approval.approve.\(approval.id)", title: pending.title) {
-                                    Task { await respond(to: approval, decision: "approve") }
-                                }
-                                .frame(width: availableWidth * 1.25 / 2.25)
+                        HStack(spacing: 8) {
+                            approvalActionButton(AppLocalized("Reject"), isPrimary: false, isReject: true,
+                                                 id: "mif.approval.reject.\(approval.id)", title: pending.title) {
+                                Task { await respond(to: approval, decision: "reject") }
+                            }
+                            approvalActionButton(AppLocalized("Approve"), isPrimary: true, isReject: false,
+                                                 id: "mif.approval.approve.\(approval.id)", title: pending.title) {
+                                Task { await respond(to: approval, decision: "approve") }
                             }
                         }
-                        .frame(height: 44)
-                        .padding(.top, 14)
+                        .padding(.top, 10)
                         .disabled(isSubmitting || store.actionInFlight ||
                                   !MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: task.status, at: timeline.date))
                     }
@@ -301,13 +288,148 @@ struct MIFApprovalInboxRoom: View {
                 }
             }
 
-            if summary.eventChainApprovalID == approval.id, !taskStateConfirmsDecision {
-                eventChainLink(task: task)
-                    .padding(.top, 12)
+        }
+        .padding(14)
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+        .shadow(color: NanoMuseTones.action.opacity(0.12), radius: 12, y: 5)
+        .accessibilityIdentifier("mif.approval.card.\(approval.id)")
+    }
+
+    private var paginationBar: some View {
+        let total = summary.approvals.count
+        let start = (currentPage - 1) * approvalsPerPage + 1
+        let end = min(currentPage * approvalsPerPage, total)
+        return HStack(spacing: 10) {
+            Text("\(start)–\(end) / \(total)")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(NanoMuseTones.secondaryText)
+                .lineLimit(1)
+                .accessibilityIdentifier("mif.approval.range")
+            Spacer(minLength: 4)
+            Button { pageIndex = max(1, currentPage - 1) } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(AppLocalized("Back"))
+            .disabled(currentPage == 1)
+
+            HStack(spacing: 4) {
+                ForEach(Array(pageNumbers.enumerated()), id: \.element) { index, number in
+                    if index > 0, number - pageNumbers[index - 1] > 1 {
+                        Text("…").foregroundStyle(NanoMuseTones.secondaryText)
+                    }
+                    Button { pageIndex = number } label: {
+                        Text("\(number)")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(number == currentPage ? NanoMuseTones.onInk : NanoMuseTones.secondaryText)
+                            .frame(minWidth: 34, minHeight: 34)
+                            .background(number == currentPage ? NanoMuseTones.action : NanoMuseTones.surface,
+                                        in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .strokeBorder(number == currentPage ? Color.clear : NanoMuseTones.hairline))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(String(format: AppLocalized("Page: %@"), "\(number)"))
+                    .accessibilityIdentifier("mif.approval.page.\(number)")
+                }
+            }
+
+            Button { pageIndex = min(pageCount, currentPage + 1) } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(AppLocalized("Next"))
+            .disabled(currentPage == pageCount)
+        }
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+        .overlay(alignment: .top) { Rectangle().fill(NanoMuseTones.hairline).frame(height: 1) }
+        .background(approvalCanvasColor)
+        .accessibilityIdentifier("mif.approval.pagination")
+    }
+
+    private func approvalDetailsSheet(_ approval: MIFApprovalEntry) -> some View {
+        let task = approval.task
+        let pending = approval.pending
+        let taskStateConfirmsDecision = details[task.id].map {
+            !taskStillHasPendingRequest($0, matching: approval)
+        } ?? false
+        return NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text(pending.title)
+                        .font(.system(size: 22, weight: .bold))
+                        .tracking(-0.22)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let object = pending.object, !object.isEmpty {
+                        approvalDetailField(AppLocalized("Object"), value: object)
+                    }
+                    if !pending.content.isEmpty {
+                        approvalDetailField(AppLocalized("Content"), value: pending.content)
+                    }
+                    if !pending.impact.isEmpty {
+                        approvalDetailField(AppLocalized("Impact"), value: pending.impact)
+                    }
+                    ForEach(Array(MordeTaskApprovalDisclosurePresentation.lines(pending.disclosures).enumerated()), id: \.offset) { line in
+                        Text(line.element)
+                            .font(.system(size: 14))
+                            .lineSpacing(5)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let expiresAt = pending.expirationDate {
+                        Text(String(format: AppLocalized("Expires: %@"),
+                                    expiresAt.formatted(date: .abbreviated, time: .shortened)))
+                            .font(.system(size: 14))
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let message = store.actionErrors[task.id] {
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.dangerInk)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if summary.eventChainApprovalID == approval.id, !taskStateConfirmsDecision {
+                        eventChainLink(task: task)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(22)
+            }
+            .background(approvalCanvasColor)
+            .navigationTitle(AppLocalized("Details"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(AppLocalized("Close")) { selectedApproval = nil }
+                }
             }
         }
-        .padding(.top, 16)
-        .padding(.bottom, 18)
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private func approvalDetailField(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(NanoMuseTones.secondaryText)
+            Text(value)
+                .font(.system(size: 14.5))
+                .foregroundStyle(NanoMuseTones.ink)
+                .lineSpacing(5)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     @ViewBuilder
@@ -365,6 +487,8 @@ struct MIFApprovalInboxRoom: View {
         let generation = loadGeneration
         submissionLedger.use(scopeKey: scopeKey)
         if !preservingSnapshot {
+            pageIndex = 1
+            selectedApproval = nil
             taskIDs = []
             details = [:]
             failedTaskIDs = []
