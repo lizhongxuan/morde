@@ -323,7 +323,7 @@ export class MordeAPI {
       });
     } catch { throw new Error("无法连接 Morde 服务，请检查网络和服务地址后重试。"); }
     if (!response.ok) {
-      const body = await response.json().catch(() => null) as { error?: { code?: string } } | null;
+      const body = await response.json().catch(() => null) as { error?: { code?: string; details?: { reason?: string } } } | null;
       const messages: Record<string, string> = {
         unauthenticated: "用户名或密码错误，请重试。",
         account_pending: "账号正在等待管理员审核，通过后才能登录。",
@@ -332,7 +332,9 @@ export class MordeAPI {
         rate_limited: "登录尝试过于频繁，请稍后重试。",
         forbidden: "请先在管理后台修改密码，再登录客户端。",
       };
-      throw new Error(messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`));
+      const error = new Error(messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`));
+      Object.assign(error, { code: body?.error?.code, reason: body?.error?.details?.reason });
+      throw error;
     }
     const value = await response.json() as Record<string, unknown>;
     if (typeof value.installation_id !== "string" || !/^i[a-z0-9]{7}$/.test(value.installation_id) ||

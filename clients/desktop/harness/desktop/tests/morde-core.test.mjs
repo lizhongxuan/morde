@@ -372,6 +372,16 @@ test('client login explains account policy errors and offline failure', async ()
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('client login preserves the server conflict reason for ordered recovery', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => String(url).endsWith('/api/capabilities') ? json(capabilities) :
+    json({ error: { code: 'conflict', details: { reason: 'client_login_state_changed' } } }, 409);
+  try {
+    await assert.rejects(() => new MordeAPI(() => null).login('https://portal.example', 'user', 'password', attempt()),
+      (error) => error.code === 'conflict' && error.reason === 'client_login_state_changed');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('login refuses unsupported services and minimum client versions before sending a password', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

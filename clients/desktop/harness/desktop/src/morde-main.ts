@@ -867,6 +867,11 @@ function isCurrentClientLoginAttempt(origin: string, accountName: string, attemp
   return current?.clientInstanceID === attempt.clientInstanceID && current.attemptGeneration === attempt.attemptGeneration;
 }
 
+function isClientLoginStateChanged(error: unknown): boolean {
+  return error instanceof Error && (error as Error & { code?: string }).code === "conflict" &&
+    (error as Error & { reason?: string }).reason === "client_login_state_changed";
+}
+
 function bindClientInstallation(origin: string, accountName: string, attempt: ClientLoginAttempt, installationID: string): void {
   const key = accountProfileID(origin, accountName);
   const current = clientLoginAttempts[key];
@@ -2779,14 +2784,23 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     (existingFence.installationID !== null ? existingFence.installationID === lastInstallation?.id : existingFence.allowLegacyRenewal) : true;
   const previousID = lastInstallation?.serviceInstanceID && lastInstallation.origin === normalizedOrigin && lastInstallation.name === normalizedName && mayRenewInstallation
     ? { installationID: lastInstallation.id, serviceInstanceID: lastInstallation.serviceInstanceID } : undefined;
-  const attempt = nextClientLoginAttempt(normalizedOrigin, normalizedName);
+  let attempt = nextClientLoginAttempt(normalizedOrigin, normalizedName);
   let result: Awaited<ReturnType<typeof api.login>>;
   try { result = await api.login(normalizedOrigin, name, password, attempt, previousID); }
   catch (error) {
     if (!isCurrentClientLoginAttempt(normalizedOrigin, normalizedName, attempt)) {
       throw new Error("较新的登录尝试已开始，已丢弃此响应。请使用最新尝试登录。");
     }
-    throw error;
+    if (!isClientLoginStateChanged(error)) throw error;
+    rotateClientInstanceID(normalizedOrigin, normalizedName);
+    attempt = nextClientLoginAttempt(normalizedOrigin, normalizedName);
+    try { result = await api.login(normalizedOrigin, name, password, attempt); }
+    catch (retryError) {
+      if (!isCurrentClientLoginAttempt(normalizedOrigin, normalizedName, attempt)) {
+        throw new Error("较新的登录尝试已开始，已丢弃此响应。请使用最新尝试登录。");
+      }
+      throw retryError;
+    }
   }
   if (!isCurrentClientLoginAttempt(normalizedOrigin, normalizedName, attempt)) {
     throw new Error("较新的登录尝试已开始，已丢弃此响应。请使用最新尝试登录。");

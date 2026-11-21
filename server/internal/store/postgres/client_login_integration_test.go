@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -203,8 +204,9 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	}
 	_, err = clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-after-logout-0001", "192.0.2.1",
 		app.ClientLoginAttempt{InstanceID: "9f0de095-66ba-49c6-a87b-0c527f4f81a1", Generation: 5})
-	if domain.CodeOf(err) != domain.CodeUnauthenticated {
-		t.Fatalf("login stream restored a logged-out installation = %v; want unauthenticated", err)
+	var loginErr *domain.Error
+	if domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &loginErr) || loginErr.Details["reason"] != "client_login_state_changed" {
+		t.Fatalf("login stream restored a logged-out installation = %v; want client_login_state_changed conflict", err)
 	}
 	items, err := store.ListClientInstallations(ctx, owner.ID)
 	if err != nil || len(items) != 1 || items[0].RevokedAt == nil {
@@ -891,8 +893,16 @@ func TestClientLoginHTTPPostgresSessionFenceAndLogout(t *testing.T) {
 		t.Fatalf("revoked Web session accessed user route = %d %s", res.Code, res.Body)
 	}
 	lateDesktopLogin := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"desktop","display_name":"laptop","client_instance_id":"2f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":2}`
-	if res := request(http.MethodPost, "/api/auth/client-login", lateDesktopLogin, "", "", "", "http-login-late-01"); res.Code != http.StatusUnauthorized {
-		t.Fatalf("late login restored logged-out installation = %d %s", res.Code, res.Body)
+	lateLogin := request(http.MethodPost, "/api/auth/client-login", lateDesktopLogin, "", "", "", "http-login-late-01")
+	var lateLoginError struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if lateLogin.Code != http.StatusConflict || json.Unmarshal(lateLogin.Body.Bytes(), &lateLoginError) != nil ||
+		lateLoginError.Error.Code != string(domain.CodeConflict) || lateLoginError.Error.Details["reason"] != "client_login_state_changed" {
+		t.Fatalf("late login restored logged-out installation = %d %s", lateLogin.Code, lateLogin.Body)
 	}
 	iosBody := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"ios","display_name":"phone","client_instance_id":"3f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":1}`
 	iosLogin := request(http.MethodPost, "/api/auth/client-login", iosBody, "", "", "", "http-login-ios-01")

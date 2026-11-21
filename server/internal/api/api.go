@@ -775,7 +775,7 @@ func writeError(c *gin.Context, err error) {
 
 func validSafeErrorReason(reason string) bool {
 	switch reason {
-	case "authentication_rejected", "access_rejected", "rate_limited", "quota_exhausted", "invalid_request", "unavailable", "timeout", "transport", "invalid_response":
+	case "authentication_rejected", "access_rejected", "rate_limited", "quota_exhausted", "invalid_request", "unavailable", "timeout", "transport", "invalid_response", "client_login_state_changed":
 		return true
 	default:
 		return false

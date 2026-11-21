@@ -625,7 +625,7 @@ paths:
       tags: [Clients]
       operationId: clientLogin
       summary: Log in on a native client
-      description: Approved accounts sign in with name and password. Desktop and iOS clients must first require ordered_client_login from /api/capabilities. Each ordered network attempt has a new Idempotency-Key and a strictly increasing attempt_generation persisted by the client before sending. The service binds client_instance_id to one installation and rejects stale generations. A retry after an unknown result increments the generation; the prior response may then contain a revoked credential and must be discarded. Revoked installations cannot be restored by a late login. For source compatibility only, Android requests that omit both ordered fields continue using the legacy server-ordered path; it is not advertised as a capability and does not fence delayed client intents. Legacy same-key Android retries rotate credentials on the same installation. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set.
+      description: Approved accounts sign in with name and password. Desktop and iOS clients must first require ordered_client_login from /api/capabilities. Each ordered network attempt has a new Idempotency-Key and a strictly increasing attempt_generation persisted by the client before sending. The service binds client_instance_id to one installation and rejects stale generations. A retry after an unknown result increments the generation; the prior response may then contain a revoked credential and must be discarded. Revoked installations cannot be restored by a late login. If the password is valid but the bound installation has since been revoked, the service returns 409 with error.details.reason=client_login_state_changed; the client may start a fresh ordered login stream without a renewal_installation_id. For source compatibility only, Android requests that omit both ordered fields continue using the legacy server-ordered path; it is not advertised as a capability and does not fence delayed client intents. Legacy same-key Android retries rotate credentials on the same installation. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set.
       security: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -643,7 +643,11 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
+        '409':
+          description: Login attempt conflict, including a revoked installation after successful password verification; client_login_state_changed permits a fresh ordered login stream without renewal_installation_id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         '422': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/RateLimited' }
         default: { $ref: '#/components/responses/Error' }

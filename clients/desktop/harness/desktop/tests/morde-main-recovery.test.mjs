@@ -327,6 +327,62 @@ test('a generation-zero post-logout fence never renews the revoked installation'
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }
 });
 
+test('a revoked installation rotates to a fresh ordered login stream once', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const instanceID = '123e4567-e89b-42d3-a456-426614174000';
+  const profileID = createHash('sha256').update(`${auth.origin}\0${auth.accountName}`).digest('hex');
+  globalThis.fetch = async (url, options) => {
+    const requestURL = String(url);
+    requests.push({ url: requestURL, options });
+    if (requestURL.endsWith('/api/capabilities')) return loginFetch(url);
+    if (requestURL.endsWith('/api/auth/client-login') && requests.filter((request) => request.url.endsWith('/api/auth/client-login')).length === 1) {
+      return json({ error: { code: 'conflict', details: { reason: 'client_login_state_changed' } } }, 409);
+    }
+    return loginFetch(url);
+  };
+  const h = harness();
+  try {
+    writeFileSync(join(h.userData, 'installation.json'), JSON.stringify({ origin: auth.origin, serviceInstanceID: auth.serviceInstanceID, name: auth.accountName, id: auth.installationId }));
+    writeFileSync(join(h.userData, 'client-login-attempts.json'), JSON.stringify({ [profileID]: {
+      clientInstanceID: instanceID, attemptGeneration: '3', retiredClientInstanceIDs: [], installationID: auth.installationId, allowLegacyRenewal: false,
+    } }));
+    await h.ready();
+    assert.equal((await h.invoke('morde:login', auth.origin, auth.accountName, 'password')).authenticated, true);
+    const logins = requests.filter((request) => request.url.endsWith('/api/auth/client-login'));
+    assert.equal(logins.length, 2);
+    const firstBody = JSON.parse(logins[0].options.body);
+    const secondBody = JSON.parse(logins[1].options.body);
+    assert.equal(firstBody.client_instance_id, instanceID);
+    assert.equal(firstBody.attempt_generation, 4);
+    assert.equal(firstBody.renewal_installation_id, auth.installationId);
+    assert.notEqual(secondBody.client_instance_id, instanceID);
+    assert.equal(secondBody.attempt_generation, 1);
+    assert.equal('renewal_installation_id' in secondBody, false);
+    const fence = JSON.parse(readFileSync(join(h.userData, 'client-login-attempts.json'), 'utf8'))[profileID];
+    assert.equal(fence.clientInstanceID, secondBody.client_instance_id);
+    assert.deepEqual(fence.retiredClientInstanceIDs, [instanceID]);
+    assert.equal(fence.attemptGeneration, 1);
+  } finally { globalThis.fetch = originalFetch; h.cleanup(); }
+});
+
+test('an invalid password does not start a replacement login stream', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    const requestURL = String(url);
+    requests.push({ url: requestURL, options });
+    if (requestURL.endsWith('/api/capabilities')) return loginFetch(url);
+    return json({ error: { code: 'unauthenticated' } }, 401);
+  };
+  const h = harness();
+  try {
+    await h.ready();
+    await assert.rejects(h.invoke('morde:login', auth.origin, auth.accountName, 'wrong-password'), /用户名或密码错误/);
+    assert.equal(requests.filter((request) => request.url.endsWith('/api/auth/client-login')).length, 1);
+  } finally { globalThis.fetch = originalFetch; h.cleanup(); }
+});
+
 test('a late login response cannot replace credentials from the newest generation', async () => {
   const originalFetch = globalThis.fetch;
   const pending = [];
